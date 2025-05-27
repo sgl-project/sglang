@@ -123,7 +123,8 @@ class TboCudaGraphRunnerPlugin:
         # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
         assert batch.tbo_split_seq_index is not None, f"{num_tokens=}"
 
-        self._tbo_children_num_token_non_padded[...] = TODO
+        self._tbo_children_num_token_non_padded[
+            ...] = TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(batch)
 
         TboForwardBatchPreparer.prepare_raw(
             batch,
