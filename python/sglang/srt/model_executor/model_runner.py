@@ -541,11 +541,6 @@ class ModelRunner:
         # check model support pipeline parallelism
         if isinstance(model_class, SupportsPP):
             self.support_pp = True
-            if model_class.config.tie_word_embeddings:
-                raise RuntimeError(
-                    "model %s does not support pipeline parallelism now when enabled tie_word_embeddings.",
-                    model_class,
-                )
         else:
             self.support_pp = False
             if self.pp_size > 1:
