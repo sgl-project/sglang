@@ -131,14 +131,18 @@ class TboCudaGraphRunnerPlugin:
             tbo_children_num_token_non_padded=self._tbo_children_num_token_non_padded,
         )
 
-    def replay_prepare(self, forward_mode: ForwardMode, bs: int):
+    def replay_prepare(self, forward_mode: ForwardMode, bs: int, num_token_non_padded: int):
         tbo_split_seq_index, tbo_split_token_index = compute_split_indices_for_cuda_graph_replay(
             forward_mode=forward_mode,
             # TODO support bs!=num_tokens
             cuda_graph_num_tokens=bs,
         )
 
-        self._tbo_children_num_token_non_padded[...] = TODO
+        self._tbo_children_num_token_non_padded[
+            ...] = TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded_raw(
+            tbo_split_token_index=tbo_split_token_index,
+            num_token_non_padded=num_token_non_padded,
+        )
 
 
 class TboDPAttentionPreparer:
