@@ -68,30 +68,34 @@ void rope_kernel_impl(
 
 template <typename scalar_t>
 void rotary_embedding_origin_impl(
-    const int64_t* __restrict__ positions,  // [batch_size, seq_len] or
-                                            // [num_tokens]
-    scalar_t* __restrict__ query,           /// [batch_size, seq_len, num_heads,
-                                   /// head_size] or [num_tokens, num_heads,
-                                   /// head_size]
-    scalar_t* __restrict__ key,  // [batch_size, seq_len, num_kv_heads,
-                                 // head_size] or [num_tokens, num_kv_heads,
-                                 // head_size]
+    const int64_t* __restrict__ positions,       // [batch_size, seq_len] or
+                                                 // [num_tokens]
+    scalar_t* __restrict__ query,                /// [batch_size, seq_len, num_heads,
+                                                 /// head_size] or [num_tokens, num_heads,
+                                                 /// head_size]
+    scalar_t* __restrict__ key,                  // [batch_size, seq_len, num_kv_heads,
+                                                 // head_size] or [num_tokens, num_kv_heads,
+                                                 // head_size]
     const scalar_t* __restrict__ cos_sin_cache,  // [max_position, 2, rot_dim //
                                                  // 2]
-    const int rot_dim, const int64_t query_stride, const int64_t key_stride,
-    const int num_heads, const int num_kv_heads, const int head_size,
+    const int rot_dim,
+    const int64_t query_stride,
+    const int64_t key_stride,
+    const int num_heads,
+    const int num_kv_heads,
+    const int head_size,
     const int num_tokens) {
-  using sVec = at::vec::Vectorized<scalar_t>;
-  constexpr int VEC_ELEM_NUM = sVec::size();
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int bVecSize = bVec::size();
 
   const int embed_dim = rot_dim / 2;
-  bool flag = (embed_dim % VEC_ELEM_NUM == 0);
-  const int loop_upper = flag ? embed_dim : embed_dim - VEC_ELEM_NUM;
+  bool flag = (embed_dim % bVecSize == 0);
+  const int loop_upper = flag ? embed_dim : embed_dim - bVecSize;
 
-  auto compute_loop = [&](const int64_t token_head, const scalar_t* cache_ptr,
-                          scalar_t* qk) {
+  auto compute_loop = [&](const int64_t token_head, const scalar_t* cache_ptr, scalar_t* qk) {
     int j = 0;
-    for (; j < loop_upper; j += VEC_ELEM_NUM) {
+    for (; j < loop_upper; j += bVecSize) {
       const int rot_offset = j;
       const int x_index = rot_offset;
       const int y_index = embed_dim + rot_offset;
@@ -99,16 +103,28 @@ void rotary_embedding_origin_impl(
       const int64_t out_x = token_head + x_index;
       const int64_t out_y = token_head + y_index;
 
-      sVec _cos = sVec::loadu(cache_ptr + x_index);
-      sVec _sin = sVec::loadu(cache_ptr + y_index);
+      bVec _cos = bVec::loadu(cache_ptr + x_index);
+      bVec _sin = bVec::loadu(cache_ptr + y_index);
 
-      sVec _q_x = sVec::loadu(qk + out_x);
-      sVec _q_y = sVec::loadu(qk + out_y);
+      bVec _q_x = bVec::loadu(qk + out_x);
+      bVec _q_y = bVec::loadu(qk + out_y);
+      fVec _cos_0, _cos_1;
+      std::tie(_cos_0, _cos_1) = at::vec::convert_to_float(_cos);
+      fVec _sin_0, _sin_1;
+      std::tie(_sin_0, _sin_1) = at::vec::convert_to_float(_sin);
+      fVec _q_x_0, _q_x_1;
+      std::tie(_q_x_0, _q_x_1) = at::vec::convert_to_float(_q_x);
+      fVec _q_y_0, _q_y_1;
+      std::tie(_q_y_0, _q_y_1) = at::vec::convert_to_float(_q_y);
 
-      auto out1 = _q_x * _cos - _q_y * _sin;
+      auto out1_0 = _q_x_0 * _cos_0 - _q_y_0 * _sin_0;
+      auto out1_1 = _q_x_1 * _cos_1 - _q_y_1 * _sin_1;
+      auto out1 = convert_from_float_ext<scalar_t>(out1_0, out1_1);
       out1.store(qk + out_x);
 
-      auto out2 = _q_y * _cos + _q_x * _sin;
+      auto out2_0 = _q_y_0 * _cos_0 + _q_x_0 * _sin_0;
+      auto out2_1 = _q_y_1 * _cos_1 + _q_x_1 * _sin_1;
+      auto out2 = convert_from_float_ext<scalar_t>(out2_0, out2_1);
       out2.store(qk + out_y);
     }
     if (!flag) {
@@ -138,8 +154,7 @@ void rotary_embedding_origin_impl(
 
     for (int i = 0; i < num_heads; ++i) {
       const int head_idx = i;
-      const int64_t token_head =
-          token_idx * query_stride + head_idx * head_size;
+      const int64_t token_head = token_idx * query_stride + head_idx * head_size;
       compute_loop(token_head, cache_ptr, query);
     }
 
@@ -153,18 +168,22 @@ void rotary_embedding_origin_impl(
 
 template <typename scalar_t>
 void rotary_embedding_origin_gptj_impl(
-    const int64_t* __restrict__ positions,  // [batch_size, seq_len] or
-                                            // [num_tokens]
-    scalar_t* __restrict__ query,           /// [batch_size, seq_len, num_heads,
-                                   /// head_size] or [num_tokens, num_heads,
-                                   /// head_size]
-    scalar_t* __restrict__ key,  // [batch_size, seq_len, num_kv_heads,
-                                 // head_size] or [num_tokens, num_kv_heads,
-                                 // head_size]
+    const int64_t* __restrict__ positions,       // [batch_size, seq_len] or
+                                                 // [num_tokens]
+    scalar_t* __restrict__ query,                /// [batch_size, seq_len, num_heads,
+                                                 /// head_size] or [num_tokens, num_heads,
+                                                 /// head_size]
+    scalar_t* __restrict__ key,                  // [batch_size, seq_len, num_kv_heads,
+                                                 // head_size] or [num_tokens, num_kv_heads,
+                                                 // head_size]
     const scalar_t* __restrict__ cos_sin_cache,  // [max_position, 2, rot_dim //
                                                  // 2]
-    const int rot_dim, const int64_t query_stride, const int64_t key_stride,
-    const int num_heads, const int num_kv_heads, const int head_size,
+    const int rot_dim,
+    const int64_t query_stride,
+    const int64_t key_stride,
+    const int num_heads,
+    const int num_kv_heads,
+    const int head_size,
     const int num_tokens) {
   const int embed_dim = rot_dim / 2;
 
@@ -176,8 +195,7 @@ void rotary_embedding_origin_gptj_impl(
       const scalar_t* cos_cache_ptr = cache_ptr;
       const scalar_t* sin_cache_ptr = cache_ptr + embed_dim;
       const int head_idx = i;
-      const int64_t token_head =
-          token_idx * query_stride + head_idx * head_size;
+      const int64_t token_head = token_idx * query_stride + head_idx * head_size;
       scalar_t* head_query = token_head + query;
       for (int j = 0; j < embed_dim; j += 1) {
         const int rot_offset = j;
@@ -226,33 +244,50 @@ void rotary_embedding_origin_gptj_impl(
 
 }  // namespace
 
-void rotary_embedding_origin_cpu(at::Tensor& positions, at::Tensor& query,
-  at::Tensor& key, int64_t head_size,
-  at::Tensor& cos_sin_cache, bool is_neox) {
-int num_tokens = positions.numel();
-int rot_dim = cos_sin_cache.size(1);
-int num_heads = query.size(-1) / head_size;
-int num_kv_heads = key.size(-1) / head_size;
-int64_t key_stride = key.stride(-2);
-int64_t query_stride = query.stride(-2);
+void rotary_embedding_origin_cpu(
+    at::Tensor& positions,
+    at::Tensor& query,
+    at::Tensor& key,
+    int64_t head_size,
+    at::Tensor& cos_sin_cache,
+    bool is_neox) {
+  RECORD_FUNCTION("sgl-kernel::rotary_position_embedding_origin_cpu", std::vector<c10::IValue>({query, key}));
+  int num_tokens = positions.numel();
+  int rot_dim = cos_sin_cache.size(1);
+  int num_heads = query.size(-1) / head_size;
+  int num_kv_heads = key.size(-1) / head_size;
+  int64_t key_stride = key.stride(-2);
+  int64_t query_stride = query.stride(-2);
 
-AT_DISPATCH_REDUCED_FLOATING_TYPES(
-query.scalar_type(), "rotary_embedding_origin_impl", [&] {
-if (is_neox) {
-  rotary_embedding_origin_impl(
-positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-key.data_ptr<scalar_t>(), cos_sin_cache.data_ptr<scalar_t>(),
-rot_dim, query_stride, key_stride, num_heads, num_kv_heads,
-head_size, num_tokens);
-} else {
-  rotary_embedding_origin_gptj_impl(
-positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-key.data_ptr<scalar_t>(), cos_sin_cache.data_ptr<scalar_t>(),
-rot_dim, query_stride, key_stride, num_heads, num_kv_heads,
-head_size, num_tokens);
-}
-
-});
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "rotary_embedding_origin_impl", [&] {
+    if (is_neox) {
+      rotary_embedding_origin_impl(
+          positions.data_ptr<int64_t>(),
+          query.data_ptr<scalar_t>(),
+          key.data_ptr<scalar_t>(),
+          cos_sin_cache.data_ptr<scalar_t>(),
+          rot_dim,
+          query_stride,
+          key_stride,
+          num_heads,
+          num_kv_heads,
+          head_size,
+          num_tokens);
+    } else {
+      rotary_embedding_origin_gptj_impl(
+          positions.data_ptr<int64_t>(),
+          query.data_ptr<scalar_t>(),
+          key.data_ptr<scalar_t>(),
+          cos_sin_cache.data_ptr<scalar_t>(),
+          rot_dim,
+          query_stride,
+          key_stride,
+          num_heads,
+          num_kv_heads,
+          head_size,
+          num_tokens);
+    }
+  });
 }
 std::tuple<at::Tensor, at::Tensor>
 rotary_position_embedding_cpu(at::Tensor& t_pos, at::Tensor& q_pe, at::Tensor& k_pe, at::Tensor& t_emb_pos) {

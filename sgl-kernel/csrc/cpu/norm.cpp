@@ -12,7 +12,6 @@ void l2norm_kernel_impl(
     int64_t batch_size,
     int64_t hidden_size,
     float eps = 1e-5) {
-
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
 
@@ -27,7 +26,7 @@ void l2norm_kernel_impl(
       float sum_val = float(0);
 
       int64_t d;
-      #pragma GCC unroll 4
+#pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
@@ -36,7 +35,7 @@ void l2norm_kernel_impl(
         sum_fvec += x_fvec0 * x_fvec0;
         sum_fvec += x_fvec1 * x_fvec1;
       }
-      #pragma GCC unroll 4
+#pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
         float x_val = static_cast<float>(input_ptr[d]);
         sum_val += x_val * x_val;
@@ -46,7 +45,7 @@ void l2norm_kernel_impl(
       float rsqrt_var = float(1) / std::sqrt(sum_val / hidden_size + eps);
       const fVec scale_fvec = fVec(rsqrt_var);
 
-      #pragma GCC unroll 4
+#pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
         bVec x_bvec = bVec::loadu(input_ptr + d);
         fVec x_fvec0, x_fvec1;
@@ -58,7 +57,7 @@ void l2norm_kernel_impl(
         bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
         out_bvec.store(out_ptr + d);
       }
-      #pragma GCC unroll 4
+#pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
         float x_val = static_cast<float>(input_ptr[d]);
         out_ptr[d] = static_cast<scalar_t>(x_val * rsqrt_var);
@@ -233,12 +232,7 @@ at::Tensor l2norm_cpu(at::Tensor& input, double eps) {
   at::Tensor output = at::empty_like(input);
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "l2norm_kernel", [&] {
-    l2norm_kernel_impl<scalar_t>(
-        output.data_ptr<scalar_t>(),
-        input.data_ptr<scalar_t>(),
-        batch_size,
-        hidden_size,
-        eps);
+    l2norm_kernel_impl<scalar_t>(output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), batch_size, hidden_size, eps);
   });
   return output;
 }

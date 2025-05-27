@@ -31,11 +31,9 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
 // fused_add_rmsnorm
 void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
 
-
-std::tuple<at::Tensor, at::Tensor> topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output,
-    int64_t topk);
-std::tuple<at::Tensor, at::Tensor> topk_softmax_cpu(at::Tensor& hidden_states, at::Tensor& gating_output,
-    int64_t topk, bool renormalize);
+std::tuple<at::Tensor, at::Tensor> topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk);
+std::tuple<at::Tensor, at::Tensor>
+topk_softmax_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize);
 // topk
 std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
     at::Tensor& hidden_states,
@@ -186,9 +184,13 @@ at::Tensor shm_allgather(at::Tensor& data, c10::intrusive_ptr<c10d::ProcessGroup
 std::tuple<at::Tensor, at::Tensor>
 rotary_position_embedding_cpu(at::Tensor& t_pos, at::Tensor& q_pe, at::Tensor& k_pe, at::Tensor& t_emb_pos);
 
-void rotary_embedding_origin_cpu(at::Tensor& positions, at::Tensor& query,
-    at::Tensor& key, int64_t head_size,
-    at::Tensor& cos_sin_cache, bool is_neox);
+void rotary_embedding_origin_cpu(
+    at::Tensor& positions,
+    at::Tensor& query,
+    at::Tensor& key,
+    int64_t head_size,
+    at::Tensor& cos_sin_cache,
+    bool is_neox);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // activation
@@ -198,7 +200,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("l2norm_cpu", &l2norm_cpu, "Rl2norm for CPU");
   m.def("rmsnorm_cpu", &rmsnorm_cpu, "Root mean square normalization for CPU");
   m.def("fused_add_rmsnorm_cpu", &fused_add_rmsnorm_cpu, "Fused add root mean square normalization for CPU");
-  
+
   // topk
   m.def("topk_sigmoid_cpu", &topk_sigmoid_cpu, "TopK-Sigmoid fusion for CPU");
   m.def("topk_softmax_cpu", &topk_softmax_cpu, "TopK-Softmax fusion for CPU");
