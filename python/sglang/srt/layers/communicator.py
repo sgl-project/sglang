@@ -411,6 +411,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
 
 class CommunicateSummableTensorPairFn:
+    """It is allowed to make (hidden_states, residual) := (hidden_states + residual, None) if needed."""
+
     @classmethod
     def execute(
         cls,
@@ -434,8 +436,6 @@ class CommunicateSummableTensorPairFn:
         output_mode: ScatterMode,
         context: CommunicateContext,
     ):
-        """It is allowed to make (hidden_states, residual) := (hidden_states + residual, None) if needed."""
-
         if context.is_same_group_size(
             hidden_states_input_mode, output_mode
         ) and context.is_same_group_size(residual_input_mode, output_mode):
