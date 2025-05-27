@@ -69,7 +69,11 @@ impl LBState {
             .get("input_ids")
             .and_then(|input_ids| input_ids.as_array())
         {
-            Some(input_ids.len())
+            if input_ids[0].is_array() {
+                Some(input_ids.len())
+            } else {
+                None
+            }
         } else {
             None
         };
