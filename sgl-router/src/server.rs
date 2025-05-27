@@ -1,4 +1,5 @@
 use crate::logging::{self, LoggingConfig};
+use crate::prometheus::{self, PrometheusConfig};
 use crate::router::PolicyConfig;
 use crate::router::Router;
 use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
@@ -132,6 +133,13 @@ async fn add_worker(
     }
 }
 
+#[get("/list_workers")]
+async fn list_workers(data: web::Data<AppState>) -> impl Responder {
+    let workers = data.router.get_worker_urls();
+    let worker_list = workers.read().unwrap().clone();
+    HttpResponse::Ok().json(serde_json::json!({ "urls": worker_list }))
+}
+
 #[post("/remove_worker")]
 async fn remove_worker(
     query: web::Query<HashMap<String, String>>,
@@ -154,6 +162,7 @@ pub struct ServerConfig {
     pub max_payload_size: usize,
     pub log_dir: Option<String>,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
+    pub prometheus_config: Option<PrometheusConfig>,
 }
 
 pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
@@ -176,6 +185,17 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     } else {
         None
     };
+
+    // Initialize prometheus metrics exporter
+    if let Some(prometheus_config) = config.prometheus_config {
+        info!(
+            "🚧 Initializing Prometheus metrics on {}:{}",
+            prometheus_config.host, prometheus_config.port
+        );
+        prometheus::start_prometheus(prometheus_config);
+    } else {
+        info!("🚧 Prometheus metrics disabled");
+    }
 
     info!("🚧 Initializing router on {}:{}", config.host, config.port);
     info!("🚧 Initializing workers on {:?}", config.worker_urls);
@@ -253,10 +273,11 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
             .service(get_server_info)
             .service(add_worker)
             .service(remove_worker)
+            .service(list_workers)
             // Default handler for unmatched routes.
             .default_service(web::route().to(sink_handler))
     })
-    .bind((config.host, config.port))?
+    .bind_auto_h2c((config.host, config.port))?
     .run()
     .await
 }
