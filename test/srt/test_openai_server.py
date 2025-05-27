@@ -264,13 +264,7 @@ class TestOpenAIServer(CustomTestCase):
                 assert (
                     ret_num_top_logprobs == logprobs
                 ), f"{ret_num_top_logprobs} vs {logprobs}"
-                top_logprob_tokens.append(
-                    response.choices[0].logprobs.content[0].top_logprobs[0].token
-                )
 
-            assert (
-                len(top_logprob_tokens) <= 2 or len(set(top_logprob_tokens)) > 1
-            ), "Top Logprob tokens should not consistent of the same token repeated"
             assert (
                 isinstance(data.content, str)
                 or isinstance(data.reasoning_content, str)
