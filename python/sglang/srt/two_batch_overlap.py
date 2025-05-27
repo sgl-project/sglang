@@ -448,7 +448,7 @@ def _model_forward_tbo_split_inputs(
             output_mode=layer_input_scatter_mode,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
-            context=CommunicateContext.init_new(),
+            context=context,
         )
         return dict(
             hidden_states=hidden_states,
