@@ -354,6 +354,10 @@ class TboForwardBatchPreparer:
 
         return ForwardBatch(**output_dict)
 
+    @classmethod
+    def compute_tbo_children_num_token_non_padded(cls):
+        return torch.tensor([TODO, TODO], device=TODO)
+
 
 def _compute_extend_num_tokens(input_ids, forward_mode: ForwardMode):
     if forward_mode.is_extend():
