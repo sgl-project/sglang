@@ -40,6 +40,9 @@ class PythonicDetector(BaseFormatDetector):
         text = text.strip()
 
         match = self.tool_call_regex.search(text)
+        if match is None:
+            return StreamingParseResult(normal_text=text, calls=[])
+
         # Extract the tool call part and any text before/after it
         tool_call_start = match.start()
         tool_call_end = match.end()
