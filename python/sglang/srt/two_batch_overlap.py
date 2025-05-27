@@ -215,12 +215,8 @@ class TboForwardBatchPreparer:
         if batch.tbo_split_seq_index is None:
             return
 
-        cls.prepare_raw(
-            batch,
-            tbo_children_num_token_non_padded=cls.compute_tbo_children_num_token_non_padded(
-                batch
-            ),
-        )
+        tbo_children_num_token_non_padded = cls.compute_tbo_children_num_token_non_padded(batch)
+        cls.prepare_raw(batch, tbo_children_num_token_non_padded=tbo_children_num_token_non_padded)
 
     @classmethod
     def prepare_raw(
