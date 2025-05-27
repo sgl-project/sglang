@@ -20,7 +20,7 @@ rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
 pip install -e "python[dev]"
 
 # Install additional dependencies
-pip install mooncake-transfer-engine==0.3.0 nvidia-cuda-nvrtc-cu12
+pip install mooncake-transfer-engine==0.3.2.post1 nvidia-cuda-nvrtc-cu12
 
 # For lmms_evals evaluating MMMU
 git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
