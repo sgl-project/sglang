@@ -3,7 +3,6 @@ import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
-
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.communicator import (
     CommunicateContext,
@@ -83,6 +82,26 @@ def compute_split_token_index(
         return 0
     else:
         raise NotImplementedError
+
+
+def compute_split_indices_for_cuda_graph_replay(
+    forward_mode: ForwardMode,
+    num_tokens: int,
+):
+    forward_mode_for_tbo_split = (
+        forward_mode if forward_mode != ForwardMode.IDLE else ForwardMode.DECODE
+    )
+    tbo_split_seq_index = compute_split_seq_index(
+        forward_mode=forward_mode_for_tbo_split,
+        num_tokens=num_tokens,
+        extend_lens=None,
+    )
+    tbo_split_token_index = compute_split_token_index(
+        split_seq_index=tbo_split_seq_index,
+        forward_mode=forward_mode_for_tbo_split,
+        extend_seq_lens=None,
+    )
+    return tbo_split_seq_index, tbo_split_token_index
 
 
 # -------------------------------- Preparation ---------------------------------------
