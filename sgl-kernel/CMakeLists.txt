@@ -285,11 +285,10 @@ if (SGL_KERNEL_ENABLE_FA3)
             "-gencode=arch=compute_80,code=sm_80"
             "-gencode=arch=compute_86,code=sm_86"
         )
+        # SM8X Logic
+        file(GLOB FA3_SM8X_GEN_SRCS
+            "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim*_sm80.cu")
     endif()
-
-    # SM8X Logic
-    file(GLOB FA3_SM8X_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim*_sm80.cu")
 
     file(GLOB FA3_BF16_GEN_SRCS
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_bf16*_sm90.cu")
@@ -330,14 +329,17 @@ if (SGL_KERNEL_ENABLE_FA3)
     target_link_libraries(flash_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 
     install(TARGETS flash_ops LIBRARY DESTINATION "sgl_kernel")
-
-    target_compile_definitions(flash_ops PRIVATE
-        # FLASHATTENTION_DISABLE_SM8x
+    set(FLASH_OPS_COMPILE_DEFS
         FLASHATTENTION_DISABLE_BACKWARD
         FLASHATTENTION_DISABLE_DROPOUT
         FLASHATTENTION_DISABLE_UNEVEN_K
         FLASHATTENTION_VARLEN_ONLY
     )
+
+    if(NOT ENABLE_BELOW_SM90)
+        list(APPEND FLASH_OPS_COMPILE_DEFS FLASHATTENTION_DISABLE_SM8x)
+    endif()
+    target_compile_definitions(flash_ops PRIVATE ${FLASH_OPS_COMPILE_DEFS})
 endif()
 
 # JIT Logic
