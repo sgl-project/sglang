@@ -21,11 +21,15 @@ from typing import Iterable, List, Optional, Set, Tuple, Union
 import torch
 import torch.nn as nn
 from transformers import PixtralVisionConfig, PretrainedConfig
-from transformers.models.pixtral.modeling_pixtral import PixtralRotaryEmbedding
+from transformers.models.pixtral.modeling_pixtral import (
+    PixtralRotaryEmbedding,
+)
 from transformers.models.pixtral.modeling_pixtral import (
     generate_block_attention_mask as _get_pixtral_attention_mask,
 )
-from transformers.models.pixtral.modeling_pixtral import position_ids_in_meshgrid
+from transformers.models.pixtral.modeling_pixtral import (
+    position_ids_in_meshgrid,
+)
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
