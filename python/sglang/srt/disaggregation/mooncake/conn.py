@@ -182,6 +182,10 @@ class MooncakeKVManager(BaseKVManager):
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
+            assert transfer_thread_pool_size >= transfer_queue_size, (
+                f"The environment variable SGLANG_DISAGGREGATION_THREAD_POOL_SIZE={transfer_thread_pool_size} must be "
+                f"greater than or equal to SGLANG_DISAGGREGATION_QUEUE_SIZE={transfer_queue_size}."
+            )
             self.executors = [
                 concurrent.futures.ThreadPoolExecutor(
                     transfer_thread_pool_size // transfer_queue_size
