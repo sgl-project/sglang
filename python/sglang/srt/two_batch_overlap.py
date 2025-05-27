@@ -375,17 +375,9 @@ class TboForwardBatchPreparer:
 
     @classmethod
     def compute_tbo_children_num_token_non_padded(cls, batch: ForwardBatch):
-        return cls.compute_tbo_children_num_token_non_padded_raw(
-            tbo_split_token_index=cls._compute_split_token_index(batch),
-            num_token_non_padded=len(batch.input_ids),
-        )
+        tbo_split_token_index = cls._compute_split_token_index(batch)
+        num_token_non_padded = len(batch.input_ids)
 
-    @classmethod
-    def compute_tbo_children_num_token_non_padded_raw(
-            cls,
-            tbo_split_token_index: int,
-            num_token_non_padded: int,
-    ):
         # TODO we may make padding on both sub-batches to make it slightly more balanced
         value_a = min(tbo_split_token_index, num_token_non_padded)
         value_b = max(0, num_token_non_padded - tbo_split_token_index)
