@@ -182,7 +182,10 @@ class TboForwardBatchPreparer:
     def prepare(cls, batch: ForwardBatch):
         cls.prepare_raw(
             batch,
-            tbo_children_num_token_non_padded=cls.compute_tbo_children_num_token_non_padded()
+            tbo_children_num_token_non_padded=cls.compute_tbo_children_num_token_non_padded(
+                tbo_split_token_index=TODO,
+                num_token_non_padded=len(batch.input_ids),
+            )
         )
 
     @classmethod
