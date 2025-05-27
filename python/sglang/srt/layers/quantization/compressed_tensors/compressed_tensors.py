@@ -43,7 +43,11 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 
 try:
     import vllm
-
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+    W4A16SPARSE24_SUPPORTED_BITS, WNA16_SUPPORTED_BITS, CompressedTensors24,
+    CompressedTensorsW4A16Sparse24,
+    CompressedTensorsW8A8Int8,
+    CompressedTensorsWNA16)
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
