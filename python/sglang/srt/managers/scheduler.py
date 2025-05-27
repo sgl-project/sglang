@@ -141,6 +141,8 @@ from sglang.srt.utils import (
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
+from sglang.srt.managers.schedule_batch import WaitingStatus
+
 expert_distribution_recorder = ExpertDistributionRecorder()
 
 logger = logging.getLogger(__name__)
@@ -405,6 +407,11 @@ class Scheduler(
         t = threading.Thread(target=self.watchdog_thread, daemon=True)
         t.start()
         self.parent_process = psutil.Process().parent()
+
+        # Init loading l3 cache thread
+        if self.enable_hierarchical_cache and self.enable_mooncake_store_l3_cache:
+            loading_l3_cache_thread = threading.Thread(target=self.loading_l3_cache(), daemon=True)
+            loading_l3_cache_thread.start()
 
         # Init memory saver
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1383,6 +1390,13 @@ class Scheduler(
                 self.running_batch.batch_is_full = True
                 break
 
+            if (
+                self.enable_hierarchical_cache
+                and self.enable_mooncake_store_l3_cache
+                and req.waiting_status != WaitingStatus.READY
+            ):
+                continue
+
             req.init_next_round_input(
                 None if prefix_computed else self.tree_cache,
                 self.enable_hierarchical_cache,
@@ -1780,6 +1794,31 @@ class Scheduler(
                 batch.next_batch_sampling_info.update_regex_vocab_mask()
                 self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
+
+    def loading_l3_cache(self):
+        while True:
+            if len(self.waiting_queue) == 0:
+                time.sleep(0.002)
+            else:
+                for req in self.waiting_queue:
+                    if req.waiting_status == WaitingStatus.READY:
+                        continue
+
+                    req.init_next_round_input(
+                        self.tree_cache,
+                        self.enable_hierarchical_cache,
+                    )
+                    if (
+                        req.last_node_global is not None
+                        and not req.last_node_global.l2_backuped
+                        and req.last_node_global.l3_backuped
+                    ):
+                        self.tree_cache.l3_load_back(req, req.last_node_global)
+                    else:
+                        req.waiting_status = WaitingStatus.READY
+
+                self.tree_cache.l3_loading_check()
+
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""

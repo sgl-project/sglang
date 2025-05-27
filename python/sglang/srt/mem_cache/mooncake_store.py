@@ -10,7 +10,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 
 import torch
 from safetensors.torch import load as safetensors_load
@@ -21,6 +21,24 @@ DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 1024  # 1.0 GiB
 
 logger = logging.getLogger(__name__)
 
+def byte2tensor(data: bytes):
+    loaded_tensors = safetensors_load(data)
+    tensor = loaded_tensors["tensor"]
+    if "device_id" not in loaded_tensors.keys():
+        return tensor
+    device_id_tensor = loaded_tensors["device_id"]
+    device_id = int(device_id_tensor.item())
+    device = torch.device(
+        'cuda', device_id) if device_id >= 0 else torch.device('cpu')
+    return tensor.to(device)
+
+def tensor2byte(tensor_value: torch.Tensor):
+    tensors = {"tensor": tensor_value}
+    device_id = tensor_value.device.index if tensor_value.device.type == 'cuda' else -1
+    if device_id != -1:
+        device_tensor = torch.tensor(device_id, dtype=torch.int32)
+        tensors['device_id'] = device_tensor
+    return safetensors_save(tensors)
 
 @dataclass
 class MooncakeStoreConfig:
@@ -121,11 +139,28 @@ class MooncakeStore:
     def put(
         self,
         key: str,
-        value: Optional[torch.Tensor],
+        value: Optional[torch.Tensor]
     ) -> None:
         # A message queue needs to be introduced before making it asynchronous.
         if value is not None:
             self._put_impl(key, value)
+
+    def batch_put(
+        self,
+        keys: List[str],
+        values: List[torch.Tensor]
+    ) -> None:
+        if keys is None or values is None:
+            return
+
+        if len(keys) != len(values):
+            return
+
+        for i in range(len(keys)):
+            if keys[i] is None or values[i] is None:
+                return
+
+        self._put_batch_impl(keys, values)
 
     def get(
         self,
@@ -135,6 +170,19 @@ class MooncakeStore:
         value = self._get_impl(key)
         return value
 
+    def batch_get(
+        self,
+        keys: List[str],
+    ) -> Optional[List[torch.Tensor]]:
+        if keys is None:
+            return None
+
+        for key in keys:
+            if key is None :
+                return None
+
+        return self._get_batch_impl(keys)
+
     def is_exist(self,
                  key: str
     ) -> bool:
@@ -142,23 +190,48 @@ class MooncakeStore:
             return self.store.is_exist(key) == 1
         return False
 
+    def _put_batch_impl(
+        self,
+        keys: List[str],
+        values: List[torch.Tensor]
+    ) -> None:
+        value_bytes = [tensor2byte(value) for value in values]
+        batches = {}
+        for i in range(len(keys)):
+            batches[keys[i]] = value_bytes[i]
+        try:
+            self.store.put_batch(batches)
+        except TypeError as err:
+            logger.error("Failed to put value into Mooncake Store: %s", err)
+            raise TypeError("Mooncake Store Put Type Error.") from err
+
     def _put_impl(
         self,
         key: str,
-        value: torch.Tensor,
+        value: torch.Tensor
     ) -> None:
         """Put KVCache to Mooncake Store"""
-        device_id = value.device.index if value.device.type == 'cuda' else -1
-        device_tensor = torch.tensor(device_id, dtype=torch.int32)
-        value_bytes = safetensors_save({
-            "tensor": value,
-            "device_id": device_tensor
-        })
+        value_bytes = tensor2byte(value)
         try:
             self.store.put(key, value_bytes)
         except TypeError as err:
             logger.error("Failed to put value into Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Put Type Error.") from err
+
+    def _get_batch_impl(
+        self,
+        keys: List[str]
+    ) -> Optional[List[torch.Tensor]]:
+        try:
+            batch_data = self.store.get_batch(keys)
+        except TypeError as err:
+            logger.error("Failed to get value from Mooncake Store: %s", err)
+            raise TypeError("Mooncake Store Get Type Error.") from err
+
+        if batch_data:
+            if len(batch_data) > 0:
+                return [byte2tensor(data) for data in batch_data]
+        return None
 
     def _get_impl(
         self,
@@ -172,12 +245,6 @@ class MooncakeStore:
             raise TypeError("Mooncake Store Get Type Error.") from err
 
         if data:
-            loaded_tensors = safetensors_load(data)
-            tensor = loaded_tensors["tensor"]
-            device_id_tensor = loaded_tensors["device_id"]
-            device_id = int(device_id_tensor.item())
-            device = torch.device(
-                'cuda', device_id) if device_id >= 0 else torch.device('cpu')
-            return tensor.to(device)
+            return byte2tensor(data)
 
         return None
