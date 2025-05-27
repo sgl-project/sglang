@@ -1707,22 +1707,17 @@ class DeepseekV2ForCausalLM(nn.Module):
     def post_load_weights(self, is_nextn=False, weight_names=None):
 
         # Perform post-processing after loading weights
-        if weight_names is None:
-            layer_ids = (
-                range(self.config.num_hidden_layers)
-                if not is_nextn
-                else [self.config.num_hidden_layers]
-            )
+        if is_nextn:
+            layer_ids = [self.config.num_hidden_layers]
         else:
-            layer_ids = set()
-            for name in weight_names:
-                if "kv_b_proj" in name:
-                    layer_id = int(name.split(".")[2])
-                    # filter the nextn layer.
-                    if is_nextn:
-                        if layer_id == self.config.num_hidden_layers:
-                            layer_ids.add(layer_id)
-                    else:
+            if weight_names is None:
+                layer_ids = range(self.config.num_hidden_layers)
+            else:
+                layer_ids = set()
+                for name in weight_names:
+                    if "kv_b_proj" in name:
+                        layer_id = int(name.split(".")[2])
+                        # filter the nextn layer.
                         if layer_id != self.config.num_hidden_layers:
                             layer_ids.add(layer_id)
 
