@@ -14,6 +14,7 @@ from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
+from sglang.srt.configs.minicpm4 import MiniCPMConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaModel
 
@@ -1306,7 +1307,7 @@ class LlamaAttention(nn.Module):
 
 class MiniCPM4ForCausalLM(PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
-    config_class = LlamaConfig
+    config_class = MiniCPMConfig
 
     def __init__(self, config):
         super().__init__(config)
