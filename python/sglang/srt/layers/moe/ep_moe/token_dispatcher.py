@@ -97,7 +97,7 @@ class DeepEPBuffer:
             group,
             num_nvl_bytes,
             num_rdma_bytes,
-            low_latency_mode=deepep_mode.enable_low_latency(),
+            low_latency_mode=True,
             num_qps_per_rank=(
                 max(
                     num_experts // group.size(),
