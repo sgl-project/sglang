@@ -159,10 +159,8 @@ class LayerCommunicator:
 
         self._context = CommunicateContext.init_new()
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
-            hidden_states_input_mode=self.layer_scatter_modes.attn_mode,
-            residual_input_mode=self.layer_scatter_modes.layer_input_mode,
-            hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
-            residual_output_mode=self.layer_scatter_modes.middle_residual_mode,
+            input_mode=self.layer_scatter_modes.layer_input_mode,
+            output_mode=self.layer_scatter_modes.attn_mode,
             context=self._context,
         )
         self._communicate_with_all_reduce_and_layer_norm_fn = (
@@ -198,9 +196,8 @@ class LayerCommunicator:
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        hidden_states, residual = self._communicate_simple_fn(
+        hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,
-            residual=residual,
             forward_batch=forward_batch,
             context=self._context,
         )
@@ -255,6 +252,7 @@ class CommunicateContext:
         process_group_sizes = {
             ScatterMode.SCATTERED: 1,
             ScatterMode.TP_ATTN_FULL: attn_tp_size,
+            # TODO: support --moe-dense-tp-size > 1
             ScatterMode.FULL: tp_size,
         }
         return cls(
@@ -269,50 +267,31 @@ class CommunicateContext:
 class CommunicateSimpleFn:
     @staticmethod
     def get_fn(
-        hidden_states_input_mode: ScatterMode,
-        residual_input_mode: ScatterMode,
-        hidden_states_output_mode: ScatterMode,
-        residual_output_mode: ScatterMode,
+        input_mode: ScatterMode,
+        output_mode: ScatterMode,
         context: CommunicateContext,
     ):
-        if context.is_same_group_size(
-            hidden_states_input_mode, hidden_states_output_mode
-        ) and context.is_same_group_size(residual_input_mode, residual_output_mode):
+        if context.is_same_group_size(input_mode, output_mode):
             return CommunicateSimpleFn._trivial
 
-        if (
-            hidden_states_input_mode == ScatterMode.TP_ATTN_FULL
-            and residual_input_mode == ScatterMode.SCATTERED
-            and hidden_states_output_mode == ScatterMode.TP_ATTN_FULL
-            and residual_output_mode == ScatterMode.SCATTERED
+        if (input_mode == ScatterMode.SCATTERED) and (
+            output_mode == ScatterMode.TP_ATTN_FULL
         ):
-            return CommunicateSimpleFn._gather_hidden_states
+            return CommunicateSimpleFn._scattered_to_tp_attn_full
 
-        if (
-            hidden_states_input_mode == ScatterMode.TP_ATTN_FULL
-            and residual_input_mode == ScatterMode.SCATTERED
-            and hidden_states_output_mode == ScatterMode.TP_ATTN_FULL
-            and residual_output_mode == ScatterMode.TP_ATTN_FULL
-        ):
-            return CommunicateSimpleFn._gather_hidden_states_and_residual
-
-        raise NotImplementedError(
-            f"{hidden_states_input_mode=} {residual_input_mode=} {residual_output_mode=} {residual_output_mode=}"
-        )
+        raise NotImplementedError(f"{input_mode=} {output_mode=}")
 
     @staticmethod
     def _trivial(
         hidden_states: torch.Tensor,
-        residual: torch.Tensor,
         forward_batch: ForwardBatch,
         context: CommunicateContext,
     ) -> torch.Tensor:
-        return hidden_states, residual
+        return hidden_states
 
     @staticmethod
-    def _gather_hidden_states(
+    def _scattered_to_tp_attn_full(
         hidden_states: torch.Tensor,
-        residual: torch.Tensor,
         forward_batch: ForwardBatch,
         context: CommunicateContext,
     ) -> torch.Tensor:
@@ -324,32 +303,7 @@ class CommunicateSimpleFn:
             list(hidden_states.tensor_split(context.attn_tp_size)),
             local_hidden_states,
         )
-        return hidden_states, residual
-
-    @staticmethod
-    def _gather_hidden_states_and_residual(
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        forward_batch: ForwardBatch,
-        context: CommunicateContext,
-    ) -> torch.Tensor:
-        hidden_states, local_hidden_states = (
-            forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-            hidden_states,
-        )
-        attn_tp_all_gather(
-            list(hidden_states.tensor_split(context.attn_tp_size)),
-            local_hidden_states,
-        )
-        hidden_states = hidden_states.clone()
-        residual, local_residual = (
-            forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-            residual,
-        )
-        attn_tp_all_gather(
-            list(residual.tensor_split(context.attn_tp_size)), local_residual
-        )
-        return hidden_states, residual
+        return hidden_states
 
 
 class CommunicateWithAllReduceAndLayerNormFn:
@@ -372,17 +326,22 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 hidden_states_input_mode, hidden_states_output_mode
             )
             and context.is_same_group_size(residual_input_mode, residual_output_mode)
-            and context.attn_tp_size == 1
+            and context.attn_tp_size == 1 
         ):
             return CommunicateWithAllReduceAndLayerNormFn._simple
 
         if (
             (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
-            and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
+            and (
+                residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
+            )
             and (hidden_states_output_mode == ScatterMode.FULL)
             and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
         ):
-            return CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states
+            return partial(
+                CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
+                residual_input_mode=residual_input_mode,
+            )
 
         if (
             (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
@@ -415,13 +374,23 @@ class CommunicateWithAllReduceAndLayerNormFn:
         return hidden_states, residual
 
     @staticmethod
-    def _gather_hidden_states(
+    def _gather_hidden_states_and_residual(
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         layernorm: torch.nn.Module,
         context: CommunicateContext,
+        *,
+        residual_input_mode,
     ):
+        if residual_input_mode == ScatterMode.SCATTERED:
+            residual, local_residual = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                residual,
+            )
+            attn_tp_all_gather(
+                list(residual.tensor_split(context.attn_tp_size)), local_residual
+            )
         if context.local_attn_dp_size != 1:
             if context.attn_tp_rank == 0:
                 hidden_states += residual
