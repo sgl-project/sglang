@@ -176,7 +176,7 @@ if __name__ == "__main__":
     pynccl_comm = get_tensor_model_parallel_group().pynccl_comm
     pymscclpp_comm = get_tensor_model_parallel_group().pymscclpp_comm
     dist.barrier()
-    profile = True
+    profile = False
     dtype = torch.bfloat16
     ctx = get_torch_prof_ctx(profile)
     result = []

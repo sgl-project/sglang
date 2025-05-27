@@ -43,30 +43,22 @@ def mscclpp_is_weak_contiguous(inp: torch.Tensor):
 
 
 def mscclpp_bench_time(
-    func, graph_niter: int = 10, warmup_niter: int = 2, test_niter: int = 10
+    func, test_niter: int = 10, warmup_niter: int = 2
 ):
-    stream = torch.cuda.Stream()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        for _ in range(graph_niter):
-            func()
-
     # warmup
     for _ in range(warmup_niter):
-        graph.replay()
-    latencies: List[float] = []
+        func()
+    # latencies: List[float] = []
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    dist.barrier()
+    start_event.record()
     for _ in range(test_niter):
-        torch.cuda.synchronize()
-        dist.barrier()
-        start_event.record()
-        graph.replay()
-        end_event.record()
-        end_event.synchronize()
-        latencies.append(start_event.elapsed_time(end_event))
-    func_cost_us = sum(latencies) / len(latencies) / graph_niter * 1000
-    graph.reset()
+        func()
+    end_event.record()
+    end_event.synchronize()
+    func_cost_us = start_event.elapsed_time(end_event) / test_niter * 1000
     return func_cost_us
 
 
@@ -158,7 +150,7 @@ class PyMscclppCommunicator:
         )
         for r in range(world_size):
             self.rank_to_node[r] = r // 8
-            self.rank_to_ib[r] = r % 8
+            self.rank_to_ib[r] = self.rank % 8
 
         self._context = None
         self.context_selection = None
@@ -234,7 +226,7 @@ class PyMscclppCommunicator:
                         best_time = cur_cost
             self.msg_size2best_config[msg_size] = best_config
             if self.rank == 0:
-                logger.debug(f"for msg_size {msg_size}, best_config: {best_config}")
+                logger.debug(f"for msg_size {msg_size}, best_config: {best_config}, best_time: {best_time}us")
 
     def should_mscclpp_allreduce(
         self, inp: torch.Tensor, op: ReduceOp = ReduceOp.SUM
