@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import bisect
 import inspect
+import logging
 import os
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -48,6 +49,8 @@ from sglang.srt.utils import (
     get_device_memory_capacity,
     rank0_log,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -233,6 +236,7 @@ class CudaGraphRunner:
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
+
         # FIXME(lsyin): leave it here for now, I don't know whether it is necessary
         self.encoder_len_fill_value = 0
         self.seq_lens_cpu = torch.full(
@@ -611,13 +615,13 @@ class CudaGraphRunner:
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
-            self.req_pool_indices,
-            self.seq_lens,
+            self.req_pool_indices[:bs],
+            self.seq_lens[:bs],
             forward_batch.seq_lens_sum + (bs - raw_bs),
-            self.encoder_lens,
+            self.encoder_lens[:bs] if self.is_encoder_decoder else None,
             forward_batch.forward_mode,
             forward_batch.spec_info,
-            seq_lens_cpu=self.seq_lens_cpu,
+            seq_lens_cpu=self.seq_lens_cpu[:bs],
         )
 
         # Store fields

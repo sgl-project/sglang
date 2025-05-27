@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List
@@ -226,7 +227,6 @@ def _dp_gather(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
-    is_nextn_dp: bool = False,
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
@@ -238,7 +238,7 @@ def _dp_gather(
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
-        if is_nextn_dp:
+        if forward_batch.forward_mode.is_draft_extend():
             shape_tensor = local_num_tokens.new_full((), local_tokens.shape[0])
             local_num_tokens = torch.minimum(local_num_tokens, shape_tensor)
 
@@ -264,14 +264,12 @@ def dp_gather_partial(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
-    is_nextn_dp: bool = False,
 ):
     _dp_gather(
         global_tokens,
         local_tokens,
         forward_batch,
         is_partial=True,
-        is_nextn_dp=is_nextn_dp,
     )
 
 
@@ -287,7 +285,6 @@ def dp_scatter(
     local_tokens: torch.Tensor,  # output
     global_tokens: torch.Tensor,  # input
     forward_batch: ForwardBatch,
-    is_nextn_dp: bool = False,
 ):
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
     # since local_tokens may be padded for cuda graph
@@ -300,7 +297,7 @@ def dp_scatter(
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
-        if is_nextn_dp:
+        if forward_batch.forward_mode.is_draft_extend():
             shape_tensor = local_num_tokens.new_full((), local_tokens.shape[0])
             local_num_tokens = torch.minimum(local_num_tokens, shape_tensor)
 
@@ -312,12 +309,18 @@ def dp_scatter(
 def dp_gather_weight(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
+    use_attn_tp_group: bool,
 ):
     global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
-    if get_attention_tp_rank() == 0:
+    if use_attn_tp_group:
+        attn_tp_all_gather(
+            list(global_tokens.tensor_split(get_attention_tp_size())),
+            local_tokens,
+        )
+    else:
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
@@ -331,7 +334,7 @@ def dp_gather_weight(
             global_tokens, local_tokens, 0, start_pos, local_num_tokens, False
         )
 
-    global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+        global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
 def attn_tp_reduce_scatter(

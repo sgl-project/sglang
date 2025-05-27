@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import logging
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -34,6 +35,8 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
 
 
 class ScatterMode(Enum):
@@ -441,7 +444,6 @@ class CommunicateSummableTensorPairFn:
             hidden_states_input_mode, output_mode
         ) and context.is_same_group_size(residual_input_mode, output_mode):
             return CommunicateSummableTensorPairFn._trivial
-
         if (
             (hidden_states_input_mode == ScatterMode.FULL)
             and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
@@ -462,6 +464,13 @@ class CommunicateSummableTensorPairFn:
             and (output_mode == ScatterMode.SCATTERED)
         ):
             return CommunicateSummableTensorPairFn._scatter
+
+        if (
+            (hidden_states_input_mode == ScatterMode.FULL)
+            and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
+            and (output_mode == ScatterMode.FULL)
+        ):
+            return CommunicateSummableTensorPairFn._scatter_hidden_states
 
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"

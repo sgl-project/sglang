@@ -8,7 +8,11 @@ import torch
 from huggingface_hub import snapshot_download
 
 from sglang.srt.distributed import GroupCoordinator, patch_tensor_parallel_group
-from sglang.srt.layers.dp_attention import get_attention_dp_size, get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_dp_size,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import (
@@ -336,9 +340,7 @@ class EAGLEWorker(TpModelWorker):
             local_info,
             group=self.target_worker.get_tp_group().cpu_group,
         )
-        need_forward = (
-            global_info[:, :, 0].any().item()
-        )  # Any DP worker has forward batch
+        need_forward = global_info[:, :, 0].any().item()
         return need_forward
 
     def forward_target_extend(
@@ -346,7 +348,7 @@ class EAGLEWorker(TpModelWorker):
     ) -> Tuple[LogitsProcessorOutput, List[int], int]:
         """Run the target extend.
 
-        Args:
+        Args::
             batch: The batch to run. States could be modified.
 
         Returns:
@@ -368,8 +370,8 @@ class EAGLEWorker(TpModelWorker):
         # Parse args
         num_seqs = batch.batch_size()
         if not batch.forward_mode.is_idle():
-
             spec_info = batch.spec_info
+            assert spec_info is not None
             # Accumulate penalty
             if batch.sampling_info.penalizer_orchestrator.is_required:
                 # This is a relaxed version of penalties for speculative decoding.
@@ -459,6 +461,7 @@ class EAGLEWorker(TpModelWorker):
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
+
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
@@ -604,7 +607,7 @@ class EAGLEWorker(TpModelWorker):
                 self.token_to_kv_pool_allocator,
                 self.page_size,
                 vocab_mask,
-        )
+            )
 
             # Post process based on verified outputs.
             # Pick indices that we care (accepted)
@@ -718,6 +721,7 @@ class EAGLEWorker(TpModelWorker):
             hidden_states=hidden_states,
             verified_id=next_token_ids,
         )
+
         batch.spec_info.prepare_for_extend(batch)
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch = batch.get_model_worker_batch()
@@ -750,7 +754,7 @@ class EAGLEWorker(TpModelWorker):
                     batch,
                     self.speculative_num_steps,
                     pad_input=self.cuda_graph_runner_for_draft_extend is not None,
-        )
+                )
             else:
                 origin_batch = batch
                 batch = origin_batch.copy()
@@ -760,6 +764,7 @@ class EAGLEWorker(TpModelWorker):
                     hidden_size=self.model_config.hidden_size,
                     topk=self.topk,
                 )
+                batch.forward_mode = ForwardMode.IDLE
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         batch.return_logprob = False
         model_worker_batch = batch.get_model_worker_batch()
@@ -778,7 +783,10 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch
             )
         else:
-            self.draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+            if not is_idle and batch.spec_info.verified_id is not None:
+                self.draft_model_runner.attn_backend.init_forward_metadata(
+                    forward_batch
+                )
             logits_output = self.draft_model_runner.model.forward(
                 forward_batch.input_ids, forward_batch.positions, forward_batch
             )

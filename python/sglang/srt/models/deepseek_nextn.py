@@ -13,6 +13,7 @@
 # ==============================================================================
 
 """Inference-only DeepSeek NextN Speculative Decoding."""
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -33,6 +34,8 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.utils import BumpAllocator, add_prefix
+
+logger = logging.getLogger(__name__)
 
 
 class DeepseekModelNextN(nn.Module):
@@ -168,7 +171,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 torch.empty_like(self.lm_head.weight.data),
                 head.data,
             )
-            dp_gather_weight(global_head_data, local_head_data)
+            use_attn_tp_group = global_server_args_dict["enable_dp_lm_head"]
+            dp_gather_weight(global_head_data, local_head_data, use_attn_tp_group)
             self.lm_head.weight.data = global_head_data
         else:
             del self.lm_head.weight
