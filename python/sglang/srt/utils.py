@@ -2252,11 +2252,6 @@ def get_numa_id_for_gpu(gpu_id: int) -> Optional[str]:
         return None
 
 
-def extract_numa_id(device_id):
-    """Legacy function for compatibility. Now extracts from PCI bus ID format."""
-    return device_id.split(":")[0]
-
-
 def check_device_cross_numa_node(visible_device_idx=None) -> bool:
     """Check if the GPU devices are on different NUMA nodes.
     Uses nvidia-smi topo command to get accurate NUMA node information.
