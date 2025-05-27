@@ -362,7 +362,7 @@ class DecodeTransferQueue:
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if poll == KVPoll.Failed:
-                error_message = f"Decode transfer failed for request {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                error_message = f"Decode transfer failed for request rank={self.scheduler.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
                     decode_req.kv_receiver.failure_exception()
                 except Exception as e:
@@ -410,7 +410,8 @@ class DecodeTransferQueue:
                             : decode_req.req.top_logprobs_num
                         ].tolist()
                     )
-
+                if hasattr(decode_req.kv_receiver, "clear"):
+                    decode_req.kv_receiver.clear()
                 transferred_reqs.append(decode_req.req)
                 indices_to_remove.add(i)
             elif poll in [
