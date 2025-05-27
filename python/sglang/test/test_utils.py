@@ -487,6 +487,15 @@ def popen_launch_server(
     start_time = time.perf_counter()
     with requests.Session() as session:
         while time.perf_counter() - start_time < timeout:
+
+            return_code = process.poll()
+            if return_code is not None:
+                # Server failed to start (non-zero exit code) or crashed
+                raise Exception(
+                    f"Server process exited with code {return_code}. "
+                    "Check server logs for errors."
+                )
+
             try:
                 headers = {
                     "Content-Type": "application/json; charset=utf-8",
@@ -549,49 +558,7 @@ def popen_launch_pd_server(
 
     print(f"command={' '.join(command)}")
 
-    if return_stdout_stderr:
-        process = subprocess.Popen(
-            command,
-            stdout=return_stdout_stderr[0],
-            stderr=return_stdout_stderr[1],
-            env=env,
-            text=True,
-        )
-    else:
-        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
-
-    start_time = time.time()
-    with requests.Session() as session:
-        while time.time() - start_time < timeout:
-
-            # check if server process has crashe/exited
-            return_code = process.poll()
-            if return_code is not None:
-                # Server failed to start (non-zero exit code) or crashed
-                raise Exception(
-                    f"Server process exited with code {return_code}. "
-                    "Check server logs for errors."
-                )
-
-            try:
-                headers = {
-                    "Content-Type": "application/json; charset=utf-8",
-                    "Authorization": f"Bearer {api_key}",
-                }
-                response = session.get(
-                    f"{base_url}/health",
-                    headers=headers,
-                )
-                if response.status_code == 200:
-                    return process
-            except requests.RequestException:
-                pass
-
-            return_code = process.poll()
-            if return_code is not None:
-                raise Exception(f"Server unexpectedly exits ({return_code=}).")
-
-            time.sleep(10)
+    process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
     return process
 
