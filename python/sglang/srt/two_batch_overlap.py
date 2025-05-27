@@ -105,6 +105,7 @@ class TboCudaGraphRunnerPlugin:
         assert batch.tbo_split_seq_index is not None, f"{num_tokens=}"
 
         self._fill_tensor_content(batch)
+
         TboForwardBatchPreparer.prepare_raw(
             batch,
             tbo_children_num_token_non_padded=self._tbo_children_num_token_non_padded,
