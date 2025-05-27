@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 class ExpertLocationUpdater:
     def __init__(self):
-        pass
+        self._first_execution = True
 
     def update(
         self,
@@ -38,6 +38,10 @@ class ExpertLocationUpdater:
         nnodes: int,
         rank: int,
     ):
+        if self._first_execution:
+            self._first_execution = False
+            torch.cuda.empty_cache()
+
         old_expert_location_metadata = get_global_expert_location_metadata()
         _update_expert_weights(
             routed_experts_weights_of_layer,
