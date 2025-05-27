@@ -621,22 +621,6 @@ class EAGLEWorker(TpModelWorker):
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
-    def ensure_is_last_hidden_states_only(self, hidden_states, seq_lens):
-        print("ensure_is_last_hidden_states", hidden_states.shape, seq_lens)
-        bs = seq_lens.numel()
-        if hidden_states.size(0) == bs:
-            return hidden_states  # already LAST (or FULL with one token - doesn't matter which)
-
-        # FULL → slice out the last row of each sequence
-        # tokens of the same sequence are contiguous, so the
-        # last row index for seq i is prefix_sum(seq_lens)[i]-1
-        last_row_idx = torch.cumsum(seq_lens, dim=0) - 1
-        assert (
-            ((last_row_idx >= 0) & (last_row_idx < hidden_states.size(0))).all().item()
-        ), f"last_row_idx: {last_row_idx}, hidden_states.size(0): {hidden_states.size(0)}"
-        hidden_states = hidden_states[last_row_idx]  # (bs, hidden_size)
-        return hidden_states
-
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
