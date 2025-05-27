@@ -484,7 +484,7 @@ class CudaGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
         )
-        self.tbo_plugin.prepare(forward_batch, num_tokens=num_tokens)
+        self.tbo_plugin.prepare_capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_paths is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)

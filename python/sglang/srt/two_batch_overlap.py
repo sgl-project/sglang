@@ -91,7 +91,7 @@ class TboCudaGraphRunnerPlugin:
     def __init__(self):
         self.tbo_children_num_token_non_padded = torch.zeros((2,), dtype=torch.int32)
 
-    def prepare(self, batch: ForwardBatch, num_tokens: int):
+    def prepare_capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
         batch.tbo_split_seq_index = self._compute_tbo_split_seq_index(num_tokens, batch.forward_mode)
         if batch.tbo_split_seq_index is None:
             return
