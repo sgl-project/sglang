@@ -2292,8 +2292,8 @@ def check_device_cross_numa_node(visible_device_idx=None) -> bool:
         return not same_numa
 
     except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to execute nvidia-smi: {e}")
-        return False
+        logger.error(f"Failed to execute nvidia-smi: {e}. Assuming potential cross-NUMA for safety.")
+        return True
     except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}")
-        return False
+        logger.error(f"An unexpected error occurred: {e}. Assuming potential cross-NUMA for safety.")
+        return True
