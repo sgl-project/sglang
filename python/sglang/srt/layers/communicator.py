@@ -326,7 +326,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 hidden_states_input_mode, hidden_states_output_mode
             )
             and context.is_same_group_size(residual_input_mode, residual_output_mode)
-            and context.attn_tp_size == 1 
+            and context.attn_tp_size == 1
         ):
             return CommunicateWithAllReduceAndLayerNormFn._simple
 
