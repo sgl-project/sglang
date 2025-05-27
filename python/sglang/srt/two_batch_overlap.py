@@ -90,11 +90,11 @@ def compute_split_token_index(
 class TboCudaGraphRunnerUtils:
     @classmethod
     def prepare(cls, batch: ForwardBatch, num_tokens: int):
-        batch.tbo_split_seq_index = cls.compute_tbo_split_seq_index(num_tokens, batch.forward_mode)
+        batch.tbo_split_seq_index = cls._compute_tbo_split_seq_index(num_tokens, batch.forward_mode)
         TboForwardBatchPreparer.prepare(batch)
 
     @staticmethod
-    def compute_tbo_split_seq_index(num_tokens: int, forward_mode):
+    def _compute_tbo_split_seq_index(num_tokens: int, forward_mode):
         if global_server_args_dict["enable_two_batch_overlap"]:
             tbo_split_seq_index = compute_split_seq_index(
                 forward_mode=forward_mode,
