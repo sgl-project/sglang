@@ -33,22 +33,33 @@ class PythonicDetector(BaseFormatDetector):
         )
 
     def has_tool_call(self, text: str) -> bool:
-        return bool(self.tool_call_regex.match(text.strip()))
+        return bool(self.tool_call_regex.search(text.strip()))
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         # Try parsing the text as a Python list of function calls
         text = text.strip()
-        if not (text.startswith("[") and text.endswith("]")):
-            # Not a pythonic tool call format
-            return StreamingParseResult(normal_text=text, calls=[])
+
+        match = self.tool_call_regex.search(text)
+        # Extract the tool call part and any text before/after it
+        tool_call_start = match.start()
+        tool_call_end = match.end()
+
+        normal_text_before = text[:tool_call_start] if tool_call_start > 0 else ""
+        tool_call_text = text[tool_call_start:tool_call_end]
+        normal_text_after = text[tool_call_end:] if tool_call_end < len(text) else ""
+
+        # Combine normal text
+        normal_text = normal_text_before + normal_text_after
+
         try:
-            module = ast.parse(text)
+            module = ast.parse(tool_call_text)
             parsed = getattr(module.body[0], "value", None)
             if not (
                 isinstance(parsed, ast.List)
                 and all(isinstance(e, ast.Call) for e in parsed.elts)
             ):
                 return StreamingParseResult(normal_text=text, calls=[])
+
             calls = []
             tool_indices = {
                 tool.function.name: i
@@ -75,7 +86,8 @@ class PythonicDetector(BaseFormatDetector):
                         parameters=json.dumps(arguments, ensure_ascii=False),
                     )
                 )
-            return StreamingParseResult(normal_text="", calls=calls)
+
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception:
             logger.exception("Error in pythonic tool call parsing.")
             return StreamingParseResult(normal_text=text, calls=[])
