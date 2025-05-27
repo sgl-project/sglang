@@ -96,14 +96,16 @@ class TboCudaGraphRunnerPlugin:
         if batch.tbo_split_seq_index is None:
             return
 
-        self.tbo_children_num_token_non_padded[...] = TODO
+        self.tbo_children_num_token_non_padded[...] = TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(
+            batch)
         TboForwardBatchPreparer.prepare_raw(
             batch,
             tbo_children_num_token_non_padded=self.tbo_children_num_token_non_padded,
         )
 
     def replay_prepare(self):
-        self.tbo_children_num_token_non_padded[...] = TODO
+        self.tbo_children_num_token_non_padded[...] = TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(
+            TODO)
 
     @staticmethod
     def _compute_tbo_split_seq_index(num_tokens: int, forward_mode):
