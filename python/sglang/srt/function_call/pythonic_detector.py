@@ -156,8 +156,8 @@ class PythonicDetector(BaseFormatDetector):
     def build_ebnf(self, tools: List[Tool]) -> Optional[str]:
         return EBNFComposer.build_ebnf(
             tools,
-            bot_token="[",
-            eot_token="]",
+            sequence_start_token="[",
+            sequence_end_token="]",
             tool_call_separator=",",
             function_format="pythonic",
         )

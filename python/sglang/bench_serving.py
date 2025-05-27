@@ -340,7 +340,7 @@ async def async_request_sglang_generate(
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
-            "text": prompt,
+            ("text" if isinstance(prompt, str) else "input_ids"): prompt,
             "sampling_params": {
                 "temperature": 0.0,
                 "max_new_tokens": request_func_input.output_len,
@@ -493,7 +493,9 @@ def get_tokenizer(
 
 
 def get_dataset(args, tokenizer):
+    tokenize_prompt = getattr(args, "tokenize_prompt", False)
     if args.dataset_name == "sharegpt":
+        assert not tokenize_prompt
         input_requests = sample_sharegpt_requests(
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
@@ -512,8 +514,10 @@ def get_dataset(args, tokenizer):
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
             random_sample=args.dataset_name == "random",
+            return_text=not tokenize_prompt,
         )
     elif args.dataset_name == "generated-shared-prefix":
+        assert not tokenize_prompt
         input_requests = sample_generated_shared_prefix_requests(
             num_groups=args.gsp_num_groups,
             prompts_per_group=args.gsp_prompts_per_group,
@@ -524,6 +528,7 @@ def get_dataset(args, tokenizer):
             args=args,
         )
     elif args.dataset_name == "mmmu":
+        assert not tokenize_prompt
         input_requests = sample_mmmu_requests(
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
@@ -1304,14 +1309,12 @@ async def benchmark(
     if "sglang" in backend:
         server_info = requests.get(base_url + "/get_server_info")
         if server_info.status_code == 200:
-            if pd_separated:
-                accept_length = server_info.json()["decode"][0]["internal_states"][
-                    0
-                ].get("avg_spec_accept_length", None)
-            else:
-                accept_length = server_info.json()["internal_states"][0].get(
-                    "avg_spec_accept_length", None
-                )
+            server_info_json = server_info.json()
+            if "decode" in server_info_json:
+                server_info_json = server_info_json["decode"][0]
+            accept_length = server_info_json["internal_states"][0].get(
+                "avg_spec_accept_length", None
+            )
         else:
             accept_length = None
     else:
@@ -1497,6 +1500,9 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "output_details"):
         args.output_details = False
 
+    if not hasattr(args, "tokenize_prompt"):
+        args.tokenize_prompt = False
+
     print(f"benchmark_args={args}")
 
     # Set global environments
@@ -1507,6 +1513,11 @@ def run_benchmark(args_: argparse.Namespace):
     extra_request_body = {}
     if args.extra_request_body:
         extra_request_body = json.loads(args.extra_request_body)
+
+    if args.tokenize_prompt:
+        assert (
+            args.backend == "sglang"
+        ), "`--tokenize-prompt` only compatible with `--backend sglang` currently"
 
     # Set url
     if args.port is None:
@@ -1618,6 +1629,7 @@ def run_benchmark(args_: argparse.Namespace):
             profile=args.profile,
             pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
+            warmup_requests=args.warmup_requests,
         )
     )
 
@@ -1812,6 +1824,11 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of warmup requests to run before the benchmark",
+    )
+    parser.add_argument(
+        "--tokenize-prompt",
+        action="store_true",
+        help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
     )
 
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")

@@ -38,6 +38,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_reduce_scatter,
@@ -67,6 +68,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -78,7 +82,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
-from sglang.srt.utils import DeepEPMode, add_prefix
+from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
+from sglang.srt.utils import DeepEPMode, add_prefix, is_non_idle_and_non_empty
 
 Qwen3MoeConfig = None
 
@@ -136,7 +141,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.top_k = config.num_experts_per_tok
             self.renormalize = config.norm_topk_prob
 
-            self.deepep_dispatcher = DeepEPDispatcher(
+            self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
                 group=parallel_state.get_tp_group().device_group,
                 router_topk=self.top_k,
                 permute_fusion=True,
@@ -150,13 +155,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_mode: Optional[ForwardMode] = None
+        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
     ) -> torch.Tensor:
 
         if not global_server_args_dict["enable_deepep_moe"]:
             return self.forward_normal(hidden_states)
         else:
-            return self.forward_deepep(hidden_states, forward_mode)
+            return self.forward_deepep(hidden_states, forward_batch)
 
     def get_moe_weights(self):
         return [
@@ -180,13 +185,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward_deepep(
-        self, hidden_states: torch.Tensor, forward_mode: ForwardMode
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        if (
-            forward_mode is not None
-            and not forward_mode.is_idle()
-            and hidden_states.shape[0] > 0
-        ):
+        forward_mode = forward_batch.forward_mode
+        if is_non_idle_and_non_empty(forward_mode, hidden_states):
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
 
@@ -219,9 +221,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 masked_m,
                 expected_m,
             ) = self.deepep_dispatcher.dispatch(
-                hidden_states,
-                topk_idx,
-                topk_weights,
+                hidden_states=hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
                 forward_mode=forward_mode,
             )
         final_hidden_states = self.experts(
@@ -237,12 +239,104 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         )
         if self.ep_size > 1:
             final_hidden_states = self.deepep_dispatcher.combine(
-                final_hidden_states,
-                topk_idx,
-                topk_weights,
-                forward_mode,
+                hidden_states=final_hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                forward_mode=forward_mode,
             )
         return final_hidden_states
+
+    def op_gate(self, state):
+        if is_non_idle_and_non_empty(
+            state.forward_batch.forward_mode, state.hidden_states_mlp_input
+        ):
+            # router_logits: (num_tokens, n_experts)
+            state.router_logits, _ = self.gate(state.hidden_states_mlp_input)
+        else:
+            state.router_logits = None
+
+    def op_select_experts(self, state):
+        router_logits = state.pop("router_logits")
+        hidden_states = state.hidden_states_mlp_input
+        if router_logits is not None:
+            state.topk_weights_local, state.topk_idx_local = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                top_k=self.top_k,
+                use_grouped_topk=False,
+                renormalize=self.renormalize,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
+        else:
+            state.topk_idx_local = torch.full(
+                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+            )
+            state.topk_weights_local = torch.empty(
+                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+            )
+
+    def op_dispatch_a(self, state):
+        if self.ep_size > 1:
+            # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
+            self.deepep_dispatcher.dispatch_a(
+                hidden_states=state.pop("hidden_states_mlp_input"),
+                topk_idx=state.pop("topk_idx_local"),
+                topk_weights=state.pop("topk_weights_local"),
+                forward_mode=state.forward_batch.forward_mode,
+                tbo_subbatch_index=state.get("tbo_subbatch_index"),
+            )
+
+    def op_dispatch_b(self, state):
+        if self.ep_size > 1:
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                (
+                    state.hidden_states_experts_input,
+                    state.topk_idx_dispatched,
+                    state.topk_weights_dispatched,
+                    state.reorder_topk_ids,
+                    state.num_recv_tokens_per_expert,
+                    state.seg_indptr,
+                    state.masked_m,
+                    state.expected_m,
+                ) = self.deepep_dispatcher.dispatch_b(
+                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
+                )
+
+    def op_experts(self, state):
+        state.hidden_states_experts_output = self.experts(
+            hidden_states=state.pop("hidden_states_experts_input"),
+            topk_idx=state.topk_idx_dispatched,
+            topk_weights=state.topk_weights_dispatched,
+            reorder_topk_ids=state.pop("reorder_topk_ids"),
+            seg_indptr=state.pop("seg_indptr"),
+            masked_m=state.pop("masked_m"),
+            expected_m=state.pop("expected_m"),
+            num_recv_tokens_per_expert=state.pop("num_recv_tokens_per_expert"),
+            forward_mode=state.forward_batch.forward_mode,
+        )
+
+    def op_combine_a(self, state):
+        if self.ep_size > 1:
+            self.deepep_dispatcher.combine_a(
+                hidden_states=state.pop("hidden_states_experts_output"),
+                topk_idx=state.pop("topk_idx_dispatched"),
+                topk_weights=state.pop("topk_weights_dispatched"),
+                forward_mode=state.forward_batch.forward_mode,
+                tbo_subbatch_index=state.get("tbo_subbatch_index"),
+            )
+
+    def op_combine_b(self, state):
+        if self.ep_size > 1:
+            state.hidden_states_after_combine = self.deepep_dispatcher.combine_b(
+                tbo_subbatch_index=state.get("tbo_subbatch_index"),
+            )
+
+    def op_output(self, state):
+        state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
 
 
 class Qwen3MoeAttention(nn.Module):
@@ -341,32 +435,53 @@ class Qwen3MoeAttention(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
+    def op_prepare(self, state):
+        state.attn_intermediate_state = self.forward_prepare(
+            positions=state.positions,
+            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
+            forward_batch=state.forward_batch,
+        )
+
+    def op_core(self, state):
+        state.hidden_states_after_attn = self.forward_core(
+            state.pop("attn_intermediate_state")
+        )
+
+    def forward_prepare(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if hidden_states.shape[0] == 0:
+            return hidden_states, forward_batch, None
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self._apply_qk_norm(q, k)
+        q, k = self.rotary_emb(positions, q, k)
+        inner_state = q, k, v, forward_batch
+        return None, forward_batch, inner_state
+
+    def forward_core(self, intermediate_state):
+        hidden_states, forward_batch, inner_state = intermediate_state
+        if inner_state is None:
+            return hidden_states
+        attn_output = self.attn(*inner_state)
+        output, _ = self.o_proj(attn_output)
+        return output
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
-        return output
-
-
-class _FFNInputMode(Enum):
-    # The MLP sublayer requires 1/tp_size tokens as input
-    SCATTERED = auto()
-    # The MLP sublayer requires all tokens as input
-    FULL = auto()
-
-
-@dataclass
-class _DecoderLayerInfo:
-    is_sparse: bool
-    ffn_input_mode: _FFNInputMode
+        s = self.forward_prepare(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+        return self.forward_core(s)
 
 
 class Qwen3MoeDecoderLayer(nn.Module):
@@ -378,6 +493,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -408,15 +524,18 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.attn_tp_rank = get_attention_tp_rank()
         self.local_dp_size = get_local_attention_dp_size()
 
-        self.info = self._compute_info(config, layer_id=layer_id)
-        previous_layer_info = self._compute_info(config, layer_id=layer_id - 1)
-        self.input_is_scattered = (
-            layer_id > 0
-            and previous_layer_info.ffn_input_mode == _FFNInputMode.SCATTERED
-        )
-        self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
+        # Qwen3MoE all layers are sparse and have no nextn now
+        self.is_layer_sparse = True
+        is_previous_layer_sparse = True
 
-        if self.info.is_sparse:
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=self.is_layer_sparse,
+            is_previous_layer_sparse=is_previous_layer_sparse,
+        )
+
+        if self.is_layer_sparse:
             self.mlp = Qwen3MoeSparseMoeBlock(
                 layer_id=self.layer_id,
                 config=config,
@@ -436,26 +555,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    @staticmethod
-    def _enable_moe_dense_fully_dp():
-        return global_server_args_dict["moe_dense_tp_size"] == 1
-
-    @staticmethod
-    def _compute_info(config: PretrainedConfig, layer_id: int):
-        # WARN: Qwen3MOE has no dense_layer, it is only for compatibility.
-        mlp_only_layers = (
-            [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
         )
-        is_sparse = (layer_id not in mlp_only_layers) and (
-            config.num_experts > 0 and (layer_id + 1) % config.decoder_sparse_step == 0
-        )
-        ffn_input_mode = (
-            _FFNInputMode.SCATTERED
-            if (global_server_args_dict["enable_deepep_moe"] and is_sparse)
-            or (Qwen3MoeDecoderLayer._enable_moe_dense_fully_dp() and not is_sparse)
-            else _FFNInputMode.FULL
-        )
-        return _DecoderLayerInfo(is_sparse=is_sparse, ffn_input_mode=ffn_input_mode)
 
     def forward(
         self,
@@ -464,105 +568,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.info.ffn_input_mode == _FFNInputMode.SCATTERED:
-            return self.forward_ffn_with_scattered_input(
-                positions, hidden_states, forward_batch, residual
-            )
-        elif self.info.ffn_input_mode == _FFNInputMode.FULL:
-            return self.forward_ffn_with_full_input(
-                positions, hidden_states, forward_batch, residual
-            )
-        else:
-            raise NotImplementedError
 
-    def forward_ffn_with_full_input(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if hidden_states.shape[0] == 0:
-            residual = hidden_states
-        else:
-            if residual is None:
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
 
-            # Self Attention
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
-        # Gather
-        if get_tensor_model_parallel_world_size() > 1:
-            if self.local_dp_size != 1:
-                if self.attn_tp_rank == 0:
-                    hidden_states += residual
-                hidden_states, local_hidden_states = (
-                    forward_batch.gathered_buffer,
-                    hidden_states,
-                )
-                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
-                dp_scatter(residual, hidden_states, forward_batch)
-                hidden_states = self.post_attention_layernorm(hidden_states)
-            else:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                # TODO extract this bugfix
-                if hidden_states.shape[0] != 0:
-                    hidden_states, residual = self.post_attention_layernorm(
-                        hidden_states, residual
-                    )
-        elif hidden_states.shape[0] != 0:
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
-
-        # Fully Connected
-        hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
-
-        # TODO: use reduce-scatter in MLP to avoid this scatter
-        # Scatter
-        if self.local_dp_size != 1:
-            # important: forward batch.gathered_buffer is used both after scatter and after gather.
-            # be careful about this!
-            hidden_states, global_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            dp_scatter(hidden_states, global_hidden_states, forward_batch)
-
-        return hidden_states, residual
-
-    def forward_ffn_with_scattered_input(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if hidden_states.shape[0] == 0:
-            residual = hidden_states
-        else:
-            if residual is None:
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
-
-        if self.attn_tp_size != 1 and self.input_is_scattered:
-            hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            attn_tp_all_gather(
-                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
-            )
-
-        # Self Attention
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -570,49 +580,76 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        if self.attn_tp_size != 1:
-            if self.input_is_scattered:
-                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
-                hidden_states = tensor_list[self.attn_tp_rank]
-                attn_tp_reduce_scatter(hidden_states, tensor_list)
-                if hidden_states.shape[0] != 0:
-                    hidden_states, residual = self.post_attention_layernorm(
-                        hidden_states, residual
-                    )
-            else:
-                if self.attn_tp_rank == 0:
-                    hidden_states += residual
-                tensor_list = list(hidden_states.tensor_split(self.attn_tp_size))
-                hidden_states = tensor_list[self.attn_tp_rank]
-                attn_tp_reduce_scatter(hidden_states, tensor_list)
-                residual = hidden_states
-                if hidden_states.shape[0] != 0:
-                    hidden_states = self.post_attention_layernorm(hidden_states)
-        else:
-            if hidden_states.shape[0] != 0:
-                hidden_states, residual = self.post_attention_layernorm(
-                    hidden_states, residual
-                )
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
 
-        if not (
-            self._enable_moe_dense_fully_dp()
-            and (not self.info.is_sparse)
-            and hidden_states.shape[0] == 0
-        ):
-            hidden_states = self.mlp(hidden_states, forward_batch.forward_mode)
+        hidden_states = self.mlp(hidden_states, forward_batch)
 
-        if self.is_last_layer and self.attn_tp_size != 1:
-            hidden_states += residual
-            residual = None
-            hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-                hidden_states,
-            )
-            attn_tp_all_gather(
-                list(hidden_states.tensor_split(self.attn_tp_size)), local_hidden_states
-            )
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
 
         return hidden_states, residual
+
+    def op_comm_prepare_attn(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        tbo_subbatch_index: Optional[int] = None,
+    ):
+        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
+            self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+        )
+        state.update(
+            dict(
+                forward_batch=forward_batch,
+                positions=positions,
+                tbo_subbatch_index=tbo_subbatch_index,
+            )
+        )
+
+    def op_comm_prepare_mlp(self, state):
+        state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
+            self.layer_communicator.prepare_mlp(
+                state.pop("hidden_states_after_attn"),
+                state.pop("residual_after_input_ln"),
+                state.forward_batch,
+            )
+        )
+
+    def op_mlp(self, state):
+        hidden_states = state.pop("hidden_states_mlp_input")
+        state.hidden_states_mlp_output = self.mlp(
+            hidden_states, state.forward_batch.forward_mode
+        )
+
+    def op_comm_postprocess_layer(self, state):
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            state.pop("hidden_states_mlp_output"),
+            state.pop("residual_after_comm_pre_mlp"),
+            state.forward_batch,
+        )
+
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=state.forward_batch,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+
+        state.clear(
+            expect_keys={
+                "positions",
+                "forward_batch",
+                "tbo_subbatch_index",
+            }
+        )
+        return output
 
 
 class Qwen3MoeModel(Qwen2MoeModel):
