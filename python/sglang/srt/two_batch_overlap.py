@@ -393,9 +393,6 @@ def _model_forward_tbo(
     input_data_scatter_mode: ScatterMode,
     layer_input_scatter_mode: ScatterMode,
 ):
-    # The attn_tp_size!=1 case is not yet extracted to master
-    assert get_attention_tp_size() == 1
-
     inputs_arr = _model_forward_tbo_split_inputs(
         **inputs,
         input_data_scatter_mode=input_data_scatter_mode,
