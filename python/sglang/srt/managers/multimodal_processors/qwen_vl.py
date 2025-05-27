@@ -155,7 +155,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             images=None if images_are_preprocessed else base_output.images,
             audio=base_output.audios,
         )
-        input_ids = ret["input_ids"].flatten().tolist()
+        input_ids = ret["input_ids"].flatten()
         image_offsets = self.get_mm_items_offset(
             input_ids=input_ids, mm_token_id=self.image_token_id
         )

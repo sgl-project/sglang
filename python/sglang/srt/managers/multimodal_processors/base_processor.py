@@ -378,6 +378,8 @@ class BaseMultimodalProcessor(ABC):
             mm_token_id = 3
             return result = [(2,4),(6,7)]
         """
+        assert isinstance(mm_token_id, int), type(mm_token_id)
+        assert isinstance(input_ids, torch.Tensor), type(input_ids)
         mask = input_ids == mm_token_id
 
         start_positions = (mask & ~torch.roll(mask, 1)).nonzero(as_tuple=True)[0]
