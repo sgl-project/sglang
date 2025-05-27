@@ -448,6 +448,13 @@ class CommunicateSummableTensorPairFn:
         ):
             return CommunicateSummableTensorPairFn._gather
 
+        if (
+            (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
+            and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
+            and (output_mode == ScatterMode.SCATTERED)
+        ):
+            return CommunicateSummableTensorPairFn._scatter
+
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
         )
@@ -495,4 +502,16 @@ class CommunicateSummableTensorPairFn:
             list(hidden_states.tensor_split(context.attn_tp_size)),
             local_hidden_states,
         )
+        return hidden_states, residual
+
+    @staticmethod
+    def _scatter(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        context: CommunicateContext,
+    ):
+        assert residual is None, "not yet handled residual!=None"
+        tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
+        hidden_states = tensor_list[context.attn_tp_rank]
         return hidden_states, residual
