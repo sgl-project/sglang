@@ -119,6 +119,7 @@ class TboCudaGraphRunnerPlugin:
             TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(batch)
         )
 
+
 class TboDPAttentionPreparer:
     def prepare_all_gather(
         self, local_batch, deepep_mode, enable_deepep_moe, enable_two_batch_overlap
@@ -369,14 +370,6 @@ class TboForwardBatchPreparer:
         return ForwardBatch(**output_dict)
 
     @classmethod
-    def _compute_split_token_index(cls, batch: ForwardBatch):
-        return compute_split_token_index(
-            split_seq_index=batch.tbo_split_seq_index,
-            forward_mode=batch.forward_mode,
-            extend_seq_lens=batch.extend_seq_lens_cpu,
-        )
-
-    @classmethod
     def compute_tbo_children_num_token_non_padded(cls, batch: ForwardBatch):
         tbo_split_token_index = cls._compute_split_token_index(batch)
         num_token_non_padded = len(batch.input_ids)
@@ -385,8 +378,17 @@ class TboForwardBatchPreparer:
         value_a = min(tbo_split_token_index, num_token_non_padded)
         value_b = max(0, num_token_non_padded - tbo_split_token_index)
         return torch.tensor(
-            [value_a, value_b], device=global_server_args_dict["device"],
+            [value_a, value_b],
+            device=global_server_args_dict["device"],
             dtype=torch.int32,
+        )
+
+    @classmethod
+    def _compute_split_token_index(cls, batch: ForwardBatch):
+        return compute_split_token_index(
+            split_seq_index=batch.tbo_split_seq_index,
+            forward_mode=batch.forward_mode,
+            extend_seq_lens=batch.extend_seq_lens_cpu,
         )
 
 
