@@ -256,6 +256,7 @@ class CudaGraphRunner:
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+            self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
             # pipeline parallelism
             if self.pp_size > 1:
@@ -483,7 +484,7 @@ class CudaGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
         )
-        TboCudaGraphRunnerPlugin.prepare(forward_batch, num_tokens=num_tokens)
+        self.tbo_plugin.prepare(forward_batch, num_tokens=num_tokens)
 
         if lora_paths is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
