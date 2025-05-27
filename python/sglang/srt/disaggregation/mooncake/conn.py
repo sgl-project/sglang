@@ -31,7 +31,7 @@ from sglang.srt.disaggregation.base.conn import (
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
+from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote, get_int_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -172,11 +172,9 @@ class MooncakeKVManager(BaseKVManager):
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             self.executor = concurrent.futures.ThreadPoolExecutor(
-                int(
-                    os.getenv(
-                        "DISAGGREGATION_THREAD_POOL_SIZE",
-                        min(max(1, cpu_count // 8), 8),
-                    )
+                get_int_env_var(
+                    "DISAGGREGATION_THREAD_POOL_SIZE",
+                    min(max(1, cpu_count // 8), 8),
                 )
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
