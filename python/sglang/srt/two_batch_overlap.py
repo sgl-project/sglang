@@ -355,9 +355,10 @@ class TboForwardBatchPreparer:
         return ForwardBatch(**output_dict)
 
     @classmethod
-    def compute_tbo_children_num_token_non_padded(cls, num_token_non_padded):
-        value_a = TODO
-        value_b = TODO
+    def compute_tbo_children_num_token_non_padded(cls, num_token_non_padded: int):
+        # TODO we may make padding on both sub-batches to make it slightly more balanced
+        value_a = min(tbo_split_token_index, num_token_non_padded)
+        value_b = max(0, num_token_non_padded - tbo_split_token_index)
         return torch.tensor([value_a, value_b], device=TODO)
 
 
