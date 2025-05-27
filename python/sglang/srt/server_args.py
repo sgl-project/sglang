@@ -279,7 +279,7 @@ class ServerArgs:
         }, "moe_dense_tp_size only support 1 and None currently"
 
         if self.moe_dense_tp_size == 1:
-            assert self.enable_dp_lm_head
+            assert self.enable_dp_lm_head == True
 
         if self.attention_backend == "flashmla":
             logger.warning(
