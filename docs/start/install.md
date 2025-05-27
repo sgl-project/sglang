@@ -23,8 +23,6 @@ uv pip install "sglang[all]>=0.4.6.post5"
   1. Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
   2. Install FlashInfer first following [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html), then install SGLang as described above.
 
-- If you encounter `ImportError; cannot import name 'is_valid_list_of_images' from 'transformers.models.llama.image_processing_llama'`, try to use the specified version of `transformers` in [pyproject.toml](https://github.com/sgl-project/sglang/blob/main/python/pyproject.toml). Currently, just running `pip install transformers==4.51.1`.
-
 ## Method 2: From source
 
 ```bash

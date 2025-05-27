@@ -146,7 +146,7 @@ class TestDisaggregationAccuracy(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
     def test_logprob(self):
-        prompt = "The capital of taiwan is "
+        prompt = "The capital of france is "
         response = requests.post(
             self.lb_url + "/generate",
             json={
