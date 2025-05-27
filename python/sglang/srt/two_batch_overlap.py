@@ -91,7 +91,7 @@ class TboCudaGraphRunnerUtils:
     @classmethod
     def prepare(cls, batch: ForwardBatch, num_tokens: int):
         batch.tbo_split_seq_index = cls._compute_tbo_split_seq_index(num_tokens, batch.forward_mode)
-        TboForwardBatchPreparer.prepare(batch)
+        TboForwardBatchPreparer.prepare_raw(batch, tbo_children_num_token_non_padded=TODO)
 
     @staticmethod
     def _compute_tbo_split_seq_index(num_tokens: int, forward_mode):
@@ -180,6 +180,10 @@ class TboDPAttentionPreparer:
 class TboForwardBatchPreparer:
     @classmethod
     def prepare(cls, batch: ForwardBatch):
+        cls.prepare_raw(batch, tbo_children_num_token_non_padded=TODO)
+
+    @classmethod
+    def prepare_raw(cls, batch: ForwardBatch, tbo_children_num_token_non_padded: torch.Tensor):
         from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 
         if batch.tbo_split_seq_index is None:
@@ -202,7 +206,7 @@ class TboForwardBatchPreparer:
         assert isinstance(batch.attn_backend, TboAttnBackend)
         attn_backend_child_a, attn_backend_child_b = batch.attn_backend.children
 
-        [out_num_token_non_padded_a, out_num_token_non_padded_b] = TODO
+        [out_num_token_non_padded_a, out_num_token_non_padded_b] = tbo_children_num_token_non_padded
 
         child_a = cls.filter_batch(
             batch,
