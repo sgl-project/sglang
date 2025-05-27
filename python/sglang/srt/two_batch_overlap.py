@@ -89,22 +89,24 @@ def compute_split_token_index(
 
 class TboCudaGraphRunnerPlugin:
     def __init__(self):
-        self.tbo_children_num_token_non_padded = torch.zeros((2,), dtype=torch.int32)
+        self._tbo_children_num_token_non_padded = torch.zeros((2,), dtype=torch.int32)
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
         batch.tbo_split_seq_index = self._compute_tbo_split_seq_index(num_tokens, batch.forward_mode)
         if batch.tbo_split_seq_index is None:
             return
 
-        self.tbo_children_num_token_non_padded[...] = TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(
+        self._tbo_children_num_token_non_padded[
+            ...] = TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(
             batch)
         TboForwardBatchPreparer.prepare_raw(
             batch,
-            tbo_children_num_token_non_padded=self.tbo_children_num_token_non_padded,
+            tbo_children_num_token_non_padded=self._tbo_children_num_token_non_padded,
         )
 
     def replay_prepare(self, batch: ForwardBatch):
-        self.tbo_children_num_token_non_padded[...] = TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(
+        self._tbo_children_num_token_non_padded[
+            ...] = TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(
             batch)
 
     @staticmethod
