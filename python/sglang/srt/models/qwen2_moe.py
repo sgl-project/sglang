@@ -32,7 +32,11 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes, ScatterMode
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    ScatterMode,
+)
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_reduce_scatter,
