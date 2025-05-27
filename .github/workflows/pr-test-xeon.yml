@@ -1,0 +1,84 @@
+name: PR Test (Xeon)
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: pr-test-xeon-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    if: github.event_name == 'pull_request'
+    runs-on: test-7470
+    environment: 'prod'
+    strategy:
+      matrix:
+        build_type: ['all']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push
+        run: |
+          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          tag=v${version}-xeon
+
+          docker build . -f docker/Dockerfile.xeon  -t sglang_xeon --no-cache
+  unit-test:
+    if: github.event_name == 'pull_request'
+    needs: [build-test]
+    runs-on: test-7470
+    steps:
+      - name: Run container
+        run: |
+          docker run -dt \
+            -v ${{ github.workspace }}:/sgl-workspace --ipc=host \
+            -e https_proxy=http://proxy-dmz.intel.com:912/ \
+            --name ci_sglang_xeon \
+            sglang_xeon
+
+      - name: Install Dependency
+        timeout-minutes: 20
+        run: |
+          docker exec ci_sglang_xeon bash -c "python3 -m pip install --upgrade pip"
+          docker exec ci_sglang_xeon pip uninstall sgl-kernel -y || true
+          docker exec -w /sgl-workspace/sgl-kernel ci_sglang_xeon bash -c "cp pyproject_cpu.toml pyproject.toml && pip install -v ."
+          docker exec -w /sgl-workspace/ ci_sglang_xeon bash -c "pip install -e "python[all_cpu]""
+          docker exec ci_sglang_xeon bash -c "python3 -m pip install pytest expecttest"
+
+      - name: Run UT Cases
+        timeout-minutes: 20
+        run: |
+          docker exec -w /sgl-workspace/sglang ci_sglang_xeon \
+            bash -c "cd ./test/srt && python3 run_suite.py --suite per-commit-cpu"
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f ci_sglang_xpu || true
+
+  finish:
+    if: always()
+    needs: [build-test, unit-test]
+    runs-on: test-7470
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          results=(${{ join(needs.*.result, ' ') }})
+          for result in "${results[@]}"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "Job failed with result: $result"
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0
