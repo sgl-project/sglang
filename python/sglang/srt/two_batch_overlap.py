@@ -198,6 +198,8 @@ class TboForwardBatchPreparer:
 
         assert isinstance(batch.attn_backend, TboAttnBackend)
         attn_backend_child_a, attn_backend_child_b = batch.attn_backend.children
+        
+        [out_num_token_non_padded_a, out_num_token_non_padded_b] = TODO
 
         child_a = cls.filter_batch(
             batch,
