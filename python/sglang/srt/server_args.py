@@ -366,12 +366,28 @@ class ServerArgs:
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
 
+        if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
+            self.expert_distribution_recorder_mode = "stat"
+            logger.info(
+                f"EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
+            )
+
+        if (self.enable_eplb or (self.init_expert_location is not None)) and (
+            self.ep_dispatch_algorithm is None
+        ):
+            self.ep_dispatch_algorithm = "static"
+            logger.info(
+                f"EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
+            )
+
+        if self.enable_expert_distribution_metrics and (
+            self.expert_distribution_recorder_mode is None
+        ):
+            self.expert_distribution_recorder_mode = "stat"
+
         if self.expert_distribution_recorder_buffer_size is None:
-            # TODO pr-chain: enable this later
-            # if (x := self.eplb_rebalance_num_iterations) is not None:
-            #     self.expert_distribution_recorder_buffer_size = x
-            if False:
-                pass
+            if (x := self.eplb_rebalance_num_iterations) is not None:
+                self.expert_distribution_recorder_buffer_size = x
             elif self.expert_distribution_recorder_mode is not None:
                 self.expert_distribution_recorder_buffer_size = 1000
 
@@ -1457,7 +1473,7 @@ class ServerArgs:
             self.max_loras_per_batch > 0
             # FIXME
             and (self.lora_paths is None or self.disable_radix_cache)
-        ), "compatibility of lora and cuda graph and radix attention is in progress"
+        ), "compatibility of lora and radix attention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
