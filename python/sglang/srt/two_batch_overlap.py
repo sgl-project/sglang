@@ -423,13 +423,13 @@ def _model_forward_tbo_split_inputs(
         input_data_scatter_mode: ScatterMode,
         layer_input_scatter_mode: ScatterMode,
 ) -> List[Dict]:
-    intermediate_mode = ScatterMode.TP_ATTN_FULL
+    tbo_splitter_scatter_mode = ScatterMode.TP_ATTN_FULL
     context = CommunicateContext.init_new()
 
     hidden_states, residual = CommunicateSummableTensorPairFn.execute(
         hidden_states_input_mode=input_data_scatter_mode,
         residual_input_mode=input_data_scatter_mode,
-        output_mode=intermediate_mode,
+        output_mode=tbo_splitter_scatter_mode,
         hidden_states=hidden_states,
         residual=residual,
         forward_batch=forward_batch,
@@ -447,7 +447,7 @@ def _model_forward_tbo_split_inputs(
     def _post_transform(hidden_states, residual, forward_batch, **kwargs):
         assert residual is None
         hidden_states = CommunicateSimpleFn.execute(
-            input_mode=intermediate_mode,
+            input_mode=tbo_splitter_scatter_mode,
             output_mode=layer_input_scatter_mode,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
