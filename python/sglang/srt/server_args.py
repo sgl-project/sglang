@@ -269,8 +269,7 @@ class ServerArgs:
                     reserve_mem = 1024 * 20
                 self.mem_fraction_static = min(
                     mem_fraction + 48 * 1024 * (1 - mem_fraction) / gpu_mem,
-                    (gpu_mem - reserve_mem)
-                    / gpu_mem,  
+                    (gpu_mem - reserve_mem) / gpu_mem,
                 )
 
         # Set chunked prefill size, which depends on the gpu memory capacity
