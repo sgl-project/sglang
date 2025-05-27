@@ -616,12 +616,6 @@ class EAGLEWorker(TpModelWorker):
         )
         forward_batch.return_logprob = False
         logits_output, _ = self.draft_model_runner.forward(forward_batch)
-        print(
-            "   in forward_draft_extend::: logits_output.hidden_states.shape",
-            logits_output.hidden_states.shape,
-            "forward_batch.capture_hidden_mode",
-            forward_batch.capture_hidden_mode.name,
-        )
         self._detect_nan_if_needed(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
