@@ -1789,6 +1789,12 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
+            accept_length = spec_info.accept_length[:bs]
+            metadata.max_seq_len_q = accept_length.max().item()
+            metadata.cu_seqlens_q[1:].copy_(
+                torch.cumsum(accept_length, dim=0, dtype=torch.int32)
+            )
+
             max_seq_pages = (
                 metadata.max_seq_len_k + self.page_size - 1
             ) // self.page_size
