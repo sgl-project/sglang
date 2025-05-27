@@ -223,7 +223,7 @@ class EAGLEWorker(TpModelWorker):
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
-        self.draft_cuda_graph_runner = None
+        self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
         if self.server_args.disable_cuda_graph:
@@ -235,7 +235,7 @@ class EAGLEWorker(TpModelWorker):
         logger.info(
             f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        self.draft_cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
+        self.cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
@@ -249,13 +249,6 @@ class EAGLEWorker(TpModelWorker):
     def draft_model_runner(self):
         return self.model_runner
 
-    @print_shapes(
-        "batch.forward_mode.name",
-        "batch.spec_info.hidden_states",
-        "batch.prefix_lens!",
-        "batch.extend_lens!",
-        "batch.seq_lens!",
-    )
     def forward_batch_speculative_generation(
         self, batch: ScheduleBatch
     ) -> Tuple[LogitsProcessorOutput, List[int], int, int]:
@@ -305,12 +298,6 @@ class EAGLEWorker(TpModelWorker):
                 )
             return logits_output, next_token_ids, bid, 0, False
 
-    @print_shapes(
-        "batch.spec_info.hidden_states",
-        "batch.prefix_lens!",
-        "batch.extend_lens!",
-        "batch.seq_lens!",
-    )
     def forward_target_extend(
         self, batch: ScheduleBatch
     ) -> Tuple[LogitsProcessorOutput, List[int], int]:
@@ -333,7 +320,6 @@ class EAGLEWorker(TpModelWorker):
         )
         return logits_output, next_token_ids, model_worker_batch.bid
 
-    @print_shapes("batch.spec_info.hidden_states")
     def draft(self, batch: ScheduleBatch):
         # Parse args
         num_seqs = batch.batch_size()
@@ -420,12 +406,11 @@ class EAGLEWorker(TpModelWorker):
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
-        can_cuda_graph = (
-            self.draft_cuda_graph_runner
-            and self.draft_cuda_graph_runner.can_run(forward_batch)
+        can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
+            forward_batch
         )
         if can_cuda_graph:
-            score_list, token_list, parents_list = self.draft_cuda_graph_runner.replay(
+            score_list, token_list, parents_list = self.cuda_graph_runner.replay(
                 forward_batch
             )
         else:
@@ -452,13 +437,6 @@ class EAGLEWorker(TpModelWorker):
         )
         return ret
 
-    @print_shapes(
-        "forward_batch.capture_hidden_mode.name",
-        "forward_batch.spec_info.hidden_states",
-        "forward_batch.prefix_lens!",
-        "forward_batch.extend_lens!",
-        "forward_batch.seq_lens!",
-    )
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info = forward_batch.spec_info
@@ -513,7 +491,6 @@ class EAGLEWorker(TpModelWorker):
 
         return score_list, token_list, parents_list
 
-    @print_shapes("batch.spec_info.hidden_states", "spec_info.hidden_states")
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         spec_info.prepare_for_verify(batch, self.page_size)
         batch.return_hidden_states = False
@@ -611,7 +588,6 @@ class EAGLEWorker(TpModelWorker):
                         )
                 pt += 1
 
-    @print_shapes("batch.spec_info.hidden_states", "hidden_states")
     def forward_draft_extend(
         self,
         batch: ScheduleBatch,
@@ -661,15 +637,12 @@ class EAGLEWorker(TpModelWorker):
         # tokens of the same sequence are contiguous, so the
         # last row index for seq i is prefix_sum(seq_lens)[i]-1
         last_row_idx = torch.cumsum(seq_lens, dim=0) - 1
-        print(hidden_states.shape, last_row_idx, seq_lens)
         assert (
             ((last_row_idx >= 0) & (last_row_idx < hidden_states.size(0))).all().item()
         ), f"last_row_idx: {last_row_idx}, hidden_states.size(0): {hidden_states.size(0)}"
         hidden_states = hidden_states[last_row_idx]  # (bs, hidden_size)
-        print("ensure_is_last_hidden_states", hidden_states.shape)
         return hidden_states
 
-    @print_shapes("batch.spec_info.hidden_states")
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
@@ -706,7 +679,6 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info.accept_length = accept_length_backup
         batch.return_logprob = return_logprob_backup
 
-    @print_shapes("logits_output.hidden_states", "draft_input.hidden_states")
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):

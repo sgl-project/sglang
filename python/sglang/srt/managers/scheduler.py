@@ -282,7 +282,7 @@ class Scheduler(
         if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
-            self.eagle_worker = EAGLEWorker(
+            self.draft_worker = EAGLEWorker(
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 server_args=server_args,
@@ -291,7 +291,7 @@ class Scheduler(
                 dp_rank=dp_rank,
             )
         else:
-            self.eagle_worker = None
+            self.draft_worker = None
 
         # Get token and memory info from the model worker
         (
@@ -1538,7 +1538,7 @@ class Scheduler(
                     bid,
                     num_accepted_tokens,
                     can_run_cuda_graph,
-                ) = self.eagle_worker.forward_batch_speculative_generation(batch)
+                ) = self.draft_worker.forward_batch_speculative_generation(batch)
                 # print("num_accepted_tokens", num_accepted_tokens)
                 self.spec_num_total_accepted_tokens += (
                     num_accepted_tokens + batch.batch_size()
@@ -1835,8 +1835,8 @@ class Scheduler(
             self.token_to_kv_pool_allocator.clear()
 
             if not self.spec_algorithm.is_none():
-                self.eagle_worker.model_runner.req_to_token_pool.clear()
-                self.eagle_worker.model_runner.token_to_kv_pool_allocator.clear()
+                self.draft_worker.model_runner.req_to_token_pool.clear()
+                self.draft_worker.model_runner.token_to_kv_pool_allocator.clear()
 
             self.num_generated_tokens = 0
             self.forward_ct_decode = 0

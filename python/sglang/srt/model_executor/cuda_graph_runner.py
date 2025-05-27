@@ -210,7 +210,6 @@ class CudaGraphRunner:
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
-            print("-->setting capture hidden mode to full", flush=True)
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         # Attention backend
@@ -574,47 +573,8 @@ class CudaGraphRunner:
 
         # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
         if self.capture_hidden_mode != required_capture_hidden_mode:
-            print("Recapture C")
-            print(
-                "fwbatch",
-                forward_batch.capture_hidden_mode.name,
-                "self",
-                self.capture_hidden_mode.name,
-                "spec",
-                capture_hidden_mode_required_by_spec_info.name,
-            )
-            print("required", required_capture_hidden_mode.name)
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
-
-        """
-        hidden_mode_from_spec_info = getattr(
-            forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
-        )
-        # If this forward batch is a full capture and we aren't in full capture mode,
-        # we need to promote to full capture mode and recapture the CUDA graph
-        # (forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL wins over all)
-        if (
-            forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
-            and self.capture_hidden_mode != CaptureHiddenMode.FULL
-        ):
-                print("Recapture A")
-                print("fwbatch", forward_batch.capture_hidden_mode.name, "self", self.capture_hidden_mode.name)
-                self.capture_hidden_mode = CaptureHiddenMode.FULL
-                self.capture()
-        # If this forward batch is not a full capture and our capture mode is not the same as the spec info,
-        # we need to change it to match the spec info and re-capture the CUDA graph
-        elif (
-            forward_batch.capture_hidden_mode != CaptureHiddenMode.FULL
-            and self.capture_hidden_mode != hidden_mode_from_spec_info
-        ):
-            print("Recapture B")
-            print("fwbatch", forward_batch.capture_hidden_mode.name, "self", self.capture_hidden_mode.name, "spec", hidden_mode_from_spec_info.name)
-            self.capture_hidden_mode = hidden_mode_from_spec_info
-            self.capture()
-        else:
-            print(".", end="")
-        """
 
     def replay_prepare(
         self,

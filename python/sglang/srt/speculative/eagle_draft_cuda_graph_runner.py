@@ -202,10 +202,6 @@ class EAGLEDraftCudaGraphRunner:
         self.positions[:raw_num_token].copy_(forward_batch.positions)
         self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
-        print(
-            self.hidden_states[:raw_bs].shape,
-            forward_batch.spec_info.hidden_states.shape,
-        )
         self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
 
         # Attention backend
