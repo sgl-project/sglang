@@ -142,8 +142,8 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
 
         if return_hidden_states:
             assert (
-                len(hidden_states_list) == parallel_sample_num
-            ), f"Expected {parallel_sample_num} hidden states, got {len(hidden_states_list)}"
+                len(hidden_states_list) == parallel_sample_num * num_choices
+            ), f"Expected {parallel_sample_num * num_choices} hidden states, got {len(hidden_states_list)}"
         else:
             assert (
                 hidden_states_list == []
