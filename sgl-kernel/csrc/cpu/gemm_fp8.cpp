@@ -191,7 +191,7 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
     constexpr int BLOCK_K2 = BLOCK_K >> 1;
     for (int kb = 0; kb < KB; ++kb) {
       int kb_start = kb * BLOCK_K2;
-      int kb_end = std::min(K, kb_start + BLOCK_K2);
+      int kb_end = std::min(K >> 1, kb_start + BLOCK_K2);
       // 1. load scale vector
       vscale = _mm512_set1_ps(scale[kb]);
       if constexpr (PREFETCH_SIZE_KB > 0) {
