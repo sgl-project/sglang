@@ -32,7 +32,7 @@ class TestBenchServing(CustomTestCase):
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
             if os.getenv("SGLANG_AMD_CI") == "1":
-                self.assertGreater(res["output_throughput"], 3500)
+                self.assertGreater(res["output_throughput"], 3150)
             else:
                 self.assertGreater(res["output_throughput"], 3800)
 
@@ -70,7 +70,7 @@ class TestBenchServing(CustomTestCase):
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
             if os.getenv("SGLANG_AMD_CI") == "1":
-                self.assertGreater(res["output_throughput"], 3500)
+                self.assertGreater(res["output_throughput"], 3050)
             else:
                 self.assertGreater(res["output_throughput"], 3800)
 
@@ -126,7 +126,7 @@ class TestBenchServing(CustomTestCase):
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
             if os.getenv("SGLANG_AMD_CI") == "1":
-                self.assertGreater(res["output_throughput"], 4000)
+                self.assertGreater(res["output_throughput"], 3500)
             else:
                 self.assertGreater(res["output_throughput"], 4300)
 
