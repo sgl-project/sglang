@@ -90,7 +90,7 @@ class PythonicDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception:
             logger.exception("Error in pythonic tool call parsing.")
-            return StreamingParseResult(normal_text=text, calls=[])
+            return StreamingParseResult(normal_text=normal_text, calls=[])
 
     def _find_matching_bracket(self, buffer: str, start: int) -> int:
         """
