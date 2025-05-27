@@ -1,10 +1,12 @@
 use pyo3::prelude::*;
 pub mod logging;
 use std::collections::HashMap;
+pub mod prometheus;
 pub mod router;
 pub mod server;
 pub mod service_discovery;
 pub mod tree;
+use crate::prometheus::PrometheusConfig;
 
 #[pyclass(eq)]
 #[derive(Clone, PartialEq, Debug)]
@@ -35,6 +37,8 @@ struct Router {
     selector: HashMap<String, String>,
     service_discovery_port: u16,
     service_discovery_namespace: Option<String>,
+    prometheus_port: Option<u16>,
+    prometheus_host: Option<String>,
 }
 
 #[pymethods]
@@ -58,7 +62,9 @@ impl Router {
         service_discovery = false,
         selector = HashMap::new(),
         service_discovery_port = 80,
-        service_discovery_namespace = None
+        service_discovery_namespace = None,
+        prometheus_port = None,
+        prometheus_host = None
     ))]
     fn new(
         worker_urls: Vec<String>,
@@ -79,6 +85,8 @@ impl Router {
         selector: HashMap<String, String>,
         service_discovery_port: u16,
         service_discovery_namespace: Option<String>,
+        prometheus_port: Option<u16>,
+        prometheus_host: Option<String>,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -99,6 +107,8 @@ impl Router {
             selector,
             service_discovery_port,
             service_discovery_namespace,
+            prometheus_port,
+            prometheus_host,
         })
     }
 
@@ -136,6 +146,15 @@ impl Router {
             None
         };
 
+        // Create Prometheus config if enabled
+        let prometheus_config = Some(PrometheusConfig {
+            port: self.prometheus_port.unwrap_or(29000),
+            host: self
+                .prometheus_host
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
+        });
+
         actix_web::rt::System::new().block_on(async move {
             server::startup(server::ServerConfig {
                 host: self.host.clone(),
@@ -146,6 +165,7 @@ impl Router {
                 max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
                 service_discovery_config,
+                prometheus_config,
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;

@@ -5,6 +5,8 @@ import torch
 from torch.nn import Module
 
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
+from sglang.srt.managers.expert_location import get_global_expert_location_metadata
+from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 try:
@@ -139,6 +141,7 @@ class EPMoE(torch.nn.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
+        layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
         renormalize: bool = True,
         use_grouped_topk: bool = False,
@@ -162,6 +165,7 @@ class EPMoE(torch.nn.Module):
         )
         self.tp_rank = get_tensor_model_parallel_rank()
 
+        self.layer_id = layer_id
         self.num_experts = num_experts
         assert self.num_experts % self.tp_size == 0
         self.num_experts_per_partition = self.num_experts // self.tp_size
@@ -236,6 +240,9 @@ class EPMoE(torch.nn.Module):
             correction_bias=self.correction_bias,
             custom_routing_function=self.custom_routing_function,
             routed_scaling_factor=self.routed_scaling_factor,
+            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                layer_id=self.layer_id,
+            ),
         )
 
         reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
@@ -426,6 +433,28 @@ class EPMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        physical_expert_ids = (
+            get_global_expert_location_metadata().logical_to_all_physical(
+                self.layer_id, expert_id
+            )
+        )
+        for physical_expert_id in physical_expert_ids:
+            self._weight_loader_physical(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=physical_expert_id,
+            )
+
+    def _weight_loader_physical(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+    ) -> None:
         if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
             return
         expert_id = expert_id - self.start_expert_id
@@ -468,7 +497,8 @@ class EPMoE(torch.nn.Module):
         # Input scales can be loaded directly and should be equal.
         if "input_scale" in weight_name:
             if (
-                param_data[expert_id] != 1
+                (shard_id == "w1" or shard_id == "w3")
+                and param_data[expert_id] != 1
                 and (param_data[expert_id] - loaded_weight).abs() > 1e-5
             ):
                 raise ValueError(
@@ -542,13 +572,10 @@ class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # scale
+        layer.register_parameter("w13_input_scale", None)
+        layer.register_parameter("w13_weight_scale", None)
+
         ones_tensor = torch.ones(num_experts_per_partition, dtype=torch.float32)
-        w13_input_scale = torch.nn.Parameter(
-            ones_tensor,
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_input_scale", w13_input_scale)
-        set_weight_attrs(w13_input_scale, extra_weight_attrs)
 
         w2_input_scale = torch.nn.Parameter(
             ones_tensor,
@@ -556,13 +583,6 @@ class UnquantizedEPMoEMethod(FusedMoEMethodBase, CustomOp):
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
-
-        w13_weight_scale = torch.nn.Parameter(
-            ones_tensor,
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight_scale", w13_weight_scale)
-        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
 
         w2_weight_scale = torch.nn.Parameter(
             ones_tensor,
@@ -810,6 +830,7 @@ class DeepEPMoE(EPMoE):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
+        layer_id: int,
         params_dtype: Optional[torch.dtype] = None,
         renormalize: bool = True,
         use_grouped_topk: bool = False,
@@ -829,6 +850,7 @@ class DeepEPMoE(EPMoE):
             top_k,
             hidden_size,
             intermediate_size,
+            layer_id,
             params_dtype,
             renormalize,
             use_grouped_topk,
