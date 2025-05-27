@@ -39,8 +39,6 @@ from sglang.srt.utils import empty_context, fast_topk, get_available_gpu_memory,
 if is_cuda():
     from sgl_kernel import segment_packbits
 
-from sglang.srt.speculative.instrumentor import print_shapes
-
 logger = logging.getLogger(__name__)
 
 

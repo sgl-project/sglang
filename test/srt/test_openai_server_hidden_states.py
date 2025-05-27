@@ -236,7 +236,6 @@ class TestOpenAIServerWithHiddenStatesEnabled(
         kill_process_tree(cls.process.pid)
 
 
-"""
 class TestOpenAIServerWithHiddenStatesEnabledAndCUDAGraphDisabled(
     unittest.TestCase, BaseTestOpenAIServerWithHiddenStates
 ):
@@ -261,6 +260,7 @@ class TestOpenAIServerWithHiddenStatesEnabledAndCUDAGraphDisabled(
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
 
 class TestOpenAIServerWithEAGLEAndHiddenStatesEnabled(
     unittest.TestCase, BaseTestOpenAIServerWithHiddenStates
@@ -294,7 +294,7 @@ class TestOpenAIServerWithEAGLEAndHiddenStatesEnabled(
                 128,
                 "--max-running-requests",
                 8,
-                "--enable-return-hidden-states"
+                "--enable-return-hidden-states",
             ],
         )
         cls.base_url += "/v1"
@@ -342,7 +342,7 @@ class TestOpenAIServerWithEAGLE3AndHiddenStatesEnabled(
                 8,
                 "--dtype",
                 "float16",
-                "--enable-return-hidden-states"
+                "--enable-return-hidden-states",
             ],
         )
         cls.base_url += "/v1"
@@ -355,6 +355,6 @@ class TestOpenAIServerWithEAGLE3AndHiddenStatesEnabled(
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-"""
+
 if __name__ == "__main__":
     unittest.main()
