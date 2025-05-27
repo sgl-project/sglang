@@ -370,6 +370,9 @@ class DeepseekV2MoE(nn.Module):
                 correction_bias=self.correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
                 num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
             )
         else:
             topk_idx = torch.full(
@@ -1622,7 +1625,11 @@ class DeepseekV2Model(nn.Module):
                 with get_global_expert_distribution_recorder().with_current_layer(i):
                     layer = self.layers[i]
                     hidden_states, residual = layer(
-                        positions, hidden_states, forward_batch, residual, zero_allocator
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        zero_allocator,
                     )
             if normal_num_layers != total_num_layers:
                 hidden_states, residual = model_forward_maybe_tbo(
@@ -1632,6 +1639,9 @@ class DeepseekV2Model(nn.Module):
                     forward_batch=forward_batch,
                     hidden_states=hidden_states,
                     residual=residual,
+                    input_data_scatter_mode=self.layers[
+                        normal_num_layers - 1
+                    ].layer_scatter_modes.layer_output_mode,
                     zero_allocator=zero_allocator,
                 )
         else:
@@ -1639,7 +1649,11 @@ class DeepseekV2Model(nn.Module):
                 with get_global_expert_distribution_recorder().with_current_layer(i):
                     layer = self.layers[i]
                     hidden_states, residual = layer(
-                        positions, hidden_states, forward_batch, residual, zero_allocator
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        zero_allocator,
                     )
 
         if not self.pp_group.is_last_rank:
