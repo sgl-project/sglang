@@ -263,11 +263,6 @@ class CommunicateSimpleFn:
         ):
             return CommunicateSimpleFn._scattered_to_tp_attn_full
 
-        if (input_mode == ScatterMode.TP_ATTN_FULL) and (
-            output_mode == ScatterMode.SCATTERED
-        ):
-            return CommunicateSimpleFn._tp_attn_full_to_scattered
-
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
 
     @staticmethod
@@ -293,15 +288,6 @@ class CommunicateSimpleFn:
             local_hidden_states,
         )
         return hidden_states
-
-    @staticmethod
-    def _tp_attn_full_to_scattered(
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        context: CommunicateContext,
-    ) -> torch.Tensor:
-        tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
-        return tensor_list[context.attn_tp_rank]
 
 
 class CommunicateWithAllReduceAndLayerNormFn:
@@ -339,8 +325,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
         if (
             (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
             and (
-                residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
-            )
+            residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
+        )
             and (hidden_states_output_mode == ScatterMode.SCATTERED)
             and (residual_output_mode == ScatterMode.SCATTERED)
         ):
@@ -455,6 +441,13 @@ class CommunicateSummableTensorPairFn:
         ):
             return CommunicateSummableTensorPairFn._gather
 
+        if (
+            (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
+            and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
+            and (output_mode == ScatterMode.SCATTERED)
+        ):
+            return CommunicateSummableTensorPairFn._scatter
+
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
         )
@@ -503,3 +496,14 @@ class CommunicateSummableTensorPairFn:
             local_hidden_states,
         )
         return hidden_states, residual
+
+    @staticmethod
+    def _scatter(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        context: CommunicateContext,
+    ) -> torch.Tensor:
+        assert residual is None, "not yet handled residual!=None"
+        tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
+        return tensor_list[context.attn_tp_rank]

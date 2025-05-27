@@ -445,11 +445,12 @@ def _model_forward_tbo_split_inputs(
     )
 
     def _post_transform(hidden_states, residual, forward_batch, **kwargs):
-        assert residual is None
-        hidden_states = CommunicateSimpleFn.execute(
-            input_mode=tbo_splitter_scatter_mode,
+        hidden_states, residual = CommunicateSummableTensorPairFn.execute(
+            hidden_states_input_mode=tbo_splitter_scatter_mode,
+            residual_input_mode=tbo_splitter_scatter_mode,
             output_mode=layer_input_scatter_mode,
             hidden_states=hidden_states,
+            residual=residual,
             forward_batch=forward_batch,
             context=context,
         )
