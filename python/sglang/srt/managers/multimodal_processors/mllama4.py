@@ -135,11 +135,17 @@ class Mllama4ImageProcessor(BaseMultimodalProcessor):
         processor_output["im_end_id"] = self.eoi_token_index
         processor_output["im_token_id"] = self.image_token_index
 
+        image_offsets = self.get_mm_items_offset(
+            input_ids=torch.tensor(processor_output["input_ids"]),
+            mm_token_id=self.image_token_index,
+        )
+
         # Add metadata for image processing
         processor_output["mm_items"] = [
             MultimodalDataItem(
                 pixel_values=processor_output["pixel_values"],
                 modality=Modality.IMAGE,
+                image_offsets=image_offsets,
             )
         ]
 
