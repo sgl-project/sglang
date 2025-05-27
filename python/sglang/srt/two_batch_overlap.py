@@ -215,12 +215,9 @@ class TboForwardBatchPreparer:
         if batch.tbo_split_seq_index is None:
             return
 
-        cls.prepare_raw(
-            batch,
-            tbo_children_num_token_non_padded=cls.compute_tbo_children_num_token_non_padded(
-                batch
-            ),
-        )
+        tbo_children_num_token_non_padded = cls.compute_tbo_children_num_token_non_padded(
+            tbo_split_token_index=cls._compute_split_token_index(batch), num_token_non_padded=len(batch.input_ids))
+        cls.prepare_raw(batch, tbo_children_num_token_non_padded=tbo_children_num_token_non_padded)
 
     @classmethod
     def prepare_raw(
@@ -390,10 +387,7 @@ class TboForwardBatchPreparer:
         return ForwardBatch(**output_dict)
 
     @classmethod
-    def compute_tbo_children_num_token_non_padded(cls, batch: ForwardBatch):
-        tbo_split_token_index = cls._compute_split_token_index(batch)
-        num_token_non_padded = len(batch.input_ids)
-
+    def compute_tbo_children_num_token_non_padded(cls, tbo_split_token_index: int, num_token_non_padded: int):
         # TODO we may make padding on both sub-batches to make it slightly more balanced
         value_a = min(tbo_split_token_index, num_token_non_padded)
         value_b = max(0, num_token_non_padded - tbo_split_token_index)
