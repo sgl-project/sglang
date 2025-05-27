@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
@@ -23,6 +24,8 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.build_eagle_tree import build_tree_kernel_efficient
 from sglang.srt.utils import fast_topk, is_cuda, is_hip, next_power_of_2
+
+logger = logging.getLogger(__name__)
 
 if is_cuda():
     from sgl_kernel import (

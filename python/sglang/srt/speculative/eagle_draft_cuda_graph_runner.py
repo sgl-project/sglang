@@ -6,11 +6,9 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.srt.model_executor.cuda_graph_runner import (
-    CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
     get_batch_sizes_to_capture,
     get_global_graph_memory_pool,
-    model_capture_mode,
     set_global_graph_memory_pool,
     set_torch_compile_config,
 )
@@ -45,9 +43,6 @@ class EAGLEDraftCudaGraphRunner:
         self.tp_size = self.model_runner.tp_size
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
-        self.enable_profile_cuda_graph = (
-            model_runner.server_args.enable_profile_cuda_graph
-        )
         server_args = model_runner.server_args
 
         # Batch sizes to capture
@@ -58,7 +53,7 @@ class EAGLEDraftCudaGraphRunner:
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
         self.model_runner.draft_attn_backend.init_cuda_graph_state(
-            self.max_bs, self.max_num_token
+            self.max_bs, num_tokens_per_bs=self.num_tokens_per_bs
         )
         self.seq_len_fill_value = self.model_runner.draft_attn_backend.attn_backends[
             0
@@ -103,11 +98,16 @@ class EAGLEDraftCudaGraphRunner:
 
         # Capture
         try:
-            with model_capture_mode():
-                self.capture()
+            self.capture()
         except RuntimeError as e:
             raise Exception(
-                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                f"Capture CUDA graph failed: {e}\n"
+                "Possible solutions:\n"
+                "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
+                "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
+                "3. disable torch compile by not using --enable-torch-compile\n"
+                "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
+                "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
     def can_run(self, forward_batch: ForwardBatch):
@@ -183,7 +183,7 @@ class EAGLEDraftCudaGraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum().item(),
+            seq_lens_sum=seq_lens.sum(),
             return_logprob=False,
             positions=positions,
             global_num_tokens_gpu=global_num_tokens,
@@ -193,7 +193,6 @@ class EAGLEDraftCudaGraphRunner:
             capture_hidden_mode=(
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
-            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob,
         )
 
         # Attention backend
@@ -256,6 +255,7 @@ class EAGLEDraftCudaGraphRunner:
         if bs != raw_bs:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
+            self.positions.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
 
@@ -269,13 +269,6 @@ class EAGLEDraftCudaGraphRunner:
         self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
-
-        if self.enable_dp_attention or self.enable_sp_layernorm:
-            self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
-            self.global_num_tokens_for_logprob_gpu.copy_(
-                forward_batch.global_num_tokens_for_logprob_gpu
-            )
-            forward_batch.gathered_buffer = self.gathered_buffer
 
         # Attention backend
         if bs != raw_bs:
