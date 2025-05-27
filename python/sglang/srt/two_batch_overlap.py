@@ -180,7 +180,10 @@ class TboDPAttentionPreparer:
 class TboForwardBatchPreparer:
     @classmethod
     def prepare(cls, batch: ForwardBatch):
-        cls.prepare_raw(batch, tbo_children_num_token_non_padded=TODO)
+        cls.prepare_raw(
+            batch,
+            tbo_children_num_token_non_padded=cls.compute_tbo_children_num_token_non_padded()
+        )
 
     @classmethod
     def prepare_raw(cls, batch: ForwardBatch, tbo_children_num_token_non_padded: torch.Tensor):
@@ -242,8 +245,6 @@ class TboForwardBatchPreparer:
             output_attn_backend: AttentionBackend,
             out_num_token_non_padded: torch.Tensor,
     ):
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
-
         num_tokens = batch.input_ids.shape[0]
         num_seqs = batch.batch_size
 
@@ -355,11 +356,11 @@ class TboForwardBatchPreparer:
         return ForwardBatch(**output_dict)
 
     @classmethod
-    def compute_tbo_children_num_token_non_padded(cls, num_token_non_padded: int):
+    def compute_tbo_children_num_token_non_padded(cls, *, tbo_split_token_index: int, num_token_non_padded: int):
         # TODO we may make padding on both sub-batches to make it slightly more balanced
         value_a = min(tbo_split_token_index, num_token_non_padded)
         value_b = max(0, num_token_non_padded - tbo_split_token_index)
-        return torch.tensor([value_a, value_b], device=TODO)
+        return torch.tensor([value_a, value_b], device=global_server_args_dict["device"])
 
 
 def _compute_extend_num_tokens(input_ids, forward_mode: ForwardMode):
