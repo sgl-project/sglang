@@ -43,7 +43,6 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import (
-    Modality,
     MultimodalDataItem,
     MultimodalInputs,
     flatten_nested_list,
@@ -62,8 +61,6 @@ from sglang.srt.utils import logger
 try:
     from transformers import LogitsWarper
     from vector_quantize_pytorch import GroupedResidualFSQ
-    from vocos import Vocos
-    from vocos.pretrained import instantiate_class
 
     _tts_deps = True
 except:

@@ -369,7 +369,7 @@ class ServerArgs:
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
             logger.info(
-                f"EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
+                "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
             )
 
         if (self.enable_eplb or (self.init_expert_location is not None)) and (
@@ -377,7 +377,7 @@ class ServerArgs:
         ):
             self.ep_dispatch_algorithm = "static"
             logger.info(
-                f"EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
+                "EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
             )
 
         if self.enable_expert_distribution_metrics and (

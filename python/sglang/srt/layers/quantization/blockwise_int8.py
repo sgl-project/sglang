@@ -49,7 +49,7 @@ class BlockInt8Config(QuantizationConfig):
         if weight_block_size is not None:
             if not is_checkpoint_int8_serialized:
                 raise ValueError(
-                    f"The block-wise quantization only supports int8-serialized checkpoint for now."
+                    "The block-wise quantization only supports int8-serialized checkpoint for now."
                 )
             if len(weight_block_size) != 2:
                 raise ValueError(

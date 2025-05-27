@@ -263,7 +263,7 @@ class ModelOptFp4Config(QuantizationConfig):
         quant_method = quant_config["quant_algo"]
         if not quant_method in ["FP8", "NVFP4"]:
             raise ValueError(
-                f"ModelOpt currently only supports: FP8, NVFP4"
+                "ModelOpt currently only supports: FP8, NVFP4"
                 " quantizations in sglang. Please check the "
                 "`hf_quant_config.json` file for your model's "
                 "quant configuration."

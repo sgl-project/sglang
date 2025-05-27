@@ -69,7 +69,7 @@ def main():
 
     output = response.json()
     print("===============================")
-    print(f"Output token ids: ", output["output_ids"])
+    print("Output token ids: ", output["output_ids"])
 
     terminate_process(server_process)
 

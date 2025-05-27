@@ -172,12 +172,12 @@ def run_test(tp_size, batch_size, model_config, check=False):
 
     # --- Benchmarking ---
     quantiles = [0.5, 0.2, 0.8]
-    print(f"Benchmarking Cutlass fused_experts...")
+    print("Benchmarking Cutlass fused_experts...")
     cutlass_ms, cutlass_min, cutlass_max = triton.testing.do_bench_cudagraph(
         cutlass_lambda, rep=1000, quantiles=quantiles
     )
 
-    print(f"Benchmarking Triton fused_experts...")
+    print("Benchmarking Triton fused_experts...")
     triton_ms, triton_min, triton_max = triton.testing.do_bench_cudagraph(
         triton_lambda, rep=1000, quantiles=quantiles
     )

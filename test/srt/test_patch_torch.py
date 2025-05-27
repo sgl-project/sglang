@@ -86,7 +86,7 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
 
         for _ in range(len(processes)):
             self.assertTrue(
-                output_reader.recv(), f"Subprocess has error, please see logs above."
+                output_reader.recv(), "Subprocess has error, please see logs above."
             )
 
         for p in processes:

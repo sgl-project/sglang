@@ -1,7 +1,6 @@
 # Adapted from qwen2.py
 
 import logging
-from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -11,8 +10,6 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    split_tensor_along_last_dim,
-    tensor_model_parallel_all_gather,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear

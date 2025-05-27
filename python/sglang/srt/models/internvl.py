@@ -19,7 +19,7 @@ import torch
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/7f62077af5159c625fe3ad1c812e6c1a2b93ba3b/vllm/model_executor/models/internlm2.py
 # Adapted from https://raw.githubusercontent.com/hehesangsj/sglang/refs/heads/internvl/python/sglang/srt/models/internvl.py
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from einops import rearrange
 from sgl_kernel.flash_attn import flash_attn_varlen_func
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel

@@ -132,7 +132,7 @@ def refine_server_args(server_args: ServerArgs, compile_args: CompileArgs):
     # Disable cuda graph and torch compile to save time
     server_args.disable_cuda_graph = True
     server_args.enable_torch_compile = False
-    print(f"Disable CUDA Graph and Torch Compile to save time...")
+    print("Disable CUDA Graph and Torch Compile to save time...")
 
     # Set watchdog timeout to compile_args.timeout because compilation will take a long time
     server_args.watchdog_timeout = compile_args.timeout

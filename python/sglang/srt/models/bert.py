@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-from typing import Any, Dict, Iterable, Optional, Set, Tuple
+from typing import Iterable, Optional, Set, Tuple
 
 import torch
 from torch import nn
@@ -11,7 +11,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
+from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -332,7 +332,7 @@ class BertModel(nn.Module):
         self.config = config
         self.embeddings = BertEmbedding(config)
         self.encoder = BertEncoder(
-            config=config, quant_config=quant_config, prefix=f"encoder"
+            config=config, quant_config=quant_config, prefix="encoder"
         )
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         # self.pooler = BertPooler(config)

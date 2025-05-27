@@ -42,7 +42,7 @@ class HiRadixCache(RadixCache):
                 self.kv_cache, hicache_ratio, hicache_size, page_size
             )
         else:
-            raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
+            raise ValueError("HiRadixCache only supports MHA and MLA yet")
 
         self.tp_group = tp_cache_group
 

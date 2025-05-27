@@ -74,7 +74,7 @@ def run():
     _log(f"{prompt=} {output=}")
 
     fragment.shutdown()
-    _log(f"End script")
+    _log("End script")
 
 
 if __name__ == "__main__":

@@ -108,7 +108,7 @@ class TestExpertLocationUpdater(CustomTestCase):
 
         for _ in range(num_gpus):
             self.assertTrue(
-                output_reader.recv(), f"Subprocess has error, please see logs above."
+                output_reader.recv(), "Subprocess has error, please see logs above."
             )
 
         for p in processes:
@@ -246,7 +246,7 @@ def _execute_test(info: _TestInfo, rank: int, num_gpus: int, device: str):
 
             if rank == 0:
                 print("\n\n".join(global_messages), flush=True)
-            raise AssertionError(f"Error happens, see logs above")
+            raise AssertionError("Error happens, see logs above")
 
         physical_to_logical_map = new_physical_to_logical_map
 

@@ -95,12 +95,12 @@ def main():
         result = benchmark_sequential_vs_batch(all_prompts, batch_size, tokenizer)
         results.append(result)
 
-        print(f"  Sequential tokenization (encode):")
+        print("  Sequential tokenization (encode):")
         for i, run_time in enumerate(result["sequential_runs"]):
             print(f"    Run {i+1}: {run_time:.2f} ms")
         print(f"    Average: {result['avg_sequential_ms']:.2f} ms")
 
-        print(f"  Batch tokenization (tokenizer):")
+        print("  Batch tokenization (tokenizer):")
         for i, run_time in enumerate(result["batch_runs"]):
             print(f"    Run {i+1}: {run_time:.2f} ms")
         print(f"    Average: {result['avg_batch_ms']:.2f} ms")

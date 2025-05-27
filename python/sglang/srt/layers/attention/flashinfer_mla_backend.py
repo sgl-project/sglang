@@ -720,7 +720,7 @@ class FlashInferMLAMultiStepDraftBackend:
 
         if topk > 1:
             raise ValueError(
-                f"Currently Flashinfer MLA only supports topk=1 for speculative decoding"
+                "Currently Flashinfer MLA only supports topk=1 for speculative decoding"
             )
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps

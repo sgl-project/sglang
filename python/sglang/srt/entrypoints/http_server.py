@@ -858,7 +858,7 @@ def _wait_and_warmup(
             )
             assert res.status_code == 200, f"{res}"
         else:
-            logger.info(f"Start of prefill warmup ...")
+            logger.info("Start of prefill warmup ...")
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,

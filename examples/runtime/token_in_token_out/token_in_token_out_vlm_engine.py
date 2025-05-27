@@ -57,7 +57,7 @@ def token_in_out_example(
     )
 
     print("===============================")
-    print(f"Output token ids: ", output["output_ids"])
+    print("Output token ids: ", output["output_ids"])
 
     backend.shutdown()
 

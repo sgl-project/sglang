@@ -93,7 +93,7 @@ class TestStaticEPLB(CustomTestCase):
                 # enable_expert_distribution_metrics=True,
             )
 
-            print(f"Action: start engine")
+            print("Action: start engine")
             os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR"] = tmp_dir
             engine = sgl.Engine(
                 **engine_kwargs,
@@ -102,17 +102,17 @@ class TestStaticEPLB(CustomTestCase):
             engine.start_expert_distribution_record()
             self._assert_engine_generate_correct(engine)
 
-            print(f"Action: dump_expert_distribution_record")
+            print("Action: dump_expert_distribution_record")
             engine.dump_expert_distribution_record()
             snapshot_path = list(Path(tmp_dir).glob("*.pt"))[0]
             assert snapshot_path is not None
             print(f"{snapshot_path=}")
 
-            print(f"Action: shutdown engine")
+            print("Action: shutdown engine")
             engine.shutdown()
             del engine
 
-            print(f"Action: start engine with init_expert_location")
+            print("Action: start engine with init_expert_location")
             engine = sgl.Engine(
                 **engine_kwargs,
                 init_expert_location=str(snapshot_path),
@@ -121,7 +121,7 @@ class TestStaticEPLB(CustomTestCase):
                 ep_dispatch_algorithm="static",
             )
             self._assert_engine_generate_correct(engine)
-            print(f"Action: shutdown engine")
+            print("Action: shutdown engine")
             engine.shutdown()
             del engine
 

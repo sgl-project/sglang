@@ -16,9 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/mixtral.py#L1
 """Inference-only Grok1 model."""
 import functools
-import json
 import logging
-import math
 import os
 import warnings
 from typing import Iterable, Optional, Tuple

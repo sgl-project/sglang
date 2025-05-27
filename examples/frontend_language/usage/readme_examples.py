@@ -32,7 +32,7 @@ def tip_suggestion(s):
     forks = s.fork(2)
     for i, f in enumerate(forks):
         f += f"Now, expand tip {i+1} into a paragraph:\n"
-        f += sgl.gen(f"detailed_tip", max_tokens=256, stop="\n\n")
+        f += sgl.gen("detailed_tip", max_tokens=256, stop="\n\n")
 
     s += "Tip 1:" + forks[0]["detailed_tip"] + "\n"
     s += "Tip 2:" + forks[1]["detailed_tip"] + "\n"

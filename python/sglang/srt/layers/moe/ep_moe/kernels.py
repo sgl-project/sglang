@@ -18,7 +18,7 @@ if _is_cuda:
     try:
         from deep_gemm import ceil_div
     except ImportError:
-        logger.error(f"Failed to import ceil_div from deep_gemm.")
+        logger.error("Failed to import ceil_div from deep_gemm.")
 
 import triton.language as tl
 

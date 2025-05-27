@@ -111,7 +111,7 @@ class TestTracing(CustomTestCase):
             forks = s.fork(3)
             for i in range(3):
                 forks[i] += f"Now, expand tip {i+1} into a paragraph:\n"
-                forks[i] += sgl.gen(f"detailed_tip")
+                forks[i] += sgl.gen("detailed_tip")
 
             s += "Tip 1:" + forks[0]["detailed_tip"] + "\n"
             s += "Tip 2:" + forks[1]["detailed_tip"] + "\n"
