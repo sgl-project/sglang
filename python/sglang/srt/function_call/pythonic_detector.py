@@ -32,12 +32,21 @@ class PythonicDetector(BaseFormatDetector):
             re.DOTALL,
         )
 
+    @staticmethod
+    def _text_strip(text: str) -> str:
+        # Llama 4 model sometime will output <|python_start|> and <|python_end|> tokens
+        # remove those tokens
+        text = text.replace("<|python_start|>", "")
+        text = text.replace("<|python_end|>", "")
+        return text
+
     def has_tool_call(self, text: str) -> bool:
-        return bool(self.tool_call_regex.match(text.strip()))
+        return bool(self.tool_call_regex.match(self._text_strip(text.strip())))
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         # Try parsing the text as a Python list of function calls
         text = text.strip()
+        text = self._text_strip(text)
         if not (text.startswith("[") and text.endswith("]")):
             # Not a pythonic tool call format
             return StreamingParseResult(normal_text=text, calls=[])
@@ -104,6 +113,9 @@ class PythonicDetector(BaseFormatDetector):
         Buffers input until a complete pythonic tool call (from [ to ]) is found,
         then parses and emits any detected calls.
         """
+        # remove unexpected <|python_start|> and <|python_end|> for llama4
+        new_text = self._text_strip(new_text)
+
         self._buffer += new_text
         start = self._buffer.find("[")
 

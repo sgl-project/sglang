@@ -264,6 +264,47 @@ class TestPythonicDetector(unittest.TestCase):
         self.assertEqual(params["location"], "Tokyo")
         self.assertEqual(params["data"], [1, 2, 3])
 
+    def test_parse_streaming_with_python_start_and_end_token(self):
+        """Test parsing a message that starts with <|python_start|> and <|python_end|> across chunks."""
+        text1 = (
+            "Here's a call: <|python_start|>[get_weather(location='Tokyo', data=[1, 2"
+        )
+        result1 = self.detector.parse_streaming_increment(text1, self.tools)
+
+        self.assertEqual(result1.normal_text, "Here's a call: ")
+        self.assertEqual(result1.calls, [])
+        self.assertEqual(
+            self.detector._buffer, "[get_weather(location='Tokyo', data=[1, 2"
+        )
+
+        text2 = ", 3])]<|python_end|>"
+        result2 = self.detector.parse_streaming_increment(text2, self.tools)
+
+        self.assertEqual(result2.normal_text, "")
+        self.assertEqual(len(result2.calls), 1)
+        self.assertEqual(result2.calls[0].name, "get_weather")
+        self.assertEqual(self.detector._buffer, "")
+
+        # Check the parameters
+        params = json.loads(result2.calls[0].parameters)
+        self.assertEqual(params["location"], "Tokyo")
+        self.assertEqual(params["data"], [1, 2, 3])
+
+    def test_detect_and_parse_with_python_start_and_end_token(self):
+        """Test parsing a message that starts with <|python_start|> and contains a valid tool call."""
+        text = "   <|python_start|>[get_weather(location='Mars', unit='celsius')]<|python_end|>  "
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(self.detector._buffer, "")
+
+        # Check the parameters
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["location"], "Mars")
+        self.assertEqual(params["unit"], "celsius")
+
 
 class TestMistralDetector(unittest.TestCase):
     def setUp(self):
