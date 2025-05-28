@@ -2253,6 +2253,7 @@ class Scheduler(
         self.torch_profiler = None
         self.torch_profiler_output_dir = None
         self.profiler_activities = None
+        self.profiler_target_forward_ct = None
 
         return ProfileReqOutput(success=True, message="Succeeded")
 

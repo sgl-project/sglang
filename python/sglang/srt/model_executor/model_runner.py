@@ -73,8 +73,8 @@ from sglang.srt.mem_cache.memory_pool import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
-from sglang.srt.model_executor import expert_location_updater
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import (
@@ -269,6 +269,7 @@ class ModelRunner:
             if self.server_args.enable_eplb and (not self.is_draft_worker)
             else None
         )
+        self.expert_location_updater = ExpertLocationUpdater()
 
         # Load the model
         self.sampler = Sampler()
@@ -602,7 +603,7 @@ class ModelRunner:
     def update_expert_location(
         self, new_expert_location_metadata: ExpertLocationMetadata
     ):
-        expert_location_updater.update_expert_location(
+        self.expert_location_updater.update(
             self.model.routed_experts_weights_of_layer,
             new_expert_location_metadata,
             nnodes=self.server_args.nnodes,
