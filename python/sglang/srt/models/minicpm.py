@@ -15,7 +15,8 @@
 
 import math
 import warnings
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from functools import lru_cache
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from cachetools import Cache
@@ -27,6 +28,11 @@ from transformers.utils import is_flash_attn_greater_or_equal_2_10
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attention.native_sparse_attention import (
+    CompressedAttention,
+    _get_attention_score,
+    transform_score,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -255,7 +261,6 @@ class CompressKV(torch.nn.Module):
             kernel_size: 每个chunk的大小
             compress_func: 压缩方式（如meanpool, mlp, conv1d等）
             add_pos_embed: 是否添加位置编码
-            stride: 分块时的步长
         """
         super().__init__()
         self.kernel_size = kernel_size
@@ -840,7 +845,7 @@ def compressed_attention(
     return attn_output, topk_idx
 
 
-class MiniCPMFlashAttention2(MiniCPMAttention):
+class MiniCPMFlashAttention2(nn.Module):
     """
     MiniCPM flash attention module. This module inherits from `MiniCPMAttention` as the weights of the module stays
     untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
@@ -906,9 +911,7 @@ class MiniCPMFlashAttention2(MiniCPMAttention):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         attention_mask: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
-        use_cache: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         # MiniCPMFlashAttention2 attention does not support output_attentions
@@ -1140,7 +1143,6 @@ class MiniCPMFlashAttention2(MiniCPMAttention):
         cu_seqlens_k,
         max_seqlen_in_batch_q,
         max_seqlen_in_batch_k,
-        original_hidden_states=None,
     ):
         kv = torch.stack((key_layer, value_layer), dim=1)
         compressed_k, compressed_v, compressed_cu_seqlens = self.compress_kv(
@@ -1163,55 +1165,6 @@ class MiniCPMFlashAttention2(MiniCPMAttention):
             init_blocks=self.init_blocks,
             local_blocks=self.local_blocks,
         )
-        if (
-            globals()["debug_token"] == globals()["token_now"]
-            and globals()["save_no_cache"]
-        ):
-            torch.save(
-                compressed_attn_output,
-                "/home/zhouzihan/project/LongContext/patch_nsa_model/.vscode/debug_kvcache/no_cache/compressed_attn_output.pt",
-            )
-            torch.save(
-                topk_idx,
-                "/home/zhouzihan/project/LongContext/patch_nsa_model/.vscode/debug_kvcache/no_cache/topk_idx.pt",
-            )
-            torch.save(
-                compressed_k,
-                "/home/zhouzihan/project/LongContext/patch_nsa_model/.vscode/debug_kvcache/no_cache/compressed_k.pt",
-            )
-            torch.save(
-                compressed_v,
-                "/home/zhouzihan/project/LongContext/patch_nsa_model/.vscode/debug_kvcache/no_cache/compressed_v.pt",
-            )
-            torch.save(
-                compressed_cu_seqlens,
-                "/home/zhouzihan/project/LongContext/patch_nsa_model/.vscode/debug_kvcache/no_cache/compressed_cu_seqlens.pt",
-            )
-            torch.save(
-                compressed_seqlens,
-                "/home/zhouzihan/project/LongContext/patch_nsa_model/.vscode/debug_kvcache/no_cache/compressed_seqlens.pt",
-            )
-            torch.save(
-                cu_seqlens_q,
-                "/home/zhouzihan/project/LongContext/patch_nsa_model/.vscode/debug_kvcache/no_cache/cu_seqlens_q.pt",
-            )
-            torch.save(
-                cu_seqlens_k,
-                "/home/zhouzihan/project/LongContext/patch_nsa_model/.vscode/debug_kvcache/no_cache/cu_seqlens_k.pt",
-            )
-            torch.save(
-                query_layer,
-                "/home/zhouzihan/project/LongContext/patch_nsa_model/.vscode/debug_kvcache/no_cache/query_layer.pt",
-            )
-            torch.save(
-                key_layer,
-                "/home/zhouzihan/project/LongContext/patch_nsa_model/.vscode/debug_kvcache/no_cache/key_layer.pt",
-            )
-            torch.save(
-                value_layer,
-                "/home/zhouzihan/project/LongContext/patch_nsa_model/.vscode/debug_kvcache/no_cache/value_layer.pt",
-            )
-        # raise ValueError('debug')
         # topk_idx_np = topk_idx.cpu().numpy()
 
         # # 设置numpy的打印选项，这里将阈值设为1000000
@@ -1276,27 +1229,6 @@ class MiniCPMFlashAttention2(MiniCPMAttention):
             gate_scores[..., 0:1] * compressed_attn_output  # topk_attn_output
             + gate_scores[..., 1:2] * topk_attn_output
         )
-        if (
-            globals()["debug_token"] == globals()["token_now"]
-            and globals()["save_no_cache"]
-        ):
-            torch.save(
-                topk_attn_output,
-                "/home/zhouzihan/project/LongContext/patch_nsa_model/.vscode/debug_kvcache/no_cache/topk_attn_output.pt",
-            )
-            torch.save(
-                gate_scores,
-                "/home/zhouzihan/project/LongContext/patch_nsa_model/.vscode/debug_kvcache/no_cache/gate_scores.pt",
-            )
-            torch.save(
-                gate_input,
-                "/home/zhouzihan/project/LongContext/patch_nsa_model/.vscode/debug_kvcache/no_cache/gate_input.pt",
-            )
-            torch.save(
-                attn_output,
-                "/home/zhouzihan/project/LongContext/patch_nsa_model/.vscode/debug_kvcache/no_cache/attn_output.pt",
-            )
-            raise ValueError("debug")
         del (
             gate_input,
             compressed_attn_output,
