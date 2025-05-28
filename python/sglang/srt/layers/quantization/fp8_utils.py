@@ -29,12 +29,14 @@ from sglang.srt.utils import (
     get_cuda_version,
     get_device_capability,
     is_cuda,
+    is_flashinfer_available,
     is_hip,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
+
 
 use_aiter_moe = get_bool_env_var("SGLANG_AITER_MOE")
 
@@ -112,7 +114,7 @@ def normalize_e4m3fn_to_e4m3fnuz(
 
 
 def cutlass_block_fp8_supported() -> bool:
-    if not get_bool_env_var("SUPPORT_CUTLASS_BLOCK_FP8"):
+    if not get_bool_env_var("SGLANG_SUPPORT_CUTLASS_BLOCK_FP8"):
         return False
     if _is_cuda:
         major, minor = torch.cuda.get_device_capability()
