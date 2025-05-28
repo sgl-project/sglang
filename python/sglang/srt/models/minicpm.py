@@ -19,11 +19,9 @@ from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
-from cachetools import Cache
 from einops import rearrange
 from torch import nn
-from transformers import DynamicCache
-from transformers.modeling_flash_attention_utils import flash_attn_func
+from transformers import Cache, DynamicCache, PretrainedConfig
 from transformers.utils import is_flash_attn_greater_or_equal_2_10
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
@@ -102,6 +100,7 @@ class MiniCPMAttention(nn.Module):
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        **kwargs,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -167,6 +166,7 @@ class MiniCPMAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        **kwargs,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -516,7 +516,7 @@ class DynamicCacheQKV(DynamicCache):
         layer_idx: int,
         cache_kwargs: Optional[Dict[str, Any]] = None,
         query_states: torch.Tensor = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Updates the cache with the new `key_states` and `value_states` for the layer `layer_idx`.
 
@@ -863,8 +863,11 @@ class MiniCPMFlashAttention2(nn.Module):
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        config: PretrainedConfig = None,
     ):
         super().__init__()
+
+        self.config = config
 
         # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
         # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignment, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
@@ -875,7 +878,7 @@ class MiniCPMFlashAttention2(nn.Module):
         self.kernel_stride = 16
         compress_type = "meanpool"
         self.init_blocks = 1
-
+        self.layer_idx = layer_id
         self.block_size = 64
 
         self.window_size = 2048
@@ -883,6 +886,22 @@ class MiniCPMFlashAttention2(nn.Module):
         self.local_blocks = self.window_size // self.block_size
         # local_blocks
         self.topk = 32
+        self.hidden_size = hidden_size
+        tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_kv_heads >= tp_size:
+            # Number of KV heads is greater than TP size, so we partition
+            # the KV heads across multiple tensor parallel GPUs.
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            # Number of KV heads is less than TP size, so we replicate
+            # the KV heads across multiple tensor parallel GPUs.
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.head_dim = hidden_size // self.total_num_heads
         self.gate_proj = torch.nn.Sequential(
             torch.nn.Linear(self.head_dim, 2),  # 对应三个专家
             torch.nn.Sigmoid(),
@@ -895,9 +914,9 @@ class MiniCPMFlashAttention2(nn.Module):
             rope_scaling=rope_scaling,
         )
         # set rope as fp32 instead of bf16
-        self.rotary_emb.cos_sin_cache = self.rotary_emb._compute_cos_sin_cache()
+        # self.rotary_emb.cos_sin_cache = self.rotary_emb._compute_cos_sin_cache()
         self.compress_kv = CompressKV(
-            self.num_key_value_heads,
+            self.num_kv_heads,
             self.head_dim,
             compress_func=compress_type,
             kernel_size=self.kernel_size,
@@ -905,13 +924,39 @@ class MiniCPMFlashAttention2(nn.Module):
             add_pos_embed=False,
         )
 
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
+        )
+
+        # TODO: check this
+        self.is_causal = True
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         attention_mask: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_value: Optional[DynamicCacheQKV] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         # MiniCPMFlashAttention2 attention does not support output_attentions
@@ -923,59 +968,64 @@ class MiniCPMFlashAttention2(nn.Module):
             # overwrite attention_mask with padding_mask
             attention_mask = kwargs.pop("padding_mask")
 
+        hidden_states = hidden_states.unsqueeze(0)
         bsz, q_len, _ = hidden_states.size()
         assert bsz == 1, "现在只支持batch_size=1"
 
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        # q = self.q_proj(hidden_states)
+        # k = self.k_proj(hidden_states)
+        # v = self.v_proj(hidden_states)
+
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Flash attention requires the input to have the shape
         # batch_size x seq_length x head_dim x hidden_dim
         # therefore we just need to keep the original shape
         q = q.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        k = k.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = k.shape[-2]
-        # if past_key_value is not None:
-        #     kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(v.to(torch.float32), seq_len=kv_seq_len)
+        if past_key_value is not None:
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        cos, sin = self.rotary_emb(
+            positions=positions,
+            query=q,
+            key=k,
+            # TODO: offsets?
+            # v.to(torch.float32),
+            # seq_len=kv_seq_len
+        )
+
+        print(f"{past_key_value=}")
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+            new_k = k
+            new_v = v
+            new_q = q
+            try:
+                past_k, past_v, past_q = past_key_value.__getitem__(self.layer_idx)
+            except Exception as e:
+                print(f"exception: {e}")
+                # If the cache is empty, we need to create a new one
+                past_k, past_v, past_q = k, v, q
+                new_k, new_v = None, None
+
+            k, v, q = past_key_value.update(
+                k, v, self.layer_idx, cache_kwargs, query_states=q
+            )
+
         # if key_states.shape[-2] == 1:  #这里是possition ids的问题
         #     position_ids = torch.tensor([[kv_seq_len-1]], device=key_states.device, dtype=position_ids.dtype)
         #     # breakpoint()
-
-        q, k = q.float(), k.float()
-        q, k = self.rotary_emb(positions, q, k)
-
-        # if past_key_value is not None:
-
-        cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-        new_k = k
-        new_v = v
-        new_q = q
-        try:
-            past_k, past_v, past_q = past_key_value.__getitem__(self.layer_idx)
-        except Exception as e:
-            # If the cache is empty, we need to create a new one
-            past_k, past_v, past_q = k, v, q
-            new_k, new_v = None, None
-
-        k, v, q = past_key_value.update(
-            k,
-            v,
-            self.layer_idx,
-            cache_kwargs,
-            query_states=q,
-        )
 
         # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
         # to be able to avoid many of these transpose/reshape/view.
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-
-        dropout_rate = self.attention_dropout if self.training else 0.0
 
         # In PEFT, usually we cast the layer norms in float32 for training stability reasons
         # therefore the input hidden states gets silently casted in float32. Hence, we need
@@ -989,17 +1039,17 @@ class MiniCPMFlashAttention2(nn.Module):
             if hasattr(self.config, "_pre_quantization_dtype"):
                 target_dtype = self.config._pre_quantization_dtype
             else:
-                target_dtype = self.q_proj.weight.dtype
+                target_dtype = next(self.qkv_proj.parameters()).dtype
 
-        logger.warning_once(
-            f"The input hidden states seems to be silently casted in float32, this might be related to"
-            f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
-            f" {target_dtype}."
-        )
+            logger.warning_once(
+                f"The input hidden states seems to be silently casted in float32, this might be related to"
+                f" the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in"
+                f" {target_dtype}."
+            )
 
-        q = q.to(target_dtype)
-        k = k.to(target_dtype)
-        v = v.to(target_dtype)
+            q = q.to(target_dtype)
+            k = k.to(target_dtype)
+            v = v.to(target_dtype)
         # if past_key_value is None or new_k is None:
         #     attn_output = self._flash_attention_forward(
         #         query_states,
@@ -1018,7 +1068,6 @@ class MiniCPMFlashAttention2(nn.Module):
             v,
             attention_mask,
             q_len,
-            dropout=dropout_rate,
             original_hidden_states=hidden_states,
             past_k=past_k,
             past_v=past_v,
@@ -1067,69 +1116,70 @@ class MiniCPMFlashAttention2(nn.Module):
             softmax_scale (`float`, *optional*):
                 The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
         """
+        # assert new_k is not None
         if not self._flash_attn_uses_top_left_mask:
             causal = self.is_causal
         else:
             # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in MiniCPMFlashAttention2 __init__.
             causal = self.is_causal and query_length != 1
         # Contains at least one padding token in the sequence
-        if attention_mask is not None:
-            query_length = query_states.shape[1]
-            batch_size = query_states.shape[0]
+        # if attention_mask is not None:
+        query_length = query_states.shape[1]
+        batch_size = query_states.shape[0]
 
-            # query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-            #     query_states, key_states, value_states, attention_mask, query_length=query_length
-            # )
+        # query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
+        #     query_states, key_states, value_states, attention_mask, query_length=query_length
+        # )
 
-            # ! 这里的attention_mask是没有包括最后一个,所以不准
-            assert batch_size == 1, "现在只支持batch_size=1"
-            query_states = query_states.squeeze(0)
-            key_states = key_states.squeeze(0)
-            value_states = value_states.squeeze(0)
-            original_hidden_states = original_hidden_states.squeeze(0)
-            cu_seqlens_q = cu_seqlens_k = torch.tensor(
-                [0, query_length], device=query_states.device, dtype=torch.int32
-            )
-            max_seqlen_in_batch_q = max_seqlen_in_batch_k = query_length
-            attn_output = self.nsa_forward_with_kv_cache(
-                query_states,
-                key_states,
-                value_states,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_in_batch_q,
-                max_seqlen_in_batch_k,
-                original_hidden_states=original_hidden_states,
-                past_k=past_k,
-                past_v=past_v,
-                new_k=new_k,
-                new_v=new_v,
-                new_q=new_q,
-                batch_size=batch_size,
-            )
-            # attn_output_unpad = flash_attn_varlen_func(
-            #     query_states,
-            #     key_states,
-            #     value_states,
-            #     cu_seqlens_q=cu_seqlens_q,
-            #     cu_seqlens_k=cu_seqlens_k,
-            #     max_seqlen_q=max_seqlen_in_batch_q,
-            #     max_seqlen_k=max_seqlen_in_batch_k,
-            #     dropout_p=dropout,
-            #     softmax_scale=softmax_scale,
-            #     causal=causal,
-            # )
+        # ! 这里的attention_mask是没有包括最后一个,所以不准
+        assert batch_size == 1, "现在只支持batch_size=1"
+        query_states = query_states.squeeze(0)
+        key_states = key_states.squeeze(0)
+        value_states = value_states.squeeze(0)
+        original_hidden_states = original_hidden_states.squeeze(0)
+        cu_seqlens_q = cu_seqlens_k = torch.tensor(
+            [0, query_length], device=query_states.device, dtype=torch.int32
+        )
+        max_seqlen_in_batch_q = max_seqlen_in_batch_k = query_length
+        attn_output = self.nsa_forward_with_kv_cache(
+            query_states,
+            key_states,
+            value_states,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_in_batch_q,
+            max_seqlen_in_batch_k,
+            original_hidden_states=original_hidden_states,
+            past_k=past_k,
+            past_v=past_v,
+            new_k=new_k,
+            new_v=new_v,
+            new_q=new_q,
+            batch_size=batch_size,
+        )
+        # attn_output_unpad = flash_attn_varlen_func(
+        #     query_states,
+        #     key_states,
+        #     value_states,
+        #     cu_seqlens_q=cu_seqlens_q,
+        #     cu_seqlens_k=cu_seqlens_k,
+        #     max_seqlen_q=max_seqlen_in_batch_q,
+        #     max_seqlen_k=max_seqlen_in_batch_k,
+        #     dropout_p=dropout,
+        #     softmax_scale=softmax_scale,
+        #     causal=causal,
+        # )
 
-            # attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
-        else:
-            attn_output = flash_attn_func(
-                query_states,
-                key_states,
-                value_states,
-                dropout,
-                softmax_scale=softmax_scale,
-                causal=causal,
-            )
+        # attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
+        # else:
+        #     attn_output = flash_attn_func(
+        #         query_states,
+        #         key_states,
+        #         value_states,
+        #         dropout,
+        #         softmax_scale=softmax_scale,
+        #         causal=causal,
+        #     )
 
         return attn_output
 
@@ -1280,6 +1330,7 @@ class MiniCPMFlashAttention2(nn.Module):
             init_blocks=self.init_blocks,
             local_blocks=self.local_blocks,
         )
+        # assert new_k is not None
         compressed_attn_output = compressed_attn_output[-1].unsqueeze(0).unsqueeze(0)
         # raise ValueError('debug')
         # topk_idx_np = topk_idx.cpu().numpy()
@@ -1344,10 +1395,10 @@ class MiniCPMFlashAttention2(nn.Module):
         # past_k = key_layer.unsqueeze(0)[:, :-1].contiguous()
         # past_v = value_layer.unsqueeze(0)[:, :-1].contiguous()
         past_k = torch.cat(
-            [past_k, torch.zeros_like(new_k, dtype=new_k.dtype)], dim=1
+            [past_k, torch.zeros_like(new_k, dtype=query_layer.dtype)], dim=1
         )  # 填充多一个
         past_v = torch.cat(
-            [past_v, torch.zeros_like(new_v, dtype=new_v.dtype)], dim=1
+            [past_v, torch.zeros_like(new_v, dtype=value_layer.dtype)], dim=1
         )  # 填充多一个
         # TODO: triton kernel for qvk
         topk_attn_output, softmax_lse = block_sparse_attn_kvcache_func(
@@ -1498,6 +1549,8 @@ class MiniCPMDecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        # FIXME: for testing
+        config._attn_implementation = "flash_attention_2"
         self.self_attn = MINICPM_ATTENTION_CLASSES[config._attn_implementation](
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -1508,6 +1561,7 @@ class MiniCPMDecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
+            config=config,
         )
         self.mlp = MiniCPMMLP(
             hidden_size=self.hidden_size,
@@ -1527,6 +1581,7 @@ class MiniCPMDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         residual = hidden_states
@@ -1535,6 +1590,7 @@ class MiniCPMDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            past_key_value=past_key_value,
         )
         hidden_states = residual + hidden_states * (
             self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
@@ -1580,6 +1636,11 @@ class MiniCPMModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # past_key_values_length = past_key_values.get_usable_length(seq_length)
+        # if past_key_values_length == 0:
+        self.past_key_values = DynamicCacheQKV()
+        # else:
+        # assert isinstance(past_key_values, DynamicCacheQKV), "past_key_values must be a DynamicCacheQKV instance"
 
     def forward(
         self,
@@ -1601,6 +1662,7 @@ class MiniCPMModel(nn.Module):
                 hidden_states,
                 forward_batch,
                 residual,
+                past_key_value=self.past_key_values,
             )
         hidden_states = self.norm(hidden_states)
         return hidden_states
