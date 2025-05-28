@@ -7,15 +7,14 @@ import vllm
 from transformers import AutoConfig
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe as fused_moe_vllm
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-    fused_moe as fused_moe_sglang,
-)
-
 from sglang.srt.distributed.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
     init_distributed_environment,
     initialize_model_parallel,
-    destroy_model_parallel,
-    destroy_distributed_environment,
+)
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+    fused_moe as fused_moe_sglang,
 )
 
 
@@ -312,7 +311,7 @@ def main():
                 world_size=1,
                 rank=0,
             )
-        
+
         init_distributed_environment(
             world_size=1,
             rank=0,
@@ -320,7 +319,7 @@ def main():
             local_rank=0,
             backend="nccl" if torch.cuda.is_available() else "gloo",
         )
-        
+
         initialize_model_parallel(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
