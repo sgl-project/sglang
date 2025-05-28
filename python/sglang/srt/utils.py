@@ -2136,8 +2136,6 @@ def log_info_on_rank0(logger, msg):
 
     if get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
-    else:
-        logger.debug(msg)
 
 
 def load_json_config(data: str):
