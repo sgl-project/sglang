@@ -136,17 +136,6 @@ void grouped_topk_kernel_impl(
   });
 }
 
-inline void _sigmoid(float* __restrict__ out, const float* __restrict__ input, int SIZE) {
-  using fVec = at::vec::Vectorized<float>;
-  const fVec one = fVec(1.f);
-  constexpr int kVecSize = fVec::size();
-  for (int d = 0; d < SIZE; d += kVecSize) {
-    fVec x_fvec = fVec::loadu(input + d);
-    x_fvec = one / (one + x_fvec.neg().exp_u20());
-    x_fvec.store(out + d);
-  }
-}
-
 template <typename scalar_t, int SIZE>
 inline void sigmoid(float* __restrict__ out, const scalar_t* __restrict__ input) {
   using bVec = at::vec::Vectorized<scalar_t>;
@@ -188,7 +177,8 @@ void topk_sigmoid_kernel_impl(
     int32_t* __restrict__ topk_ids,
     const scalar_t* __restrict__ gating_output,
     int64_t num_tokens,
-    int64_t topk) {
+    int64_t topk,
+    bool renormalize) {
   using Vec = at::vec::Vectorized<float>;
   const int64_t num_experts_per_group = NUM_EXPERTS;
   at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
@@ -215,6 +205,17 @@ void topk_sigmoid_kernel_impl(
       // scalar sigmoid
       topk_weights[i] = 1.0 / (1.0 + exp(0.0 - gmax));
       topk_ids[i] = first_max_idx;
+
+      if (renormalize) {
+        float sum = 0.f;
+        for (int64_t j = 0; j < topk; ++j) {
+          sum += topk_weights[i * topk + j];
+        }
+        float scale = 1.f / sum;
+        for (int64_t j = 0; j < topk; ++j) {
+          topk_weights[i * topk + j] *= scale;
+        }
+      }
     }
   });
 }
@@ -407,7 +408,8 @@ void biased_grouped_topk_kernel_impl(
       topk_ids.data_ptr<int32_t>(),       \
       gating_output.data_ptr<scalar_t>(), \
       num_tokens,                         \
-      topk);
+      topk,                               \
+      renormalize);
 
 #define LAUNCH_TOPK_SOFTMAX_KERNEL(NE)    \
   topk_softmax_kernel_impl<scalar_t, NE>( \
@@ -432,7 +434,7 @@ void biased_grouped_topk_kernel_impl(
 }  // anonymous namespace
 
 std::tuple<at::Tensor, at::Tensor>
-topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk) {
+topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize) {
   RECORD_FUNCTION("sgl-kernel::topk_sigmoid_cpu", std::vector<c10::IValue>({hidden_states, gating_output}));
   CHECK_INPUT(gating_output);
 
