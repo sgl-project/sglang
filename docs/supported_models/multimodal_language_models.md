@@ -1,7 +1,6 @@
 # Multimodal Language Models
 
-These models accept multi-modal inputs (e.g., images and text) and generate text output. They augment language models
-with multimodal encoders.
+These models accept multi-modal inputs (e.g., images and text) and generate text output. They augment language models with multimodal encoders.
 
 ## Example launch Command
 
@@ -12,7 +11,18 @@ python3 -m sglang.launch_server \
   --port 30000 \
 ```
 
-## Supporting Metrics
+## Supported models
+
+Below the supported models are summarized in a table.
+
+If you are unsure if a specific architecture is implemented, you can search for it via GitHub. For example, to search for `Qwen2_5_VLForConditionalGeneration`, use the expression:
+
+```
+repo:sgl-project/sglang path:/^python\/sglang\/srt\/models\// Qwen2_5_VLForConditionalGeneration
+```
+
+in the GitHub search bar.
+
 
 | Model Family (Variants)    | Example HuggingFace Identifier             | Chat Template    | Description                                                                                                                                                                                                     |
 |----------------------------|--------------------------------------------|------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
