@@ -130,7 +130,6 @@ class BaseFormatDetector(ABC):
         flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
 
         try:
-            # Parse the current tool call directly without building arrays
             try:
                 start_idx = (
                     len(self.bot_token)
