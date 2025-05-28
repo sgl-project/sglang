@@ -392,8 +392,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
             dp_scatter(residual, hidden_states, forward_batch)
-            if hidden_states.shape[0] != 0:
-                hidden_states = layernorm(hidden_states)
+            # print(f"{hidden_states.shape=} {residual.shape=}")
+            hidden_states = layernorm(hidden_states)
         else:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             hidden_states, residual = layernorm(hidden_states, residual)

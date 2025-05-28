@@ -2183,6 +2183,8 @@ def require_mlp_tp_gather(server_args):
             return True
         elif not server_args.enable_dp_lm_head:
             return True
+        elif not server_args.enable_deepep_moe:
+            return False
         else:
             return (
                 server_args.moe_dense_tp_size
