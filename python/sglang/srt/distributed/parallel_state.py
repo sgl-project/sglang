@@ -43,9 +43,12 @@ from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
     is_cuda_alike,
+    is_hip,
     is_npu,
     supports_custom_op,
 )
+
+_is_hip = is_hip()
 
 
 @dataclass
@@ -124,19 +127,37 @@ if supports_custom_op():
         fake_impl=inplace_all_reduce_fake,
     )
 
-    def outplace_all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    def outplace_quick_all_reduce(
+        tensor: torch.Tensor, group_name: str
+    ) -> torch.Tensor:
         assert group_name in _groups, f"Group {group_name} is not found."
         group = _groups[group_name]()
         if group is None:
             raise ValueError(f"Group {group_name} is destroyed.")
-        return group._all_reduce_out_place(tensor)
+        return group._quick_all_reduce_out_place(tensor)
+
+    def outplace_custom_all_reduce(
+        tensor: torch.Tensor, group_name: str
+    ) -> torch.Tensor:
+        assert group_name in _groups, f"Group {group_name} is not found."
+        group = _groups[group_name]()
+        if group is None:
+            raise ValueError(f"Group {group_name} is destroyed.")
+        return group._custom_all_reduce_out_place(tensor)
 
     def outplace_all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
         return torch.empty_like(tensor)
 
     direct_register_custom_op(
-        op_name="outplace_all_reduce",
-        op_func=outplace_all_reduce,
+        op_name="outplace_quick_all_reduce",
+        op_func=outplace_quick_all_reduce,
+        mutates_args=[],
+        fake_impl=outplace_all_reduce_fake,
+    )
+
+    direct_register_custom_op(
+        op_name="outplace_custom_all_reduce",
+        op_func=outplace_custom_all_reduce,
         mutates_args=[],
         fake_impl=outplace_all_reduce_fake,
     )
@@ -191,12 +212,14 @@ class GroupCoordinator:
     device_group: ProcessGroup  # group for device communication
     use_pynccl: bool  # a hint of whether to use PyNccl
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
+    use_quick_allreduce: bool  # a hint of whether to use QuickAllreduce
     use_message_queue_broadcaster: (
         bool  # a hint of whether to use message queue broadcaster
     )
     # communicators are only created for world size > 1
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
+    qr_comm: Optional[Any]  # Quick allreduce communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
 
     def __init__(
@@ -206,6 +229,7 @@ class GroupCoordinator:
         torch_distributed_backend: Union[str, Backend],
         use_pynccl: bool,
         use_custom_allreduce: bool,
+        use_quick_allreduce: bool,
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
         use_npu_communicator: bool,
@@ -245,6 +269,7 @@ class GroupCoordinator:
 
         self.use_pynccl = use_pynccl
         self.use_custom_allreduce = use_custom_allreduce
+        self.use_quick_allreduce = use_quick_allreduce
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
         self.use_npu_communicator = use_npu_communicator
@@ -256,6 +281,9 @@ class GroupCoordinator:
         )
         from sglang.srt.distributed.device_communicators.pynccl import (
             PyNcclCommunicator,
+        )
+        from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+            QuickAllreduce,
         )
 
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
@@ -276,6 +304,20 @@ class GroupCoordinator:
             except Exception as e:
                 logger.warning(
                     f"Setup Custom allreduce failed with {e}. To silence this "
+                    "warning, specify --disable-custom-all-reduce explicitly."
+                )
+
+        self.qr_comm: Optional[QuickAllreduce] = None
+        if use_quick_allreduce and self.world_size > 1 and _is_hip:
+            # Initialize a quick all-reduce implementation when rocm >= gfx942
+            try:
+                self.qr_comm = QuickAllreduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Setup Quick allreduce failed with {e}. To silence this "
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
 
@@ -410,6 +452,8 @@ class GroupCoordinator:
         a new tensor in the same op. So we need to figure out if the op is
         in-place or out-of-place ahead of time.
         """
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
@@ -433,19 +477,38 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
+        # if rocm, try quick allreduce first, then custom ar.
         if (
+            self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and self.qr_comm.should_quick_ar(input_)
+            and not get_is_capture_mode()
+        ):
+            # print("qr+++++++++++++++++++++++++++++++++++++++++")
+            return torch.ops.sglang.outplace_quick_all_reduce(
+                input_, group_name=self.unique_name
+            )
+        elif (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
         ):
-            return torch.ops.sglang.outplace_all_reduce(
+            return torch.ops.sglang.outplace_custom_all_reduce(
                 input_, group_name=self.unique_name
             )
         else:
             torch.ops.sglang.inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
-    def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
+    def _quick_all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
+        qr_comm = self.qr_comm
+        assert qr_comm is not None
+        assert not qr_comm.disabled
+        out = qr_comm.quick_all_reduce(input_)
+        assert out is not None
+        return out
+
+    def _custom_all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         ca_comm = self.ca_comm
         assert ca_comm is not None
         assert not ca_comm.disabled
@@ -936,6 +999,8 @@ class GroupCoordinator:
             self.cpu_group = None
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
+        if self.qr_comm is not None:
+            self.qr_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
         if self.mq_broadcaster is not None:
@@ -959,6 +1024,7 @@ def init_world_group(
         torch_distributed_backend=backend,
         use_pynccl=False,
         use_custom_allreduce=False,
+        use_quick_allreduce=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,
@@ -971,17 +1037,21 @@ def init_model_parallel_group(
     local_rank: int,
     backend: str,
     use_custom_allreduce: Optional[bool] = None,
+    use_quick_allreduce: Optional[bool] = None,
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
+    if use_quick_allreduce is None:
+        use_quick_allreduce = _ENABLE_QUICK_ALL_REDUCE
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
         use_pynccl=not is_npu(),
         use_custom_allreduce=use_custom_allreduce,
+        use_quick_allreduce=use_quick_allreduce,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
         use_npu_communicator=True,
@@ -1037,11 +1107,17 @@ def graph_capture():
 logger = logging.getLogger(__name__)
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
+_ENABLE_QUICK_ALL_REDUCE = True
 
 
 def set_custom_all_reduce(enable: bool):
     global _ENABLE_CUSTOM_ALL_REDUCE
     _ENABLE_CUSTOM_ALL_REDUCE = enable
+
+
+def set_quick_all_reduce(enable: bool):
+    global _ENABLE_QUICK_ALL_REDUCE
+    _ENABLE_QUICK_ALL_REDUCE = enable
 
 
 def init_distributed_environment(
@@ -1174,6 +1250,7 @@ def initialize_model_parallel(
         get_world_group().local_rank,
         backend,
         use_custom_allreduce=False,
+        use_quick_allreduce=False,
         group_name="pp",
     )
 

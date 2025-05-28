@@ -13,10 +13,11 @@ from torch.distributed import ProcessGroup
 from typing_extensions import ParamSpec
 
 from sglang.srt import _custom_ops as ops
-from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
-from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+from sglang.srt.distributed.device_communicators.all_reduce_utils import (
     gpu_p2p_access_check,
+    is_full_nvlink,
 )
+from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -25,23 +26,6 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
-if _is_cuda:
-    try:
-        import pynvml
-    except ImportError as e:
-        logger.warning("Failed to import pynvml with %r", e)
-
-if _is_hip:
-    try:
-        from amdsmi import (
-            AmdSmiException,
-            amdsmi_get_processor_handles,
-            amdsmi_init,
-            amdsmi_shut_down,
-            amdsmi_topo_get_link_type,
-        )
-    except ImportError as e:
-        logger.warning("Failed to import amdsmi with %r", e)
 
 try:
     if ops.use_vllm_custom_allreduce and not _is_hip:
@@ -56,70 +40,6 @@ except Exception:
     custom_ar = False
 
 logger = logging.getLogger(__name__)
-
-_P = ParamSpec("_P")
-_R = TypeVar("_R")
-
-
-def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
-    @wraps(fn)
-    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-        if _is_hip:
-            try:
-                amdsmi_init()
-                return fn(*args, **kwargs)
-            finally:
-                amdsmi_shut_down()
-        else:
-            pynvml.nvmlInit()
-            try:
-                return fn(*args, **kwargs)
-            finally:
-                pynvml.nvmlShutdown()
-
-    return wrapper
-
-
-@with_nvml_context
-def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
-    if _is_hip:
-        """
-        query if the set of gpus are fully connected by xgmi (1 hop)
-        """
-        handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
-        for i, handle in enumerate(handles):
-            for j, peer_handle in enumerate(handles):
-                if i < j:
-                    try:
-                        link_type = amdsmi_topo_get_link_type(handle, peer_handle)
-                        # type is 2 for XGMI
-                        if link_type["hops"] != 1 or link_type["type"] != 2:
-                            return False
-                    except AmdSmiException as error:
-                        logger.error("AMD 1 hop XGMI detection failed.", exc_info=error)
-                        return False
-        return True
-    else:
-        """
-        query if the set of gpus are fully connected by nvlink (1 hop)
-        """
-        handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
-        for i, handle in enumerate(handles):
-            for j, peer_handle in enumerate(handles):
-                if i < j:
-                    try:
-                        p2p_status = pynvml.nvmlDeviceGetP2PStatus(
-                            handle, peer_handle, pynvml.NVML_P2P_CAPS_INDEX_NVLINK
-                        )
-                        if p2p_status != pynvml.NVML_P2P_STATUS_OK:
-                            return False
-                    except pynvml.NVMLError:
-                        logger.exception(
-                            "NVLink detection failed. This is normal if your"
-                            " machine has no NVLink equipped."
-                        )
-                        return False
-        return True
 
 
 def _can_p2p(rank: int, world_size: int) -> bool:
@@ -169,7 +89,6 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
-
         if not custom_ar:
             # disable because of missing custom allreduce library
             # e.g. in a non-cuda environment

@@ -1,6 +1,6 @@
-#include <hip/hip_runtime.h>
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <hip/hip_runtime.h>
 
 #include "quick_all_reduce.cuh"
 
@@ -19,8 +19,7 @@ void DeviceComms::init(int world_size, int rank) {
   long data_buffer_size = 2 * kMaxProblemSize;
   long total_buffer_size = flags_buffer_size + data_buffer_size;
   data_offset = flags_buffer_size;
-  HIP_CHECK(hipExtMallocWithFlags((void**)&dbuffer, total_buffer_size,
-                                  hipDeviceMallocUncached));
+  HIP_CHECK(hipExtMallocWithFlags((void**)&dbuffer, total_buffer_size, hipDeviceMallocUncached));
 
   // Clear the flags buffer.
   hipMemset(dbuffer, 0, flags_buffer_size);
@@ -51,8 +50,7 @@ void DeviceComms::destroy() {
   }
 }
 
-void DeviceComms::open_ipc_handles(
-    std::vector<hipIpcMemHandle_t> const& ipc_handles) {
+void DeviceComms::open_ipc_handles(std::vector<hipIpcMemHandle_t> const& ipc_handles) {
   for (int i = 0; i < world_size; i++) {
     all_buffer_ipc_handles[i] = ipc_handles[i];
   }
@@ -61,15 +59,13 @@ void DeviceComms::open_ipc_handles(
   // Note: For our own rank, we do not need to open a handle.
   for (int i = 0; i < world_size; i++) {
     if (i != rank) {
-      hipIpcOpenMemHandle((void**)&buffer_list[i], all_buffer_ipc_handles[i],
-                          hipIpcMemLazyEnablePeerAccess);
+      hipIpcOpenMemHandle((void**)&buffer_list[i], all_buffer_ipc_handles[i], hipIpcMemLazyEnablePeerAccess);
     } else {
       buffer_list[i] = dbuffer;
     }
   }
 
-  hipMemcpy(dbuffer_list, buffer_list.data(), world_size * sizeof(uint8_t*),
-            hipMemcpyHostToDevice);
+  hipMemcpy(dbuffer_list, buffer_list.data(), world_size * sizeof(uint8_t*), hipMemcpyHostToDevice);
 }
 
 // ============================================================
@@ -77,14 +73,20 @@ void DeviceComms::open_ipc_handles(
 // ============================================================
 template <typename AllReduceKenel, typename T>
 __global__ __quickreduce_launch_bounds__ static void allreduce_prototype(
-    T const* A, T* B, int N, int num_blocks, int world_size, int rank,
-    uint8_t** dbuffer_list, long data_offset, int flag_color) {
+    T const* A,
+    T* B,
+    int N,
+    int num_blocks,
+    int world_size,
+    int rank,
+    uint8_t** dbuffer_list,
+    long data_offset,
+    int flag_color) {
   int block = blockIdx.x;
   int grid = gridDim.x;
 
   while (block < num_blocks) {
-    AllReduceKenel::run(A, B, N, block, num_blocks, world_size, rank,
-                        dbuffer_list, data_offset, flag_color);
+    AllReduceKenel::run(A, B, N, block, num_blocks, world_size, rank, dbuffer_list, data_offset, flag_color);
     block += grid;
   }
 }
@@ -92,38 +94,68 @@ __global__ __quickreduce_launch_bounds__ static void allreduce_prototype(
 // ============================================================
 // DISPATCH
 // ============================================================
-#define TWOSHOT_DISPATCH(__codec)                                             \
-  if (world_size == 2) {                                                      \
-    using LineCodec = __codec<2, T>;                                          \
-    using AllReduceKernel = AllReduceTwoshot<LineCodec, T>;                   \
-    hipLaunchKernelGGL((allreduce_prototype<AllReduceKernel, T>), dim3(grid), \
-                       dim3(kBlock), 0, stream, A, B, N, num_blocks,          \
-                       world_size, rank, dbuffer_list, data_offset,           \
-                       flag_color);                                           \
-  } else if (world_size == 4) {                                               \
-    using LineCodec = __codec<4, T>;                                          \
-    using AllReduceKernel = AllReduceTwoshot<LineCodec, T>;                   \
-    hipLaunchKernelGGL((allreduce_prototype<AllReduceKernel, T>), dim3(grid), \
-                       dim3(kBlock), 0, stream, A, B, N, num_blocks,          \
-                       world_size, rank, dbuffer_list, data_offset,           \
-                       flag_color);                                           \
-  } else if (world_size == 8) {                                               \
-    using LineCodec = __codec<8, T>;                                          \
-    using AllReduceKernel = AllReduceTwoshot<LineCodec, T>;                   \
-    hipLaunchKernelGGL((allreduce_prototype<AllReduceKernel, T>), dim3(grid), \
-                       dim3(kBlock), 0, stream, A, B, N, num_blocks,          \
-                       world_size, rank, dbuffer_list, data_offset,           \
-                       flag_color);                                           \
+#define TWOSHOT_DISPATCH(__codec)                           \
+  if (world_size == 2) {                                    \
+    using LineCodec = __codec<2, T>;                        \
+    using AllReduceKernel = AllReduceTwoshot<LineCodec, T>; \
+    hipLaunchKernelGGL(                                     \
+        (allreduce_prototype<AllReduceKernel, T>),          \
+        dim3(grid),                                         \
+        dim3(kBlock),                                       \
+        0,                                                  \
+        stream,                                             \
+        A,                                                  \
+        B,                                                  \
+        N,                                                  \
+        num_blocks,                                         \
+        world_size,                                         \
+        rank,                                               \
+        dbuffer_list,                                       \
+        data_offset,                                        \
+        flag_color);                                        \
+  } else if (world_size == 4) {                             \
+    using LineCodec = __codec<4, T>;                        \
+    using AllReduceKernel = AllReduceTwoshot<LineCodec, T>; \
+    hipLaunchKernelGGL(                                     \
+        (allreduce_prototype<AllReduceKernel, T>),          \
+        dim3(grid),                                         \
+        dim3(kBlock),                                       \
+        0,                                                  \
+        stream,                                             \
+        A,                                                  \
+        B,                                                  \
+        N,                                                  \
+        num_blocks,                                         \
+        world_size,                                         \
+        rank,                                               \
+        dbuffer_list,                                       \
+        data_offset,                                        \
+        flag_color);                                        \
+  } else if (world_size == 8) {                             \
+    using LineCodec = __codec<8, T>;                        \
+    using AllReduceKernel = AllReduceTwoshot<LineCodec, T>; \
+    hipLaunchKernelGGL(                                     \
+        (allreduce_prototype<AllReduceKernel, T>),          \
+        dim3(grid),                                         \
+        dim3(kBlock),                                       \
+        0,                                                  \
+        stream,                                             \
+        A,                                                  \
+        B,                                                  \
+        N,                                                  \
+        num_blocks,                                         \
+        world_size,                                         \
+        rank,                                               \
+        dbuffer_list,                                       \
+        data_offset,                                        \
+        flag_color);                                        \
   }
 
 template <typename T>
-void DeviceComms::allreduce(int profile, hipStream_t stream, T const* A, T* B,
-                            int N) {
-  static_assert(sizeof(T) == 2,
-                "Template parameter T must be 16 bits (2 bytes) in size.");
+void DeviceComms::allreduce(int profile, hipStream_t stream, T const* A, T* B, int N) {
+  static_assert(sizeof(T) == 2, "Template parameter T must be 16 bits (2 bytes) in size.");
   if (world_size != 2 && world_size != 4 && world_size != 8) {
-    throw std::runtime_error("All Reduce not supported for world_size = " +
-                             std::to_string(world_size));
+    throw std::runtime_error("All Reduce not supported for world_size = " + std::to_string(world_size));
   }
 
   // Configuration.
@@ -149,10 +181,21 @@ void DeviceComms::allreduce(int profile, hipStream_t stream, T const* A, T* B,
       break;
     case QuickReduceProfile::ONESHOT_F16:
       using AllReduceKernel = AllReduceOneshot<T>;
-      hipLaunchKernelGGL((allreduce_prototype<AllReduceKernel, T>), dim3(grid),
-                         dim3(kBlock), 0, stream, A, B, N, num_blocks,
-                         world_size, rank, dbuffer_list, data_offset,
-                         flag_color);
+      hipLaunchKernelGGL(
+          (allreduce_prototype<AllReduceKernel, T>),
+          dim3(grid),
+          dim3(kBlock),
+          0,
+          stream,
+          A,
+          B,
+          N,
+          num_blocks,
+          world_size,
+          rank,
+          dbuffer_list,
+          data_offset,
+          flag_color);
       break;
     default:
       TWOSHOT_DISPATCH(TwoshotF16LineCodec)
@@ -184,19 +227,14 @@ void DeviceComms::allreduce(int profile, hipStream_t stream, T const* A, T* B,
  */
 bool _is_weak_contiguous(torch::Tensor const& t) {
   return t.is_contiguous() ||
-         (t.storage().nbytes() - t.storage_offset() * t.element_size() ==
-          t.numel() * t.element_size());
+         (t.storage().nbytes() - t.storage_offset() * t.element_size() == t.numel() * t.element_size());
 }
 
 fptr_t init_quick_ar(int64_t world_size, int64_t rank) {
-  if (world_size > 8)
-    throw std::invalid_argument("world size > 8 is not supported");
-  if (world_size == 6)
-    throw std::invalid_argument("world size == 6 is not supported");
-  if (world_size % 2 != 0)
-    throw std::invalid_argument("Odd num gpus is not supported for now");
-  if (rank < 0 || rank >= world_size)
-    throw std::invalid_argument("invalid rank passed in");
+  if (world_size > 8) throw std::invalid_argument("world size > 8 is not supported");
+  if (world_size == 6) throw std::invalid_argument("world size == 6 is not supported");
+  if (world_size % 2 != 0) throw std::invalid_argument("Odd num gpus is not supported for now");
+  if (rank < 0 || rank >= world_size) throw std::invalid_argument("invalid rank passed in");
 
   quickreduce::DeviceComms* dev_comm = new quickreduce::DeviceComms();
   dev_comm->init(world_size, rank);
@@ -206,16 +244,13 @@ fptr_t init_quick_ar(int64_t world_size, int64_t rank) {
 torch::Tensor qr_get_comm_handle(fptr_t _fa) {
   auto fa = reinterpret_cast<quickreduce::DeviceComms*>(_fa);
   hipIpcMemHandle_t handle = fa->get_handle();
-  auto options =
-      torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
-  torch::Tensor tensor_handle =
-      torch::empty({static_cast<int64_t>(sizeof(hipIpcMemHandle_t))}, options);
+  auto options = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
+  torch::Tensor tensor_handle = torch::empty({static_cast<int64_t>(sizeof(hipIpcMemHandle_t))}, options);
   std::memcpy(tensor_handle.data_ptr(), &handle, sizeof(hipIpcMemHandle_t));
   return tensor_handle;
 }
 
-void qr_set_comm_handles(fptr_t _fa,
-                         std::vector<torch::Tensor> const& comm_handles) {
+void qr_set_comm_handles(fptr_t _fa, std::vector<torch::Tensor> const& comm_handles) {
   auto fa = reinterpret_cast<quickreduce::DeviceComms*>(_fa);
   auto world_size = comm_handles.size();
   std::vector<hipIpcMemHandle_t> ipc_handles(world_size);
@@ -223,22 +258,20 @@ void qr_set_comm_handles(fptr_t _fa,
   for (int i = 0; i < world_size; ++i) {
     const auto& tensor = comm_handles[i];
     TORCH_CHECK(tensor.device().is_cpu(), "Comm handle tensor must be on CPU");
-    TORCH_CHECK(tensor.scalar_type() == torch::kUInt8,
-                "Comm handle tensor must be of type uint8");
-    TORCH_CHECK(tensor.numel() == sizeof(hipIpcMemHandle_t),
-                "Comm handle tensor must have ", sizeof(hipIpcMemHandle_t),
-                " elements");
+    TORCH_CHECK(tensor.scalar_type() == torch::kUInt8, "Comm handle tensor must be of type uint8");
+    TORCH_CHECK(
+        tensor.numel() == sizeof(hipIpcMemHandle_t),
+        "Comm handle tensor must have ",
+        sizeof(hipIpcMemHandle_t),
+        " elements");
 
-    std::memcpy(&(ipc_handles[i]), tensor.data_ptr(),
-                sizeof(hipIpcMemHandle_t));
+    std::memcpy(&(ipc_handles[i]), tensor.data_ptr(), sizeof(hipIpcMemHandle_t));
   }
   fa->open_ipc_handles(ipc_handles);
 }
 
-void qr_all_reduce(fptr_t _fa, int64_t profile, torch::Tensor const& inp,
-                   torch::Tensor& out) {
-  quickreduce::DeviceComms* fa =
-      reinterpret_cast<quickreduce::DeviceComms*>(_fa);
+void qr_all_reduce(fptr_t _fa, int64_t profile, torch::Tensor const& inp, torch::Tensor& out) {
+  quickreduce::DeviceComms* fa = reinterpret_cast<quickreduce::DeviceComms*>(_fa);
   auto stream = c10::cuda::getCurrentCUDAStream().stream();  // hipStream_t
 
   TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
@@ -249,16 +282,21 @@ void qr_all_reduce(fptr_t _fa, int64_t profile, torch::Tensor const& inp,
   auto input_size = inp.numel() * inp.element_size();
 
   if (out.scalar_type() == at::ScalarType::Half) {
-    fa->allreduce<half>(profile, stream,
-                        reinterpret_cast<half const*>(inp.data_ptr()),
-                        reinterpret_cast<half*>(out.data_ptr()), inp.numel());
+    fa->allreduce<half>(
+        profile,
+        stream,
+        reinterpret_cast<half const*>(inp.data_ptr()),
+        reinterpret_cast<half*>(out.data_ptr()),
+        inp.numel());
   } else if (out.scalar_type() == at::ScalarType::BFloat16) {
     fa->allreduce<nv_bfloat16>(
-        profile, stream, reinterpret_cast<nv_bfloat16 const*>(inp.data_ptr()),
-        reinterpret_cast<nv_bfloat16*>(out.data_ptr()), inp.numel());
+        profile,
+        stream,
+        reinterpret_cast<nv_bfloat16 const*>(inp.data_ptr()),
+        reinterpret_cast<nv_bfloat16*>(out.data_ptr()),
+        inp.numel());
   } else {
-    throw std::runtime_error(
-        "quick allreduce only supports float16 and bfloat16 for now.");
+    throw std::runtime_error("quick allreduce only supports float16 and bfloat16 for now.");
   }
 }
 

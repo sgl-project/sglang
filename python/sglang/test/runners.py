@@ -475,6 +475,7 @@ class SRTRunner:
         speculative_num_draft_tokens: Optional[int] = None,
         disable_overlap_schedule: bool = False,
         disable_custom_all_reduce: bool = False,
+        disable_quick_all_reduce: bool = False,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -510,6 +511,7 @@ class SRTRunner:
             disable_overlap_schedule=disable_overlap_schedule,
             cuda_graph_max_bs=4,
             disable_custom_all_reduce=disable_custom_all_reduce,
+            disable_quick_all_reduce=disable_quick_all_reduce,
             **spec_kwargs,
         )
 

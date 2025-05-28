@@ -1,12 +1,12 @@
 #pragma once
 
-#include <cstdint>
-#include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
-
-#include <vector>
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
 #include <torch/torch.h>
+
+#include <cstdint>
+#include <vector>
 
 typedef __hip_bfloat16 nv_bfloat16;
 typedef __hip_bfloat162 nv_bfloat162;
@@ -17,13 +17,13 @@ typedef __hip_bfloat162 nv_bfloat162;
 // Setup acquire-release semantics for vector memory reads (mubuf instruction)
 // as per architecture.
 #if defined(__gfx942__)
-  // CDNA3: Scope bits sc0, sc1
-  #define MUBUF_ACQUIRE 16
-  #define MUBUF_RELEASE 16
+// CDNA3: Scope bits sc0, sc1
+#define MUBUF_ACQUIRE 16
+#define MUBUF_RELEASE 16
 #elif (defined(__gfx908__) || defined(__gfx90a__))
-  // CDNA1 and CDNA2 - glc bit
-  #define MUBUF_ACQUIRE 1
-  #define MUBUF_RELEASE 0
+// CDNA1 and CDNA2 - glc bit
+#define MUBUF_ACQUIRE 1
+#define MUBUF_RELEASE 0
 #endif
 
 namespace quickreduce {
@@ -59,8 +59,7 @@ __device_inline__ __host__ int divceil(int x, int y) {
   return ((x + y - 1) / y);
 }
 
-__device_inline__ __host__ constexpr int divceil_constexpr(int const x,
-                                                           int const y) {
+__device_inline__ __host__ constexpr int divceil_constexpr(int const x, int const y) {
   return ((x + y - 1) / y);
 }
 
@@ -84,26 +83,24 @@ on the `vmcnt`.
 union BufferResource {
   __device_inline__ constexpr BufferResource() : config(0x00020000U) {}
 
-  __device_inline__ constexpr BufferResource(void* buffer_address,
-                                             uint32_t buffer_size)
+  __device_inline__ constexpr BufferResource(void* buffer_address, uint32_t buffer_size)
       : address(buffer_address), range(buffer_size), config(0x00020000U) {}
 
   int32x4_t descriptor;
   struct {
-    void* address;   // 8B, out of which first 48b is address, and 16b is stride
-                     // (unused)
-    uint32_t range;  // Byte range for the buffer resource
+    void* address;    // 8B, out of which first 48b is address, and 16b is stride
+                      // (unused)
+    uint32_t range;   // Byte range for the buffer resource
     uint32_t config;  // Constant, DFMT=32b
   };
 };
 
 __device_inline__ static int32x4_t buffer_load_dwordx4(
-    int32x4_t srsrc, int32_t voffset, int32_t soffset,
-    int32_t aux) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
+    int32x4_t srsrc, int32_t voffset, int32_t soffset, int32_t aux) __asm("llvm.amdgcn.raw.buffer.load.v4i32");
 
-__device_inline__ static void buffer_store_dwordx4(
-    int32x4_t data, int32x4_t srsrc, int32_t voffset, int32_t soffset,
-    int32_t aux) __asm("llvm.amdgcn.raw.buffer.store.v4i32");
+__device_inline__ static void
+buffer_store_dwordx4(int32x4_t data, int32x4_t srsrc, int32_t voffset, int32_t soffset, int32_t aux) __asm(
+    "llvm.amdgcn.raw.buffer.store.v4i32");
 
 __device_inline__ static void set_fp16_ovfl(bool const value) {
   // short size = 0b00001;    // Specifies the bit size to modify
@@ -169,15 +166,25 @@ struct DeviceComms {
   long data_offset;
 
   DeviceComms() : initialized(false), world_size(1), rank(0) {}
-  ~DeviceComms() { destroy(); }
+  ~DeviceComms() {
+    destroy();
+  }
 
   void init(int world_size, int rank);
-  int get_world_size() { return world_size; }
-  int get_rank() { return rank; }
-  bool status() { return initialized; }
+  int get_world_size() {
+    return world_size;
+  }
+  int get_rank() {
+    return rank;
+  }
+  bool status() {
+    return initialized;
+  }
   void destroy();
 
-  hipIpcMemHandle_t const get_handle() { return buffer_ipc_handle; }
+  hipIpcMemHandle_t const get_handle() {
+    return buffer_ipc_handle;
+  }
   void open_ipc_handles(std::vector<hipIpcMemHandle_t> const& ipc_handles);
   template <typename T>
   void allreduce(int profile, hipStream_t stream, T const* A, T* B, int N);
@@ -260,14 +267,8 @@ __device_inline__ int pk_max_abs<half>(int a, int b) {
   half2 wminh2 = __builtin_bit_cast(half2, b);
   half2 wblockmaxh2;
 
-  wblockmaxh2.x =
-      __half2float(__habs(wmaxh2.x)) > __half2float(__habs(wminh2.x))
-          ? wmaxh2.x
-          : wminh2.x;
-  wblockmaxh2.y =
-      __half2float(__habs(wmaxh2.y)) > __half2float(__habs(wminh2.y))
-          ? wmaxh2.y
-          : wminh2.y;
+  wblockmaxh2.x = __half2float(__habs(wmaxh2.x)) > __half2float(__habs(wminh2.x)) ? wmaxh2.x : wminh2.x;
+  wblockmaxh2.y = __half2float(__habs(wmaxh2.y)) > __half2float(__habs(wminh2.y)) ? wmaxh2.y : wminh2.y;
   return __builtin_bit_cast(int, wblockmaxh2);
 }
 
@@ -276,14 +277,8 @@ __device_inline__ int pk_max_abs<nv_bfloat16>(int a, int b) {
   bf162_int_union A, B, R;
   A.i = a;
   B.i = b;
-  R.bf2.x =
-      __bfloat162float(__habs(A.bf2.x)) > __bfloat162float(__habs(B.bf2.x))
-          ? A.bf2.x
-          : B.bf2.x;
-  R.bf2.y =
-      __bfloat162float(__habs(A.bf2.y)) > __bfloat162float(__habs(B.bf2.y))
-          ? A.bf2.y
-          : B.bf2.y;
+  R.bf2.x = __bfloat162float(__habs(A.bf2.x)) > __bfloat162float(__habs(B.bf2.x)) ? A.bf2.x : B.bf2.x;
+  R.bf2.y = __bfloat162float(__habs(A.bf2.y)) > __bfloat162float(__habs(B.bf2.y)) ? A.bf2.y : B.bf2.y;
   return R.i;
 }
 
@@ -324,9 +319,13 @@ __device_inline__ int pk_hcp<nv_bfloat16>(int a) {
 }
 
 // changes dtype
-__device_inline__ float T2float(half a) { return __half2float(a); }
+__device_inline__ float T2float(half a) {
+  return __half2float(a);
+}
 
-__device_inline__ float T2float(nv_bfloat16 a) { return __bfloat162float(a); }
+__device_inline__ float T2float(nv_bfloat16 a) {
+  return __bfloat162float(a);
+}
 
 // const Q8
 template <typename T>
@@ -334,8 +333,7 @@ struct Quant8Const;
 
 template <>
 struct Quant8Const<half> {
-  static constexpr int kScaleFactor =
-      0xA000A000;  // {-1/128.0h, -1/128.0h}, fp16x2_t
+  static constexpr int kScaleFactor = 0xA000A000;   // {-1/128.0h, -1/128.0h}, fp16x2_t
   static constexpr int kScaleEpsilon = 0x00010001;  // {1e-7, 1e-7}, fp16x2_t
   static constexpr int kRangeMin = 0xD800D800;      // {-128, -128}, fp16x2_t
   static constexpr int kRangeMax = 0x57F057F0;      // {+127, +127}, fp16x2_t
@@ -343,8 +341,7 @@ struct Quant8Const<half> {
 
 template <>
 struct Quant8Const<nv_bfloat16> {
-  static constexpr int kScaleFactor =
-      0xBC00BC00;  // {-1/128.0h, -1/128.0h}, fp16x2_t
+  static constexpr int kScaleFactor = 0xBC00BC00;   // {-1/128.0h, -1/128.0h}, fp16x2_t
   static constexpr int kScaleEpsilon = 0x33D733D7;  // {1e-7, 1e-7}, fp16x2_t
   static constexpr int kRangeMin = 0xC300C300;      // {-128, -128}, fp16x2_t
   static constexpr int kRangeMax = 0x42FE42FE;      // {+127, +127}, fp16x2_t
@@ -355,8 +352,7 @@ struct Quant6Const;
 
 template <>
 struct Quant6Const<half> {
-  static int constexpr kScaleFactor =
-      0xA800A800;  // {-1/32.0h, -1/32.0h}, fp16x2_t
+  static int constexpr kScaleFactor = 0xA800A800;   // {-1/32.0h, -1/32.0h}, fp16x2_t
   static int constexpr kScaleEpsilon = 0x00010001;  // {1e-7, 1e-7}, fp16x2_t
   static int constexpr kRangeMin = 0xD000D000;      // {-32, -32}, fp16x2_t
   static int constexpr kRangeMax = 0x4FC04FC0;      // {+31, +31}, fp16x2_t
@@ -364,8 +360,7 @@ struct Quant6Const<half> {
 
 template <>
 struct Quant6Const<nv_bfloat16> {
-  static int constexpr kScaleFactor =
-      0xBD00BD00;  // {-1/32.0h, -1/32.0h}, fp16x2_t
+  static int constexpr kScaleFactor = 0xBD00BD00;   // {-1/32.0h, -1/32.0h}, fp16x2_t
   static int constexpr kScaleEpsilon = 0x33D733D7;  // {1e-7, 1e-7}, fp16x2_t
   static int constexpr kRangeMin = 0xC200C200;      // {-32, -32}, fp16x2_t
   static int constexpr kRangeMax = 0x41F841F8;      // {+31, +31}, fp16x2_t
@@ -377,8 +372,7 @@ struct Quant4Const;
 
 template <>
 struct Quant4Const<half> {
-  static int constexpr kScaleFactor =
-      0xB000B000;  // {-1/8.0h, -1/8.0h}, fp16x2_t
+  static int constexpr kScaleFactor = 0xB000B000;   // {-1/8.0h, -1/8.0h}, fp16x2_t
   static int constexpr kScaleEpsilon = 0x00010001;  // {1e-7, 1e-7}, fp16x2_t
   static int constexpr kRangeMin = 0xC800C800;      // {-8, -8}, fp16x2_t
   static int constexpr kRangeMax = 0x47004700;      // {+7, +7}, fp16x2_t
@@ -386,8 +380,7 @@ struct Quant4Const<half> {
 
 template <>
 struct Quant4Const<nv_bfloat16> {
-  static int constexpr kScaleFactor =
-      0xBE00BE00;  // {-1/8.0h, -1/8.0h}, fp16x2_t
+  static int constexpr kScaleFactor = 0xBE00BE00;   // {-1/8.0h, -1/8.0h}, fp16x2_t
   static int constexpr kScaleEpsilon = 0x33D733D7;  // {1e-7, 1e-7}, fp16x2_t
   static int constexpr kRangeMin = 0xC100C100;      // {-8, -8}, fp16x2_t
   static int constexpr kRangeMax = 0x40E040E0;      // {+7, +7}, fp16x2_t
@@ -418,9 +411,7 @@ using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 fptr_t init_quick_ar(int64_t world_size, int64_t rank);
 torch::Tensor qr_get_comm_handle(fptr_t _fa);
-void qr_set_comm_handles(fptr_t _fa,
-                         std::vector<torch::Tensor> const& comm_handles);
-void qr_all_reduce(fptr_t _fa, int64_t profile, torch::Tensor const& inp,
-                   torch::Tensor& out);
+void qr_set_comm_handles(fptr_t _fa, std::vector<torch::Tensor> const& comm_handles);
+void qr_all_reduce(fptr_t _fa, int64_t profile, torch::Tensor const& inp, torch::Tensor& out);
 void qr_destroy(fptr_t _fa);
 void is_quickreduce_available();
