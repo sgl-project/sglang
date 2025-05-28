@@ -777,7 +777,7 @@ def w8a8_block_fp8_matmul_deepgemm(
     As: torch.Tensor,
     Bs: torch.Tensor,
     block_size: List[int],
-    output_dtype: torch.dtype = torch.float16,
+    output_dtype: torch.dtype,
 ) -> torch.Tensor:
     M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
 
