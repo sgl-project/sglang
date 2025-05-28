@@ -175,6 +175,7 @@ class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
             ),
         )
 
+
 class TestQwenMoePPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
