@@ -452,22 +452,22 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
-        total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
-        )
-        input_tokens = (
-            -(-req.extend_input_len // self.tree_cache.page_size)
-            * self.tree_cache.page_size
-        )
-        prefix_len = len(req.prefix_indices)
-
-        if total_tokens >= self.rem_total_tokens:
-            return AddReqResult.NO_TOKEN
-
-        if input_tokens > self.rem_input_tokens and len(self.can_run_list) != 0:
-            return AddReqResult.OTHER
-
         with self._lock_node(req.last_node):
+            total_tokens = req.extend_input_len + min(
+                req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
+            )
+            input_tokens = (
+                -(-req.extend_input_len // self.tree_cache.page_size)
+                * self.tree_cache.page_size
+            )
+            prefix_len = len(req.prefix_indices)
+
+            if total_tokens >= self.rem_total_tokens:
+                return AddReqResult.NO_TOKEN
+
+            if input_tokens > self.rem_input_tokens and len(self.can_run_list) != 0:
+                return AddReqResult.OTHER
+
             if (
                 enable_hierarchical_cache
                 and req.last_node_global is not None
