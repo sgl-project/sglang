@@ -1,3 +1,4 @@
+use crate::io_struct::{Bootstrap, ChatReqInput, GenerateReqInput};
 use crate::strategy_lb::{EngineInfo, StrategyLB};
 use actix_web::{HttpRequest, HttpResponse, HttpServer, get, post, web};
 use bytes::Bytes;
@@ -54,45 +55,6 @@ impl LBState {
             client,
             log_interval: lb_config.log_interval,
         })
-    }
-
-    pub fn modify_request(
-        request: &serde_json::Value,
-        prefill_info: &EngineInfo,
-    ) -> serde_json::Value {
-        let mut modified_request = request.clone();
-
-        assert!(request.get("text").is_some() || request.get("input_ids").is_some());
-        let batch_size = if let Some(text) = request.get("text").and_then(|text| text.as_array()) {
-            Some(text.len())
-        } else if let Some(input_ids) = request
-            .get("input_ids")
-            .and_then(|input_ids| input_ids.as_array())
-        {
-            if input_ids[0].is_array() {
-                Some(input_ids.len())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if let Some(batch_size) = batch_size {
-            modified_request["bootstrap_host"] =
-                vec![prefill_info.get_hostname(); batch_size].into();
-            modified_request["bootstrap_room"] = (0..batch_size)
-                .map(|_| rand::random::<u64>())
-                .collect::<Vec<_>>()
-                .into();
-            modified_request["bootstrap_port"] =
-                vec![prefill_info.boostrap_port; batch_size].into();
-        } else {
-            modified_request["bootstrap_host"] = prefill_info.get_hostname().into();
-            modified_request["bootstrap_room"] = rand::random::<u64>().into();
-            modified_request["bootstrap_port"] = prefill_info.boostrap_port.into();
-        }
-        modified_request
     }
 
     async fn route_one(
@@ -188,25 +150,14 @@ impl LBState {
     async fn generate(
         &self,
         api_path: &str,
-        json: serde_json::Value,
+        mut req: Box<dyn Bootstrap>,
     ) -> Result<HttpResponse, actix_web::Error> {
         let (prefill, decode) = self.strategy_lb.select_pair(&self.client).await;
-        let stream = json.get("stream").is_some() && json["stream"] == true;
-        let modified_json = LBState::modify_request(&json, &prefill);
-        let prefill_task = self.route_one(
-            prefill.clone(),
-            "POST",
-            api_path,
-            modified_json.clone(),
-            false,
-        );
-        let decode_task = self.route_one(
-            decode.clone(),
-            "POST",
-            api_path,
-            modified_json.clone(),
-            stream,
-        );
+        let stream = req.is_stream();
+        req.add_bootstrap_info(&prefill)?;
+        let json = serde_json::to_value(req)?;
+        let prefill_task = self.route_one(prefill.clone(), "POST", api_path, json.clone(), false);
+        let decode_task = self.route_one(decode.clone(), "POST", api_path, json.clone(), stream);
         let (_, decode_response) = tokio::join!(prefill_task, decode_task);
         decode_response?.into()
     }
@@ -321,20 +272,22 @@ pub async fn get_model_info(
 #[post("/generate")]
 pub async fn generate(
     _req: HttpRequest,
-    json: web::Json<serde_json::Value>,
+    req: web::Json<GenerateReqInput>,
     app_state: web::Data<LBState>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    app_state.generate("/generate", json.into_inner()).await
+    app_state
+        .generate("/generate", Box::new(req.into_inner()))
+        .await
 }
 
 #[post("/v1/chat/completions")]
 pub async fn chat_completions(
     _req: HttpRequest,
-    json: web::Json<serde_json::Value>,
+    req: web::Json<ChatReqInput>,
     app_state: web::Data<LBState>,
 ) -> Result<HttpResponse, actix_web::Error> {
     app_state
-        .generate("/v1/chat/completions", json.into_inner())
+        .generate("/v1/chat/completions", Box::new(req.into_inner()))
         .await
 }
 

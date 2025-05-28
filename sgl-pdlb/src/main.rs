@@ -1,5 +1,6 @@
 mod server;
 mod strategy_lb;
+mod io_struct;
 
 fn main() -> anyhow::Result<()> {
     // test code
