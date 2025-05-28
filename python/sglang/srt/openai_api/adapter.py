@@ -1327,7 +1327,6 @@ def v1_chat_generate_response(
                     tool_calls = [
                         ToolCall(
                             id=f"call_{base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b'=').decode()}",
-                            index=call_info.tool_index,
                             function=FunctionResponse(
                                 name=call_info.name, arguments=call_info.parameters
                             ),
