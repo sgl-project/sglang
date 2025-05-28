@@ -9,13 +9,15 @@ import queue
 import socket
 import struct
 import threading
-from functools import cache
-from typing import Dict, List, Optional, Tuple, Union
+import time
 from collections import deque
+from functools import cache, reduce
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
 import requests
+import torch
 import zmq
 from aiohttp import web
 
@@ -27,26 +29,42 @@ from sglang.srt.disaggregation.base.conn import (
     KVArgs,
     KVPoll,
 )
+from sglang.srt.disaggregation.mooncake.conn import (
+    KVArgsRegisterInfo,
+    MooncakeKVManager,
+    MooncakeKVReceiver,
+    MooncakeKVSender,
+    TransferInfo,
+    TransferKVChunk,
+)
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
-from sglang.srt.disaggregation.utils import DisaggregationMode, StreamAsyncSubmitter, get_src_dst_index_length, FakeBootstrapHost
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    FakeBootstrapHost,
+    StreamAsyncSubmitter,
+    get_src_dst_index_length,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender, MooncakeKVReceiver, TransferInfo, KVArgsRegisterInfo, TransferKVChunk
-import torch
-import time
-from functools import reduce
+
 logger = logging.getLogger(__name__)
+
 
 @dataclasses.dataclass
 class TransferKVChunkSet:
-    rooms : Tuple[int] = dataclasses.field(default_factory=tuple)  
-    prefill_kv_indices : Tuple[npt.NDArray[np.int64]] = dataclasses.field(default_factory=tuple)
+    rooms: Tuple[int] = dataclasses.field(default_factory=tuple)
+    prefill_kv_indices: Tuple[npt.NDArray[np.int64]] = dataclasses.field(
+        default_factory=tuple
+    )
     index_slices: Tuple[slice] = dataclasses.field(default_factory=tuple)
+
 
 @dataclasses.dataclass
 class AsyncInfo:
-    layer_ids : Tuple[int] = dataclasses.field(default_factory=tuple)
-    kv_chunk_info : TransferKVChunkSet = dataclasses.field(default_factory=TransferKVChunkSet)
+    layer_ids: Tuple[int] = dataclasses.field(default_factory=tuple)
+    kv_chunk_info: TransferKVChunkSet = dataclasses.field(
+        default_factory=TransferKVChunkSet
+    )
 
 
 class MooncakeAsyncKVManager(MooncakeKVManager):
@@ -61,21 +79,24 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         # [TODO] support other backends
         if not is_mla_backend:
             logger.error("MooncakeAsyncKVManager is not supported for other backend.")
-            raise NotImplementedError("MooncakeAsyncKVManager is not supported for other backend.")
+            raise NotImplementedError(
+                "MooncakeAsyncKVManager is not supported for other backend."
+            )
         self._sem = threading.Semaphore(0)
-        submit_func = lambda : self._sem.release()
+        submit_func = lambda: self._sem.release()
         self._async_submitter = StreamAsyncSubmitter(submit_func)
         self._notify_queue = deque()
         self._init_put_kvcache_thread()
         self._waiting_rooms = deque()
-        self._current_kv_chunk_infos : Optional[TransferKVChunkSet] = None
-        self._req_begin_count :Dict[int, int] = {}
-        self._req_bids : Dict[int, List[Tuple[int]]] = {}
+        self._current_kv_chunk_infos: Optional[TransferKVChunkSet] = None
+        self._req_begin_count: Dict[int, int] = {}
+        self._req_bids: Dict[int, List[Tuple[int]]] = {}
         self._lock = threading.Lock()
+
     @property
     def is_support_asnyc(self):
         return True
-    
+
     def _put_kvcache_thread_func(self):
         while True:
             self._sem.acquire()
@@ -84,43 +105,64 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                 self._put_kv_cache_internal(info)
             except Exception as e:
                 import traceback
+
                 traceback.print_exc()
                 print(f"Error in put_kvcache_thread: {e}", flush=True)
                 import os
+
                 os._exit(1)
-                
+
     def _init_put_kvcache_thread(self):
-        self._put_kvcache_thread = threading.Thread(target=self._put_kvcache_thread_func, daemon=True)
+        self._put_kvcache_thread = threading.Thread(
+            target=self._put_kvcache_thread_func, daemon=True
+        )
         self._put_kvcache_thread.start()
         print(f"start put_kvcache_thread : {self._put_kvcache_thread}")
 
-    def get_info_with_risk(self, room : int)-> TransferInfo:
+    def get_info_with_risk(self, room: int) -> TransferInfo:
         """
         there is no lock to protect the self.transfer_infos, so it have the risk, but it is ok because we delete the task after the transfer is done.
         """
         return self.transfer_infos[room]
-    
+
     # Worker function for processing a single layer
-    def submit_layer(self, session_id: str, src_ptr: int, dst_ptr: int, prefill_kv_blocks : npt.NDArray[np.int64], dst_kv_blocks : npt.NDArray[np.int64], item_len : int) -> int:
-        prefill_kv_blocks, dst_kv_blocks, block_lengths = get_src_dst_index_length(tuple(prefill_kv_blocks), tuple(dst_kv_blocks))
+    def submit_layer(
+        self,
+        session_id: str,
+        src_ptr: int,
+        dst_ptr: int,
+        prefill_kv_blocks: npt.NDArray[np.int64],
+        dst_kv_blocks: npt.NDArray[np.int64],
+        item_len: int,
+    ) -> int:
+        prefill_kv_blocks, dst_kv_blocks, block_lengths = get_src_dst_index_length(
+            tuple(prefill_kv_blocks), tuple(dst_kv_blocks)
+        )
         # [TODO] support the blocks == 1 for now
         assert len(prefill_kv_blocks) == len(dst_kv_blocks)
         bids = []
-        for prefill_index, decode_index, block_length in zip(prefill_kv_blocks, dst_kv_blocks, block_lengths):
+        for prefill_index, decode_index, block_length in zip(
+            prefill_kv_blocks, dst_kv_blocks, block_lengths
+        ):
             src_addr = src_ptr + int(prefill_index) * item_len
             dst_addr = dst_ptr + int(decode_index) * item_len
             length = item_len * block_length
             batch_id = self.engine.transfer_submit_write(
-                    session_id, src_addr, dst_addr, length
-                )
+                session_id, src_addr, dst_addr, length
+            )
             bids.append(batch_id)
         return tuple(bids)
-    
-    def _put_kv_cache_internal(self, async_info : AsyncInfo):
+
+    def _put_kv_cache_internal(self, async_info: AsyncInfo):
         kv_chunk_info = async_info.kv_chunk_info
         infos = [self.get_info_with_risk(room) for room in kv_chunk_info.rooms]
         for layer_id in async_info.layer_ids:
-            for room_id, transfer_info_dict, kv_indice, index_slice in zip(kv_chunk_info.rooms, infos, kv_chunk_info.prefill_kv_indices, kv_chunk_info.index_slices):
+            for room_id, transfer_info_dict, kv_indice, index_slice in zip(
+                kv_chunk_info.rooms,
+                infos,
+                kv_chunk_info.prefill_kv_indices,
+                kv_chunk_info.index_slices,
+            ):
                 for transfer_info in transfer_info_dict.values():
                     if not transfer_info.is_dummy:
                         src = kv_indice
@@ -128,17 +170,19 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                         dst = transfer_info.dst_kv_indices[index_slice]
                         session_id = transfer_info.mooncake_session_id
                         dst_kv_ptrs = self.decode_kv_args_table[
-                                            transfer_info.mooncake_session_id
-                                        ].dst_kv_ptrs
+                            transfer_info.mooncake_session_id
+                        ].dst_kv_ptrs
                         src_ptr = self.kv_args.kv_data_ptrs[layer_id]
                         dst_ptr = dst_kv_ptrs[layer_id]
                         item_len = self.kv_args.kv_item_lens[layer_id]
-                        bids = self.submit_layer(session_id, src_ptr, dst_ptr, src, dst, item_len)
+                        bids = self.submit_layer(
+                            session_id, src_ptr, dst_ptr, src, dst, item_len
+                        )
                         with self._lock:
                             if room_id not in self._req_bids:
                                 self._req_bids[room_id] = []
                             self._req_bids[room_id].append(bids)
-        
+
     def mark_layer_ready(self, layer_id: int):
         # for first layer, we need update the kv_chunk_info
         if layer_id == 0:
@@ -150,17 +194,24 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                     self._req_begin_count[rid] = begin_count
         # and then, we need to push the info to queue, and do step_async
         if self._current_kv_chunk_infos:
-            self._notify_queue.appendleft(AsyncInfo(layer_ids=(layer_id,), kv_chunk_info=self._current_kv_chunk_infos))
+            self._notify_queue.appendleft(
+                AsyncInfo(
+                    layer_ids=(layer_id,), kv_chunk_info=self._current_kv_chunk_infos
+                )
+            )
             self._async_submitter.step_async()
 
-    def _is_bids_finished_func(self, rid : int):
+    def _is_bids_finished_func(self, rid: int):
         num_layers = len(self.kv_args.kv_data_ptrs)
-        is_bids_finished = rid not in self._req_bids or len(self._req_bids[rid]) != num_layers
+        is_bids_finished = (
+            rid not in self._req_bids or len(self._req_bids[rid]) != num_layers
+        )
         return is_bids_finished
-    def pop_req_bids(self, rid : int):
+
+    def pop_req_bids(self, rid: int):
         return self._req_bids.pop(rid)
-        
-    def _flush_all_layers(self, rid : int):
+
+    def _flush_all_layers(self, rid: int):
         start_time = time.time()
         # we have to make sure the send is finished, to do so, we need to get sent count and wait for it
         current_sent_count = self._async_submitter.get_sent_count()
@@ -168,12 +219,12 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         num_layers = len(self.kv_args.kv_data_ptrs)
         self._async_submitter.wait_sent_finish(begin_count + num_layers)
         # and we have to make sure all the layers are sent out
-        
+
         while self._is_bids_finished_func(rid):
             # print(f"self._req_bids[{rid}]({len(self._req_bids[rid])}) == {self._req_bids[rid]}")
             time.sleep(1e-3)
         # print(f"all layers are sent out of {rid}, we need to wait it finish")
-        
+
         bids = reduce(lambda x, y: list(x) + list(y), self.pop_req_bids(rid), [])
         for bid in bids:
             status = self.engine.transfer_check_status(bid)
@@ -181,9 +232,11 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                 status = self.engine.transfer_check_status(bid)
                 time.sleep(1e-3)
             assert status == 1, f"status is {status} in {rid}"
-        print(f"finish send (rid={rid}, n_blocks={bids}) in {1000*(time.time() - start_time)} ms.")
+        print(
+            f"finish send (rid={rid}, n_blocks={bids}) in {1000*(time.time() - start_time)} ms."
+        )
 
-    def prepare_batch(self, sch : "Scheduler", batch : "ScheduleBatch"):
+    def prepare_batch(self, sch: "Scheduler", batch: "ScheduleBatch"):
         # we have to prepare the batch for each forward
         rooms = []
         kv_chunk_info_set = None
@@ -193,20 +246,24 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             if req.bootstrap_host == FakeBootstrapHost:
                 continue
             # print(f"req={req}, start_idx = {req.start_send_idx}, fill_ids = {req.fill_ids}, origin_input_ids={req.origin_input_ids}")
-            kv_chunk_info : Tuple[Tuple[npt.NDArray[np.int64], slice],int] = sch.get_kv_chunk_info(req, delay_send = False)
+            kv_chunk_info: Tuple[Tuple[npt.NDArray[np.int64], slice], int] = (
+                sch.get_kv_chunk_info(req, delay_send=False)
+            )
             if kv_chunk_info is not None:
-                (page_indices, indexs),_ = kv_chunk_info
+                (page_indices, indexs), _ = kv_chunk_info
                 bootstrap_room = req.bootstrap_room
                 rooms.append(bootstrap_room)
                 prefill_kv_indices.append(page_indices)
                 index_slices.append(indexs)
-        #we need convert async_infos to TransferKVChunkSet
+        # we need convert async_infos to TransferKVChunkSet
         if len(rooms):
-            kv_chunk_info_set = TransferKVChunkSet(rooms = tuple(rooms), prefill_kv_indices = tuple(prefill_kv_indices), index_slices = tuple(index_slices))
+            kv_chunk_info_set = TransferKVChunkSet(
+                rooms=tuple(rooms),
+                prefill_kv_indices=tuple(prefill_kv_indices),
+                index_slices=tuple(index_slices),
+            )
         # print(f"kv_chunk_info_set is {kv_chunk_info_set}")
         self._waiting_rooms.appendleft(kv_chunk_info_set)
-
-
 
     def start_prefill_thread(self):
         # copy from srt/disaggregation/mooncake/conn.py
@@ -258,7 +315,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                             assert len(chunked_dst_kv_indice) == len(
                                 kv_chunk.prefill_kv_indices
                             ), f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
-                            
+
                             self._flush_all_layers(kv_chunk.room)
 
                             if kv_chunk.is_last:
@@ -304,6 +361,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
 
 class MooncakeAsyncKVSender(MooncakeKVSender):
     pass
+
 
 class MooncakeAsyncKVReceiver(MooncakeKVReceiver):
     pass

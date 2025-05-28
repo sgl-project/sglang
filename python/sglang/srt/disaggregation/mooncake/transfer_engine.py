@@ -71,7 +71,6 @@ class MooncakeTransferEngine:
             raise RuntimeError("Mooncake Transfer Engine Return Error.")
         return ret
 
-
     def transfer_submit_write(
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int
     ) -> int:
@@ -81,9 +80,8 @@ class MooncakeTransferEngine:
             session_id, buffer, peer_buffer_address, length
         )
         return batch_id
-    
-    def transfer_check_status(
-        self, batch_id: int) -> int:
+
+    def transfer_check_status(self, batch_id: int) -> int:
         status = self.engine.transfer_check_status(batch_id)
         return status
 

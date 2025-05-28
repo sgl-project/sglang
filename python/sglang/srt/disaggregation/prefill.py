@@ -23,7 +23,8 @@ import logging
 import threading
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Tuple, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
 import numpy as np
 import numpy.typing as npt
 import torch
@@ -209,7 +210,7 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler):
         """A normal scheduler loop for prefill worker in disaggregation mode."""
-        self.kv_manager : BaseKVManager
+        self.kv_manager: BaseKVManager
         if self.kv_manager.is_support_asnyc:
             model = self.tp_worker.worker.model_runner.model
             self.kv_manager.insert_layer_callbacks(model)
@@ -252,7 +253,7 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler):
         self.result_queue = deque()
-        self.kv_manager : BaseKVManager
+        self.kv_manager: BaseKVManager
         if self.kv_manager.is_support_asnyc:
             model = self.tp_worker.worker.model_runner.model
             self.kv_manager.insert_layer_callbacks(model)
@@ -466,8 +467,8 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
-        delay_send : Optional[bool] = True,
-    ) -> Tuple[Tuple[npt.NDArray[np.int64], slice],int]:
+        delay_send: Optional[bool] = True,
+    ) -> Tuple[Tuple[npt.NDArray[np.int64], slice], int]:
         """
         Send a prefilled chunk to the decode server
         """
