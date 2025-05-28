@@ -257,11 +257,14 @@ class Scheduler(
         # Init tokenizer
         self.init_tokenizer()
 
-        # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
+        # Set reasoning_parser, think_start_id and think_end_id if --reasoning_parser is enabled
         if self.server_args.reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
+            self.tokenizer.think_start_id = self.tokenizer.encode(
+                reasoning_parser.detector.think_start_token, add_special_tokens=False
+            )[0]
             self.tokenizer.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]

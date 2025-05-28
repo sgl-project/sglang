@@ -135,7 +135,7 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         super().__init__(
             "<think>",
             "</think>",
-            force_reasoning=True,
+            force_reasoning=False,
             stream_reasoning=stream_reasoning,
         )
 
