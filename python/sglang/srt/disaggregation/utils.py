@@ -14,7 +14,7 @@ import requests
 import torch
 import torch.distributed as dist
 
-from sglang.srt.utils import get_ip
+from sglang.srt.utils import get_ip, get_local_ip_by_remote
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -299,3 +299,20 @@ class FastQueue:
             while not self._buf:
                 self._cond.wait()
             return self._buf.popleft()
+
+
+def group_concurrent_contiguous(
+    src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
+) -> Tuple[List[npt.NDArray[np.int64]], List[npt.NDArray[np.int64]]]:
+    """Vectorised NumPy implementation."""
+    if src_indices.size == 0:
+        return [], []
+
+    brk = np.where((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))[0] + 1
+    src_groups = np.split(src_indices, brk)
+    dst_groups = np.split(dst_indices, brk)
+
+    src_groups = [g.tolist() for g in src_groups]
+    dst_groups = [g.tolist() for g in dst_groups]
+
+    return src_groups, dst_groups
