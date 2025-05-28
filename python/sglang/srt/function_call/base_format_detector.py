@@ -226,8 +226,8 @@ class BaseFormatDetector(ABC):
                             self.current_tool_id
                         )  # Save the ID of the tool that's completing
 
-                        # Clear buffer when tool completes
-                        self._buffer = ""
+                        # Only remove the processed portion, keep unprocessed content
+                        self._buffer = current_text[start_idx + end_idx :]
 
                         if self.current_tool_id < len(self.prev_tool_call_arr):
                             self.prev_tool_call_arr[self.current_tool_id].clear()
