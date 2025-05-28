@@ -84,6 +84,7 @@ class EagleDraftInput:
         self,
         batch: ScheduleBatch,
         speculative_num_steps: int,
+        pad_input: bool = False,
     ):
         assert len(self.verified_id) == len(batch.out_cache_loc)
         accept_length_cpu = batch.spec_info.accept_length_cpu
@@ -110,6 +111,50 @@ class EagleDraftInput:
         batch.seq_lens_sum = sum(seq_lens_cpu)
         batch.input_ids = self.verified_id
         self.verified_id = new_verified_id
+
+        if pad_input:
+            batch_size = sum(not req.finished() for req in batch.reqs)
+            # Total constant input length after padding
+            static_len = speculative_num_steps + 1
+            # Total size after padding
+            padded_input_size = batch_size * static_len
+
+            padded_len = padded_input_size - batch.input_ids.shape[0]
+            if padded_len > 0:
+                new_input_ids = torch.nn.functional.pad(
+                    batch.input_ids, (0, padded_len), value=0
+                )
+                position_padding = torch.arange(
+                    padded_len, device=self.positions.device
+                )
+                new_positions = torch.cat([self.positions, position_padding])
+
+                # need dummy hidden states for the padded positions
+                hidden_states_dim = self.hidden_states.shape[-1]
+                new_hidden_states = torch.cat(
+                    [
+                        self.hidden_states,
+                        torch.zeros(
+                            (padded_len, hidden_states_dim),
+                            dtype=self.hidden_states.dtype,
+                            device=self.hidden_states.device,
+                        ),
+                    ],
+                    dim=0,
+                )
+
+                # allocate KV cache location for the padded tokens
+                padded_cache_loc = torch.zeros(
+                    padded_len,
+                    dtype=batch.out_cache_loc.dtype,
+                    device=batch.out_cache_loc.device,
+                )
+                new_out_cache_loc = torch.cat([batch.out_cache_loc, padded_cache_loc])
+
+                batch.input_ids = new_input_ids
+                self.hidden_states = new_hidden_states
+                self.positions = new_positions
+                batch.out_cache_loc = new_out_cache_loc
 
     def generate_attn_arg_prefill(
         self,

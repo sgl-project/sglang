@@ -34,6 +34,7 @@ import zmq
 from torch.distributed import barrier
 
 from sglang.global_config import global_config
+from sglang.srt import two_batch_overlap
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
 from sglang.srt.disaggregation.decode import (
@@ -48,6 +49,7 @@ from sglang.srt.disaggregation.prefill import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     prepare_abort,
@@ -131,7 +133,9 @@ from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils import (
+    DeepEPMode,
     DynamicGradMode,
     broadcast_pyobj,
     configure_logger,
@@ -569,20 +573,13 @@ class Scheduler(
             req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            aux_dtype = torch.int32
-            # A list of metadata buffers. The shape is (b, metadata_size) where
-            # b corresponds to a max running requests. The last shape * dtype.itemsize
-            # should be larger than 64 bytes to work with RDMA, so we pad it.
-            output_id_buffer = torch.zeros(
-                (buffer_size, 16), dtype=aux_dtype, device="cpu"
-            )
-            metadata_buffers = [output_id_buffer]
+            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
                 gloo_group=self.attn_tp_cpu_group,
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
-                metadata_buffers=metadata_buffers,
+                metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 tree_cache=self.tree_cache,
             )
@@ -591,9 +588,13 @@ class Scheduler(
             self.disagg_decode_prealloc_queue = DecodePreallocQueue(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                draft_token_to_kv_pool=(
+                    None
+                    if self.draft_worker is None
+                    else self.draft_worker.model_runner.token_to_kv_pool
+                ),
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
-                metadata_buffers=metadata_buffers,
-                aux_dtype=aux_dtype,
+                metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 transfer_queue=self.disagg_decode_transfer_queue,
                 tree_cache=self.tree_cache,
@@ -613,20 +614,17 @@ class Scheduler(
             req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            aux_dtype = torch.int32
-            # A list of metadata buffers. The shape is (b, metadata_size) where
-            # b corresponds to a max running requests. The last shape * dtype.itemsize
-            # should be larger than 64 bytes to work with RDMA, so we pad it.
-            output_id_buffer = torch.zeros(
-                (buffer_size, 16), dtype=aux_dtype, device="cpu"
-            )
-            metadata_buffers = [output_id_buffer]
+            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
+                draft_token_to_kv_pool=(
+                    None
+                    if self.draft_worker is None
+                    else self.draft_worker.model_runner.token_to_kv_pool
+                ),
                 req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
-                metadata_buffers=metadata_buffers,
-                aux_dtype=aux_dtype,
+                metadata_buffers=self.disagg_metadata_buffers,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
@@ -1070,8 +1068,11 @@ class Scheduler(
         else:
             self.waiting_queue.append(req)
 
-    def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
+    def _extend_requests_to_queue(self, reqs: List[Req]):
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.disagg_prefill_bootstrap_queue.extend(reqs)
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            # If this is a decode server, we put the request to the decode pending prealloc queue
             self.disagg_decode_prealloc_queue.extend(reqs)
         else:
             self.waiting_queue.extend(reqs)
@@ -1409,6 +1410,13 @@ class Scheduler(
                 self.running_batch.batch_is_full = True
                 break
 
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                # In prefill mode, prealloc queue and transfer queue can also take memory,
+                # so we need to check if the available size for the actual available size.
+                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                    self.running_batch.batch_is_full = True
+                    break
+
             req.init_next_round_input(
                 None if prefix_computed else self.tree_cache,
                 self.enable_hierarchical_cache,
@@ -1643,6 +1651,9 @@ class Scheduler(
             disable_cuda_graph=self.server_args.disable_cuda_graph,
             spec_algorithm=self.spec_algorithm,
             speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+            enable_two_batch_overlap=self.server_args.enable_two_batch_overlap,
+            enable_deepep_moe=self.server_args.enable_deepep_moe,
+            deepep_mode=DeepEPMode[self.server_args.deepep_mode],
         )
 
     @staticmethod
@@ -1656,6 +1667,9 @@ class Scheduler(
         disable_cuda_graph: bool,
         spec_algorithm,
         speculative_num_draft_tokens,
+        enable_two_batch_overlap: bool,
+        enable_deepep_moe: bool,
+        deepep_mode: DeepEPMode,
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -1691,17 +1705,26 @@ class Scheduler(
         is_extend_in_batch = (
             local_batch.forward_mode.is_extend() if local_batch else False
         )
+
+        tbo_preparer = TboDPAttentionPreparer()
+
         local_info = torch.tensor(
             [
                 num_tokens,
                 can_cuda_graph,
                 num_tokens_for_logprob,
                 is_extend_in_batch,
+                *tbo_preparer.prepare_all_gather(
+                    local_batch,
+                    deepep_mode,
+                    enable_deepep_moe,
+                    enable_two_batch_overlap,
+                ),
             ],
             dtype=torch.int64,
         )
         global_info = torch.empty(
-            (dp_size, attn_tp_size, 4),
+            (dp_size, attn_tp_size, 6),
             dtype=torch.int64,
         )
         torch.distributed.all_gather_into_tensor(
@@ -1713,6 +1736,10 @@ class Scheduler(
         can_cuda_graph = min(global_info[:, 0, 1].tolist())
         global_num_tokens_for_logprob = global_info[:, 0, 2].tolist()
         is_extend_in_batch = global_info[:, 0, 3].tolist()
+
+        tbo_split_seq_index, global_forward_mode = tbo_preparer.compute_output(
+            global_info[:, :, 4:6]
+        )
 
         if local_batch is None and max(global_num_tokens) > 0:
             local_batch = get_idle_batch()
@@ -1727,6 +1754,8 @@ class Scheduler(
                 local_batch.global_num_tokens_for_logprob = (
                     global_num_tokens_for_logprob
                 )
+            local_batch.tbo_split_seq_index = tbo_split_seq_index
+            local_batch.global_forward_mode = global_forward_mode
 
             # Check forward mode for cuda graph
             if not disable_cuda_graph:
@@ -2174,6 +2203,7 @@ class Scheduler(
         self.torch_profiler = None
         self.torch_profiler_output_dir = None
         self.profiler_activities = None
+        self.profiler_target_forward_ct = None
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
