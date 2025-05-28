@@ -1152,15 +1152,33 @@ class Scheduler(
             + self.tree_cache.evictable_size()
         )
 
+        if self.token_to_kv_pool_allocator_local is not None:
+            self.local_max_total_num_tokens = self.token_to_kv_pool_allocator_local.size
+            num_used_local = self.local_max_total_num_tokens - (
+                self.token_to_kv_pool_allocator_local.available_size()
+                + self.tree_cache.evictable_size()
+            )
+
         num_new_seq = len(can_run_list)
-        f = (
-            f"Prefill batch. "
-            f"#new-seq: {num_new_seq}, "
-            f"#new-token: {adder.log_input_tokens}, "
-            f"#cached-token: {adder.log_hit_tokens}, "
-            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-            f"#running-req: {running_bs}, "
-        )
+        if self.token_to_kv_pool_allocator_local is not None:
+            f = (
+                f"Prefill batch. "
+                f"#new-seq: {num_new_seq}, "
+                f"#new-token: {adder.log_input_tokens}, "
+                f"#cached-token: {adder.log_hit_tokens}, "
+                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+                f"token usage local: {num_used_local / self.local_max_total_num_tokens:.2f}, "
+                f"#running-req: {running_bs}, "
+            )
+        else:
+            f = (
+                f"Prefill batch. "
+                f"#new-seq: {num_new_seq}, "
+                f"#new-token: {adder.log_input_tokens}, "
+                f"#cached-token: {adder.log_hit_tokens}, "
+                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+                f"#running-req: {running_bs}, "
+            )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
@@ -1203,18 +1221,32 @@ class Scheduler(
             self.token_to_kv_pool_allocator.available_size()
             + self.tree_cache.evictable_size()
         )
+        if self.token_to_kv_pool_allocator_local is not None:
+            num_used_local = self.local_max_total_num_tokens - (
+                self.token_to_kv_pool_allocator_local.available_size()
+                + self.tree_cache.evictable_size()
+            )
 
         if RECORD_STEP_TIME:
             self.step_time_dict[num_running_reqs].append(
                 gap_latency / self.server_args.decode_log_interval
             )
 
-        msg = (
-            f"Decode batch. "
-            f"#running-req: {num_running_reqs}, "
-            f"#token: {num_used}, "
-            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-        )
+        if self.token_to_kv_pool_allocator_local is not None:
+            msg = (
+                f"Decode batch. "
+                f"#running-req: {num_running_reqs}, "
+                f"#token: {num_used}, "
+                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+                f"token usage local: {num_used_local / self.local_max_total_num_tokens:.2f}, "
+            )
+        else:
+            msg = (
+                f"Decode batch. "
+                f"#running-req: {num_running_reqs}, "
+                f"#token: {num_used}, "
+                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+            )
 
         if self.spec_algorithm.is_none():
             spec_accept_length = 0

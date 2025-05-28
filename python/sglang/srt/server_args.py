@@ -60,7 +60,7 @@ class ServerArgs:
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
-    enable_hybrid_kvcache: Optional[float] = None
+    hybrid_kvcache_ratio: Optional[float] = None
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -694,11 +694,11 @@ class ServerArgs:
             help="The number of tokens in a page.",
         )
         parser.add_argument(
-            "--enable-hybrid-kvcache",
+            "--hybrid-kvcache-ratio",
             nargs="?",
             const=0.5,
             type=float,
-            default=ServerArgs.enable_hybrid_kvcache,
+            default=ServerArgs.hybrid_kvcache_ratio,
             help=(
                 "Mix ratio in [0,1] between uniform and hybrid kv buffers "
                 "(0.0 = pure uniform: local_size / global_size = 1)"

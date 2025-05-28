@@ -832,15 +832,15 @@ class ModelRunner:
             (1 - self.is_hybrid)
             + self.is_hybrid * self.attention_chunk_size / self.model_config.context_len
         )
-        self.local_max_num_tokens = (
+        self.local_max_total_num_tokens = (
             4 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
         )
         self.max_total_num_tokens = (
             4 * self.max_total_num_tokens
             - 12 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
         )
-        self.local_max_num_tokens = int(
-            self.local_max_num_tokens
+        self.local_max_total_num_tokens = int(
+            self.local_max_total_num_tokens
             // self.server_args.page_size
             * self.server_args.page_size
         )
@@ -934,7 +934,7 @@ class ModelRunner:
                     "Hybrid cache does not support radix_cache currently. Please set --diable-radix-cache."
                 )
         else:
-            self.local_max_num_tokens = None
+            self.local_max_total_num_tokens = None
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
@@ -996,7 +996,7 @@ class ModelRunner:
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
-                local_size=self.local_max_num_tokens,
+                local_size=self.local_max_total_num_tokens,
             )
 
         if self.token_to_kv_pool_allocator is None:
@@ -1009,7 +1009,7 @@ class ModelRunner:
                 )
                 if self.is_hybrid is not None:
                     self.token_to_kv_pool_allocator_local = TokenToKVPoolAllocator(
-                        self.local_max_num_tokens,
+                        self.local_max_total_num_tokens,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=self.token_to_kv_pool,

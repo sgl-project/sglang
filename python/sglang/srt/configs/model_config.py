@@ -53,7 +53,7 @@ class ModelConfig:
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
-        enable_hybrid_kvcache: Optional[float] = None,
+        hybrid_kvcache_ratio: Optional[float] = None,
     ) -> None:
 
         self.model_path = model_path
@@ -81,7 +81,7 @@ class ModelConfig:
         )
         self.is_hybrid = is_hybrid_model(
             self.hf_config.architectures,
-            enable_hybrid_kvcache=enable_hybrid_kvcache,
+            hybrid_kvcache_ratio=hybrid_kvcache_ratio,
             context_length=context_length,
             attention_chunk_size=self.attention_chunk_size,
         )
@@ -247,7 +247,7 @@ class ModelConfig:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
-            enable_hybrid_kvcache=server_args.enable_hybrid_kvcache,
+            hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             **kwargs,
         )
 
@@ -612,17 +612,17 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
 
 def is_hybrid_model(
     model_architectures: List[str],
-    enable_hybrid_kvcache: Optional[float],
+    hybrid_kvcache_ratio: Optional[float],
     context_length: Optional[int],
     attention_chunk_size: Optional[int],
 ):
-    if enable_hybrid_kvcache is None:
+    if hybrid_kvcache_ratio is None:
         return None
     elif (
-        enable_hybrid_kvcache > 0
+        hybrid_kvcache_ratio > 0
         and model_architectures[0] == "Llama4ForConditionalGeneration"
         and context_length > attention_chunk_size
     ):
-        return enable_hybrid_kvcache
+        return hybrid_kvcache_ratio
     else:
         return None
