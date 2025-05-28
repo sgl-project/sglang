@@ -31,14 +31,13 @@ from sglang.srt.utils import get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
 
-NixlEngineInfo: TypeAlias = Dict[str, Union[str, int]]
-
 GUARD = "NixlMsgGuard".encode("ascii")
 
 
-# prefill
 @dataclasses.dataclass
 class TransferInfo:
+    """Contains indices for a transfer, sent by KVReceiver. Received by prefill bootstrap thread."""
+
     room: int
     endpoint: str
     dst_port: int
@@ -63,14 +62,15 @@ class TransferInfo:
         )
 
 
-# decode
 @dataclasses.dataclass
 class KVArgsRegisterInfo:
+    """Contains base pointers and other info which only needs to be sent once by KVReceiver. Received by prefill bootstrap thread."""
+
     room: str
     endpoint: str
     dst_port: int
     agent_name: str
-    agent_metadata: str
+    agent_metadata: bytes
     dst_kv_ptrs: list[int]
     dst_aux_ptrs: list[int]
     gpu_id: int
@@ -89,7 +89,6 @@ class KVArgsRegisterInfo:
         )
 
 
-# decode
 @dataclasses.dataclass
 class TransferStatus:
     """Used by KV Receiver to know when a transfer is done."""
@@ -287,6 +286,7 @@ class NixlKVManager(CommonKVManager):
 
             chunked_dst_kv_indice = req.dst_kv_indices[index_slice]
             assert len(chunked_dst_kv_indice) == len(kv_indices)
+            assert req.agent_name in self.decode_kv_args_table
 
             notif = "_".join([str(req.room), "kv", str(chunk_id), str(int(is_last))])
             kv_xfer_handle = self.send_kvcache(
@@ -354,11 +354,11 @@ class NixlKVManager(CommonKVManager):
                 room = waiting_req_bytes[0].decode("ascii")
                 agent_name = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
-                    # Register KV args message.
-                    self._add_remote_peer(KVArgsRegisterInfo.from_zmq(waiting_req_bytes))
-                    logger.debug(
-                        f"Register KVArgs from {agent_name} successfully"
+                    # Register new peer and save KV base pointers.
+                    self._add_remote_peer(
+                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     )
+                    logger.debug(f"Register KVArgs from {agent_name} successfully")
                     continue
                 room = int(room)
                 if room not in self.transfer_infos:
@@ -366,7 +366,9 @@ class NixlKVManager(CommonKVManager):
                 self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
                     waiting_req_bytes
                 )
-                required_dst_info_num = self.transfer_infos[room][agent_name].required_dst_info_num
+                required_dst_info_num = self.transfer_infos[room][
+                    agent_name
+                ].required_dst_info_num
                 logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
                     logger.debug(f"{room=} is bootstrapped")
