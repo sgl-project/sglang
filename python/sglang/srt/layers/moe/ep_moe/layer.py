@@ -62,6 +62,9 @@ _is_hip = is_hip()
 if _is_hip:
     from vllm._custom_ops import scaled_fp8_quant
 
+if _is_cuda:
+    from sgl_kernel import moe_pre_reorder as sgl_moe_pre_reorder
+
 logger = logging.getLogger(__name__)
 
 
@@ -284,19 +287,31 @@ class EPMoE(torch.nn.Module):
                 self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
 
         # PreReorder
-        pre_reorder_triton_kernel[(hidden_states.shape[0],)](
-            hidden_states,
-            gateup_input,
-            src2dst,
-            topk_ids,
-            self.w13_input_scale,
-            self.start_expert_id,
-            self.end_expert_id,
-            self.top_k,
-            hidden_states.shape[1],
-            BLOCK_SIZE=512,
-            use_per_token_if_dynamic=self.use_per_token_if_dynamic,
-        )
+        if _is_cuda:
+            sgl_ep_moe_pre_reorder(
+                hidden_states,
+                gateup_input,
+                src2dst,
+                topk_ids,
+                self.w13_input_scale,
+                self.start_expert_id,
+                self.end_expert_id,
+                self.top_k,
+            )
+        else:
+            pre_reorder_triton_kernel[(hidden_states.shape[0],)](
+                hidden_states,
+                gateup_input,
+                src2dst,
+                topk_ids,
+                self.w13_input_scale,
+                self.start_expert_id,
+                self.end_expert_id,
+                self.top_k,
+                hidden_states.shape[1],
+                BLOCK_SIZE=512,
+            )
+
         dispose_tensor(hidden_states)
 
         if (
