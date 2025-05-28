@@ -58,12 +58,15 @@ pub struct EngineLoad {
 }
 
 impl EngineLoad {
-    pub fn from_json(engine_info: EngineInfo, json: serde_json::Value) -> Self {
+    pub fn from_json(engine_info: &EngineInfo, json: &serde_json::Value) -> Self {
         let load = match json.get("load") {
             Some(load) => load.as_i64().unwrap_or(-1) as isize,
             None => -1,
         };
-        EngineLoad { engine_info, load }
+        EngineLoad {
+            engine_info: engine_info.clone(),
+            load,
+        }
     }
     pub fn to_json(&self) -> serde_json::Value {
         json!({

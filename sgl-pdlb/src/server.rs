@@ -70,15 +70,16 @@ impl LBState {
 
     async fn route_one(
         &self,
-        engine_info: EngineInfo,
+        engine_info: &EngineInfo,
         method: &str,
         api_path: &str,
-        request: serde_json::Value,
+        request: Option<&serde_json::Value>,
         stream: bool,
     ) -> Result<ProxyResponse, actix_web::Error> {
         let url = engine_info.api_path(api_path);
+        let request = request.unwrap_or(&serde_json::Value::Null);
         let task = match method {
-            "POST" => self.client.post(&url).json(&request).send(),
+            "POST" => self.client.post(&url).json(request).send(),
             "GET" => self.client.get(&url).send(),
             _ => panic!("Unsupported method: {}", method),
         };
@@ -111,14 +112,14 @@ impl LBState {
 
     async fn route_collect(
         &self,
-        engines: Vec<EngineInfo>,
+        engines: &Vec<EngineInfo>,
         method: &str,
         api_path: &str,
-        request: serde_json::Value,
+        request: Option<&serde_json::Value>,
     ) -> Result<Vec<ProxyResponse>, actix_web::Error> {
         let tasks = engines
-            .into_iter()
-            .map(|engine| self.route_one(engine, method, api_path, request.clone(), false));
+            .iter()
+            .map(|engine| self.route_one(engine, method, api_path, request, false));
         let responses = join_all(tasks).await;
         responses
             .into_iter()
@@ -135,8 +136,8 @@ impl LBState {
         let stream = req.is_stream();
         req.add_bootstrap_info(&prefill)?;
         let json = serde_json::to_value(req)?;
-        let prefill_task = self.route_one(prefill.clone(), "POST", api_path, json.clone(), false);
-        let decode_task = self.route_one(decode.clone(), "POST", api_path, json.clone(), stream);
+        let prefill_task = self.route_one(&prefill, "POST", api_path, Some(&json), false);
+        let decode_task = self.route_one(&decode, "POST", api_path, Some(&json), stream);
         let (_, decode_response) = tokio::join!(prefill_task, decode_task);
         decode_response?.into()
     }
@@ -146,12 +147,12 @@ impl LBState {
     ) -> Result<(Vec<EngineLoad>, Vec<EngineLoad>), actix_web::Error> {
         let servers = self.strategy_lb.get_all_servers();
         let responses = self
-            .route_collect(servers.clone(), "GET", "/get_load", serde_json::Value::Null)
+            .route_collect(&servers, "GET", "/get_load", None)
             .await?;
         let loads = responses
             .into_iter()
             .enumerate()
-            .map(|(i, r)| Ok(EngineLoad::from_json(servers[i].clone(), r.to_json()?)))
+            .map(|(i, r)| Ok(EngineLoad::from_json(&servers[i], &r.to_json()?)))
             .collect::<Result<Vec<EngineLoad>, actix_web::Error>>()?;
         let mut prefill_loads = Vec::new();
         let mut decode_loads = Vec::new();
@@ -177,7 +178,7 @@ pub async fn health_generate(
 ) -> Result<HttpResponse, actix_web::Error> {
     let servers = app_state.strategy_lb.get_all_servers();
     app_state
-        .route_collect(servers, "GET", "/health_generate", serde_json::Value::Null)
+        .route_collect(&servers, "GET", "/health_generate", None)
         .await?;
     Ok(HttpResponse::Ok().body("Health check passed on all servers"))
 }
@@ -189,7 +190,7 @@ pub async fn flush_cache(
 ) -> Result<HttpResponse, actix_web::Error> {
     let servers = app_state.strategy_lb.get_all_servers();
     app_state
-        .route_collect(servers, "POST", "/flush_cache", serde_json::Value::Null)
+        .route_collect(&servers, "POST", "/flush_cache", None)
         .await?;
     Ok(HttpResponse::Ok().body("Cache flushed on all servers"))
 }
@@ -202,13 +203,7 @@ pub async fn get_model_info(
     // Return the first server's model info
     let engine = app_state.strategy_lb.get_one_server();
     app_state
-        .route_one(
-            engine,
-            "GET",
-            "/get_model_info",
-            serde_json::Value::Null,
-            false,
-        )
+        .route_one(&engine, "GET", "/get_model_info", None, false)
         .await?
         .into()
 }
@@ -242,19 +237,13 @@ pub async fn get_server_info(
 ) -> Result<HttpResponse, actix_web::Error> {
     let servers = app_state.strategy_lb.get_all_servers();
     let responses = app_state
-        .route_collect(
-            servers.clone(),
-            "GET",
-            "/get_server_info",
-            serde_json::Value::Null,
-        )
+        .route_collect(&servers, "GET", "/get_server_info", None)
         .await?;
     let mut prefill_infos = Vec::new();
     let mut decode_infos = Vec::new();
     for (i, resp) in responses.iter().enumerate() {
         let json = resp.to_json()?;
-        let engine_info = servers[i].clone();
-        match engine_info.engine_type {
+        match servers[i].engine_type {
             EngineType::Prefill => prefill_infos.push(json),
             EngineType::Decode => decode_infos.push(json),
         }
