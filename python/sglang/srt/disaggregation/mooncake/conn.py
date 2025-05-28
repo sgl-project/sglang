@@ -33,6 +33,7 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     FastQueue,
     group_concurrent_contiguous,
+    check_gdr_support,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -53,6 +54,16 @@ class KVTransferError(Exception):
 
     def __str__(self):
         return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
+
+
+# For CPU fallback
+@dataclasses.dataclass
+class CPUKVArgs:
+    kv_data_ptrs: list[int]
+
+    @classmethod
+    def from_ptr(cls, kv_ptrs: list[int]):
+        return cls(kv_data_ptrs=kv_ptrs)
 
 
 # prefill
@@ -150,6 +161,13 @@ class MooncakeKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self.rank_port = None
         self.server_socket = zmq.Context().socket(zmq.PULL)
+        self.gdr_support = check_gdr_support()
+        if not self.gdr_support:
+            logger.info(
+                "GDR is not supported, use CPU memory for bounce buffer."
+                "The performance may slow down."
+            )
+            self.cpu_buffer = self.init_cpu_fallback_buffer()
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
@@ -213,6 +231,14 @@ class MooncakeKVManager(BaseKVManager):
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
+    def init_cpu_fallback_buffer(self):
+        kv_cpu_buffer = [
+            self.engine.allocate_managed_buffer(self.kv_args.kv_data_lens[i])
+            for i in range(len(self.kv_args.kv_data_ptrs))
+        ]
+
+        return CPUKVArgs.from_ptr(kv_cpu_buffer)
+
     def register_buffer_to_engine(self):
         for kv_data_ptr, kv_data_len in zip(
             self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
@@ -246,7 +272,11 @@ class MooncakeKVManager(BaseKVManager):
         num_layers = len(self.kv_args.kv_data_ptrs)
         layers_params = [
             (
-                self.kv_args.kv_data_ptrs[layer_id],
+                (
+                    self.kv_args.kv_data_ptrs[layer_id]
+                    if self.gdr_support
+                    else self.cpu_buffer.kv_data_ptrs[layer_id]
+                ),
                 dst_kv_ptrs[layer_id],
                 self.kv_args.kv_item_lens[layer_id],
             )
@@ -302,6 +332,34 @@ class MooncakeKVManager(BaseKVManager):
             mooncake_session_id, prefill_aux_addr, decode_aux_addr, aux_item_len
         )
         return status
+
+    def fill_cpu_kv_buffer(self, kv_indices: npt.NDArray[np.int64]):
+        kv_blocks, _ = group_concurrent_contiguous(kv_indices, kv_indices)
+        for layer_id in range(len(self.kv_args.kv_data_ptrs)):
+            gpu_ptr = self.kv_args.kv_data_ptrs[layer_id]
+            cpu_ptr = self.cpu_buffer.kv_data_ptrs[layer_id]
+            item_len = self.kv_args.kv_item_lens[layer_id]
+            for index in kv_blocks:
+                gpu_addr = gpu_ptr + int(index[0]) * item_len
+                cpu_addr = cpu_ptr + int(index[0]) * item_len
+                length = item_len * len(index)
+                self.engine.transfer_sync(
+                    self.get_session_id(), gpu_addr, cpu_addr, length
+                )
+
+    def fill_gpu_kv_buffer(self, kv_indices: npt.NDArray[np.int64]):
+        kv_blocks, _ = group_concurrent_contiguous(kv_indices, kv_indices)
+        for layer_id in range(len(self.kv_args.kv_data_ptrs)):
+            gpu_ptr = self.kv_args.kv_data_ptrs[layer_id]
+            cpu_ptr = self.cpu_buffer.kv_data_ptrs[layer_id]
+            item_len = self.kv_args.kv_item_lens[layer_id]
+            for index in kv_blocks:
+                gpu_addr = gpu_ptr + int(index[0]) * item_len
+                cpu_addr = cpu_ptr + int(index[0]) * item_len
+                length = item_len * len(index)
+                self.engine.transfer_sync(
+                    self.get_session_id(), cpu_addr, gpu_addr, length
+                )
 
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int
@@ -690,6 +748,8 @@ class MooncakeKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int64],
     ):
+        if not self.kv_mgr.gdr_support:
+            self.kv_mgr.fill_cpu_kv_buffer(kv_indices)
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
@@ -923,9 +983,14 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.prefill_server_url = (
                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
             )
-            packed_kv_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-            )
+            if self.kv_mgr.gdr_support:
+                packed_kv_data_ptrs = b"".join(
+                    struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+                )
+            else:
+                packed_kv_data_ptrs = b"".join(
+                    struct.pack("Q", ptr) for ptr in self.kv_mgr.cpu_buffer.kv_data_ptrs
+                )
             packed_aux_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
             )
@@ -954,6 +1019,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
     def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+        self.kv_indices = kv_indices
         for bootstrap_info in self.bootstrap_infos:
             self.prefill_server_url = (
                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
@@ -979,6 +1045,8 @@ class MooncakeKVReceiver(BaseKVReceiver):
             status = self.kv_mgr.check_status(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
+            if status == KVPoll.Success and not self.kv_mgr.gdr_support:
+                self.kv_mgr.fill_gpu_kv_buffer(self.kv_indices)
 
             return status
         else:
