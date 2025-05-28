@@ -487,16 +487,18 @@ class EmbeddingResponse(BaseModel):
 
 
 class ScoringRequest(BaseModel):
-    text_1: str
-    text_2: List[str]
-    positive_token_id: int
-    negative_token_id: int
+    text_1: Optional[str] = None
+    text_2: Optional[List[str]] = None
+    token_ids_1: Optional[List[int]] = None  # Pre-tokenized text_1
+    token_ids_2: Optional[List[List[int]]] = None  # Pre-tokenized text_2
+    output_prob_token_ids: Optional[List[int]] = None  # Token IDs to compute probabilities for
+    apply_softmax: bool = False
     prepend: bool = False
     model: str
 
 
 class ScoringResponse(BaseModel):
-    scores: List[Optional[float]]
+    scores: List[Dict[int, float]]  # List of dicts mapping token IDs to probabilities
     model: str
-    usage: UsageInfo
+    usage: Optional[UsageInfo] = None
     object: str = "scoring"

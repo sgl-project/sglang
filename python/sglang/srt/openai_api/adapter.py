@@ -1932,19 +1932,21 @@ async def v1_score(tokenizer_manager, raw_request):
         request = ScoringRequest(**request_data)
 
         # Use tokenizer_manager's score_request method directly
-        result = await tokenizer_manager.score_request(
+        scores = await tokenizer_manager.score_request(
+            output_prob_token_ids=request.output_prob_token_ids,
             text_1=request.text_1,
             text_2=request.text_2,
-            positive_token_id=request.positive_token_id,
-            negative_token_id=request.negative_token_id,
+            token_ids_1=request.token_ids_1,
+            token_ids_2=request.token_ids_2,
+            apply_softmax=request.apply_softmax,
             prepend=request.prepend,
             request=request,
         )
 
+        # Create response with just the scores, without usage info
         response = ScoringResponse(
-            scores=result["scores"],
+            scores=scores,
             model=request.model,
-            usage=result["usage"]
         )
         return response
 

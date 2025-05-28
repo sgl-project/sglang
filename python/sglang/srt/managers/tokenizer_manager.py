@@ -1419,83 +1419,103 @@ class TokenizerManager:
 
     async def score_request(
         self,
-        text_1: str,
-        text_2: Union[str, List[str]],
-        positive_token_id: int,
-        negative_token_id: int,
+        text_1: Optional[str] = None,
+        text_2: Optional[Union[str, List[str]]] = None,
+        token_ids_1: Optional[List[int]] = None,
+        token_ids_2: Optional[List[List[int]]] = None,
+        output_prob_token_ids: Optional[List[int]] = None,
+        apply_softmax: bool = False,
         prepend: bool = False,
         request: Optional[Any] = None,
-    ) -> Dict:
+    ) -> List[Dict[int, float]]:
         """
-        Internal implementation of the scoring API. See Engine.score() for detailed documentation.
+        Score the probability of specified token IDs appearing after the given text.
+
+        Args:
+            text_1: The first part of the text. Either text_1 or token_ids_1 must be provided.
+            text_2: The second part of the text or a list of second parts. Either text_2 or token_ids_2 must be provided.
+            token_ids_1: Pre-tokenized first part of the text. Either text_1 or token_ids_1 must be provided.
+            token_ids_2: Pre-tokenized second part of the text. Either text_2 or token_ids_2 must be provided.
+            output_prob_token_ids: List of token IDs to compute probabilities for. If None, no token probabilities will be computed.
+            apply_softmax: Whether to normalize probabilities using softmax.
+            prepend: If True, prepend text_2 to text_1. Otherwise append text_2 to text_1.
+            request: Optional request object for handling disconnections.
+
+        Returns:
+            List of dictionaries mapping token IDs to their probabilities for each text_2
         """
+        # Validate inputs
+        if output_prob_token_ids is None:
+            raise ValueError("output_prob_token_ids must be provided")
+
+        # Check input format and validate required fields
+        if text_1 is not None:
+            if text_2 is None:
+                raise ValueError("text_2 must be provided when using text_1")
+            if token_ids_2 is not None:
+                raise ValueError("Cannot mix text_1 with token_ids_2 - both inputs must use the same format")
+        elif token_ids_1 is not None:
+            if token_ids_2 is None:
+                raise ValueError("token_ids_2 must be provided when using token_ids_1")
+            if text_2 is not None:
+                raise ValueError("Cannot mix token_ids_1 with text_2 - both inputs must use the same format")
+        else:
+            raise ValueError("Either text_1 or token_ids_1 must be provided")
+
+        # Convert text_2 to list if it's a string
         if isinstance(text_2, str):
             text_2 = [text_2]
 
-        prompts = [f"{text}{text_1}" for text in text_2] if prepend else [f"{text_1}{text}" for text in text_2]
+        # Prepare inputs based on whether we have text or token IDs
+        if text_1 is not None and text_2 is not None:
+            # Text-based inputs - combine them directly
+            prompts = [f"{text}{text_1}" for text in text_2] if prepend else [f"{text_1}{text}" for text in text_2]
+            batch_request = GenerateReqInput(
+                text=prompts,
+                return_logprob=True,
+                token_ids_logprob=output_prob_token_ids,
+                stream=False,
+                sampling_params={"max_new_tokens": 1},
+            )
+        else:
+            # Token ID-based inputs
+            if token_ids_1 is None or token_ids_2 is None:
+                raise ValueError("Both token_ids_1 and token_ids_2 must be provided for token ID-based inputs")
+                
+            # Combine token IDs based on prepend flag
+            input_ids_list = [token_ids_2[i] + token_ids_1 for i in range(len(token_ids_2))] if prepend else [token_ids_1 + token_ids_2[i] for i in range(len(token_ids_2))]
+            
+            if self.tokenizer is not None:
+                vocab_size = self.tokenizer.vocab_size
+                for token_id in output_prob_token_ids:
+                    if token_id >= vocab_size:
+                        raise ValueError(f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})")
 
-        if self.tokenizer is not None:
-            vocab_size = self.tokenizer.vocab_size
-            if positive_token_id >= vocab_size:
-                raise ValueError(f"Positive token ID {positive_token_id} is out of vocabulary (vocab size: {vocab_size})")
-            if negative_token_id >= vocab_size:
-                raise ValueError(f"Negative token ID {negative_token_id} is out of vocabulary (vocab size: {vocab_size})")
-
-        batch_request = GenerateReqInput(
-            text=prompts,
-            return_logprob=True,
-            token_ids_logprob=[positive_token_id, negative_token_id],
-            stream=False,
-            sampling_params={"max_new_tokens": 1},
-        )
+            batch_request = GenerateReqInput(
+                input_ids=input_ids_list,
+                return_logprob=True,
+                token_ids_logprob=output_prob_token_ids,
+                stream=False,
+                sampling_params={"max_new_tokens": 1},
+            )
 
         scores = []
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
-        total_cached_tokens = 0
-
-        request_to_pass = request if hasattr(request, 'is_disconnected') else None
-        async for results in self.generate_request(batch_request, request_to_pass):
-            if not isinstance(results, list):
-                results = [results]
+        results = await self.generate_request(batch_request, request).__anext__()
+        for result in results:
+            output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
                 
-            for result in results:
-                output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
-                pos_logprob = None
-                neg_logprob = None
-                
-                if output_logprobs and len(output_logprobs) > 0:
-                    # Directly access logprobs for the target tokens
-                    first_position_logprobs = output_logprobs[0]
-                    logprob_dict = {token_id: logprob for logprob, token_id, _ in first_position_logprobs}
-                    pos_logprob = logprob_dict.get(positive_token_id)
-                    neg_logprob = logprob_dict.get(negative_token_id)
+            # Get logprobs for first position and convert to probabilities
+            first_position = output_logprobs[0]
+            probs = {token_id: math.exp(logprob) for logprob, token_id, _ in first_position 
+                    if token_id in output_prob_token_ids}
+            if apply_softmax:
+                total = sum(probs.values())
+                if total > 0:
+                    probs = {tid: p/total for tid, p in probs.items()}
+            
+            scores.append(probs)
 
-                if pos_logprob is None or neg_logprob is None:
-                    scores.append(None)
-                else:
-                    pos_prob = math.exp(pos_logprob)
-                    neg_prob = math.exp(neg_logprob)
-                    score = pos_prob / (pos_prob + neg_prob)
-                    scores.append(score)
-
-                total_prompt_tokens += result["meta_info"]["prompt_tokens"]
-                total_completion_tokens += result["meta_info"]["completion_tokens"]
-                total_cached_tokens += result["meta_info"]["cached_tokens"]
-
-        return {
-            "scores": scores,
-            "model_info": {
-                "model": self.served_model_name,
-                "context_length": self.context_len,
-            },
-            "usage": {
-                "prompt_tokens": total_prompt_tokens,
-                "completion_tokens": total_completion_tokens,
-                "cached_tokens": total_cached_tokens,
-                "total_tokens": total_prompt_tokens + total_completion_tokens,
-            },
-        }
+        return scores
 
 
 async def print_exception_wrapper(func):
