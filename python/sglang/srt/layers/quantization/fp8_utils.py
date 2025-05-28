@@ -180,7 +180,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 ) -> torch.Tensor:
     assert input_scale is None
 
-    output_dtype = input_2d.dtype
+    output_dtype = input.dtype
     dtype_supported = output_dtype == torch.bfloat16
 
     # TODO: add more robust shape check here
