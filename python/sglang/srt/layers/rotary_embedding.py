@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import is_cuda, is_hip, cpu_has_amx_support
+from sglang.srt.utils import cpu_has_amx_support, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -697,7 +697,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             key = key_rot
         return query.to(dtype), key.to(dtype)
 
-
     def forward_cpu(
         self,
         positions: torch.Tensor,
@@ -708,7 +707,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         positions = torch.add(positions, offsets) if offsets is not None else positions
         if positions.device == torch.device("cpu") and _is_cpu_amx:
             return torch.ops.sgl_kernel.rotary_embedding_cpu(
-                positions, query, key, self.head_size, self.cos_sin_cache, False)
+                positions, query, key, self.head_size, self.cos_sin_cache, False
+            )
         else:
             return self.forward_native(positions, query, key, offsets)
 
