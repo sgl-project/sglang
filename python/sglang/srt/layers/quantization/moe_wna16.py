@@ -131,7 +131,7 @@ class MoeWNA16Config(QuantizationConfig):
         capability_tuple = get_device_capability()
         device_capability = (
             -1
-            if capability_tuple is None
+            if all(capability is None for capability in capability_tuple)
             else capability_tuple[0] * 10 + capability_tuple[1]
         )
         # Avoid circular import
