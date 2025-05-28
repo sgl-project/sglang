@@ -258,6 +258,8 @@ class ServerArgs:
                     self.mem_fraction_static = 0.87
                 else:
                     self.mem_fraction_static = 0.88
+            else:
+                self.mem_fraction_static = 0.88
             if gpu_mem is not None and gpu_mem > 180 * 1000:
                 self.mem_fraction_static = 0.79
             elif gpu_mem is not None and gpu_mem > 96 * 1024:
