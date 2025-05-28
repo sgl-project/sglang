@@ -1465,7 +1465,7 @@ async def benchmark(
             result_for_dump = result | result_details
         else:
             result_for_dump = result
-        file.write(json.dumps(result_for_dump) + "\n")
+        file.write(json.dumps(result_for_dump, ensure_ascii=False) + "\n")
 
     return result | result_details
 
