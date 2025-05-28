@@ -55,7 +55,7 @@ jobs:
           docker exec -w /sglang-checkout/ ci_sglang_xeon \
             bash -c "python3 -c 'import torch; import sgl_kernel; assert torch._C._cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, \"convert_weight_packed\"); '"
         continue-on-error: true
-            
+
       - name: Run UT Cases
         if: steps.check_amx.outcome == 'success'
         timeout-minutes: 20
