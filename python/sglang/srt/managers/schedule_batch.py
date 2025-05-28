@@ -1260,7 +1260,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.token_to_kv_pool_allocator.page_size == 1:
             out_cache_loc = self.alloc_token_slots(extend_num_tokens)
         else:
-            if all([x == 0 for x in prefix_lens]) and sum(seq_lens) == extend_num_tokens:
+            if all([x == 0 for x in prefix_lens]):
                 out_cache_loc = self.alloc_paged_token_slots_fastpass(
                     seq_lens, extend_num_tokens
                 )
