@@ -29,28 +29,19 @@ from sglang.srt.disaggregation.base.conn import (
     KVPoll,
 )
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    group_concurrent_contiguous,
+)
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_free_port, get_ip, get_local_ip_by_remote
+from sglang.srt.utils import (
+    get_free_port,
+    get_int_env_var,
+    get_ip,
+    get_local_ip_by_remote,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def group_concurrent_contiguous(
-    src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
-) -> Tuple[List[npt.NDArray[np.int64]], List[npt.NDArray[np.int64]]]:
-    """Vectorised NumPy implementation."""
-    if src_indices.size == 0:
-        return [], []
-
-    brk = np.where((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))[0] + 1
-    src_groups = np.split(src_indices, brk)
-    dst_groups = np.split(dst_indices, brk)
-
-    src_groups = [g.tolist() for g in src_groups]
-    dst_groups = [g.tolist() for g in dst_groups]
-
-    return src_groups, dst_groups
 
 
 class KVTransferError(Exception):
@@ -172,11 +163,9 @@ class MooncakeKVManager(BaseKVManager):
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             self.executor = concurrent.futures.ThreadPoolExecutor(
-                int(
-                    os.getenv(
-                        "DISAGGREGATION_THREAD_POOL_SIZE",
-                        min(max(1, cpu_count // 8), 8),
-                    )
+                get_int_env_var(
+                    "SGLANG_DISAGGREGATION_THREAD_POOL_SIZE",
+                    min(max(1, cpu_count // 8), 8),
                 )
             )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -187,11 +176,11 @@ class MooncakeKVManager(BaseKVManager):
             self.connection_lock = threading.Lock()
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
-                float(os.getenv("DISAGGREGATION_HEARTBEAT_INTERVAL", 5.0)), 2.0
+                float(os.getenv("SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL", 5.0)), 2.0
             )
             # Heartbeat failure should be at least 1
             self.max_failures = max(
-                int(os.getenv("DISAGGREGATION_HEARTBEAT_MAX_FAILURE", 2)), 1
+                int(os.getenv("SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE", 2)), 1
             )
             self.start_decode_thread()
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
