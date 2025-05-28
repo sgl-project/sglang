@@ -180,6 +180,7 @@ pub async fn health_generate(
     app_state
         .route_collect(&servers, "GET", "/health_generate", None)
         .await?;
+    // FIXME: log the response
     Ok(HttpResponse::Ok().body("Health check passed on all servers"))
 }
 

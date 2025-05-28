@@ -6,7 +6,7 @@ use server::{periodic_logging, startup};
 use tokio::signal;
 
 fn main() -> anyhow::Result<()> {
-    // test code
+    // FIXME: test code, move to test folder
     let prefill_infos = (0..8)
         .map(|i| (format!("123.123.123.123:{}", i), None))
         .collect::<Vec<(String, Option<u16>)>>();
