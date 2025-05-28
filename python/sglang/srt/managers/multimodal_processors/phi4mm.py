@@ -6,7 +6,7 @@ from sglang.srt.managers.multimodal_processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.models.phi4mmvllm import Phi4MMForCausalLM
+from sglang.srt.models.phi4mm import Phi4MMForCausalLM
 
 logger = logging.getLogger(__name__)
 

@@ -21,6 +21,7 @@ from enum import IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
+from sglang.srt.utils import read_system_prompt_from_file
 
 
 class SeparatorStyle(IntEnum):
@@ -648,6 +649,20 @@ register_conv_template(
     )
 )
 
+register_conv_template(
+    Conversation(
+        name="devstral",
+        system_template="[SYSTEM_PROMPT]\n{system_message}\n[/SYSTEM_PROMPT]\n\n",
+        system_message=read_system_prompt_from_file("mistralai/Devstral-Small-2505"),
+        roles=("[INST]", "[/INST]"),
+        sep_style=SeparatorStyle.LLAMA2,
+        sep=" ",
+        sep2=" </s><s>",
+        stop_str=["[INST]", "[/INST]", "[SYSTEM_PROMPT]", "[/SYSTEM_PROMPT]"],
+        image_token="[IMG]",
+    )
+)
+
 # reference: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct/blob/main/chat_template.json
 register_conv_template(
     Conversation(
@@ -959,6 +974,12 @@ def match_openbmb_minicpm(model_path: str):
 def match_moonshot_kimivl(model_path: str):
     if re.search(r"kimi.*vl", model_path, re.IGNORECASE):
         return "kimi-vl"
+
+
+@register_conv_template_matching_function
+def match_devstral(model_path: str):
+    if re.search(r"devstral", model_path, re.IGNORECASE):
+        return "devstral"
 
 
 @register_conv_template_matching_function

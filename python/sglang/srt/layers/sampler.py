@@ -101,7 +101,7 @@ class Sampler(nn.Module):
                     # Check Nan will throw exception, only check when crash_on_warnings is True
                     check_nan = self.use_nan_detection and crash_on_warnings()
                     batch_next_token_ids = top_k_top_p_sampling_from_probs(
-                        probs,
+                        probs.contiguous(),
                         sampling_info.top_ks,
                         sampling_info.top_ps,
                         filter_apply_order="joint",

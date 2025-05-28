@@ -413,7 +413,7 @@ class ChatCompletionResponseChoice(BaseModel):
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Literal[
-        "stop", "length", "tool_calls", "content_filter", "function_call"
+        "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
     ]
     matched_stop: Union[None, int, str] = None
 

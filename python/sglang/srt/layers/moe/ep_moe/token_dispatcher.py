@@ -93,17 +93,20 @@ class DeepEPBuffer:
                 ),
                 num_rdma_bytes,
             )
+
+        if deepep_mode == DeepEPMode.normal:
+            num_qps_per_rank = DeepEPConfig.get_instance().num_sms // 2
+        elif deepep_mode in [DeepEPMode.low_latency, DeepEPMode.auto]:
+            num_qps_per_rank = num_experts // group.size()
+        else:
+            raise NotImplementedError
+
         cls._buffer = Buffer(
             group,
             num_nvl_bytes,
             num_rdma_bytes,
             low_latency_mode=deepep_mode.enable_low_latency(),
-            num_qps_per_rank=(
-                max(
-                    num_experts // group.size(),
-                    DeepEPConfig.get_instance().num_sms // 2,
-                )
-            ),
+            num_qps_per_rank=num_qps_per_rank,
         )
         return cls._buffer
 

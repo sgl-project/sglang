@@ -58,15 +58,22 @@ python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_tri
 # Compare with FP8 mode for Qwen2-57B
 python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py \
     --model Qwen/Qwen2-57B-A14B-Instruct \
-    --use-fp8
+    --use-fp8-w8a8
 
 # Compare with custom TP size
 python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py \
-    --tp-size 4
+    --model deepseek-ai/DeepSeek-V3-0324 \
+    --tp-size 8
+
+# Compare with custom TP size and n_share_experts_fusion
+python benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py \
+    --model deepseek-ai/DeepSeek-V3-0324 \
+    --tp-size 8 \
+    --n-share-experts-fusion 8
 ```
 
 The benchmark results will be saved as plots and data files in the specified output directory (default: `./configs/benchmark_ops/vllm_sglang_fused_moe/`).
 
 - `benchmark_torch_compile_fused_moe.py`: A tool for benchmarking the performance of the fused MoE kernel with `torch.compile` and original fused MoE kernel.
 
-Usage is the same as `benchmark_vllm_vs_sglang_fused_moe_triton.py`.
+Usage is the same as `benchmark_vllm_vs_sglang_fused_moe_triton.py`, note that `torch.compile` does not support `fp8_w8a8` and `int8_w8a8` fused_moe_kernel.

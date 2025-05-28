@@ -1,3 +1,4 @@
+import logging
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -13,6 +14,8 @@ from sglang.srt.openai_api.protocol import (
     Tool,
     ToolChoice,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class FunctionCallParser:
@@ -165,11 +168,35 @@ class FunctionCallParser:
     ) -> Optional[str]:
         """
         Get the EBNF grammar for the specified tool choice.
+
+        Args:
+            tool_choice: The tool choice specification
+
+        Returns:
+            EBNF grammar string, or None if no valid tools found
+
+        Note:
+            If a specific function is requested but not found in available tools,
+            logs a warning and falls back to using all available tools for backward compatibility.
         """
         filtered_tools = []
         if isinstance(tool_choice, ToolChoice):
             fn_name = tool_choice.function.name
             filtered_tools = [t for t in self.tools if t.function.name == fn_name]
+
+            # Check if the requested function exists in available tools
+            if not filtered_tools:
+                available_functions = [t.function.name for t in self.tools]
+                logger.warning(
+                    f"Function '{fn_name}' not found in available tools. "
+                    f"Available functions: {available_functions}. "
+                    f"Skipping tool choice."
+                )
+
+                # TODO: Return a 400 error instead of warning when adapter supports proper error handling
+                # For now, fall back to return None
+                return None
         else:
             filtered_tools = self.tools
+
         return self.detector.build_ebnf(filtered_tools)

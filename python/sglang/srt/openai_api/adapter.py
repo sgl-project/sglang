@@ -1618,14 +1618,14 @@ async def v1_chat_completions(
                                     latest_delta_len = len(call_item.parameters)
 
                                 expected_call = json.dumps(
-                                    parser.multi_format_parser.detectors[0]
-                                    .prev_tool_call_arr[index]
-                                    .get("arguments", {}),
+                                    parser.detector.prev_tool_call_arr[index].get(
+                                        "arguments", {}
+                                    ),
                                     ensure_ascii=False,
                                 )
-                                actual_call = parser.multi_format_parser.detectors[
-                                    0
-                                ].streamed_args_for_tool[index]
+                                actual_call = parser.detector.streamed_args_for_tool[
+                                    index
+                                ]
                                 if latest_delta_len > 0:
                                     actual_call = actual_call[:-latest_delta_len]
                                 remaining_call = expected_call.replace(

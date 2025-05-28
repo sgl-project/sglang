@@ -1,9 +1,9 @@
 # How to Support New Models
 
-This document explains how to add support for new language models and multimodal large language models (mllms) in
+This document explains how to add support for new language models and multimodal large language models (MLLMs) in
 SGLang. It also covers how to test new models and register external implementations.
 
-## How to Support a new Language Model
+## How to Support a New Language Model
 
 To support a new model in SGLang, you only need to add a single file under
 the [SGLang Models Directory](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/models). You can learn
@@ -11,7 +11,7 @@ from existing model implementations and create a new file for your model. For mo
 similar model to start with (e.g., starting from Llama). Also refer how
 to [port a Model from vLLM to SGLang](#port-a-model-from-vllm-to-sglang)
 
-## How to Support a new Multimodal Large Language Model
+## How to Support a New Multimodal Large Language Model
 
 To support a new multimodal large language model (MLLM) in SGLang, there are several key components in addition to the
 standard LLM support:
@@ -93,6 +93,8 @@ To port a model from vLLM to SGLang:
     - **Change the `forward()` functions** and add a `forward_batch()` method.
     - **Add `EntryClass`** at the end.
     - **Ensure that the new implementation uses only SGLang components** and does not rely on any vLLM components.
+
+Note: make sure you add your new model to the supported models list in the supported models documentation.
 
 ## Registering an External Model Implementation
 

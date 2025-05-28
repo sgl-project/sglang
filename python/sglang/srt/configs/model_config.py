@@ -199,6 +199,7 @@ class ModelConfig:
             if (
                 "MistralModel" in self.hf_config.architectures
                 or "MixtralForCausalLM" in self.hf_config.architectures
+                or "MistralForCausalLM" in self.hf_config.architectures
             ):
                 if getattr(self, "head_dim", None) is None:
                     self.head_dim = (

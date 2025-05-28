@@ -262,10 +262,14 @@ class ServerArgs:
                 self.mem_fraction_static = 0.88
             if gpu_mem is not None and gpu_mem > 96 * 1024:
                 mem_fraction = self.mem_fraction_static
+                # 15 GB + additional 3GB for cuda graph
+                reserve_mem = 1024 * 18
+                # need reserve more memory for spec cuda graph
+                if self.speculative_algorithm is not None:
+                    reserve_mem = 1024 * 20
                 self.mem_fraction_static = min(
                     mem_fraction + 48 * 1024 * (1 - mem_fraction) / gpu_mem,
-                    (gpu_mem - 1024 * 18)
-                    / gpu_mem,  # 15 GB + additional 3GB for cuda graph
+                    (gpu_mem - reserve_mem) / gpu_mem,
                 )
 
         # Set chunked prefill size, which depends on the gpu memory capacity
@@ -366,12 +370,28 @@ class ServerArgs:
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
 
+        if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
+            self.expert_distribution_recorder_mode = "stat"
+            logger.info(
+                f"EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
+            )
+
+        if (self.enable_eplb or (self.init_expert_location is not None)) and (
+            self.ep_dispatch_algorithm is None
+        ):
+            self.ep_dispatch_algorithm = "static"
+            logger.info(
+                f"EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
+            )
+
+        if self.enable_expert_distribution_metrics and (
+            self.expert_distribution_recorder_mode is None
+        ):
+            self.expert_distribution_recorder_mode = "stat"
+
         if self.expert_distribution_recorder_buffer_size is None:
-            # TODO pr-chain: enable this later
-            # if (x := self.eplb_rebalance_num_iterations) is not None:
-            #     self.expert_distribution_recorder_buffer_size = x
-            if False:
-                pass
+            if (x := self.eplb_rebalance_num_iterations) is not None:
+                self.expert_distribution_recorder_buffer_size = x
             elif self.expert_distribution_recorder_mode is not None:
                 self.expert_distribution_recorder_buffer_size = 1000
 
@@ -1457,7 +1477,7 @@ class ServerArgs:
             self.max_loras_per_batch > 0
             # FIXME
             and (self.lora_paths is None or self.disable_radix_cache)
-        ), "compatibility of lora and cuda graph and radix attention is in progress"
+        ), "compatibility of lora and radix attention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 

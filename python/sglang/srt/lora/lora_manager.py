@@ -32,7 +32,7 @@ from sglang.srt.lora.utils import (
     LoRAType,
     get_customized_names_from_hf_names,
     get_layer_id,
-    get_stacked_name,
+    get_normalized_lora_weight_names,
     get_weight_name,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -101,10 +101,13 @@ class LoRAManager:
             self.hf_target_names.update(self.configs[name].target_modules)
 
         # Target lora weight names for lora_a and lora_b modules respectively.
-        # e.g., {("qkv_proj", "q_proj"), ("qkv_proj", "kv_proj")}
-        self.lora_weight_names: Set[Tuple[str]] = set(
-            [get_stacked_name(module) for module in self.hf_target_names]
-        )
+        weights_A: List[str] = []
+        weights_B: List[str] = []
+        for module in self.hf_target_names:
+            lora_A, lora_B = get_normalized_lora_weight_names(module)
+            weights_A += lora_A
+            weights_B += lora_B
+        self.lora_weight_names: Tuple[Set[str]] = set(weights_A), set(weights_B)
 
         # load all weights to cpu
         self.loras: Dict[str, LoRAAdapter] = {}
@@ -263,7 +266,18 @@ class LoRAManager:
         self.lora_modules: Dict[int, List[Tuple[str, BaseLayerWithLoRA]]] = {
             i: [] for i in range(self.base_hf_config.num_hidden_layers)
         }
+
         for module_name, module in self.base_model.named_modules():
+            # TODO (lifuhuang): in the future, we should consider generalizing the
+            # should_apply_lora function to support mapping by full module name instead
+            # of just the last part (e.g., "qkv_proj") to support scenarios with multiple
+            # attention stacks (e.g., multimodal models).
+            # See: https://github.com/sgl-project/sglang/issues/6608
+            if getattr(
+                self.base_model, "should_apply_lora", None
+            ) and not self.base_model.should_apply_lora(module_name):
+                continue
+
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in customized_target_names:
                 layer_id = get_layer_id(module_name)
