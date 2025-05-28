@@ -85,7 +85,54 @@ def compute_split_token_index(
         raise NotImplementedError
 
 
+def compute_split_indices_for_cuda_graph_replay(
+    forward_mode: ForwardMode,
+    cuda_graph_num_tokens: int,
+):
+    forward_mode_for_tbo_split = (
+        forward_mode if forward_mode != ForwardMode.IDLE else ForwardMode.DECODE
+    )
+    tbo_split_seq_index = compute_split_seq_index(
+        forward_mode=forward_mode_for_tbo_split,
+        num_tokens=cuda_graph_num_tokens,
+        extend_lens=None,
+    )
+    tbo_split_token_index = compute_split_token_index(
+        split_seq_index=tbo_split_seq_index,
+        forward_mode=forward_mode_for_tbo_split,
+        extend_seq_lens=None,
+    )
+    return tbo_split_seq_index, tbo_split_token_index
+
+
 # -------------------------------- Preparation ---------------------------------------
+
+
+class TboCudaGraphRunnerPlugin:
+    def __init__(self):
+        pass  # TODO add logic here
+
+    def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
+        if not global_server_args_dict["enable_two_batch_overlap"]:
+            return
+
+        batch.tbo_split_seq_index = compute_split_seq_index(
+            forward_mode=batch.forward_mode,
+            num_tokens=num_tokens,
+            extend_lens=None,
+        )
+        # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
+        assert batch.tbo_split_seq_index is not None, f"{num_tokens=}"
+
+        TboForwardBatchPreparer.prepare(batch)
+
+    def replay_prepare(
+        self, forward_mode: ForwardMode, bs: int, num_token_non_padded: int
+    ):
+        if not global_server_args_dict["enable_two_batch_overlap"]:
+            return
+
+        pass  # TODO add logic here
 
 
 class TboCudaGraphRunnerUtils:
