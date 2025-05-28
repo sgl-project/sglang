@@ -258,9 +258,9 @@ class ServerArgs:
                     self.mem_fraction_static = 0.87
                 else:
                     self.mem_fraction_static = 0.88
-            elif gpu_mem is not None and gpu_mem > 180 * 1000:
+            if gpu_mem is not None and gpu_mem > 180 * 1000:
                 self.mem_fraction_static = 0.79
-            if gpu_mem is not None and gpu_mem > 96 * 1024:
+            elif gpu_mem is not None and gpu_mem > 96 * 1024:
                 mem_fraction = self.mem_fraction_static
                 # 15 GB + additional 3GB for cuda graph
                 reserve_mem = 1024 * 18
