@@ -68,40 +68,40 @@ void rope_kernel_impl(
 
 template <typename scalar_t>
 void rotary_embedding_origin_impl(
-    const int64_t* __restrict__ positions,       // [batch_size, seq_len] or
-                                                 // [num_tokens]
-    scalar_t* __restrict__ query,                /// [batch_size, seq_len, num_heads,
-                                                 /// head_size] or [num_tokens, num_heads,
-                                                 /// head_size]
-    scalar_t* __restrict__ key,                  // [batch_size, seq_len, num_kv_heads,
-                                                 // head_size] or [num_tokens, num_kv_heads,
-                                                 // head_size]
-    const scalar_t* __restrict__ cos_sin_cache,  // [max_position, 2, rot_dim //
-                                                 // 2]
-    const int rot_dim,
-    const int64_t query_stride,
-    const int64_t key_stride,
-    const int num_heads,
-    const int num_kv_heads,
-    const int head_size,
-    const int num_tokens) {
+    int64_t* __restrict__ positions,       // [batch_size, seq_len] or
+                                           // [num_tokens]
+    scalar_t* __restrict__ query,          /// [batch_size, seq_len, num_heads,
+                                           /// head_size] or [num_tokens, num_heads,
+                                           /// head_size]
+    scalar_t* __restrict__ key,            // [batch_size, seq_len, num_kv_heads,
+                                           // head_size] or [num_tokens, num_kv_heads,
+                                           // head_size]
+    scalar_t* __restrict__ cos_sin_cache,  // [max_position, 2, rot_dim //
+                                           // 2]
+    int64_t rot_dim,
+    int64_t query_stride,
+    int64_t key_stride,
+    int64_t num_heads,
+    int64_t num_kv_heads,
+    int64_t head_size,
+    int64_t num_tokens) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
-  constexpr int bVecSize = bVec::size();
+  constexpr int64_t bVecSize = bVec::size();
 
-  const int embed_dim = rot_dim / 2;
+  int64_t embed_dim = rot_dim / 2;
   bool flag = (embed_dim % bVecSize == 0);
-  const int loop_upper = flag ? embed_dim : embed_dim - bVecSize;
+  int64_t loop_upper = flag ? embed_dim : embed_dim - bVecSize;
 
-  auto compute_loop = [&](const int64_t token_head, const scalar_t* cache_ptr, scalar_t* qk) {
-    int j = 0;
+  auto compute_loop = [&](int64_t token_head, scalar_t* cache_ptr, scalar_t* qk) {
+    int64_t j = 0;
     for (; j < loop_upper; j += bVecSize) {
-      const int rot_offset = j;
-      const int x_index = rot_offset;
-      const int y_index = embed_dim + rot_offset;
+      int64_t rot_offset = j;
+      int64_t x_index = rot_offset;
+      int64_t y_index = embed_dim + rot_offset;
 
-      const int64_t out_x = token_head + x_index;
-      const int64_t out_y = token_head + y_index;
+      int64_t out_x = token_head + x_index;
+      int64_t out_y = token_head + y_index;
 
       bVec _cos = bVec::loadu(cache_ptr + x_index);
       bVec _sin = bVec::loadu(cache_ptr + y_index);
@@ -129,17 +129,17 @@ void rotary_embedding_origin_impl(
     }
     if (!flag) {
       for (; j < embed_dim; ++j) {
-        const int x_index = j;
-        const int y_index = embed_dim + j;
+        int64_t x_index = j;
+        int64_t y_index = embed_dim + j;
 
-        const int64_t out_x = token_head + x_index;
-        const int64_t out_y = token_head + y_index;
+        int64_t out_x = token_head + x_index;
+        int64_t out_y = token_head + y_index;
 
-        const float _cos = cache_ptr[x_index];
-        const float _sin = cache_ptr[y_index];
+        float _cos = cache_ptr[x_index];
+        float _sin = cache_ptr[y_index];
 
-        const float _q_x = qk[out_x];
-        const float _q_y = qk[out_y];
+        float _q_x = qk[out_x];
+        float _q_y = qk[out_y];
 
         qk[out_x] = _q_x * _cos - _q_y * _sin;
         qk[out_y] = _q_y * _cos + _q_x * _sin;
@@ -148,19 +148,19 @@ void rotary_embedding_origin_impl(
   };
 
 #pragma omp parallel for
-  for (int token_idx = 0; token_idx < num_tokens; ++token_idx) {
+  for (int64_t token_idx = 0; token_idx < num_tokens; ++token_idx) {
     int64_t pos = positions[token_idx];
-    const scalar_t* cache_ptr = cos_sin_cache + pos * rot_dim;
+    scalar_t* cache_ptr = cos_sin_cache + pos * rot_dim;
 
-    for (int i = 0; i < num_heads; ++i) {
-      const int head_idx = i;
-      const int64_t token_head = token_idx * query_stride + head_idx * head_size;
+    for (int64_t i = 0; i < num_heads; ++i) {
+      int64_t head_idx = i;
+      int64_t token_head = token_idx * query_stride + head_idx * head_size;
       compute_loop(token_head, cache_ptr, query);
     }
 
-    for (int i = 0; i < num_kv_heads; ++i) {
-      const int head_idx = i;
-      const int64_t token_head = token_idx * key_stride + head_idx * head_size;
+    for (int64_t i = 0; i < num_kv_heads; ++i) {
+      int64_t head_idx = i;
+      int64_t token_head = token_idx * key_stride + head_idx * head_size;
       compute_loop(token_head, cache_ptr, key);
     }
   }
@@ -168,78 +168,82 @@ void rotary_embedding_origin_impl(
 
 template <typename scalar_t>
 void rotary_embedding_origin_gptj_impl(
-    const int64_t* __restrict__ positions,       // [batch_size, seq_len] or
-                                                 // [num_tokens]
-    scalar_t* __restrict__ query,                /// [batch_size, seq_len, num_heads,
-                                                 /// head_size] or [num_tokens, num_heads,
-                                                 /// head_size]
-    scalar_t* __restrict__ key,                  // [batch_size, seq_len, num_kv_heads,
-                                                 // head_size] or [num_tokens, num_kv_heads,
-                                                 // head_size]
-    const scalar_t* __restrict__ cos_sin_cache,  // [max_position, 2, rot_dim //
-                                                 // 2]
-    const int rot_dim,
-    const int64_t query_stride,
-    const int64_t key_stride,
-    const int num_heads,
-    const int num_kv_heads,
-    const int head_size,
-    const int num_tokens) {
-  const int embed_dim = rot_dim / 2;
+    int64_t* __restrict__ positions,       // [batch_size, seq_len] or
+                                           // [num_tokens]
+    scalar_t* __restrict__ query,          /// [batch_size, seq_len, num_heads,
+                                           /// head_size] or [num_tokens, num_heads,
+                                           /// head_size]
+    scalar_t* __restrict__ key,            // [batch_size, seq_len, num_kv_heads,
+                                           // head_size] or [num_tokens, num_kv_heads,
+                                           // head_size]
+    scalar_t* __restrict__ cos_sin_cache,  // [max_position, 2, rot_dim //
+                                           // 2]
+    int64_t rot_dim,
+    int64_t query_stride,
+    int64_t key_stride,
+    int64_t num_heads,
+    int64_t num_kv_heads,
+    int64_t head_size,
+    int64_t num_tokens) {
+  int64_t embed_dim = rot_dim / 2;
 
-#pragma omp parallel for collapse(2)
-  for (int token_idx = 0; token_idx < num_tokens; ++token_idx) {
-    for (int i = 0; i < num_heads; ++i) {
+  at::parallel_for(0, num_tokens * num_heads, GRAIN_SIZE / rot_dim, [&](int64_t begin, int64_t end) {
+    int64_t token_idx = {0}, i = {0};
+    data_index_init(begin, token_idx, num_tokens, i, num_heads);
+    for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
       int64_t pos = positions[token_idx];
-      const scalar_t* cache_ptr = cos_sin_cache + pos * rot_dim;
-      const scalar_t* cos_cache_ptr = cache_ptr;
-      const scalar_t* sin_cache_ptr = cache_ptr + embed_dim;
-      const int head_idx = i;
-      const int64_t token_head = token_idx * query_stride + head_idx * head_size;
+      scalar_t* cache_ptr = cos_sin_cache + pos * rot_dim;
+      scalar_t* cos_cache_ptr = cache_ptr;
+      scalar_t* sin_cache_ptr = cache_ptr + embed_dim;
+      int64_t head_idx = i;
+      int64_t token_head = token_idx * query_stride + head_idx * head_size;
       scalar_t* head_query = token_head + query;
-      for (int j = 0; j < embed_dim; j += 1) {
-        const int rot_offset = j;
-        const int x_index = 2 * rot_offset;
-        const int y_index = 2 * rot_offset + 1;
+      for (int64_t j = 0; j < embed_dim; j += 1) {
+        int64_t rot_offset = j;
+        int64_t x_index = 2 * rot_offset;
+        int64_t y_index = 2 * rot_offset + 1;
 
-        const float cos = cos_cache_ptr[rot_offset];
-        const float sin = sin_cache_ptr[rot_offset];
+        float cos = cos_cache_ptr[rot_offset];
+        float sin = sin_cache_ptr[rot_offset];
 
-        const float x = head_query[x_index];
-        const float y = head_query[y_index];
+        float x = head_query[x_index];
+        float y = head_query[y_index];
 
         head_query[x_index] = x * cos - y * sin;
         head_query[y_index] = y * cos + x * sin;
       }
+      data_index_step(token_idx, num_tokens, i, num_heads);
     }
-  }
+  });
 
-#pragma omp parallel for collapse(2)
-  for (int token_idx = 0; token_idx < num_tokens; ++token_idx) {
-    for (int i = 0; i < num_kv_heads; ++i) {
+  at::parallel_for(0, num_tokens * num_kv_heads, GRAIN_SIZE / rot_dim, [&](int64_t begin, int64_t end) {
+    int64_t token_idx{0}, i = {0};
+    data_index_init(begin, token_idx, num_tokens, i, num_kv_heads);
+    for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
       int64_t pos = positions[token_idx];
-      const scalar_t* cache_ptr = cos_sin_cache + pos * rot_dim;
-      const scalar_t* cos_cache_ptr = cache_ptr;
-      const scalar_t* sin_cache_ptr = cache_ptr + embed_dim;
-      const int head_idx = i;
-      const int64_t token_head = token_idx * key_stride + head_idx * head_size;
+      scalar_t* cache_ptr = cos_sin_cache + pos * rot_dim;
+      scalar_t* cos_cache_ptr = cache_ptr;
+      scalar_t* sin_cache_ptr = cache_ptr + embed_dim;
+      int64_t head_idx = i;
+      int64_t token_head = token_idx * key_stride + head_idx * head_size;
       scalar_t* head_key = key + token_head;
-      for (int j = 0; j < embed_dim; j += 1) {
-        const int rot_offset = j;
-        const int x_index = 2 * rot_offset;
-        const int y_index = 2 * rot_offset + 1;
+      for (int64_t j = 0; j < embed_dim; j += 1) {
+        int64_t rot_offset = j;
+        int64_t x_index = 2 * rot_offset;
+        int64_t y_index = 2 * rot_offset + 1;
 
-        const float cos = cos_cache_ptr[rot_offset];
-        const float sin = sin_cache_ptr[rot_offset];
+        float cos = cos_cache_ptr[rot_offset];
+        float sin = sin_cache_ptr[rot_offset];
 
-        const float x = head_key[x_index];
-        const float y = head_key[y_index];
+        float x = head_key[x_index];
+        float y = head_key[y_index];
 
         head_key[x_index] = x * cos - y * sin;
         head_key[y_index] = y * cos + x * sin;
       }
+      data_index_step(token_idx, num_tokens, i, num_kv_heads);
     }
-  }
+  });
 }
 
 }  // namespace
@@ -252,10 +256,10 @@ void rotary_embedding_origin_cpu(
     at::Tensor& cos_sin_cache,
     bool is_neox) {
   RECORD_FUNCTION("sgl-kernel::rotary_position_embedding_origin_cpu", std::vector<c10::IValue>({query, key}));
-  int num_tokens = positions.numel();
-  int rot_dim = cos_sin_cache.size(1);
-  int num_heads = query.size(-1) / head_size;
-  int num_kv_heads = key.size(-1) / head_size;
+  int64_t num_tokens = positions.numel();
+  int64_t rot_dim = cos_sin_cache.size(1);
+  int64_t num_heads = query.size(-1) / head_size;
+  int64_t num_kv_heads = key.size(-1) / head_size;
   int64_t key_stride = key.stride(-2);
   int64_t query_stride = query.stride(-2);
 
