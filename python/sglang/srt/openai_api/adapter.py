@@ -879,6 +879,26 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     n_prev_tokens[index] = n_prev_token
 
                     yield f"data: {chunk.model_dump_json()}\n\n"
+                if request.return_hidden_states and len(hidden_states):
+                    for index, hidden_states_ in hidden_states.items():
+                        hidden_states_ = hidden_states_[1:]  # trim off the prefill
+                        hidden_states_ = (
+                            hidden_states_[-1] if len(hidden_states_) > 0 else []
+                        )  # slice out the last token
+                        hidden_states_chunk = CompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=created,
+                            choices=[
+                                CompletionResponseStreamChoice(
+                                    text="",
+                                    index=index,
+                                    hidden_states=hidden_states_,
+                                    finish_reason=None,
+                                )
+                            ],
+                            model=request.model,
+                        )
+                        yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
                 if request.stream_options and request.stream_options.include_usage:
                     total_prompt_tokens = sum(
                         tokens
@@ -902,26 +922,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                         total_tokens=total_prompt_tokens + total_completion_tokens,
                         prompt_tokens_details=prompt_tokens_details,
                     )
-                    if request.return_hidden_states and hidden_states:
-                        for index, hidden_states_ in hidden_states.items():
-                            hidden_states_ = hidden_states_[1:]  # trim off the prefill
-                            hidden_states_ = (
-                                hidden_states_[-1] if len(hidden_states_) > 0 else []
-                            )  # slice out the last token
-                            hidden_states_chunk = CompletionStreamResponse(
-                                id=content["meta_info"]["id"],
-                                created=created,
-                                choices=[
-                                    CompletionResponseStreamChoice(
-                                        text="",
-                                        index=index,
-                                        hidden_states=hidden_states_,
-                                        finish_reason=None,
-                                    )
-                                ],
-                                model=request.model,
-                            )
-                            yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
+
                     final_usage_chunk = CompletionStreamResponse(
                         id=content["meta_info"]["id"],
                         created=created,
