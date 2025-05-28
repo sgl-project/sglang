@@ -74,7 +74,7 @@ fn shared_prefix_count(a: &str, b: &str) -> usize {
         }
     }
 
-    return i;
+    i
 }
 
 fn slice_by_chars(s: &str, start: usize, end: usize) -> String {
@@ -246,79 +246,8 @@ impl Tree {
         }
     }
 
-    #[allow(unused_assignments)]
-    pub fn prefix_match(&self, text: &str) -> (String, String) {
-        let mut curr = Arc::clone(&self.root);
-        let mut curr_idx = 0;
-
-        let mut prev = Arc::clone(&self.root);
-        let text_count = text.chars().count();
-
-        while curr_idx < text_count {
-            let first_char = text.chars().nth(curr_idx).unwrap();
-            let curr_text = slice_by_chars(text, curr_idx, text_count);
-
-            curr = prev.clone();
-
-            match curr.children.entry(first_char) {
-                Entry::Occupied(entry) => {
-                    let matched_node = entry.get().clone();
-                    let shared_count =
-                        shared_prefix_count(&matched_node.text.read().unwrap(), &curr_text);
-
-                    let matched_node_text_count = matched_node.text.read().unwrap().chars().count();
-
-                    if shared_count == matched_node_text_count {
-                        // Full match with current node's text, continue to next node
-                        curr_idx += shared_count;
-                        prev = Arc::clone(&matched_node);
-                    } else {
-                        // Partial match, stop here
-                        curr_idx += shared_count;
-                        prev = Arc::clone(&matched_node);
-                        break;
-                    }
-                }
-                Entry::Vacant(_) => {
-                    // No match found, stop here
-                    break;
-                }
-            }
-        }
-
-        curr = prev.clone();
-
-        // Select the first tenant (key in the map)
-        let tenant = curr
-            .tenant_last_access_time
-            .iter()
-            .next()
-            .map(|kv| kv.key().to_owned())
-            .unwrap_or("empty".to_string());
-
-        // Traverse from the curr node to the root and update the timestamp
-
-        let timestamp_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-
-        if !tenant.eq("empty") {
-            let mut current_node = Some(curr);
-            while let Some(node) = current_node {
-                node.tenant_last_access_time
-                    .insert(tenant.clone(), timestamp_ms);
-                current_node = node.parent.read().unwrap().clone();
-            }
-        }
-
-        let ret_text = slice_by_chars(text, 0, curr_idx);
-        (ret_text, tenant)
-    }
-
-    #[allow(unused_assignments)]
-    pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
-        let mut curr = Arc::clone(&self.root);
+    fn prefix_match_inner(&self, text: &str, tenant: Option<&str>) -> (String, String) {
+        let mut curr;
         let mut curr_idx = 0;
 
         let mut prev = Arc::clone(&self.root);
@@ -335,8 +264,10 @@ impl Tree {
                     let matched_node = entry.get().clone();
 
                     // Only continue matching if this node belongs to the specified tenant
-                    if !matched_node.tenant_last_access_time.contains_key(tenant) {
-                        break;
+                    if let Some(t) = tenant {
+                        if !matched_node.tenant_last_access_time.contains_key(t) {
+                            break;
+                        }
                     }
 
                     let shared_count =
@@ -364,8 +295,20 @@ impl Tree {
 
         curr = prev.clone();
 
-        // Only update timestamp if we found a match for the specified tenant
-        if curr.tenant_last_access_time.contains_key(tenant) {
+        let (perform_update, tenant) = if let Some(t) = tenant {
+            // Only update timestamp if we found a match for the specified tenant
+            (curr.tenant_last_access_time.contains_key(t), t.to_string())
+        } else {
+            // Select the first tenant (key in the map)
+            let tenant = curr
+                .tenant_last_access_time
+                .iter()
+                .next()
+                .map(|kv| kv.key().to_owned())
+                .unwrap_or_else(|| "empty".to_string());
+            (!tenant.eq("empty"), tenant)
+        };
+        if perform_update {
             let timestamp_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -379,7 +322,18 @@ impl Tree {
             }
         }
 
-        slice_by_chars(text, 0, curr_idx)
+        (slice_by_chars(text, 0, curr_idx), tenant)
+    }
+
+    #[allow(unused_assignments)]
+    pub fn prefix_match(&self, text: &str) -> (String, String) {
+        self.prefix_match_inner(text, None)
+    }
+
+    #[allow(unused_assignments)]
+    pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
+        let (prefix_match, _) = self.prefix_match_inner(text, Some(tenant));
+        prefix_match
     }
 
     fn leaf_of(node: &NodeRef) -> Vec<String> {
@@ -515,7 +469,7 @@ impl Tree {
             // add parent to queue if it becomes a leaf
             if let Some(parent) = curr.parent.read().unwrap().as_ref() {
                 if Tree::leaf_of(parent).contains(&tenant.to_string()) {
-                    queue.push_back(Arc::clone(&parent));
+                    queue.push_back(Arc::clone(parent));
                 }
             }
         }
@@ -651,8 +605,6 @@ impl Tree {
         }
 
         println!("{result}");
-
-        return;
     }
 }
 
@@ -856,8 +808,8 @@ mod tests {
         // spawn 3 threads for insert
         let tree_clone = Arc::clone(&tree);
 
-        let texts = vec!["hello", "apple", "banana"];
-        let tenants = vec!["tenant1", "tenant2", "tenant3"];
+        let texts = ["hello", "apple", "banana"];
+        let tenants = ["tenant1", "tenant2", "tenant3"];
 
         let mut handles = vec![];
 
@@ -910,7 +862,7 @@ mod tests {
         // spawn 3 threads for insert
         let tree_clone = Arc::clone(&tree);
 
-        let texts = vec!["apple", "apabc", "acbdeds"];
+        let texts = ["apple", "apabc", "acbdeds"];
 
         let mut handles = vec![];
 
@@ -958,13 +910,13 @@ mod tests {
 
     #[test]
     fn test_group_prefix_insert_match_concurrent() {
-        let prefix = vec![
+        let prefix = [
             "Clock strikes midnight, I'm still wide awake",
             "Got dreams bigger than these city lights",
             "Time waits for no one, gotta make my move",
             "Started from the bottom, that's no metaphor",
         ];
-        let suffix = vec![
+        let suffix = [
             "Got too much to prove, ain't got time to lose",
             "History in the making, yeah, you can't erase this",
         ];
@@ -1021,13 +973,13 @@ mod tests {
     fn test_mixed_concurrent_insert_match() {
         // ensure it does not deadlock instead of doing correctness check
 
-        let prefix = vec![
+        let prefix = [
             "Clock strikes midnight, I'm still wide awake",
             "Got dreams bigger than these city lights",
             "Time waits for no one, gotta make my move",
             "Started from the bottom, that's no metaphor",
         ];
-        let suffix = vec![
+        let suffix = [
             "Got too much to prove, ain't got time to lose",
             "History in the making, yeah, you can't erase this",
         ];
@@ -1074,7 +1026,7 @@ mod tests {
         // use .chars() to get the iterator of the utf-8 value
         let tree = Arc::new(Tree::new());
 
-        let test_pairs = vec![
+        let test_pairs = [
             ("你好嗎", "tenant1"),
             ("你好喔", "tenant2"),
             ("你心情好嗎", "tenant3"),
@@ -1102,7 +1054,7 @@ mod tests {
     fn test_utf8_split_concurrent() {
         let tree = Arc::new(Tree::new());
 
-        let test_pairs = vec![
+        let test_pairs = [
             ("你好嗎", "tenant1"),
             ("你好喔", "tenant2"),
             ("你心情好嗎", "tenant3"),
@@ -1196,7 +1148,7 @@ mod tests {
         let max_size: usize = 100;
 
         // Define prefixes
-        let prefixes = vec!["aqwefcisdf", "iajsdfkmade", "kjnzxcvewqe", "iejksduqasd"];
+        let prefixes = ["aqwefcisdf", "iajsdfkmade", "kjnzxcvewqe", "iejksduqasd"];
 
         // Insert strings with shared prefixes
         for _i in 0..100 {
