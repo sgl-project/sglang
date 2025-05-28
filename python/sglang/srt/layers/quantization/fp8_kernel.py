@@ -779,7 +779,7 @@ def w8a8_block_fp8_matmul_deepgemm(
     block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
-    M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size)
+    M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
 
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and _ENABLE_JIT_DEEPGEMM
@@ -817,7 +817,7 @@ def w8a8_block_fp8_matmul_triton(
         torch.Tensor: The result of matmul.
     """
 
-    M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size)
+    M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
 
     block_n, block_k = block_size
 
