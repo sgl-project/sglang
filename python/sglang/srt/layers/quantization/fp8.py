@@ -336,6 +336,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     cpu_has_amx_support()
                 ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
                 _process_weight_after_loading(layer, ["weight"])
+                return
             else:
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
             layer.weight = torch.nn.Parameter(weight, requires_grad=False)
