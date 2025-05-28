@@ -34,11 +34,13 @@ pub enum Router {
         current_index: AtomicUsize,
         timeout_secs: u64,
         interval_secs: u64,
+        rid_to_worker: Arc<RwLock<HashMap<String, String>>>,
     },
     Random {
         worker_urls: Arc<RwLock<Vec<String>>>,
         timeout_secs: u64,
         interval_secs: u64,
+        rid_to_worker: Arc<RwLock<HashMap<String, String>>>,
     },
     CacheAware {
         /*
@@ -111,6 +113,7 @@ pub enum Router {
         timeout_secs: u64,
         interval_secs: u64,
         _eviction_thread: Option<thread::JoinHandle<()>>,
+        rid_to_worker: Arc<RwLock<HashMap<String, String>>>,
     },
 }
 
@@ -169,6 +172,7 @@ impl Router {
                 worker_urls: Arc::new(RwLock::new(worker_urls)),
                 timeout_secs,
                 interval_secs,
+                rid_to_worker: Arc::new(RwLock::new(HashMap::new())),
             },
             PolicyConfig::RoundRobinConfig {
                 timeout_secs,
@@ -178,6 +182,7 @@ impl Router {
                 current_index: std::sync::atomic::AtomicUsize::new(0),
                 timeout_secs,
                 interval_secs,
+                rid_to_worker: Arc::new(RwLock::new(HashMap::new())),
             },
             PolicyConfig::CacheAwareConfig {
                 cache_threshold,
@@ -201,11 +206,13 @@ impl Router {
                 let tree = Arc::new(Mutex::new(Tree::new()));
                 let running_queue = Arc::new(Mutex::new(running_queue));
                 let processed_queue = Arc::new(Mutex::new(processed_queue));
+                let rid_to_worker = Arc::new(RwLock::new(HashMap::new()));
 
                 // Create background eviction thread
                 let tree_clone = Arc::clone(&tree);
                 let processed_queue_clone = Arc::clone(&processed_queue);
                 let running_queue_clone = Arc::clone(&running_queue);
+                let rid_to_worker_clone = Arc::clone(&rid_to_worker);
                 let eviction_thread = thread::spawn(move || {
                     loop {
                         // Sleep for the specified interval
@@ -222,6 +229,21 @@ impl Router {
                         // Print the running queue
                         let locked_running_queue = running_queue_clone.lock().unwrap();
                         info!("Running Queue: {:?}", locked_running_queue);
+
+                        // Clean up when rid mappings are too large
+                        const MAX_RID_MAPPINGS: usize = 10000;
+                        let mut rid_mapping = rid_to_worker_clone.write().unwrap();
+                        if rid_mapping.len() > MAX_RID_MAPPINGS {
+                            let keys_to_remove: Vec<_> = rid_mapping
+                                .keys()
+                                .take(1000)
+                                .cloned()
+                                .collect();
+
+                            for key in keys_to_remove {
+                                rid_mapping.remove(&key);
+                            }
+                        }
                     }
                 });
 
@@ -240,6 +262,7 @@ impl Router {
                     timeout_secs,
                     interval_secs,
                     _eviction_thread: Some(eviction_thread),
+                    rid_to_worker,
                 }
             }
         })
@@ -251,6 +274,33 @@ impl Router {
             Router::RoundRobin { worker_urls, .. } => Arc::clone(worker_urls),
             Router::Random { worker_urls, .. } => Arc::clone(worker_urls),
             Router::CacheAware { worker_urls, .. } => Arc::clone(worker_urls),
+        }
+    }
+
+    /// Extract the request ID from the request body
+    fn extract_rid_from_body(&self, body: &Bytes) -> Option<String> {
+        let json: Value = match serde_json::from_slice(body) {
+            Ok(j) => j,
+            Err(_) => {
+                warn!("Failed to parse JSON from request body when extracting rid.");
+                return None;
+            }
+        };
+
+        json.get("rid").and_then(Value::as_str).map(|s| s.to_string())
+    }
+
+    pub fn get_rid_to_worker(&self) -> Arc<RwLock<HashMap<String, String>>> {
+        match self {
+            Router::RoundRobin { rid_to_worker, .. } => Arc::clone(rid_to_worker),
+            Router::Random { rid_to_worker, .. } => Arc::clone(rid_to_worker),
+            Router::CacheAware { rid_to_worker, .. } => Arc::clone(rid_to_worker),
+        }
+    }
+
+    fn store_rid_to_worker(&self, rid: &str, worker_url: &str) {
+        if let Ok(mut mapping) = self.get_rid_to_worker().write() {
+            mapping.insert(rid.to_string(), worker_url.to_string());
         }
     }
 
@@ -574,6 +624,11 @@ impl Router {
             }
         };
 
+        if let Some(rid) = self.extract_rid_from_body(body) {
+            self.store_rid_to_worker(&rid, &worker_url);
+            debug!("Stored rid {} -> worker {}", rid, worker_url);
+        }
+
         worker_url
     }
 
@@ -852,6 +907,23 @@ impl Router {
             }
         }
 
+        {
+            let rid_to_worker = self.get_rid_to_worker();
+            let mut rid_mapping = rid_to_worker.write().unwrap();
+            let mut rids_to_remove = Vec::new();
+
+            for (rid, mapped_worker) in rid_mapping.iter() {
+                if mapped_worker == worker_url {
+                    rids_to_remove.push(rid.clone());
+                }
+            }
+
+            for rid in rids_to_remove {
+                rid_mapping.remove(&rid);
+                debug!("Removed rid mapping: {} -> {}", rid, worker_url);
+            }
+        }
+
         // if cache aware, remove the worker from the tree
         if let Router::CacheAware {
             tree,
@@ -873,6 +945,118 @@ impl Router {
                 "Removed worker from tree and cleaned up queues: {}",
                 worker_url
             );
+        }
+    }
+
+    pub async fn route_abort_request(
+        &self,
+        client: &reqwest::Client,
+        req: &HttpRequest,
+        body: &Bytes,
+    ) -> HttpResponse {
+        let rid = match self.extract_rid_from_body(body) {
+            Some(rid) => rid,
+            None => {
+                warn!("No rid found in abort");
+                return HttpResponse::BadRequest().body("No rid found in abort request");
+            }
+        };
+
+        let target_worker = {
+            let rid_to_worker = self.get_rid_to_worker();
+            let rid_mapping = rid_to_worker.read().unwrap();
+            rid_mapping.get(&rid).cloned()
+        };
+
+        let worker_urls = match self {
+            Router::RoundRobin { worker_urls, .. }
+            | Router::Random { worker_urls, .. }
+            | Router::CacheAware { worker_urls, .. } => worker_urls.read().unwrap().clone(),
+        };
+
+        if worker_urls.is_empty() {
+            return HttpResponse::InternalServerError().body("No workers available");
+        }
+
+        match target_worker {
+            Some(worker_url) => {
+                info!("Sending abort for rid {} to worker: {}", rid, worker_url);
+
+                let mut request_builder = client
+                    .post(format!("{}/abort_request", worker_url))
+                    .body(body.to_vec());
+
+                for (name, value) in copy_request_headers(req) {
+                    request_builder = request_builder.header(name, value);
+                }
+
+                match request_builder.send().await {
+                    Ok(res) => {
+                        let status = actix_web::http::StatusCode::from_u16(res.status().as_u16())
+                            .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+                        match res.bytes().await {
+                            Ok(response_body) => HttpResponse::build(status).body(response_body.to_vec()),
+                            Err(e) => HttpResponse::InternalServerError()
+                                .body(format!("Failed to read response body: {}", e)),
+                        }
+                    }
+                    Err(e) => HttpResponse::InternalServerError().body(format!(
+                        "Failed to send abort request to worker {}: {}",
+                        worker_url, e
+                    )),
+                }
+            }
+            None => {
+                warn!("Rid {} not found in mapping, broadcasting", rid);
+
+                let mut success_count = 0;
+                let mut last_response = None;
+
+                for worker_url in &worker_urls {
+                    let mut request_builder = client
+                        .post(format!("{}/abort_request", worker_url))
+                        .body(body.to_vec());
+
+                    for (name, value) in copy_request_headers(req) {
+                        request_builder = request_builder.header(name, value);
+                    }
+
+                    match request_builder.send().await {
+                        Ok(res) => {
+                            let status = res.status();
+                            if status.is_success() {
+                                success_count += 1;
+                            }
+
+                            match res.bytes().await {
+                                Ok(response_body) => {
+                                    last_response = Some((status, response_body.to_vec()));
+                                }
+                                Err(e) => {
+                                    warn!("Failed to read response from worker {}: {}", worker_url, e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to send abort to worker {}: {}", worker_url, e);
+                        }
+                    }
+                }
+
+                if success_count > 0 {
+                    match last_response {
+                        Some((status, body)) => {
+                            let actix_status = actix_web::http::StatusCode::from_u16(status.as_u16())
+                                .unwrap_or(actix_web::http::StatusCode::OK);
+                            HttpResponse::build(actix_status).body(body)
+                        }
+                        None => HttpResponse::Ok().body("Abort broadcasted successfully"),
+                    }
+                } else {
+                    HttpResponse::InternalServerError().body("Failed to send abort request to any worker")
+                }
+            }
         }
     }
 }
