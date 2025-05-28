@@ -22,11 +22,7 @@ from typing import Dict, List, Optional, Set, Union
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Req,
-    ScheduleBatch,
-    global_server_args_dict,
-)
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
@@ -468,6 +464,9 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
+            if total_tokens > self.rem_total_tokens:
+                return AddReqResult.NO_TOKEN
+
             if (
                 enable_hierarchical_cache
                 and req.last_node_global is not None
