@@ -60,6 +60,16 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = remove_failing_models(
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2
 )
 
+NO_MOE_PADDING_MODELS = {"neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8"}
+DISABLE_HF_XET_MODELS = {
+    "Qwen/Qwen2-57B-A14B-Instruct",
+    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8",
+}
+TRITON_MOE_MODELS = {
+    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
+    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",
+}
+
 
 def parse_models(model_string):
     return [model.strip() for model in model_string.split(",") if model.strip()]
@@ -156,28 +166,15 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             for model in model_group:
                 with self.subTest(model=model):
                     os.environ["SGLANG_MOE_PADDING"] = (
-                        "0"
-                        if model == "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8"
-                        else "1"
+                        "0" if model in NO_MOE_PADDING_MODELS else "1"
                     )
                     os.environ["HF_HUB_DISABLE_XET"] = (
-                        "1"
-                        if model
-                        in [
-                            "Qwen/Qwen2-57B-A14B-Instruct",
-                            "neuralmagic/Qwen2-57B-A14B-Instruct-FP8",
-                        ]
-                        else "0"
+                        "1" if model in DISABLE_HF_XET_MODELS else "0"
                     )
                     os.environ["SGLANG_AITER_MOE"] = (
-                        "0"
-                        if model
-                        in [
-                            "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
-                            "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",
-                        ]
-                        else "1"
+                        "0" if model in TRITON_MOE_MODELS else "1"
                     )
+
                     process = popen_launch_server_wrapper(self.base_url, model, is_tp2)
 
                     args = SimpleNamespace(
