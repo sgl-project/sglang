@@ -151,7 +151,7 @@ def apply_w8a8_block_fp8_linear(
     )
     if ENABLE_FLASHINFER_GEMM:
         assert is_sm100_supported(), "Flashinfer Blockwise GEMM only supports SM100"
-        q_input, x_scale = per_token_group_quant_fp8(
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
             input_2d, block_size[1], column_major_scales=False
         )
         x_scale_input = x_scale.T.contiguous()
