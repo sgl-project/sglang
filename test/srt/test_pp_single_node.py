@@ -108,11 +108,13 @@ class TestQwenPPAccuracy(unittest.TestCase):
 
         print(f"[Qwen PP Comparison] Baseline: {baseline} | PP: {pp_metrics}")
 
-        self.assertAlmostEqual(
+        self.assertGreaterEqual(
             pp_metrics["accuracy"],
-            baseline["accuracy"],
-            delta=0.01,
-            msg=f"PP accuracy exceeds 1% (baseline: {baseline['accuracy']}, pp: {pp_metrics['accuracy']})",
+            baseline["accuracy"] - 0.01,
+            msg=(
+                f"PP accuracy dropped more than 1% compared to baseline. "
+                f"Baseline: {baseline['accuracy']:.2%}, PP: {pp_metrics['accuracy']:.2%}"
+            ),
         )
 
 
@@ -164,11 +166,13 @@ class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
 
         print(f"[Qwen PP Comparison] Baseline: {baseline} | PP: {pp_metrics}")
 
-        self.assertAlmostEqual(
+        self.assertGreaterEqual(
             pp_metrics["accuracy"],
-            baseline["accuracy"],
-            delta=0.01,
-            msg=f"PP accuracy exceeds 1% (baseline: {baseline['accuracy']}, pp: {pp_metrics['accuracy']})",
+            baseline["accuracy"] - 0.01,
+            msg=(
+                f"PP accuracy dropped more than 1% compared to baseline. "
+                f"Baseline: {baseline['accuracy']:.2%}, PP: {pp_metrics['accuracy']:.2%}"
+            ),
         )
 
 
