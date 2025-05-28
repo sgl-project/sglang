@@ -354,7 +354,7 @@ class MooncakeKVManager(BaseKVManager):
                             kv_chunk.prefill_kv_indices
                         ):
                             kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
-                                len(chunked_dst_kv_indice)
+                                : len(chunked_dst_kv_indice)
                             ]
                             logger.warning(
                                 f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
