@@ -31,6 +31,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
         self.func_call_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
         self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```<｜tool▁call▁end｜>"
         self._last_arguments = ""
+        self.current_tool_id = -1
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek format tool call."""
@@ -75,7 +76,12 @@ class DeepSeekV3Detector(BaseFormatDetector):
         self._buffer += new_text
         current_text = self._buffer
 
-        if self.bot_token not in current_text:
+        # Check if we have a tool call (either the start token or individual tool call)
+        has_tool_call = (
+            self.bot_token in current_text or "<｜tool▁call▁begin｜>" in current_text
+        )
+
+        if not has_tool_call:
             self._buffer = ""
             for e_token in [self.eot_token, "```", "<｜tool▁call▁end｜>"]:
                 if e_token in new_text:
@@ -100,15 +106,32 @@ class DeepSeekV3Detector(BaseFormatDetector):
                 func_name = partial_match.group(2).strip()
                 func_args_raw = partial_match.group(3).strip()
 
+                # Initialize state if this is the first tool call
+                if self.current_tool_id == -1:
+                    self.current_tool_id = 0
+                    self.prev_tool_call_arr = []
+                    self.streamed_args_for_tool = [""]
+
+                # Ensure we have enough entries in our tracking arrays
+                while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                    self.prev_tool_call_arr.append({})
+                while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                    self.streamed_args_for_tool.append("")
+
                 if not self.current_tool_name_sent:
                     calls.append(
                         ToolCallItem(
-                            tool_index=self._tool_indices.get(func_name, 0),
+                            tool_index=self.current_tool_id,
                             name=func_name,
                             parameters="",
                         )
                     )
                     self.current_tool_name_sent = True
+                    # Store the tool call info for adapter.py
+                    self.prev_tool_call_arr[self.current_tool_id] = {
+                        "name": func_name,
+                        "arguments": {},
+                    }
                 else:
                     argument_diff = (
                         func_args_raw[len(self._last_arguments) :]
@@ -119,16 +142,41 @@ class DeepSeekV3Detector(BaseFormatDetector):
                     if argument_diff:
                         calls.append(
                             ToolCallItem(
-                                tool_index=self._tool_indices.get(func_name, 0),
+                                tool_index=self.current_tool_id,
                                 name=None,
                                 parameters=argument_diff,
                             )
                         )
                         self._last_arguments += argument_diff
+                        self.streamed_args_for_tool[
+                            self.current_tool_id
+                        ] += argument_diff
 
                     if _is_complete_json(func_args_raw):
+                        # Update the stored arguments for adapter.py
+                        try:
+                            parsed_args = json.loads(func_args_raw)
+                            self.prev_tool_call_arr[self.current_tool_id][
+                                "arguments"
+                            ] = parsed_args
+                        except json.JSONDecodeError:
+                            pass
+
+                        # Find the end of the current tool call and remove only that part from buffer
+                        tool_call_end_pattern = (
+                            r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
+                        )
+                        match = re.search(
+                            tool_call_end_pattern, current_text, re.DOTALL
+                        )
+                        if match:
+                            # Remove the completed tool call from buffer, keep any remaining content
+                            self._buffer = current_text[match.end() :]
+                        else:
+                            self._buffer = ""
+
                         result = StreamingParseResult(normal_text="", calls=calls)
-                        self._buffer = ""
+                        self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
                         return result
