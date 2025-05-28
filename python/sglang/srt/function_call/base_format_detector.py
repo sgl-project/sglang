@@ -72,7 +72,7 @@ class BaseFormatDetector(ABC):
         action = json.loads(text)
         return StreamingParseResult(calls=self.parse_base_json(action, tools))
 
-    def ends_with_partial_token(self, buffer: str, bot_token: str) -> int:
+    def _ends_with_partial_token(self, buffer: str, bot_token: str) -> int:
         """
         Check if buffer ends with a partial bot_token.
         Return the length of the partial bot_token.
@@ -108,7 +108,7 @@ class BaseFormatDetector(ABC):
         current_text = self._buffer
         if not (self.bot_token in current_text or current_text.startswith("{")):
             # Only clear buffer if we're sure no tool call is starting
-            if not self.ends_with_partial_token(self._buffer, self.bot_token):
+            if not self._ends_with_partial_token(self._buffer, self.bot_token):
                 normal_text = self._buffer
                 self._buffer = ""
                 if self.eot_token in normal_text:
