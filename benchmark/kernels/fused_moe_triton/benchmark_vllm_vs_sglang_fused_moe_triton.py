@@ -11,6 +11,13 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe as fused_moe_sglang,
 )
 
+from sglang.srt.distributed.parallel_state import (
+    init_distributed_environment,
+    initialize_model_parallel,
+    destroy_model_parallel,
+    destroy_distributed_environment,
+)
+
 
 def get_model_config(model_name: str, tp_size: int, n_share_experts_fusion: int = 0):
     """Get model configuration parameters"""
@@ -297,16 +304,41 @@ def main():
     )
     args = parser.parse_args()
 
-    model_config = get_model_config(
-        args.model, args.tp_size, args.n_share_experts_fusion
-    )
-    benchmark.run(
-        show_plots=True,
-        print_data=True,
-        save_path=args.save_path,
-        model_config=model_config,
-        use_fp8_w8a8=args.use_fp8_w8a8,
-    )
+    try:
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                backend="nccl" if torch.cuda.is_available() else "gloo",
+                init_method="tcp://127.0.0.1:23456",
+                world_size=1,
+                rank=0,
+            )
+        
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            distributed_init_method="tcp://127.0.0.1:23456",
+            local_rank=0,
+            backend="nccl" if torch.cuda.is_available() else "gloo",
+        )
+        
+        initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+        )
+
+        model_config = get_model_config(
+            args.model, args.tp_size, args.n_share_experts_fusion
+        )
+        benchmark.run(
+            show_plots=True,
+            print_data=True,
+            save_path=args.save_path,
+            model_config=model_config,
+            use_fp8_w8a8=args.use_fp8_w8a8,
+        )
+    finally:
+        destroy_model_parallel()
+        destroy_distributed_environment()
 
 
 if __name__ == "__main__":
