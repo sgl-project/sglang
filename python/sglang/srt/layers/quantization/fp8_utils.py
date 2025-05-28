@@ -125,7 +125,9 @@ def cutlass_block_fp8_supported() -> bool:
 
 
 CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
-ENABLE_FLASHINFER_GEMM = get_bool_env_var("SGLANG_ENABLE_FLASHINFER_GEMM")
+ENABLE_FLASHINFER_GEMM = (
+    get_bool_env_var("SGLANG_ENABLE_FLASHINFER_GEMM") and is_sm100_supported()
+)
 if ENABLE_FLASHINFER_GEMM:
     assert (
         is_flashinfer_available()
@@ -150,7 +152,6 @@ def apply_w8a8_block_fp8_linear(
         weight.shape[0] % 128 == 0 and weight.shape[1] % 128 == 0
     )
     if ENABLE_FLASHINFER_GEMM:
-        assert is_sm100_supported(), "Flashinfer Blockwise GEMM only supports SM100"
         q_input, x_scale = sglang_per_token_group_quant_fp8(
             input_2d, block_size[1], column_major_scales=False
         )
