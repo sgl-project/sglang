@@ -211,6 +211,11 @@ std::vector<at::Tensor> moe_fused_gate(
 
 void fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& a_scales_ptrs,
+    torch::Tensor& b_scales_ptrs,
     const torch::Tensor& a,
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
@@ -221,7 +226,19 @@ void fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& layout_sfa,
     const torch::Tensor& layout_sfb,
     const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets);
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace);
+
+void prepare_moe_input(
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_offsets,
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& problem_sizes2,
+    torch::Tensor& input_permutation,
+    torch::Tensor& output_permutation,
+    const int64_t num_experts,
+    const int64_t n,
+    const int64_t k);
 
 /*
  * From csrc/speculative
@@ -387,3 +404,24 @@ void convert_vertical_slash_indexes_mergehead(
  * From XGrammar
  */
 void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt);
+
+/*
+ * From QServe
+ */
+void qserve_w4a8_per_chn_gemm(
+    const torch::Tensor& _in_feats,
+    const torch::Tensor& _kernel,
+    const torch::Tensor& _wscales,
+    const torch::Tensor& _ascales,
+    const torch::Tensor& _w_szs,
+    const torch::Tensor& _a_ssums,
+    torch::Tensor& _out_feats);
+
+void qserve_w4a8_per_group_gemm(
+    const torch::Tensor& _in_feats,
+    const torch::Tensor& _kernel,
+    const torch::Tensor& _zeros,
+    const torch::Tensor& _scales_i8,
+    const torch::Tensor& _wscales,
+    const torch::Tensor& _ascales,
+    torch::Tensor& _out_feats);
