@@ -157,20 +157,6 @@ inline void sigmoid(float* __restrict__ out, const scalar_t* __restrict__ input)
   }
 }
 
-template <typename scalar_t, int SIZE>
-inline void _copy_and_convert_to_float(float* __restrict__ out, const scalar_t* __restrict__ input) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  for (int d = 0; d < SIZE; d += kVecSize) {
-    bVec x_bvec = bVec::loadu(input + d);
-    fVec x_fvec0, x_fvec1;
-    std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
-    x_fvec0.store(out + d);
-    x_fvec1.store(out + d + fVec::size());
-  }
-}
-
 template <typename scalar_t, int NUM_EXPERTS>
 void topk_sigmoid_kernel_impl(
     float* __restrict__ topk_weights,
@@ -187,7 +173,7 @@ void topk_sigmoid_kernel_impl(
     std::vector<elem_t> queue(num_experts_per_group);
 
     for (int64_t i = begin; i < end; ++i) {
-      _copy_and_convert_to_float<scalar_t, NUM_EXPERTS>(scores, gating_output + i * NUM_EXPERTS);
+      at::vec::convert<scalar_t, float>(gating_output + i * NUM_EXPERTS, scores, NUM_EXPERTS);
 
       float gmax = at::vec::reduce_all<float>(
           [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, scores, num_experts_per_group);
