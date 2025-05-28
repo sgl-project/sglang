@@ -486,6 +486,9 @@ class ModelRunner:
                 import sgl_kernel
 
                 # Bind OpenMP threads to CPU cores
+                assert (
+                    cpu_has_amx_support()
+                ), "init_cpu_threads_env failed since intel amx backend is not available"
                 torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
 
             # Only initialize the distributed environment on the target model worker.
