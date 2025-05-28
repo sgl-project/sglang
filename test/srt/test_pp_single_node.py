@@ -121,7 +121,7 @@ class TestQwenPPAccuracy(unittest.TestCase):
 class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.base_url = "http://127.0.0.1:23334"  # different ports to avoid conflicts
+        cls.base_url = "http://127.0.0.1:23335"  # different ports to avoid conflicts
         cls.model_name = (
             "Qwen/Qwen3-0.6B"  # qwen3 < 8B all have tie_word_embeddings = True
         )
@@ -178,7 +178,7 @@ class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
 class TestQwenMoePPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.base_url = "http://127.0.0.1:23334"  # different ports to avoid conflicts
+        cls.base_url = "http://127.0.0.1:23336"  # different ports to avoid conflicts
         cls.model_name = "Qwen/Qwen3-30B-A3B"  # replace with your Qwen Model if needed
 
     def run_gsm8k_test(self, pp_size):
