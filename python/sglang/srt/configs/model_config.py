@@ -196,6 +196,22 @@ class ModelConfig:
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
         else:
+            if (
+                "MistralModel" in self.hf_config.architectures
+                or "MixtralForCausalLM" in self.hf_config.architectures
+                or "MistralForCausalLM" in self.hf_config.architectures
+            ):
+                if getattr(self, "head_dim", None) is None:
+                    self.head_dim = (
+                        self.hf_config.hidden_size // self.hf_config.num_attention_heads
+                    )
+                    # In transformers==4.52.3, the head_dim is null in MistralConfig
+                    if (
+                        not hasattr(self.hf_text_config, "head_dim")
+                        or self.hf_text_config.head_dim is None
+                    ):
+                        setattr(self.hf_text_config, "head_dim", self.head_dim)
+
             self.attention_arch = AttentionArch.MHA
 
         self.num_attention_heads = self.hf_text_config.num_attention_heads
