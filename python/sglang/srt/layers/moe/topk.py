@@ -28,7 +28,7 @@ from sglang.srt.managers.expert_location_dispatch import (
     topk_ids_logical_to_physical,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip, cpu_has_amx_support
+from sglang.srt.utils import cpu_has_amx_support, get_compiler_backend, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
