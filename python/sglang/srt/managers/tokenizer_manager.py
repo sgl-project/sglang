@@ -1428,22 +1428,6 @@ class TokenizerManager:
         prepend: bool = False,
         request: Optional[Any] = None,
     ) -> List[Dict[int, float]]:
-        """
-        Score the probability of specified token IDs appearing after the given text.
-
-        Args:
-            text_1: The first part of the text. Either text_1 or token_ids_1 must be provided.
-            text_2: The second part of the text or a list of second parts. Either text_2 or token_ids_2 must be provided.
-            token_ids_1: Pre-tokenized first part of the text. Either text_1 or token_ids_1 must be provided.
-            token_ids_2: Pre-tokenized second part of the text. Either text_2 or token_ids_2 must be provided.
-            output_prob_token_ids: List of token IDs to compute probabilities for. If None, no token probabilities will be computed.
-            apply_softmax: Whether to normalize probabilities using softmax.
-            prepend: If True, prepend text_2 to text_1. Otherwise append text_2 to text_1.
-            request: Optional request object for handling disconnections.
-
-        Returns:
-            List of dictionaries mapping token IDs to their probabilities for each text_2
-        """
         # Validate inputs
         if output_prob_token_ids is None:
             raise ValueError("output_prob_token_ids must be provided")
