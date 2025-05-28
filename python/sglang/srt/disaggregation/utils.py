@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import random
+import threading
 import warnings
 from collections import deque
 from enum import Enum
@@ -279,6 +280,25 @@ class MetadataBuffers:
                 ] = torch.tensor(
                     req.output_top_logprobs_idx[0], dtype=torch.int32, device="cpu"
                 )
+
+
+class FastQueue:
+    def __init__(self):
+        self._buf = deque()
+        self._cond = threading.Condition()
+
+    def put(self, item):
+        with self._cond:
+            self._buf.append(item)
+            # wake up a thread of wait()
+            self._cond.notify()
+
+    def get(self):
+        with self._cond:
+            # if queue is empty  ,block until is notified()
+            while not self._buf:
+                self._cond.wait()
+            return self._buf.popleft()
 
 
 def group_concurrent_contiguous(
