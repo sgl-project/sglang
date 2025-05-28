@@ -126,12 +126,11 @@ def cutlass_block_fp8_supported() -> bool:
 
 CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
 ENABLE_FLASHINFER_GEMM = (
-    get_bool_env_var("SGLANG_ENABLE_FLASHINFER_GEMM") and is_sm100_supported()
+    get_bool_env_var("SGLANG_ENABLE_FLASHINFER_GEMM")
+    and is_sm100_supported()
+    and is_flashinfer_available()
 )
 if ENABLE_FLASHINFER_GEMM:
-    assert (
-        is_flashinfer_available()
-    ), "Flashinfer should be installed to use Flashinfer GEMM"
     from flashinfer.gemm import gemm_fp8_nt_groupwise
 
 
