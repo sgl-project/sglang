@@ -297,7 +297,9 @@ class GenerateReqInput:
             self.image_data = [[self.image_data]] * num
             self.modalities = ["image"] * num
         elif isinstance(self.image_data, list):
-            if len(self.image_data) != self.batch_size:
+            if len(self.image_data) == 0:
+                self.image_data = [None] * num
+            elif len(self.image_data) != self.batch_size:
                 raise ValueError(
                     "The length of image_data should be equal to the batch size."
                 )
