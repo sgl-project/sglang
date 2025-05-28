@@ -84,10 +84,29 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 25
+        timeout-minutes: 30
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-2-gpu
+
+  unittest-test-backend-4-gpu:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+        github.event.pull_request.draft == false
+    needs: [unit-test-frontend, unit-test-backend-2-gpu]
+    runs-on: 4-gpu-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-4-gpu
 
   unittest-test-backend-8-gpu:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
