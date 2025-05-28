@@ -366,15 +366,6 @@ class CudaGraphRunner:
             or requested_capture_hidden_mode == self.capture_hidden_mode
         )
 
-        if (
-            is_encoder_lens_supported
-            and is_encoder_lens_supported
-            and not capture_hidden_mode_matches
-        ):
-            print(
-                "###Can't run graph runner solely due to mismatched Capture Hidden Mode"
-            )
-
         return (
             is_bs_supported
             and is_encoder_lens_supported

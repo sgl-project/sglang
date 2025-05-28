@@ -151,9 +151,6 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
             ), "hidden_states were returned and should not have been"
 
     def run_chat_completion(self, parallel_sample_num, return_hidden_states):
-        print(
-            f"run_chat_completion: parallel_sample_num={parallel_sample_num}, return_hidden_states={return_hidden_states}"
-        )
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         response = client.chat.completions.create(
             model=self.model,
@@ -268,7 +265,6 @@ class TestOpenAIServerWithEAGLEAndHiddenStatesEnabled(
 ):
     @classmethod
     def setUpClass(cls):
-        print("STARTING EAGLE WITH HIDDEN STATES TEST SUITE")
         cls.model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
@@ -314,7 +310,6 @@ class TestOpenAIServerWithEAGLE3AndHiddenStatesEnabled(
 ):
     @classmethod
     def setUpClass(cls):
-        print("STARTING EAGLE 3 WITH HIDDEN STATES TEST SUITE")
         cls.model = "meta-llama/Llama-3.1-8B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
