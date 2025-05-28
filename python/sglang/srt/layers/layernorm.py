@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import is_cuda, is_hip, cpu_has_amx_support
+from sglang.srt.utils import cpu_has_amx_support, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -114,10 +114,14 @@ class RMSNorm(CustomOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if cpu_has_amx_support():
             if residual is not None:
-                torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(x, residual, self.weight.data, self.variance_epsilon)
+                torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(
+                    x, residual, self.weight.data, self.variance_epsilon
+                )
                 return x, residual
             out = torch.empty_like(x)
-            torch.ops.sgl_kernel.rmsnorm_cpu(out, x, self.weight.data, self.variance_epsilon)
+            torch.ops.sgl_kernel.rmsnorm_cpu(
+                out, x, self.weight.data, self.variance_epsilon
+            )
             return out
         else:
             return self.forward_native(x, residual)

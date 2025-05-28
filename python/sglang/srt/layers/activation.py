@@ -28,7 +28,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import is_cuda, set_weight_attrs, cpu_has_amx_support
+from sglang.srt.utils import cpu_has_amx_support, is_cuda, set_weight_attrs
 
 _is_cuda = is_cuda()
 _is_cpu_amx = cpu_has_amx_support()
@@ -59,6 +59,7 @@ class SiluAndMul(CustomOp):
             return out
         else:
             return self.forward_native(x)
+
 
 class GeluAndMul(CustomOp):
     def __init__(self, approximate="tanh"):
