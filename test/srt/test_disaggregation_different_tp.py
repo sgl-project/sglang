@@ -21,6 +21,9 @@ from sglang.test.test_utils import (
 class TestDisaggregationMooncakeDifferentTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        # wait for 5 seconds
+        time.sleep(5)
+
         # Temporarily disable JIT DeepGEMM
         cls.original_jit_deepgemm = os.environ.get("SGL_ENABLE_JIT_DEEPGEMM")
         os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
@@ -130,6 +133,8 @@ class TestDisaggregationMooncakeDifferentTP(CustomTestCase):
                     kill_process_tree(process.pid)
                 except Exception as e:
                     print(f"Error killing process {process.pid}: {e}")
+        # wait for 5 seconds
+        time.sleep(5)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
