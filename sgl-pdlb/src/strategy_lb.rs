@@ -1,4 +1,5 @@
 use rand::Rng;
+use serde_json::json;
 
 #[derive(Debug, Clone)]
 pub enum EngineType {
@@ -8,7 +9,6 @@ pub enum EngineType {
 
 #[derive(Debug, Clone)]
 pub struct EngineInfo {
-    #[allow(dead_code)]
     pub engine_type: EngineType,
     pub url: String,
     pub boostrap_port: Option<u16>,
@@ -49,6 +49,31 @@ impl EngineInfo {
             .trim_start_matches("http://")
             .trim_start_matches("https://");
         url.split(':').next().unwrap().to_string()
+    }
+}
+
+pub struct EngineLoad {
+    pub engine_info: EngineInfo,
+    pub load: isize,
+}
+
+impl EngineLoad {
+    pub fn from_json(engine_info: EngineInfo, json: serde_json::Value) -> Self {
+        let load = match json.get("load") {
+            Some(load) => load.as_i64().unwrap_or(-1) as isize,
+            None => -1,
+        };
+        EngineLoad { engine_info, load }
+    }
+    pub fn to_json(&self) -> serde_json::Value {
+        json!({
+            "engine": self.engine_info.to_string(),
+            "load": self.load,
+        })
+    }
+
+    pub fn to_string(&self) -> String {
+        format!("{}: {}", self.engine_info.to_string(), self.load)
     }
 }
 

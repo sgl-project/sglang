@@ -41,14 +41,14 @@ impl LoadBalancer {
         })?;
 
         let ret: PyResult<()> = actix_web::rt::System::new().block_on(async move {
-            tokio::spawn(periodic_logging(lb_state.clone()));
-            startup(self.lb_config.clone(), lb_state)
-                .await
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!("Failed to start LB server: {}", e))
-                })?;
-
             tokio::select! {
+                _ = periodic_logging(lb_state.clone()) => {
+                    unreachable!()
+                }
+                res = startup(self.lb_config.clone(), lb_state) => {
+                    res.map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    unreachable!()
+                }
                 _ = signal::ctrl_c() => {
                     println!("Received Ctrl+C, shutting down");
                     std::process::exit(0);
