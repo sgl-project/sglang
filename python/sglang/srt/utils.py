@@ -2177,12 +2177,17 @@ def require_mlp_tp_gather(server_args):
     """
     if server_args.enable_dp_attention:
         assert server_args.dp_size > 1, "dp_size must be greater than 1"
-        if server_args.moe_dense_tp_size is None:    # TODO(ch-wan): some MoE models do not have dense layers
+        if (
+            server_args.moe_dense_tp_size is None
+        ):  # TODO(ch-wan): some MoE models do not have dense layers
             return True
         elif not server_args.enable_dp_lm_head:
             return True
         else:
-            return server_args.moe_dense_tp_size > server_args.tp_size // server_args.dp_size
+            return (
+                server_args.moe_dense_tp_size
+                > server_args.tp_size // server_args.dp_size
+            )
     else:
         return False
 

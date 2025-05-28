@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.utils import require_gathered_buffer
 from sglang.srt.disaggregation.base import BaseKVManager, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -45,6 +44,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import require_gathered_buffer
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup

@@ -49,7 +49,7 @@ from sglang.srt.utils import (
     rank0_log,
     require_attn_tp_gather,
     require_gathered_buffer,
-    require_mlp_tp_gather
+    require_mlp_tp_gather,
 )
 
 if TYPE_CHECKING:

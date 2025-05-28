@@ -31,7 +31,6 @@ import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
-from sglang.srt.utils import require_gathered_buffer
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -50,6 +49,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import require_gathered_buffer
 
 logger = logging.getLogger(__name__)
 
