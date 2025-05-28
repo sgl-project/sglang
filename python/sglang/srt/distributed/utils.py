@@ -60,7 +60,7 @@ def split_tensor_along_last_dim(
     return tensor_list
 
 
-# Adapted from https://github.com/vllm-project/vllm/blob/v0.9.0/vllm/distributed/utils.py:89
+# Adapted from https://github.com/vllm-project/vllm/blob/v0.9.0/vllm/distributed/utils.py#L89
 def get_pp_indices(
     num_hidden_layers: int, pp_rank: int, pp_size: int
 ) -> Tuple[int, int]:
