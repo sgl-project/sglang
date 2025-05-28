@@ -418,10 +418,8 @@ class TboForwardBatchPreparer:
         # TODO we may make padding on both sub-batches to make it slightly more balanced
         value_a = min(tbo_split_token_index, num_token_non_padded)
         value_b = max(0, num_token_non_padded - tbo_split_token_index)
-        return torch.tensor(
-            [value_a, value_b],
-            device=global_server_args_dict["device"],
-            dtype=torch.int32,
+        return torch.tensor([value_a, value_b], dtype=torch.int32).to(
+            device=global_server_args_dict["device"], non_blocking=True
         )
 
     @classmethod
