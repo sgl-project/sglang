@@ -117,8 +117,8 @@ class MiniLoadBalancer:
             ) as session:
                 # Create the tasks for both prefill and decode requests
                 tasks = [
-                    session.post(f"{prefill_server}/generate", json=modified_request),
-                    session.post(f"{decode_server}/generate", json=modified_request),
+                    session.post(f"{prefill_server}/{endpoint}", json=modified_request),
+                    session.post(f"{decode_server}/{endpoint}", json=modified_request),
                 ]
                 # Wait for both responses to complete. Since this is streaming, they return immediately.
                 prefill_response, decode_response = await asyncio.gather(*tasks)

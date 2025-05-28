@@ -86,7 +86,7 @@ class Qwen25Detector(BaseFormatDetector):
                 result.normal_text = cleaned_text
             else:
                 # Check if buffer might contain partial end token at the end
-                partial_match_len = self.ends_with_partial_token(
+                partial_match_len = self._ends_with_partial_token(
                     self._normal_text_buffer, end_token_without_newline
                 )
 
@@ -106,8 +106,8 @@ class Qwen25Detector(BaseFormatDetector):
     def structure_info(self) -> _GetInfoFunc:
         # TODO: Update the begin and end tokens with '\n' if necessary
         return lambda name: StructureInfo(
-            begin='<tool_call>{"name":"' + name + '", "arguments":',
-            end="}</tool_call>",
+            begin='<tool_call>\n{"name":"' + name + '", "arguments":',
+            end="}\n</tool_call>",
             trigger="<tool_call>",
         )
 
