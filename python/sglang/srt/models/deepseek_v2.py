@@ -529,10 +529,10 @@ class DeepseekV2MoE(nn.Module):
 
         if (shared_output := state.pop("shared_output")) is not None:
             x = shared_output
-            x.add_(final_hidden_states, alpha=self.mlp.routed_scaling_factor)
+            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
         else:
-            final_hidden_states *= self.mlp.routed_scaling_factor
+            final_hidden_states *= self.routed_scaling_factor
 
         state.hidden_states_mlp_output = final_hidden_states
 
