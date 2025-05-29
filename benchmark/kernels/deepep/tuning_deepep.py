@@ -288,6 +288,8 @@ def test_main(
     if local_rank == 0:
         print("", flush=True)
 
+    output_data = {}
+
     # Tune dispatch performance
     best_dispatch_results = None
     fp8_factor = (1 + 4 / 128) / 2
@@ -331,6 +333,9 @@ def test_main(
                 flush=True,
             )
             print("", flush=True)
+            is_fp8 = isinstance(current_x, tuple)
+            if is_fp8:
+                output_data["normal_dispatch"] = TODO
 
         if isinstance(current_x, tuple):
             # Gather FP8 the best config from rank 0
@@ -396,24 +401,14 @@ def test_main(
             flush=True,
         )
         print("", flush=True)
+        output_data["normal_combine"] = TODO
 
     if rank == 0 and local_rank == 0:
-        _write_output()
+        _write_output(args, output_data)
 
 
-def _write_output(args):
-    data = {
-        "normal_dispatch": {
-            "num_sms": TODO,
-            "num_max_nvl_chunked_send_tokens": TODO,
-            "num_max_nvl_chunked_recv_tokens": TODO,
-            "num_max_rdma_chunked_send_tokens": TODO,
-            "num_max_rdma_chunked_recv_tokens": TODO,
-        },
-        "normal_combine": TODO
-    }
-
-    text = json.dumps(data)
+def _write_output(args, output_data):
+    text = json.dumps(output_data)
     output_path = args.output_path
     print(f"Write to {output_path} with {text}")
     Path(output_path).write_text(text)
