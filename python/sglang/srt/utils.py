@@ -13,6 +13,8 @@
 # ==============================================================================
 """Common utilities."""
 
+from __future__ import annotations
+
 import base64
 import builtins
 import ctypes
@@ -89,10 +91,9 @@ from triton.runtime.cache import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.configs.load_config import LoadConfig
+    from sglang.srt.configs.model_config import ModelConfig
 
-from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
 DEFAULT_MOE_PADDING_SIZE = 32
 
@@ -2581,6 +2582,8 @@ def update_intermediate_size(model_config, attr_name, intermediate_padding_size)
     if hasattr(model_config.hf_config, attr_name):
         attr_value = getattr(model_config.hf_config, attr_name)
         if attr_value % intermediate_padding_size != 0:
+            from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
+
             attr_value = pad_vocab_size(attr_value, intermediate_padding_size)
             setattr(model_config.hf_config, attr_name, attr_value)
             setattr(model_config.hf_text_config, attr_name, attr_value)
@@ -2596,6 +2599,8 @@ def update_config(
             model_config.num_attention_heads // model_config.get_total_num_kv_heads()
         )
         total_kv_heads = model_config.get_total_num_kv_heads()
+        from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
+
         num_key_value_heads = pad_vocab_size(total_kv_heads, tp_size)
         model_config.num_key_value_heads = num_key_value_heads
         model_config.hf_config.num_key_value_heads = num_key_value_heads

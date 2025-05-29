@@ -9,7 +9,6 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
 
-from sglang.srt.cpu_utils import get_actual_shard_size, reset_param_data_if_needed
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -35,6 +34,8 @@ from sglang.srt.utils import (
     _process_weight_after_loading,
     cpu_has_amx_support,
     is_cpu,
+    get_actual_shard_size,
+    reset_param_data_if_needed,
     set_weight_attrs,
 )
 

@@ -6,7 +6,6 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.cpu_utils import get_actual_shard_size, reset_param_data_if_needed
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -25,6 +24,8 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    get_actual_shard_size,
+    reset_param_data_if_needed,
     set_weight_attrs,
 )
 
