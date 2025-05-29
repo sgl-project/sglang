@@ -40,6 +40,8 @@ class Router:
             worker URLs using this port. Default: 80
         service_discovery_namespace: Kubernetes namespace to watch for pods. If not provided,
             watches pods across all namespaces (requires cluster-wide permissions). Default: None
+        prometheus_port: Port to expose Prometheus metrics. Default: None
+        prometheus_host: Host address to bind the Prometheus metrics server. Default: None
     """
 
     def __init__(
@@ -62,6 +64,8 @@ class Router:
         selector: Dict[str, str] = None,
         service_discovery_port: int = 80,
         service_discovery_namespace: Optional[str] = None,
+        prometheus_port: Optional[int] = None,
+        prometheus_host: Optional[str] = None,
     ):
         if selector is None:
             selector = {}
@@ -85,6 +89,8 @@ class Router:
             selector=selector,
             service_discovery_port=service_discovery_port,
             service_discovery_namespace=service_discovery_namespace,
+            prometheus_port=prometheus_port,
+            prometheus_host=prometheus_host,
         )
 
     def start(self) -> None:
