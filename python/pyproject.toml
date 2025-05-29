@@ -41,7 +41,7 @@ runtime_common = [
     "soundfile==0.13.1",
     "scipy",
     "torchao==0.9.0",
-    "transformers==4.51.1",
+    "transformers==4.52.3",
     "uvicorn",
     "uvloop",
     "xgrammar==0.1.19",
