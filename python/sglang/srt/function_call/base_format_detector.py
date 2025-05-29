@@ -36,6 +36,7 @@ class BaseFormatDetector(ABC):
         )  # map what has been streamed for each tool so far to a list
         self.bot_token = ""
         self.eot_token = ""
+        self.tool_call_separator = "; "
 
     def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
         tool_indices = {
@@ -227,7 +228,9 @@ class BaseFormatDetector(ABC):
                         )  # Save the ID of the tool that's completing
 
                         # Only remove the processed portion, keep unprocessed content
-                        self._buffer = current_text[start_idx + end_idx :]
+                        self._buffer = current_text[
+                            start_idx + end_idx + len(self.tool_call_separator) :
+                        ]
 
                         if self.current_tool_id < len(self.prev_tool_call_arr):
                             self.prev_tool_call_arr[self.current_tool_id].clear()

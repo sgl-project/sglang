@@ -689,10 +689,9 @@ class TestBaseFormatDetector(unittest.TestCase):
         tourist_calls = [
             call for call in result.calls if call.name == "get_tourist_attractions"
         ]
-        if tourist_calls:
-            self.assertEqual(
-                tourist_calls[0].tool_index, 1, "Second tool should have tool_index=1"
-            )
+        self.assertEqual(
+            tourist_calls[0].tool_index, 1, "Second tool should have tool_index=1"
+        )
 
     def test_tool_name_streaming_with_correct_index(self):
         """Test that tool names are streamed with correct tool_index values."""
@@ -715,7 +714,7 @@ class TestBaseFormatDetector(unittest.TestCase):
         )
 
         # Start second tool
-        self.detector.parse_streaming_increment("<tool_call>", self.tools)
+        self.detector.parse_streaming_increment(", ", self.tools)
         result2 = self.detector.parse_streaming_increment(
             '{"name": "get_tourist_attractions", ', self.tools
         )
