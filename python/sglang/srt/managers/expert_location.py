@@ -87,10 +87,31 @@ class ExpertLocationMetadata:
         num_layers = model_config_for_expert_location.num_layers
         num_logical_experts = model_config_for_expert_location.num_logical_experts
 
-        physical_to_logical_map = (
-            torch.arange(0, num_physical_experts).repeat(num_layers, 1)
-            % num_logical_experts
-        )
+        if server_args.ep_dispatch_algorithm == "balance":
+            assert (
+                num_physical_experts % num_logical_experts == 0
+            ), "The situation where num_physical_experts is not a multiple of num_logical_experts is not supported. Please set --ep-num-redundant-experts to a multiple of n_routed_experts"
+
+            physical_to_logical_map = []
+            num_physical_experts_each_gpu = num_physical_experts // server_args.ep_size
+            num_logical_experts_each_gpu = num_logical_experts // server_args.ep_size
+            for i in range(0, server_args.ep_size):
+                start_idx = i * num_logical_experts_each_gpu
+                for logical_expert_id in range(
+                    start_idx, start_idx + num_physical_experts_each_gpu
+                ):
+                    physical_to_logical_map.append(
+                        logical_expert_id % num_logical_experts
+                    )
+
+            physical_to_logical_map = torch.tensor(
+                physical_to_logical_map, dtype=torch.int64
+            ).repeat(num_layers, 1)
+        else:
+            physical_to_logical_map = (
+                torch.arange(0, num_physical_experts).repeat(num_layers, 1)
+                % num_logical_experts
+            )
 
         return ExpertLocationMetadata.init_by_mapping(
             server_args,
