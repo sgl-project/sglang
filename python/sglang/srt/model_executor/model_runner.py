@@ -1065,7 +1065,6 @@ class ModelRunner:
                         or not self.plan_stream_for_flashinfer
                     ):
                         self.plan_stream_for_flashinfer = torch.cuda.Stream()
-                    self.plan_stream_for_flashinfer = torch.cuda.Stream()
                 return FlashInferAttnBackend(self)
             else:
                 from sglang.srt.layers.attention.flashinfer_mla_backend import (
