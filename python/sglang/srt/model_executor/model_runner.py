@@ -900,7 +900,7 @@ class ModelRunner:
         # modify max_total_num_tokens due to ReqToTokenPool
         self.max_total_num_tokens -= (
             (max_num_reqs + 1)
-            * (self.server_args.context_length + 4)
+            * (self.model_config.context_len + 4)
             * torch._utils._element_size(torch.int32)
             // cell_size
         )
