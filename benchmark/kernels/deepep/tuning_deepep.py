@@ -1,5 +1,11 @@
 # MODIFIED FROM https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_inernode.py
 
+"""
+Example usage:
+python tuning_deepep.py --nnodes 4 --node-rank $MY_NODE_RANK --master-addr 1.2.3.4
+Then check `deepep_tuned.json`
+"""
+
 import argparse
 import json
 import time
