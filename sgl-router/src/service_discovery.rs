@@ -7,11 +7,12 @@ use kube::{
     Client,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
+use crate::router::Router;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task;
 use tokio::time;
-use tracing::{error, info, warn};
+use tracing::{error, debug, info, warn};
 
 /// Represents the service discovery configuration
 #[derive(Debug, Clone)]
@@ -81,7 +82,7 @@ impl PodInfo {
 
 pub async fn start_service_discovery(
     config: ServiceDiscoveryConfig,
-    worker_urls: Arc<RwLock<Vec<String>>>,
+    router: Arc<Router>,
 ) -> Result<task::JoinHandle<()>, kube::Error> {
     // Don't initialize anything if service discovery is disabled
     if !config.enabled {
@@ -136,7 +137,7 @@ pub async fn start_service_discovery(
             // Clone Arcs for the closures
             let selector_clone = Arc::clone(&selector);
             let tracked_pods_clone = Arc::clone(&tracked_pods);
-            let worker_urls_clone = Arc::clone(&worker_urls);
+            // let router_clone = Arc::clone(&router);
 
             // Apply label selector filter separately since we can't do it directly with the watcher anymore
             let filtered_stream = watcher_stream.filter_map(move |obj_res| {
@@ -164,12 +165,13 @@ pub async fn start_service_discovery(
 
             // Clone again for the next closure
             let tracked_pods_clone2 = Arc::clone(&tracked_pods_clone);
-            let worker_urls_clone2 = Arc::clone(&worker_urls_clone);
+            let router_clone = Arc::clone(&router);
+            // let router_clone2 = Arc::clone(&router_clone);
 
             match filtered_stream
                 .try_for_each(move |pod| {
                     let tracked_pods_inner = Arc::clone(&tracked_pods_clone2);
-                    let worker_urls_inner = Arc::clone(&worker_urls_clone2);
+                    let router_inner = Arc::clone(&router_clone);
 
                     async move {
                         if let Some(pod_info) = PodInfo::from_pod(&pod) {
@@ -177,7 +179,7 @@ pub async fn start_service_discovery(
                                 handle_pod_deletion(
                                     &pod_info,
                                     tracked_pods_inner,
-                                    worker_urls_inner,
+                                    router_inner, // Pass router instance
                                     port,
                                 )
                                 .await;
@@ -185,7 +187,7 @@ pub async fn start_service_discovery(
                                 handle_pod_event(
                                     &pod_info,
                                     tracked_pods_inner,
-                                    worker_urls_inner,
+                                    router_inner, // Pass router instance
                                     port,
                                 )
                                 .await;
@@ -219,7 +221,7 @@ pub async fn start_service_discovery(
 async fn handle_pod_event(
     pod_info: &PodInfo,
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
-    worker_urls: Arc<RwLock<Vec<String>>>,
+    router: Arc<Router>,
     port: u16,
 ) {
     let worker_url = pod_info.worker_url(port);
@@ -234,52 +236,46 @@ async fn handle_pod_event(
     if pod_info.is_healthy() {
         if !already_tracked {
             info!(
-                "Adding healthy pod {} ({}) as worker",
-                pod_info.name, pod_info.ip
+                "Healthy pod found: {}. Adding worker: {}",
+                pod_info.name,
+                worker_url
             );
-
-            // Add URL to worker list
-            let mut urls = worker_urls.write().unwrap();
-            if !urls.contains(&worker_url) {
-                urls.push(worker_url.clone());
-                info!("Added new worker URL: {}", worker_url);
+            match router.add_worker(&worker_url).await {
+                Ok(msg) => info!("Router add_worker: {}", msg),
+                Err(e) => error!("Failed to add worker {} to router: {}", worker_url, e),
             }
-
-            // Track this pod
             let mut tracker = tracked_pods.lock().unwrap();
             tracker.insert(pod_info.clone());
         }
     } else if already_tracked {
         // If pod was healthy before but not anymore, remove it
-        handle_pod_deletion(pod_info, tracked_pods, worker_urls, port).await;
+        handle_pod_deletion(pod_info, tracked_pods, router, port).await;
     }
 }
 
 async fn handle_pod_deletion(
     pod_info: &PodInfo,
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
-    worker_urls: Arc<RwLock<Vec<String>>>,
+    router: Arc<Router>,
     port: u16,
 ) {
     let worker_url = pod_info.worker_url(port);
+    let mut tracked = tracked_pods.lock().unwrap();
 
-    // Remove the pod from our tracking
-    let was_tracked = {
-        let mut tracker = tracked_pods.lock().unwrap();
-        tracker.remove(pod_info)
-    };
-
-    if was_tracked {
+    if tracked.remove(pod_info) {
         info!(
-            "Removing pod {} ({}) from workers",
-            pod_info.name, pod_info.ip
+            "Pod deleted: {}. Removing worker: {}",
+            pod_info.name,
+            worker_url
         );
-
-        // Remove URL from worker list
-        let mut urls = worker_urls.write().unwrap();
-        if let Some(idx) = urls.iter().position(|url| url == &worker_url) {
-            urls.remove(idx);
-            info!("Removed worker URL: {}", worker_url);
-        }
+        router.remove_worker(&worker_url);
+    } else {
+        // This case might occur if a pod is deleted before it was ever marked healthy and added.
+        // Or if the event is duplicated. No action needed on the router if it wasn't tracked (and thus not added).
+        debug!(
+            "Pod deletion event for untracked/already removed pod: {}. Worker URL: {}",
+            pod_info.name,
+            worker_url
+        );
     }
 }
