@@ -7,21 +7,21 @@ use reqwest::StatusCode;
 use serde_json::json;
 use std::{io::Write, pin::Pin};
 
-pub enum ProxyResponseType {
+pub enum ProxyResponseBody {
     Full(Bytes),
     Stream(Pin<Box<dyn Stream<Item = Result<Bytes, actix_web::Error>> + Send>>),
 }
 
 pub struct ProxyResponse {
     pub status: StatusCode,
-    pub body: ProxyResponseType,
+    pub body: ProxyResponseBody,
 }
 
 impl ProxyResponse {
     pub fn to_json(&self) -> Result<serde_json::Value, actix_web::Error> {
         match &self.body {
-            ProxyResponseType::Full(body) => Ok(serde_json::from_slice(&body)?),
-            ProxyResponseType::Stream(_) => Err(actix_web::error::ErrorBadRequest(
+            ProxyResponseBody::Full(body) => Ok(serde_json::from_slice(&body)?),
+            ProxyResponseBody::Stream(_) => Err(actix_web::error::ErrorBadRequest(
                 "Stream response is not supported",
             )),
         }
@@ -34,8 +34,8 @@ impl Into<Result<HttpResponse, actix_web::Error>> for ProxyResponse {
             actix_web::error::ErrorBadGateway(format!("Invalid status code: {}", e))
         })?;
         match self.body {
-            ProxyResponseType::Full(body) => Ok(HttpResponse::Ok().status(status).body(body)),
-            ProxyResponseType::Stream(body) => Ok(HttpResponse::Ok()
+            ProxyResponseBody::Full(body) => Ok(HttpResponse::Ok().status(status).body(body)),
+            ProxyResponseBody::Stream(body) => Ok(HttpResponse::Ok()
                 .status(status)
                 .content_type("application/octet-stream")
                 .streaming(body)),
@@ -96,7 +96,7 @@ impl LBState {
             });
             Ok(ProxyResponse {
                 status,
-                body: ProxyResponseType::Stream(Box::pin(resp_stream)),
+                body: ProxyResponseBody::Stream(Box::pin(resp_stream)),
             })
         } else {
             let body = resp
@@ -105,7 +105,7 @@ impl LBState {
                 .map_err(|e| actix_web::error::ErrorBadGateway(e))?;
             Ok(ProxyResponse {
                 status,
-                body: ProxyResponseType::Full(body),
+                body: ProxyResponseBody::Full(body),
             })
         }
     }
