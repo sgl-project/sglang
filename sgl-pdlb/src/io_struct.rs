@@ -4,38 +4,16 @@ use serde_json::Value;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
-pub enum InputIds {
-    Single(Vec<i32>),
-    Batch(Vec<Vec<i32>>),
+pub enum SingleOrBatch<T> {
+    Single(T),
+    Batch(Vec<T>),
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum InputText {
-    Single(String),
-    Batch(Vec<String>),
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum BootstrapHost {
-    Single(String),
-    Batch(Vec<String>),
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum BootstrapPort {
-    Single(Option<u16>),
-    Batch(Vec<Option<u16>>),
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum BootstrapRoom {
-    Single(u64),
-    Batch(Vec<u64>),
-}
+pub type InputIds = SingleOrBatch<Vec<i32>>;
+pub type InputText = SingleOrBatch<String>;
+pub type BootstrapHost = SingleOrBatch<String>;
+pub type BootstrapPort = SingleOrBatch<Option<u16>>;
+pub type BootstrapRoom = SingleOrBatch<u64>;
 
 #[typetag::serde(tag = "type")]
 pub trait Bootstrap {
