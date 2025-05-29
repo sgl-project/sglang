@@ -275,7 +275,7 @@ async def handle_generate_request(request_data: dict):
 
 
 @app.post("/v1/chat/completions")
-async def handle_completion_request(request_data: dict):
+async def handle_chat_completion_request(request_data: dict):
     prefill_server, bootstrap_port, decode_server = load_balancer.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
@@ -303,6 +303,38 @@ async def handle_completion_request(request_data: dict):
             prefill_server,
             decode_server,
             endpoint="v1/chat/completions",
+        )
+
+
+@app.post("/v1/completions")
+async def handle_completion_request(request_data: dict):
+    prefill_server, bootstrap_port, decode_server = load_balancer.select_pair()
+
+    # Parse and transform prefill_server for bootstrap data
+    parsed_url = urllib.parse.urlparse(prefill_server)
+    hostname = parsed_url.hostname
+    modified_request = request_data.copy()
+    modified_request.update(
+        {
+            "bootstrap_host": hostname,
+            "bootstrap_port": bootstrap_port,
+            "bootstrap_room": random.randint(0, 2**63 - 1),
+        }
+    )
+
+    if request_data.get("stream", False):
+        return await load_balancer.generate_stream(
+            modified_request,
+            prefill_server,
+            decode_server,
+            endpoint="v1/completions",
+        )
+    else:
+        return await load_balancer.generate(
+            modified_request,
+            prefill_server,
+            decode_server,
+            endpoint="v1/completions",
         )
 
 
