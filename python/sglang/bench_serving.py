@@ -53,8 +53,12 @@ def _get_bool_env_var(name: str, default: str = "false") -> bool:
 def _create_bench_client_session():
     # When the pressure is big, the read buffer could be full before aio thread read
     # the content. We increase the read_bufsize from 64K to 10M.
-    aiohttp_timeout = aiohttp.ClientTimeout(total=6 * 60 * 60)
-    return aiohttp.ClientSession(timeout=aiohttp_timeout, read_bufsize=10 * 1024**2)
+    # Define constants for timeout and buffer size for clarity and maintainability
+    BENCH_AIOHTTP_TIMEOUT_SECONDS = 6 * 60 * 60  # 6 hours
+    BENCH_AIOHTTP_READ_BUFSIZE_BYTES = 10 * 1024**2  # 10 MB
+
+    aiohttp_timeout = aiohttp.ClientTimeout(total=BENCH_AIOHTTP_TIMEOUT_SECONDS)
+    return aiohttp.ClientSession(timeout=aiohttp_timeout, read_bufsize=BENCH_AIOHTTP_READ_BUFSIZE_BYTES)
 
 
 @dataclass
