@@ -222,7 +222,11 @@ class DeepseekV2MoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
-        self.num_fused_shared_experts = 0 if global_server_args_dict["disable_shared_experts_fusion"] else config.n_shared_experts
+        self.num_fused_shared_experts = (
+            0
+            if global_server_args_dict["disable_shared_experts_fusion"]
+            else config.n_shared_experts
+        )
         self.config = config
         self.layer_id = layer_id
 
@@ -1665,7 +1669,11 @@ class DeepseekV2ForCausalLM(nn.Module):
     def determine_num_fused_shared_experts(
         self, architecture: str = "DeepseekV3ForCausalLM"
     ):
-        self.num_fused_shared_experts = 0 if global_server_args_dict["disable_shared_experts_fusion"] else self.config.n_shared_experts
+        self.num_fused_shared_experts = (
+            0
+            if global_server_args_dict["disable_shared_experts_fusion"]
+            else self.config.n_shared_experts
+        )
         if self.num_fused_shared_experts > 0:
             # Only Deepseek V3/R1 can use shared experts fusion optimization now.
             if (
@@ -1926,8 +1934,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                             f"{self.config.n_routed_experts + 0}"
                             f".{suffix}",
                             weights_dict[shared_expert_weight_name],
-                            )
                         )
+                    )
                     names_to_remove += [shared_expert_weight_name]
             weights = [w for w in weights_list if w[0] not in names_to_remove]
 
