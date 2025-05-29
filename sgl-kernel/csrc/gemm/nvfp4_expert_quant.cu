@@ -38,7 +38,9 @@ constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  // PTX instructions used here requires sm100a.
+#if CUDA_VERSION >= 12080
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && __CUDA_ARCH_HAS_FEATURE__(SM100_ALL)
   uint32_t val;
   asm volatile(
       "{\n"
@@ -53,17 +55,26 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
       "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
       "}"
       : "=r"(val)
-      : "f"(array[0]), "f"(array[1]), "f"(array[2]), "f"(array[3]),
-        "f"(array[4]), "f"(array[5]), "f"(array[6]), "f"(array[7]));
+      : "f"(array[0]),
+        "f"(array[1]),
+        "f"(array[2]),
+        "f"(array[3]),
+        "f"(array[4]),
+        "f"(array[5]),
+        "f"(array[6]),
+        "f"(array[7]));
   return val;
 #else
   return 0;
+#endif
 #endif
 }
 
 // Convert 4 float2 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  // PTX instructions used here requires sm100a.
+#if CUDA_VERSION >= 12080
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && __CUDA_ARCH_HAS_FEATURE__(SM100_ALL)
   uint32_t val;
   asm volatile(
       "{\n"
@@ -78,11 +89,18 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
       "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
       "}"
       : "=r"(val)
-      : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y),
-        "f"(array[2].x), "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
+      : "f"(array[0].x),
+        "f"(array[0].y),
+        "f"(array[1].x),
+        "f"(array[1].y),
+        "f"(array[2].x),
+        "f"(array[2].y),
+        "f"(array[3].x),
+        "f"(array[3].y));
   return val;
 #else
   return 0;
+#endif
 #endif
 }
 
@@ -331,7 +349,7 @@ void quant_impl(void* output, void* output_scale, void* input,
   CHECK_TH_CUDA(x, m);    \
   CHECK_CONTIGUOUS(x, m);
 
-constexpr auto FP8 = at::ScalarType::Float8_e4m3fn;
+// constexpr auto FP8 = at::ScalarType::Float8_e4m3fn;
 constexpr auto HALF = at::ScalarType::Half;
 constexpr auto BF16 = at::ScalarType::BFloat16;
 constexpr auto FLOAT = at::ScalarType::Float;

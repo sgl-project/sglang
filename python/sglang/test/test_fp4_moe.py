@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import pytest
 import torch
-
-from sgl_kernel import scaled_fp4_experts_quant
-from sgl_kernel.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
+from sgl_kernel import scaled_fp4_quant
+from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.activation import SiluAndMul
 
@@ -14,6 +13,8 @@ if torch.cuda.get_device_capability() < (10, 0):
 kE2M1ToFloat = torch.tensor([0., 0.5, 1., 1.5, 2., 3., 4., 6.],
                             dtype=torch.float32)
 
+FLOAT8_E4M3_MAX = 448.0
+FLOAT4_E2M1_MAX = 6.0
 
 def convert_swizzled_to_linear(a_sf_swizzled: torch.Tensor, m, k, block_size):
     m_tiles = (m + 128 - 1) // 128
@@ -109,10 +110,6 @@ def torch_moe(a, w1, w2, score, topk, expert_map):
 @torch.inference_mode()
 def test_cutlass_fp4_moe_no_graph(m: int, n: int, k: int, e: int, topk: int,
                                   dtype: torch.dtype):
-    current_platform.seed_everything(7)
-    with set_current_vllm_config(
-            VllmConfig(parallel_config=ParallelConfig(
-                pipeline_parallel_size=1))):
 
         a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
         w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
@@ -144,10 +141,10 @@ def test_cutlass_fp4_moe_no_graph(m: int, n: int, k: int, e: int, topk: int,
             w1_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
             w2_gs[expert] = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
 
-            w1_q[expert], w1_blockscale[expert] = ops.scaled_fp4_quant(
+            w1_q[expert], w1_blockscale[expert] = scaled_fp4_quant(
                 w1[expert], w1_gs[expert])
 
-            w2_q[expert], w2_blockscale[expert] = ops.scaled_fp4_quant(
+            w2_q[expert], w2_blockscale[expert] = scaled_fp4_quant(
                 w2[expert], w2_gs[expert])
 
         score = torch.randn((m, e), device="cuda", dtype=dtype)
@@ -184,7 +181,7 @@ def test_cutlass_fp4_moe_no_graph(m: int, n: int, k: int, e: int, topk: int,
         # Reference check:
         a_global_scale = ((FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) /
                           torch.amax(a.flatten(), dim=-1)).to(torch.float32)
-        a_fp4, a_scale_interleaved = ops.scaled_fp4_quant(a, a_global_scale)
+        a_fp4, a_scale_interleaved = scaled_fp4_quant(a, a_global_scale)
         _, m_k = a_fp4.shape
         a_in_dtype = dequantize_nvfp4_to_dtype(a_fp4,
                                                a_scale_interleaved,

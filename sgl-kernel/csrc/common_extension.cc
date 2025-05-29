@@ -140,6 +140,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor output_scale_offset_by_experts) -> ()");
   m.impl("scaled_fp4_experts_quant", torch::kCUDA, &scaled_fp4_experts_quant);
 
+  m.def(
+      "cutlass_fp4_group_mm(Tensor! output, Tensor a, Tensor b,"
+      "Tensor a_blockscale, Tensor b_blockscale, Tensor alphas,"
+      "Tensor problem_sizes, Tensor expert_offsets, Tensor sf_offsets) -> ()");
+  m.impl("cutlass_fp4_group_mm", torch::kCUDA, &cutlass_fp4_group_mm);
+
   /*
    * From csrc/moe
    */
