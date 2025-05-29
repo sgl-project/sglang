@@ -53,13 +53,13 @@ pub trait Bootstrap {
         if let Some(batch_size) = batch_size {
             self.set_bootstrap_info(
                 BootstrapHost::Batch(vec![prefill_info.get_hostname(); batch_size]),
-                BootstrapPort::Batch(vec![prefill_info.boostrap_port; batch_size]),
+                BootstrapPort::Batch(vec![prefill_info.bootstrap_port; batch_size]),
                 BootstrapRoom::Batch((0..batch_size).map(|_| rand::random::<u64>()).collect()),
             );
         } else {
             self.set_bootstrap_info(
                 BootstrapHost::Single(prefill_info.get_hostname()),
-                BootstrapPort::Single(prefill_info.boostrap_port),
+                BootstrapPort::Single(prefill_info.bootstrap_port),
                 BootstrapRoom::Single(rand::random::<u64>()),
             );
         }

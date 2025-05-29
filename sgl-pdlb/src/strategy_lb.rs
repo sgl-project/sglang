@@ -11,15 +11,15 @@ pub enum EngineType {
 pub struct EngineInfo {
     pub engine_type: EngineType,
     pub url: String,
-    pub boostrap_port: Option<u16>,
+    pub bootstrap_port: Option<u16>,
 }
 
 impl EngineInfo {
-    pub fn new_prefill(url: String, boostrap_port: Option<u16>) -> Self {
+    pub fn new_prefill(url: String, bootstrap_port: Option<u16>) -> Self {
         EngineInfo {
             engine_type: EngineType::Prefill,
             url,
-            boostrap_port,
+            bootstrap_port,
         }
     }
 
@@ -27,7 +27,7 @@ impl EngineInfo {
         EngineInfo {
             engine_type: EngineType::Decode,
             url,
-            boostrap_port: None,
+            bootstrap_port: None,
         }
     }
 
