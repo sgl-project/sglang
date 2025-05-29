@@ -1355,7 +1355,7 @@ class ServerArgs:
             "--deepep-config",
             type=str,
             default=ServerArgs.deepep_config,
-            help="Tuned DeepEP config suitable for your own cluster.",
+            help="Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.",
         )
 
         parser.add_argument(
