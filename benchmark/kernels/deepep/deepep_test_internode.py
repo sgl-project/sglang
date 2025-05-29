@@ -251,11 +251,14 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 def test_loop(local_rank: int, num_local_ranks: int):
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    test_ll_compatibility = False
+    if test_ll_compatibility:
+        ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
     num_sms = 24
-    num_qps_per_rank = num_sms // 2
+    num_qps_per_rank = max(num_sms // 2, ll_num_experts // num_ranks if test_ll_compatibility else 0)
 
-    buffer = deep_ep.Buffer(group, int(1e9), int(1e9), low_latency_mode=False,
+    buffer = deep_ep.Buffer(group, int(1e9), int(1e9), low_latency_mode=test_ll_compatibility,
                             num_qps_per_rank=num_qps_per_rank)
     assert num_local_ranks == 8 and num_ranks > 8
     torch.manual_seed(rank)
@@ -264,6 +267,12 @@ def test_loop(local_rank: int, num_local_ranks: int):
         test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group)
         if local_rank == 0:
             print('', flush=True)
+
+    # Test compatibility with low latency functions
+    if test_ll_compatibility:
+        buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
+        test_low_latency.test_main(ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk, rank, num_ranks, group,
+                                   buffer, seed=1)
 
 
 if __name__ == '__main__':
