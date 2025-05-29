@@ -1,4 +1,5 @@
 import os
+from curses import flash
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -126,10 +127,19 @@ def cutlass_block_fp8_supported() -> bool:
 
 
 CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
+ENABLE_FLASHINFER_GEMM = (
+    get_bool_env_var("SGLANG_ENABLE_FLASHINFER_GEMM")
+    and is_sm100_supported()
+    and is_flashinfer_available()
+)
+if ENABLE_FLASHINFER_GEMM:
+    from flashinfer.gemm import gemm_fp8_nt_groupwise
 
 
 def dispatch_w8a8_block_fp8_linear() -> Callable:
-    if CUTLASS_BLOCK_FP8_SUPPORTED:
+    if ENABLE_FLASHINFER_GEMM:
+        return flashinfer_gemm_w8a8_block_fp8_linear
+    elif CUTLASS_BLOCK_FP8_SUPPORTED:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _is_hip and use_aiter_moe:
         return aiter_w8a8_block_fp8_linear
@@ -137,6 +147,35 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
     else:
         return triton_w8a8_block_fp8_linear
+
+
+def flashinfer_gemm_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    assert input_scale is None
+
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    q_input, x_scale = sglang_per_token_group_quant_fp8(
+        input_2d, block_size[1], column_major_scales=False
+    )
+    x_scale_input = x_scale.T.contiguous()
+    weight_scale_input = weight_scale.T.contiguous()
+
+    output = gemm_fp8_nt_groupwise(
+        q_input, weight, x_scale_input, weight_scale_input, out_dtype=input_2d.dtype
+    )
+
+    if bias is not None:
+        output += bias
+
+    return output.to(dtype=input_2d.dtype).view(*output_shape)
 
 
 def cutlass_w8a8_block_fp8_linear_with_fallback(
