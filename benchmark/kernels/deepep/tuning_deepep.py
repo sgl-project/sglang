@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import time
+from copy import deepcopy
 from pathlib import Path
 
 # noinspection PyUnresolvedReferences
@@ -322,6 +323,7 @@ def test_main(
                         num_sms,
                         nvl_chunk_size,
                         rdma_chunk_size,
+                        config_kwargs,
                     )
                 if local_rank == 0:
                     print(
@@ -336,13 +338,7 @@ def test_main(
             print("", flush=True)
             is_fp8 = isinstance(current_x, tuple)
             if is_fp8:
-                output_data["normal_dispatch"] = {
-                    "num_sms": TODO,
-                    "num_max_nvl_chunked_send_tokens": TODO,
-                    "num_max_nvl_chunked_recv_tokens": TODO,
-                    "num_max_rdma_chunked_send_tokens": TODO,
-                    "num_max_rdma_chunked_recv_tokens": TODO,
-                },
+                output_data["normal_dispatch"] = deepcopy(best_results[3])
 
         if isinstance(current_x, tuple):
             # Gather FP8 the best config from rank 0
@@ -401,6 +397,7 @@ def test_main(
                         num_sms,
                         nvl_chunk_size,
                         rdma_chunk_size,
+                        config_kwargs,
                     )
 
     if local_rank == 0:
@@ -409,7 +406,7 @@ def test_main(
             flush=True,
         )
         print("", flush=True)
-        output_data["normal_combine"] = TODO
+        output_data["normal_combine"] = deepcopy(best_results[3])
 
     if rank == 0 and local_rank == 0:
         _write_output(args, output_data)
