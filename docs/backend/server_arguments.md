@@ -134,6 +134,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `download_dir` | Overrides the default Hugging Face cache directory for model weights. | None |
 | `base_gpu_id` | Sets the first GPU to use when distributing the model across multiple GPUs. | `0` |
 | `allow_auto_truncate`| Automatically truncate requests that exceed the maximum input length. | `False` |
+| `enable_return_hidden_states` | Enables returning hidden states to the user. | `False` |
 
 ## Logging
 
