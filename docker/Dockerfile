@@ -1,6 +1,6 @@
-ARG CUDA_VERSION=12.4.1
+ARG CUDA_VERSION=12.6.3
 
-FROM nvcr.io/nvidia/tritonserver:25.03-py3-min
+FROM nvcr.io/nvidia/tritonserver:24.12-py3-min
 
 ARG BUILD_TYPE=all
 ENV DEBIAN_FRONTEND=noninteractive
@@ -31,6 +31,8 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && if [ "$CUDA_VERSION" = "12.1.1" ]; then \
          export CUINDEX=121; \
        elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
+         export CUINDEX=124; \
+       elif [ "$CUDA_VERSION" = "12.6.3" ]; then \
          export CUINDEX=124; \
        elif [ "$CUDA_VERSION" = "12.8.1" ]; then \
          export CUINDEX=124; \
