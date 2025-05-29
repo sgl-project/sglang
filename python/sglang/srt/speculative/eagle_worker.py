@@ -26,11 +26,15 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
+from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+    EAGLEDraftExtendCudaGraphRunner,
+)
 from sglang.srt.speculative.eagle_utils import (
     EagleDraftInput,
     EagleVerifyInput,
     EagleVerifyOutput,
     assign_draft_cache_locs,
+    generate_token_bitmask,
     select_top_k_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -175,6 +179,7 @@ class EAGLEWorker(TpModelWorker):
             self.has_prefill_wrapper_verify = True
         elif self.server_args.attention_backend == "triton":
             from sglang.srt.layers.attention.triton_backend import (
+                TritonAttnBackend,
                 TritonMultiStepDraftBackend,
             )
 
@@ -183,15 +188,35 @@ class EAGLEWorker(TpModelWorker):
                 self.topk,
                 self.speculative_num_steps,
             )
-            self.draft_extend_attn_backend = None
+            self.draft_extend_attn_backend = TritonAttnBackend(
+                self.draft_model_runner,
+                skip_prefill=False,
+            )
             self.padded_static_len = self.speculative_num_steps + 1
             self.has_prefill_wrapper_verify = False
         elif self.server_args.attention_backend == "fa3":
             from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
                 FlashAttentionMultiStepBackend,
             )
 
             self.draft_attn_backend = FlashAttentionMultiStepBackend(
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            self.draft_extend_attn_backend = FlashAttentionBackend(
+                self.draft_model_runner,
+                skip_prefill=False,
+            )
+            self.padded_static_len = self.speculative_num_steps + 1
+            self.has_prefill_wrapper_verify = False
+        elif self.server_args.attention_backend == "flashmla":
+            from sglang.srt.layers.attention.flashmla_backend import (
+                FlashMLAMultiStepDraftBackend,
+            )
+
+            self.draft_attn_backend = FlashMLAMultiStepDraftBackend(
                 self.draft_model_runner,
                 self.topk,
                 self.speculative_num_steps,
@@ -215,7 +240,7 @@ class EAGLEWorker(TpModelWorker):
             return
 
         # Capture draft
-        tic = time.time()
+        tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
@@ -223,12 +248,23 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture draft cuda graph end. Time elapsed: {time.time() - tic:.2f} s. avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
+            f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
         )
 
         # Capture extend
         if self.draft_extend_attn_backend:
-            raise NotImplementedError()
+            tic = time.perf_counter()
+            before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            logger.info(
+                f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            )
+            self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
+                self
+            )
+            after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            logger.info(
+                f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
+            )
 
     @property
     def draft_model_runner(self):
@@ -479,11 +515,41 @@ class EAGLEWorker(TpModelWorker):
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = spec_info
         model_worker_batch = batch.get_model_worker_batch()
+
+        if batch.has_grammar:
+            retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
+            retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
+            draft_tokens_cpu = spec_info.draft_token.view(
+                spec_info.retrive_next_token.shape
+            ).cpu()
+
+        # Forward
         logits_output, _, can_run_cuda_graph = (
             self.target_worker.forward_batch_generation(
                 model_worker_batch, skip_sample=True
             )
         )
+
+        vocab_mask = None
+        if batch.has_grammar:
+            # Generate the logit mask for structured output.
+            # Overlap the CPU operations for bitmask generation with the forward pass.
+            vocab_mask = generate_token_bitmask(
+                batch.reqs,
+                spec_info,
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+                batch.sampling_info.vocab_size,
+            )
+
+            if vocab_mask is not None:
+                assert spec_info.grammar is not None
+                vocab_mask = vocab_mask.to(spec_info.retrive_next_token.device)
+                # otherwise, this vocab mask will be the one from the previous extend stage
+                # and will be applied to produce wrong results
+                batch.sampling_info.vocab_mask = None
+
         self._detect_nan_if_needed(logits_output)
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(
@@ -491,6 +557,7 @@ class EAGLEWorker(TpModelWorker):
             logits_output,
             self.token_to_kv_pool_allocator,
             self.page_size,
+            vocab_mask,
         )
 
         # Post process based on verified outputs.
@@ -611,6 +678,7 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info.prepare_extend_after_decode(
             batch,
             self.speculative_num_steps,
+            pad_input=self.cuda_graph_runner_for_draft_extend is not None,
         )
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         batch.return_logprob = False
@@ -620,7 +688,19 @@ class EAGLEWorker(TpModelWorker):
         )
 
         # Run
-        logits_output, _ = self.draft_model_runner.forward(forward_batch)
+        can_cuda_graph = (
+            self.cuda_graph_runner_for_draft_extend
+            and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
+        )
+        if can_cuda_graph:
+            logits_output = self.cuda_graph_runner_for_draft_extend.replay(
+                forward_batch
+            )
+        else:
+            self.draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+            logits_output = self.draft_model_runner.model.forward(
+                forward_batch.input_ids, forward_batch.positions, forward_batch
+            )
 
         self._detect_nan_if_needed(logits_output)
         self.capture_for_decode(logits_output, forward_batch.spec_info)

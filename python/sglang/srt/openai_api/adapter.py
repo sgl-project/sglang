@@ -40,7 +40,7 @@ from sglang.srt.conversation import (
     get_conv_template_by_model_path,
     register_conv_template,
 )
-from sglang.srt.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.openai_api.protocol import (
     BatchRequest,
@@ -980,7 +980,7 @@ def v1_chat_generate_request(
         #  - image_data: None or a list of image strings (URLs or base64 strings).
         #  - audio_data: None or a list of audio strings (URLs).
         #    None skips any image processing in GenerateReqInput.
-        strict_tag = None
+        tool_call_constraint = None
         prompt = ""
         prompt_ids = []
         if not isinstance(request.messages, str):
@@ -999,7 +999,9 @@ def v1_chat_generate_request(
 
                 tool_call_parser = tokenizer_manager.server_args.tool_call_parser
                 parser = FunctionCallParser(request.tools, tool_call_parser)
-                strict_tag = parser.get_structure_tag()
+                tool_call_constraint = parser.get_structure_constraint(
+                    request.tool_choice
+                )
 
             if chat_template_name is None:
                 openai_compatible_messages = []
@@ -1166,20 +1168,24 @@ def v1_chat_generate_request(
                 request.response_format.model_dump(by_alias=True)
             )
 
-        if strict_tag is not None:
-            if (
-                sampling_params.get("regex")
-                or sampling_params.get("ebnf")
-                or sampling_params.get("structural_tag")
-                or sampling_params.get("json_schema")
-            ):
-                logger.warning(
-                    "Constrained decoding is not compatible with tool calls."
+        # Check if there are already existing output constraints
+        has_existing_constraints = (
+            sampling_params.get("regex")
+            or sampling_params.get("ebnf")
+            or sampling_params.get("structural_tag")
+            or sampling_params.get("json_schema")
+        )
+
+        if tool_call_constraint and has_existing_constraints:
+            logger.warning("Constrained decoding is not compatible with tool calls.")
+        elif tool_call_constraint:
+            constraint_type, constraint_value = tool_call_constraint
+            if constraint_type == "structural_tag":
+                sampling_params[constraint_type] = convert_json_schema_to_str(
+                    constraint_value.model_dump(by_alias=True)
                 )
             else:
-                sampling_params["structural_tag"] = convert_json_schema_to_str(
-                    strict_tag.model_dump(by_alias=True)
-                )
+                sampling_params[constraint_type] = constraint_value
 
         sampling_params_list.append(sampling_params)
 
@@ -1203,6 +1209,7 @@ def v1_chat_generate_request(
         top_logprobs_nums = top_logprobs_nums[0]
         modalities_list = modalities_list[0]
         lora_paths = lora_paths[0]
+        request_ids = request_ids[0]
     else:
         if tokenizer_manager.model_config.is_multimodal:
             # processor will need text input
@@ -1330,7 +1337,6 @@ def v1_chat_generate_response(
                     tool_calls = [
                         ToolCall(
                             id=f"call_{base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b'=').decode()}",
-                            index=call_info.tool_index,
                             function=FunctionResponse(
                                 name=call_info.name, arguments=call_info.parameters
                             ),
@@ -1439,7 +1445,9 @@ async def v1_chat_completions(
         return create_error_response("Invalid request body, error: ", str(e))
     all_requests = [ChatCompletionRequest(**request_json)]
     created = int(time.time())
-    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
+    adapted_request, request = v1_chat_generate_request(
+        all_requests, tokenizer_manager, request_ids=[all_requests[0].rid]
+    )
 
     if adapted_request.stream:
         parser_dict = {}
@@ -1619,14 +1627,14 @@ async def v1_chat_completions(
                                     latest_delta_len = len(call_item.parameters)
 
                                 expected_call = json.dumps(
-                                    parser.multi_format_parser.detectors[0]
-                                    .prev_tool_call_arr[index]
-                                    .get("arguments", {}),
+                                    parser.detector.prev_tool_call_arr[index].get(
+                                        "arguments", {}
+                                    ),
                                     ensure_ascii=False,
                                 )
-                                actual_call = parser.multi_format_parser.detectors[
-                                    0
-                                ].streamed_args_for_tool[index]
+                                actual_call = parser.detector.streamed_args_for_tool[
+                                    index
+                                ]
                                 if latest_delta_len > 0:
                                     actual_call = actual_call[:-latest_delta_len]
                                 remaining_call = expected_call.replace(
@@ -1822,6 +1830,7 @@ def v1_embedding_request(all_requests, tokenizer_manager):
                 prompt_kwargs = {"text": generate_prompts, "image_data": images}
         else:
             prompt_kwargs = {"input_ids": prompt}
+        request_ids = all_requests[0].rid
     else:
         if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
             prompt_kwargs = {"text": prompts}
@@ -1834,8 +1843,10 @@ def v1_embedding_request(all_requests, tokenizer_manager):
             )
         else:
             prompt_kwargs = {"input_ids": prompts}
+        request_ids = [req.rid for req in all_requests]
 
     adapted_request = EmbeddingReqInput(
+        rid=request_ids,
         **prompt_kwargs,
     )
 
