@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 import logging
-from datetime import timedelta
 from typing import Dict, List, Tuple
 
 import torch
@@ -27,21 +26,30 @@ from sglang.srt.managers.expert_location import (
 logger = logging.getLogger(__name__)
 
 
-def update_expert_location(
-    routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
-    new_expert_location_metadata: ExpertLocationMetadata,
-    nnodes: int,
-    rank: int,
-):
-    old_expert_location_metadata = get_global_expert_location_metadata()
-    _update_expert_weights(
-        routed_experts_weights_of_layer,
-        old_expert_location_metadata,
-        new_expert_location_metadata,
-        nnodes,
-        rank,
-    )
-    old_expert_location_metadata.update(new_expert_location_metadata)
+class ExpertLocationUpdater:
+    def __init__(self):
+        self._first_execution = True
+
+    def update(
+        self,
+        routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
+        new_expert_location_metadata: ExpertLocationMetadata,
+        nnodes: int,
+        rank: int,
+    ):
+        if self._first_execution:
+            self._first_execution = False
+            torch.cuda.empty_cache()
+
+        old_expert_location_metadata = get_global_expert_location_metadata()
+        _update_expert_weights(
+            routed_experts_weights_of_layer,
+            old_expert_location_metadata,
+            new_expert_location_metadata,
+            nnodes,
+            rank,
+        )
+        old_expert_location_metadata.update(new_expert_location_metadata)
 
 
 def _update_expert_weights(
@@ -339,14 +347,8 @@ def update_expert_weights_single_layer(
             return
 
         reqs = torch.distributed.batch_isend_irecv(p2p_ops)
-        try:
-            for req in reqs:
-                req.wait(timeout=timedelta(seconds=30))
-        except RuntimeError:
-            logger.error(
-                f"Context: {rank=} {old_physical_to_logical_map=} {new_physical_to_logical_map=} {num_local_physical_experts=} {num_gpu_per_node=}"
-            )
-            raise
+        for req in reqs:
+            req.wait()
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (
