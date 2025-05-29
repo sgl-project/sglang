@@ -66,15 +66,11 @@ impl GenerateReqInput {
                 "Both text and input_ids are present in the request".to_string(),
             ));
         }
-        if let Some(text) = &self.text {
-            if let InputText::Batch(texts) = text {
-                return Ok(Some(texts.len()));
-            }
+        if let Some(InputText::Batch(texts)) = &self.text {
+            return Ok(Some(texts.len()));
         }
-        if let Some(input_ids) = &self.input_ids {
-            if let InputIds::Batch(ids) = input_ids {
-                return Ok(Some(ids.len()));
-            }
+        if let Some(InputIds::Batch(ids)) = &self.input_ids {
+            return Ok(Some(ids.len()));
         }
         Ok(None)
     }
