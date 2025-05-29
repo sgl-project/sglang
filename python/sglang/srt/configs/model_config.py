@@ -116,6 +116,10 @@ class ModelConfig:
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
+        self.is_multimodal_chunked_prefill_supported = (
+            enable_multimodal
+            and is_multimodal_chunked_prefill_supported(self.hf_config.architectures)
+        )
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -192,6 +196,22 @@ class ModelConfig:
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
         else:
+            if (
+                "MistralModel" in self.hf_config.architectures
+                or "MixtralForCausalLM" in self.hf_config.architectures
+                or "MistralForCausalLM" in self.hf_config.architectures
+            ):
+                if getattr(self, "head_dim", None) is None:
+                    self.head_dim = (
+                        self.hf_config.hidden_size // self.hf_config.num_attention_heads
+                    )
+                    # In transformers==4.52.3, the head_dim is null in MistralConfig
+                    if (
+                        not hasattr(self.hf_text_config, "head_dim")
+                        or self.hf_text_config.head_dim is None
+                    ):
+                        setattr(self.hf_text_config, "head_dim", self.head_dim)
+
             self.attention_arch = AttentionArch.MHA
 
         self.num_attention_heads = self.hf_text_config.num_attention_heads
@@ -345,6 +365,7 @@ class ModelConfig:
             "w8a8_int8",
             "w8a8_fp8",
             "moe_wna16",
+            "qoq",
         ]
         compatible_quantization_methods = {
             "modelopt_fp4": ["modelopt"],
@@ -454,6 +475,8 @@ def _get_and_verify_dtype(
     # NOTE: getattr(config, "torch_dtype", torch.float32) is not correct
     # because config.torch_dtype can be None.
     config_dtype = getattr(config, "torch_dtype", None)
+    if isinstance(config_dtype, str):
+        config_dtype = _STR_DTYPE_TO_TORCH_DTYPE.get(config_dtype, None)
     if config_dtype is None:
         config_dtype = torch.float32
 
@@ -545,6 +568,7 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
+    "Phi4MMForCausalLM",
 ]
 
 
@@ -572,6 +596,21 @@ def is_audio_model(model_architectures: List[str]):
 
 def is_encoder_decoder_model(model_architectures: List[str]):
     return "MllamaForConditionalGeneration" in model_architectures
+
+
+def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
+    """Check if chunked prefill is supported for a MultiModal model."""
+    unsupported = [
+        "Grok1VForCausalLM",
+        "Grok1AForCausalLM",
+        "LlavaLlamaForCausalLM",
+        "MllamaForConditionalGeneration",
+        "CLIPModel",
+    ]
+    if any(multi_model_arch in unsupported for multi_model_arch in model_architectures):
+        return False
+    else:
+        return True
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
