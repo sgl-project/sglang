@@ -454,6 +454,7 @@ class DeepseekV2MoE(nn.Module):
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
+                num_token_non_padded=state.forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -526,9 +527,13 @@ class DeepseekV2MoE(nn.Module):
 
     def op_output(self, state):
         final_hidden_states = state.pop("hidden_states_after_combine")
-        final_hidden_states *= self.routed_scaling_factor
-        if (s := state.pop("shared_output")) is not None:
-            final_hidden_states = final_hidden_states + s
+
+        if (shared_output := state.pop("shared_output")) is not None:
+            x = shared_output
+            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = x
+        else:
+            final_hidden_states *= self.routed_scaling_factor
 
         state.hidden_states_mlp_output = final_hidden_states
 

@@ -571,7 +571,7 @@ class Fp8MoEMethod:
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
             if (
-                get_bool_env_var("CUTLASS_MOE")
+                get_bool_env_var("SGLANG_CUTLASS_MOE")
                 and self.cutlass_fp8_supported
                 and is_sm100_supported()
             ):
@@ -973,7 +973,7 @@ class Fp8MoEMethod:
                 return ret
 
         if (
-            get_bool_env_var("CUTLASS_MOE")
+            get_bool_env_var("SGLANG_CUTLASS_MOE")
             and self.cutlass_fp8_supported
             and self.block_quant
             and is_sm100_supported()

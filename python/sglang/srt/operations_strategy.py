@@ -127,9 +127,9 @@ def _compute_moe_deepseek_blog_decode(layer):
             layer.mlp.op_combine_a,
             operations.YieldOperation(),
             layer.mlp.op_combine_b,
+            operations.YieldOperation(),
             layer.mlp.op_output,
             layer.op_comm_postprocess_layer,
-            operations.YieldOperation(),
         ],
     )
 
