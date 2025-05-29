@@ -1,6 +1,5 @@
 import argparse
 import json
-import os
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -421,8 +420,8 @@ def _write_output(args, output_data):
 
 # noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int, args):
-    num_nodes = int(os.getenv("WORLD_SIZE", 1))
-    rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    num_nodes = args.nnodes
+    rank, num_ranks, group = init_dist(local_rank, num_local_ranks, args)
 
     num_sms = args.num_sms
     num_qps_per_rank = num_sms // 2
@@ -449,6 +448,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-sms", type=int, default=24)
     parser.add_argument("--output-path", type=str, default="deepep_tuned.json")
+    parser.add_argument("--nnodes", type=int, default=1)
+    parser.add_argument("--node-rank", type=int, default=0)
+    parser.add_argument("--master-addr", type=str, default="127.0.0.1")
+    parser.add_argument("--master-port", type=int, default=8361)
     args = parser.parse_args()
 
     num_processes = 8

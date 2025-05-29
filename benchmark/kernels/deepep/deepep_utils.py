@@ -9,12 +9,12 @@ import torch
 import torch.distributed as dist
 
 
-def init_dist(local_rank: int, num_local_ranks: int):
+def init_dist(local_rank: int, num_local_ranks: int, args):
     # NOTES: you may rewrite this function with your own cluster settings
-    ip = os.getenv("MASTER_ADDR", "127.0.0.1")
-    port = int(os.getenv("MASTER_PORT", "8361"))
-    num_nodes = int(os.getenv("WORLD_SIZE", 1))
-    node_rank = int(os.getenv("RANK", 0))
+    ip = args.master_addr
+    port = args.master_port
+    num_nodes = args.nnodes
+    node_rank = args.node_rank
     assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
 
     dist.init_process_group(
