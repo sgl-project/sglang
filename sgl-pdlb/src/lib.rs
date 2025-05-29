@@ -1,9 +1,11 @@
 pub mod io_struct;
+pub mod lb_state;
 pub mod server;
 pub mod strategy_lb;
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 
-use server::{LBConfig, LBState, periodic_logging, startup};
+use lb_state::{LBConfig, LBState};
+use server::{periodic_logging, startup};
 use tokio::signal;
 
 #[pyclass]
