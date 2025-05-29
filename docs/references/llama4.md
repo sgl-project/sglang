@@ -19,6 +19,7 @@ python3 -m sglang.launch_server --model-path meta-llama/Llama-4-Scout-17B-16E-In
 - **OOM Mitigation**: Adjust `--context-length` to avoid a GPU out-of-memory issue. For the Scout model, we recommend setting this value up to 1M on 8\*H100 and up to 2.5M on 8\*H200. For the Maverick model, we don't need to set context length on 8\*H200.
 
 - **Chat Template**: Add `--chat-template llama-4` for chat completion tasks.
+- **Enable Multi-Modal**: Add `--enable-multimodal` for multi-modal capabilities.
 
 ## Benchmarking Results
 

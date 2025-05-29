@@ -323,7 +323,7 @@ void extend_attention_kernel_impl(
             /* ld_src */ v_strideN,
             /* ld_dst */ head_size_v);
 
-        // caculate V' <- s_delta @ V + V'
+        // calculate V' <- s_delta @ V + V'
         at::native::cpublas::brgemm(
             /* M     */ m_size,
             /* N     */ head_size_v,
@@ -434,7 +434,7 @@ void extend_attention_kernel_impl(
             /* ld_src */ ve_strideN,
             /* ld_dst */ head_size_v);
 
-        // caculate V' <- s_delta @ V + V'
+        // calculate V' <- s_delta @ V + V'
         at::native::cpublas::brgemm(
             /* M     */ m_size,
             /* N     */ head_size_v,
