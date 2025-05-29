@@ -1,5 +1,5 @@
 use crate::io_struct::{Bootstrap, ChatReqInput, GenerateReqInput};
-use crate::strategy_lb::{EngineInfo, EngineLoad, EngineType, StrategyLB};
+use crate::strategy_lb::{EngineInfo, EngineLoad, EngineType, LBPolicy, StrategyLB};
 use actix_web::{HttpRequest, HttpResponse, HttpServer, get, post, web};
 use bytes::Bytes;
 use futures::{Stream, StreamExt, future::join_all};
@@ -55,12 +55,22 @@ impl LBState {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(lb_config.timeout))
             .build()?;
-
-        let lb = StrategyLB::new(
-            lb_config.policy,
-            lb_config.prefill_infos,
-            lb_config.decode_infos,
-        );
+        let policy = match lb_config.policy.as_str() {
+            "random" => LBPolicy::Random,
+            "po2" => LBPolicy::PowerOfTwo,
+            _ => anyhow::bail!("Invalid policy"),
+        };
+        let prefill_servers = lb_config
+            .prefill_infos
+            .into_iter()
+            .map(|(url, port)| EngineInfo::new_prefill(url, port))
+            .collect();
+        let decode_servers = lb_config
+            .decode_infos
+            .into_iter()
+            .map(|url| EngineInfo::new_decode(url))
+            .collect();
+        let lb = StrategyLB::new(policy, prefill_servers, decode_servers);
         Ok(Self {
             strategy_lb: lb,
             client,

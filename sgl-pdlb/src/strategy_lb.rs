@@ -95,26 +95,14 @@ pub struct StrategyLB {
 
 impl StrategyLB {
     pub fn new(
-        policy: String,
-        prefill_infos: Vec<(String, Option<u16>)>,
-        decode_infos: Vec<String>,
+        policy: LBPolicy,
+        prefill_servers: Vec<EngineInfo>,
+        decode_servers: Vec<EngineInfo>,
     ) -> Self {
-        let policy = match policy.as_str() {
-            "random" => LBPolicy::Random,
-            "po2" => LBPolicy::PowerOfTwo,
-            _ => panic!("Invalid policy"),
-        };
-
         StrategyLB {
             policy,
-            prefill_servers: prefill_infos
-                .into_iter()
-                .map(|(url, port)| EngineInfo::new_prefill(url, port))
-                .collect(),
-            decode_servers: decode_infos
-                .into_iter()
-                .map(|url| EngineInfo::new_decode(url))
-                .collect(),
+            prefill_servers,
+            decode_servers,
         }
     }
 
