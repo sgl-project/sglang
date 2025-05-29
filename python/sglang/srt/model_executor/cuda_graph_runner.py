@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 import torch
 import tqdm
 
+from sglang.srt import two_batch_overlap
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
@@ -38,6 +39,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
+from sglang.srt.two_batch_overlap import (
+    TboCudaGraphRunnerPlugin,
+    TboForwardBatchPreparer,
+)
 from sglang.srt.utils import (
     get_available_gpu_memory,
     get_device_memory_capacity,
@@ -46,6 +51,13 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+# Detect whether the current forward pass is in capture mode
+is_capture_mode = False
+
+
+def get_is_capture_mode():
+    return is_capture_mode
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
@@ -137,6 +149,8 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         gpu_mem = get_device_memory_capacity()
         if gpu_mem is not None and gpu_mem > 96 * 1024:
             capture_bs += list(range(160, 257, 8))
+        if gpu_mem is not None and gpu_mem > 180 * 1000:
+            capture_bs += list(range(256, 528, 16))
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
@@ -144,6 +158,9 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         capture_bs += [model_runner.req_to_token_pool.size - 1] + [
             model_runner.req_to_token_pool.size
         ]
+
+    if server_args.enable_two_batch_overlap:
+        capture_bs = [bs for bs in capture_bs if bs >= 2]
 
     if server_args.cuda_graph_max_bs:
         capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
@@ -240,6 +257,8 @@ class CudaGraphRunner:
             self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
+            self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+            self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
             # pipeline parallelism
             if self.pp_size > 1:
@@ -310,17 +329,12 @@ class CudaGraphRunner:
 
     @contextmanager
     def model_capture_mode(self):
-        if hasattr(self.model_runner.model, "capture_mode"):
-            self.model_runner.model.capture_mode = True
-        if hasattr(self.model_runner.token_to_kv_pool, "capture_mode"):
-            self.model_runner.token_to_kv_pool.capture_mode = True
+        global is_capture_mode
+        is_capture_mode = True
 
         yield
 
-        if hasattr(self.model_runner.model, "capture_mode"):
-            self.model_runner.model.capture_mode = False
-        if hasattr(self.model_runner.token_to_kv_pool, "capture_mode"):
-            self.model_runner.token_to_kv_pool.capture_mode = False
+        is_capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.enable_dp_attention or self.enable_sp_layernorm:
@@ -346,7 +360,14 @@ class CudaGraphRunner:
             if self.is_encoder_decoder
             else True
         )
-        return is_bs_supported and is_encoder_lens_supported
+
+        is_tbo_supported = (
+            forward_batch.can_run_tbo
+            if self.model_runner.server_args.enable_two_batch_overlap
+            else True
+        )
+
+        return is_bs_supported and is_encoder_lens_supported and is_tbo_supported
 
     def capture(self):
         with graph_capture() as graph_capture_context:
@@ -403,6 +424,7 @@ class CudaGraphRunner:
         else:
             encoder_lens = None
         mrope_positions = self.mrope_positions[:, :bs]
+        self.num_token_non_padded[...] = num_tokens
 
         # pipeline parallelism
         if self.pp_size > 1:
@@ -461,7 +483,10 @@ class CudaGraphRunner:
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             lora_paths=lora_paths,
+            num_token_non_padded=self.num_token_non_padded,
+            global_forward_mode=self.capture_forward_mode,
         )
+        self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_paths is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
@@ -556,6 +581,13 @@ class CudaGraphRunner:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
+        num_token_non_padded = len(forward_batch.input_ids)
+        self.num_token_non_padded[...] = num_token_non_padded
+        self.tbo_plugin.replay_prepare(
+            forward_mode=forward_batch.forward_mode,
+            bs=bs,
+            num_token_non_padded=num_token_non_padded,
+        )
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(1)
@@ -608,6 +640,7 @@ class CudaGraphRunner:
 
         # Replay
         self.graphs[self.bs].replay()
+
         output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):
             return LogitsProcessorOutput(

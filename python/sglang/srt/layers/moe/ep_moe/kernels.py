@@ -184,8 +184,10 @@ def pre_reorder_triton_kernel(
     src_idx = tl.program_id(0)
     src2dst_ptr = src2dst_ptr + src_idx * topk
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
-
     src_ptr = input_ptr + src_idx * hidden_size
+
+    vec = tl.arange(0, BLOCK_SIZE)
+
     for idx in range(topk):
         expert_id = tl.load(topk_ids_ptr + idx)
         if expert_id >= start_expert_id and expert_id <= end_expert_id:
@@ -197,7 +199,7 @@ def pre_reorder_triton_kernel(
             dst_idx = tl.load(src2dst_ptr + idx)
             dst_ptr = gateup_input_ptr + dst_idx * hidden_size
             for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
-                offset = start_offset + tl.arange(0, BLOCK_SIZE)
+                offset = start_offset + vec
                 mask = offset < hidden_size
                 in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
                 out_data = (in_data * scale).to(OutDtype)
@@ -481,8 +483,11 @@ def post_reorder_triton_kernel(
 
     computed = False
     store_ptr = output_ptr + src_idx * hidden_size
+
+    vec = tl.arange(0, BLOCK_SIZE)
+
     for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
-        offset = start_offset + tl.arange(0, BLOCK_SIZE)
+        offset = start_offset + vec
         mask = offset < hidden_size
 
         sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
@@ -499,7 +504,7 @@ def post_reorder_triton_kernel(
 
     if computed == False:
         for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
-            offset = start_offset + tl.arange(0, BLOCK_SIZE)
+            offset = start_offset + vec
             mask = offset < hidden_size
             tl.store(
                 store_ptr + offset, tl.zeros([BLOCK_SIZE], dtype=InDtype), mask=mask
@@ -791,19 +796,23 @@ def _fwd_kernel_ep_scatter_2(
     offset_in_s = tl.arange(0, SCALE_HIDDEN_SIZE_PAD)
     mask_s = offset_in_s < SCALE_HIDDEN_SIZE
 
-    for token_id in range(start_token_id, total_token_num, grid_num):
+    for token_id_int32 in range(start_token_id, total_token_num, grid_num):
+        token_id = token_id_int32.to(tl.int64)
         to_copy = tl.load(recv_x + token_id * recv_x_stride0 + offset_in, mask=mask)
         to_copy_s = tl.load(
             recv_x_scale + token_id * recv_x_scale_stride0 + offset_in_s, mask=mask_s
         )
 
-        for topk_index in tl.range(0, topk_num, 1, num_stages=4):
+        for topk_idx_int32 in tl.range(0, topk_num, 1, num_stages=4):
+            topk_index = topk_idx_int32.to(tl.int64)
             expert_id = tl.load(recv_topk + token_id * recv_topk_stride0 + topk_index)
             if expert_id >= 0:
-                dest_token_index = tl.atomic_add(expert_start_loc + expert_id, 1)
+                dest_token_index_int32 = tl.atomic_add(expert_start_loc + expert_id, 1)
+                dest_token_index = dest_token_index_int32.to(tl.int64)
+
                 tl.store(
                     output_index + token_id * output_index_stride0 + topk_index,
-                    dest_token_index,
+                    dest_token_index_int32,
                 )
                 output_tensor_ptr = (
                     output_tensor + dest_token_index * output_tensor_stride0
@@ -902,21 +911,31 @@ def _fwd_kernel_ep_gather(
     topk_num: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    cur_block = tl.program_id(0)
-    start_cur_token = tl.program_id(1)
+    cur_block_int32 = tl.program_id(0)
+    cur_block = cur_block_int32.to(tl.int64)
+
+    start_cur_token_int32 = tl.program_id(1)
+
     grid_num = tl.num_programs(1)
 
-    for cur_token in range(start_cur_token, total_token_num, grid_num):
+    for cur_token_int32 in range(start_cur_token_int32, total_token_num, grid_num):
+        cur_token = cur_token_int32.to(tl.int64)
+
         off_d = tl.arange(0, BLOCK_D)
         accumulator = tl.zeros([BLOCK_D], dtype=tl.float32)
-        for topk_index in range(0, topk_num):
+
+        for topk_index_int32 in range(0, topk_num):
+            topk_index = topk_index_int32.to(tl.int64)
+
             expert_id = tl.load(
                 recv_topk_ids + cur_token * recv_topk_ids_stride0 + topk_index
             )
             if expert_id >= 0:
-                source_token_index = tl.load(
+                source_token_index_int32 = tl.load(
                     input_index + cur_token * input_index_stride0 + topk_index
                 )
+                source_token_index = source_token_index_int32.to(tl.int64)
+
                 acc_weight = tl.load(
                     recv_topk_weight + cur_token * recv_topk_weight_stride0 + topk_index
                 )

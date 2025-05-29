@@ -47,7 +47,7 @@ from sglang.srt.disaggregation.utils import (
     register_disaggregation_server,
 )
 from sglang.srt.entrypoints.engine import _launch_subprocesses
-from sglang.srt.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -182,9 +182,9 @@ async def health_generate(request: Request) -> Response:
         async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
             break
 
-    tic = time.time()
+    tic = time.perf_counter()
     task = asyncio.create_task(gen())
-    while time.time() < tic + HEALTH_CHECK_TIMEOUT:
+    while time.perf_counter() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
@@ -227,6 +227,11 @@ async def get_server_info():
         "internal_states": internal_states,
         "version": __version__,
     }
+
+
+@app.get("/get_load")
+async def get_load():
+    return await _global_state.tokenizer_manager.get_load()
 
 
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
@@ -355,7 +360,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
 @app.api_route("/stop_profile", methods=["GET", "POST"])
 async def stop_profile_async():
     """Stop profiling."""
-    _global_state.tokenizer_manager.stop_profile()
+    await _global_state.tokenizer_manager.stop_profile()
     return Response(
         content="Stop profiling. This will take some time.\n",
         status_code=200,
