@@ -13,6 +13,7 @@
 # ==============================================================================
 """The baseclass of a backend for reasoner grammar-guided constrained decoding."""
 
+from concurrent.futures import Future
 from typing import List, Optional, Tuple
 
 import torch
@@ -21,17 +22,18 @@ from .base_grammar_backend import BaseGrammarBackend, BaseGrammarObject
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
-    def __init__(self, grammar: BaseGrammarObject, think_start_id: int, think_end_id: int):
+    def __init__(
+        self,
+        grammar: BaseGrammarObject,
+        think_end_id: int,
+        expect_thinking: bool,
+    ):
         super().__init__()
         self.grammar = grammar
-        self.think_start_id = think_start_id
         self.think_end_id = think_end_id
-        self.is_in_reasoning = False
+        self.is_in_reasoning = expect_thinking
 
     def accept_token(self, token: int):
-        if token == self.think_start_id:
-            self.is_in_reasoning = True
-
         if token == self.think_end_id:
             self.is_in_reasoning = False
 
@@ -55,7 +57,11 @@ class ReasonerGrammarObject(BaseGrammarObject):
         return self.grammar.apply_vocab_mask
 
     def copy(self) -> BaseGrammarObject:
-        return ReasonerGrammarObject(self.grammar.copy(), self.think_start_id, self.think_end_id)
+        return ReasonerGrammarObject(
+            self.grammar.copy(),
+            self.think_end_id,
+            self.is_in_reasoning,
+        )
 
     @property
     def finished(self):
@@ -80,16 +86,31 @@ class ReasonerGrammarObject(BaseGrammarObject):
 
 
 class ReasonerGrammarBackend(BaseGrammarBackend):
-    def __init__(self, grammar_backend: BaseGrammarBackend, think_start_id: int, think_end_id: int):
+    def __init__(
+        self,
+        grammar_backend: BaseGrammarBackend,
+        think_end_id: int,
+    ):
         super().__init__()
         self.grammar_backend = grammar_backend
-        self.think_start_id = think_start_id
         self.think_end_id = think_end_id
 
     def _init_value_dispatch(
-        self, key: Tuple[str, str]
+        self,
+        key: Tuple[str, str, str],
     ) -> Optional[ReasonerGrammarObject]:
-        ret = self.grammar_backend._init_value_dispatch(key)
+        key_type, key_string, expect_thinking = key
+        base_key = (key_type, key_string)
+        ret = self.grammar_backend._init_value_dispatch(base_key)
         if ret is None:
             return None
-        return ReasonerGrammarObject(ret, self.think_start_id, self.think_end_id)
+        return ReasonerGrammarObject(ret, self.think_end_id, expect_thinking)
+
+    def get_cached_or_future_value(
+        self, key: Tuple[str, str, str]
+    ) -> Tuple[Future[ReasonerGrammarObject], bool]:
+        value = self.cache.get(key)
+        if value:
+            return value.copy(), True
+        value = self.executor.submit(self._init_value_dispatch, key)
+        return value, False

@@ -1176,6 +1176,10 @@ def v1_chat_generate_request(
                 )
             else:
                 sampling_params[constraint_type] = constraint_value
+        elif has_existing_constraints:
+            sampling_params["expect_thinking"] = _get_enable_thinking_from_request(
+                request
+            )
 
         sampling_params_list.append(sampling_params)
 
