@@ -176,6 +176,7 @@ class ServerArgs:
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
+    eplb_algorithm: str = "auto"
     eplb_rebalance_num_iterations: int = 1000
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "per_pass", "per_token"]
@@ -1336,6 +1337,12 @@ class ServerArgs:
             help="Enable EPLB algorithm",
         )
         parser.add_argument(
+            "--eplb-algorithm",
+            type=str,
+            default=ServerArgs.eplb_algorithm,
+            help="Chosen EPLB algorithm",
+        )
+        parser.add_argument(
             "--eplb-rebalance-num-iterations",
             type=int,
             default=ServerArgs.eplb_rebalance_num_iterations,
@@ -1362,7 +1369,7 @@ class ServerArgs:
             "--deepep-config",
             type=str,
             default=ServerArgs.deepep_config,
-            help="Tuned DeepEP config suitable for your own cluster.",
+            help="Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.",
         )
 
         parser.add_argument(

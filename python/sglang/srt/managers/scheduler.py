@@ -1944,6 +1944,27 @@ class Scheduler(
             if_success = False
         return if_success
 
+    def get_load(self):
+        # TODO(lsyin): use dynamically maintained num_waiting_tokens
+        load = (
+            self.max_total_num_tokens
+            - self.token_to_kv_pool_allocator.available_size()
+            - self.tree_cache.evictable_size()
+        )
+        load += sum(len(req.origin_input_ids) for req in self.waiting_queue)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            load += sum(
+                len(req.origin_input_ids)
+                for req in self.disagg_prefill_bootstrap_queue.queue
+            )
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            load += sum(
+                len(req.req.origin_input_ids)
+                for req in self.disagg_decode_prealloc_queue.queue
+            )
+
+        return load
+
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
         ret["last_gen_throughput"] = self.last_gen_throughput
@@ -1953,9 +1974,10 @@ class Scheduler(
             )
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
-        return GetInternalStateReqOutput(
-            internal_state=ret,
-        )
+
+        ret["load"] = self.get_load()
+
+        return GetInternalStateReqOutput(internal_state=ret)
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
