@@ -16,7 +16,6 @@ from pathlib import Path
 import deep_ep
 import torch
 import torch.distributed as dist
-
 from deepep_utils import (
     bench,
     calc_diff,
@@ -29,15 +28,15 @@ from deepep_utils import (
 
 
 def test_main(
-        num_sms: int,
-        local_rank: int,
-        num_local_ranks: int,
-        num_ranks: int,
-        num_nodes: int,
-        rank: int,
-        buffer: deep_ep.Buffer,
-        group: dist.ProcessGroup,
-        args,
+    num_sms: int,
+    local_rank: int,
+    num_local_ranks: int,
+    num_ranks: int,
+    num_nodes: int,
+    rank: int,
+    buffer: deep_ep.Buffer,
+    group: dist.ProcessGroup,
+    args,
 ):
     # Settings
     num_tokens, hidden, num_topk_groups, num_topk, num_experts = (
@@ -59,8 +58,8 @@ def test_main(
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
     x_e4m3 = per_token_cast_to_fp8(x)
     scores = (
-            torch.randn((num_tokens, num_experts), dtype=torch.float32, device="cuda").abs()
-            + 1
+        torch.randn((num_tokens, num_experts), dtype=torch.float32, device="cuda").abs()
+        + 1
     )
     group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
     group_idx = torch.topk(
@@ -71,7 +70,7 @@ def test_main(
         1
     ]
     topk_weights = (
-            torch.ones((num_tokens, num_topk), dtype=torch.float32, device="cuda") * rank
+        torch.ones((num_tokens, num_topk), dtype=torch.float32, device="cuda") * rank
     )
     topk_weights_pure_rand = torch.randn(
         (num_tokens, num_topk), dtype=torch.float32, device="cuda"
@@ -203,20 +202,20 @@ def test_main(
                         0
                     ), f"{gbl_num_tokens_per_rank[rank].item()} != {recv_x.size(0)}"
                     assert (
-                            gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist()
-                            == recv_num_tokens_per_expert_list
+                        gbl_num_tokens_per_expert.view(num_ranks, -1)[rank].tolist()
+                        == recv_num_tokens_per_expert_list
                     )
                     if current_x is not x_pure_rand:
                         check_data(recv_x, recv_gbl_rank_prefix_sum)
                     if with_topk:
                         # Check `topk_idx`
                         assert (
-                                       recv_topk_idx.eq(-1)
-                                       | (
-                                               (recv_topk_idx >= 0)
-                                               & (recv_topk_idx < (num_experts // num_ranks))
-                                       )
-                               ).sum().item() == recv_topk_idx.numel()
+                            recv_topk_idx.eq(-1)
+                            | (
+                                (recv_topk_idx >= 0)
+                                & (recv_topk_idx < (num_experts // num_ranks))
+                            )
+                        ).sum().item() == recv_topk_idx.numel()
                         for i, count in enumerate(recv_num_tokens_per_expert_list):
                             assert recv_topk_idx.eq(i).sum().item() == count
 
@@ -274,8 +273,8 @@ def test_main(
                             combined_topk_weights
                             if (current_x is x_pure_rand)
                             else (
-                                    combined_topk_weights
-                                    / is_token_in_rank.sum(dim=1).unsqueeze(1)
+                                combined_topk_weights
+                                / is_token_in_rank.sum(dim=1).unsqueeze(1)
                             )
                         )
                         ref_topk_weights = (
@@ -446,7 +445,15 @@ def test_loop(local_rank: int, num_local_ranks: int, args):
 
     for i in (num_sms,):
         test_main(
-            i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group, args
+            i,
+            local_rank,
+            num_local_ranks,
+            num_ranks,
+            num_nodes,
+            rank,
+            buffer,
+            group,
+            args,
         )
         if local_rank == 0:
             print("", flush=True)
@@ -464,4 +471,6 @@ if __name__ == "__main__":
     print(f"Start system with {args=}")
 
     num_processes = 8
-    torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
+    torch.multiprocessing.spawn(
+        test_loop, args=(num_processes, args), nprocs=num_processes
+    )
