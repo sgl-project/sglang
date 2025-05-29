@@ -206,7 +206,7 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t num_expert_group,
     int64_t topk_group,
     int64_t topk,
-    int64_t n_share_experts_fusion,
+    int64_t num_fused_shared_experts,
     double routed_scaling_factor);
 
 void fp8_blockwise_scaled_grouped_mm(
