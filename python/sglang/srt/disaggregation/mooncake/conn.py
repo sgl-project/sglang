@@ -254,18 +254,26 @@ class MooncakeKVManager(BaseKVManager):
         local_tp_size = self.tp_size // self.dp_size
 
         # decode config
-        decode_tp_rank_per_prefill_rank = decode_tp_world_size // local_tp_size
-        decode_rank_registered_item_lens = [item // decode_tp_rank_per_prefill_rank for item in self.kv_args.kv_item_lens]
+        decode_rank_registered_item_lens = [(item * local_tp_size //  decode_tp_world_size) for item in self.kv_args.kv_item_lens]
         
         num_kv_heads = self.kv_args.kv_head_num
         num_layers = len(self.kv_args.kv_data_ptrs)
 
-        heads_per_decode_rank = num_kv_heads // decode_tp_world_size
-        heads_per_prefill_rank = num_kv_heads // local_tp_size
+        heads_per_decode_rank = num_kv_heads * local_tp_size // decode_tp_world_size
+        heads_per_prefill_rank = num_kv_heads 
         decode_rank_global_start_head_idx = target_tp_rank * heads_per_decode_rank
         prefill_rank_global_start_head_idx = local_tp_rank * heads_per_prefill_rank
-        head_idx_for_rank = \
-        decode_rank_global_start_head_idx - prefill_rank_global_start_head_idx
+
+        if local_tp_size > decode_tp_world_size:
+            head_idx_for_rank = 0  # for tp_p > tp_d
+            num_heads_in_sub_slice = heads_per_prefill_rank  # for tp_p > tp_d
+            head_idx_in_group = prefill_rank_global_start_head_idx - decode_rank_global_start_head_idx
+
+        else:
+            head_idx_for_rank = \
+            decode_rank_global_start_head_idx - prefill_rank_global_start_head_idx
+            num_heads_in_sub_slice = heads_per_decode_rank
+            head_idx_in_group = 0
 
         layers_params_for_processing = []
         for layer_id in range(num_layers): 
@@ -283,9 +291,18 @@ class MooncakeKVManager(BaseKVManager):
             # Calculate precise byte offset and length for the sub-slice within P_m's page data
             offset_in_prefill_page = \
                 head_idx_for_rank * bytes_per_head_in_prefill_rank_page
-            
             byte_length_per_page = \
-                heads_per_decode_rank * bytes_per_head_in_prefill_rank_page
+                num_heads_in_sub_slice * bytes_per_head_in_prefill_rank_page
+            offset_in_decode_page = head_idx_in_group * bytes_per_head_in_prefill_rank_page
+
+            # Sanity check: The data sub-slice we intend to send should fit into D_n's page.
+            # This means byte_length_per_page <= item_len_of_decode_rank_page
+            if byte_length_per_page > item_len_of_decode_rank_page:
+                self.logger.error(f"[{mooncake_session_id}] Calculated sub-slice byte length per page "
+                                  f"({byte_length_per_page}) "
+                                  f"exceeds target Decode Rank's page item_len/stride ({item_len_of_decode_rank_page}) "
+                                  f"for layer {layer_id}.")
+                return -1  
 
             layers_params_for_processing.append(
                 (
@@ -294,6 +311,7 @@ class MooncakeKVManager(BaseKVManager):
                     item_len_of_prefill_rank_page,            # Prefill page size (all heads)2048
                     item_len_of_decode_rank_page,             # Decode page stride (for its slice page) 1024
                     offset_in_prefill_page,                   # Offset to slice data in Prefill page
+                    offset_in_decode_page,
                     byte_length_per_page,                     # Length of slice data per page (actual data to send)
                 )
             )
@@ -302,7 +320,7 @@ class MooncakeKVManager(BaseKVManager):
         def process_layer_tp_aware(layer_processing_params_tuple):
             (src_ptr, dst_ptr,
             src_item_len, dst_item_len,
-            slice_offset_in_prefill_page, slice_len_per_page) = layer_processing_params_tuple
+            slice_offset_in_prefill_page, slice_offset_in_decode_page, slice_len_per_page) = layer_processing_params_tuple
 
             for prefill_page_indices_in_block, decode_page_indices_in_block in zip(prefill_kv_blocks, dst_kv_blocks):
                 for i in range(len(prefill_page_indices_in_block)):
@@ -312,7 +330,7 @@ class MooncakeKVManager(BaseKVManager):
                     src_full_page_addr = src_ptr + prefill_page_idx * src_item_len
                     src_addr_for_this_page_slice = src_full_page_addr + slice_offset_in_prefill_page
 
-                    dst_addr_for_this_page_slice = dst_ptr + decode_page_idx * dst_item_len
+                    dst_addr_for_this_page_slice = dst_ptr + decode_page_idx * dst_item_len + slice_offset_in_decode_page
                     
                     length_for_this_page_slice = slice_len_per_page
 
@@ -891,6 +909,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                     * (prefill_tp_size_per_dp_rank // local_tp_size_per_dp_rank),
                 )
             ]
+            logger.info(f"self.target_tp_ranks {self.target_tp_ranks}")
 
             # For MLA models, we can retrieve KVCache from only one prefill rank, but we still need to maintain
             # multiple connections in the connection pool and have to send dummy requests to other prefill ranks,
@@ -912,12 +931,25 @@ class MooncakeKVReceiver(BaseKVReceiver):
                     target_tp_rank,
                     self.target_dp_group,
                 )
+                logger.info(f"target_tp_rank {target_tp_rank}")
+                logger.info(f"bootstrap_info {bootstrap_info}")
+
                 if bootstrap_info is not None:
-                    # NOTE: only support MLA for now: select one prefill rank as real rank
-                    bootstrap_info["is_dummy"] = not bool(
-                        target_tp_rank == self.target_tp_rank
-                        or self.target_tp_rank is None
-                    )
+                    # # NOTE: only support MLA for now: select one prefill rank as real rank
+                    # bootstrap_info["is_dummy"] = not bool(
+                    #     target_tp_rank == self.target_tp_rank
+                    #     or self.target_tp_rank is None
+                    # )
+                    if self.kv_mgr.is_mla_backend:
+                        # MLA :select one prefill rank as real rank
+                        bootstrap_info["is_dummy"] = not bool(
+                            target_tp_rank == self.target_tp_rank
+                            or self.target_tp_rank is None
+                        )
+                    else:
+                        # no-MLA：select all prefill ranks as real ranks
+                        bootstrap_info["is_dummy"] = False
+
                     logger.debug(
                         f"Fetched bootstrap info: {bootstrap_info} for DP {self.target_dp_group} TP {target_tp_rank}"
                     )
