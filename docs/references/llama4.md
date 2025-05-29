@@ -20,7 +20,7 @@ python3 -m sglang.launch_server --model-path meta-llama/Llama-4-Scout-17B-16E-In
 
 - **Chat Template**: Add `--chat-template llama-4` for chat completion tasks.
 - **Enable Multi-Modal**: Add `--enable-multimodal` for multi-modal capabilities.
-- **Enable Hybrid-KVCache**: Add `--hybrid-kvcache-ratio` with `--disable-radix-cache` for hybrid kv cache. Details can be seen in [this PR](https://github.com/sgl-project/sglang/pull/6563)
+- **Enable Hybrid-KVCache**: Add `--hybrid-kvcache-ratio` for hybrid kv cache. Details can be seen in [this PR](https://github.com/sgl-project/sglang/pull/6563)
 
 ## Benchmarking Results
 

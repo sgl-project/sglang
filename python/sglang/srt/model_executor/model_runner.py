@@ -421,6 +421,10 @@ class ModelRunner:
             if self.model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
 
+        if self.is_hybrid is not None and not server_args.disable_radix_cache:
+            logger.info("Automatically disable radix cache for hybrid cache.")
+            server_args.disable_radix_cache = True
+
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
 
@@ -938,12 +942,7 @@ class ModelRunner:
 
         # create token size for hybrid cache
         if self.is_hybrid is not None:
-            if self.server_args.disable_radix_cache:
-                self.get_num_token_hybrid()
-            else:
-                raise RuntimeError(
-                    "Hybrid cache does not support radix_cache currently. Please set --diable-radix-cache."
-                )
+            self.get_num_token_hybrid()
         else:
             self.local_max_total_num_tokens = None
 
