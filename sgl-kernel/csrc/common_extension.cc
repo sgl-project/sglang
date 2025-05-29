@@ -132,7 +132,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "                 Tensor! output_scale, Tensor! input_scale) -> ()");
   m.impl("scaled_fp4_quant", torch::kCUDA, &scaled_fp4_quant);
 
-
   // Compute NVFP4 experts quantization.
   m.def(
       "scaled_fp4_experts_quant(Tensor! output, Tensor! output_scale,"

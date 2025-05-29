@@ -1,10 +1,8 @@
-#include <torch/all.h>
-
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
-
-#include <cuda_runtime.h>
 #include <cuda_fp8.h>
+#include <cuda_runtime.h>
+#include <torch/all.h>
 
 template <typename T>
 struct TypeConverter {
@@ -112,12 +110,9 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
 }
 
 template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>
-__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(int rowIdx, int colIdx,
-                                                       int numCols,
-                                                       SFType* SFout) {
+__device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(int rowIdx, int colIdx, int numCols, SFType* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 ||
-                CVT_FP4_NUM_THREADS_PER_SF == 2);
+  static_assert(CVT_FP4_NUM_THREADS_PER_SF == 1 || CVT_FP4_NUM_THREADS_PER_SF == 2);
 
   // One pair of threads write one SF to global memory.
   // TODO: stage through smem for packed STG.32
@@ -150,9 +145,8 @@ __device__ uint8_t* cvt_quant_to_fp4_get_sf_out_offset(int rowIdx, int colIdx,
     int64_t innerKStride = 1;
 
     // Compute the global offset.
-    int64_t SFOffset = mTileIdx * mTileStride + kTileIdx * kTileStride +
-                       outerMIdx * outerMStride + innerMIdx * innerMStride +
-                       innerKIdx * innerKStride;
+    int64_t SFOffset = mTileIdx * mTileStride + kTileIdx * kTileStride + outerMIdx * outerMStride +
+                       innerMIdx * innerMStride + innerKIdx * innerKStride;
 
     return reinterpret_cast<uint8_t*>(SFout) + SFOffset;
   }
@@ -173,14 +167,13 @@ struct PackedVec<__nv_fp8_e4m3> {
 
 // Quantizes the provided PackedVec into the uint32_t output
 template <class Type, bool UE8M0_SF = false>
-__device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
-                                         uint8_t* SFout) {
+__device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   // Get absolute maximum values among the local 8 values.
   auto localMax = __habs2(vec.elts[0]);
 
-  // Local maximum value.
-  #pragma unroll
+// Local maximum value.
+#pragma unroll
   for (int i = 1; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
     localMax = __hmax2(localMax, __habs2(vec.elts[i]));
   }
@@ -215,9 +208,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
   // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) *
   //                       reciprocal(SFScaleVal))
   float outputScale =
-      SFValue != 0 ? reciprocal_approximate_ftz(
-                         SFValue * reciprocal_approximate_ftz(SFScaleVal))
-                   : 0.0f;
+      SFValue != 0 ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal)) : 0.0f;
 
   if (SFout) {
     // Write the SF to global memory (STG.8).
@@ -227,7 +218,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
   // Convert the input to float.
   float2 fp2Vals[CVT_FP4_ELTS_PER_THREAD / 2];
 
-  #pragma unroll
+#pragma unroll
   for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
     if constexpr (std::is_same_v<Type, half>) {
       fp2Vals[i] = __half22float2(vec.elts[i]);
@@ -256,20 +247,23 @@ __launch_bounds__(512, 4) cvt_fp16_to_fp4(
 #else
 cvt_fp16_to_fp4(
 #endif
-    int32_t numRows, int32_t numCols, Type const* in, float const* SFScale,
-    uint32_t* out, uint32_t* SFout, uint32_t* input_offset_by_experts,
-    uint32_t* output_scale_offset_by_experts, int n_experts) {
+    int32_t numRows,
+    int32_t numCols,
+    Type const* in,
+    float const* SFScale,
+    uint32_t* out,
+    uint32_t* SFout,
+    uint32_t* input_offset_by_experts,
+    uint32_t* output_scale_offset_by_experts,
+    int n_experts) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   using PackedVec = PackedVec<Type>;
-  static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
-      (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
-  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
-                "Vec size is not matched.");
+  static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
+  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD, "Vec size is not matched.");
 
   // Input tensor row/col loops.
   for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x) {
-    for (int colIdx = threadIdx.x; colIdx < numCols / CVT_FP4_ELTS_PER_THREAD;
-         colIdx += blockDim.x) {
+    for (int colIdx = threadIdx.x; colIdx < numCols / CVT_FP4_ELTS_PER_THREAD; colIdx += blockDim.x) {
       int64_t inOffset = rowIdx * (numCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
       PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
       // Get the output tensor offset.
@@ -281,8 +275,7 @@ cvt_fp16_to_fp4(
       int rowIdx_in_expert = 0;
       int expert_idx = 0;
       for (int i = 0; i < n_experts; i++) {
-        if (rowIdx >= input_offset_by_experts[i] &&
-            rowIdx < input_offset_by_experts[i + 1]) {
+        if (rowIdx >= input_offset_by_experts[i] && rowIdx < input_offset_by_experts[i + 1]) {
           rowIdx_in_expert = rowIdx - input_offset_by_experts[i];
           expert_idx = i;
           break;
@@ -298,32 +291,34 @@ cvt_fp16_to_fp4(
       // The actual output_scales dim is computed from the padded numCols.
       int32_t numCols_padded = (numCols + factor - 1) / factor * factor;
       int numCols_SFout = numCols_padded / CVT_FP4_SF_VEC_SIZE / 4;
-      uint32_t* SFout_in_expert =
-          SFout + output_scale_offset_by_experts[expert_idx] * numCols_SFout;
+      uint32_t* SFout_in_expert = SFout + output_scale_offset_by_experts[expert_idx] * numCols_SFout;
 
-      auto sf_out =
-          cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
-                                             CVT_FP4_NUM_THREADS_PER_SF>(
-              rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
+      auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, CVT_FP4_NUM_THREADS_PER_SF>(
+          rowIdx_in_expert, colIdx, numCols, SFout_in_expert);
 
-      out_pos =
-          cvt_warp_fp16_to_fp4<Type, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+      out_pos = cvt_warp_fp16_to_fp4<Type, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
     }
   }
 #endif
 }
 
 template <typename T>
-void quant_impl(void* output, void* output_scale, void* input,
-                void* input_global_scale, void* input_offset_by_experts,
-                void* output_scale_offset_by_experts, int m_topk, int k,
-                int n_experts, cudaStream_t stream) {
+void quant_impl(
+    void* output,
+    void* output_scale,
+    void* input,
+    void* input_global_scale,
+    void* input_offset_by_experts,
+    void* output_scale_offset_by_experts,
+    int m_topk,
+    int k,
+    int n_experts,
+    cudaStream_t stream) {
   // TODO: this multiProcessorCount should be cached.
   int device;
   cudaGetDevice(&device);
   int multiProcessorCount;
-  cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount,
-                         device);
+  cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
 
   // Grid, Block size.
   // Each thread converts 8 values.
@@ -333,18 +328,20 @@ void quant_impl(void* output, void* output_scale, void* input,
   dim3 grid(std::min(int(m_topk), multiProcessorCount * numBlocksPerSM));
 
   cvt_fp16_to_fp4<T, false><<<grid, block, 0, stream>>>(
-      m_topk, k, reinterpret_cast<T*>(input),
+      m_topk,
+      k,
+      reinterpret_cast<T*>(input),
       reinterpret_cast<float*>(input_global_scale),
       reinterpret_cast<uint32_t*>(output),
       reinterpret_cast<uint32_t*>(output_scale),
       reinterpret_cast<uint32_t*>(input_offset_by_experts),
-      reinterpret_cast<uint32_t*>(output_scale_offset_by_experts), n_experts);
+      reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
+      n_experts);
 }
 
 /*Quantization entry for fp4 experts quantization*/
 #define CHECK_TH_CUDA(x, m) TORCH_CHECK(x.is_cuda(), m, "must be a CUDA tensor")
-#define CHECK_CONTIGUOUS(x, m) \
-  TORCH_CHECK(x.is_contiguous(), m, "must be contiguous")
+#define CHECK_CONTIGUOUS(x, m) TORCH_CHECK(x.is_contiguous(), m, "must be contiguous")
 #define CHECK_INPUT(x, m) \
   CHECK_TH_CUDA(x, m);    \
   CHECK_CONTIGUOUS(x, m);
@@ -357,18 +354,18 @@ constexpr auto INT = at::ScalarType::Int;
 constexpr auto UINT8 = at::ScalarType::Byte;
 
 void scaled_fp4_experts_quant_sm100a(
-    torch::Tensor& output, torch::Tensor& output_scale,
-    torch::Tensor const& input, torch::Tensor const& input_global_scale,
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    torch::Tensor const& input,
+    torch::Tensor const& input_global_scale,
     torch::Tensor const& input_offset_by_experts,
     torch::Tensor const& output_scale_offset_by_experts) {
   CHECK_INPUT(output, "output must be a CUDA tensor");
   CHECK_INPUT(output_scale, "output_scale must be a CUDA tensor");
   CHECK_INPUT(input, "input must be a CUDA tensor");
   CHECK_INPUT(input_global_scale, "input_global_scale must be a CUDA tensor");
-  CHECK_INPUT(input_offset_by_experts,
-              "input_offset_by_experts must be a CUDA tensor");
-  CHECK_INPUT(output_scale_offset_by_experts,
-              "output_scale_offset_by_experts must be a CUDA tensor");
+  CHECK_INPUT(input_offset_by_experts, "input_offset_by_experts must be a CUDA tensor");
+  CHECK_INPUT(output_scale_offset_by_experts, "output_scale_offset_by_experts must be a CUDA tensor");
 
   TORCH_CHECK(output.dim() == 2);
   TORCH_CHECK(output_scale.dim() == 2);
@@ -403,20 +400,31 @@ void scaled_fp4_experts_quant_sm100a(
 
   auto in_dtype = input.dtype();
   at::cuda::CUDAGuard device_guard{(char)input.get_device()};
-  const cudaStream_t stream =
-      at::cuda::getCurrentCUDAStream(input.get_device());
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(input.get_device());
   if (in_dtype == at::ScalarType::Half) {
-    quant_impl<half>(output.data_ptr(), output_scale.data_ptr(),
-                     input.data_ptr(), input_global_scale.data_ptr(),
-                     input_offset_by_experts.data_ptr(),
-                     output_scale_offset_by_experts.data_ptr(), m_topk, k,
-                     n_experts, stream);
+    quant_impl<half>(
+        output.data_ptr(),
+        output_scale.data_ptr(),
+        input.data_ptr(),
+        input_global_scale.data_ptr(),
+        input_offset_by_experts.data_ptr(),
+        output_scale_offset_by_experts.data_ptr(),
+        m_topk,
+        k,
+        n_experts,
+        stream);
   } else if (in_dtype == at::ScalarType::BFloat16) {
-    quant_impl<__nv_bfloat16>(output.data_ptr(), output_scale.data_ptr(),
-                              input.data_ptr(), input_global_scale.data_ptr(),
-                              input_offset_by_experts.data_ptr(),
-                              output_scale_offset_by_experts.data_ptr(), m_topk,
-                              k, n_experts, stream);
+    quant_impl<__nv_bfloat16>(
+        output.data_ptr(),
+        output_scale.data_ptr(),
+        input.data_ptr(),
+        input_global_scale.data_ptr(),
+        input_offset_by_experts.data_ptr(),
+        output_scale_offset_by_experts.data_ptr(),
+        m_topk,
+        k,
+        n_experts,
+        stream);
   } else {
     TORCH_CHECK(false, "Expected input data type to be half or bfloat16");
   }
