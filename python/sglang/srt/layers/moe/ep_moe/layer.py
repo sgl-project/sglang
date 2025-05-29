@@ -55,15 +55,16 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_quant_fp8,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import DeepEPMode, dispose_tensor, is_hip, set_weight_attrs
+from sglang.srt.utils import DeepEPMode, dispose_tensor, is_hip, set_weight_attrs, is_cuda
 
 _is_hip = is_hip()
+_is_cuda = is_cuda()
 
 if _is_hip:
     from vllm._custom_ops import scaled_fp8_quant
 
 if _is_cuda:
-    from sgl_kernel import moe_pre_reorder as sgl_moe_pre_reorder
+    from sgl_kernel import ep_moe_pre_reorder as sgl_ep_moe_pre_reorder
 
 logger = logging.getLogger(__name__)
 
