@@ -203,8 +203,8 @@ class ExpertLocationMetadata:
                 logical_to_all_physical_map=logical_to_all_physical_map,
                 num_gpus=ep_size,
                 num_physical_experts=num_physical_experts,
-                # TODO update when EP != TP
-                ep_rank=get_tensor_model_parallel_rank(),
+                # TODO improve
+                ep_rank=torch.distributed.get_rank() % ep_size,
             ),
         )
 
