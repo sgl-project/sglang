@@ -97,7 +97,7 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
 
     def _init_value_dispatch(
         self,
-        key: Tuple[str, str, str],
+        key: Tuple[str, str, bool],
     ) -> Optional[ReasonerGrammarObject]:
         key_type, key_string, expect_thinking = key
         base_key = (key_type, key_string)
