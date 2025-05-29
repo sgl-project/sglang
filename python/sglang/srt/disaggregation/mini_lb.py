@@ -274,8 +274,7 @@ async def handle_generate_request(request_data: dict):
         )
 
 
-@app.post("/v1/chat/completions")
-async def handle_completion_request(request_data: dict):
+async def _forward_to_backend(request_data: dict, endpoint_name: str):
     prefill_server, bootstrap_port, decode_server = load_balancer.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
@@ -286,7 +285,7 @@ async def handle_completion_request(request_data: dict):
         {
             "bootstrap_host": hostname,
             "bootstrap_port": bootstrap_port,
-            "bootstrap_room": random.randint(0, 2**63 - 1),
+            "bootstrap_room": _generate_bootstrap_room(),
         }
     )
 
@@ -295,15 +294,25 @@ async def handle_completion_request(request_data: dict):
             modified_request,
             prefill_server,
             decode_server,
-            endpoint="v1/chat/completions",
+            endpoint=endpoint_name,
         )
     else:
         return await load_balancer.generate(
             modified_request,
             prefill_server,
             decode_server,
-            endpoint="v1/chat/completions",
+            endpoint=endpoint_name,
         )
+
+
+@app.post("/v1/chat/completions")
+async def handle_chat_completion_request(request_data: dict):
+    return await _forward_to_backend(request_data, "v1/chat/completions")
+
+
+@app.post("/v1/completions")
+async def handle_completion_request(request_data: dict):
+    return await _forward_to_backend(request_data, "v1/completions")
 
 
 def _generate_bootstrap_room():
