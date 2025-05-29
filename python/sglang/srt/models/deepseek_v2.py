@@ -759,7 +759,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 # because the chunked_prefix_cache is not supported for paged KV cache
                 # so we just enable it for prefill without prefix only
                 # [TODO] we need to fix it when allocator support chunked_prefix_cache
-                and not any(forward_batch.extend_prefix_lens_cpu)
+                and (forward_batch.extend_prefix_lens_cpu is None or not any(forward_batch.extend_prefix_lens_cpu))
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
             ):
