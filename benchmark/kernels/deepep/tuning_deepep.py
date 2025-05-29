@@ -1,6 +1,8 @@
 import argparse
+import json
 import os
 import time
+from pathlib import Path
 
 # noinspection PyUnresolvedReferences
 import deep_ep
@@ -399,7 +401,12 @@ def test_main(
         _write_output()
 
 
-def _write_output():
+def _write_output(args):
+    output_path = args.output_path
+    print(f"Write to: {output_path}")
+    Path(output_path).write_text(json.dumps(dict(
+        TODO=TODO,
+    )))
     TODO
 
 
