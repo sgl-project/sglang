@@ -413,7 +413,7 @@ def test_main(
 
 
 def _write_output(args, output_data):
-    text = json.dumps(output_data)
+    text = json.dumps(output_data, indent=4)
     output_path = args.output_path
     print(f"Write to {output_path} with {text}")
     Path(output_path).write_text(text)
