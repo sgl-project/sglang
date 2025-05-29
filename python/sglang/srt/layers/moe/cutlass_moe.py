@@ -296,14 +296,19 @@ def cutlass_moe_fp4(
 
     # problem shapes should have [m, n, k]
     # Note that problem sizes are based on logical number of elements.
-    prepare_moe_input(
-        topk_ids, expert_offsets, problem_sizes1, problem_sizes2, a_map, c_map, e, n, k
-    )
-
-    tokens_per_expert = problem_sizes1[:, 0]
-    rounded_tokens_per_expert = (tokens_per_expert + (128 - 1)) // 128 * 128
     blockscale_offsets = torch.zeros(e + 1, dtype=torch.int32, device=device)
-    blockscale_offsets[1:] = torch.cumsum(rounded_tokens_per_expert, dim=0)
+    prepare_moe_input(
+        topk_ids,
+        expert_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        a_map,
+        c_map,
+        e,
+        n,
+        k,
+        blockscale_offsets,
+    )
 
     rep_a_fp4, rep_a_blockscale = scaled_fp4_experts_quant(
         a, a1_gscale, expert_offsets, blockscale_offsets, num_topk, expert_map=a_map

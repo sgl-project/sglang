@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 
@@ -138,18 +140,33 @@ def prepare_moe_input(
     num_experts,
     n,
     k,
+    blockscale_offsets: Optional[torch.Tensor] = None,
 ):
-    torch.ops.sgl_kernel.prepare_moe_input.default(
-        topk_ids,
-        expert_offsets,
-        problem_sizes1,
-        problem_sizes2,
-        input_permutation,
-        output_permutation,
-        num_experts,
-        n,
-        k,
-    )
+    if blockscale_offsets is None:
+        torch.ops.sgl_kernel.prepare_moe_input.default(
+            topk_ids,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            input_permutation,
+            output_permutation,
+            num_experts,
+            n,
+            k,
+        )
+    else:
+        torch.ops.sgl_kernel.prepare_moe_input_v2.default(
+            topk_ids,
+            expert_offsets,
+            blockscale_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            input_permutation,
+            output_permutation,
+            num_experts,
+            n,
+            k,
+        )
 
 
 def cutlass_fp4_group_mm(
