@@ -21,6 +21,8 @@ if _is_cuda:
         fp8_blockwise_scaled_grouped_mm,
         prepare_moe_input,
         silu_and_mul,
+        scaled_fp4_experts_quant,
+        cutlass_fp4_group_mm,
     )
 
 
@@ -281,8 +283,7 @@ def cutlass_moe_fp4(a: torch.Tensor, a1_gscale: torch.Tensor,
    
     # problem shapes should have [m, n, k]
     # Note that problem sizes are based on logical number of elements.
-    # To Do: Add @elfiegg's kernel here
-    get_cutlass_moe_mm_data(topk_ids, expert_offsets, problem_sizes1,
+    prepare_moe_input(topk_ids, expert_offsets, problem_sizes1,
                                 problem_sizes2, a_map, c_map, e, n, k)
 
     tokens_per_expert = problem_sizes1[:, 0]
@@ -290,7 +291,7 @@ def cutlass_moe_fp4(a: torch.Tensor, a1_gscale: torch.Tensor,
     blockscale_offsets = torch.zeros(e + 1, dtype=torch.int32, device=device)
     blockscale_offsets[1:] = torch.cumsum(rounded_tokens_per_expert, dim=0)
 
-    rep_a_fp4, rep_a_blockscale = ops.scaled_fp4_experts_quant(
+    rep_a_fp4, rep_a_blockscale = scaled_fp4_experts_quant(
         a,
         a1_gscale,
         expert_offsets,
@@ -298,7 +299,7 @@ def cutlass_moe_fp4(a: torch.Tensor, a1_gscale: torch.Tensor,
         num_topk,
         expert_map=a_map)
 
-    c1 = ops.cutlass_fp4_moe_mm(rep_a_fp4, w1_fp4, rep_a_blockscale,
+    c1 = cutlass_fp4_group_mm(rep_a_fp4, w1_fp4, rep_a_blockscale,
                                 w1_blockscale, w1_alphas, problem_sizes1,
                                 expert_offsets[:-1], blockscale_offsets[:-1],
                                 out_dtype, device)
@@ -308,11 +309,11 @@ def cutlass_moe_fp4(a: torch.Tensor, a1_gscale: torch.Tensor,
                                device=device,
                                dtype=out_dtype)
 
-    torch.ops._C.silu_and_mul(intermediate, c1)
+    silu_and_mul(c1, intermediate)
 
-    int_fp4, int_blockscale = ops.scaled_fp4_experts_quant(
+    int_fp4, int_blockscale = scaled_fp4_experts_quant(
         intermediate, a2_gscale, expert_offsets, blockscale_offsets, num_topk)
-    c2 = ops.cutlass_fp4_moe_mm(int_fp4, w2_fp4, int_blockscale, w2_blockscale,
+    c2 = cutlass_fp4_group_mm(int_fp4, w2_fp4, int_blockscale, w2_blockscale,
                                 w2_alphas, problem_sizes2, expert_offsets[:-1],
                                 blockscale_offsets[:-1], out_dtype, device)
     del int_fp4, int_blockscale
