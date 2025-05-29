@@ -50,6 +50,13 @@ class MiniLoadBalancer:
         self.prefill_servers = [p.url for p in prefill_configs]
         self.decode_servers = decode_servers
 
+    def add_prefill_server(self, new_prefill_config: PrefillConfig):
+        self.prefill_configs.append(new_prefill_config)
+        self.prefill_servers.append(new_prefill_config.url)
+
+    def add_decode_server(self, new_decode_server: str):
+        self.decode_servers.append(new_decode_server)
+
     def select_pair(self):
         # TODO: return some message instead of panic
         assert len(self.prefill_configs) > 0, "No prefill servers available"
@@ -110,8 +117,8 @@ class MiniLoadBalancer:
             ) as session:
                 # Create the tasks for both prefill and decode requests
                 tasks = [
-                    session.post(f"{prefill_server}/generate", json=modified_request),
-                    session.post(f"{decode_server}/generate", json=modified_request),
+                    session.post(f"{prefill_server}/{endpoint}", json=modified_request),
+                    session.post(f"{decode_server}/{endpoint}", json=modified_request),
                 ]
                 # Wait for both responses to complete. Since this is streaming, they return immediately.
                 prefill_response, decode_response = await asyncio.gather(*tasks)
@@ -157,7 +164,7 @@ class MiniLoadBalancer:
 
 
 app = FastAPI()
-load_balancer = None
+load_balancer: Optional[MiniLoadBalancer] = None
 
 
 @app.get("/health")
@@ -267,8 +274,7 @@ async def handle_generate_request(request_data: dict):
         )
 
 
-@app.post("/v1/chat/completions")
-async def handle_completion_request(request_data: dict):
+async def _forward_to_backend(request_data: dict, endpoint_name: str):
     prefill_server, bootstrap_port, decode_server = load_balancer.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
@@ -279,7 +285,7 @@ async def handle_completion_request(request_data: dict):
         {
             "bootstrap_host": hostname,
             "bootstrap_port": bootstrap_port,
-            "bootstrap_room": random.randint(0, 2**63 - 1),
+            "bootstrap_room": _generate_bootstrap_room(),
         }
     )
 
@@ -288,15 +294,25 @@ async def handle_completion_request(request_data: dict):
             modified_request,
             prefill_server,
             decode_server,
-            endpoint="v1/chat/completions",
+            endpoint=endpoint_name,
         )
     else:
         return await load_balancer.generate(
             modified_request,
             prefill_server,
             decode_server,
-            endpoint="v1/chat/completions",
+            endpoint=endpoint_name,
         )
+
+
+@app.post("/v1/chat/completions")
+async def handle_chat_completion_request(request_data: dict):
+    return await _forward_to_backend(request_data, "v1/chat/completions")
+
+
+@app.post("/v1/completions")
+async def handle_completion_request(request_data: dict):
+    return await _forward_to_backend(request_data, "v1/completions")
 
 
 def _generate_bootstrap_room():
@@ -331,14 +347,14 @@ async def get_models():
 @app.post("/register")
 async def register(obj: PDRegistryRequest):
     if obj.mode == "prefill":
-        load_balancer.prefill_configs.append(
+        load_balancer.add_prefill_server(
             PrefillConfig(obj.registry_url, obj.bootstrap_port)
         )
         logger.info(
             f"Registered prefill server: {obj.registry_url} with bootstrap port: {obj.bootstrap_port}"
         )
     elif obj.mode == "decode":
-        load_balancer.decode_servers.append(obj.registry_url)
+        load_balancer.add_decode_server(obj.registry_url)
         logger.info(f"Registered decode server: {obj.registry_url}")
     else:
         raise HTTPException(
@@ -361,42 +377,7 @@ def run(prefill_configs, decode_addrs, host, port):
 
 
 if __name__ == "__main__":
-    import argparse
+    # FIXME: remove this, use the unified entry point: sglang.srt.disaggregation.launch_lb
+    from sglang.srt.disaggregation.launch_lb import main
 
-    parser = argparse.ArgumentParser(description="Mini Load Balancer Server")
-    parser.add_argument(
-        "--prefill", type=str, default=[], nargs="+", help="URLs for prefill servers"
-    )
-    parser.add_argument(
-        "--decode", type=str, default=[], nargs="+", help="URLs for decode servers"
-    )
-    parser.add_argument(
-        "--prefill-bootstrap-ports",
-        type=int,
-        nargs="+",
-        help="Bootstrap ports for prefill servers",
-    )
-    parser.add_argument(
-        "--host", default="0.0.0.0", help="Host to bind the server (default: 0.0.0.0)"
-    )
-    parser.add_argument(
-        "--port", type=int, default=8000, help="Port to bind the server (default: 8000)"
-    )
-    args = parser.parse_args()
-
-    bootstrap_ports = args.prefill_bootstrap_ports
-    if bootstrap_ports is None:
-        bootstrap_ports = [None] * len(args.prefill)
-    elif len(bootstrap_ports) == 1:
-        bootstrap_ports = bootstrap_ports * len(args.prefill)
-    else:
-        if len(bootstrap_ports) != len(args.prefill):
-            raise ValueError(
-                "Number of prefill URLs must match number of bootstrap ports"
-            )
-
-    prefill_configs = [
-        PrefillConfig(url, port) for url, port in zip(args.prefill, bootstrap_ports)
-    ]
-
-    run(prefill_configs, args.decode, args.host, args.port)
+    main()
