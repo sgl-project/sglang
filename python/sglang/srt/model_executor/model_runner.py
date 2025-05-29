@@ -826,7 +826,7 @@ class ModelRunner:
             1 - self.mem_fraction_static
         )
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
-        return max_num_token
+        return max_num_token, cell_size
 
     def get_num_token_hybrid(self):
         temp_ratio = (
@@ -872,7 +872,9 @@ class ModelRunner:
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
 
-        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        self.max_total_num_tokens, cell_size = self.profile_max_num_token(
+            total_gpu_memory
+        )
 
         if max_num_reqs is None:
             max_num_reqs = min(
@@ -920,6 +922,14 @@ class ModelRunner:
                 )
             self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
 
+        # modify max_total_num_tokens due to ReqToTokenPool
+
+        self.max_total_num_tokens -= (
+            (max_num_reqs + 1)
+            * (self.server_args.context_length + 4)
+            * torch._utils._element_size(torch.int32)
+            // cell_size
+        )
         self.max_total_num_tokens = (
             self.max_total_num_tokens
             // self.server_args.page_size
