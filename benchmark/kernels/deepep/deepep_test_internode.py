@@ -1,10 +1,10 @@
-# ADAPTED FROM https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py
-
 import os
 import time
 
 # noinspection PyUnresolvedReferences
 import deep_ep
+# Test compatibility with low latency functions
+import test_low_latency
 import torch
 import torch.distributed as dist
 
@@ -251,7 +251,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 def test_loop(local_rank: int, num_local_ranks: int):
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    test_ll_compatibility = False
+    test_ll_compatibility = True
     if test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
