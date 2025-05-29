@@ -453,6 +453,7 @@ if __name__ == "__main__":
     parser.add_argument("--master-addr", type=str, default="127.0.0.1")
     parser.add_argument("--master-port", type=int, default=8361)
     args = parser.parse_args()
+    print(f"Start system with {args=}")
 
     num_processes = 8
     torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
