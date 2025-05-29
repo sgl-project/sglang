@@ -307,13 +307,14 @@ def test_main(
         )
         for nvl_chunk_size in range(4, 33, 4):
             for rdma_chunk_size in range(4, 33, 4):
-                config = deep_ep.Config(
-                    num_sms,
-                    nvl_chunk_size,
-                    nvl_buffer_size,
-                    rdma_chunk_size,
-                    rdma_buffer_size,
-                )
+                config_kwargs = {
+                    "num_sms": num_sms,
+                    "num_max_nvl_chunked_send_tokens": nvl_chunk_size,
+                    "num_max_nvl_chunked_recv_tokens": nvl_buffer_size,
+                    "num_max_rdma_chunked_send_tokens": rdma_chunk_size,
+                    "num_max_rdma_chunked_recv_tokens": rdma_buffer_size,
+                }
+                config = deep_ep.Config(**config_kwargs)
                 tune_args = {"x": current_x, "handle": handle, "config": config}
                 t = bench(lambda: buffer.dispatch(**tune_args))[0]
                 if t < best_time:
@@ -380,13 +381,14 @@ def test_main(
     best_time, best_results = 1e10, None
     for nvl_chunk_size in range(1, 5, 1):
         for rdma_chunk_size in range(8, 33, 4):
-            config = deep_ep.Config(
-                num_sms,
-                nvl_chunk_size,
-                nvl_buffer_size,
-                rdma_chunk_size,
-                rdma_buffer_size,
-            )
+            config_kwargs = {
+                "num_sms": num_sms,
+                "num_max_nvl_chunked_send_tokens": nvl_chunk_size,
+                "num_max_nvl_chunked_recv_tokens": nvl_buffer_size,
+                "num_max_rdma_chunked_send_tokens": rdma_chunk_size,
+                "num_max_rdma_chunked_recv_tokens": rdma_buffer_size,
+            }
+            config = deep_ep.Config(**config_kwargs)
             tune_args = {"x": recv_x, "handle": handle, "config": config}
             t = bench(lambda: buffer.combine(**tune_args))[0]
             if local_rank == 0:
