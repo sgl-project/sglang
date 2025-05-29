@@ -177,6 +177,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "prepare_moe_input(Tensor topk_ids, Tensor expert_offsets, Tensor problem_sizes1, Tensor problem_sizes2, Tensor "
       "input_permutation, Tensor output_permutation, int num_experts, int n, int k) -> ()");
   m.impl("prepare_moe_input", torch::kCUDA, &prepare_moe_input);
+
+  m.def(
+      "prepare_moe_input_v2(Tensor topk_ids, Tensor expert_offsets, Tensor blockscale_offsets, Tensor problem_sizes1, "
+      "Tensor problem_sizes2, Tensor input_permutation, Tensor output_permutation, int num_experts, int n, int k) -> "
+      "()");
+  m.impl("prepare_moe_input_v2", torch::kCUDA, &prepare_moe_input_v2);
+
   /*
    * From csrc/speculative
    */
