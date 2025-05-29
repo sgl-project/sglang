@@ -68,7 +68,7 @@ __device__ void moe_fused_gate_impl(
   }
 
   // Calculate topk_excluding_share_expert_fusion from topk
-  int64_t topk_excluding_share_expert_fusion = topk - (num_fused_shared_experts > 0 ? 1 : 0);
+  int64_t topk_excluding_share_expert_fusion = topk - num_fused_shared_experts;
 
   // Cast pointers to type T:
   auto* input_ptr = reinterpret_cast<T*>(input);
