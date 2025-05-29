@@ -3,11 +3,9 @@ import time
 
 # noinspection PyUnresolvedReferences
 import deep_ep
-
-# Test compatibility with low latency functions
-import test_low_latency
 import torch
 import torch.distributed as dist
+
 from deepep_utils import (
     bench,
     calc_diff,
@@ -201,12 +199,12 @@ def test_main(
                     if with_topk:
                         # Check `topk_idx`
                         assert (
-                            recv_topk_idx.eq(-1)
-                            | (
-                                (recv_topk_idx >= 0)
-                                & (recv_topk_idx < (num_experts // num_ranks))
-                            )
-                        ).sum().item() == recv_topk_idx.numel()
+                                   recv_topk_idx.eq(-1)
+                                   | (
+                                       (recv_topk_idx >= 0)
+                                       & (recv_topk_idx < (num_experts // num_ranks))
+                                   )
+                               ).sum().item() == recv_topk_idx.numel()
                         for i, count in enumerate(recv_num_tokens_per_expert_list):
                             assert recv_topk_idx.eq(i).sum().item() == count
 
@@ -403,20 +401,15 @@ def test_main(
 def test_loop(local_rank: int, num_local_ranks: int):
     num_nodes = int(os.getenv("WORLD_SIZE", 1))
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    test_ll_compatibility = True
-    if test_ll_compatibility:
-        ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
     num_sms = 24
-    num_qps_per_rank = max(
-        num_sms // 2, ll_num_experts // num_ranks if test_ll_compatibility else 0
-    )
+    num_qps_per_rank = num_sms // 2
 
     buffer = deep_ep.Buffer(
         group,
         int(1e9),
         int(1e9),
-        low_latency_mode=test_ll_compatibility,
+        low_latency_mode=False,
         num_qps_per_rank=num_qps_per_rank,
     )
     assert num_local_ranks == 8 and num_ranks > 8
@@ -428,21 +421,6 @@ def test_loop(local_rank: int, num_local_ranks: int):
         )
         if local_rank == 0:
             print("", flush=True)
-
-    # Test compatibility with low latency functions
-    if test_ll_compatibility:
-        buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
-        test_low_latency.test_main(
-            ll_num_tokens,
-            ll_hidden,
-            ll_num_experts,
-            ll_num_topk,
-            rank,
-            num_ranks,
-            group,
-            buffer,
-            seed=1,
-        )
 
 
 if __name__ == "__main__":
