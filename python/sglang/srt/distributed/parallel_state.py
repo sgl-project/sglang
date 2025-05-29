@@ -308,7 +308,8 @@ class GroupCoordinator:
                 )
 
         self.qr_comm: Optional[QuickAllreduce] = None
-        if use_quick_allreduce and self.world_size > 1 and _is_hip:
+        _is_mi300 = "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
+        if use_quick_allreduce and self.world_size > 1 and _is_mi300:
             # Initialize a quick all-reduce implementation when rocm >= gfx942
             try:
                 self.qr_comm = QuickAllreduce(
@@ -318,7 +319,7 @@ class GroupCoordinator:
             except Exception as e:
                 logger.warning(
                     f"Setup Quick allreduce failed with {e}. To silence this "
-                    "warning, specify --disable-custom-all-reduce explicitly."
+                    "warning, specify --disable-quick-all-reduce explicitly."
                 )
 
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
@@ -399,6 +400,8 @@ class GroupCoordinator:
         else:
             stream = graph_capture_context.stream
 
+        # We don't need the context of quick allreduce because the ipc access
+        # is already collected in init() and we can capture the quick allreduce directly.
         ca_comm = self.ca_comm
         maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
 
@@ -413,18 +416,18 @@ class GroupCoordinator:
             # operations. The current status is:
             #     allreduce \ Mode   |  Eager  |  Graph  |
             # --------------------------------------------
+            # quick allreduce        | enabled | enabled |
             # custom allreduce       | enabled | enabled |
             # PyNccl                 | disabled| enabled |
             # torch.distributed      | enabled | disabled|
             #
-            # Note that custom allreduce will have a runtime check, if the
-            #  tensor size is too large, it will fallback to the next
-            #  available option.
+            # Note that custom allreduce will have a runtime check, if the tensor
+            #  size is too large, it will fallback to the next available option.
             # In summary: When using CUDA graph, we use
-            #  either custom all-reduce kernel or pynccl. When not using
-            #  CUDA graph, we use either custom all-reduce kernel or
-            #  PyTorch NCCL. We always prioritize using custom all-reduce
-            #  kernel but fall back to PyTorch or pynccl if it is
+            #  quick all-reduce, custom all-reduce kernel or pynccl. When not
+            #  using CUDA graph, we use quick all-reduce, custom all-reduce kernel
+            #  or PyTorch NCCL. We always prioritize using quick all-reduce, then
+            #  custom all-reduce but fall back to PyTorch or pynccl if it is
             #  disabled or not supported.
             pynccl_comm = self.pynccl_comm
             maybe_pynccl_context: Any
@@ -477,14 +480,12 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
-        # if rocm, try quick allreduce first, then custom ar.
+        # if rocm gfx942, try quick allreduce first, then custom ar.
         if (
             self.qr_comm is not None
             and not self.qr_comm.disabled
             and self.qr_comm.should_quick_ar(input_)
-            and not get_is_capture_mode()
         ):
-            # print("qr+++++++++++++++++++++++++++++++++++++++++")
             return torch.ops.sglang.outplace_quick_all_reduce(
                 input_, group_name=self.unique_name
             )

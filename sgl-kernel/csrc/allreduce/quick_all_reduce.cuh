@@ -891,6 +891,7 @@ struct AllReduceTwoshot {
 // Oneshot
 // ============================================================
 // MARK: Oneshot All Reduce
+// TODO: qr oneshot has no advantage scenario, so del one shot.
 template <typename T>
 struct AllReduceOneshot {
   // Fixed magic implementation.

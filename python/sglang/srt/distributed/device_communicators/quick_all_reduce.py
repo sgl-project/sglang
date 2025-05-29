@@ -56,13 +56,8 @@ TWOSHOT_Q4 = 5,
 class QuickAllreduce:
 
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
-    _SUPPORTED_LEVEL = [
-        1,
-        2,
-        3,
-        4,
-        5,
-    ]  # TODO: qr oneshot has no advantage scenario, so del level = 0
+    # qr oneshot has no advantage scenario, so del level = 0
+    _SUPPORTED_LEVEL = [1, 2, 3, 4, 5]
 
     def __init__(
         self,
@@ -72,6 +67,10 @@ class QuickAllreduce:
         min_size=1024 * 1024,
     ) -> None:
         """
+        quick allreduce is accelerated by quantization, currently
+        supports fp16, fp8, Q8, Q6, Q4 quantization.
+        level equal to 1 means no quantization, 2 for fp8, 3 for Q8,
+        4 for Q6, 5 for Q4.
         Args:
             group: the process group to work on. If None, it will use the
                 default process group.
@@ -84,8 +83,10 @@ class QuickAllreduce:
         is bind to a unique device, and all communicators in this group
         are in the same node.
         """
-        if not _is_hip:
-            logger.warning("Quick allreduce only supports rocm above gfx942. ")
+        _is_mi300 = "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
+        if not _is_hip or not _is_mi300:
+            # TODO: recognize machine version
+            logger.warning("Quick allreduce only supports rocm above gfx942.")
             return
 
         self._IS_CAPTURING = False
@@ -207,7 +208,7 @@ class QuickAllreduce:
             )
         return False
 
-    def all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):
+    def all_reduce(self, inp: torch.Tensor, out: torch.Tensor = None):
         """Performs an out-of-place all reduce."""
         if out is None:
             out = torch.empty_like(inp)
