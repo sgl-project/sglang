@@ -222,7 +222,9 @@ class DeepseekV2MoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
-        self.num_fused_shared_experts = global_server_args_dict["num_fused_shared_experts"]
+        self.num_fused_shared_experts = global_server_args_dict[
+            "num_fused_shared_experts"
+        ]
         self.config = config
         self.layer_id = layer_id
 
@@ -1663,7 +1665,9 @@ class DeepseekV2ForCausalLM(nn.Module):
     def determine_num_fused_shared_experts(
         self, architecture: str = "DeepseekV3ForCausalLM"
     ):
-        self.num_fused_shared_experts = global_server_args_dict["num_fused_shared_experts"]
+        self.num_fused_shared_experts = global_server_args_dict[
+            "num_fused_shared_experts"
+        ]
         if self.num_fused_shared_experts > 0:
             # Only Deepseek V3/R1 can use shared experts fusion optimization now.
             if (

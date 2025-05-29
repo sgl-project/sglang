@@ -305,7 +305,7 @@ __global__ void moe_fused_gate_kernel(
             num_rows,                                                                                    \
             topk_group,                                                                                  \
             topk,                                                                                        \
-            num_fused_shared_experts,                                                                      \
+            num_fused_shared_experts,                                                                    \
             routed_scaling_factor);                                                                      \
     dispatched = true;                                                                                   \
   } while (0)

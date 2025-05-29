@@ -323,9 +323,7 @@ def main():
             pipeline_model_parallel_size=1,
         )
 
-        model_config = get_model_config(
-            args.model, args.tp_size
-        )
+        model_config = get_model_config(args.model, args.tp_size)
         benchmark.run(
             show_plots=True,
             print_data=True,
