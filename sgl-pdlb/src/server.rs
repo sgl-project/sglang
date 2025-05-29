@@ -332,6 +332,7 @@ pub async fn startup(lb_config: LBConfig, lb_state: LBState) -> std::io::Result<
             .service(get_server_info)
             .service(get_loads)
             .service(generate)
+            .service(chat_completions)
     })
     .bind((lb_config.host, lb_config.port))?
     .run()
