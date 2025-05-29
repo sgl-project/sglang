@@ -556,30 +556,18 @@ impl Router {
                 };
 
                 // Update queues and tree
-                if let Some(count) = running_queue.get_mut(&selected_url) {
-                    *count += 1;
+                *running_queue.get_mut(&selected_url).unwrap() += 1;
 
-                    // Update the gauge only if the worker still exists
-                    gauge!("sgl_router_running_requests", "worker" => selected_url.to_string())
-                        .set(*count as f64);
-                } else {
-                    warn!("Worker {} not found in running_queue - it may have been removed recently", selected_url);
-                    // Re-select a worker that's guaranteed to exist
-                    return worker_urls.read().unwrap()[0].clone();
-                }
+                *processed_queue
+                    .lock()
+                    .unwrap()
+                    .get_mut(&selected_url)
+                    .unwrap() += 1;
 
-                // Similarly for processed_queue
-                let mut processed_queue_guard = processed_queue.lock().unwrap();
-                if let Some(count) = processed_queue_guard.get_mut(&selected_url) {
-                    *count += 1;
-                    counter!("sgl_router_processed_requests_total", "worker" => selected_url.to_string()).increment(1);
-                } else {
-                    warn!("Worker {} not found in processed_queue - it may have been removed recently", selected_url);
-                    // Don't insert into tree since the worker was removed
-                    return worker_urls.read().unwrap()[0].clone();
-                }
+                gauge!("sgl_router_running_requests", "worker" => selected_url.to_string())
+                    .set(*running_queue.get(&selected_url).unwrap() as f64);
+                counter!("sgl_router_processed_requests_total", "worker" => selected_url.to_string()).increment(1);
 
-                // Only insert into tree if the worker still exists in both queues
                 tree.insert(&text, &selected_url);
 
                 selected_url
