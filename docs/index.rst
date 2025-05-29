@@ -7,7 +7,7 @@ The core features include:
 
 - **Fast Backend Runtime**: Provides efficient serving with RadixAttention for prefix caching, zero-overhead CPU scheduler, continuous batching, token attention (paged attention), speculative decoding, tensor parallelism, chunked prefill, structured outputs, quantization (FP8/INT4/AWQ/GPTQ), and multi-lora batching.
 - **Flexible Frontend Language**: Offers an intuitive interface for programming LLM applications, including chained generation calls, advanced prompting, control flow, multi-modal inputs, parallelism, and external interactions.
-- **Extensive Model Support**: Supports a wide range of generative models (Llama, Gemma, Mistral, QWen, DeepSeek, LLaVA, etc.), embedding models (e5-mistral, gte, mcdse) and reward models (Skywork), with easy extensibility for integrating new models.
+- **Extensive Model Support**: Supports a wide range of generative models (Llama, Gemma, Mistral, Qwen, DeepSeek, LLaVA, etc.), embedding models (e5-mistral, gte, mcdse) and reward models (Skywork), with easy extensibility for integrating new models.
 - **Active Community**: SGLang is open-source and backed by an active community with industry adoption.
 
 .. toctree::
@@ -20,14 +20,19 @@ The core features include:
    :maxdepth: 1
    :caption: Backend Tutorial
 
-   references/llama4
    references/deepseek
+   references/llama4
    backend/send_request.ipynb
    backend/openai_api_completions.ipynb
    backend/openai_api_vision.ipynb
    backend/openai_api_embeddings.ipynb
    backend/native_api.ipynb
    backend/offline_engine_api.ipynb
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Advanced Backend Configurations
+
    backend/server_arguments.md
    backend/sampling_params.md
    backend/hyperparameter_tuning.md
@@ -38,7 +43,7 @@ The core features include:
    :caption: Supported Models
 
    supported_models/generative_models.md
-   supported_models/vision_language_models.md
+   supported_models/multimodal_language_models.md
    supported_models/embedding_models.md
    supported_models/reward_models.md
    supported_models/support_new_models.md
@@ -55,6 +60,7 @@ The core features include:
    backend/custom_chat_template.md
    backend/quantization.md
    backend/lora.ipynb
+   backend/pd_disaggregation.md
 
 .. toctree::
    :maxdepth: 1
@@ -76,4 +82,5 @@ The core features include:
       references/general
       references/hardware
       references/advanced_deploy
-      references/performance_tuning
+      references/performance_analysis_and_optimization
+      references/developer

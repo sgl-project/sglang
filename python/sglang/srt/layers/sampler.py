@@ -10,9 +10,9 @@ from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda_available
+from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda
 
-if is_cuda_available():
+if is_cuda():
     from sgl_kernel import (
         min_p_sampling_from_probs,
         top_k_renorm_prob,
@@ -86,11 +86,9 @@ class Sampler(nn.Module):
                     # NOTE: the top_p_renorm_prob from flashinfer has numerical problems,
                     # https://github.com/flashinfer-ai/flashinfer/issues/708
                     # so we use the torch implementation.
-
-                    # clamp to avoid -inf
-                    logprobs = torch.log(
-                        top_p_normalize_probs_torch(probs, sampling_info.top_ps)
-                    ).clamp(min=torch.finfo(probs.dtype).min)
+                    # NOTE: OpenAI's logprobs is independent of top-p, we use the
+                    # same rule.
+                    logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
 
                 max_top_k_round, batch_size = 32, probs.shape[0]
                 if sampling_info.need_min_p_sampling:
@@ -103,7 +101,7 @@ class Sampler(nn.Module):
                     # Check Nan will throw exception, only check when crash_on_warnings is True
                     check_nan = self.use_nan_detection and crash_on_warnings()
                     batch_next_token_ids = top_k_top_p_sampling_from_probs(
-                        probs,
+                        probs.contiguous(),
                         sampling_info.top_ks,
                         sampling_info.top_ps,
                         filter_apply_order="joint",
@@ -121,10 +119,7 @@ class Sampler(nn.Module):
                 )
 
                 if return_logprob:
-                    # clamp to avoid -inf
-                    logprobs = torch.log(
-                        top_p_normalize_probs_torch(probs, sampling_info.top_ps)
-                    ).clamp(min=torch.finfo(probs.dtype).min)
+                    logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
             else:
                 raise ValueError(
                     f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
@@ -239,10 +234,6 @@ def top_p_normalize_probs_torch(
 
 
 def get_top_logprobs(logprobs: torch.Tensor, top_logprobs_nums: List[int]):
-    assert len(top_logprobs_nums) == logprobs.shape[0], (
-        len(top_logprobs_nums),
-        logprobs.shape[0],
-    )
     max_k = max(top_logprobs_nums)
     ret = logprobs.topk(max_k, dim=1)
     values = ret.values.tolist()

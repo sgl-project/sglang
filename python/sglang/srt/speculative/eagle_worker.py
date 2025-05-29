@@ -26,22 +26,21 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
+from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+    EAGLEDraftExtendCudaGraphRunner,
+)
 from sglang.srt.speculative.eagle_utils import (
     EagleDraftInput,
     EagleVerifyInput,
     EagleVerifyOutput,
     assign_draft_cache_locs,
+    generate_token_bitmask,
     select_top_k_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import (
-    empty_context,
-    fast_topk,
-    get_available_gpu_memory,
-    is_cuda_available,
-)
+from sglang.srt.utils import empty_context, fast_topk, get_available_gpu_memory, is_cuda
 
-if is_cuda_available():
+if is_cuda():
     from sgl_kernel import segment_packbits
 
 logger = logging.getLogger(__name__)
@@ -111,11 +110,12 @@ class EAGLEWorker(TpModelWorker):
         # Init draft worker
         with empty_context():
             super().__init__(
+                server_args=server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
-                server_args=server_args,
-                nccl_port=nccl_port,
+                pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
+                nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -179,6 +179,7 @@ class EAGLEWorker(TpModelWorker):
             self.has_prefill_wrapper_verify = True
         elif self.server_args.attention_backend == "triton":
             from sglang.srt.layers.attention.triton_backend import (
+                TritonAttnBackend,
                 TritonMultiStepDraftBackend,
             )
 
@@ -187,15 +188,35 @@ class EAGLEWorker(TpModelWorker):
                 self.topk,
                 self.speculative_num_steps,
             )
-            self.draft_extend_attn_backend = None
+            self.draft_extend_attn_backend = TritonAttnBackend(
+                self.draft_model_runner,
+                skip_prefill=False,
+            )
             self.padded_static_len = self.speculative_num_steps + 1
             self.has_prefill_wrapper_verify = False
         elif self.server_args.attention_backend == "fa3":
             from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
                 FlashAttentionMultiStepBackend,
             )
 
             self.draft_attn_backend = FlashAttentionMultiStepBackend(
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            self.draft_extend_attn_backend = FlashAttentionBackend(
+                self.draft_model_runner,
+                skip_prefill=False,
+            )
+            self.padded_static_len = self.speculative_num_steps + 1
+            self.has_prefill_wrapper_verify = False
+        elif self.server_args.attention_backend == "flashmla":
+            from sglang.srt.layers.attention.flashmla_backend import (
+                FlashMLAMultiStepDraftBackend,
+            )
+
+            self.draft_attn_backend = FlashMLAMultiStepDraftBackend(
                 self.draft_model_runner,
                 self.topk,
                 self.speculative_num_steps,
@@ -205,7 +226,7 @@ class EAGLEWorker(TpModelWorker):
             self.has_prefill_wrapper_verify = False
         else:
             raise ValueError(
-                f"EAGLE is not supportted in attention backend {self.server_args.attention_backend}"
+                f"EAGLE is not supported in attention backend {self.server_args.attention_backend}"
             )
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
@@ -219,7 +240,7 @@ class EAGLEWorker(TpModelWorker):
             return
 
         # Capture draft
-        tic = time.time()
+        tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
@@ -227,12 +248,23 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture draft cuda graph end. Time elapsed: {time.time() - tic:.2f} s. avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
+            f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
         )
 
         # Capture extend
         if self.draft_extend_attn_backend:
-            raise NotImplementedError()
+            tic = time.perf_counter()
+            before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            logger.info(
+                f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            )
+            self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
+                self
+            )
+            after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            logger.info(
+                f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
+            )
 
     @property
     def draft_model_runner(self):
@@ -249,14 +281,14 @@ class EAGLEWorker(TpModelWorker):
         Args:
             batch: The batch to run forward. The state of the batch is modified as it runs.
         Returns:
-            A tuple of the final logit output of the target model, next tokens accepeted,
-            the batch id (used for overlap schedule), and number of accepeted tokens.
+            A tuple of the final logit output of the target model, next tokens accepted,
+            the batch id (used for overlap schedule), and number of accepted tokens.
         """
         if batch.forward_mode.is_decode():
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
-            logits_output, verify_output, model_worker_batch = self.verify(
-                batch, spec_info
+            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
+                self.verify(batch, spec_info)
             )
 
             # If it is None, it means all requests are finished
@@ -268,21 +300,22 @@ class EAGLEWorker(TpModelWorker):
                 verify_output.verified_id,
                 model_worker_batch.bid,
                 sum(verify_output.accept_length_per_req_cpu),
+                can_run_cuda_graph,
             )
         elif batch.forward_mode.is_idle():
             model_worker_batch = batch.get_model_worker_batch()
-            logits_output, next_token_ids = self.target_worker.forward_batch_generation(
-                model_worker_batch
+            logits_output, next_token_ids, _ = (
+                self.target_worker.forward_batch_generation(model_worker_batch)
             )
 
-            return logits_output, next_token_ids, model_worker_batch.bid, 0
+            return logits_output, next_token_ids, model_worker_batch.bid, 0, False
         else:
             logits_output, next_token_ids, bid = self.forward_target_extend(batch)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids
                 )
-            return logits_output, next_token_ids, bid, 0
+            return logits_output, next_token_ids, bid, 0, False
 
     def forward_target_extend(
         self, batch: ScheduleBatch
@@ -301,7 +334,7 @@ class EAGLEWorker(TpModelWorker):
         # We need the full hidden states to prefill the KV cache of the draft model.
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        logits_output, next_token_ids = self.target_worker.forward_batch_generation(
+        logits_output, next_token_ids, _ = self.target_worker.forward_batch_generation(
             model_worker_batch
         )
         return logits_output, next_token_ids, model_worker_batch.bid
@@ -482,9 +515,41 @@ class EAGLEWorker(TpModelWorker):
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = spec_info
         model_worker_batch = batch.get_model_worker_batch()
-        logits_output, _ = self.target_worker.forward_batch_generation(
-            model_worker_batch, skip_sample=True
+
+        if batch.has_grammar:
+            retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
+            retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
+            draft_tokens_cpu = spec_info.draft_token.view(
+                spec_info.retrive_next_token.shape
+            ).cpu()
+
+        # Forward
+        logits_output, _, can_run_cuda_graph = (
+            self.target_worker.forward_batch_generation(
+                model_worker_batch, skip_sample=True
+            )
         )
+
+        vocab_mask = None
+        if batch.has_grammar:
+            # Generate the logit mask for structured output.
+            # Overlap the CPU operations for bitmask generation with the forward pass.
+            vocab_mask = generate_token_bitmask(
+                batch.reqs,
+                spec_info,
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+                batch.sampling_info.vocab_size,
+            )
+
+            if vocab_mask is not None:
+                assert spec_info.grammar is not None
+                vocab_mask = vocab_mask.to(spec_info.retrive_next_token.device)
+                # otherwise, this vocab mask will be the one from the previous extend stage
+                # and will be applied to produce wrong results
+                batch.sampling_info.vocab_mask = None
+
         self._detect_nan_if_needed(logits_output)
         spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(
@@ -492,14 +557,15 @@ class EAGLEWorker(TpModelWorker):
             logits_output,
             self.token_to_kv_pool_allocator,
             self.page_size,
+            vocab_mask,
         )
 
         # Post process based on verified outputs.
-        # Pick indices that we care (accepeted)
+        # Pick indices that we care (accepted)
         logits_output.next_token_logits = logits_output.next_token_logits[
-            res.accepeted_indices
+            res.accepted_indices
         ]
-        logits_output.hidden_states = logits_output.hidden_states[res.accepeted_indices]
+        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = ForwardMode.DECODE
@@ -508,7 +574,7 @@ class EAGLEWorker(TpModelWorker):
         if batch.return_logprob:
             self.add_logprob_values(batch, res, logits_output)
 
-        return logits_output, res, model_worker_batch
+        return logits_output, res, model_worker_batch, can_run_cuda_graph
 
     def add_logprob_values(
         self,
@@ -594,14 +660,14 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch, self.draft_model_runner
         )
         forward_batch.return_logprob = False
-        logits_output = self.draft_model_runner.forward(forward_batch)
+        logits_output, _ = self.draft_model_runner.forward(forward_batch)
         self._detect_nan_if_needed(logits_output)
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        # Backup fileds that will be modified in-place
+        # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
         req_pool_indices_backup = batch.req_pool_indices
         accept_length_backup = batch.spec_info.accept_length
@@ -612,6 +678,7 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info.prepare_extend_after_decode(
             batch,
             self.speculative_num_steps,
+            pad_input=self.cuda_graph_runner_for_draft_extend is not None,
         )
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         batch.return_logprob = False
@@ -621,7 +688,19 @@ class EAGLEWorker(TpModelWorker):
         )
 
         # Run
-        logits_output = self.draft_model_runner.forward(forward_batch)
+        can_cuda_graph = (
+            self.cuda_graph_runner_for_draft_extend
+            and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
+        )
+        if can_cuda_graph:
+            logits_output = self.cuda_graph_runner_for_draft_extend.replay(
+                forward_batch
+            )
+        else:
+            self.draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+            logits_output = self.draft_model_runner.model.forward(
+                forward_batch.input_ids, forward_batch.positions, forward_batch
+            )
 
         self._detect_nan_if_needed(logits_output)
         self.capture_for_decode(logits_output, forward_batch.spec_info)

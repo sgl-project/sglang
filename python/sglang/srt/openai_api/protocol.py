@@ -183,12 +183,17 @@ class CompletionRequest(BaseModel):
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
 
+    # For PD disaggregation
+    bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
+    bootstrap_room: Optional[int] = None
+
 
 class CompletionResponseChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Literal["stop", "length", "content_filter"]
+    finish_reason: Literal["stop", "length", "content_filter", "abort"]
     matched_stop: Union[None, int, str] = None
 
 
@@ -250,9 +255,29 @@ ChatCompletionMessageContentPart = Union[
 ]
 
 
+class FunctionResponse(BaseModel):
+    """Function response."""
+
+    name: Optional[str] = None
+    arguments: Optional[str] = None
+
+
+class ToolCall(BaseModel):
+    """Tool call response."""
+
+    id: Optional[str] = None
+    index: Optional[int] = None
+    type: Literal["function"] = "function"
+    function: FunctionResponse
+
+
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool"]
     content: Union[str, List[ChatCompletionMessageContentTextPart], None]
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
+    reasoning_content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
 
 class ChatCompletionMessageUserParam(BaseModel):
@@ -320,7 +345,16 @@ class ChatCompletionRequest(BaseModel):
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: bool = False
     top_logprobs: Optional[int] = None
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = Field(
+        default=None,
+        deprecated="max_tokens is deprecated in favor of the max_completion_tokens field",
+        description="The maximum number of tokens that can be generated in the chat completion. ",
+    )
+    max_completion_tokens: Optional[int] = Field(
+        default=None,
+        description="The maximum number of completion tokens for a chat completion request, "
+        "including visible output tokens and reasoning tokens. Input tokens are not included. ",
+    )
     n: int = 1
     presence_penalty: float = 0.0
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
@@ -361,21 +395,15 @@ class ChatCompletionRequest(BaseModel):
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
+    chat_template_kwargs: Optional[Dict] = None
 
+    # The request id.
+    rid: Optional[str] = None
 
-class FunctionResponse(BaseModel):
-    """Function response."""
-
-    name: Optional[str] = None
-    arguments: Optional[str] = None
-
-
-class ToolCall(BaseModel):
-    """Tool call response."""
-
-    id: str
-    type: Literal["function"] = "function"
-    function: FunctionResponse
+    # For PD disaggregation
+    bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
+    bootstrap_room: Optional[int] = None
 
 
 class ChatMessage(BaseModel):
@@ -390,7 +418,7 @@ class ChatCompletionResponseChoice(BaseModel):
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Literal[
-        "stop", "length", "tool_calls", "content_filter", "function_call"
+        "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
     ]
     matched_stop: Union[None, int, str] = None
 
@@ -445,6 +473,9 @@ class EmbeddingRequest(BaseModel):
     encoding_format: str = "float"
     dimensions: int = None
     user: Optional[str] = None
+
+    # The request id.
+    rid: Optional[str] = None
 
 
 class EmbeddingObject(BaseModel):

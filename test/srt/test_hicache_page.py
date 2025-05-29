@@ -24,7 +24,9 @@ class TestHiCachePage(CustomTestCase):
             other_args=[
                 "--enable-hierarchical-cache",
                 "--page-size",
-                "32",
+                32,
+                "--hicache-write-policy",
+                "write-back",
             ],
         )
 

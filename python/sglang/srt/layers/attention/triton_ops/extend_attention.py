@@ -23,10 +23,10 @@ import triton.language as tl
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_cuda, is_hip
 
-is_cuda_available = torch.cuda.is_available()
-if is_cuda_available:
+_is_cuda = is_cuda()
+if _is_cuda:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 _is_hip = is_hip()
@@ -345,12 +345,12 @@ def extend_attention_fwd(
         num_warps = 4
 
     else:
-        if is_cuda_available and CUDA_CAPABILITY[0] >= 9:
+        if _is_cuda and CUDA_CAPABILITY[0] >= 9:
             if Lq <= 256:
                 BLOCK_M, BLOCK_N = (128, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
-        elif is_cuda_available and CUDA_CAPABILITY[0] >= 8:
+        elif _is_cuda and CUDA_CAPABILITY[0] >= 8:
             # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
             if CUDA_CAPABILITY[1] == 9 or CUDA_CAPABILITY[1] == 6:
                 if Lq <= 128:

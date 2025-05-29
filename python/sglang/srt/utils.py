@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
+
 import base64
 import builtins
 import ctypes
@@ -43,9 +44,22 @@ from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
+from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    List,
+    Optional,
+    Protocol,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import numpy as np
 import psutil
@@ -78,10 +92,34 @@ time_infos = {}
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
+_warned_bool_env_var_keys = set()
+
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
-    return value.lower() in ("true", "1")
+    value = value.lower()
+
+    truthy_values = ("true", "1")
+    falsy_values = ("false", "0")
+
+    if (value not in truthy_values) and (value not in falsy_values):
+        if value not in _warned_bool_env_var_keys:
+            logger.warning(
+                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+            )
+        _warned_bool_env_var_keys.add(value)
+
+    return value in truthy_values
+
+
+def get_int_env_var(name: str, default: int = 0) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -100,10 +138,6 @@ builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
 builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
 
-def is_rocm() -> bool:
-    return torch.cuda.is_available() and torch.version.hip
-
-
 def is_cuda():
     return torch.cuda.is_available() and torch.version.cuda
 
@@ -120,6 +154,10 @@ def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
+def is_npu() -> bool:
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.
@@ -128,10 +166,6 @@ def is_flashinfer_available():
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
-
-
-def is_cuda_available():
-    return is_cuda()
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -225,7 +259,7 @@ def mark_start(name, interval=0.1, color=0, indent=0):
     torch.cuda.synchronize()
     if time_infos.get(name, None) is None:
         time_infos[name] = TimeInfo(name, interval, color, indent)
-    time_infos[name].acc_time -= time.time()
+    time_infos[name].acc_time -= time.perf_counter()
 
 
 def mark_end(name):
@@ -233,7 +267,7 @@ def mark_end(name):
     if not show_time_cost:
         return
     torch.cuda.synchronize()
-    time_infos[name].acc_time += time.time()
+    time_infos[name].acc_time += time.perf_counter()
     if time_infos[name].check():
         time_infos[name].pretty_print()
 
@@ -243,11 +277,11 @@ def calculate_time(show=False, min_cost_ms=0.0):
         def inner_func(*args, **kwargs):
             torch.cuda.synchronize()
             if show:
-                start_time = time.time()
+                start_time = time.perf_counter()
             result = func(*args, **kwargs)
             torch.cuda.synchronize()
             if show:
-                cost_time = (time.time() - start_time) * 1000
+                cost_time = (time.perf_counter() - start_time) * 1000
                 if cost_time > min_cost_ms:
                     print(f"Function {func.__name__} took {cost_time} ms to run.")
             return result
@@ -257,7 +291,9 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
-def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True):
+def get_available_gpu_memory(
+    device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
+):
     """
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
@@ -307,12 +343,22 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
         free_gpu_memory = psutil.virtual_memory().available
+    elif device == "npu":
+        num_gpus = torch.npu.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.npu.current_device() != gpu_id:
+            print(
+                f"WARNING: current device is not {gpu_id}, but {torch.npu.current_device()}, ",
+                "which may cause useless memory allocation for torch NPU context.",
+            )
+        free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
 
     if distributed:
-        tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
-            torch.device(device, gpu_id)
+        tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
+        torch.distributed.all_reduce(
+            tensor, op=torch.distributed.ReduceOp.MIN, group=cpu_group
         )
-        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
         free_gpu_memory = tensor.item()
 
     return free_gpu_memory / (1 << 30)
@@ -394,16 +440,40 @@ class LayerFn(Protocol):
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
+    pp_rank: Optional[int] = None,
+    pp_size: Optional[int] = None,
     prefix: str = "",
+    return_tuple: bool = False,
 ) -> Tuple[int, int, torch.nn.ModuleList]:
     """Make a list of layers with the given layer function"""
+    # circula imports
+    from sglang.srt.distributed import get_pp_indices
+    from sglang.srt.layers.utils import PPMissingLayer
+
+    assert not pp_size or num_hidden_layers >= pp_size
+    start_layer, end_layer = (
+        get_pp_indices(
+            num_hidden_layers,
+            pp_rank,
+            pp_size,
+        )
+        if pp_rank is not None and pp_size is not None
+        else (0, num_hidden_layers)
+    )
     modules = torch.nn.ModuleList(
-        [
+        [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
+        + [
             maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
-            for idx in range(num_hidden_layers)
+            for idx in range(start_layer, end_layer)
+        ]
+        + [
+            PPMissingLayer(return_tuple=return_tuple)
+            for _ in range(end_layer, num_hidden_layers)
         ]
     )
-    return modules
+    if pp_rank is None or pp_size is None:
+        return modules
+    return modules, start_layer, end_layer
 
 
 def set_random_seed(seed: int) -> None:
@@ -774,6 +844,8 @@ def add_api_key_middleware(app, api_key: str):
             return await call_next(request)
         if request.url.path.startswith("/health"):
             return await call_next(request)
+        if request.url.path.startswith("/metrics"):
+            return await call_next(request)
         if request.headers.get("Authorization") != "Bearer " + api_key:
             return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
@@ -850,12 +922,15 @@ def broadcast_pyobj(
     src: int = 0,
     force_cpu_device: bool = True,
 ):
-    """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
+    """Broadcast inputs from src rank to all other ranks with torch.dist backend.
+    The `rank` here refer to the source rank on global process group (regardless
+    of dist_group argument).
+    """
     device = torch.device(
         "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
     )
 
-    if rank == 0:
+    if rank == src:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.broadcast(tensor_size, src=src, group=dist_group)
@@ -885,6 +960,50 @@ def broadcast_pyobj(
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
         return data
+
+
+def point_to_point_pyobj(
+    data: List[Any],
+    rank: int,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    src: int = 0,
+    dst: int = 1,
+):
+    """Send data from src to dst in group."""
+
+    if rank == src:
+        if len(data) == 0:
+            tensor_size = torch.tensor([0], dtype=torch.long)
+            dist.send(tensor_size, dst=dst, group=group)
+        else:
+            serialized_data = pickle.dumps(data)
+            size = len(serialized_data)
+            tensor_data = torch.ByteTensor(
+                np.frombuffer(serialized_data, dtype=np.uint8)
+            )
+            tensor_size = torch.tensor([size], dtype=torch.long)
+
+            dist.send(tensor_size, dst=dst, group=group)
+            dist.send(tensor_data, dst=dst, group=group)
+        return data
+
+    elif rank == dst:
+        tensor_size = torch.tensor([0], dtype=torch.long)
+        dist.recv(tensor_size, src=src, group=group)
+        size = tensor_size.item()
+
+        if size == 0:
+            return []
+
+        tensor_data = torch.empty(size, dtype=torch.uint8)
+        dist.recv(tensor_data, src=src, group=group)
+
+        serialized_data = bytes(tensor_data.cpu().numpy())
+        data = pickle.loads(serialized_data)
+        return data
+
+    # Other ranks in pp_group do nothing
+    return []
 
 
 step_counter = 0
@@ -930,6 +1049,8 @@ def get_zmq_socket(
         buf_size = -1
 
     socket = context.socket(socket_type)
+    if endpoint.find("[") != -1:
+        socket.setsockopt(zmq.IPV6, 1)
 
     def set_send_opt():
         socket.setsockopt(zmq.SNDHWM, 0)
@@ -1146,6 +1267,20 @@ def get_hpu_memory_capacity():
         )
 
 
+def get_device_memory_capacity(device: str = None):
+    if is_cuda():
+        gpu_mem = get_nvgpu_memory_capacity()
+    elif is_hip():
+        gpu_mem = get_amdgpu_memory_capacity()
+    elif device == "hpu":
+        gpu_mem = get_hpu_memory_capacity()
+    else:
+        # GPU memory is not known yet or no GPU is available.
+        gpu_mem = None
+
+    return gpu_mem
+
+
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
 # https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/utils/distributed_util.py
@@ -1237,6 +1372,9 @@ def get_device_name(device_id: int = 0) -> str:
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return torch.hpu.get_device_name(device_id)
+
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.npu.get_device_name(device_id)
 
 
 @lru_cache(maxsize=1)
@@ -1333,6 +1471,13 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 def get_compiler_backend() -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
+
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        import torchair
+
+        config = torchair.CompilerConfig()
+        npu_backend = torchair.get_npu_backend(compiler_config=config)
+        return npu_backend
 
     return "inductor"
 
@@ -1701,6 +1846,13 @@ def configure_ipv6(dist_init_addr):
     return port, host
 
 
+def rank0_log(msg: str):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() == 0:
+        logger.info(msg)
+
+
 def rank0_print(msg: str):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
@@ -1715,6 +1867,8 @@ def get_cuda_version():
 
 
 def launch_dummy_health_check_server(host, port):
+    import asyncio
+
     import uvicorn
     from fastapi import FastAPI, Response
 
@@ -1730,13 +1884,27 @@ def launch_dummy_health_check_server(host, port):
         """Check the health of the http server."""
         return Response(status_code=200)
 
-    uvicorn.run(
+    config = uvicorn.Config(
         app,
         host=host,
         port=port,
         timeout_keep_alive=5,
-        loop="uvloop",
+        loop="auto",
+        log_config=None,
+        log_level="warning",
     )
+    server = uvicorn.Server(config=config)
+
+    try:
+        loop = asyncio.get_running_loop()
+        logger.info(
+            f"Dummy health check server scheduled on existing loop at {host}:{port}"
+        )
+        loop.create_task(server.serve())
+
+    except RuntimeError:
+        logger.info(f"Starting dummy health check server at {host}:{port}")
+        server.run()
 
 
 def create_checksum(directory: str):
@@ -1865,6 +2033,14 @@ class DeepEPMode(Enum):
             return DeepEPMode.normal
 
 
+def is_non_idle_and_non_empty(forward_mode, hidden_states):
+    return (
+        (forward_mode is not None)
+        and not forward_mode.is_idle()
+        and hidden_states.shape[0] > 0
+    )
+
+
 def fast_topk(values, topk, dim):
     if topk == 1:
         # Use max along the specified dimension to get both value and index
@@ -1874,13 +2050,16 @@ def fast_topk(values, topk, dim):
         return torch.topk(values, topk, dim=dim)
 
 
-def is_hopper_with_cuda_12_3():
+def _check(cc_major):
     if not is_cuda():
         return False
-    is_hopper = torch.cuda.get_device_capability()[0] == 9
-    cuda_version = torch.version.cuda.split(".")
-    is_cuda_compatible = int(cuda_version[0]) == 12 and int(cuda_version[1]) >= 3
-    return is_hopper and is_cuda_compatible
+    return torch.cuda.get_device_capability()[0] == cc_major and tuple(
+        map(int, torch.version.cuda.split(".")[:2])
+    ) >= (12, 3)
+
+
+is_ampere_with_cuda_12_3 = lambda: _check(8)
+is_hopper_with_cuda_12_3 = lambda: _check(9)
 
 
 def get_free_port():
@@ -1913,13 +2092,15 @@ def get_local_ip_by_remote() -> str:
         s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
     except Exception:
-        raise ValueError(f"Can not get local ip")
+        raise ValueError("Can not get local ip")
 
 
 def is_page_size_one(server_args):
     return server_args.page_size == 1
 
 
+# TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
+# TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
 def is_no_spec_infer_or_topk_one(server_args):
     return server_args.speculative_eagle_topk is None or (
         server_args.speculative_eagle_topk is not None
@@ -1936,8 +2117,10 @@ def is_fa3_default_architecture(hf_config):
         "Qwen2ForCausalLM",
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
-        "MistralForCausalLM",
         "Gemma2ForCausalLM",
+        "Gemma3ForConditionalGeneration",
+        "Qwen3ForCausalLM",
+        "Qwen3MoeForCausalLM",
     }
     return architectures[0] in default_archs
 
@@ -1953,3 +2136,91 @@ class BumpAllocator:
         output = self._buffer[self._pointer : self._pointer + size]
         self._pointer += size
         return output
+
+
+def log_info_on_rank0(logger, msg):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() == 0:
+        logger.info(msg)
+
+
+def load_json_config(data: str):
+    try:
+        return json.loads(data)
+    except JSONDecodeError:
+        return json.loads(Path(data).read_text())
+
+
+def dispose_tensor(x: torch.Tensor):
+    x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
+
+
+T = TypeVar("T")
+
+
+class Withable(Generic[T]):
+    def __init__(self):
+        self._value: Optional[T] = None
+
+    @property
+    def value(self) -> T:
+        return self._value
+
+    @contextmanager
+    def with_value(self, new_value: T):
+        assert self._value is None
+        self._value = new_value
+        try:
+            yield
+        finally:
+            assert self._value is new_value
+            self._value = None
+
+
+def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
+    import huggingface_hub as hf
+
+    # Build cache path
+    cache_path = os.path.join(
+        hf.constants.HF_HUB_CACHE,
+        hf.constants.REPO_ID_SEPARATOR.join(["models", *repo_id.split("/")]),
+    )
+
+    # Get revision from main ref if not specified
+    if not revision:
+        ref_path = os.path.join(cache_path, "refs", "main")
+        if os.path.isfile(ref_path):
+            with open(ref_path) as f:
+                revision = f.read().strip()
+
+    # List files from revision directory
+    if revision:
+        rev_dir = os.path.join(cache_path, "snapshots", revision)
+        if os.path.isdir(rev_dir):
+            return rev_dir
+
+    return None
+
+
+def read_system_prompt_from_file(model_name: str) -> str:
+    """Read system prompt from a file in the HuggingFace cache directory.
+
+    Args:
+        model_name: The model name to construct the file path
+
+    Returns:
+        The system prompt content from the file, or empty string if file not found
+    """
+    try:
+        local_repo_dir = find_local_repo_dir(model_name)
+        if local_repo_dir:
+            system_prompt_file = os.path.join(local_repo_dir, "SYSTEM_PROMPT.txt")
+            if os.path.exists(system_prompt_file):
+                with open(system_prompt_file, "r", encoding="utf-8") as f:
+                    return f.read()
+
+        return ""
+    except Exception:
+        # If anything fails, return empty string
+        return ""

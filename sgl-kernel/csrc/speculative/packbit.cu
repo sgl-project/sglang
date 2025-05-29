@@ -1,4 +1,4 @@
-// This is only a pluggin used for flashinfer 0.1.6. The new version does not need it.
+// This is only a plugin used for flashinfer 0.1.6. The new version does not need it.
 /*
  * Copyright (c) 2025 by SGLang team.
  * Copyright (c) 2025 by FlashInfer team.

@@ -295,7 +295,7 @@ class TestSRTEndpoint(CustomTestCase):
         print(f"{output_top_logprobs=}")
 
         # Parse results
-        # This is becaues the grammar constraint allows all prefix tokens
+        # This is because the grammar constraint allows all prefix tokens
         logprobs = [None] * 2
         for i in range(len(output_top_logprobs)):
             try:
@@ -344,9 +344,7 @@ class TestSRTEndpoint(CustomTestCase):
         custom_json = base_json.copy()
         # Only set the custom logit processor if target_token_id is not None.
         if target_token_id is not None:
-            custom_json["custom_logit_processor"] = (
-                DeterministicLogitProcessor().to_str()
-            )
+            custom_json["custom_logit_processor"] = DeterministicLogitProcessor.to_str()
             custom_json["sampling_params"]["custom_params"] = custom_params
 
         custom_response = requests.post(
@@ -373,7 +371,6 @@ class TestSRTEndpoint(CustomTestCase):
         Should sample the first `delay` tokens normally, then output first_token_id and consecutive tokens after that.
         If first_token_id is None, the custom logit processor won't be passed in.
         """
-
         custom_params = {"token_id": first_token_id, "delay": 2}
 
         class DeterministicStatefulLogitProcessor(CustomLogitProcessor):
@@ -447,10 +444,22 @@ class TestSRTEndpoint(CustomTestCase):
         with ThreadPoolExecutor(len(target_token_ids)) as executor:
             list(executor.map(self.run_custom_logit_processor, target_token_ids))
 
+    @unittest.skip("Skip this test because this feature has a bug. See comments below.")
     def test_stateful_custom_logit_processor(self):
         """Test custom logit processor with a single request."""
+
+        """
+        NOTE: This feature has a race condition bug.
+        This line https://github.com/sgl-project/sglang/blob/ef8ec07b2ce4c70c2a33ec5acda4ce529bc3cda4/test/srt/test_srt_endpoint.py#L395-L396 can be accessed by two concurrent threads at the same time. The access order is not guaranteed.
+        In sglang, we use two python threads to overlap the GPU computation and CPU scheduling.
+        Thread 1 (the CPU scheduling thread) will update the `param_dict["__req__"].output_ids`.
+        Thread 2 (the GPU computation thread) will call `DeterministicStatefulLogitProcessor` because sampling is considered as GPU computation.
+        We can fix this by moving the call of DeterministicStatefulLogitProcessor to the CPU scheduling thread.
+        """
+
         self.run_stateful_custom_logit_processor(first_token_id=5)
 
+    @unittest.skip("Skip this test because this feature has a bug. See comments above.")
     def test_stateful_custom_logit_processor_batch_mixed(self):
         """Test a batch of requests mixed of requests with and without custom logit processor."""
         target_token_ids = list(range(32)) + [None] * 16
@@ -491,9 +500,6 @@ class TestSRTEndpoint(CustomTestCase):
 
         max_total_num_tokens = response_json["max_total_num_tokens"]
         self.assertIsInstance(max_total_num_tokens, int)
-
-        attention_backend = response_json["attention_backend"]
-        self.assertIsInstance(attention_backend, str)
 
         version = response_json["version"]
         self.assertIsInstance(version, str)

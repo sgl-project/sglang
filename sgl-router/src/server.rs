@@ -1,26 +1,31 @@
+use crate::logging::{self, LoggingConfig};
+use crate::prometheus::{self, PrometheusConfig};
 use crate::router::PolicyConfig;
 use crate::router::Router;
+use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
 use actix_web::{
     error, get, post, web, App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use bytes::Bytes;
-use env_logger::Builder;
 use futures_util::StreamExt;
-use log::{info, LevelFilter};
+use reqwest::Client;
 use std::collections::HashMap;
-use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::spawn;
+use tracing::{error, info, warn, Level};
 
 #[derive(Debug)]
 pub struct AppState {
     router: Router,
-    client: reqwest::Client,
+    client: Client,
 }
 
 impl AppState {
     pub fn new(
         worker_urls: Vec<String>,
-        client: reqwest::Client,
+        client: Client,
         policy_config: PolicyConfig,
     ) -> Result<Self, String> {
         // Create router based on policy
@@ -128,6 +133,13 @@ async fn add_worker(
     }
 }
 
+#[get("/list_workers")]
+async fn list_workers(data: web::Data<AppState>) -> impl Responder {
+    let workers = data.router.get_worker_urls();
+    let worker_list = workers.read().unwrap().clone();
+    HttpResponse::Ok().json(serde_json::json!({ "urls": worker_list }))
+}
+
 #[post("/remove_worker")]
 async fn remove_worker(
     query: web::Query<HashMap<String, String>>,
@@ -148,30 +160,42 @@ pub struct ServerConfig {
     pub policy_config: PolicyConfig,
     pub verbose: bool,
     pub max_payload_size: usize,
+    pub log_dir: Option<String>,
+    pub service_discovery_config: Option<ServiceDiscoveryConfig>,
+    pub prometheus_config: Option<PrometheusConfig>,
 }
 
 pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
-    // Initialize logger
-    Builder::new()
-        .format(|buf, record| {
-            use chrono::Local;
-            writeln!(
-                buf,
-                "[Router (Rust)] {} - {} - {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S"),
-                record.level(),
-                record.args()
-            )
-        })
-        .filter(
-            None,
-            if config.verbose {
-                LevelFilter::Debug
+    // Only initialize logging if not already done (for Python bindings support)
+    static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+    let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
+        Some(logging::init_logging(LoggingConfig {
+            level: if config.verbose {
+                Level::DEBUG
             } else {
-                LevelFilter::Info
+                Level::INFO
             },
-        )
-        .init();
+            json_format: false,
+            log_dir: config.log_dir.clone(),
+            colorize: true,
+            log_file_name: "sgl-router".to_string(),
+            log_targets: None,
+        }))
+    } else {
+        None
+    };
+
+    // Initialize prometheus metrics exporter
+    if let Some(prometheus_config) = config.prometheus_config {
+        info!(
+            "🚧 Initializing Prometheus metrics on {}:{}",
+            prometheus_config.host, prometheus_config.port
+        );
+        prometheus::start_prometheus(prometheus_config);
+    } else {
+        info!("🚧 Prometheus metrics disabled");
+    }
 
     info!("🚧 Initializing router on {}:{}", config.host, config.port);
     info!("🚧 Initializing workers on {:?}", config.worker_urls);
@@ -181,7 +205,15 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         config.max_payload_size / (1024 * 1024)
     );
 
-    let client = reqwest::Client::builder()
+    // Log service discovery status
+    if let Some(service_discovery_config) = &config.service_discovery_config {
+        info!("🚧 Service discovery enabled");
+        info!("🚧 Selector: {:?}", service_discovery_config.selector);
+    } else {
+        info!("🚧 Service discovery disabled");
+    }
+
+    let client = Client::builder()
         .pool_idle_timeout(Some(Duration::from_secs(50)))
         .build()
         .expect("Failed to create HTTP client");
@@ -189,11 +221,35 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     let app_state = web::Data::new(
         AppState::new(
             config.worker_urls.clone(),
-            client,
+            client.clone(), // Clone the client here
             config.policy_config.clone(),
         )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
     );
+
+    // Start the service discovery if enabled
+    if let Some(service_discovery_config) = config.service_discovery_config {
+        if service_discovery_config.enabled {
+            let worker_urls = Arc::clone(&app_state.router.get_worker_urls());
+
+            match start_service_discovery(service_discovery_config, worker_urls).await {
+                Ok(handle) => {
+                    info!("✅ Service discovery started successfully");
+
+                    // Spawn a task to handle the service discovery thread
+                    spawn(async move {
+                        if let Err(e) = handle.await {
+                            error!("Service discovery task failed: {:?}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to start service discovery: {}", e);
+                    warn!("Continuing without service discovery");
+                }
+            }
+        }
+    }
 
     info!("✅ Serving router on {}:{}", config.host, config.port);
     info!("✅ Serving workers on {:?}", config.worker_urls);
@@ -217,10 +273,11 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
             .service(get_server_info)
             .service(add_worker)
             .service(remove_worker)
+            .service(list_workers)
             // Default handler for unmatched routes.
             .default_service(web::route().to(sink_handler))
     })
-    .bind((config.host, config.port))?
+    .bind_auto_h2c((config.host, config.port))?
     .run()
     .await
 }
