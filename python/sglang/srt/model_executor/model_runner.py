@@ -37,6 +37,7 @@ from sglang.srt.distributed import (
     set_custom_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -51,6 +52,7 @@ from sglang.srt.layers.quantization.deep_gemm import (
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_distribution import (
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
@@ -71,8 +73,8 @@ from sglang.srt.mem_cache.memory_pool import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
-from sglang.srt.model_executor import expert_location_updater
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import (
@@ -165,6 +167,9 @@ class ModelRunner:
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
+        self.is_multimodal_chunked_prefill_supported = (
+            model_config.is_multimodal_chunked_prefill_supported
+        )
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -194,6 +199,8 @@ class ModelRunner:
                 "disable_radix_cache": server_args.disable_radix_cache,
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
+                "enable_two_batch_overlap": server_args.enable_two_batch_overlap,
+                "enable_dp_lm_head": server_args.enable_dp_lm_head,
                 "enable_ep_moe": server_args.enable_ep_moe,
                 "enable_deepep_moe": server_args.enable_deepep_moe,
                 "deepep_config": server_args.deepep_config,
@@ -254,6 +261,13 @@ class ModelRunner:
                     rank=self.tp_rank,
                 )
             )
+
+        self.eplb_manager = (
+            EPLBManager(self)
+            if self.server_args.enable_eplb and (not self.is_draft_worker)
+            else None
+        )
+        self.expert_location_updater = ExpertLocationUpdater()
 
         # Load the model
         self.sampler = Sampler()
@@ -382,12 +396,15 @@ class ModelRunner:
         if self.is_multimodal:
             self.mem_fraction_static *= 0.90
             logger.info(
-                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} because this is a multimodal model."
+                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} "
+                f"because this is a multimodal model."
             )
-            server_args.chunked_prefill_size = -1
-            logger.info(
-                "Automatically turn off --chunked-prefill-size for multimodal model."
-            )
+            if not self.is_multimodal_chunked_prefill_supported:
+                server_args.chunked_prefill_size = -1
+                logger.info(
+                    f"Automatically turn of --chunked-prefill-size as it is not supported for "
+                    f"{self.model_config.hf_config.model_type}"
+                )
 
         if not self.use_mla_backend:
             server_args.disable_chunked_prefix_cache = True
@@ -397,6 +414,10 @@ class ModelRunner:
 
         if not server_args.disable_chunked_prefix_cache:
             logger.info("Chunked prefix cache is turned on.")
+
+        if server_args.attention_backend == "aiter":
+            if self.model_config.context_len > 8192:
+                self.mem_fraction_static *= 0.85
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -580,7 +601,7 @@ class ModelRunner:
     def update_expert_location(
         self, new_expert_location_metadata: ExpertLocationMetadata
     ):
-        expert_location_updater.update_expert_location(
+        self.expert_location_updater.update(
             self.model.routed_experts_weights_of_layer,
             new_expert_location_metadata,
             nnodes=self.server_args.nnodes,
@@ -775,12 +796,15 @@ class ModelRunner:
             distributed=get_world_group().world_size > 1,
             cpu_group=get_world_group().cpu_group,
         )
-        if self.use_mla_backend:
-            num_layers = (
-                self.model_config.num_hidden_layers
-                if not self.is_draft_worker
-                else self.model_config.hf_config.num_nextn_predict_layers
+        if self.is_draft_worker:
+            num_layers = getattr(
+                self.model_config.hf_config,
+                "num_nextn_predict_layers",
+                self.num_effective_layers,
             )
+        else:
+            num_layers = self.num_effective_layers
+        if self.use_mla_backend:
             # FIXME: pipeline parallelism is not compatible with mla backend
             assert self.pp_size == 1
             cell_size = (
@@ -792,7 +816,7 @@ class ModelRunner:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
                 * self.model_config.head_dim
-                * self.num_effective_layers
+                * num_layers
                 * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
@@ -973,6 +997,13 @@ class ModelRunner:
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
+        if self.server_args.enable_two_batch_overlap:
+            self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
+        else:
+            self.attn_backend = self._get_attention_backend()
+
+    # TODO unify with 6338
+    def _get_attention_backend(self):
         if self.server_args.attention_backend == "flashinfer":
             if not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -982,17 +1013,17 @@ class ModelRunner:
                 # Init streams
                 if self.server_args.speculative_algorithm == "EAGLE":
                     self.plan_stream_for_flashinfer = torch.cuda.Stream()
-                self.attn_backend = FlashInferAttnBackend(self)
+                return FlashInferAttnBackend(self)
             else:
                 from sglang.srt.layers.attention.flashinfer_mla_backend import (
                     FlashInferMLAAttnBackend,
                 )
 
-                self.attn_backend = FlashInferMLAAttnBackend(self)
+                return FlashInferMLAAttnBackend(self)
         elif self.server_args.attention_backend == "aiter":
             from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
-            self.attn_backend = AiterAttnBackend(self)
+            return AiterAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
             assert self.sliding_window_size is None, (
                 "Window attention is not supported in the triton attention backend. "
@@ -1007,21 +1038,21 @@ class ModelRunner:
                     DoubleSparseAttnBackend,
                 )
 
-                self.attn_backend = DoubleSparseAttnBackend(self)
+                return DoubleSparseAttnBackend(self)
             else:
                 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
-                self.attn_backend = TritonAttnBackend(self)
+                return TritonAttnBackend(self)
         elif self.server_args.attention_backend == "torch_native":
             from sglang.srt.layers.attention.torch_native_backend import (
                 TorchNativeAttnBackend,
             )
 
-            self.attn_backend = TorchNativeAttnBackend(self)
+            return TorchNativeAttnBackend(self)
         elif self.server_args.attention_backend == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
-            self.attn_backend = FlashMLABackend(self)
+            return FlashMLABackend(self)
         elif self.server_args.attention_backend == "fa3":
             assert (
                 torch.cuda.get_device_capability()[0] == 8 and not self.use_mla_backend
@@ -1033,13 +1064,13 @@ class ModelRunner:
                 FlashAttentionBackend,
             )
 
-            self.attn_backend = FlashAttentionBackend(self)
+            return FlashAttentionBackend(self)
         elif self.server_args.attention_backend == "cutlass_mla":
             from sglang.srt.layers.attention.cutlass_mla_backend import (
                 CutlassMLABackend,
             )
 
-            self.attn_backend = CutlassMLABackend(self)
+            return CutlassMLABackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
@@ -1152,9 +1183,14 @@ class ModelRunner:
             self.forward_pass_id,
             forward_batch,
         ):
-            return self._forward_raw(
+            output = self._forward_raw(
                 forward_batch, skip_attn_backend_init, pp_proxy_tensors
             )
+
+        if self.eplb_manager is not None:
+            self.eplb_manager.on_forward_pass_end(self.forward_pass_id)
+
+        return output
 
     def _forward_raw(
         self,
