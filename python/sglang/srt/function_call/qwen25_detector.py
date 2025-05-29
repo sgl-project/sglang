@@ -29,6 +29,7 @@ class Qwen25Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<tool_call>\n"
         self.eot_token = "\n</tool_call>"
+        self.tool_call_separator = "\n"
         self._normal_text_buffer = ""  # Buffer for handling partial end tokens
 
     def has_tool_call(self, text: str) -> bool:

@@ -36,7 +36,7 @@ class BaseFormatDetector(ABC):
         )  # map what has been streamed for each tool so far to a list
         self.bot_token = ""
         self.eot_token = ""
-        self.tool_call_separator = "; "
+        self.tool_call_separator = ", "
 
     def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
         tool_indices = {
@@ -108,7 +108,16 @@ class BaseFormatDetector(ABC):
         self._buffer += new_text
         current_text = self._buffer
 
-        if not (self.bot_token in current_text or current_text.startswith("{")):
+        # The current_text has tool_call if it is the start of a new tool call sequence
+        # or it is the start of a new tool call after a tool call separator, when there is a previous tool call
+        if not (
+            self.bot_token in current_text
+            or current_text.startswith("{")
+            or (
+                self.current_tool_id > 0
+                and current_text.startswith(self.tool_call_separator + "{")
+            )
+        ):
             # Only clear buffer if we're sure no tool call is starting
             if not self._ends_with_partial_token(self._buffer, self.bot_token):
                 normal_text = self._buffer
@@ -132,11 +141,14 @@ class BaseFormatDetector(ABC):
 
         try:
             try:
-                start_idx = (
-                    len(self.bot_token)
-                    if current_text.startswith(self.bot_token)
-                    else 0
-                )
+                if current_text.startswith(self.bot_token):
+                    start_idx = len(self.bot_token)
+                elif self.current_tool_id > 0 and current_text.startswith(
+                    self.tool_call_separator
+                ):
+                    start_idx = len(self.tool_call_separator)
+                else:
+                    start_idx = 0
 
                 if start_idx >= len(current_text):
                     return StreamingParseResult()
@@ -228,9 +240,7 @@ class BaseFormatDetector(ABC):
                         )  # Save the ID of the tool that's completing
 
                         # Only remove the processed portion, keep unprocessed content
-                        self._buffer = current_text[
-                            start_idx + end_idx + len(self.tool_call_separator) :
-                        ]
+                        self._buffer = current_text[start_idx + end_idx :]
 
                         if self.current_tool_id < len(self.prev_tool_call_arr):
                             self.prev_tool_call_arr[self.current_tool_id].clear()
