@@ -107,8 +107,8 @@ impl StrategyLB {
     }
 
     pub fn get_one_server(&self) -> EngineInfo {
-        assert!(self.prefill_servers.len() > 0);
-        assert!(self.decode_servers.len() > 0);
+        assert!(!self.prefill_servers.is_empty());
+        assert!(!self.decode_servers.is_empty());
         self.prefill_servers[0].clone()
     }
 
