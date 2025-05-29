@@ -48,6 +48,7 @@ from sgl_kernel.gemm import (
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.moe import (
+    balance_topk_ids,
     cutlass_fp4_group_mm,
     ep_moe_post_reorder,
     ep_moe_pre_reorder,

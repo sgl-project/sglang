@@ -196,6 +196,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("shuffle_rows(Tensor input, Tensor dst2src_map, Tensor output) -> ()");
   m.impl("shuffle_rows", torch::kCUDA, &shuffle_rows);
 
+  m.def(
+      "balance_topk_ids(Tensor topk_ids, int num_gpus, int num_logical_experts, int num_physical_experts, Tensor "
+      "max_workload_after_balance, Tensor gpu_workloads_balance_mapping, Tensor new_topk_ids) -> ()");
+  m.impl("balance_topk_ids", torch::kCUDA, &balance_topk_ids);
+
   /*
    * From csrc/speculative
    */
