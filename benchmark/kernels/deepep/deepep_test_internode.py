@@ -1,12 +1,12 @@
 # ADAPTED FROM https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py
 
-import os
 import time
 
 # noinspection PyUnresolvedReferences
 import deep_ep
 import torch
 import torch.distributed as dist
+
 from deepep_utils import (
     bench,
     calc_diff,
@@ -200,12 +200,12 @@ def test_main(
                     if with_topk:
                         # Check `topk_idx`
                         assert (
-                            recv_topk_idx.eq(-1)
-                            | (
-                                (recv_topk_idx >= 0)
-                                & (recv_topk_idx < (num_experts // num_ranks))
-                            )
-                        ).sum().item() == recv_topk_idx.numel()
+                                   recv_topk_idx.eq(-1)
+                                   | (
+                                       (recv_topk_idx >= 0)
+                                       & (recv_topk_idx < (num_experts // num_ranks))
+                                   )
+                               ).sum().item() == recv_topk_idx.numel()
                         for i, count in enumerate(recv_num_tokens_per_expert_list):
                             assert recv_topk_idx.eq(i).sum().item() == count
 
@@ -396,8 +396,7 @@ def test_main(
 
 
 # noinspection PyUnboundLocalVariable
-def test_loop(local_rank: int, num_local_ranks: int):
-    num_nodes = int(os.getenv("WORLD_SIZE", 1))
+def test_loop(local_rank: int, num_local_ranks: int, num_nodes: int):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
 
     num_sms = 24
@@ -421,6 +420,8 @@ def test_loop(local_rank: int, num_local_ranks: int):
             print("", flush=True)
 
 
-if __name__ == "__main__":
+def run(
+    num_nodes: int,
+):
     num_processes = 8
-    torch.multiprocessing.spawn(test_loop, args=(num_processes,), nprocs=num_processes)
+    torch.multiprocessing.spawn(test_loop, args=(num_processes, num_nodes), nprocs=num_processes)
