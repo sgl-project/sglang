@@ -40,6 +40,7 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt.utils import (
+    cpu_has_amx_support,
     direct_register_custom_op,
     is_cuda_alike,
     is_npu,
@@ -414,9 +415,16 @@ class GroupCoordinator:
             return input_
 
         if input_.is_cpu:
-            import intel_extension_for_pytorch as ipex
-
-            ipex.distributed.all_reduce(input_, group=self.device_group)
+            # TODO: fix the binding of device_group
+            if False:
+                # if cpu_has_amx_support():
+                # TODO: check correctness
+                torch.ops.sgl_kernel.shm_allreduce(
+                    input_, self.device_group, torch.distributed.ReduceOp.SUM
+                )
+            else:
+                # fallback when intel amx backend not available
+                torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
 
         if not supports_custom_op():
