@@ -1,4 +1,4 @@
-# MODIFIED FROM https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_inernode.py
+# MODIFIED FROM https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py
 
 """
 Example usage:
