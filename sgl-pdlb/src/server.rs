@@ -89,31 +89,23 @@ impl LBState {
         let url = engine_info.api_path(api_path);
         let request = request.unwrap_or(&serde_json::Value::Null);
         let task = self.client.request(method, url).json(request).send();
-        let resp = task
-            .await
-            .map_err(|e| actix_web::error::ErrorBadGateway(e))?;
+        let resp = task.await.map_err(actix_web::error::ErrorBadGateway)?;
         // FIXME: handle error status code (map status code to error)
         let status = resp.status();
-
-        if stream {
+        let body = if stream {
             let resp_stream = resp.bytes_stream().map(|r| {
-                r.map_err(|e| actix_web::error::ErrorBadGateway(e))
+                r.map_err(actix_web::error::ErrorBadGateway)
                     .map(Bytes::from)
             });
-            Ok(ProxyResponse {
-                status,
-                body: ProxyResponseBody::Stream(Box::pin(resp_stream)),
-            })
+            ProxyResponseBody::Stream(Box::pin(resp_stream))
         } else {
             let body = resp
                 .bytes()
                 .await
-                .map_err(|e| actix_web::error::ErrorBadGateway(e))?;
-            Ok(ProxyResponse {
-                status,
-                body: ProxyResponseBody::Full(body),
-            })
-        }
+                .map_err(actix_web::error::ErrorBadGateway)?;
+            ProxyResponseBody::Full(body)
+        };
+        Ok(ProxyResponse { status, body })
     }
 
     async fn route_collect(
@@ -129,7 +121,7 @@ impl LBState {
         let responses = join_all(tasks).await;
         responses
             .into_iter()
-            .map(|r| r.map_err(|e| actix_web::error::ErrorBadGateway(e)))
+            .map(|r| r.map_err(actix_web::error::ErrorBadGateway))
             .collect()
     }
 
