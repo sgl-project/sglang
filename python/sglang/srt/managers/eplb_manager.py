@@ -27,7 +27,8 @@ class EPLBManager:
             <= self._server_args.expert_distribution_recorder_buffer_size
         ), "eplb_rebalance_num_iterations must be less than expert_distribution_recorder_buffer_size"
 
-        get_global_expert_distribution_recorder().start_record()
+        if not get_global_expert_distribution_recorder().recording:
+            get_global_expert_distribution_recorder().start_record()
 
         logger.info(
             f"[EPLBManager] system started, will rebalance per {self._server_args.eplb_rebalance_num_iterations} iterations."
