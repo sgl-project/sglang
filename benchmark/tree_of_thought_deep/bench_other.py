@@ -138,7 +138,7 @@ def main(args):
     # Run requests
     states = [None] * len(questions)
 
-    tic = time.time()
+    tic = time.perf_counter()
     if args.backend != "lmql":
 
         def get_one_answer(i):
@@ -177,7 +177,7 @@ def main(args):
             tasks = [get_one_answer_async(k) for k in bt]
             loop.run_until_complete(asyncio.gather(*tasks))
 
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     answers_text = []
     for s in states:
