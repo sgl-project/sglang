@@ -432,6 +432,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-sms", type=int, default=24)
+    parser.add_argument("--output-path", type=str, default="deepep_tuned.json")
     args = parser.parse_args()
 
     num_processes = 8
