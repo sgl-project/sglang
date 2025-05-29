@@ -98,6 +98,9 @@ class GenerateReqInput:
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
 
+    # Data parallel rank information for sticky scheduling
+    dp_rank: Optional[int] = None
+
     # Whether to return hidden states
     return_hidden_states: bool = False
 
@@ -456,6 +459,9 @@ class TokenizedGenerateReqInput:
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[str] = None
 
+    # Data parallel rank information for sticky scheduling
+    dp_rank: Optional[int] = None
+
     # Whether to return hidden states
     return_hidden_states: bool = False
 
@@ -614,6 +620,9 @@ class BatchTokenIDOut:
     # Hidden states
     output_hidden_states: List[List[float]]
 
+    # Data parallel rank information for sticky scheduling
+    dp_ranks: Optional[List[int]] = None
+
 
 @dataclass
 class BatchMultimodalDecodeReq:
@@ -660,6 +669,9 @@ class BatchStrOut:
 
     # Hidden states
     output_hidden_states: List[List[float]]
+
+    # Data parallel rank information for sticky scheduling
+    dp_ranks: Optional[List[int]] = None
 
 
 @dataclass

@@ -438,6 +438,7 @@ class Req:
         custom_logit_processor: Optional[str] = None,
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
+        dp_rank: Optional[int] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
@@ -607,6 +608,9 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
+
+        # Data parallel rank information for sticky scheduling
+        self.dp_rank: Optional[int] = dp_rank
 
     @property
     def seqlen(self):

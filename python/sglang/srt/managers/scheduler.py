@@ -196,6 +196,7 @@ class Scheduler(
         self.server_args = server_args
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
+        self.dp_rank = dp_rank
         self.tp_size = server_args.tp_size
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
@@ -215,14 +216,18 @@ class Scheduler(
         self.page_size = server_args.page_size
         # Distributed rank info
         self.dp_size = server_args.dp_size
-        self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
-            compute_dp_attention_world_info(
-                server_args.enable_dp_attention,
-                self.tp_rank,
-                self.tp_size,
-                self.dp_size,
+        if server_args.enable_dp_attention:
+            self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
+                compute_dp_attention_world_info(
+                    server_args.enable_dp_attention,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.dp_size,
+                )
             )
-        )
+        else:
+            self.attn_tp_rank = self.tp_rank
+            self.attn_tp_size = self.tp_size
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -931,6 +936,7 @@ class Scheduler(
                 custom_logit_processor=recv_req.custom_logit_processor,
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+                dp_rank=recv_req.dp_rank if recv_req.dp_rank is not None else self.dp_rank,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
