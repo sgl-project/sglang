@@ -169,11 +169,12 @@ class ServerArgs:
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
+    enable_two_batch_overlap: bool = False
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
-    ep_dispatch_algorithm: Optional[Literal["static", "dynamic"]] = None
+    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
     eplb_rebalance_num_iterations: int = 1000
@@ -263,10 +264,14 @@ class ServerArgs:
                 self.mem_fraction_static = 0.88
             if gpu_mem is not None and gpu_mem > 96 * 1024:
                 mem_fraction = self.mem_fraction_static
+                # 15 GB + additional 3GB for cuda graph
+                reserve_mem = 1024 * 18
+                # need reserve more memory for spec cuda graph
+                if self.speculative_algorithm is not None:
+                    reserve_mem = 1024 * 20
                 self.mem_fraction_static = min(
                     mem_fraction + 48 * 1024 * (1 - mem_fraction) / gpu_mem,
-                    (gpu_mem - 1024 * 18)
-                    / gpu_mem,  # 15 GB + additional 3GB for cuda graph
+                    (gpu_mem - reserve_mem) / gpu_mem,
                 )
 
         # Set chunked prefill size, which depends on the gpu memory capacity
@@ -332,12 +337,6 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
-        if self.pp_size > 1:
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled because of using pipeline parallelism."
-            )
-
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -379,12 +378,28 @@ class ServerArgs:
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
 
+        if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
+            self.expert_distribution_recorder_mode = "stat"
+            logger.info(
+                f"EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
+            )
+
+        if (self.enable_eplb or (self.init_expert_location is not None)) and (
+            self.ep_dispatch_algorithm is None
+        ):
+            self.ep_dispatch_algorithm = "static"
+            logger.info(
+                f"EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
+            )
+
+        if self.enable_expert_distribution_metrics and (
+            self.expert_distribution_recorder_mode is None
+        ):
+            self.expert_distribution_recorder_mode = "stat"
+
         if self.expert_distribution_recorder_buffer_size is None:
-            # TODO pr-chain: enable this later
-            # if (x := self.eplb_rebalance_num_iterations) is not None:
-            #     self.expert_distribution_recorder_buffer_size = x
-            if False:
-                pass
+            if (x := self.eplb_rebalance_num_iterations) is not None:
+                self.expert_distribution_recorder_buffer_size = x
             elif self.expert_distribution_recorder_mode is not None:
                 self.expert_distribution_recorder_buffer_size = 1000
 
@@ -1188,6 +1203,11 @@ class ServerArgs:
             help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
         )
         parser.add_argument(
+            "--enable-two-batch-overlap",
+            action="store_true",
+            help="Enabling two micro batches to overlap.",
+        )
+        parser.add_argument(
             "--enable-torch-compile",
             action="store_true",
             help="Optimize the model with torch.compile. Experimental feature.",
@@ -1481,8 +1501,6 @@ class ServerArgs:
 
         # FIXME pp constraints
         if self.pp_size > 1:
-            logger.warning(f"Turn off overlap scheule for pipeline parallelism.")
-            self.disable_overlap_schedule = True
             assert (
                 self.disable_overlap_schedule
                 and self.speculative_algorithm is None
@@ -1496,7 +1514,7 @@ class ServerArgs:
             self.max_loras_per_batch > 0
             # FIXME
             and (self.lora_paths is None or self.disable_radix_cache)
-        ), "compatibility of lora and cuda graph and radix attention is in progress"
+        ), "compatibility of lora and radix attention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 

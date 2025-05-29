@@ -78,6 +78,7 @@ global_server_args_dict = {
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "enable_deepep_moe": ServerArgs.enable_deepep_moe,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
+    "enable_two_batch_overlap": ServerArgs.enable_two_batch_overlap,
     "enable_dp_lm_head": ServerArgs.enable_dp_lm_head,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
     "deepep_config": ServerArgs.deepep_config,
@@ -831,6 +832,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     can_run_dp_cuda_graph: bool = False
+    tbo_split_seq_index: Optional[int] = None
+    global_forward_mode: Optional[ForwardMode] = None
 
     # For processing logprobs
     return_logprob: bool = False
@@ -1633,6 +1636,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 or attention_backend_str == "flashmla"
                 or attention_backend_str == "fa3"
                 or attention_backend_str == "cutlass_mla"
+                or global_server_args_dict["enable_two_batch_overlap"]
             )
 
         # Create seq_lens_cpu when needed
@@ -1663,6 +1667,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            tbo_split_seq_index=self.tbo_split_seq_index,
+            global_forward_mode=self.global_forward_mode,
             seq_lens_cpu=seq_lens_cpu,
             extend_num_tokens=self.extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
@@ -1741,6 +1747,8 @@ class ModelWorkerBatch:
     global_num_tokens: Optional[List[int]]
     global_num_tokens_for_logprob: Optional[List[int]]
     can_run_dp_cuda_graph: bool
+    tbo_split_seq_index: Optional[int]
+    global_forward_mode: Optional[ForwardMode]
 
     # For extend
     extend_num_tokens: Optional[int]

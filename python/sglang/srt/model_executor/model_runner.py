@@ -37,6 +37,7 @@ from sglang.srt.distributed import (
     set_custom_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -72,8 +73,8 @@ from sglang.srt.mem_cache.memory_pool import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
-from sglang.srt.model_executor import expert_location_updater
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import (
@@ -198,6 +199,8 @@ class ModelRunner:
                 "disable_radix_cache": server_args.disable_radix_cache,
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
+                "enable_two_batch_overlap": server_args.enable_two_batch_overlap,
+                "enable_dp_lm_head": server_args.enable_dp_lm_head,
                 "enable_ep_moe": server_args.enable_ep_moe,
                 "enable_deepep_moe": server_args.enable_deepep_moe,
                 "deepep_config": server_args.deepep_config,
@@ -264,6 +267,7 @@ class ModelRunner:
             if self.server_args.enable_eplb and (not self.is_draft_worker)
             else None
         )
+        self.expert_location_updater = ExpertLocationUpdater()
 
         # Load the model
         self.sampler = Sampler()
@@ -410,6 +414,10 @@ class ModelRunner:
 
         if not server_args.disable_chunked_prefix_cache:
             logger.info("Chunked prefix cache is turned on.")
+
+        if server_args.attention_backend == "aiter":
+            if self.model_config.context_len > 8192:
+                self.mem_fraction_static *= 0.85
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -593,7 +601,7 @@ class ModelRunner:
     def update_expert_location(
         self, new_expert_location_metadata: ExpertLocationMetadata
     ):
-        expert_location_updater.update_expert_location(
+        self.expert_location_updater.update(
             self.model.routed_experts_weights_of_layer,
             new_expert_location_metadata,
             nnodes=self.server_args.nnodes,
@@ -988,6 +996,13 @@ class ModelRunner:
         return c
 
     def init_attention_backend(self):
+        if self.server_args.enable_two_batch_overlap:
+            self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
+        else:
+            self.attn_backend = self._get_attention_backend()
+
+    def _get_attention_backend(self):
+        """Init attention kernel backend."""
         self.decode_attention_backend_str = (
             self.server_args.decode_attention_backend
             if self.server_args.decode_attention_backend
@@ -1006,7 +1021,7 @@ class ModelRunner:
                 HybridAttnBackend,
             )
 
-            self.attn_backend = HybridAttnBackend(
+            attn_backend = HybridAttnBackend(
                 decode_backend=self._get_attention_backend_from_str(
                     self.decode_attention_backend_str
                 ),
@@ -1024,7 +1039,7 @@ class ModelRunner:
                 f"The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
             )
         else:
-            self.attn_backend = self._get_attention_backend_from_str(
+            attn_backend = self._get_attention_backend_from_str(
                 self.server_args.attention_backend
             )
 
@@ -1034,9 +1049,9 @@ class ModelRunner:
                 "prefill_attention_backend": self.prefill_attention_backend_str,
             }
         )
+        return attn_backend
 
     def _get_attention_backend_from_str(self, backend_str: str):
-        """Init attention kernel backend."""
         if backend_str == "flashinfer":
             if not self.use_mla_backend:
                 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -1050,6 +1065,7 @@ class ModelRunner:
                         or not self.plan_stream_for_flashinfer
                     ):
                         self.plan_stream_for_flashinfer = torch.cuda.Stream()
+                    self.plan_stream_for_flashinfer = torch.cuda.Stream()
                 return FlashInferAttnBackend(self)
             else:
                 from sglang.srt.layers.attention.flashinfer_mla_backend import (
