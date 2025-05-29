@@ -246,6 +246,9 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
             flush=True)
         print('', flush=True)
 
+    if rank == 0 and local_rank == 0:
+        TODO_output
+
 
 # noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int):
