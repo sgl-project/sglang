@@ -7,13 +7,18 @@ use futures_util::{StreamExt, TryStreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use tokio;
 use tracing::{debug, error, info, warn};
+
+
+// Static counter for round-robin tie-breaking
+static ROUND_ROBIN_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 
 fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
     req.headers()
@@ -94,10 +99,17 @@ pub enum Router {
             System is potentially imbalanced if max_load > min_load * rel_threshold
             Used in conjunction with abs_threshold to determine final imbalance state.
 
-            4. eviction_interval_secs: (integer)
+            4. input_char_length_threshold: (integer)
+            Input character length threshold for load balancing.
+            Requests with input length < threshold are routed to the least busy worker.
+
+            5. round_robin_tie_breaking: (boolean)
+            Whether to use round-robin tie-breaking.
+
+            6. eviction_interval_secs: (integer)
             Interval between LRU eviction cycles for the approximate trees.
 
-            5. max_tree_size: (integer)
+            7. max_tree_size: (integer)
             Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
             during the next eviction cycle.
         */
@@ -108,6 +120,8 @@ pub enum Router {
         cache_threshold: f32,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
+        input_char_length_threshold: usize,
+        round_robin_tie_breaking: bool,
         timeout_secs: u64,
         interval_secs: u64,
         _eviction_thread: Option<thread::JoinHandle<()>>,
@@ -128,6 +142,8 @@ pub enum PolicyConfig {
         cache_threshold: f32,
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
+        input_char_length_threshold: usize,
+        round_robin_tie_breaking: bool,
         eviction_interval_secs: u64,
         max_tree_size: usize,
         timeout_secs: u64,
@@ -183,6 +199,8 @@ impl Router {
                 cache_threshold,
                 balance_abs_threshold,
                 balance_rel_threshold,
+                input_char_length_threshold,
+                round_robin_tie_breaking,
                 eviction_interval_secs,
                 max_tree_size,
                 timeout_secs,
@@ -237,6 +255,8 @@ impl Router {
                     cache_threshold,
                     balance_abs_threshold,
                     balance_rel_threshold,
+                    input_char_length_threshold,
+                    round_robin_tie_breaking,
                     timeout_secs,
                     interval_secs,
                     _eviction_thread: Some(eviction_thread),
@@ -504,6 +524,8 @@ impl Router {
                 cache_threshold,
                 balance_abs_threshold,
                 balance_rel_threshold,
+                input_char_length_threshold,
+                round_robin_tie_breaking,
                 ..
             } => {
                 // TODO: delay scheduling if cache hit rate is high because it may cause imbalance. prioritize low hit rate ones
@@ -514,12 +536,19 @@ impl Router {
                 // Get current load statistics
                 let max_load = *running_queue.values().max().unwrap_or(&0);
                 let min_load = *running_queue.values().min().unwrap_or(&0);
+                // log the first 20 characters of the text
+                debug!("CacheAware routing strategy selected for a new request (first 20 chars): {}", text.chars().take(20).collect::<String>());
+                debug!("Current loads - max: {}, min: {}", max_load, min_load);
 
                 // Load is considered imbalanced if:
                 // 1. (max - min) > abs_threshold AND
                 // 2. max > rel_threshold * min
-                let is_imbalanced = max_load.saturating_sub(min_load) > *balance_abs_threshold
-                    && (max_load as f32) > (min_load as f32 * balance_rel_threshold);
+                // Or the length of text is < input_char_length_threshold then force to use load-aware routing
+                let is_imbalanced = (max_load.saturating_sub(min_load) > *balance_abs_threshold
+                    && (max_load as f32) > (min_load as f32 * balance_rel_threshold))
+                    || text.chars().count() < *input_char_length_threshold;
+
+                debug!("Load balancing check - is_imbalanced: {}", is_imbalanced);
 
                 let selected_url = if is_imbalanced {
                     // Log load balancing trigger and current queue state
@@ -535,16 +564,41 @@ impl Router {
                     gauge!("sgl_router_min_load").set(min_load as f64);
 
                     // Use shortest queue routing when load is imbalanced
-                    running_queue
-                        .iter()
-                        .min_by_key(|(_url, &count)| count)
-                        .map(|(url, _)| url.clone())
-                        .unwrap_or_else(|| worker_urls.read().unwrap()[0].clone())
+                    if !*round_robin_tie_breaking {
+                        running_queue
+                            .iter()
+                            .min_by_key(|(_url, &count)| count)
+                            .map(|(url, _)| url.clone())
+                            .unwrap_or_else(|| worker_urls.read().unwrap()[0].clone())
+                    } else {
+                        let urls_len = worker_urls.read().unwrap().len();
+                        let rotation = ROUND_ROBIN_COUNTER.fetch_add(1, Ordering::SeqCst) % urls_len;
+                        let mut rotated_queue = HashMap::new();
+                        {
+                            let urls = worker_urls.read().unwrap();
+                            for i in 0..urls_len {
+                                let url = urls[(i + rotation) % urls_len].clone();
+                                let count = running_queue.get(&url).copied().unwrap_or(0);
+                                rotated_queue.insert(url, count);
+                            }
+                        }
+                        rotated_queue
+                            .iter()
+                            .min_by_key(|(_url, &count)| count)
+                            .map(|(url, _)| url.clone())
+                            .unwrap_or_else(|| worker_urls.read().unwrap()[0].clone())
+                    }
                 } else {
                     // Use cache-aware routing when load is balanced
                     let (matched_text, matched_worker) = tree.prefix_match(&text);
                     let matched_rate =
                         matched_text.chars().count() as f32 / text.chars().count() as f32;
+                    debug!(
+                        "Apply cache-aware routing - matched text length: {}, match rate: {:.4}, matched_worker: {}",
+                        matched_text.chars().count(),
+                        matched_rate,
+                        matched_worker
+                    );
 
                     if matched_rate > *cache_threshold {
                         counter!("sgl_router_cache_hits_total").increment(1);
@@ -554,6 +608,7 @@ impl Router {
                         tree.get_smallest_tenant()
                     }
                 };
+                debug!("Selected worker: {}\n", selected_url);
 
                 // Update queues and tree
                 *running_queue.get_mut(&selected_url).unwrap() += 1;
