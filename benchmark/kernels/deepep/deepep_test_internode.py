@@ -1,7 +1,6 @@
 # ADAPTED FROM https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py
 
 import time
-from typing import Any, Dict
 
 # noinspection PyUnresolvedReferences
 import deep_ep
@@ -397,10 +396,11 @@ def test_main(
 
 
 # noinspection PyUnboundLocalVariable
-def test_loop(local_rank: int, num_local_ranks: int, info: Dict[str, Any]):
+def test_loop(local_rank: int, num_local_ranks: int, num_nodes: int):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
 
-    num_qps_per_rank = info["num_sms"] // 2
+    num_sms = 24
+    num_qps_per_rank = num_sms // 2
 
     buffer = deep_ep.Buffer(
         group,
@@ -412,9 +412,9 @@ def test_loop(local_rank: int, num_local_ranks: int, info: Dict[str, Any]):
     assert num_local_ranks == 8 and num_ranks > 8
     torch.manual_seed(rank)
 
-    for i in (info["num_sms"],):
+    for i in (num_sms,):
         test_main(
-            i, local_rank, num_local_ranks, num_ranks, info["num_nodes"], rank, buffer, group
+            i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group
         )
         if local_rank == 0:
             print("", flush=True)
@@ -422,11 +422,6 @@ def test_loop(local_rank: int, num_local_ranks: int, info: Dict[str, Any]):
 
 def run(
     num_nodes: int,
-    num_sms: int,
 ):
     num_processes = 8
-    info = dict(
-        num_nodes=num_nodes,
-        num_sms=num_sms,
-    )
-    torch.multiprocessing.spawn(test_loop, args=(num_processes, info), nprocs=num_processes)
+    torch.multiprocessing.spawn(test_loop, args=(num_processes, num_nodes), nprocs=num_processes)
