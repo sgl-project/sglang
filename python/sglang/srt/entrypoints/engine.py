@@ -478,7 +478,7 @@ class Engine(EngineBase):
         text_2: Optional[Union[str, List[str]]] = None,
         token_ids_1: Optional[List[int]] = None,
         token_ids_2: Optional[List[List[int]]] = None,
-        output_prob_token_ids: Optional[List[int]] = None,
+        label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
         prepend: bool = False,
     ) -> List[Dict[int, float]]:
@@ -490,7 +490,7 @@ class Engine(EngineBase):
             text_2: The second part of the text or a list of second parts. Either text_2 or token_ids_2 must be provided.
             token_ids_1: Pre-tokenized first part of the text. Either text_1 or token_ids_1 must be provided.
             token_ids_2: Pre-tokenized second part of the text. Either text_2 or token_ids_2 must be provided.
-            output_prob_token_ids: List of token IDs to compute probabilities for. If None, no token probabilities will be computed.
+            label_token_ids: List of token IDs to compute probabilities for. If None, no token probabilities will be computed.
             apply_softmax: Whether to normalize probabilities using softmax.
             prepend: If True, prepend text_2 to text_1. Otherwise append text_2 to text_1.
 
@@ -509,7 +509,7 @@ class Engine(EngineBase):
                 text_2=text_2,
                 token_ids_1=token_ids_1,
                 token_ids_2=token_ids_2,
-                output_prob_token_ids=output_prob_token_ids,
+                label_token_ids=label_token_ids,
                 apply_softmax=apply_softmax,
                 prepend=prepend,
                 request=None
@@ -522,7 +522,7 @@ class Engine(EngineBase):
         text_2: Optional[Union[str, List[str]]] = None,
         token_ids_1: Optional[List[int]] = None,
         token_ids_2: Optional[List[List[int]]] = None,
-        output_prob_token_ids: Optional[List[int]] = None,
+        label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
         prepend: bool = False,
     ) -> List[Dict[int, float]]:
@@ -536,7 +536,7 @@ class Engine(EngineBase):
             text_2=text_2,
             token_ids_1=token_ids_1,
             token_ids_2=token_ids_2,
-            output_prob_token_ids=output_prob_token_ids,
+            label_token_ids=label_token_ids,
             apply_softmax=apply_softmax,
             prepend=prepend,
             request=None

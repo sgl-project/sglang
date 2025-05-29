@@ -1423,32 +1423,14 @@ class TokenizerManager:
         text_2: Optional[Union[str, List[str]]] = None,
         token_ids_1: Optional[List[int]] = None,
         token_ids_2: Optional[List[List[int]]] = None,
-        output_prob_token_ids: Optional[List[int]] = None,
+        label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
         prepend: bool = False,
         request: Optional[Any] = None,
     ) -> List[Dict[int, float]]:
         # Validate inputs
-        if output_prob_token_ids is None:
-            raise ValueError("output_prob_token_ids must be provided")
-
-        # Check input format and validate required fields
-        if text_1 is not None:
-            if text_2 is None:
-                raise ValueError("text_2 must be provided when using text_1")
-            if token_ids_2 is not None:
-                raise ValueError("Cannot mix text_1 with token_ids_2 - both inputs must use the same format")
-        elif token_ids_1 is not None:
-            if token_ids_2 is None:
-                raise ValueError("token_ids_2 must be provided when using token_ids_1")
-            if text_2 is not None:
-                raise ValueError("Cannot mix token_ids_1 with text_2 - both inputs must use the same format")
-        else:
-            raise ValueError("Either text_1 or token_ids_1 must be provided")
-
-        # Convert text_2 to list if it's a string
-        if isinstance(text_2, str):
-            text_2 = [text_2]
+        if label_token_ids is None:
+            raise ValueError("label_token_ids must be provided")
 
         # Prepare inputs based on whether we have text or token IDs
         if text_1 is not None and text_2 is not None:
@@ -1457,7 +1439,7 @@ class TokenizerManager:
             batch_request = GenerateReqInput(
                 text=prompts,
                 return_logprob=True,
-                token_ids_logprob=output_prob_token_ids,
+                token_ids_logprob=label_token_ids,
                 stream=False,
                 sampling_params={"max_new_tokens": 1},
             )
@@ -1471,14 +1453,14 @@ class TokenizerManager:
             
             if self.tokenizer is not None:
                 vocab_size = self.tokenizer.vocab_size
-                for token_id in output_prob_token_ids:
+                for token_id in label_token_ids:
                     if token_id >= vocab_size:
                         raise ValueError(f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})")
 
             batch_request = GenerateReqInput(
                 input_ids=input_ids_list,
                 return_logprob=True,
-                token_ids_logprob=output_prob_token_ids,
+                token_ids_logprob=label_token_ids,
                 stream=False,
                 sampling_params={"max_new_tokens": 1},
             )
@@ -1491,7 +1473,7 @@ class TokenizerManager:
             # Get logprobs for first position and convert to probabilities
             first_position = output_logprobs[0]
             probs = {token_id: math.exp(logprob) for logprob, token_id, _ in first_position 
-                    if token_id in output_prob_token_ids}
+                    if token_id in label_token_ids}
             if apply_softmax:
                 total = sum(probs.values())
                 if total > 0:

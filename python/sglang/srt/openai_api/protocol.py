@@ -491,7 +491,7 @@ class ScoringRequest(BaseModel):
     text_2: Optional[List[str]] = None
     token_ids_1: Optional[List[int]] = None  # Pre-tokenized text_1
     token_ids_2: Optional[List[List[int]]] = None  # Pre-tokenized text_2
-    output_prob_token_ids: Optional[List[int]] = None  # Token IDs to compute probabilities for
+    label_token_ids: Optional[List[int]] = None  # Token IDs to compute probabilities for
     apply_softmax: bool = False
     prepend: bool = False
     model: str

@@ -21,7 +21,7 @@ class TestScoreAPI(CustomTestCase):
             self.engine.shutdown()
             torch.cuda.empty_cache()
 
-    def compute_hf_scores(self, prompt, texts, output_prob_token_ids, apply_softmax=False):
+    def compute_hf_scores(self, prompt, texts, label_token_ids, apply_softmax=False):
         """Compute scores using direct HuggingFace model inference.
         Returns probabilities for each token ID, optionally normalized with softmax.
         """
@@ -42,13 +42,13 @@ class TestScoreAPI(CustomTestCase):
                     last_token_logits = outputs.logits[0, -1]
                     
                 # Get logits for just our target tokens
-                target_logits = last_token_logits[output_prob_token_ids]
+                target_logits = last_token_logits[label_token_ids]
                 
                 # Apply softmax over just the target tokens
                 target_probs = torch.softmax(target_logits, dim=-1)
                 
                 # Create dictionary of token probabilities
-                probs = {tid: target_probs[i].item() for i, tid in enumerate(output_prob_token_ids)}
+                probs = {tid: target_probs[i].item() for i, tid in enumerate(label_token_ids)}
                 
                 scores.append(probs)
             
@@ -71,17 +71,17 @@ class TestScoreAPI(CustomTestCase):
         
         # Get token IDs using HF tokenizer temporarily
         tokenizer = AutoTokenizer.from_pretrained(TEST_MODEL_NAME, trust_remote_code=True)
-        output_prob_token_ids = []
+        label_token_ids = []
         for token in tokens:
             encoding = tokenizer.encode_plus(token, add_special_tokens=False)
             token_ids = encoding['input_ids']
-            output_prob_token_ids.append(token_ids[0])
+            label_token_ids.append(token_ids[0])
         del tokenizer 
         # Get scores from SGLang first
         sglang_scores = self.engine.score(
             text_1=prompt,
             text_2=texts,
-            output_prob_token_ids=output_prob_token_ids,
+            label_token_ids=label_token_ids,
             apply_softmax=True
         )
 
@@ -90,7 +90,7 @@ class TestScoreAPI(CustomTestCase):
         # Get scores from HuggingFace
         hf_scores = self.compute_hf_scores(
             prompt, texts,
-            output_prob_token_ids
+            label_token_ids
         )
         
         print(f"\nHF scores: {hf_scores}")
@@ -99,7 +99,7 @@ class TestScoreAPI(CustomTestCase):
         self.assertEqual(len(hf_scores), len(sglang_scores), "Score lengths don't match")
         for hf_score_dict, sglang_score_dict in zip(hf_scores, sglang_scores):
             print(f"\nScore comparison:")
-            for tid in output_prob_token_ids:
+            for tid in label_token_ids:
                 hf_score = hf_score_dict[tid]
                 sglang_score = sglang_score_dict[tid]
                 self.assertAlmostEqual(hf_score, sglang_score, places=3,
@@ -115,14 +115,14 @@ class TestScoreAPI(CustomTestCase):
         """Test that batch scoring works correctly."""
         # Test with different batch sizes
         batch_sizes = [1, 2, 4, 8]
-        output_prob_token_ids = [1, 2, 3] 
+        label_token_ids = [1, 2, 3] 
         
         for batch_size in batch_sizes:
             texts = [f"test {i}" for i in range(batch_size)]
             scores = self.engine.score(
                 text_1="The test was",
                 text_2=texts,
-                output_prob_token_ids=output_prob_token_ids,
+                label_token_ids=label_token_ids,
                 apply_softmax=True
             )
             
@@ -133,8 +133,8 @@ class TestScoreAPI(CustomTestCase):
             
             # Verify each score dictionary has all token IDs
             for score_dict in scores:
-                self.assertEqual(set(score_dict.keys()), set(output_prob_token_ids),
-                    f"Score dict missing some token IDs: {set(score_dict.keys())} vs {set(output_prob_token_ids)}")
+                self.assertEqual(set(score_dict.keys()), set(label_token_ids),
+                    f"Score dict missing some token IDs: {set(score_dict.keys())} vs {set(label_token_ids)}")
 
 
 
