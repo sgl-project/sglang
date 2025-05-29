@@ -271,6 +271,9 @@ class ServerArgs:
                     mem_fraction + 48 * 1024 * (1 - mem_fraction) / gpu_mem,
                     (gpu_mem - reserve_mem) / gpu_mem,
                 )
+            else:
+                if self.speculative_algorithm is not None:
+                    self.mem_fraction_static *= 0.95
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
