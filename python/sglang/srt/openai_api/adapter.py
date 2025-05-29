@@ -604,6 +604,9 @@ def v1_generate_request(
         stream=all_requests[0].stream,
         rid=request_ids,
         lora_path=lora_paths,
+        bootstrap_host=all_requests[0].bootstrap_host,
+        bootstrap_port=all_requests[0].bootstrap_port,
+        bootstrap_room=all_requests[0].bootstrap_room,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
@@ -1327,7 +1330,6 @@ def v1_chat_generate_response(
                     tool_calls = [
                         ToolCall(
                             id=f"call_{base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b'=').decode()}",
-                            index=call_info.tool_index,
                             function=FunctionResponse(
                                 name=call_info.name, arguments=call_info.parameters
                             ),

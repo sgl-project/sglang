@@ -24,6 +24,11 @@ class Llama32Detector(BaseFormatDetector):
     def __init__(self):
         super().__init__()
         self.bot_token = "<|python_tag|>"
+        # NOTE: technically Llama3.2 doesn't support well with parallel tool calls
+        # They need specific prompt engineering to support parallel tool calls
+        # Here we use ';' as the separator, which might have compatibility issues
+        # if users define to use a different separator in their prompt
+        self.tool_call_separator = ";"
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Llama 3.2 format tool call."""
@@ -42,7 +47,11 @@ class Llama32Detector(BaseFormatDetector):
             normal_text, action_text = "", text
 
         # Split by semicolon and process each part
-        json_parts = [part.strip() for part in action_text.split(";") if part.strip()]
+        json_parts = [
+            part.strip()
+            for part in action_text.split(self.tool_call_separator)
+            if part.strip()
+        ]
         all_actions = []
         for part in json_parts:
             try:
@@ -70,5 +79,5 @@ class Llama32Detector(BaseFormatDetector):
         return EBNFComposer.build_ebnf(
             tools,
             function_format="json",
-            tool_call_separator=",",
+            tool_call_separator=self.tool_call_separator,
         )
