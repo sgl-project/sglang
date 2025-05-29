@@ -23,6 +23,7 @@ import torch.distributed
 import torch.nn.functional as F
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.managers import deepseek_eplb
 from sglang.srt.model_loader import get_model_architecture
 from sglang.srt.server_args import ServerArgs
@@ -202,7 +203,8 @@ class ExpertLocationMetadata:
                 logical_to_all_physical_map=logical_to_all_physical_map,
                 num_gpus=ep_size,
                 num_physical_experts=num_physical_experts,
-                ep_rank=torch.distributed.get_rank(),
+                # TODO update when EP != TP
+                ep_rank=get_tensor_model_parallel_rank(),
             ),
         )
 
