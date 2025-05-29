@@ -936,8 +936,15 @@ def get_moe_configs(
     # directory
     json_file_name = get_config_file_name(E, N, dtype, [block_n, block_k])
 
+    # We found that using the fused_moe_kernel config from Triton 3.1.0 with Triton 3.2.0 results in negative performance gains,
+    # so we also include the Triton version as a key for finding the fused_moe_kernel config to achieve the best performance.
+    triton_version = triton.__version__
+    version_dir = f"triton_{triton_version.replace('.', '_')}"
     config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
+        os.path.dirname(os.path.realpath(__file__)),
+        "configs",
+        version_dir,
+        json_file_name,
     )
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
