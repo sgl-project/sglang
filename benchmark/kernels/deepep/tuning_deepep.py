@@ -335,7 +335,13 @@ def test_main(
             print("", flush=True)
             is_fp8 = isinstance(current_x, tuple)
             if is_fp8:
-                output_data["normal_dispatch"] = TODO
+                output_data["normal_dispatch"] = {
+                    "num_sms": TODO,
+                    "num_max_nvl_chunked_send_tokens": TODO,
+                    "num_max_nvl_chunked_recv_tokens": TODO,
+                    "num_max_rdma_chunked_send_tokens": TODO,
+                    "num_max_rdma_chunked_recv_tokens": TODO,
+                },
 
         if isinstance(current_x, tuple):
             # Gather FP8 the best config from rank 0
