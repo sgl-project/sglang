@@ -8,6 +8,7 @@
 | **FA3**                  | ✅                | ✅                | ✅     | ✅                 | ✅ |
 | **Triton**               | ❌                | ✅                | ✅     | ❌                 | ❌ |
 | **Torch Native**         | ❌                | ❌                | ❌     | ❌                 | ❌ |
+| **FlashMLA**                  | ✅                | ✅                | ✅     | ❌                 | ❌ |
 
 
 ## User guide
@@ -30,10 +31,15 @@ python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-V3 --trust-r
 ```bash
 python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --attention-backend triton
 python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-V3 --attention-backend triton --trust-remote-code
-
 ```
 
 - Torch Native
 ```bash
 python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --attention-backend torch_native
+```
+
+- FlashMLA
+```bash
+python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-R1 --attention-backend flashmla --trust-remote-code
+python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-R1 --attention-backend flashmla --kv-cache-dtype fp8_e4m3 --trust-remote-code
 ```

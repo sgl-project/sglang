@@ -1,4 +1,4 @@
-#include <torch/torch.h>
+#include <torch/all.h>
 
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 

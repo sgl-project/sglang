@@ -1,7 +1,6 @@
 from typing import List, Union
 
 import torch
-from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor,
@@ -20,33 +19,6 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
         super().__init__(hf_config, server_args, _processor)
         self.image_token = "(<image>./</image>)"
         self.audio_token = "(<audio>./</audio>)"
-
-    def process_data_task(self, input_text, images=None, audios=None):
-
-        if isinstance(images, list) and len(images) == 0:
-            images = None
-        if isinstance(audios, list) and len(audios) == 0:
-            audios = None
-        processor = self._processor
-        args = {}
-        if isinstance(processor, BaseImageProcessorFast):
-            args["device"] = "cuda"
-        result = self._processor.__call__(
-            text=input_text,
-            images=images,
-            audios=audios,
-            return_tensors="pt",
-            chunk_input=True,
-            **args,
-        )
-        return {
-            "input_ids": result.input_ids,
-            "pixel_values": getattr(result, "pixel_values", None),
-            "tgt_sizes": getattr(result, "tgt_sizes", None),
-            "audio_features": getattr(result, "audio_features", None),
-            "audio_feature_lens": getattr(result, "audio_feature_lens", None),
-            "audio_bounds": getattr(result, "audio_bounds", None),
-        }
 
     async def process_mm_data_async(
         self,
@@ -70,7 +42,8 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             audio_data=audio_data,
             image_data=image_data,
             multimodal_tokens=MultimodalSpecialTokens(
-                image_token=self.image_token, audio_token=self.audio_token
+                image_token=self.image_token,
+                audio_token=self.audio_token,
             ),
         )
         if base_output is None:
@@ -97,6 +70,8 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             audio_start_id = tokenizer.audio_start_id
             audio_end_id = tokenizer.audio_end_id
 
+        im_start_id = tokenizer.im_start_id
+        im_end_id = tokenizer.im_end_id
         im_token_id = tokenizer.unk_id
         pixel_values = res["pixel_values"]
         tgt_sizes = res["tgt_sizes"]
@@ -132,9 +107,20 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
         pixel_values = pixel_values_flat
 
         items = []
+        input_ids = res["input_ids"].flatten()
+        image_offsets = self.get_mm_items_offset_by_pair(
+            input_ids=input_ids, mm_start_id=im_start_id, mm_end_id=im_end_id
+        )
+        slice_offsets = self.get_mm_items_offset_by_pair(
+            input_ids=input_ids, mm_start_id=slice_start_id, mm_end_id=slice_end_id
+        )
+        image_offsets.extend(slice_offsets)
+        image_offsets = sorted(image_offsets)
+
         if len(pixel_values) != 0:
             item = MultimodalDataItem(
                 pixel_values=pixel_values,
+                image_offsets=image_offsets,
                 tgt_size=tgt_sizes_flat,
                 modality=Modality.IMAGE,
             )
@@ -145,21 +131,30 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             and res["audio_features"] is not None
             and len(res["audio_features"]) != 0
         ):
+            if audio_start_id is not None and audio_end_id is not None:
+                audio_offsets = self.get_mm_items_offset_by_pair(
+                    input_ids=input_ids,
+                    mm_start_id=audio_start_id,
+                    mm_end_id=audio_end_id,
+                )
+            else:
+                audio_offsets = None
             item = MultimodalDataItem(
                 audio_features=[res["audio_features"]],
                 audio_feature_lens=res["audio_feature_lens"],
+                audio_offsets=audio_offsets,
                 modality=Modality.AUDIO,
             )
             items += [item]
 
         return {
             "mm_items": items,
-            "input_ids": res["input_ids"].flatten().tolist(),
+            "input_ids": input_ids.tolist(),
             "audio_start_id": audio_start_id,
             "audio_end_id": audio_end_id,
             "im_token_id": im_token_id,
-            "im_start_id": tokenizer.im_start_id,
-            "im_end_id": tokenizer.im_end_id,
+            "im_start_id": im_start_id,
+            "im_end_id": im_end_id,
             "slice_start_id": slice_start_id,
             "slice_end_id": slice_end_id,
         }

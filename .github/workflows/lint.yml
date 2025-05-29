@@ -1,6 +1,6 @@
 name: Lint
 
-on: [pull_request]
+on: [ pull_request ]
 
 jobs:
   lint:
@@ -19,4 +19,4 @@ jobs:
           pre-commit install
 
       - name: Linting
-        run: pre-commit run --all-files
+        run: pre-commit run --all-files --show-diff-on-failure

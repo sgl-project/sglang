@@ -30,6 +30,66 @@ convert_from_float_ext<at::BFloat16>(const Vectorized<float>& a, const Vectorize
 
 #define CVT_FP16_TO_FP32(a) _mm512_cvtps_ph(a, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC))
 
+inline __m512bh cvt_e4m3_bf16_intrinsic_without_denorm(__m256i fp8_vec) {
+  // The following conversion is without denorm behavior, that is to say,
+  //   Max subnorm   : S.0000.111 = 0.875 ∗ 2**(−6)
+  //   Min subnorm   : S.0000.001 = 2**(−9)
+  // 0.0019 ~ 0.0137 cannot be converted correctly.
+  __m512i x = _mm512_cvtepu8_epi16(fp8_vec);
+  auto mask = _mm512_cmpneq_epi16_mask(
+      _mm512_and_si512(x, _mm512_set1_epi16(127)),
+      _mm512_setzero_si512());  // mask = x & 0x7f
+  auto mask_nan = _mm512_cmpneq_epi16_mask(
+      _mm512_and_si512(x, _mm512_set1_epi16(127)),
+      _mm512_set1_epi16(127));                                                      // mask_nan = x & 0x7f
+  auto mantissa = _mm512_slli_epi16(_mm512_and_si512(x, _mm512_set1_epi16(7)), 4);  // mantissa = (x & 7) << 4
+  auto exponent = _mm512_add_epi16(
+      _mm512_srli_epi16(_mm512_and_si512(x, _mm512_set1_epi16(120)), 3),
+      _mm512_set1_epi16(120));  // exponent = (((x >> 3) & 15) + 120)
+  auto nonsign = _mm512_maskz_mov_epi16(mask, _mm512_or_si512(mantissa, _mm512_slli_epi16(exponent, 7)));
+  nonsign = _mm512_mask_mov_epi16(_mm512_set1_epi16(0x7fff), mask_nan, nonsign);  // deal with Nan
+  return (__m512bh)(_mm512_or_si512(
+      nonsign,
+      _mm512_slli_epi16(
+          _mm512_and_si512(x, _mm512_set1_epi16(128)),
+          8)));  // add sign (x & 128) << 8
+}
+
+inline __m512bh cvt_e4m3_bf16_intrinsic_with_denorm(__m256i fp8_vec) {
+  __m512i x = _mm512_cvtepu8_epi16(fp8_vec);
+  __m512i lg2mant = _mm512_mask_mov_epi16(
+      _mm512_mask_mov_epi16(
+          _mm512_setzero_si512(), _mm512_test_epi16_mask(x, _mm512_set1_epi16(2)), _mm512_set1_epi16(1)),
+      _mm512_test_epi16_mask(x, _mm512_set1_epi16(4)),
+      _mm512_set1_epi16(2));
+  return (__m512bh)(_mm512_or_si512(
+      _mm512_maskz_mov_epi16(
+          _mm512_cmpneq_epi16_mask(_mm512_and_si512(x, _mm512_set1_epi16(127)), _mm512_setzero_si512()),
+          _mm512_mask_blend_epi16(
+              _mm512_test_epi16_mask(x, _mm512_set1_epi16(120)),
+              _mm512_or_si512(
+                  _mm512_and_si512(
+                      _mm512_sllv_epi16(
+                          _mm512_and_si512(x, _mm512_set1_epi16(3)), _mm512_sub_epi16(_mm512_set1_epi16(7), lg2mant)),
+                      _mm512_set1_epi16(0x007f)),
+                  _mm512_slli_epi16(_mm512_add_epi16(lg2mant, _mm512_set1_epi16(118)), 7)),
+              _mm512_or_si512(
+                  _mm512_slli_epi16(_mm512_and_si512(x, _mm512_set1_epi16(7)), 4),
+                  _mm512_slli_epi16(
+                      _mm512_add_epi16(
+                          _mm512_srli_epi16(_mm512_and_si512(x, _mm512_set1_epi16(120)), 3), _mm512_set1_epi16(120)),
+                      7)))),
+      _mm512_slli_epi16(_mm512_and_si512(x, _mm512_set1_epi16(128)), 8)));
+}
+
+inline __m512bh CVT_FP8_TO_BF16(__m256i a) {
+#ifdef SGLANG_CPU_FP8_CVT_FTZ
+  return cvt_e4m3_bf16_intrinsic_without_denorm(a);
+#else
+  return cvt_e4m3_bf16_intrinsic_with_denorm(a);
+#endif
+}
+
 #endif
 
 // vector to scalar reduction

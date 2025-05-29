@@ -177,15 +177,15 @@ You can specify a JSON schema, regular expression or [EBNF](https://en.wikipedia
 
 SGLang supports two grammar backends:
 
-- [Outlines](https://github.com/dottxt-ai/outlines) (default): Supports JSON schema and regular expression constraints.
-- [XGrammar](https://github.com/mlc-ai/xgrammar): Supports JSON schema, regular expression, and EBNF constraints.
+- [Outlines](https://github.com/dottxt-ai/outlines): Supports JSON schema and regular expression constraints.
+- [XGrammar](https://github.com/mlc-ai/xgrammar) (default): Supports JSON schema, regular expression, and EBNF constraints.
   - XGrammar currently uses the [GGML BNF format](https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md).
 
-Initialize the XGrammar backend using `--grammar-backend xgrammar` flag:
+If instead you want to initialize the Outlines backend, you can use `--grammar-backend outlines` flag:
 
 ```bash
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
---port 30000 --host 0.0.0.0 --grammar-backend [xgrammar|outlines] # xgrammar or outlines (default: outlines)
+--port 30000 --host 0.0.0.0 --grammar-backend [xgrammar|outlines] # xgrammar or outlines (default: xgrammar)
 ```
 
 ```python
