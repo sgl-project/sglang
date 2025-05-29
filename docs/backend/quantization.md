@@ -80,8 +80,8 @@ Here's an example of how to quantize a model to FP8 using ModelOpt:
 ```python
 from transformers import AutoTokenizer
 from modelopt.torch.quantization import quantize
-from tensorrt_llm.quantization import QuantConfig
-from tensorrt_llm.modelopt.torch.export import export_hf_checkpoint
+from modelopt.torch.quantization import QuantConfig
+from modelopt.torch.export.unified_export_hf import export_hf_checkpoint
 
 
 # Step 1: Load the model's tokenizer
@@ -89,7 +89,7 @@ MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
 # Step 2: Configure and apply quantization
-config = QuantConfig(weights_precision="fp8")
+config = QuantConfig(weights_precision=modelopt.torch.quantization.FP8_DEFAULT_CFG)
 model = quantize(MODEL_ID, config)
 
 # Step 3: Save the quantized model
