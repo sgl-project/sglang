@@ -1,4 +1,4 @@
-# COPIED FROM https://github.com/deepseek-ai/DeepEP/blob/main/tests/utils.py
+# ADAPTED FROM https://github.com/deepseek-ai/DeepEP/blob/main/tests/utils.py
 
 import os
 import sys
@@ -10,7 +10,6 @@ import torch.distributed as dist
 
 
 def init_dist(local_rank: int, num_local_ranks: int, args):
-    # NOTES: you may rewrite this function with your own cluster settings
     ip = args.master_addr
     port = args.master_port
     num_nodes = args.nnodes
