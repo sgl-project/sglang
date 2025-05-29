@@ -131,6 +131,10 @@ class AttnForwardMethod(IntEnum):
     # Use multi-head attention, but with KV cache chunked.
     # This method can avoid OOM when prefix lengths are long.
     MHA_CHUNKED_KV = auto()
+    
+    # Use multi-head attention, but with paged KV cache.
+    # This method only support MHA without prefix-cache for now. 
+    MHA_PAGED_PREFILL = auto()
 
     # Use MLA but with fused RoPE
     MLA_FUSED_ROPE = auto()
@@ -750,6 +754,16 @@ class DeepseekV2AttentionMLA(nn.Module):
                 )
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
+            elif (
+                forward_batch.forward_mode.is_prefill() 
+                # because the chunked_prefix_cache is not supported for paged KV cache
+                # so we just enable it for prefill without prefix only
+                # [TODO] we need to fix it when allocator support chunked_prefix_cache
+                and not any(forward_batch.extend_prefix_lens_cpu)
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend()
+            ):
+                return AttnForwardMethod.MHA_PAGED_PREFILL
             else:
                 return _dispatch_mla_subtype()
         else:
@@ -815,6 +829,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             inner_state = self.forward_normal_chunked_kv_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
             )
+        elif attn_forward_method == AttnForwardMethod.MHA_PAGED_PREFILL:
+            inner_state = self.forward_normal_paged_prefill_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
         elif attn_forward_method == AttnForwardMethod.MLA:
             inner_state = self.forward_absorb_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
@@ -838,6 +856,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             return self.forward_normal_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             return self.forward_normal_chunked_kv_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MHA_PAGED_PREFILL:
+            return self.forward_normal_paged_prefill_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA:
             return self.forward_absorb_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
@@ -1340,6 +1360,20 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def forward_normal_paged_prefill_prepare(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ):
+        return self.forward_normal_chunked_kv_prepare(
+            positions, hidden_states, forward_batch, zero_allocator
+        )
+    
+    def forward_normal_paged_prefill_core(self, q, k, v, forward_batch):
+        return self.forward_normal_chunked_kv_core(q, k, v, forward_batch)
 
 
 class DeepseekV2DecoderLayer(nn.Module):
