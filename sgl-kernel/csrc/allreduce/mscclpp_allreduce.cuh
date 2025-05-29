@@ -122,13 +122,13 @@ __forceinline__ __device__ int add_vectors<__half>(int a, int b) {
 }
 
 // -------------------------------------------------------
-// allreduce_1shot_1node using LLPacket, origin allreduce2
+// allreduce_LL_1node using LLPacket, origin allreduce2
 // -------------------------------------------------------
 
 __device__ uint64_t globalFlag = 1;
 
 template <typename TYPE>
-__global__ void __launch_bounds__(1024, 1) allreduce_1shotLL_1node(
+__global__ void __launch_bounds__(1024, 1) allreduce_LL_1node(
     mscclpp::MemoryChannelDeviceHandle* memChans,
     TYPE* buff,
     TYPE* scratch,
@@ -200,11 +200,11 @@ __global__ void __launch_bounds__(1024, 1) allreduce_1shotLL_1node(
 }
 
 // -------------------------------------------------------
-// allreduce_1shot_2node using LLPacket, origin allreduce5
+// allreduce_LL_2node using LLPacket, origin allreduce5
 // -------------------------------------------------------
 
 template <typename TYPE>
-__global__ void __launch_bounds__(1024, 1) allreduce_1shotLL_2node(
+__global__ void __launch_bounds__(1024, 1) allreduce_LL_2node(
     mscclpp::MemoryChannelDeviceHandle* memChans,
     mscclpp::PortChannelDeviceHandle* portChans,
     TYPE* buff,
@@ -488,7 +488,7 @@ class MscclCommGroup {
   }
 };
 
-class Msccl1Shot1NodeLLcontext {
+class Msccl1NodeLLcontext {
  private:
   std::shared_ptr<MscclCommGroup> comm_group_ = nullptr;
   void* scratch_;
@@ -503,17 +503,22 @@ class Msccl1Shot1NodeLLcontext {
   std::unordered_map<void*, std::unordered_map<int, mscclpp::MemoryChannel>> input_ptr2memory_channels_;
   std::unordered_map<void*, mscclpp::GpuBuffer<mscclpp::MemoryChannelDeviceHandle>> input_ptr2d_memHandles_;
   cudaStream_t h2d_stream;
+  const size_t nranks_per_node_;
 
  public:
-  Msccl1Shot1NodeLLcontext(
+  Msccl1NodeLLcontext(
       mscclpp::UniqueId unique_id,
       const size_t rank,
       const size_t world_size,
       void* scratch,
       const size_t scratch_bytes,
+      const size_t nranks_per_node,
       const std::vector<int64_t>& rank_to_node,
       const std::vector<int64_t>& rank_to_ib)
-      : scratch_(scratch), scratch_bytes_(scratch_bytes), d_memHandles_(world_size - 1) {
+      : scratch_(scratch),
+        scratch_bytes_(scratch_bytes),
+        nranks_per_node_(nranks_per_node),
+        d_memHandles_(nranks_per_node - 1) {
     CHECK_CUDA_SUCCESS(cudaStreamCreateWithFlags(&h2d_stream, cudaStreamNonBlocking));
     comm_group_ = std::make_shared<MscclCommGroup>(unique_id, rank, world_size, rank_to_node, rank_to_ib);
     comm_group_->make_connection(same_node_connections_, cross_node_connections_);
@@ -541,7 +546,7 @@ class Msccl1Shot1NodeLLcontext {
         d_memHandles_.data(), memory_channel_handlers.data(), memory_channel_handlers.size(), cudaMemcpyHostToDevice);
   }
 
-  ~Msccl1Shot1NodeLLcontext() {
+  ~Msccl1NodeLLcontext() {
     CHECK_CUDA_SUCCESS(cudaStreamDestroy(h2d_stream));
   }
 
@@ -585,17 +590,17 @@ class Msccl1Shot1NodeLLcontext {
       auto it = input_ptr2d_memHandles_.find(input_void_ptr);
       memChans = it->second.data();
     }
-    allreduce_1shotLL_1node<T><<<nblks, nthrs, 0, stream>>>(
+    allreduce_LL_1node<T><<<nblks, nthrs, 0, stream>>>(
         memChans, (T*)input, (T*)scratch_, output, comm_group_->rank_, comm_group_->world_size_, input_numel);
 
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
-      printf("rank: %lu failed to launch allreduce_1shot_1node: %s\n", comm_group_->rank_, cudaGetErrorString(status));
+      printf("rank: %lu failed to launch allreduce_LL_1node: %s\n", comm_group_->rank_, cudaGetErrorString(status));
     }
   }
 };
 
-class Msccl1Shot2NodeLLcontext {
+class Msccl2NodeLLcontext {
  private:
   std::shared_ptr<MscclCommGroup> comm_group_ = nullptr;
   void* scratch_;
@@ -619,12 +624,13 @@ class Msccl1Shot2NodeLLcontext {
 
   std::shared_ptr<mscclpp::ProxyService> proxyService;
   cudaStream_t h2d_stream;
+  const size_t nranks_per_node_;
 
   std::unordered_map<void*, std::unordered_map<int, mscclpp::MemoryChannel>> input_ptr2memory_channels_;
   std::unordered_map<void*, mscclpp::GpuBuffer<mscclpp::MemoryChannelDeviceHandle>> input_ptr2d_memHandles_;
 
  public:
-  Msccl1Shot2NodeLLcontext(
+  Msccl2NodeLLcontext(
       mscclpp::UniqueId unique_id,
       const size_t rank,
       const size_t world_size,
@@ -632,14 +638,16 @@ class Msccl1Shot2NodeLLcontext {
       const size_t scratch_bytes,
       void* put_buffer,
       const size_t put_buffer_bytes,
+      const size_t nranks_per_node,
       const std::vector<int64_t>& rank_to_node,
       const std::vector<int64_t>& rank_to_ib)
       : scratch_(scratch),
         scratch_bytes_(scratch_bytes),
         put_buffer_(put_buffer),
         put_buffer_bytes_(put_buffer_bytes),
-        d_memHandles_(7),
-        d_portHandles_(world_size - 8) {
+        nranks_per_node_(nranks_per_node),
+        d_memHandles_(nranks_per_node - 1),
+        d_portHandles_(world_size - nranks_per_node) {
     CHECK_CUDA_SUCCESS(cudaStreamCreateWithFlags(&h2d_stream, cudaStreamNonBlocking));
     comm_group_ = std::make_shared<MscclCommGroup>(unique_id, rank, world_size, rank_to_node, rank_to_ib);
     proxyService = std::make_shared<mscclpp::ProxyService>();
@@ -693,7 +701,7 @@ class Msccl1Shot2NodeLLcontext {
         d_portHandles_.data(), port_channel_handlers.data(), port_channel_handlers.size(), cudaMemcpyHostToDevice);
   }
 
-  ~Msccl1Shot2NodeLLcontext() {
+  ~Msccl2NodeLLcontext() {
     CHECK_CUDA_SUCCESS(cudaStreamDestroy(h2d_stream));
     if (proxyService) {
       proxyService->stopProxy();
@@ -741,7 +749,7 @@ class Msccl1Shot2NodeLLcontext {
       auto it = input_ptr2d_memHandles_.find(input_void_ptr);
       memChans = it->second.data();
     }
-    allreduce_1shotLL_2node<T><<<nblks, nthrs, 0, stream>>>(
+    allreduce_LL_2node<T><<<nblks, nthrs, 0, stream>>>(
         memChans,
         d_portHandles_.data(),
         (T*)input,
@@ -749,13 +757,13 @@ class Msccl1Shot2NodeLLcontext {
         (T*)put_buffer_,
         output,
         comm_group_->rank_,
-        8,
+        nranks_per_node_,
         comm_group_->world_size_,
         input_numel);
 
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
-      printf("rank: %lu failed to launch allreduce_1shot_2node: %s\n", comm_group_->rank_, cudaGetErrorString(status));
+      printf("rank: %lu failed to launch allreduce_LL_2node: %s\n", comm_group_->rank_, cudaGetErrorString(status));
     }
   }
 };

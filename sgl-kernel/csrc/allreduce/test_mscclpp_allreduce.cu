@@ -93,7 +93,7 @@ int main(int argc, char* argv[]) {
   CHECK_CUDA_SUCCESS(cudaStreamCreate(&s));
   CHECK_CUDA_SUCCESS(cudaStreamSynchronize(s));
   if (nranks == 8) {
-    auto context = std::make_shared<sglang::Msccl1Shot1NodeLLcontext>(
+    auto context = std::make_shared<sglang::Msccl1NodeLLcontext>(
         unique_id,
         rank,
         nranks,
@@ -101,7 +101,7 @@ int main(int argc, char* argv[]) {
         buf_size_in_bytes * 8,
         rank_to_node,
         rank_to_ib);
-    printf("rank: %d, Msccl1Shot1NodeLLcontext setup.\n", rank);
+    printf("rank: %d, Msccl1NodeLLcontext setup.\n", rank);
     MPI_Barrier(MPI_COMM_WORLD);
     context->allreduce<T>(
         s,
@@ -110,7 +110,7 @@ int main(int argc, char* argv[]) {
         device_buf.size());
   } else if (nranks == 16) {
     // TODO: this branch is untested since there is something wrong with mpirun in my test machince
-    auto context = std::make_shared<sglang::Msccl1Shot2NodeLLcontext>(
+    auto context = std::make_shared<sglang::Msccl2NodeLLcontext>(
         unique_id,
         rank,
         nranks,
@@ -120,7 +120,7 @@ int main(int argc, char* argv[]) {
         buf_size_in_bytes,
         rank_to_node,
         rank_to_ib);
-    printf("rank: %d, Msccl1Shot2NodeLLcontext setup.\n", rank);
+    printf("rank: %d, Msccl2NodeLLcontext setup.\n", rank);
     MPI_Barrier(MPI_COMM_WORLD);
     context->allreduce<T>(
         s,

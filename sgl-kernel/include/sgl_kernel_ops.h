@@ -81,6 +81,7 @@ fptr_t mscclpp_init_context(
     const int64_t world_size,
     torch::Tensor& scratch,
     torch::Tensor& put_buffer,
+    const int64_t nranks_per_node,
     const std::vector<int64_t>& rank_to_node,
     const std::vector<int64_t>& rank_to_ib,
     const int64_t context_selection);

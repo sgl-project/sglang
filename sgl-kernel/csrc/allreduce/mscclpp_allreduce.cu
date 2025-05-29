@@ -6,23 +6,23 @@
 #include "mscclpp_allreduce.cuh"
 
 enum MscclContextSelection {
-  MSCCL1SHOT1NODELL = 1,
-  MSCCL1SHOT2NODELL = 2,
+  MSCCL1NODELL = 1,
+  MSCCL2NODELL = 2,
 };
 
 class MscclContext {
  public:
   MscclContextSelection selection_;
-  std::shared_ptr<sglang::Msccl1Shot1NodeLLcontext> msccl_1shot_1nodeLL_context;
-  std::shared_ptr<sglang::Msccl1Shot2NodeLLcontext> msccl_1shot_2nodeLL_context;
+  std::shared_ptr<sglang::Msccl1NodeLLcontext> msccl_1nodeLL_context;
+  std::shared_ptr<sglang::Msccl2NodeLLcontext> msccl_2nodeLL_context;
   MscclContext(MscclContextSelection selection) : selection_(selection) {}
   template <typename T>
   void allreduce(
       cudaStream_t stream, T* input, T* output, const size_t input_numel, int threads = 512, int block_limit = 21) {
-    if (selection_ == MSCCL1SHOT1NODELL) {
-      msccl_1shot_1nodeLL_context->allreduce<T>(stream, input, output, input_numel, threads, block_limit);
-    } else if (selection_ == MSCCL1SHOT2NODELL) {
-      msccl_1shot_2nodeLL_context->allreduce<T>(stream, input, output, input_numel, threads, block_limit);
+    if (selection_ == MSCCL1NODELL) {
+      msccl_1nodeLL_context->allreduce<T>(stream, input, output, input_numel, threads, block_limit);
+    } else if (selection_ == MSCCL2NODELL) {
+      msccl_2nodeLL_context->allreduce<T>(stream, input, output, input_numel, threads, block_limit);
     }
   }
 };
@@ -55,23 +55,33 @@ fptr_t mscclpp_init_context(
     const int64_t world_size,
     torch::Tensor& scratch,
     torch::Tensor& put_buffer,
+    const int64_t nranks_per_node,
     const std::vector<int64_t>& rank_to_node,
     const std::vector<int64_t>& rank_to_ib,
     const int64_t context_selection) {
   MscclContext* context_ptr = new MscclContext(static_cast<MscclContextSelection>(context_selection));
   mscclpp::UniqueId uid = _tensor2unique_id(unique_id);
-  if (context_selection == MSCCL1SHOT1NODELL) {
+  if (context_selection == MSCCL1NODELL) {
     void* scratch_ptr = reinterpret_cast<void*>(scratch.data_ptr());
     const size_t scratch_bytes = scratch.numel() * scratch.element_size();
-    context_ptr->msccl_1shot_1nodeLL_context = std::make_shared<sglang::Msccl1Shot1NodeLLcontext>(
-        uid, rank, world_size, scratch_ptr, scratch_bytes, rank_to_node, rank_to_ib);
-  } else if (context_selection == MSCCL1SHOT2NODELL) {
+    context_ptr->msccl_1nodeLL_context = std::make_shared<sglang::Msccl1NodeLLcontext>(
+        uid, rank, world_size, scratch_ptr, scratch_bytes, nranks_per_node, rank_to_node, rank_to_ib);
+  } else if (context_selection == MSCCL2NODELL) {
     void* scratch_ptr = reinterpret_cast<void*>(scratch.data_ptr());
     const size_t scratch_bytes = scratch.numel() * scratch.element_size();
     void* put_buffer_ptr = reinterpret_cast<void*>(put_buffer.data_ptr());
     const size_t put_buffer_bytes = put_buffer.numel() * put_buffer.element_size();
-    context_ptr->msccl_1shot_2nodeLL_context = std::make_shared<sglang::Msccl1Shot2NodeLLcontext>(
-        uid, rank, world_size, scratch_ptr, scratch_bytes, put_buffer_ptr, put_buffer_bytes, rank_to_node, rank_to_ib);
+    context_ptr->msccl_2nodeLL_context = std::make_shared<sglang::Msccl2NodeLLcontext>(
+        uid,
+        rank,
+        world_size,
+        scratch_ptr,
+        scratch_bytes,
+        put_buffer_ptr,
+        put_buffer_bytes,
+        nranks_per_node,
+        rank_to_node,
+        rank_to_ib);
   } else {
     throw std::runtime_error("invalid context selection");
   }

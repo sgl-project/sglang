@@ -111,8 +111,8 @@ class TestCustomAllReduce(unittest.TestCase):
         rank_to_node, rank_to_ib = list(range(world_size)), list(range(world_size))
         for r in range(world_size):
             rank_to_node[r] = r // 8
-            rank_to_ib[r] = r % 8
-        MAX_BYTES = 2**20 // 2
+            rank_to_ib[r] = rank % 8
+        MAX_BYTES = 2**20
         scratch = torch.empty(
             MAX_BYTES * 8, dtype=torch.bfloat16, device=torch.cuda.current_device()
         )
@@ -130,6 +130,7 @@ class TestCustomAllReduce(unittest.TestCase):
             world_size,
             scratch,
             put_buffer,
+            8,
             rank_to_node,
             rank_to_ib,
             selection,
@@ -138,6 +139,10 @@ class TestCustomAllReduce(unittest.TestCase):
             test_loop = 10
             for sz in self.test_sizes:
                 for dtype in [torch.float32, torch.float16, torch.bfloat16]:
+                    if sz * dtype.itemsize > MAX_BYTES:
+                        continue
+                    if rank == 0:
+                        print(f"mscclpp allreduce test sz {sz}, dtype {dtype}")
                     for _ in range(test_loop):
                         inp1 = torch.randint(1, 16, (sz,), dtype=dtype, device=device)
                         inp1_ref = inp1.clone()
@@ -162,7 +167,7 @@ class TestCustomAllReduce(unittest.TestCase):
         for world_size in self.world_sizes:
             print(f"Running test for world_size={world_size}")
             multi_process_parallel(world_size, self, self._run_correctness_worker)
-            print(f"mscclpp allreduce tp = {world_size}: OK")
+            print(f"mscclpp allreduce tp = {world_size}: PASS")
 
 
 if __name__ == "__main__":

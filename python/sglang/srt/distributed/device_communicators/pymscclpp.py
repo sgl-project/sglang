@@ -1,6 +1,7 @@
 import bisect
 import logging
 import math
+import os
 from contextlib import contextmanager
 from enum import IntEnum
 from typing import Any, Callable, List, Optional, TypeVar, Union
@@ -42,13 +43,51 @@ def mscclpp_is_weak_contiguous(inp: torch.Tensor):
     )
 
 
-def mscclpp_bench_time(
-    func, test_niter: int = 10, warmup_niter: int = 2
-):
+def mscclpp_convert_to_bytes(size_str):
+    """
+    Converts a human-readable size string (e.g., "1MB", "2.5kb", "3 GB")
+    into the equivalent number of bytes using binary units.
+
+    Args:
+        size_str (str): A string representing size with unit (KB, MB, GB).
+
+    Returns:
+        int: Number of bytes.
+    """
+    size_str = size_str.strip().lower()
+
+    if not size_str:
+        raise ValueError("Empty input string")
+
+    # Extract numeric part and unit
+    for i in range(len(size_str)):
+        if not size_str[i].isdigit() and size_str[i] != ".":
+            break
+    num_str = size_str[:i]
+    unit = size_str[i:].strip()
+
+    try:
+        num = float(num_str)
+    except ValueError:
+        raise ValueError(f"Invalid numeric value in '{size_str}'")
+
+    # Conversion factors
+    if unit == "b":
+        return int(num)
+    elif unit == "kb":
+        return int(num * 1024)
+    elif unit == "mb":
+        return int(num * 1024 * 1024)
+    elif unit == "gb":
+        return int(num * 1024 * 1024 * 1024)
+    else:
+        raise ValueError(f"Unsupported unit: {unit}, support B, KB, MB, GB only")
+
+
+def mscclpp_bench_time(func, test_niter: int = 10, warmup_niter: int = 2):
     # warmup
     for _ in range(warmup_niter):
         func()
-    # latencies: List[float] = []
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     torch.cuda.synchronize()
@@ -64,16 +103,16 @@ def mscclpp_bench_time(
 
 class PyMscclppCommunicator:
     _SUPPORTED_WORLD_SIZES = [8, 16]
-    _MAX_CAR_SIZE = 1024 * 1024
+    _MAX_BYTES = mscclpp_convert_to_bytes(os.getenv("SGLANG_MSCCLPP_MAX_BYTES", "1MB"))
     _SUPPORTED_DTYPE = [torch.float, torch.float16, torch.bfloat16]
 
-    # max_size: max supported mscclpp allreduce size
+    # max_bytes: max supported mscclpp allreduce size
     # in A100 mscclpp is faster than nccl only under condition of msg size smaller than1MB
     def __init__(
         self,
         group: ProcessGroup,
         device: Union[int, str, torch.device],
-        max_size=_MAX_CAR_SIZE,
+        max_bytes=_MAX_BYTES,
     ) -> None:
         """
         Args:
@@ -116,7 +155,7 @@ class PyMscclppCommunicator:
             return
 
         self.ranks = torch.distributed.get_process_group_ranks(group)
-        torch.cuda.device_count()
+        self.nranks_per_node = torch.cuda.device_count()
         # for now mscclpp with stride in the communicator is not tested
         if not (abs(self.ranks[-1] - self.ranks[0]) == world_size - 1):
             logger.warning(
@@ -135,7 +174,7 @@ class PyMscclppCommunicator:
         assert isinstance(device, torch.device)
         self.device = device
 
-        self.max_size = max_size
+        self.max_bytes = max_bytes
         self.rank = rank
         self.world_size = world_size
 
@@ -155,7 +194,7 @@ class PyMscclppCommunicator:
         self._context = None
         self.context_selection = None
         self.msg_size_for_finetune = [
-            2**i for i in range(10, math.floor(math.log2(self.max_size)) + 1)
+            2**i for i in range(10, math.floor(math.log2(self.max_bytes)) + 1)
         ]
         self.msg_size2best_config = {}
         if world_size == 8:
@@ -164,12 +203,12 @@ class PyMscclppCommunicator:
             self.context_selection = MscclContextSelection.MSCCL1SHOT2NODELL
         if not _is_hip:
             self.scratch = torch.empty(
-                PyMscclppCommunicator._MAX_CAR_SIZE * 8,
+                self.max_bytes * 8,
                 dtype=torch.uint8,
                 device=self.device,
             )
             self.put_buffer = torch.empty(
-                PyMscclppCommunicator._MAX_CAR_SIZE * 8 // 8,
+                self.max_bytes * 8 // self.nranks_per_node,
                 dtype=torch.uint8,
                 device=self.device,
             )
@@ -179,6 +218,7 @@ class PyMscclppCommunicator:
                 self.world_size,
                 self.scratch,
                 self.put_buffer,
+                self.nranks_per_node,
                 self.rank_to_node,
                 self.rank_to_ib,
                 int(self.context_selection),
@@ -226,7 +266,9 @@ class PyMscclppCommunicator:
                         best_time = cur_cost
             self.msg_size2best_config[msg_size] = best_config
             if self.rank == 0:
-                logger.debug(f"for msg_size {msg_size}, best_config: {best_config}, best_time: {best_time}us")
+                logger.debug(
+                    f"for msg_size {msg_size}, best_config: {best_config}, best_time: {best_time}us"
+                )
 
     def should_mscclpp_allreduce(
         self, inp: torch.Tensor, op: ReduceOp = ReduceOp.SUM
@@ -240,7 +282,7 @@ class PyMscclppCommunicator:
         # only support sum op
         if op != ReduceOp.SUM:
             return False
-        if inp.numel() * inp.element_size() > self.max_size:
+        if inp.numel() * inp.element_size() > self.max_bytes:
             return False
         return True
 

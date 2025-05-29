@@ -42,7 +42,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("mscclpp_generate_unique_id", &mscclpp_generate_unique_id);
   m.def(
       "mscclpp_init_context(Tensor unique_id, int rank, int world_size, Tensor scratch, Tensor put_buffer, "
-      "int[] rank_to_node, int[] rank_to_ib, int context_selection) -> int");
+      "int nranks_per_node, int[] rank_to_node, int[] rank_to_ib, int context_selection) -> int");
   m.impl("mscclpp_init_context", torch::kCUDA, &mscclpp_init_context);
 
   m.def("mscclpp_allreduce(int context, Tensor inp, Tensor! out, int nthreads, int nblocks) -> ()");
