@@ -402,12 +402,21 @@ def test_main(
 
 
 def _write_output(args):
+    data = {
+        "normal_dispatch": {
+            "num_sms": TODO,
+            "num_max_nvl_chunked_send_tokens": TODO,
+            "num_max_nvl_chunked_recv_tokens": TODO,
+            "num_max_rdma_chunked_send_tokens": TODO,
+            "num_max_rdma_chunked_recv_tokens": TODO,
+        },
+        "normal_combine": TODO
+    }
+
+    text = json.dumps(data)
     output_path = args.output_path
-    print(f"Write to: {output_path}")
-    Path(output_path).write_text(json.dumps(dict(
-        TODO=TODO,
-    )))
-    TODO
+    print(f"Write to {output_path} with {text}")
+    Path(output_path).write_text(text)
 
 
 # noinspection PyUnboundLocalVariable
