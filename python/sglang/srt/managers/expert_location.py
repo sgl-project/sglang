@@ -23,8 +23,7 @@ import torch.distributed
 import torch.nn.functional as F
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.managers import deepseek_eplb, eplb_algorithms
+from sglang.srt.managers import eplb_algorithms
 from sglang.srt.model_loader import get_model_architecture
 from sglang.srt.server_args import ServerArgs
 
