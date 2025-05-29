@@ -165,6 +165,7 @@ def flashinfer_gemm_w8a8_block_fp8_linear(
     q_input, x_scale = sglang_per_token_group_quant_fp8(
         input_2d, block_size[1], column_major_scales=False
     )
+
     x_scale_input = x_scale.T.contiguous()
     weight_scale_input = weight_scale.T.contiguous()
 
