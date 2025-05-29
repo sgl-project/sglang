@@ -2559,8 +2559,14 @@ def ceil_div(x: int, y: int) -> int:
 
 def get_moe_padding_size(model_config, load_config):
     from sglang.srt.model_loader.loader import _get_quantization_config
+    from sglang.srt.model_loader.utils import get_model_architecture
 
-    quant_config = _get_quantization_config(model_config, load_config)
+    model_class, _ = get_model_architecture(model_config)
+    packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
+
+    quant_config = _get_quantization_config(
+        model_config, load_config, packed_modules_mapping
+    )
 
     if quant_config is not None and hasattr(quant_config, "weight_block_size"):
         # See NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
