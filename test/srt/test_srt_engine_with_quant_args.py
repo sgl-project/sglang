@@ -1,6 +1,8 @@
 import unittest
+from unittest.mock import patch
 
 import sglang as sgl
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
 
@@ -54,6 +56,32 @@ class TestSRTEngineWithQuantArgs(CustomTestCase):
             )
             engine.generate(prompt, sampling_params)
             engine.shutdown()
+
+    def test_3_fp8_defaults_to_modelopt(self):
+        """Test that FP8 models default to ModelOpt on NVIDIA GPUs when no quantization is specified."""
+
+        mock_model_path = "mock_model_path"
+        mock_quant_cfg = {"quant_method": "fp8"}
+
+        with patch("torch.version.hip", None), patch(
+            "sglang.srt.configs.model_config.ModelConfig._parse_quant_hf_config",
+            return_value=mock_quant_cfg,
+        ):
+            config = ModelConfig(model_path=mock_model_path, quantization=None)
+            self.assertEqual(config.quantization, "modelopt")
+
+    def test_4_user_choice_not_overridden(self):
+        """Test that user's explicit quantization choice is not overridden even for FP8 on NVIDIA GPUs."""
+
+        mock_model_path = "mock_model_path"
+        mock_quant_cfg = {"quant_method": "fp8"}
+
+        with patch("torch.version.hip", None), patch(
+            "sglang.srt.configs.model_config.ModelConfig._parse_quant_hf_config",
+            return_value=mock_quant_cfg,
+        ):
+            config = ModelConfig(model_path=mock_model_path, quantization="fp8")
+            self.assertEqual(config.quantization, "fp8")
 
 
 if __name__ == "__main__":
