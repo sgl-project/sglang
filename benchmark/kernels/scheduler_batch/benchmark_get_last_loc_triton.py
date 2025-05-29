@@ -139,7 +139,7 @@ def get_benchmark():
     return benchmark
 
 
-def run_benchmark(save_path: str = "./configs/benchmark_ops/write_req_to_token_pool/"):
+def run_benchmark(save_path: str = "./configs/benchmark_ops/get_last_loc/"):
     """Run benchmark and save results"""
 
     # Ensure save path exists
