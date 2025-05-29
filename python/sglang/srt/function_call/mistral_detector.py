@@ -30,6 +30,7 @@ class MistralDetector(BaseFormatDetector):
         self.bot_token = "[TOOL_CALLS] ["
         self.eot_token = "]"
         self.tool_call_regex = re.compile(r"\[{.*}\]", re.DOTALL)
+        self.tool_call_separator = ", "
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Mistral format tool call."""
@@ -126,5 +127,5 @@ class MistralDetector(BaseFormatDetector):
             sequence_start_token=self.bot_token,
             sequence_end_token=self.eot_token,
             function_format="json",
-            tool_call_separator=", ",
+            tool_call_separator=self.tool_call_separator,
         )

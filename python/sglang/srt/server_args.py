@@ -260,17 +260,28 @@ class ServerArgs:
                     self.mem_fraction_static = 0.88
             else:
                 self.mem_fraction_static = 0.88
-            if gpu_mem is not None and gpu_mem > 96 * 1024:
+            if gpu_mem is not None and gpu_mem > 180 * 1000:
+                self.mem_fraction_static = 0.79
+            elif gpu_mem is not None and gpu_mem > 96 * 1024:
                 mem_fraction = self.mem_fraction_static
+                # 15 GB + additional 3GB for cuda graph
+                reserve_mem = 1024 * 18
+                # need reserve more memory for spec cuda graph
+                if self.speculative_algorithm is not None:
+                    reserve_mem = 1024 * 20
                 self.mem_fraction_static = min(
                     mem_fraction + 48 * 1024 * (1 - mem_fraction) / gpu_mem,
-                    (gpu_mem - 1024 * 18)
-                    / gpu_mem,  # 15 GB + additional 3GB for cuda graph
+                    (gpu_mem - reserve_mem) / gpu_mem,
                 )
+            else:
+                if self.speculative_algorithm is not None:
+                    self.mem_fraction_static *= 0.95
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
-            if gpu_mem is not None and gpu_mem < 25_000:
+            if gpu_mem is not None and gpu_mem > 180_000:
+                self.chunked_prefill_size = 16384
+            elif gpu_mem is not None and gpu_mem < 25_000:
                 self.chunked_prefill_size = 2048
             elif self.disaggregation_mode != "null":
                 self.chunked_prefill_size = 16384
@@ -1473,7 +1484,7 @@ class ServerArgs:
             self.max_loras_per_batch > 0
             # FIXME
             and (self.lora_paths is None or self.disable_radix_cache)
-        ), "compatibility of lora and cuda graph and radix attention is in progress"
+        ), "compatibility of lora and radix attention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
