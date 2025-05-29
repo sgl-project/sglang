@@ -259,7 +259,6 @@ void scaled_fp4_experts_quant(
     torch::Tensor const& input_offset_by_experts,
     torch::Tensor const& output_scale_offset_by_experts);
 
-
 /*
  * From csrc/speculative
  */
