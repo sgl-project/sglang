@@ -1,3 +1,4 @@
+import argparse
 import os
 import time
 
@@ -26,6 +27,7 @@ def test_main(
     rank: int,
     buffer: deep_ep.Buffer,
     group: dist.ProcessGroup,
+    args,
 ):
     # Settings
     num_tokens, hidden, num_topk_groups, num_topk, num_experts = (
@@ -398,11 +400,11 @@ def test_main(
 
 
 # noinspection PyUnboundLocalVariable
-def test_loop(local_rank: int, num_local_ranks: int):
+def test_loop(local_rank: int, num_local_ranks: int, args):
     num_nodes = int(os.getenv("WORLD_SIZE", 1))
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
 
-    num_sms = 24
+    num_sms = args.num_sms
     num_qps_per_rank = num_sms // 2
 
     buffer = deep_ep.Buffer(
@@ -417,12 +419,16 @@ def test_loop(local_rank: int, num_local_ranks: int):
 
     for i in (num_sms,):
         test_main(
-            i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group
+            i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group, args
         )
         if local_rank == 0:
             print("", flush=True)
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num-sms", type=int, default=24)
+    args = parser.parse_args()
+
     num_processes = 8
-    torch.multiprocessing.spawn(test_loop, args=(num_processes,), nprocs=num_processes)
+    torch.multiprocessing.spawn(test_loop, args=(num_processes, args), nprocs=num_processes)
