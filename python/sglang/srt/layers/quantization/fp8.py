@@ -49,8 +49,8 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
-    apply_w8a8_block_fp8_linear,
     cutlass_fp8_supported,
+    dispatch_w8a8_block_fp8_linear,
     input_to_float8,
     is_sm100_supported,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -208,6 +208,8 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             # Marlin doesn't support block-wise fp8
             self.use_marlin = False
+
+        self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
     def create_weights(
         self,
@@ -417,7 +419,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.block_quant:
-            return apply_w8a8_block_fp8_linear(
+            return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
                 block_size=self.quant_config.weight_block_size,
