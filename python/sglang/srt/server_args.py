@@ -175,6 +175,7 @@ class ServerArgs:
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
+    eplb_algorithm: str = "auto"
     eplb_rebalance_num_iterations: int = 1000
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "per_pass", "per_token"]
@@ -1320,6 +1321,12 @@ class ServerArgs:
             "--enable-eplb",
             action="store_true",
             help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--eplb-algorithm",
+            type=str,
+            default=ServerArgs.eplb_algorithm,
+            help="Chosen EPLB algorithm",
         )
         parser.add_argument(
             "--eplb-rebalance-num-iterations",
