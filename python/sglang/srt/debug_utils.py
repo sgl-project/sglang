@@ -1,3 +1,4 @@
+import os
 import time
 from pathlib import Path
 
@@ -6,6 +7,7 @@ import torch
 
 class _Dumper:
     def __init__(self):
+        self._base_dir = Path(os.environ.get("SGLANG_DUMPER_DIR", "/tmp"))
         self._partial_name = str(time.time())
         self.forward_pass_id = None
 
@@ -19,7 +21,7 @@ class _Dumper:
             **kwargs,
         )
         full_filename = '__'.join(f'{k}={v}' for k, v in full_kwargs.items()) + '.pt'
-        path = Path('/tmp') / f'sglang_dump_{self._partial_name}_{rank}' / full_filename
+        path = self._base_dir / f'sglang_dump_{self._partial_name}_{rank}' / full_filename
 
         path.mkdir(parents=True, exist_ok=True)
         torch.save(value, str(name))
