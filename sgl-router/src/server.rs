@@ -53,42 +53,42 @@ fn json_error_handler(_err: error::JsonPayloadError, _req: &HttpRequest) -> Erro
 #[get("/health")]
 async fn health(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     data.router
-            .route_to_first(&data.client, "/health", &req)
+        .route_to_first(&data.client, "/health", &req)
         .await
 }
 
 #[get("/health_generate")]
 async fn health_generate(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     data.router
-            .route_to_first(&data.client, "/health_generate", &req)
+        .route_to_first(&data.client, "/health_generate", &req)
         .await
 }
 
 #[get("/get_server_info")]
 async fn get_server_info(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     data.router
-            .route_to_first(&data.client, "/get_server_info", &req)
+        .route_to_first(&data.client, "/get_server_info", &req)
         .await
 }
 
 #[get("/v1/models")]
 async fn v1_models(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     data.router
-            .route_to_first(&data.client, "/v1/models", &req)
+        .route_to_first(&data.client, "/v1/models", &req)
         .await
 }
 
 #[get("/get_model_info")]
 async fn get_model_info(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     data.router
-            .route_to_first(&data.client, "/get_model_info", &req)
+        .route_to_first(&data.client, "/get_model_info", &req)
         .await
 }
 
 #[post("/generate")]
 async fn generate(req: HttpRequest, body: Bytes, data: web::Data<AppState>) -> impl Responder {
     data.router
-            .route_generate_request(&data.client, &req, &body, "/generate")
+        .route_generate_request(&data.client, &req, &body, "/generate")
         .await
 }
 
@@ -99,7 +99,7 @@ async fn v1_chat_completions(
     data: web::Data<AppState>,
 ) -> impl Responder {
     data.router
-            .route_generate_request(&data.client, &req, &body, "/v1/chat/completions")
+        .route_generate_request(&data.client, &req, &body, "/v1/chat/completions")
         .await
 }
 
@@ -110,7 +110,7 @@ async fn v1_completions(
     data: web::Data<AppState>,
 ) -> impl Responder {
     data.router
-            .route_generate_request(&data.client, &req, &body, "/v1/completions")
+        .route_generate_request(&data.client, &req, &body, "/v1/completions")
         .await
 }
 
