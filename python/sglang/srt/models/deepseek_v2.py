@@ -2083,7 +2083,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             ):
                 continue
             weight_names.append(name)
-            
+
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
