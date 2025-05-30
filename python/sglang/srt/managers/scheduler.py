@@ -1518,7 +1518,7 @@ class Scheduler(
             self.new_token_ratio = new_token_ratio
 
             logger.info(
-                "Decode out of memory happened. "
+                "KV cache pool is full. Retract requests. "
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
