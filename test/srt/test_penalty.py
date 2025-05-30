@@ -69,6 +69,9 @@ class TestPenalty(CustomTestCase):
     def test_presence_penalty(self):
         self.run_decode({"presence_penalty": 2})
 
+    def test_repetition_penalty(self):
+        self.run_decode({"repetition_penalty": 1.05})
+
     def test_penalty_mixed(self):
         args = [
             {},
