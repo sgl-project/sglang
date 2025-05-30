@@ -103,7 +103,7 @@ class GenerateReqInput:
 
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[int], int]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
     def contains_mm_input(self) -> bool:
