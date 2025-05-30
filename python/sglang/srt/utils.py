@@ -2219,6 +2219,14 @@ def read_system_prompt_from_file(model_name: str) -> str:
         return ""
 
 
+def bind_or_assign(target, source):
+    if target is not None:
+        target.copy_(source)
+        return target
+    else:
+        return source
+
+
 def get_numa_id_for_gpu(gpu_id: int) -> Optional[str]:
     """Get NUMA node ID for a specific GPU using nvidia-smi topo command.
 
@@ -2252,7 +2260,9 @@ def get_numa_id_for_gpu(gpu_id: int) -> Optional[str]:
         return None
 
 
-def check_device_cross_numa_node(visible_device_idx: Optional[List[int]] = None) -> bool:
+def check_device_cross_numa_node(
+    visible_device_idx: Optional[List[int]] = None,
+) -> bool:
     """Check if the GPU devices are on different NUMA nodes.
     Uses nvidia-smi topo command to get accurate NUMA node information.
     """
@@ -2292,8 +2302,12 @@ def check_device_cross_numa_node(visible_device_idx: Optional[List[int]] = None)
         return not same_numa
 
     except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to execute nvidia-smi: {e}. Assuming potential cross-NUMA for safety.")
+        logger.error(
+            f"Failed to execute nvidia-smi: {e}. Assuming potential cross-NUMA for safety."
+        )
         return True
     except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}. Assuming potential cross-NUMA for safety.")
+        logger.error(
+            f"An unexpected error occurred: {e}. Assuming potential cross-NUMA for safety."
+        )
         return True
