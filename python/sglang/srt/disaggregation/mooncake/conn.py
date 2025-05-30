@@ -32,8 +32,8 @@ from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferE
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     FastQueue,
-    group_concurrent_contiguous,
     check_gdr_support,
+    group_concurrent_contiguous,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
