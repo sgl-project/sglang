@@ -445,7 +445,7 @@ class BaseMultimodalProcessor(ABC):
         values = {}
         for k, v in items[0].items():
             if isinstance(v, list):
-                values[k] = torch.cat([item[k] for item in items])
+                values[k] = self._extract_processor_features(items, k)
             else:
                 values[k] = v
         return values
