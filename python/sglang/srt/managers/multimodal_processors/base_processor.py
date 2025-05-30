@@ -443,9 +443,26 @@ class BaseMultimodalProcessor(ABC):
         self, items: List[dict]
     ) -> dict:
         values = {}
+        # Verify all items have the same keys
+        first_keys = set(items[0].keys())
+        for item in items[1:]:
+            if set(item.keys()) != first_keys:
+                raise ValueError(
+                    f"All items must have the same attributes. "
+                    f"First item has {first_keys}, but found {set(item.keys())}"
+                )
+
+        # Process each attribute
         for k, v in items[0].items():
             if isinstance(v, list):
                 values[k] = self._extract_processor_features(items, k)
             else:
+                # Verify all items have the same value for non-list attributes
+                for item in items[1:]:
+                    if item[k] != v:
+                        raise ValueError(
+                            f"All items must have the same value for attribute {k}. "
+                            f"First item has {v}, but found {item[k]}"
+                        )
                 values[k] = v
         return values
