@@ -79,6 +79,7 @@ suites = {
         TestFile("test_triton_attention_kernels.py", 4),
         TestFile("test_triton_attention_backend.py", 134),
         TestFile("test_triton_moe_channel_fp8_kernel.py", 25),
+        TestFile("test_triton_sliding_window.py", 250),
         TestFile("test_update_weights_from_disk.py", 114),
         TestFile("test_update_weights_from_tensor.py", 48),
         TestFile("test_vertex_endpoint.py", 31),
