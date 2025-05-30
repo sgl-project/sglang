@@ -155,14 +155,14 @@ void get_moe_prepare_input_caller_v2(
     torch::Tensor& problem_sizes2,
     torch::Tensor& input_permutation,
     torch::Tensor& output_permutation,
-    const int64_t num_experts,
-    const int64_t n,
-    const int64_t k) {
+    const int num_experts,
+    const int n,
+    const int k) {
   auto stream = at::cuda::getCurrentCUDAStream(topk_ids.device().index());
   auto options_int32 = torch::TensorOptions().dtype(torch::kInt32).device(topk_ids.device());
   torch::Tensor atomic_buffer = torch::zeros(num_experts, options_int32);
 
-  int num_threads = min(THREADS_PER_EXPERT, topk_ids.numel());
+  int num_threads = static_cast<int>(min(THREADS_PER_EXPERT, topk_ids.numel()));
   compute_problem_sizes<<<num_experts, num_threads, 0, stream>>>(
       static_cast<const int32_t*>(topk_ids.data_ptr()),
       static_cast<int32_t*>(problem_sizes1.data_ptr()),
@@ -206,8 +206,8 @@ void prepare_moe_input_v2(
       problem_sizes2,
       input_permutation,
       output_permutation,
-      num_experts,
-      n,
-      k);
+      static_cast<int>(num_experts),
+      static_cast<int>(n),
+      static_cast<int>(k));
   return;
 }
