@@ -249,7 +249,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         async def stream_results() -> AsyncIterator[bytes]:
             try:
                 async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
+                        obj, request
                 ):
                     yield b"data: " + orjson.dumps(
                         out, option=orjson.OPT_NON_STR_KEYS
@@ -333,7 +333,7 @@ async def flush_cache():
     ret = await _global_state.tokenizer_manager.flush_cache()
     return Response(
         content="Cache flushed.\nPlease check backend logs for more details. "
-        "(When there are running or waiting requests, the operation will not be performed.)\n",
+                "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
 
@@ -422,7 +422,7 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
 
 @app.post("/init_weights_update_group")
 async def init_weights_update_group(
-    obj: InitWeightsUpdateGroupReqInput, request: Request
+        obj: InitWeightsUpdateGroupReqInput, request: Request
 ):
     """Initialize the parameter update group."""
     success, message = await _global_state.tokenizer_manager.init_weights_update_group(
@@ -437,7 +437,7 @@ async def init_weights_update_group(
 
 @app.post("/update_weights_from_tensor")
 async def update_weights_from_tensor(
-    obj: UpdateWeightsFromTensorReqInput, request: Request
+        obj: UpdateWeightsFromTensorReqInput, request: Request
 ):
     """Update the weights from tensor inplace without re-launching the server.
     Notes:
@@ -457,7 +457,7 @@ async def update_weights_from_tensor(
 
 @app.post("/update_weights_from_distributed")
 async def update_weights_from_distributed(
-    obj: UpdateWeightsFromDistributedReqInput, request: Request
+        obj: UpdateWeightsFromDistributedReqInput, request: Request
 ):
     """Update model parameter from distributed online."""
     success, message = (
@@ -487,7 +487,7 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
 
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
 async def release_memory_occupation(
-    obj: ReleaseMemoryOccupationReqInput, request: Request
+        obj: ReleaseMemoryOccupationReqInput, request: Request
 ):
     """Release GPU memory occupation temporarily."""
     try:
@@ -498,7 +498,7 @@ async def release_memory_occupation(
 
 @app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
 async def resume_memory_occupation(
-    obj: ResumeMemoryOccupationReqInput, request: Request
+        obj: ResumeMemoryOccupationReqInput, request: Request
 ):
     """Resume GPU memory occupation."""
     try:
@@ -704,10 +704,10 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
             ]
             break
     image_data = [
-        instance.get("image_data")
-        for instance in vertex_req.instances
-        if instance.get("image_data") is not None
-    ] or None
+                     instance.get("image_data")
+                     for instance in vertex_req.instances
+                     if instance.get("image_data") is not None
+                 ] or None
     req = GenerateReqInput(
         **inputs,
         image_data=image_data,
@@ -726,9 +726,9 @@ def _create_error_response(e):
 
 
 def launch_server(
-    server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection] = None,
-    launch_callback: Optional[Callable[[], None]] = None,
+        server_args: ServerArgs,
+        pipe_finish_writer: Optional[multiprocessing.connection.Connection] = None,
+        launch_callback: Optional[Callable[[], None]] = None,
 ):
     """
     Launch SRT (SGLang Runtime) Server.
@@ -793,10 +793,10 @@ def launch_server(
 
 
 def _wait_and_warmup(
-    server_args: ServerArgs,
-    pipe_finish_writer: Optional[multiprocessing.connection.Connection],
-    image_token_text: str,
-    launch_callback: Optional[Callable[[], None]] = None,
+        server_args: ServerArgs,
+        pipe_finish_writer: Optional[multiprocessing.connection.Connection],
+        image_token_text: str,
+        launch_callback: Optional[Callable[[], None]] = None,
 ):
     headers = {}
     url = server_args.url()
@@ -840,7 +840,8 @@ def _wait_and_warmup(
         if server_args.dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
     else:
-        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
+        # json_data["text"] = ["The capital city of France is"] * server_args.dp_size
+        json_data["text"] = [f"{index + 1}+1=" for index in range(server_args.dp_size)]
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]
@@ -874,7 +875,7 @@ def _wait_and_warmup(
                 # This is a hack to ensure fake transfer is enabled during prefill warmup
                 # ensure each dp rank has a unique bootstrap_room during prefill warmup
                 "bootstrap_room": [
-                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
+                    i * (2 ** 63 // server_args.dp_size) + (i % server_args.tp_size)
                     for i in range(server_args.dp_size)
                 ],
                 "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
