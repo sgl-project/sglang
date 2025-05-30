@@ -50,7 +50,8 @@ class Llama32Detector(BaseFormatDetector):
         idx = 0
         safe_idx = idx  # the index of the last valid JSON object
         all_actions = []
-        while idx < len(action_text):
+        action_text_len = len(action_text)
+        while idx < action_text_len:
             try:
                 obj, end = decoder.raw_decode(action_text[idx:])
                 all_actions.append(obj)
@@ -71,7 +72,7 @@ class Llama32Detector(BaseFormatDetector):
         calls = self.parse_base_json(all_actions, tools) if all_actions else []
         # Use safe_idx to avoid idx containing the last part of an invalid JSON object
         trailing_text = (
-            action_text[safe_idx:].strip() if safe_idx < len(action_text) else ""
+            action_text[safe_idx:].strip() if safe_idx < action_text_len else ""
         )
         return StreamingParseResult(
             normal_text=normal_text + trailing_text, calls=calls
