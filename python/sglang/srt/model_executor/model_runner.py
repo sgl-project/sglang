@@ -26,6 +26,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt import debug_utils
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -1174,6 +1175,8 @@ class ModelRunner:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         self.forward_pass_id += 1
+
+        debug_utils.dumper.forward_pass_id = self.forward_pass_id
 
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,

@@ -5,6 +5,7 @@ from pathlib import Path
 class _Dumper:
     def __init__(self):
         self._partial_name = str(time.time())
+        self.forward_pass_id = None
 
     def dump(self, name, value, **kwargs):
         from sglang.srt.distributed import get_tensor_model_parallel_rank
