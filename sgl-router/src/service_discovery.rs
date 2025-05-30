@@ -137,7 +137,6 @@ pub async fn start_service_discovery(
             // Clone Arcs for the closures
             let selector_clone = Arc::clone(&selector);
             let tracked_pods_clone = Arc::clone(&tracked_pods);
-            // let router_clone = Arc::clone(&router);
 
             // Apply label selector filter separately since we can't do it directly with the watcher anymore
             let filtered_stream = watcher_stream.filter_map(move |obj_res| {
@@ -166,7 +165,6 @@ pub async fn start_service_discovery(
             // Clone again for the next closure
             let tracked_pods_clone2 = Arc::clone(&tracked_pods_clone);
             let router_clone = Arc::clone(&router);
-            // let router_clone2 = Arc::clone(&router_clone);
 
             match filtered_stream
                 .try_for_each(move |pod| {
@@ -179,7 +177,7 @@ pub async fn start_service_discovery(
                                 handle_pod_deletion(
                                     &pod_info,
                                     tracked_pods_inner,
-                                    router_inner, // Pass router instance
+                                    router_inner,
                                     port,
                                 )
                                 .await;
@@ -187,7 +185,7 @@ pub async fn start_service_discovery(
                                 handle_pod_event(
                                     &pod_info,
                                     tracked_pods_inner,
-                                    router_inner, // Pass router instance
+                                    router_inner,
                                     port,
                                 )
                                 .await;
