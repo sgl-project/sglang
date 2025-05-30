@@ -1157,7 +1157,8 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
-            f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)} "
+            f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)}, "
+            f += f"time: {gap_latency:.2f} "
         else:
             f += f"#queue-req: {len(self.waiting_queue)}"
 
