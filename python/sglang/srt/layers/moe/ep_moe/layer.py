@@ -55,7 +55,13 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_quant_fp8,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import DeepEPMode, dispose_tensor, is_hip, set_weight_attrs, is_cuda
+from sglang.srt.utils import (
+    DeepEPMode,
+    dispose_tensor,
+    is_cuda,
+    is_hip,
+    set_weight_attrs,
+)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
