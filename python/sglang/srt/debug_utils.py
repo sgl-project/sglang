@@ -20,8 +20,10 @@ class _Dumper:
             name=name,
             **kwargs,
         )
-        full_filename = '___'.join(f'{k}={v}' for k, v in full_kwargs.items()) + '.pt'
-        path = self._base_dir / f'sglang_dump_{self._partial_name}_{rank}' / full_filename
+        full_filename = "___".join(f"{k}={v}" for k, v in full_kwargs.items()) + ".pt"
+        path = (
+            self._base_dir / f"sglang_dump_{self._partial_name}_{rank}" / full_filename
+        )
 
         path.mkdir(parents=True, exist_ok=True)
         torch.save(value, str(name))
