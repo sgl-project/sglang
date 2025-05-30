@@ -2236,7 +2236,14 @@ def get_numa_id_for_gpu(gpu_id: int) -> Optional[str]:
     Returns:
         NUMA node ID as string, or None if failed to get
     """
+    nvidia_smi_path = shutil.which("nvidia-smi")
+    if not nvidia_smi_path:
+        logger.error("nvidia-smi executable not found in PATH.")
+        return None
     try:
+        # nvidia-smi topo -C -i <gpu_id> outputs topology information including a line like:
+        # "NUMA IDs of closest CPU: 0" which we parse to extract the NUMA node ID
+        # This format dependency should be considered if nvidia-smi output changes in future versions
         result = subprocess.run(
             ["nvidia-smi", "topo", "-C", "-i", str(gpu_id)],
             stdout=subprocess.PIPE,
