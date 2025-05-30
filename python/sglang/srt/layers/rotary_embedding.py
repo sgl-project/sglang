@@ -15,6 +15,8 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
 
+from sglang.srt.layers.triton_ops.rotary_embedding import rotary_embedding_triton
+
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
@@ -179,6 +181,29 @@ class RotaryEmbedding(CustomOp):
         s += f", max_position_embeddings={self.max_position_embeddings}"
         s += f", base={self.base}, is_neox_style={self.is_neox_style}"
         return s
+
+    def forward_triton(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if offsets is not None:
+            raise Exception(
+                "Terminating the code as batched_rotary_embedding is not supported yet."
+            )
+        else:
+            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
+            rotary_embedding_triton(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.cos_sin_cache,
+                self.is_neox_style,
+            )
+        return query, key
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
