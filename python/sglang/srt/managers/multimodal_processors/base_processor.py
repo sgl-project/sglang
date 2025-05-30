@@ -435,12 +435,7 @@ class BaseMultimodalProcessor(ABC):
         """
         Helper function to concat extracted attributes from processor output.
         """
-        values = [
-            item.get(attr_name)
-            for item in items
-            if item.get(attr_name) is not None
-            # FIXME: Do we really need to check if the attribute is in the item?
-        ]
+        values = [value for item in items if (value := item.get(attr_name)) is not None]
         return torch.cat(values) if values else None
 
     # When we assume that all the items have the same attributes
