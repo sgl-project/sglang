@@ -741,6 +741,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return _dispatch_mla_subtype()
         elif self.attention_backend == "fa3":
             # Flash Attention: Use MHA with chunked KV cache when prefilling on long sequences.
+            sum_extend_prefix_lens = 0
             if forward_batch.extend_prefix_lens_cpu is not None:
                 sum_extend_prefix_lens = sum(forward_batch.extend_prefix_lens_cpu)
             if (
@@ -759,7 +760,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 # because the chunked_prefix_cache is not supported for paged KV cache
                 # so we just enable it for prefill without prefix only
                 # [TODO] we need to fix it when allocator support chunked_prefix_cache
-                and (forward_batch.extend_prefix_lens_cpu is None or not any(forward_batch.extend_prefix_lens_cpu))
+                and (sum_extend_prefix_lens == 0)
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
             ):
@@ -1373,7 +1374,13 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
     
     def forward_normal_paged_prefill_core(self, q, k, v, forward_batch):
-        return self.forward_normal_chunked_kv_core(q, k, v, forward_batch)
+        # we enable the chunked_prefix_cache temporarily
+        temp_disable_flag = global_server_args_dict["disable_chunked_prefix_cache"]
+        global_server_args_dict["disable_chunked_prefix_cache"] = False
+        rst = self.forward_normal_chunked_kv_core(q, k, v, forward_batch)
+        # and restore the flag
+        global_server_args_dict["disable_chunked_prefix_cache"] = temp_disable_flag
+        return rst
 
 
 class DeepseekV2DecoderLayer(nn.Module):
