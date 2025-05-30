@@ -240,18 +240,15 @@ void prepare_moe_input(
     const int64_t n,
     const int64_t k);
 
-void moe_pre_reorder(
-    torch::Tensor input_ptr,
-    torch::Tensor gateup_input_ptr,
-    torch::Tensor src2dst_ptr,
-    torch::Tensor topk_ids_ptr,
-    torch::Tensor a1_scales_ptr,
+void ep_moe_pre_reorder(
+    torch::Tensor input,
+    torch::Tensor gateup_input,
+    torch::Tensor src2dst,
+    torch::Tensor topk_ids,
+    torch::Tensor a1_scales,
     int64_t start_expert_id,
     int64_t end_expert_id,
-    int64_t topk,
-    int64_t hidden_size,
-    int64_t num_blocks,
-    int64_t block_size = 512);
+    int64_t topk);
 
 /*
  * From csrc/speculative

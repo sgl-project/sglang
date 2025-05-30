@@ -61,6 +61,7 @@ def moe_fused_gate(
         routed_scaling_factor,
     )
 
+
 def moe_pre_reorder(
     input_tensor,
     gateup_input,
@@ -70,9 +71,6 @@ def moe_pre_reorder(
     start_expert_id,
     end_expert_id,
     topk,
-    hidden_size,
-    num_blocks,
-    block_size=512,
 ):
     return torch.ops.sgl_kernel.moe_pre_reorder.default(
         input_tensor,
@@ -83,10 +81,8 @@ def moe_pre_reorder(
         start_expert_id,
         end_expert_id,
         topk,
-        hidden_size,
-        num_blocks,
-        block_size,
     )
+
 
 def fp8_blockwise_scaled_grouped_mm(
     output,

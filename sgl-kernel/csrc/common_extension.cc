@@ -152,8 +152,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("moe_fused_gate", torch::kCUDA, &moe_fused_gate);
   m.def(
       "moe_pre_reorder(Tensor input_ptr, Tensor gateup_input_ptr, Tensor src2dst_ptr, Tensor topk_ids_ptr, Tensor "
-      "a1_scales_ptr, int start_expert_id, int end_expert_id, int topk, int hidden_size, int num_blocks, int block_size) -> "
-      "()");
+      "a1_scales_ptr, int start_expert_id, int end_expert_id, int topk) -> ()");
   m.impl("moe_pre_reorder", torch::kCUDA, &moe_pre_reorder);
   m.def(
       "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a_ptrs, Tensor b_ptrs, Tensor out_ptrs, Tensor "
