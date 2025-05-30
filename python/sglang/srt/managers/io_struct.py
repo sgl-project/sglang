@@ -99,6 +99,7 @@ class GenerateReqInput:
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
 
     # Data parallel rank information for sticky scheduling
+    # Data parallel rank information for sticky scheduling. If set, the request will be routed to this specific DP rank.
     dp_rank: Optional[int] = None
 
     # Whether to return hidden states
