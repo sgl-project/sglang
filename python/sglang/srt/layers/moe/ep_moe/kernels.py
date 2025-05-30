@@ -708,8 +708,8 @@ def grouped_gemm_triton(
         triton.cdiv(b.size(1), META["BLOCK_SIZE_N"]),
     )
 
-    if use_per_token_if_dynamic:
-        assert scale_a is None or (
+    if use_fp8_w8a8 and block_shape is None and use_per_token_if_dynamic:
+        assert (
             scale_a.shape[0] == a.shape[0]
         ), f"scale_a.shape: {scale_a.shape}, a.shape: {a.shape}"
 
