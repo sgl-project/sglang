@@ -191,7 +191,7 @@ class MooncakeKVManager(BaseKVManager):
             self.heartbeat_failures = {}
             self.session_pool = defaultdict(requests.Session)
             self.session_pool_lock = threading.Lock()
-            self.addr_to_rooms_tracker = defaultdict(list)
+            self.addr_to_rooms_tracker = defaultdict(set)
             self.connection_lock = threading.Lock()
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
@@ -504,12 +504,14 @@ class MooncakeKVManager(BaseKVManager):
                         if response.status_code == 200:
                             self.heartbeat_failures[bootstrap_addr] = 0
 
-                            for bootstrap_room in self.addr_to_rooms_tracker[
+                            current_rooms = self.addr_to_rooms_tracker[
                                 bootstrap_addr
-                            ]:
-                                # Remove KVPoll.Success requests from the map
+                            ].copy()
+
+                            for bootstrap_room in current_rooms:
+                                # Remove KVPoll.Success requests from the tracker
                                 if bootstrap_room not in self.request_status:
-                                    self.addr_to_rooms_tracker[bootstrap_addr].remove(
+                                    self.addr_to_rooms_tracker[bootstrap_addr].discard(
                                         bootstrap_room
                                     )
                         else:
@@ -877,9 +879,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
         assert len(self.bootstrap_infos) > 0
-        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].append(
-            self.bootstrap_room
-        )
+        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def _get_bootstrap_info_from_server(self, engine_rank, target_dp_group):
