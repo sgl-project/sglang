@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import (
+    _ENABLE_JIT_DEEPGEMM,
     per_token_group_quant_fp8,
     w8a8_block_fp8_matmul,
 )
@@ -14,9 +15,14 @@ class TestFP8Base(CustomTestCase):
     def setUpClass(cls):
         cls.M = 256
         # test non-aligned
-        cls.N = 1024 + 64
-        cls.K = 512
-        cls.group_size = 128
+        # N = 576, K = 7168 is a quantization config shared by all GPUs (according to quantization/configs), which,
+        # together with the 2 block size options of 128 and 64, allows us to test w8a8_block_fp8_matmul()
+        # with config and without config cases on all GPUs.
+        cls.N = 576
+        cls.K = 7168
+        cls.group_sizes = [128]
+        if not _ENABLE_JIT_DEEPGEMM:
+            cls.group_sizes.append(64)
         cls.quant_type = torch.float8_e4m3fn
         cls.output_type = torch.bfloat16
 
@@ -88,38 +94,43 @@ class TestFP8Base(CustomTestCase):
 
 class TestPerTokenGroupQuantFP8(TestFP8Base):
     def test_per_token_group_quant_fp8(self):
-        if torch.cuda.get_device_capability()[0] < 9:
+        major, minor = torch.cuda.get_device_capability()
+        if major < 8 or (major == 8 and minor < 9):
             return
-        A, A_quant_gt, scale_gt = self._make_A(
-            M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
-        )
-        A_quant, scale = per_token_group_quant_fp8(x=A, group_size=self.group_size)
-        torch.testing.assert_close(scale, scale_gt)
-        diff = (A_quant.to(torch.float16) - A_quant_gt.to(torch.float16)).abs()
-        diff_count = (diff > 1e-5).count_nonzero()
-        assert diff_count / diff.numel() < 1e-4
+        for group_size in self.group_sizes:
+            A, A_quant_gt, scale_gt = self._make_A(
+                M=self.M, K=self.K, group_size=group_size, out_dtype=self.quant_type
+            )
+            A_quant, scale = per_token_group_quant_fp8(x=A, group_size=group_size)
+            torch.testing.assert_close(scale, scale_gt)
+            diff = (A_quant.to(torch.float16) - A_quant_gt.to(torch.float16)).abs()
+            diff_count = (diff > 1e-5).count_nonzero()
+            assert diff_count / diff.numel() < 1e-4
 
 
 class TestW8A8BlockFP8Matmul(TestFP8Base):
     def test_w8a8_block_fp8_matmul(self):
-        if torch.cuda.get_device_capability()[0] < 9:
+        major, minor = torch.cuda.get_device_capability()
+        if major < 8 or (major == 8 and minor < 9):
             return
-        A, A_quant_gt, A_scale_gt = self._make_A(
-            M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
-        )
-        B, B_quant_gt, B_scale_gt = self._make_B(
-            K=self.K, N=self.N, group_size=self.group_size, out_dtype=self.quant_type
-        )
-        C_gt = A.to(self.output_type) @ B.to(self.output_type)
-        C = w8a8_block_fp8_matmul(
-            A=A_quant_gt,
-            B=B_quant_gt.T.contiguous(),
-            As=A_scale_gt,
-            Bs=B_scale_gt.T.contiguous(),
-            block_size=[128, 128],
-            output_dtype=self.output_type,
-        )
-        torch.testing.assert_close(C, C_gt, atol=0.5, rtol=1e-4)
+        w8a8_block_fp8_matmul_compiled = torch.compile(w8a8_block_fp8_matmul)
+        for group_size in self.group_sizes:
+            A, A_quant_gt, A_scale_gt = self._make_A(
+                M=self.M, K=self.K, group_size=group_size, out_dtype=self.quant_type
+            )
+            B, B_quant_gt, B_scale_gt = self._make_B(
+                K=self.K, N=self.N, group_size=group_size, out_dtype=self.quant_type
+            )
+            C_gt = A.to(self.output_type) @ B.to(self.output_type)
+            C = w8a8_block_fp8_matmul_compiled(
+                A=A_quant_gt,
+                B=B_quant_gt.T.contiguous(),
+                As=A_scale_gt,
+                Bs=B_scale_gt.T.contiguous(),
+                block_size=[group_size, group_size],
+                output_dtype=self.output_type,
+            )
+            torch.testing.assert_close(C, C_gt, atol=0.5, rtol=1e-4)
 
 
 if __name__ == "__main__":
