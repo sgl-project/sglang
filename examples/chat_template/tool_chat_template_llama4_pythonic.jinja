@@ -1,6 +1,6 @@
 {# Copied from https://github.com/wukaixingxp/vllm/blob/8a32e2a6e452a03c0e8222e3876ad6086cbf581f/examples/tool_chat_template_llama4_pythonic.jinja to enable better model response. #}
 {{- bos_token }}
-{%- if custom_tools is defined and custom_tools%}
+{%- if custom_tools is defined and custom_tools %}
     {%- set tools = custom_tools %}
 {%- endif %}
 {%- if tools is defined and tools %}
@@ -45,7 +45,7 @@
 {#- Now deal with all other messages #}
 {%- for message in messages %}
     {#- Base case: messages that are not from tool role and has empty tool_call list  #}
-    {%- if not (message.role == 'ipython' or message.role == 'tool' or ('tool_calls' in message and  message.tool_calls|length != 0 )) %}
+    {%- if not (message.role == 'ipython' or message.role == 'tool' or ('tool_calls' in message and message.tool_calls|length != 0 )) %}
         {{- '<|header_start|>' + message['role'] + '<|header_end|>\n\n' }}
         {%- if message['content'] is string %}
             {{- message['content'] }}
@@ -75,7 +75,7 @@
                 {%- endif %}
             {%- endfor %}
         {%- endif %}
-            {{- "[" }}
+        {{- "[" }}
         {%- for tool_call in message.tool_calls %}
             {%- if tool_call.function is defined %}
                 {%- set tool_call = tool_call.function %}
@@ -96,11 +96,11 @@
     {%- elif message.role == "tool" or message.role == "ipython" %}
         {{- "<|header_start|>ipython<|header_end|>\n\n" }}
         {%- if message.content is string %}
-            {{-  message.content  | tojson }}
+            {{- message.content | tojson }}
         {%- else %}
             {%- for content in message['content']  %}
                 {%- if content['type']  == 'text' %}
-                    {{-  content['text'] | tojson }}
+                    {{- content['text'] | tojson }}
                 {%- endif %}
             {%- endfor %}
         {%- endif %}

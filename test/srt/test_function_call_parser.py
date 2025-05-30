@@ -267,36 +267,70 @@ class TestPythonicDetector(unittest.TestCase):
 
     def test_parse_streaming_with_python_start_and_end_token(self):
         """Test parsing a message that starts with <|python_start|> and <|python_end|> across chunks."""
-        text1 = (
-            "Here's a call: <|python_start|>[get_weather(location='Tokyo', data=[1, 2"
-        )
-        result1 = self.detector.parse_streaming_increment(text1, self.tools)
+        chunks = [
+            "Here's a call: ",
+            "<|python_",
+            "start|>[get_weather(location=",
+            "'Tokyo', data=[1, 2",
+            ", 3])]<|python_end|>",
+        ]
 
-        self.assertEqual(result1.normal_text, "Here's a call: ")
-        self.assertEqual(result1.calls, [])
+        normal_text = ""
+        call_name = ""
+        parameters = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            if result.normal_text:
+                normal_text += result.normal_text
+            if result.calls:
+                call_name += result.calls[0].name
+                parameters += result.calls[0].parameters
+
+        self.assertEqual(normal_text, "Here's a call: ")
+        self.assertEqual(call_name, "get_weather")
+        self.assertEqual(self.detector._buffer, "")
         self.assertEqual(
-            self.detector._buffer, "[get_weather(location='Tokyo', data=[1, 2"
+            result.normal_text, "", "Final result should have no normal text"
         )
 
-        text2 = ", 3])]<|python_end|>"
-        result2 = self.detector.parse_streaming_increment(text2, self.tools)
+        # Check the parameters
+        params = json.loads(parameters)
+        self.assertEqual(params["location"], "Tokyo")
+        self.assertEqual(params["data"], [1, 2, 3])
 
-        self.assertEqual(result2.normal_text, "")
-        self.assertEqual(len(result2.calls), 1)
-        self.assertEqual(result2.calls[0].name, "get_weather")
+        chunks = [
+            "Here's a call: <|python_start|>[get_weather(location='Tokyo', data=[1, 2, 3])]<|python_end|>"
+        ]
+
+        normal_text = ""
+        call_name = ""
+        parameters = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            if result.normal_text:
+                normal_text += result.normal_text
+            if result.calls:
+                call_name += result.calls[0].name
+                parameters += result.calls[0].parameters
+
+        self.assertEqual(normal_text, "Here's a call: ")
+        self.assertEqual(call_name, "get_weather")
         self.assertEqual(self.detector._buffer, "")
 
         # Check the parameters
-        params = json.loads(result2.calls[0].parameters)
+        params = json.loads(parameters)
         self.assertEqual(params["location"], "Tokyo")
         self.assertEqual(params["data"], [1, 2, 3])
 
     def test_detect_and_parse_with_python_start_and_end_token(self):
         """Test parsing a message that starts with <|python_start|> and contains a valid tool call."""
-        text = "   <|python_start|>[get_weather(location='Mars', unit='celsius')]<|python_end|>  "
+        text = "User wants to get the weather in Mars. <|python_start|>[get_weather(location='Mars', unit='celsius')]<|python_end|> In this way we will get the weather in Mars."
         result = self.detector.detect_and_parse(text, self.tools)
 
-        self.assertEqual(result.normal_text, "")
+        self.assertEqual(
+            result.normal_text,
+            "User wants to get the weather in Mars.  In this way we will get the weather in Mars.",
+        )
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_weather")
         self.assertEqual(self.detector._buffer, "")
