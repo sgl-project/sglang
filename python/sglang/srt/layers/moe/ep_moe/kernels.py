@@ -709,7 +709,7 @@ def grouped_gemm_triton(
     )
 
     if use_per_token_if_dynamic:
-        assert (
+        assert scale_a is None or (
             scale_a.shape[0] == a.shape[0]
         ), f"scale_a.shape: {scale_a.shape}, a.shape: {a.shape}"
 
