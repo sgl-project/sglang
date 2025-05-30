@@ -495,7 +495,7 @@ class TokenizerManager:
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
             max_new_tokens is not None
-            and (max_new_tokens + input_token_num) >= self.context_len
+            and (max_new_tokens + input_token_num) > self.context_len
         ):
             total_tokens = max_new_tokens + input_token_num
             error_msg = (
