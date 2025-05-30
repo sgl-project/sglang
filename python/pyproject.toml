@@ -40,7 +40,7 @@ runtime_common = [
     "pyzmq>=25.1.2",
     "soundfile==0.13.1",
     "scipy",
-    "torchao==0.9.0",
+    "torchao==0.10.0",
     "transformers==4.52.3",
     "uvicorn",
     "uvloop",
