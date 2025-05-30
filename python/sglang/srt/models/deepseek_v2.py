@@ -1461,6 +1461,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+        hidden_states = hidden_states.clone()
 
         return hidden_states, residual
 
@@ -1685,8 +1686,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                 and self.config.n_routed_experts == 256
                 and (not global_server_args_dict["enable_deepep_moe"])
             ):
-                self.n_share_experts_fusion = self.tp_size
-                global_server_args_dict["n_share_experts_fusion"] = self.tp_size
+                # self.n_share_experts_fusion = self.tp_size
+                # global_server_args_dict["n_share_experts_fusion"] = self.tp_size
+                self.n_share_experts_fusion = 0
+                global_server_args_dict["n_share_experts_fusion"] = 0
                 log_info_on_rank0(
                     logger,
                     "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled.",

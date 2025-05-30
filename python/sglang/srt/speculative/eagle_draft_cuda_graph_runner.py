@@ -95,6 +95,9 @@ class EAGLEDraftCudaGraphRunner:
                 self.global_num_tokens_gpu = torch.zeros(
                     (self.dp_size,), dtype=torch.int32
                 )
+                self.global_num_tokens_for_logprob_gpu = torch.zeros(
+                    (self.dp_size,), dtype=torch.int32
+                )
 
         # Capture
         try:
@@ -160,11 +163,23 @@ class EAGLEDraftCudaGraphRunner:
                     device=self.input_ids.device,
                 )
             )
+            self.global_num_tokens_for_logprob_gpu.copy_(
+                torch.tensor(
+                    [
+                        num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
+                        for i in range(self.dp_size)
+                    ],
+                    dtype=torch.int32,
+                    device=self.input_ids.device,
+                )
+            )
             global_num_tokens = self.global_num_tokens_gpu
             gathered_buffer = self.gathered_buffer[:num_tokens]
+            global_num_tokens_for_logprob = self.global_num_tokens_for_logprob_gpu
         else:
             global_num_tokens = None
             gathered_buffer = None
+            global_num_tokens_for_logprob = None
 
         spec_info = EagleDraftInput(
             topk_p=topk_p,
@@ -193,6 +208,7 @@ class EAGLEDraftCudaGraphRunner:
             capture_hidden_mode=(
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
+            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob,
         )
 
         # Attention backend
@@ -269,6 +285,11 @@ class EAGLEDraftCudaGraphRunner:
         self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
+        self.global_num_tokens_for_logprob_gpu.copy_(
+            forward_batch.global_num_tokens_for_logprob_gpu
+        )
+        forward_batch.gathered_buffer = self.gathered_buffer
 
         # Attention backend
         if bs != raw_bs:
