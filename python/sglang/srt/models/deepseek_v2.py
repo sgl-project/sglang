@@ -23,6 +23,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from sglang.srt import debug_utils
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     parallel_state,
@@ -1445,8 +1446,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        print(
-            f"hi [{get_tensor_model_parallel_rank()}] decoder layer forward start {self.layer_id=} {hidden_states[:, :3]=}")
+        debug_utils.dumper.dump("layer_start_hidden_states", hidden_states, layer_id=self.layer_id)
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -1457,10 +1457,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
+        debug_utils.dumper.dump("after_attn_hidden_states", hidden_states, layer_id=self.layer_id)
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        debug_utils.dumper.dump("after_mlp_hidden_states", hidden_states, layer_id=self.layer_id)
 
         hidden_states = self.mlp(hidden_states, forward_batch)
 
@@ -1468,6 +1470,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+        debug_utils.dumper.dump("layer_end_hidden_states", hidden_states, layer_id=self.layer_id)
+        debug_utils.dumper.dump("layer_end_residual", residual, layer_id=self.layer_id)
         return hidden_states, residual
 
     def op_comm_prepare_attn(
