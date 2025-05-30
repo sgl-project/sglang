@@ -2224,3 +2224,11 @@ def read_system_prompt_from_file(model_name: str) -> str:
     except Exception:
         # If anything fails, return empty string
         return ""
+
+
+def bind_or_assign(target, source):
+    if target is not None:
+        target.copy_(source)
+        return target
+    else:
+        return source
