@@ -684,25 +684,31 @@ def assign_draft_cache_locs(
     kv_start = tl.load(seq_lens + pid)
 
     if page_size == 1 or topk == 1:
-        kv_end = tl.load(seq_lens + pid) + topk * speculative_num_steps
+        kv_end = kv_start + topk * speculative_num_steps
         out_cache_ptr = out_cache_loc + pid * topk * speculative_num_steps
     else:
-        prefix_len = tl.load(seq_lens + pid)
+        prefix_len = kv_start  # prefix_len is the current sequence length
         last_page_len = prefix_len % page_size
         num_new_page = (
             last_page_len + speculative_num_steps + page_size - 1
         ) // page_size
-        kv_end = prefix_len // page_size * page_size + num_new_page * (page_size * topk)
+        kv_end = (prefix_len // page_size * page_size) + num_new_page * (
+            page_size * topk
+        )
+        out_cache_ptr = out_cache_loc + pid * topk * speculative_num_steps
 
-    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
+    token_pool_pid_base = req_to_token + tl.load(req_pool_indices + pid) * pool_len
+    num_elements_to_copy_total = topk * speculative_num_steps
 
-    num_loop = tl.cdiv(topk * speculative_num_steps, BLOCK_SIZE)
+    num_loop = tl.cdiv(num_elements_to_copy_total, BLOCK_SIZE)
     for i in range(num_loop):
-        save_offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE + kv_start
-        load_offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = save_offset < kv_end
-        data = tl.load(out_cache_ptr + load_offset, mask=mask)
-        tl.store(token_pool + save_offset, data, mask=mask)
+        block_spec_offsets = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        load_mask = block_spec_offsets < num_elements_to_copy_total
+        data = tl.load(out_cache_ptr + block_spec_offsets, mask=load_mask, other=0)
+
+        save_logical_slots = kv_start + block_spec_offsets
+        store_mask = (save_logical_slots < kv_end) & load_mask
+        tl.store(token_pool_pid_base + save_logical_slots, data, mask=store_mask)
 
 
 @triton.jit
