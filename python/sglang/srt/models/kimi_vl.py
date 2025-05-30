@@ -144,9 +144,9 @@ class KimiVLForConditionalGeneration(nn.Module):
             .type(self.vision_tower.dtype)
             .to(self.vision_tower.device)
         )
-        image_grid_hws = torch.cat(
-            [item.image_grid_hws for item in items], dim=0
-        ).to(self.vision_tower.device)
+        image_grid_hws = torch.cat([item.image_grid_hws for item in items], dim=0).to(
+            self.vision_tower.device
+        )
         image_features = self.vision_tower(pixel_values, image_grid_hws)
         assert isinstance(image_features, list)
         # lengths = [x.shape[0] for x in image_features]

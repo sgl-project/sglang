@@ -3,8 +3,8 @@ import math
 import re
 from typing import Dict, List, Union
 
-from PIL import Image
 import torch
+from PIL import Image
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.managers.multimodal_processors.base_processor import (
