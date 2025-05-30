@@ -9,11 +9,16 @@ class _Dumper:
         self._partial_name = str(time.time())
         self.forward_pass_id = None
 
-    def dump(self, name, value):
+    def dump(self, name, value, **kwargs):
         from sglang.srt.distributed import get_tensor_model_parallel_rank
 
         rank = get_tensor_model_parallel_rank()
-        full_filename = f'F{self.forward_pass_id}__{name}.pt'
+        full_kwargs = dict(
+            forward_pass_id=self.forward_pass_id,
+            name=name,
+            **kwargs,
+        )
+        full_filename = '__'.join(f'{k}={v}' for k, v in full_kwargs.items()) + '.pt'
         path = Path('/tmp') / f'sglang_dump_{self._partial_name}_{rank}' / full_filename
 
         path.mkdir(parents=True, exist_ok=True)
