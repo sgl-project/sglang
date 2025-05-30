@@ -240,6 +240,62 @@ class MooncakeKVManager(BaseKVManager):
         prefill_kv_indices: npt.NDArray[np.int64],
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int64],
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ):
+        # Group by indices
+        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
+            prefill_kv_indices, dst_kv_indices
+        )
+
+        num_layers = len(self.kv_args.kv_data_ptrs)
+        layers_params = [
+            (
+                self.kv_args.kv_data_ptrs[layer_id],
+                dst_kv_ptrs[layer_id],
+                self.kv_args.kv_item_lens[layer_id],
+            )
+            for layer_id in range(num_layers)
+        ]
+
+        # Worker function for processing a single layer
+        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+                src_addr = src_ptr + int(prefill_index[0]) * item_len
+                dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                length = item_len * len(prefill_index)
+
+                status = self.engine.transfer_sync(
+                    mooncake_session_id, src_addr, dst_addr, length
+                )
+                if status != 0:
+                    return status
+            return 0
+
+        futures = [
+            executor.submit(
+                process_layer,
+                src_ptr,
+                dst_ptr,
+                item_len,
+            )
+            for (src_ptr, dst_ptr, item_len) in layers_params
+        ]
+
+        for future in concurrent.futures.as_completed(futures):
+            status = future.result()
+            if status != 0:
+                for f in futures:
+                    f.cancel()
+                return status
+
+        return 0
+
+    def send_kvcache_slice(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int64],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int64],
         target_tp_rank: int,
         decode_tp_world_size: int,
         executor: concurrent.futures.ThreadPoolExecutor,
@@ -265,8 +321,8 @@ class MooncakeKVManager(BaseKVManager):
         prefill_rank_global_start_head_idx = local_tp_rank * heads_per_prefill_rank
 
         if local_tp_size > decode_tp_world_size:
-            head_idx_for_rank = 0  # for tp_p > tp_d
-            num_heads_in_sub_slice = heads_per_prefill_rank  # for tp_p > tp_d
+            head_idx_for_rank = 0   
+            num_heads_in_sub_slice = heads_per_prefill_rank   
             head_idx_in_group = prefill_rank_global_start_head_idx - decode_rank_global_start_head_idx
 
         else:
@@ -277,10 +333,10 @@ class MooncakeKVManager(BaseKVManager):
 
         layers_params_for_processing = []
         for layer_id in range(num_layers): 
-            item_len_of_prefill_rank_page = self.kv_args.kv_item_lens[layer_id] # Prefill page size, e.g., 2048
+            item_len_of_prefill_rank_page = self.kv_args.kv_item_lens[layer_id]  
             
             # Page stride on the target Decode rank for its slice pages
-            item_len_of_decode_rank_page = decode_rank_registered_item_lens[layer_id] # e.g., 1024
+            item_len_of_decode_rank_page = decode_rank_registered_item_lens[layer_id] 
 
             if item_len_of_prefill_rank_page == 0 or num_kv_heads == 0:
                 logger.error(f"Invalid item_len_of_prefill_rank_page or num_kv_heads for layer {layer_id}")
@@ -288,7 +344,7 @@ class MooncakeKVManager(BaseKVManager):
 
             bytes_per_head_in_prefill_rank_page = item_len_of_prefill_rank_page // heads_per_prefill_rank
 
-            # Calculate precise byte offset and length for the sub-slice within P_m's page data
+            # Calculate precise byte offset and length for the sub-slice within Prefill page data
             offset_in_prefill_page = \
                 head_idx_for_rank * bytes_per_head_in_prefill_rank_page
             byte_length_per_page = \
@@ -440,15 +496,25 @@ class MooncakeKVManager(BaseKVManager):
 
                         target_rank_registration_info: KVArgsRegisterInfo = \
                                 self.decode_kv_args_table[req.mooncake_session_id]
-                        ret = self.send_kvcache(
-                            req.mooncake_session_id,
-                            kv_chunk.prefill_kv_indices,
-                            target_rank_registration_info.dst_kv_ptrs,
-                            chunked_dst_kv_indice,
-                            target_rank_registration_info.tp_rank_id_in_group,
-                            target_rank_registration_info.tp_world_size_of_group,
-                            executor,
-                            )
+                        local_tp_rank = self.tp_size // self.dp_size
+                        if self.is_mla_backend or local_tp_rank == target_rank_registration_info.tp_world_size_of_group:
+                            ret = self.send_kvcache(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                executor,
+                                )
+                        else:
+                            ret = self.send_kvcache_slice(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                target_rank_registration_info.tp_rank_id_in_group,
+                                target_rank_registration_info.tp_world_size_of_group,
+                                executor,
+                                )
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
@@ -884,9 +950,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.required_dst_info_num = 1
             self.target_tp_ranks = [self.target_tp_rank]
         elif local_tp_size_per_dp_rank > prefill_tp_size_per_dp_rank:
-            assert (
-                self.kv_mgr.is_mla_backend
-            ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
             self.target_tp_rank = (
                 self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
             ) // (local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank)
@@ -895,10 +958,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
             )
             self.target_tp_ranks = [self.target_tp_rank]
         else:
-            assert (
-                self.kv_mgr.is_mla_backend
-            ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
-
             # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks for non MLA models;
             self.target_tp_ranks = [
                 rank
@@ -909,7 +968,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
                     * (prefill_tp_size_per_dp_rank // local_tp_size_per_dp_rank),
                 )
             ]
-            logger.info(f"self.target_tp_ranks {self.target_tp_ranks}")
 
             # For MLA models, we can retrieve KVCache from only one prefill rank, but we still need to maintain
             # multiple connections in the connection pool and have to send dummy requests to other prefill ranks,
@@ -931,15 +989,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                     target_tp_rank,
                     self.target_dp_group,
                 )
-                logger.info(f"target_tp_rank {target_tp_rank}")
-                logger.info(f"bootstrap_info {bootstrap_info}")
-
                 if bootstrap_info is not None:
-                    # # NOTE: only support MLA for now: select one prefill rank as real rank
-                    # bootstrap_info["is_dummy"] = not bool(
-                    #     target_tp_rank == self.target_tp_rank
-                    #     or self.target_tp_rank is None
-                    # )
                     if self.kv_mgr.is_mla_backend:
                         # MLA :select one prefill rank as real rank
                         bootstrap_info["is_dummy"] = not bool(
@@ -947,7 +997,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                             or self.target_tp_rank is None
                         )
                     else:
-                        # no-MLA：select all prefill ranks as real ranks
+                        # no-MLA：select all prefill ranks
                         bootstrap_info["is_dummy"] = False
 
                     logger.debug(
