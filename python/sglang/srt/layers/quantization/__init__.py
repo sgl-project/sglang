@@ -21,7 +21,6 @@ try:
     from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
     from vllm.model_executor.layers.quantization.gptq_marlin import (
         GPTQMarlinLinearMethod,
-        GPTQMarlinMoEMethod,
     )
     from vllm.model_executor.layers.quantization.gptq_marlin_24 import (
         GPTQMarlin24Config,
@@ -57,12 +56,17 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
+from sglang.srt.layers.quantization.gptq import (
+    GPTQConfig,
+    GPTQMarlinConfig,
+    GPTQMarlinMoEMethod,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
 )
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+from sglang.srt.layers.quantization.qoq import QoQConfig
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
@@ -77,6 +81,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "w8a8_fp8": W8A8Fp8Config,
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
+    "qoq": QoQConfig,
 }
 
 # VLLM-dependent quantization methods
@@ -109,7 +114,7 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
     if quantization in VLLM_QUANTIZATION_METHODS and not VLLM_AVAILABLE:
         raise ValueError(
             f"{quantization} quantization requires some operators from vllm. "
-            "Pleaes install vllm by `pip install vllm==0.8.4`"
+            "Please install vllm by `pip install vllm==0.8.4`"
         )
     logger.info("quantization: %s", quantization)
     return QUANTIZATION_METHODS[quantization]

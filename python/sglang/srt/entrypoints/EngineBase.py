@@ -28,6 +28,11 @@ class EngineBase(ABC):
         pass
 
     @abstractmethod
+    def flush_cache(self):
+        """Flush the cache of the engine."""
+        pass
+
+    @abstractmethod
     def update_weights_from_tensor(
         self,
         named_tensors: List[Tuple[str, torch.Tensor]],

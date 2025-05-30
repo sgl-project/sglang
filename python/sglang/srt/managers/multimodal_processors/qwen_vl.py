@@ -1,6 +1,7 @@
 import asyncio
 import math
-from typing import List, Union
+import re
+from typing import Dict, List, Union
 
 import torch
 from PIL import Image
@@ -23,7 +24,12 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
+        # The single, pre-expanded image token.
         self.IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
+        # The regex that matches expanded image tokens.
+        self.IMAGE_TOKEN_REGEX = re.compile(
+            r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
+        )
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
         self.image_token_id = hf_config.image_token_id
@@ -38,7 +44,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
     async def process_mm_data_async(
         self,
-        image_data: List[Union[str, bytes]],
+        image_data: List[Union[str, bytes, Dict]],
         input_text,
         request_obj,
         max_req_input_len,
@@ -48,11 +54,13 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         if isinstance(image_data, str):
             image_data = [image_data]
 
-        image_token = self.IMAGE_TOKEN
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
+            multimodal_tokens=MultimodalSpecialTokens(
+                image_token=self.IMAGE_TOKEN,
+                image_token_regex=self.IMAGE_TOKEN_REGEX,
+            ),
             max_req_input_len=max_req_input_len,
         )
 
@@ -117,26 +125,45 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         async def resize_image_async(image):
             return resize_image(image)
 
-        if base_output.images:
+        images_are_preprocessed = self.mm_inputs_are_preprocessed(base_output.images)
+        if base_output.images and not images_are_preprocessed:
             resize_tasks = [resize_image_async(image) for image in base_output.images]
             base_output.images = await asyncio.gather(*resize_tasks)
 
         ret = self.process_mm_data(
             input_text=base_output.input_text,
-            images=base_output.images,
+            images=None if images_are_preprocessed else base_output.images,
         )
-
+        input_ids = ret["input_ids"].flatten().tolist()
+        image_offsets = self.get_mm_items_offset(
+            input_ids=ret["input_ids"].flatten(), mm_token_id=self.image_token_id
+        )
+        image_grid_thw = None
+        video_grid_thw = None  # TODO
         items = []
 
-        input_ids = ret["input_ids"].flatten().tolist()
-        if "pixel_values" in ret:
+        if base_output.images:
+            if images_are_preprocessed:
+                image_grid_thw = self._extract_processor_features(
+                    base_output.images, "image_grid_thws"
+                )
+                precomputed_features = self._extract_processor_features(
+                    base_output.images, "precomputed_features"
+                )
+                pixel_values = self._extract_processor_features(
+                    base_output.images, "pixel_values"
+                )
+            else:
+                image_grid_thw = ret["image_grid_thw"]
+                pixel_values = ret["pixel_values"]
+                precomputed_features = None
             items += [
                 MultimodalDataItem(
-                    pixel_values=ret["pixel_values"],
-                    image_grid_thws=torch.concat([ret["image_grid_thw"]]),
-                    # TODO
-                    video_grid_thws=None,
-                    second_per_grid_ts=ret.get("second_per_grid_ts", None),
+                    pixel_values=pixel_values,
+                    image_grid_thws=image_grid_thw,
+                    video_grid_thws=video_grid_thw,
+                    precomputed_features=precomputed_features,
+                    image_offsets=image_offsets,
                     modality=Modality.IMAGE,
                 )
             ]
@@ -151,8 +178,8 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
                 self.hf_config.vision_config, "tokens_per_second", None
             ),
             input_ids=torch.tensor(input_ids).unsqueeze(0),
-            image_grid_thw=ret.get("image_grid_thw", None),
-            video_grid_thw=ret.get("video_grid_thw", None),
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
             second_per_grid_ts=ret.get("second_per_grid_ts", None),
         )
         mrope_positions = mrope_positions.squeeze(1)
