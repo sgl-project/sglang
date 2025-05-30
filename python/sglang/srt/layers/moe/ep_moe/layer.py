@@ -10,11 +10,7 @@ from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchI
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 try:
-    from deep_gemm import (
-        get_col_major_tma_aligned_tensor,
-        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
-        m_grouped_gemm_fp8_fp8_bf16_nt_masked,
-    )
+    from deep_gemm import fp8_m_grouped_gemm_nt_masked, m_grouped_fp8_gemm_nt_contiguous
     from sgl_kernel import silu_and_mul
 
     from sglang.srt.layers.quantization.fp8_kernel import (
@@ -1091,7 +1087,7 @@ class DeepEPMoE(EPMoE):
             dtype=torch.bfloat16,
         )
         input_tensor[1] = tma_align_input_scale(input_tensor[1])
-        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+        m_grouped_fp8_gemm_nt_contiguous(
             input_tensor, self.w13_weight_fp8, gateup_output, m_indices
         )
         del input_tensor
@@ -1115,7 +1111,7 @@ class DeepEPMoE(EPMoE):
         )
         del down_input
         down_input_scale = tma_align_input_scale(down_input_scale)
-        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+        m_grouped_fp8_gemm_nt_contiguous(
             (down_input_fp8, down_input_scale),
             self.w2_weight_fp8,
             down_output,
@@ -1148,7 +1144,7 @@ class DeepEPMoE(EPMoE):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_fp8[0].device, dtype=torch.bfloat16
         )
-        m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+        fp8_m_grouped_gemm_nt_masked(
             hidden_states_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
         )
         dispose_tensor(hidden_states_fp8[0])
@@ -1186,12 +1182,14 @@ class DeepEPMoE(EPMoE):
         n = self.w2_weight.size(1)
         down_input_fp8 = (
             down_input,
-            get_col_major_tma_aligned_tensor(down_input_scale),
+            # NOTE MODIFIED
+            # get_col_major_tma_aligned_tensor(down_input_scale),
+            down_input_scale,
         )
         down_output = torch.empty(
             (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16
         )
-        m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+        fp8_m_grouped_gemm_nt_masked(
             down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
         )
 
