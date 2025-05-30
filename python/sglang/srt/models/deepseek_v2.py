@@ -18,7 +18,6 @@
 
 import logging
 import os
-import time
 from enum import IntEnum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -375,7 +374,6 @@ class DeepseekV2MoE(nn.Module):
             topk_weights = torch.empty(
                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
-        print(f"hi DeepseekV2MoE before dispatch {hidden_states[:, :5]=}")
         if self.ep_size > 1:
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             (
@@ -393,13 +391,6 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights=topk_weights,
                 forward_mode=forward_mode,
             )
-        print("hi sleep...")
-        time.sleep(3)
-        torch.set_printoptions(profile="full")
-        print(
-            f"hi DeepseekV2MoE call experts {hidden_states[0][:, :2]=} {hidden_states[1][:, :2]=}"
-        )
-        torch.set_printoptions(profile="default")
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
