@@ -443,19 +443,6 @@ class BaseMultimodalProcessor(ABC):
         ]
         return torch.cat(values) if values else None
 
-    # FIXME: This function is not used yet, I am not sure about the use case
-    def _extract_processor_features_other_than_attributes(
-        self, items: List[dict], attr_names: List[str]
-    ) -> dict:
-        values = {}
-        for k, v in items[0].items():
-            if k not in attr_names:
-                if isinstance(v, list):
-                    values[k] = self._extract_processor_features(items, k)
-                else:
-                    values[k] = v
-        return values
-
     # When we assume that all the items have the same attributes
     def _extract_processor_features_from_all_attributes(
         self, items: List[dict]
