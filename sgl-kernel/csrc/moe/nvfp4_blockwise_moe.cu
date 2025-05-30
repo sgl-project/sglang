@@ -379,8 +379,6 @@ void run_fp4_blockwise_scaled_group_mm(
   TORCH_CHECK(status == cutlass::Status::kSuccess, "Failed to run GEMM");
 }
 
-constexpr auto FLOAT4_E2M1X2 = at::ScalarType::Byte;
-constexpr auto SF_DTYPE = at::ScalarType::Float8_e4m3fn;
 
 #define CHECK_TYPE(x, st, m) TORCH_CHECK(x.scalar_type() == st, ": Inconsistency of Tensor type:", m)
 #define CHECK_TH_CUDA(x, m) TORCH_CHECK(x.is_cuda(), m, ": must be a CUDA tensor.")
@@ -401,6 +399,9 @@ void cutlass_fp4_group_mm(
     const torch::Tensor& expert_offsets,
     const torch::Tensor& sf_offsets) {
 #if defined ENABLE_NVFP4 && ENABLE_NVFP4
+  
+  constexpr auto FLOAT4_E2M1X2 = at::ScalarType::Byte;
+  constexpr auto SF_DTYPE = at::ScalarType::Float8_e4m3fn;
   // Input validation
   CHECK_INPUT(a, FLOAT4_E2M1X2, "a");
   CHECK_INPUT(b, FLOAT4_E2M1X2, "b");
