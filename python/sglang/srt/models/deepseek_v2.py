@@ -1881,6 +1881,83 @@ class DeepseekV2ForCausalLM(nn.Module):
                 if isinstance(layer.mlp, DeepseekV2MoE)
             }
 
+    def compute_shared_experts_fusion_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        moe_layers: Iterable[int],
+    ):
+        if self.n_share_experts_fusion == 0:
+            return weights
+
+        weights_list = list(weights)
+        weights_dict = dict(weights_list)
+        if self.quant_config is not None:
+            if self.quant_config.get_name() == "w8a8_int8":
+                suffix_list = [
+                    "down_proj.weight",
+                    "down_proj.weight_scale",
+                    "gate_proj.weight",
+                    "gate_proj.weight_scale",
+                    "up_proj.weight",
+                    "up_proj.weight_scale",
+                ]
+            elif (
+                self.quant_config.get_name() == "fp8"
+                or self.quant_config.get_name() == "blockwise_int8"
+            ):
+                suffix_list = [
+                    "down_proj.weight",
+                    "down_proj.weight_scale_inv",
+                    "gate_proj.weight",
+                    "gate_proj.weight_scale_inv",
+                    "up_proj.weight",
+                    "up_proj.weight_scale_inv",
+                ]
+            elif self.quant_config.get_name() == "awq":
+                suffix_list = [
+                    "down_proj.qweight",
+                    "down_proj.qzeros",
+                    "down_proj.scales",
+                    "gate_proj.qweight",
+                    "gate_proj.qzeros",
+                    "gate_proj.scales",
+                    "up_proj.qweight",
+                    "up_proj.qzeros",
+                    "up_proj.scales",
+                ]
+            else:
+                raise ValueError(
+                    f"Unsupported shared expert fusion for quantization: {self.quant_config.get_name()}."
+                )
+        else:
+            suffix_list = [
+                "down_proj.weight",
+                "gate_proj.weight",
+                "up_proj.weight",
+            ]
+        names_to_remove = []
+        for moe_layer in tqdm(
+            moe_layers,
+            desc=f"Cloning {self.n_share_experts_fusion} "
+            f"replicas of the shared expert into MoE for {self.config.architectures[0]}",
+        ):
+            for suffix in suffix_list:
+                shared_expert_weight_name = (
+                    f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
+                )
+                for num_repeat in range(self.n_share_experts_fusion):
+                    weights_list.append(
+                        (
+                            f"model.layers.{moe_layer}."
+                            f"mlp.experts."
+                            f"{self.config.n_routed_experts + num_repeat}"
+                            f".{suffix}",
+                            weights_dict[shared_expert_weight_name],
+                        )
+                    )
+                names_to_remove += [shared_expert_weight_name]
+        return [w for w in weights_list if w[0] not in names_to_remove]
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -1900,29 +1977,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        if self.n_share_experts_fusion > 0:
-            weights_list = list(weights)
-            weights_dict = dict(weights_list)
-            if self.quant_config is None or self.quant_config.get_name() == "w8a8_int8":
-                suffix_list = [
-                    "down_proj.weight",
-                    "down_proj.weight_scale",
-                    "gate_proj.weight",
-                    "gate_proj.weight_scale",
-                    "up_proj.weight",
-                    "up_proj.weight_scale",
-                ]
-            else:
-                suffix_list = [
-                    "down_proj.weight",
-                    "down_proj.weight_scale_inv",
-                    "gate_proj.weight",
-                    "gate_proj.weight_scale_inv",
-                    "up_proj.weight",
-                    "up_proj.weight_scale_inv",
-                ]
-            names_to_remove = []
 
+        if self.n_share_experts_fusion > 0:
             moe_layers = (
                 range(
                     self.config.first_k_dense_replace,
@@ -1932,28 +1988,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                 if not is_nextn
                 else [nextn_layer_id]
             )
-
-            for moe_layer in tqdm(
-                moe_layers,
-                desc=f"Cloning {self.n_share_experts_fusion} "
-                "replicas of the shared expert into MoE",
-            ):
-                for suffix in suffix_list:
-                    shared_expert_weight_name = (
-                        f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
-                    )
-                    for num_repeat in range(self.n_share_experts_fusion):
-                        weights_list.append(
-                            (
-                                f"model.layers.{moe_layer}."
-                                f"mlp.experts."
-                                f"{self.config.n_routed_experts + num_repeat}"
-                                f".{suffix}",
-                                weights_dict[shared_expert_weight_name],
-                            )
-                        )
-                    names_to_remove += [shared_expert_weight_name]
-            weights = [w for w in weights_list if w[0] not in names_to_remove]
+            weights = self.compute_shared_experts_fusion_weights(
+                weights,
+                moe_layers=moe_layers,
+            )
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
