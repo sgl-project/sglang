@@ -571,6 +571,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
         """
         buffer = self._get_buffer()
+        print(
+            f"hi call buffer.low_latency_dispatch {topk_idx=} {hidden_states[:, :5]=}"
+        )
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
