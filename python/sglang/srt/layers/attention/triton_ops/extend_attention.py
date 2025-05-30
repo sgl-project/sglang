@@ -65,6 +65,7 @@ def _fwd_kernel(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
+    SLIDING_WINDOW_SIZE: tl.constexpr,
     logit_cap: tl.constexpr,
     Lq: tl.constexpr,
     Lv: tl.constexpr,
@@ -163,6 +164,7 @@ def _fwd_kernel(
         if logit_cap > 0:
             qk = logit_cap * tanh(qk / logit_cap)
 
+        final_mask = mask_m[:, None] & mask_n[None, :]
         if USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK:
             custom_mask = tl.load(
                 mask_ptr
@@ -173,10 +175,14 @@ def _fwd_kernel(
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
-            custom_mask &= mask_m[:, None] & mask_n[None, :]
-            qk = tl.where(custom_mask, qk, float("-inf"))
-        else:
-            qk = tl.where(mask_m[:, None] & mask_n[None, :], qk, float("-inf"))
+            final_mask &= custom_mask
+        if SLIDING_WINDOW_SIZE > 0:
+            # Add mask where q_id <= kv_id + sliding_window_size
+            window_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) <= (
+                start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE
+            )
+            final_mask &= window_mask
+        qk = tl.where(final_mask, qk, float("-inf"))
 
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp(e_max - n_e_max)
@@ -314,6 +320,7 @@ def extend_attention_fwd(
     sm_scale=None,
     logit_cap=0.0,
     skip_prefix_custom_mask=True,
+    sliding_window_size=-1,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -412,6 +419,7 @@ def extend_attention_fwd(
         k_buffer.stride(1),
         v_buffer.stride(0),
         v_buffer.stride(1),
+        SLIDING_WINDOW_SIZE=sliding_window_size,
         logit_cap=logit_cap,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
