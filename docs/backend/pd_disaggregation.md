@@ -53,14 +53,14 @@ PD Disaggregation with Mooncake supports the following environment variables for
 
 #### Prefill Server Configuration
 | Variable | Description | Default |
-|----------|-------------|---------|
-| **`SGLANG_DISAGGREGATION_THREAD_POOL_SIZE`** | Controls the total number of worker threads for KV transfer operations per TP rank | `A dynamic value calculated by int(0.75 * os.cpu_count()) // 8)` |
+|:--------:|:-----------:|:--------:
+| **`SGLANG_DISAGGREGATION_THREAD_POOL_SIZE`** | Controls the total number of worker threads for KV transfer operations per TP rank | A dynamic value calculated by `int(0.75 * os.cpu_count()) // 8)`, which is limited to be larger than 4 and less than 12 to ensure efficiency and prevent thread race conditions |
 | **`SGLANG_DISAGGREGATION_QUEUE_SIZE`** | Sets the maximum pending tasks in the parallel transfer queue | `4` |
 | **`SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT`** | Timeout (seconds) for receiving destination KV indices during request initialization | `30` |
 
 #### Decode Server Configuration
 | Variable | Description | Default |
-|----------|-------------|---------|
+|:--------:|:-----------:|:--------:
 | **`SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL`** | Interval (seconds) between health checks to prefill bootstrap servers | `5.0` |
 | **`SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE`** | Consecutive heartbeat failures before marking prefill server offline | `2` |
 
