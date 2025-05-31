@@ -21,6 +21,7 @@ from enum import IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.openai_api.protocol import ChatCompletionRequest
+from sglang.srt.utils import read_system_prompt_from_file
 
 
 class SeparatorStyle(IntEnum):
@@ -648,6 +649,20 @@ register_conv_template(
     )
 )
 
+register_conv_template(
+    Conversation(
+        name="devstral",
+        system_template="[SYSTEM_PROMPT]\n{system_message}\n[/SYSTEM_PROMPT]\n\n",
+        system_message=read_system_prompt_from_file("mistralai/Devstral-Small-2505"),
+        roles=("[INST]", "[/INST]"),
+        sep_style=SeparatorStyle.LLAMA2,
+        sep=" ",
+        sep2=" </s><s>",
+        stop_str=["[INST]", "[/INST]", "[SYSTEM_PROMPT]", "[/SYSTEM_PROMPT]"],
+        image_token="[IMG]",
+    )
+)
+
 # reference: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct/blob/main/chat_template.json
 register_conv_template(
     Conversation(
@@ -658,6 +673,20 @@ register_conv_template(
         sep="",
         stop_str=["<|end_of_text|>", "<|eot|>", "<|eom|>"],
         image_token="<|image|>",
+    )
+)
+
+# TODO (lifuhuang): Refactor BaseMultimodalProcessor to support the default image token "<|image_{index}|>" in the future.
+register_conv_template(
+    Conversation(
+        name="phi-4-mm",
+        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
+        system_template="<|system|>{system_message}<|end|>",
+        roles=("<|user|>", "<|assistant|>"),
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
+        sep="<|end|>",
+        stop_str="<|end|>",
+        image_token="<|endoftext10|>",
     )
 )
 
@@ -945,3 +974,15 @@ def match_openbmb_minicpm(model_path: str):
 def match_moonshot_kimivl(model_path: str):
     if re.search(r"kimi.*vl", model_path, re.IGNORECASE):
         return "kimi-vl"
+
+
+@register_conv_template_matching_function
+def match_devstral(model_path: str):
+    if re.search(r"devstral", model_path, re.IGNORECASE):
+        return "devstral"
+
+
+@register_conv_template_matching_function
+def match_phi_4_mm(model_path: str):
+    if "phi-4-multimodal" in model_path.lower():
+        return "phi-4-mm"
