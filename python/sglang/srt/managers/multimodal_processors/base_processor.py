@@ -5,7 +5,7 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -137,7 +137,7 @@ class BaseMultimodalProcessor(ABC):
         request_obj,
         max_req_input_len,
         **kwargs,
-    ):
+    ) -> Optional[Dict[str, Any]]:
         pass
 
     def get_estimated_frames_list(self, image_data):
@@ -254,7 +254,7 @@ class BaseMultimodalProcessor(ABC):
 
     def load_mm_data(
         self,
-        prompt: str,
+        prompt: str | List[int],
         multimodal_tokens: MultimodalSpecialTokens,
         max_req_input_len: int,
         image_data: Optional[list] = None,
