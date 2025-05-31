@@ -41,7 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.two_batch_overlap import (
-    TboCudaGraphRunnerUtils,
+    TboCudaGraphRunnerPlugin,
     TboForwardBatchPreparer,
 )
 from sglang.srt.utils import (
@@ -152,6 +152,8 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         gpu_mem = get_device_memory_capacity()
         if gpu_mem is not None and gpu_mem > 96 * 1024:
             capture_bs += list(range(160, 257, 8))
+        if gpu_mem is not None and gpu_mem > 180 * 1000:
+            capture_bs += list(range(256, 528, 16))
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
@@ -260,6 +262,7 @@ class CudaGraphRunner:
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+            self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
             # pipeline parallelism
             if self.pp_size > 1:
@@ -488,12 +491,9 @@ class CudaGraphRunner:
             capture_hidden_mode=self.capture_hidden_mode,
             lora_paths=lora_paths,
             num_token_non_padded=self.num_token_non_padded,
-            tbo_split_seq_index=TboCudaGraphRunnerUtils.compute_tbo_split_seq_index(
-                self, num_tokens
-            ),
             global_forward_mode=self.capture_forward_mode,
         )
-        TboForwardBatchPreparer.prepare(forward_batch)
+        self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_paths is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
@@ -591,7 +591,13 @@ class CudaGraphRunner:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
-        self.num_token_non_padded[...] = len(forward_batch.input_ids)
+        num_token_non_padded = len(forward_batch.input_ids)
+        self.num_token_non_padded[...] = num_token_non_padded
+        self.tbo_plugin.replay_prepare(
+            forward_mode=forward_batch.forward_mode,
+            bs=bs,
+            num_token_non_padded=num_token_non_padded,
+        )
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(1)
