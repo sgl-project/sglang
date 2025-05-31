@@ -160,6 +160,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "prepare_moe_input(Tensor topk_ids, Tensor expert_offsets, Tensor problem_sizes1, Tensor problem_sizes2, Tensor "
       "input_permutation, Tensor output_permutation, int num_experts, int n, int k) -> ()");
   m.impl("prepare_moe_input", torch::kCUDA, &prepare_moe_input);
+  m.def(
+      "balance_topk_ids(Tensor topk_ids, int num_gpus, int num_logical_experts, int num_physical_experts, Tensor "
+      "max_workload_after_balance, Tensor gpu_workloads_balance_mapping, Tensor new_topk_ids) -> ()");
+  m.impl("balance_topk_ids", torch::kCUDA, &balance_topk_ids);
+
   /*
    * From csrc/speculative
    */
