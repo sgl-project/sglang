@@ -45,7 +45,10 @@ class _Dumper:
         if (value is None) or (not isinstance(value, torch.Tensor)):
             return None
 
-        if "topk_idx" in name:
+        if value.numel() < 100:
+            return value
+
+        if ("topk_idx" in name) or ("input_ids" in name) or ("positions" in name):
             return value
 
         if ("hidden_states" in name) or ("residual" in name):
