@@ -1168,7 +1168,7 @@ class DeepEPMoE(EPMoE):
         dispose_tensor(hidden_states_fp8[0])
 
         debug_utils.dumper.dump(
-            "deepepmoe__input_gateup_output", gateup_output, layer_id=self.layer_id
+            "deepepmoe__gateup_output", gateup_output, layer_id=self.layer_id
         )
 
         # Act
@@ -1201,7 +1201,10 @@ class DeepEPMoE(EPMoE):
         del gateup_output
 
         debug_utils.dumper.dump(
-            "deepepmoe__input_down_input", down_input, layer_id=self.layer_id
+            "deepepmoe__down_input", down_input, layer_id=self.layer_id
+        )
+        debug_utils.dumper.dump(
+            "deepepmoe__down_input_scale", down_input_scale, layer_id=self.layer_id
         )
 
         # GroupGemm-1
@@ -1218,7 +1221,7 @@ class DeepEPMoE(EPMoE):
         )
 
         debug_utils.dumper.dump(
-            "deepepmoe__input_down_output", down_output, layer_id=self.layer_id
+            "deepepmoe__down_output", down_output, layer_id=self.layer_id
         )
 
         return down_output
