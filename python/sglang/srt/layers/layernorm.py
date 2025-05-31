@@ -52,12 +52,8 @@ class RMSNorm(CustomOp):
     def forward(self, *args, **kwargs):
         if torch.compiler.is_compiling():
             return self.forward_native(*args, **kwargs)
-        if _is_cuda:
-            return self.forward_cuda(*args, **kwargs)
-        elif _is_hip:
-            return self.forward_hip(*args, **kwargs)
         else:
-            return self.forward_native(*args, **kwargs)
+            return self._forward_method(*args, **kwargs)
 
     def forward_cuda(
         self,
@@ -120,10 +116,8 @@ class GemmaRMSNorm(CustomOp):
     def forward(self, *args, **kwargs):
         if torch.compiler.is_compiling():
             return self.forward_native(*args, **kwargs)
-        if _is_cuda:
-            return self.forward_cuda(*args, **kwargs)
         else:
-            return self.forward_native(*args, **kwargs)
+            return self._forward_method(*args, **kwargs)
 
     def forward_native(
         self,

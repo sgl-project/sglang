@@ -116,6 +116,12 @@ class RotaryEmbedding(CustomOp):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
+    def forward(self, *args, **kwargs):
+        if torch.compiler.is_compiling():
+            return self.forward_native(*args, **kwargs)
+        else:
+            return self._forward_method(*args, **kwargs)
+
     def forward_native(
         self,
         positions: torch.Tensor,
@@ -652,14 +658,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
 
     def forward_hip(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
-
-    def forward(self, *args, **kwargs):
-        if torch.compiler.is_compiling():
-            return self.forward_native(*args, **kwargs)
-        if _is_cuda:
-            return self.forward_cuda(*args, **kwargs)
-        else:
-            return self.forward_native(*args, **kwargs)
 
     def forward_native(
         self,
