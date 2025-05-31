@@ -25,15 +25,21 @@ class _Dumper:
             self._base_dir / f"sglang_dump_{self._partial_name}_{rank}" / full_filename
         )
 
-        if ('hidden_states' in name) or ('residual' in name):
-            sample_value = value[:, :3]
-        else:
-            sample_value = None
+        sample_value = self._get_sample_value(name, value)
 
         print(f"Dump {type(value)} to {path} (sample_value={sample_value})")
 
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(value, str(path))
+
+    def _get_sample_value(self, name, value):
+        if (value is None) or (not isinstance(value, torch.Tensor)):
+            return None
+
+        if ('hidden_states' in name) or ('residual' in name):
+            return value[:, :3]
+
+        return None
 
 
 dumper = _Dumper()
