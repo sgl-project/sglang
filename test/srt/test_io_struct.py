@@ -381,12 +381,14 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             logprob_start_len=[10, 5],
             top_logprobs_num=[5, 3],
             token_ids_logprob=[[7, 8, 9], [4, 5, 6]],
+            return_hidden_states=[False, False, True],
         )
         req.normalize_batch_and_arguments()
         self.assertEqual(req.return_logprob, [True, False])
         self.assertEqual(req.logprob_start_len, [10, 5])
         self.assertEqual(req.top_logprobs_num, [5, 3])
         self.assertEqual(req.token_ids_logprob, [[7, 8, 9], [4, 5, 6]])
+        self.assertEqual(req.return_hidden_states, [False, False, True])
 
     def test_custom_logit_processor_normalization(self):
         """Test normalization of custom_logit_processor."""

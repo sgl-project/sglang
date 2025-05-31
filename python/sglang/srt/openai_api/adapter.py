@@ -531,6 +531,7 @@ def v1_generate_request(
     logprob_start_lens = []
     top_logprobs_nums = []
     lora_paths = []
+    return_hidden_states = []
 
     for request in all_requests:
         # NOTE: with openai API, the prompt's logprobs are always not computed
@@ -577,6 +578,7 @@ def v1_generate_request(
         top_logprobs_nums.append(
             request.logprobs if request.logprobs is not None else 0
         )
+        return_hidden_states.append(request.return_hidden_states)
 
     if len(all_requests) == 1:
         if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
@@ -588,6 +590,7 @@ def v1_generate_request(
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
         lora_paths = lora_paths[0]
+        return_hidden_states = return_hidden_states[0]
     else:
         if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
             prompt_kwargs = {"text": prompts}
@@ -604,6 +607,7 @@ def v1_generate_request(
         stream=all_requests[0].stream,
         rid=request_ids,
         lora_path=lora_paths,
+        return_hidden_states=return_hidden_states,
         bootstrap_host=all_requests[0].bootstrap_host,
         bootstrap_port=all_requests[0].bootstrap_port,
         bootstrap_room=all_requests[0].bootstrap_room,
@@ -672,6 +676,17 @@ def v1_generate_response(
         else:
             logprobs = None
 
+        hidden_states = None
+        if isinstance(request, list) and request[idx].return_hidden_states:
+            hidden_states = ret_item["meta_info"].get("hidden_states", None)
+        elif (not isinstance(request, list)) and request.return_hidden_states:
+            hidden_states = ret_item["meta_info"].get("hidden_states", None)
+        if hidden_states is not None:
+            hidden_states = hidden_states[1:]  # trim off the prefill
+            hidden_states = (
+                hidden_states[-1] if len(hidden_states) > 0 else []
+            )  # slice out the last token
+
         finish_reason = ret_item["meta_info"]["finish_reason"]
 
         if to_file:
@@ -698,6 +713,7 @@ def v1_generate_response(
                     if finish_reason and "matched" in finish_reason
                     else None
                 ),
+                hidden_states=hidden_states,
             )
 
         choices.append(choice_data)
@@ -766,6 +782,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
             prompt_tokens = {}
             completion_tokens = {}
             cached_tokens = {}
+            hidden_states = {}
 
             try:
                 async for content in tokenizer_manager.generate_request(
@@ -780,6 +797,9 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                     completion_tokens[index] = content["meta_info"]["completion_tokens"]
                     cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                    hidden_states[index] = content["meta_info"].get(
+                        "hidden_states", None
+                    ) or hidden_states.get(index)
 
                     if not stream_buffer:  # The first chunk
                         if request.echo:
@@ -862,6 +882,26 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     n_prev_tokens[index] = n_prev_token
 
                     yield f"data: {chunk.model_dump_json()}\n\n"
+                if request.return_hidden_states and len(hidden_states):
+                    for index, hidden_states_ in hidden_states.items():
+                        hidden_states_ = hidden_states_[1:]  # trim off the prefill
+                        hidden_states_ = (
+                            hidden_states_[-1] if len(hidden_states_) > 0 else []
+                        )  # slice out the last token
+                        hidden_states_chunk = CompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=created,
+                            choices=[
+                                CompletionResponseStreamChoice(
+                                    text="",
+                                    index=index,
+                                    hidden_states=hidden_states_,
+                                    finish_reason=None,
+                                )
+                            ],
+                            model=request.model,
+                        )
+                        yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
                 if request.stream_options and request.stream_options.include_usage:
                     total_prompt_tokens = sum(
                         tokens
@@ -962,6 +1002,7 @@ def v1_chat_generate_request(
     top_logprobs_nums = []
     modalities_list = []
     lora_paths = []
+    return_hidden_states = []
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
@@ -1185,6 +1226,7 @@ def v1_chat_generate_request(
         image_data_list.append(image_data)
         audio_data_list.append(audio_data)
         modalities_list.append(modalities)
+        return_hidden_states.append(request.return_hidden_states)
     if len(all_requests) == 1:
         if is_multimodal:
             # processor will need text input
@@ -1203,6 +1245,7 @@ def v1_chat_generate_request(
         modalities_list = modalities_list[0]
         lora_paths = lora_paths[0]
         request_ids = request_ids[0]
+        return_hidden_states = return_hidden_states[0]
     else:
         if tokenizer_manager.model_config.is_multimodal:
             # processor will need text input
@@ -1229,6 +1272,7 @@ def v1_chat_generate_request(
         bootstrap_host=all_requests[0].bootstrap_host,
         bootstrap_port=all_requests[0].bootstrap_port,
         bootstrap_room=all_requests[0].bootstrap_room,
+        return_hidden_states=return_hidden_states,
     )
 
     return adapted_request, all_requests if len(all_requests) > 1 else all_requests[0]
@@ -1288,6 +1332,21 @@ def v1_chat_generate_response(
             choice_logprobs = ChoiceLogprobs(content=token_logprobs)
         else:
             choice_logprobs = None
+
+        if isinstance(request, list) and request[idx].return_hidden_states:
+            include_hidden_states = True
+        elif not isinstance(request, list) and request.return_hidden_states:
+            include_hidden_states = True
+        else:
+            include_hidden_states = False
+        if include_hidden_states and ret_item["meta_info"].get("hidden_states", None):
+            hidden_states = ret_item["meta_info"]["hidden_states"]
+            hidden_states = hidden_states[1:]  # trim off the prefill
+            hidden_states = (
+                hidden_states[-1] if len(hidden_states) > 0 else []
+            )  # slice out the last token
+        else:
+            hidden_states = None
 
         finish_reason = ret_item["meta_info"]["finish_reason"]
 
@@ -1352,6 +1411,7 @@ def v1_chat_generate_response(
                     "content": text if text else None,
                     "tool_calls": tool_calls,
                     "reasoning_content": reasoning_text if reasoning_text else None,
+                    "hidden_states": hidden_states,
                 },
                 "logprobs": choice_logprobs.model_dump() if choice_logprobs else None,
                 "finish_reason": finish_reason["type"] if finish_reason else None,
@@ -1377,6 +1437,7 @@ def v1_chat_generate_response(
                     if finish_reason and "matched" in finish_reason
                     else None
                 ),
+                hidden_states=hidden_states,
             )
 
         choices.append(choice_data)
@@ -1454,12 +1515,16 @@ async def v1_chat_completions(
             prompt_tokens = {}
             completion_tokens = {}
             cached_tokens = {}
+            hidden_states = {}
             try:
                 async for content in tokenizer_manager.generate_request(
                     adapted_request, raw_request
                 ):
                     index = content.get("index", 0)
                     text = content["text"]
+                    hidden_states[index] = content["meta_info"].get(
+                        "hidden_states", None
+                    ) or hidden_states.get(index)
 
                     is_first = is_firsts.get(index, True)
                     stream_buffer = stream_buffers.get(index, "")
@@ -1581,6 +1646,7 @@ async def v1_chat_completions(
                         if (delta and len(delta) == 0) or not delta:
                             stream_buffers[index] = new_stream_buffer
                             is_firsts[index] = is_first
+                            n_prev_tokens[index] = n_prev_token
                             continue
 
                     if request.tool_choice != "none" and request.tools:
@@ -1669,6 +1735,7 @@ async def v1_chat_completions(
 
                         stream_buffers[index] = new_stream_buffer
                         is_firsts[index] = is_first
+                        n_prev_tokens[index] = n_prev_token
 
                     else:
                         # No tool calls => just treat this as normal text
@@ -1701,6 +1768,7 @@ async def v1_chat_completions(
                             yield f"data: {chunk.model_dump_json()}\n\n"
                             stream_buffers[index] = new_stream_buffer
                             is_firsts[index] = is_first
+                            n_prev_tokens[index] = n_prev_token
                 if finish_reason_type == "stop" and request.tool_choice != "none":
                     parser = FunctionCallParser(
                         tools=request.tools,
@@ -1736,6 +1804,25 @@ async def v1_chat_completions(
 
                 else:
                     usage = None
+                if request.return_hidden_states and len(hidden_states):
+                    for index, hidden_states_ in hidden_states.items():
+                        hidden_states_ = hidden_states_[1:]  # trim off the prefill
+                        hidden_states_ = (
+                            hidden_states_[-1] if len(hidden_states_) > 0 else []
+                        )  # slice out the last token
+                        hidden_states_chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=created,
+                            choices=[
+                                ChatCompletionResponseStreamChoice(
+                                    index=index,
+                                    delta=DeltaMessage(hidden_states=hidden_states_),
+                                    finish_reason=finish_reason_type,
+                                )
+                            ],
+                            model=request.model,
+                        )
+                        yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=created,

@@ -117,9 +117,7 @@ class EAGLEDraftCudaGraphRunner:
         hidden_states = self.hidden_states[:num_seqs]
 
         spec_info = EagleDraftInput(
-            topk_p=topk_p,
-            topk_index=topk_index,
-            hidden_states=hidden_states,
+            topk_p=topk_p, topk_index=topk_index, hidden_states=hidden_states
         )
 
         # Forward batch
