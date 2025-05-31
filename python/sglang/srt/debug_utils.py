@@ -24,9 +24,10 @@ class _Dumper:
         path = (
             self._base_dir / f"sglang_dump_{self._partial_name}_{rank}" / full_filename
         )
+        print(f"Dump {type(value)} to {path}")
 
-        path.mkdir(parents=True, exist_ok=True)
-        torch.save(value, str(name))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(value, str(path))
 
 
 dumper = _Dumper()
