@@ -1,3 +1,5 @@
+import unittest
+
 from test_vision_openai_server_common import *
 
 from sglang.test.test_utils import (
