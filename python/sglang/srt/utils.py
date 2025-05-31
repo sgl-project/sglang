@@ -2230,3 +2230,29 @@ def read_system_prompt_from_file(model_name: str) -> str:
     except Exception:
         # If anything fails, return empty string
         return ""
+
+
+def bind_or_assign(target, source):
+    if target is not None:
+        target.copy_(source)
+        return target
+    else:
+        return source
+
+
+def support_triton(backend: str) -> bool:
+    return backend not in ["torch_native", "intel_amx"]
+
+
+try:
+    import sgl_kernel
+
+    is_intel_amx_backend_available = hasattr(
+        torch.ops.sgl_kernel, "convert_weight_packed"
+    )
+except:
+    is_intel_amx_backend_available = False
+
+
+def cpu_has_amx_support():
+    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
