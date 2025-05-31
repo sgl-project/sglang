@@ -1155,7 +1155,14 @@ class DeepEPMoE(EPMoE):
             "deepepmoe__hidden_states_fp8", hidden_states_fp8, layer_id=self.layer_id
         )
         debug_utils.dumper.dump(
-            "deepepmoe__w13_weight_fp8", self.w13_weight_fp8, layer_id=self.layer_id
+            "deepepmoe__w13_weight_fp8_a",
+            self.w13_weight_fp8[0].data,
+            layer_id=self.layer_id,
+        )
+        debug_utils.dumper.dump(
+            "deepepmoe__w13_weight_fp8_b",
+            self.w13_weight_fp8[1].data,
+            layer_id=self.layer_id,
         )
 
         # GroupGemm-0
@@ -1223,7 +1230,14 @@ class DeepEPMoE(EPMoE):
             down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
         )
         debug_utils.dumper.dump(
-            "deepepmoe__w2_weight_fp8", self.w2_weight_fp8, layer_id=self.layer_id
+            "deepepmoe__w2_weight_fp8_a",
+            self.w2_weight_fp8[0].data,
+            layer_id=self.layer_id,
+        )
+        debug_utils.dumper.dump(
+            "deepepmoe__w2_weight_fp8_b",
+            self.w2_weight_fp8[1].data,
+            layer_id=self.layer_id,
         )
 
         debug_utils.dumper.dump(
