@@ -1,4 +1,4 @@
-FROM pytorch/manylinux2_27-builder:cuda12.8
+FROM pytorch/manylinux-builder:cuda12.8
 
 ENV DEBIAN_FRONTEND=noninteractive
 
