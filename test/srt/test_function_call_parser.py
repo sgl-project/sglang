@@ -265,6 +265,81 @@ class TestPythonicDetector(unittest.TestCase):
         self.assertEqual(params["location"], "Tokyo")
         self.assertEqual(params["data"], [1, 2, 3])
 
+    def test_parse_streaming_with_python_start_and_end_token(self):
+        """Test parsing a message that starts with <|python_start|> and <|python_end|> across chunks."""
+        chunks = [
+            "Here's a call: ",
+            "<|python_",
+            "start|>[get_weather(location=",
+            "'Tokyo', data=[1, 2",
+            ", 3])]<|python_end|>",
+        ]
+
+        normal_text = ""
+        call_name = ""
+        parameters = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            if result.normal_text:
+                normal_text += result.normal_text
+            if result.calls:
+                call_name += result.calls[0].name
+                parameters += result.calls[0].parameters
+
+        self.assertEqual(normal_text, "Here's a call: ")
+        self.assertEqual(call_name, "get_weather")
+        self.assertEqual(self.detector._buffer, "")
+        self.assertEqual(
+            result.normal_text, "", "Final result should have no normal text"
+        )
+
+        # Check the parameters
+        params = json.loads(parameters)
+        self.assertEqual(params["location"], "Tokyo")
+        self.assertEqual(params["data"], [1, 2, 3])
+
+        chunks = [
+            "Here's a call: <|python_start|>[get_weather(location='Tokyo', data=[1, 2, 3])]<|python_end|>"
+        ]
+
+        normal_text = ""
+        call_name = ""
+        parameters = ""
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            if result.normal_text:
+                normal_text += result.normal_text
+            if result.calls:
+                call_name += result.calls[0].name
+                parameters += result.calls[0].parameters
+
+        self.assertEqual(normal_text, "Here's a call: ")
+        self.assertEqual(call_name, "get_weather")
+        self.assertEqual(self.detector._buffer, "")
+
+        # Check the parameters
+        params = json.loads(parameters)
+        self.assertEqual(params["location"], "Tokyo")
+        self.assertEqual(params["data"], [1, 2, 3])
+
+    def test_detect_and_parse_with_python_start_and_end_token(self):
+        """Test parsing a message that starts with <|python_start|> and contains a valid tool call."""
+        text = "User wants to get the weather in Mars. <|python_start|>[get_weather(location='Mars', unit='celsius')]<|python_end|> In this way we will get the weather in Mars."
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(
+            result.normal_text,
+            "User wants to get the weather in Mars.  In this way we will get the weather in Mars.",
+        )
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(self.detector._buffer, "")
+
+        # Check the parameters
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["location"], "Mars")
+        self.assertEqual(params["unit"], "celsius")
+
 
 class TestMistralDetector(unittest.TestCase):
     def setUp(self):
@@ -747,6 +822,102 @@ class TestBaseFormatDetector(unittest.TestCase):
         self.assertEqual(
             self.detector._buffer, "", "Buffer should be cleared for invalid tool"
         )
+
+
+class TestLlama32Detector(unittest.TestCase):
+    def setUp(self):
+        """Set up test tools and detector for Mistral format testing."""
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "City name",
+                            }
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_tourist_attractions",
+                    description="Get tourist attractions",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "City name",
+                            }
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = Llama32Detector()
+
+    def test_single_json(self):
+        text = '{"name": "get_weather", "parameters": {"city": "Paris"}}'
+        result = self.detector.detect_and_parse(text, self.tools)
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert result.normal_text == ""
+
+    def test_multiple_json_with_separator(self):
+        text = (
+            '<|python_tag|>{"name": "get_weather", "parameters": {"city": "Paris"}};'
+            '{"name": "get_tourist_attractions", "parameters": {"city": "Paris"}}'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[1].name, "get_tourist_attractions")
+        self.assertEqual(result.normal_text, "")
+
+    def test_multiple_json_with_separator_customized(self):
+        text = (
+            '<|python_tag|>{"name": "get_weather", "parameters": {}}'
+            '<|python_tag|>{"name": "get_tourist_attractions", "parameters": {}}'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[1].name, "get_tourist_attractions")
+        self.assertEqual(result.normal_text, "")
+
+    def test_json_with_trailing_text(self):
+        text = '{"name": "get_weather", "parameters": {}} Some follow-up text'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertIn("follow-up", result.normal_text)
+
+    def test_invalid_then_valid_json(self):
+        text = (
+            '{"name": "get_weather", "parameters": {'  # malformed
+            '{"name": "get_weather", "parameters": {}}'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+
+    def test_plain_text_only(self):
+        text = "This is just plain explanation text."
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, text)
+
+    def test_with_python_tag_prefix(self):
+        text = 'Some intro. <|python_tag|>{"name": "get_weather", "parameters": {}}'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertTrue(result.normal_text.strip().startswith("Some intro."))
 
 
 if __name__ == "__main__":
