@@ -383,6 +383,7 @@ class ChatCompletionRequest(BaseModel):
     top_k: int = -1
     min_p: float = 0.0
     min_tokens: int = 0
+    thinking_budget: Optional[int] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
     repetition_penalty: float = 1.0
