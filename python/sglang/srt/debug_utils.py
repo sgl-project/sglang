@@ -28,7 +28,10 @@ class _Dumper:
         sample_value = self._get_sample_value(name, value)
 
         print(
-            f"[{rank}, {time.time()}] Dump {type(value)} to {path} (sample_value={sample_value})"
+            f"[{rank}, {time.time()}] Dump {type(value)} to {path} "
+            f"shape={value.shape if isinstance(value, torch.Tensor) else None} "
+            f"dtype={value.dtype if isinstance(value, torch.Tensor) else None} "
+            f"sample_value={sample_value}"
         )
 
         path.parent.mkdir(parents=True, exist_ok=True)
