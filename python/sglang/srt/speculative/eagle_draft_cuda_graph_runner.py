@@ -53,7 +53,7 @@ class EAGLEDraftCudaGraphRunner:
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
         self.model_runner.draft_attn_backend.init_cuda_graph_state(
-            self.max_bs, num_tokens_per_bs=self.num_tokens_per_bs
+            self.max_bs, self.max_num_token
         )
         self.seq_len_fill_value = self.model_runner.draft_attn_backend.attn_backends[
             0
@@ -285,11 +285,13 @@ class EAGLEDraftCudaGraphRunner:
         self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
-        self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
-        self.global_num_tokens_for_logprob_gpu.copy_(
-            forward_batch.global_num_tokens_for_logprob_gpu
-        )
-        forward_batch.gathered_buffer = self.gathered_buffer
+
+        if self.enable_dp_attention or self.enable_sp_layernorm:
+            self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
+            self.global_num_tokens_for_logprob_gpu.copy_(
+                forward_batch.global_num_tokens_for_logprob_gpu
+            )
+            forward_batch.gathered_buffer = self.gathered_buffer
 
         # Attention backend
         if bs != raw_bs:
