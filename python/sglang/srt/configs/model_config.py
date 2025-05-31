@@ -16,7 +16,7 @@ import json
 import logging
 import math
 import os
-from enum import IntEnum, auto
+from enum import Enum, IntEnum, auto
 from typing import List, Optional, Set, Union
 
 import torch
@@ -39,6 +39,12 @@ class AttentionArch(IntEnum):
     MHA = auto()
 
 
+class ModelImpl(str, Enum):
+    AUTO = "auto"
+    SGLANG = "sglang"
+    TRANSFORMERS = "transformers"
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -53,11 +59,13 @@ class ModelConfig:
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
+        impl: Union[str, ModelImpl] = ModelImpl.AUTO,
     ) -> None:
 
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
+        self.impl = impl
 
         # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
@@ -256,6 +264,7 @@ class ModelConfig:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
+            impl=server_args.impl,
             **kwargs,
         )
 

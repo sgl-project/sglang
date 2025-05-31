@@ -61,6 +61,7 @@ class ServerArgs:
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
+    impl: str = "auto"
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -725,6 +726,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.page_size,
             help="The number of tokens in a page.",
+        )
+        parser.add_argument(
+            "--impl",
+            type=str,
+            default=ServerArgs.impl,
+            help="Which implementation of the model to use.\n\n"
+            '* "auto" will try to use the SGLang implementation if it exists '
+            "and fall back to the Transformers implementation if no SGLang "
+            "implementation is available.\n"
+            '* "sglang" will use the SGLang model implementation.\n'
+            '* "transformers" will use the Transformers model '
+            "implementation.\n",
         )
 
         # Other runtime options
