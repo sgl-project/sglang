@@ -72,6 +72,8 @@ from sglang.srt.openai_api.protocol import (
     ToolCall,
     TopLogprob,
     UsageInfo,
+    ScoringRequest,
+    ScoringResponse,
 )
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.utils import convert_json_schema_to_str, get_exception_traceback
@@ -1212,6 +1214,7 @@ def v1_chat_generate_request(
                 prompt_kwargs = {"text": input_ids}
             else:
                 prompt_kwargs = {"input_ids": input_ids}
+        request_ids = [req.rid for req in all_requests]
 
     adapted_request = GenerateReqInput(
         **prompt_kwargs,
@@ -1928,3 +1931,33 @@ def to_openai_style_logprobs(
         append_top_logprobs(output_top_logprobs)
 
     return ret_logprobs
+
+
+async def v1_score(tokenizer_manager, raw_request):
+    try:
+        # Parse request
+        request_data = await raw_request.json()
+        request = ScoringRequest(**request_data)
+
+        # Use tokenizer_manager's score_request method directly
+        scores = await tokenizer_manager.score_request(
+            output_prob_token_ids=request.output_prob_token_ids,
+            text_1=request.text_1,
+            text_2=request.text_2,
+            token_ids_1=request.token_ids_1,
+            token_ids_2=request.token_ids_2,
+            apply_softmax=request.apply_softmax,
+            prepend=request.prepend,
+            request=request,
+        )
+
+        # Create response with just the scores, without usage info
+        response = ScoringResponse(
+            scores=scores,
+            model=request.model,
+        )
+        return response
+
+    except Exception as e:
+        logger.error(f"Error in v1_score: {str(e)}")
+        return create_error_response(str(e))

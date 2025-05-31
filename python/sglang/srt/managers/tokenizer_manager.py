@@ -18,6 +18,7 @@ import copy
 import dataclasses
 import json
 import logging
+import math
 import os
 import pickle
 import signal
@@ -1428,6 +1429,72 @@ class TokenizerManager:
             # set future if the all results are received
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
+
+    async def score_request(
+        self,
+        text_1: Optional[str] = None,
+        text_2: Optional[Union[str, List[str]]] = None,
+        token_ids_1: Optional[List[int]] = None,
+        token_ids_2: Optional[List[List[int]]] = None,
+        label_token_ids: Optional[List[int]] = None,
+        apply_softmax: bool = False,
+        prepend: bool = False,
+        request: Optional[Any] = None,
+    ) -> List[Dict[int, float]]:
+        # Validate inputs
+        if label_token_ids is None:
+            raise ValueError("label_token_ids must be provided")
+
+        # Prepare inputs based on whether we have text or token IDs
+        if text_1 is not None and text_2 is not None:
+            # Text-based inputs - combine them directly
+            prompts = [f"{text}{text_1}" for text in text_2] if prepend else [f"{text_1}{text}" for text in text_2]
+            batch_request = GenerateReqInput(
+                text=prompts,
+                return_logprob=True,
+                token_ids_logprob=label_token_ids,
+                stream=False,
+                sampling_params={"max_new_tokens": 1},
+            )
+        else:
+            # Token ID-based inputs
+            if token_ids_1 is None or token_ids_2 is None:
+                raise ValueError("Both token_ids_1 and token_ids_2 must be provided for token ID-based inputs")
+                
+            # Combine token IDs based on prepend flag
+            input_ids_list = [token_ids_2[i] + token_ids_1 for i in range(len(token_ids_2))] if prepend else [token_ids_1 + token_ids_2[i] for i in range(len(token_ids_2))]
+            
+            if self.tokenizer is not None:
+                vocab_size = self.tokenizer.vocab_size
+                for token_id in label_token_ids:
+                    if token_id >= vocab_size:
+                        raise ValueError(f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})")
+
+            batch_request = GenerateReqInput(
+                input_ids=input_ids_list,
+                return_logprob=True,
+                token_ids_logprob=label_token_ids,
+                stream=False,
+                sampling_params={"max_new_tokens": 1},
+            )
+
+        scores = []
+        results = await self.generate_request(batch_request, request).__anext__()
+        for result in results:
+            output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
+                
+            # Get logprobs for first position and convert to probabilities
+            first_position = output_logprobs[0]
+            probs = {token_id: math.exp(logprob) for logprob, token_id, _ in first_position 
+                    if token_id in label_token_ids}
+            if apply_softmax:
+                total = sum(probs.values())
+                if total > 0:
+                    probs = {tid: p/total for tid, p in probs.items()}
+            
+            scores.append(probs)
+
+        return scores
 
 
 async def print_exception_wrapper(func):
