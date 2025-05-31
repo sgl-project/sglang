@@ -2,6 +2,7 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
+# Kill existing processes
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/killall_sglang.sh"
 
@@ -16,14 +17,10 @@ rm -rf /usr/local/lib/python3.10/dist-packages/flashinfer*
 rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
 
 # Install the main package
-pip install -e "python[all]"
+pip install -e "python[dev]"
 
 # Install additional dependencies
-pip install torch_memory_saver
-pip install transformers==4.51.0 timm torchaudio==2.6.0 sentence_transformers accelerate peft pandas datasets mooncake-transfer-engine
-
-# For compiling xgrammar kernels
-pip install cuda-python nvidia-cuda-nvrtc-cu12
+pip install mooncake-transfer-engine==0.3.2.post1 nvidia-cuda-nvrtc-cu12
 
 # For lmms_evals evaluating MMMU
 git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
@@ -31,3 +28,6 @@ pip install -e lmms-eval/
 
 # Install FlashMLA for attention backend tests
 pip install git+https://github.com/deepseek-ai/FlashMLA.git
+
+# Install hf_xet
+pip install huggingface_hub[hf_xet]

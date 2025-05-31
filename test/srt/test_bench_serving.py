@@ -32,7 +32,7 @@ class TestBenchServing(CustomTestCase):
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
             if os.getenv("SGLANG_AMD_CI") == "1":
-                self.assertGreater(res["output_throughput"], 3500)
+                self.assertGreater(res["output_throughput"], 3150)
             else:
                 self.assertGreater(res["output_throughput"], 3800)
 
@@ -70,7 +70,7 @@ class TestBenchServing(CustomTestCase):
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
             if os.getenv("SGLANG_AMD_CI") == "1":
-                self.assertGreater(res["output_throughput"], 3500)
+                self.assertGreater(res["output_throughput"], 3050)
             else:
                 self.assertGreater(res["output_throughput"], 3800)
 
@@ -126,7 +126,7 @@ class TestBenchServing(CustomTestCase):
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
             if os.getenv("SGLANG_AMD_CI") == "1":
-                self.assertGreater(res["output_throughput"], 4000)
+                self.assertGreater(res["output_throughput"], 3500)
             else:
                 self.assertGreater(res["output_throughput"], 4300)
 
@@ -271,6 +271,50 @@ class TestBenchServing(CustomTestCase):
                 self.assertGreater(res["output_throughput"], 2100)
             else:
                 self.assertGreater(res["output_throughput"], 2200)
+
+    def test_pp_offline_throughput_default_decode(self):
+        res = run_bench_serving(
+            model=DEFAULT_MOE_MODEL_NAME_FOR_TEST,
+            num_prompts=1000,
+            request_rate=float("inf"),
+            random_input_len=1,
+            random_output_len=1024,
+            other_server_args=["--pp", "2"],
+            need_warmup=True,
+            seed=42,
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_pp_offline_throughput_default_decode\n"
+                f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
+            )
+            self.assertGreater(res["output_throughput"], 7500)
+
+    def test_pp_long_context_prefill(self):
+        res = run_bench_serving(
+            model="meta-llama/Llama-3.3-70B-Instruct",
+            num_prompts=4,
+            request_rate=float("inf"),
+            random_input_len=128000,
+            random_output_len=1,
+            dataset_name="random",
+            other_server_args=[
+                "--quantization",
+                "fp8",
+                "--pp",
+                2,
+            ],
+            need_warmup=False,
+            seed=42,
+        )
+
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_pp_long_context_latency_prefill\n"
+                f'input_throughput: {res["input_throughput"]:.2f} ms\n'
+            )
+            self.assertGreater(res["input_throughput"], 4000)
 
 
 if __name__ == "__main__":

@@ -47,6 +47,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+    ImageDataItem,
     InitWeightsUpdateGroupReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -150,9 +151,9 @@ class Engine(EngineBase):
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[
             Union[
-                List[List[Union[Image, str]]],
-                List[Union[Image, str]],
-                Union[Image, str],
+                List[List[ImageDataItem]],
+                List[ImageDataItem],
+                ImageDataItem,
             ]
         ] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
@@ -221,9 +222,9 @@ class Engine(EngineBase):
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[
             Union[
-                List[List[Union[Image, str]]],
-                List[Union[Image, str]],
-                Union[Image, str],
+                List[List[ImageDataItem]],
+                List[ImageDataItem],
+                ImageDataItem,
             ]
         ] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
@@ -320,7 +321,26 @@ class Engine(EngineBase):
         loop.run_until_complete(self.tokenizer_manager.start_profile())
 
     def stop_profile(self):
-        self.tokenizer_manager.stop_profile()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.tokenizer_manager.stop_profile())
+
+    def start_expert_distribution_record(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            self.tokenizer_manager.start_expert_distribution_record()
+        )
+
+    def stop_expert_distribution_record(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            self.tokenizer_manager.stop_expert_distribution_record()
+        )
+
+    def dump_expert_distribution_record(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            self.tokenizer_manager.dump_expert_distribution_record()
+        )
 
     def get_server_info(self):
         loop = asyncio.get_event_loop()
@@ -330,7 +350,7 @@ class Engine(EngineBase):
         return {
             **dataclasses.asdict(self.tokenizer_manager.server_args),
             **self.scheduler_info,
-            **internal_states,
+            "internal_states": internal_states,
             "version": __version__,
         }
 
@@ -486,7 +506,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda:
         assert_pkg_version(
             "sgl-kernel",
-            "0.1.2.post1",
+            "0.1.4",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
