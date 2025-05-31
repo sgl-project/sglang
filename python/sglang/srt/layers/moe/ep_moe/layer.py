@@ -12,6 +12,8 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 try:
     from deep_gemm import fp8_m_grouped_gemm_nt_masked, m_grouped_fp8_gemm_nt_contiguous
+
+    print("hi use deep_gemm new version")
 except ImportError:
     from deep_gemm import (
         m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
@@ -20,6 +22,7 @@ except ImportError:
 
     m_grouped_fp8_gemm_nt_contiguous = m_grouped_gemm_fp8_fp8_bf16_nt_contiguous
     fp8_m_grouped_gemm_nt_masked = m_grouped_gemm_fp8_fp8_bf16_nt_masked
+    print("hi use deep_gemm old version")
 
 try:
     from sgl_kernel import silu_and_mul
