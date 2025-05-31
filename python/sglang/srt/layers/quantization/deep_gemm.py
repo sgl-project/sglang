@@ -289,6 +289,8 @@ def _maybe_compile_deep_gemm_one_type_all(
     global _INITIALIZATION_DICT
     global _BUILTIN_M_LIST
 
+    return
+
     query_key = (kernel_type, n, k, num_groups)
     if (
         _ENABLE_JIT_DEEPGEMM_PRECOMPILE
