@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 
 import torch
+
 from sglang.srt.utils import get_bool_env_var
 
 
@@ -57,7 +58,11 @@ class _Dumper:
         if ("topk_idx" in name) or ("input_ids" in name) or ("positions" in name):
             return value
 
-        if ("hidden_states" in name) or ("residual" in name) or ("shared_output" in name):
+        if (
+            ("hidden_states" in name)
+            or ("residual" in name)
+            or ("shared_output" in name)
+        ):
             return value[:, :3]
 
         return None
