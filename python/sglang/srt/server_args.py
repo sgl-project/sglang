@@ -1643,7 +1643,7 @@ def auto_choose_speculative_params(arch: str):
         return (5, 4, 8)
     elif arch in ["DeepseekV3ForCausalLM", "DeepseekV2ForCausalLM"]:
         # The default value for deepseek
-        return (5, 4, 8)
+        return (3, 1, 4)
     elif arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)
     else:

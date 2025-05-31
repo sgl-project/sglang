@@ -514,9 +514,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         pid, exitcode = os.waitpid(0, os.WNOHANG)
         if exitcode != 0:
             logger.warning(
-                "Child process unexpectedly failed with an exit code %d. pid=%d",
-                exitcode,
-                pid,
+                f"Child process unexpectedly failed with {exitcode=}. {pid=}"
             )
 
     signal.signal(signal.SIGCHLD, sigchld_handler)
