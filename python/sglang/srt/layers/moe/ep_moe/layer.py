@@ -1152,7 +1152,10 @@ class DeepEPMoE(EPMoE):
         assert self.activation == "silu"
 
         debug_utils.dumper.dump(
-            "deepepmoe__input_hidden_states", hidden_states_fp8, layer_id=self.layer_id
+            "deepepmoe__hidden_states_fp8", hidden_states_fp8, layer_id=self.layer_id
+        )
+        debug_utils.dumper.dump(
+            "deepepmoe__w13_weight_fp8", self.w13_weight_fp8, layer_id=self.layer_id
         )
 
         # GroupGemm-0
@@ -1218,6 +1221,9 @@ class DeepEPMoE(EPMoE):
         )
         fp8_m_grouped_gemm_nt_masked(
             down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
+        )
+        debug_utils.dumper.dump(
+            "deepepmoe__w2_weight_fp8", self.w2_weight_fp8, layer_id=self.layer_id
         )
 
         debug_utils.dumper.dump(
