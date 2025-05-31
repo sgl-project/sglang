@@ -19,7 +19,7 @@ class AttentionBackend(ABC):
         """Init the metadata for a forward pass."""
         raise NotImplementedError()
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()
 

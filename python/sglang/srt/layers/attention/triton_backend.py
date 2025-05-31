@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -10,7 +9,7 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import get_bool_env_var, get_device_core_count
@@ -19,10 +18,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-
-import logging
-
-logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -454,10 +449,9 @@ class TritonAttnBackend(AttentionBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
-        num_tokens_per_bs: int = 1,
+        max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
-        max_num_tokens = max_bs * num_tokens_per_bs
         self.cuda_graph_attn_logits = torch.zeros(
             (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
             dtype=torch.float32,
@@ -469,7 +463,7 @@ class TritonAttnBackend(AttentionBackend):
             device=self.device,
         )
         self.cuda_graph_num_kv_splits = torch.full(
-            (max_bs,), self.max_kv_splits, dtype=torch.int32, device=self.device
+            (max_num_tokens,), self.max_kv_splits, dtype=torch.int32, device=self.device
         )
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
@@ -498,7 +492,10 @@ class TritonAttnBackend(AttentionBackend):
                 self.cuda_graph_window_kv_indices = torch.zeros_like(kv_indices_buf)
 
             self.cuda_graph_window_num_kv_splits = torch.full(
-                (max_bs,), self.max_kv_splits, dtype=torch.int32, device=self.device
+                (max_num_tokens,),
+                self.max_kv_splits,
+                dtype=torch.int32,
+                device=self.device,
             )
 
     def init_forward_metadata_capture_cuda_graph(
@@ -943,7 +940,7 @@ class TritonMultiStepDraftBackend:
 
         self.common_template(forward_batch, kv_indices, call_fn)
 
-    def init_cuda_graph_state(self, max_bs: int, num_tokens_per_bs: int = 1):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, max_bs * self.max_context_len),
             dtype=torch.int32,
@@ -951,7 +948,7 @@ class TritonMultiStepDraftBackend:
         )
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_cuda_graph_state(
-                max_bs, num_tokens_per_bs, kv_indices_buf=self.cuda_graph_kv_indices[i]
+                max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
             )
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):

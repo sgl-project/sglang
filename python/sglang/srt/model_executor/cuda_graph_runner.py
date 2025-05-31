@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import bisect
 import inspect
-import logging
 import os
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -49,8 +48,6 @@ from sglang.srt.utils import (
     get_device_memory_capacity,
     rank0_log,
 )
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -231,10 +228,9 @@ class CudaGraphRunner:
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        if global_server_args_dict["attention_backend"] == "flashmla":
-            self.model_runner.attn_backend.init_cuda_graph_state(self.max_bs)
-        else:
-            self.model_runner.attn_backend.init_cuda_graph_state(self.max_num_token)
+        self.model_runner.attn_backend.init_cuda_graph_state(
+            self.max_bs, self.max_num_token
+        )
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )

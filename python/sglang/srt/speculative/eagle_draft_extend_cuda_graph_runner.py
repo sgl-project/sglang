@@ -47,7 +47,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
         self.eagle_worker.draft_extend_attn_backend.init_cuda_graph_state(
-            self.max_num_token
+            self.max_bs, self.max_num_token
         )
         self.seq_len_fill_value = (
             self.eagle_worker.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -283,11 +283,13 @@ class EAGLEDraftExtendCudaGraphRunner:
         if forward_batch.spec_info.accept_length is not None:
             self.accept_length[:raw_bs].copy_(forward_batch.spec_info.accept_length)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-        self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
-        self.global_num_tokens_for_logprob_gpu.copy_(
-            forward_batch.global_num_tokens_for_logprob_gpu
-        )
-        forward_batch.gathered_buffer = self.gathered_buffer
+
+        if self.enable_dp_attention or self.enable_sp_layernorm:
+            self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
+            self.global_num_tokens_for_logprob_gpu.copy_(
+                forward_batch.global_num_tokens_for_logprob_gpu
+            )
+            forward_batch.gathered_buffer = self.gathered_buffer
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
