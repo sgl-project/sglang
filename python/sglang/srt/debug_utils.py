@@ -42,7 +42,13 @@ class _Dumper:
             torch.save(value, str(path))
 
     def _get_sample_value(self, name, value):
-        if (value is None) or (not isinstance(value, torch.Tensor)):
+        if value is None:
+            return None
+
+        if isinstance(value, tuple):
+            return [self._get_sample_value(name, x) for x in value]
+
+        if not isinstance(value, torch.Tensor):
             return None
 
         if value.numel() < 100:
@@ -51,7 +57,7 @@ class _Dumper:
         if ("topk_idx" in name) or ("input_ids" in name) or ("positions" in name):
             return value
 
-        if ("hidden_states" in name) or ("residual" in name):
+        if ("hidden_states" in name) or ("residual" in name) or ("shared_output" in name):
             return value[:, :3]
 
         return None
