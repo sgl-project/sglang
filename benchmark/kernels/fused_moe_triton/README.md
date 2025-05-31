@@ -41,6 +41,7 @@ python benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton.py \
     --tp-size 16 \
     --n-share-experts-fusion 16 \
     --dtype int8_w8a8 \
+    --per-channel-quant \
     --tune
 ```
 
