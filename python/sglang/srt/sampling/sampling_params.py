@@ -51,7 +51,7 @@ class SamplingParams:
         no_stop_trim: bool = False,
         custom_params: Optional[Dict[str, Any]] = None,
         stream_interval: Optional[int] = None,
-        logit_bias: Optional[Dict[int, float]] = None,
+        logit_bias: Optional[Dict[str, float]] = None,
     ) -> None:
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop

@@ -507,7 +507,7 @@ class TestSRTEndpoint(CustomTestCase):
     def test_logit_bias(self):
         """Test that a very high logit bias forces sampling of a specific token."""
         # Choose a token ID to bias (using 5 as an example)
-        target_token_id = 5
+        target_token_id = 60704  # Paris for meta-llama/Llama-3.2-1B-Instruct, DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         logit_bias = {str(target_token_id): 100.0}  # Very high positive bias
 
         response = requests.post(
@@ -537,7 +537,7 @@ class TestSRTEndpoint(CustomTestCase):
     def test_forbidden_token(self):
         """Test that a forbidden token (very negative logit bias) doesn't appear in the output."""
         # Choose a token ID to forbid (using 10 as an example)
-        forbidden_token_id = 10
+        forbidden_token_id = 23994  # rice for meta-llama/Llama-3.2-1B-Instruct, DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         logit_bias = {
             str(forbidden_token_id): -100.0
         }  # Very negative bias to forbid the token
@@ -545,7 +545,7 @@ class TestSRTEndpoint(CustomTestCase):
         response = requests.post(
             self.base_url + "/generate",
             json={
-                "text": "Count from 1 to 20:",
+                "text": "Only output 'rice' exactly like this, in lowercase ONLY: rice",
                 "sampling_params": {
                     "temperature": 1.0,  # Use high temperature to encourage diverse output
                     "max_new_tokens": 50,  # Generate enough tokens to likely include numbers
@@ -570,7 +570,7 @@ class TestSRTEndpoint(CustomTestCase):
     def test_logit_bias_isolation(self):
         """Test that logit_bias applied to one request doesn't affect other requests in batch."""
         # Choose a token ID to bias in first request only
-        biased_token_id = 5
+        biased_token_id = 60704  # Paris for meta-llama/Llama-3.2-1B-Instruct, DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
         # Prepare batch requests - one with logit_bias and one without
         requests_data = [
