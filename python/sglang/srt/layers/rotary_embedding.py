@@ -34,9 +34,15 @@ if is_npu():
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
+
+
+# Copied from transformers
+def rotate_half(x):
+    _rotate_neox(x)
 
 
 def _rotate_gptj(x: torch.Tensor) -> torch.Tensor:
@@ -616,6 +622,7 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         cos_sin = torch.index_select(self.long_short_cos_sin_cache, 0, idx)
 
         cos, sin = cos_sin.chunk(2, dim=-1)
+        print(f"{cos=}")
         cos = cos.repeat(1, 2).unsqueeze(-2)
         sin = sin.repeat(1, 2).unsqueeze(-2)
 
@@ -1172,6 +1179,197 @@ class MRotaryEmbedding(RotaryEmbedding):
         )
 
 
+class MiniCPMRotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+        super().__init__()
+
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Build here to make `torch.jit.trace` work.
+        self._set_cos_sin_cache(
+            # seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
+            seq_len=max_position_embeddings,
+            device=self.inv_freq.device,
+            dtype=torch.float32,
+        )
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(
+            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
+        )
+        freqs = torch.outer(t, self.inv_freq)
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+
+        return (
+            self.cos_cached[:seq_len].to(dtype=x.dtype),
+            self.sin_cached[:seq_len].to(dtype=x.dtype),
+        )
+
+
+class MiniCPMScaledRotaryEmbedding(RotaryEmbedding):
+    """RotaryEmbedding implementing MiniCPM-V's LongRoPE scaling."""
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,  # Scaled max sequence length
+        base: int,
+        # MiniCPM specific params from rope_scaling
+        short_factor: List[float],
+        long_factor: List[float],
+        original_max_position_embeddings: int,
+        dtype: Optional[torch.dtype] = None,
+        is_neox_style: bool = True,
+    ) -> None:
+        self.short_factor = short_factor
+        self.long_factor = long_factor
+        self.original_max_position_embeddings = original_max_position_embeddings
+
+        scale = float(max_position_embeddings) / self.original_max_position_embeddings
+        if scale <= 1.0:
+            # If not scaling up, or scaling down, use factor 1.0.
+            # LongRoPE is primarily for extending context.
+            self.minicpm_scaling_factor = 1.0
+        else:
+            if self.original_max_position_embeddings <= 1:
+                # Avoid log(1) or log(0) if original_max_position_embeddings is 1 or less.
+                # Default to scaling_factor = 1 if original_max_position_embeddings is not suitable for log.
+                self.minicpm_scaling_factor = 1.0
+            else:
+                self.minicpm_scaling_factor = math.sqrt(
+                    1
+                    + math.log(scale) / math.log(self.original_max_position_embeddings)
+                )
+
+        super().__init__(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+        )
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        # seq_len is self.max_position_embeddings (the scaled length)
+        seq_len = self.max_position_embeddings
+
+        # Standard inverse frequency calculation (on CPU, dtype=torch.float)
+        inv_freq = 1.0 / (
+            self.base
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+            )
+        )
+
+        t = torch.arange(seq_len, dtype=torch.float)
+
+        if seq_len > self.original_max_position_embeddings:
+            ext_factors = torch.tensor(self.long_factor, dtype=torch.float)
+        else:
+            ext_factors = torch.tensor(self.short_factor, dtype=torch.float)
+
+        # Ensure all tensors for computation are on CPU and float type for consistency
+        # with base RotaryEmbedding cache computation.
+        # inv_freq, t, ext_factors are now CPU, torch.float.
+
+        # MiniCPM's frequency calculation:
+        # term1 has shape [seq_len, rotary_dim / 2] (assuming ext_factors has rotary_dim / 2 elements)
+        # inv_freq has shape [rotary_dim / 2]
+        # torch.outer(t, 1.0 / ext_factors)
+        # If ext_factors is a list/tensor of factors for each dimension pair:
+        if ext_factors.dim() == 0:  # scalar factor
+            scaled_t = t / ext_factors
+            freqs = torch.outer(scaled_t, inv_freq)
+        elif (
+            ext_factors.dim() == 1 and len(ext_factors) == self.rotary_dim // 2
+        ):  # per-dimension factor
+            # freqs = torch.mul(torch.outer(t, 1.0 / ext_factors), inv_freq) # Original MiniCPM style
+            # This can be written as:
+            # t_expanded shape: [seq_len, 1]
+            # inv_freq_expanded shape: [1, rotary_dim/2]
+            # ext_factors_expanded shape: [1, rotary_dim/2]
+            # freqs = (t.unsqueeze(-1) / ext_factors.unsqueeze(0)) * inv_freq.unsqueeze(0)
+            freqs = torch.outer(t, inv_freq / ext_factors)
+        else:
+            raise ValueError(
+                f"ext_factors has unexpected shape: {ext_factors.shape} or dimension."
+            )
+
+        cos_part = freqs.cos() * self.minicpm_scaling_factor
+        sin_part = freqs.sin() * self.minicpm_scaling_factor
+
+        # Cache format expected by RotaryEmbedding: torch.cat((cos, sin), dim=-1)
+        # where cos and sin are [max_pos, rotary_dim // 2]
+        cache = torch.cat((cos_part, sin_part), dim=-1)
+
+        # Return cache as float32 for numerical stability, consistent with base.
+        return cache.to(torch.float32)
+
+
+class MiniCPMLongRoPE(MiniCPMRotaryEmbedding):
+    """MiniCPMRotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
+
+    def __init__(
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        device=None,
+        short_factor=None,
+        long_factor=None,
+        original_max_position_embeddings=None,
+    ):
+        self.short_factor = short_factor
+        self.long_factor = long_factor
+        self.original_max_position_embeddings = original_max_position_embeddings
+        scale = max_position_embeddings / self.original_max_position_embeddings
+        self.scaling_factor = math.sqrt(
+            1 + math.log(scale) / math.log(self.original_max_position_embeddings)
+        )
+        super().__init__(dim, max_position_embeddings, base, device)
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(
+            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
+        )
+        if seq_len > self.original_max_position_embeddings:
+            ext_factors = torch.tensor(
+                self.long_factor, dtype=torch.float32, device=device
+            )
+        else:
+            ext_factors = torch.tensor(
+                self.short_factor, dtype=torch.float32, device=device
+            )
+
+        freqs = torch.mul(
+            torch.outer(t, 1.0 / ext_factors).to(device=device),
+            self.inv_freq.to(device=device).to(dtype),
+        )
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer(
+            "cos_cached", emb.cos().to(dtype) * self.scaling_factor, persistent=False
+        )
+        print(f"{self.cos_cached=}")
+        self.register_buffer(
+            "sin_cached", emb.sin().to(dtype) * self.scaling_factor, persistent=False
+        )
+
+
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
 
 
@@ -1362,14 +1560,6 @@ def get_rope(
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
-
-
-# Copied from transformers
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
 
 
 def apply_rotary_pos_emb(

@@ -34,14 +34,14 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import MiniCPMScaledRotaryEmbedding, get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.minicpm4 import apply_rotary_pos_emb, rotate_half
+from sglang.srt.models.minicpm4 import rotate_half
 from sglang.srt.utils import add_prefix, logger
 
 
@@ -116,7 +116,7 @@ class MiniCPMAttention(nn.Module):
         self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
@@ -222,8 +222,8 @@ def calc_chunks_with_stride(cu_seqlens, moba_chunk_size, kernel_stride):
     del chunk_start_in_seq
     # 5. 生成 filtered_indices
     chunk_indices = torch.arange(0, moba_chunk_size, device=cu_seqlens.device)[
-                    None, :
-                    ]  # [1, moba_chunk_size]
+        None, :
+    ]  # [1, moba_chunk_size]
     filtered_indices = (
         valid_chunk_starts[:, None] + chunk_indices
     )  # [num_valid_chunks, moba_chunk_size]
@@ -358,11 +358,11 @@ class CompressKV(torch.nn.Module):
         if self.compress_func == "meanpool":
             compressed_kv = filtered_kv.mean(dim=1)
             compress_k = compressed_kv[
-                         :, 0, :, :
-                         ]  # .reshape(-1, self.head_num_k, self.head_dim)
+                :, 0, :, :
+            ]  # .reshape(-1, self.head_num_k, self.head_dim)
             compress_v = compressed_kv[
-                         :, 1, :, :
-                         ]  # .reshape(-1, self.head_num_k, self.head_dim)
+                :, 1, :, :
+            ]  # .reshape(-1, self.head_num_k, self.head_dim)
         elif self.compress_func == "mlp":
 
             filtered_kv = filtered_kv.permute(0, 3, 4, 2, 1).reshape(
@@ -370,11 +370,11 @@ class CompressKV(torch.nn.Module):
             )
             compressed_kv = self.kv_compress(filtered_kv)
             compress_k = compressed_kv[
-                         :, :, :, 0
-                         ]  # .reshape(-1, self.head_num_k, self.head_dim)
+                :, :, :, 0
+            ]  # .reshape(-1, self.head_num_k, self.head_dim)
             compress_v = compressed_kv[
-                         :, :, :, 1
-                         ]  # .reshape(-1, self.head_num_k, self.head_dim)
+                :, :, :, 1
+            ]  # .reshape(-1, self.head_num_k, self.head_dim)
         elif self.compress_func == "mlp+residual":
             mean_kv = filtered_kv.mean(dim=1)
             mlp_kv = self.kv_compress(
@@ -645,8 +645,8 @@ class DynamicCacheQKV(DynamicCache):
             k_chunk = self.no_compress_k_cache[layer_idx][:kernel_size]
 
             self.no_compress_k_cache[layer_idx] = self.no_compress_k_cache[layer_idx][
-                                                  kernel_stride:
-                                                  ]
+                kernel_stride:
+            ]
 
             return k_chunk
         else:
@@ -713,10 +713,10 @@ class DynamicCacheQKV(DynamicCache):
             current_split = DynamicCacheQKV(num_hidden_layers)
             current_split._seen_tokens = self._seen_tokens
             current_split.key_cache = [
-                tensor[i: i + split_size] for tensor in self.key_cache
+                tensor[i : i + split_size] for tensor in self.key_cache
             ]
             current_split.value_cache = [
-                tensor[i: i + split_size] for tensor in self.value_cache
+                tensor[i : i + split_size] for tensor in self.value_cache
             ]
             out.append(current_split)
         return out
@@ -922,166 +922,6 @@ def compressed_attention(
     return topk_idx
 
 
-class MiniCPMRotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
-        super().__init__()
-
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        inv_freq = 1.0 / (
-            self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-        # Build here to make `torch.jit.trace` work.
-        self._set_cos_sin_cache(
-            # seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
-            seq_len=max_position_embeddings,
-            device=self.inv_freq.device,
-            dtype=torch.float32,
-        )
-
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(
-            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
-        )
-        freqs = torch.outer(t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
-
-    def forward(self, x, seq_len=None):
-        # x: [bs, num_attention_heads, seq_len, head_size]
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
-
-        return (
-            self.cos_cached[:seq_len].to(dtype=x.dtype),
-            self.sin_cached[:seq_len].to(dtype=x.dtype),
-        )
-
-
-class MiniCPMLongRoPE(MiniCPMRotaryEmbedding):
-    """MiniCPMRotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
-
-    def __init__(
-        self,
-        dim,
-        max_position_embeddings=2048,
-        base=10000,
-        device=None,
-        short_factor=None,
-        long_factor=None,
-        original_max_position_embeddings=None,
-    ):
-        self.short_factor = short_factor
-        self.long_factor = long_factor
-        self.original_max_position_embeddings = original_max_position_embeddings
-        scale = max_position_embeddings / self.original_max_position_embeddings
-        self.scaling_factor = math.sqrt(
-            1 + math.log(scale) / math.log(self.original_max_position_embeddings)
-        )
-        super().__init__(dim, max_position_embeddings, base, device)
-
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(
-            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
-        )
-        if seq_len > self.original_max_position_embeddings:
-            ext_factors = torch.tensor(
-                self.long_factor, dtype=torch.float32, device=device
-            )
-        else:
-            ext_factors = torch.tensor(
-                self.short_factor, dtype=torch.float32, device=device
-            )
-
-        freqs = torch.mul(
-            torch.outer(t, 1.0 / ext_factors).to(device=device),
-            self.inv_freq.to(device=device).to(dtype),
-        )
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer(
-            "cos_cached", emb.cos().to(dtype) * self.scaling_factor, persistent=False
-        )
-        self.register_buffer(
-            "sin_cached", emb.sin().to(dtype) * self.scaling_factor, persistent=False
-        )
-
-
-class MiniCPMLinearScalingRotaryEmbedding(MiniCPMRotaryEmbedding):
-    """MiniCPMRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
-
-    def __init__(
-        self,
-        dim,
-        max_position_embeddings=2048,
-        base=10000,
-        device=None,
-        scaling_factor=1.0,
-    ):
-        self.scaling_factor = scaling_factor
-        super().__init__(dim, max_position_embeddings, base, device)
-
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(
-            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
-        )
-        t = t / self.scaling_factor
-
-        freqs = torch.outer(t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
-
-
-class MiniCPMDynamicNTKScalingRotaryEmbedding(MiniCPMRotaryEmbedding):
-    """MiniCPMRotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
-
-    def __init__(
-        self,
-        dim,
-        max_position_embeddings=2048,
-        base=10000,
-        device=None,
-        scaling_factor=1.0,
-    ):
-        self.scaling_factor = scaling_factor
-        super().__init__(dim, max_position_embeddings, base, device)
-
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        self.max_seq_len_cached = seq_len
-
-        if seq_len > self.max_position_embeddings:
-            base = self.base * (
-                (self.scaling_factor * seq_len / self.max_position_embeddings)
-                - (self.scaling_factor - 1)
-            ) ** (self.dim / (self.dim - 2))
-            inv_freq = 1.0 / (
-                base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
-            )
-            self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-        t = torch.arange(
-            self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype
-        )
-
-        freqs = torch.outer(t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-
-        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
-        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
-
-
 def apply_rotary_pos_emb(q, k, cos, sin, positions):
     """
     Apply rotary position embeddings to query and key tensors.
@@ -1178,9 +1018,11 @@ def topk_to_uint64(
 
 
 def flash_attn_with_kvcache(
+    attn: RadixAttention,
     q,
     k_cache,
     v_cache,
+    forward_batch: ForwardBatch,
     k=None,
     v=None,
     rotary_cos=None,
@@ -1301,7 +1143,10 @@ def flash_attn_with_kvcache(
     block_table = maybe_contiguous(block_table)
     if topk_idx is not None:
         assert topk_idx.dtype == torch.int32
-        from nsa import topk_to_uint64 as cuda_topk_to_uint64  # Import the new conversion function
+        from nsa import (
+            topk_to_uint64 as cuda_topk_to_uint64,  # Import the new conversion function
+        )
+
         # blockmask, _ = topk_to_uint64(
         blockmask, _ = cuda_topk_to_uint64(
             topk_idx,
@@ -1316,9 +1161,10 @@ def flash_attn_with_kvcache(
         blockmask = None
 
     softmax_lse = None
-    print(f"{q.shape=}")
-    print(f"{k.shape=}")
-    print(f"{k_cache.shape=}")
+    # print(f"{q.shape=}")
+    # print(f"{k.shape=}")
+    # print(f"{k_cache.shape=}")
+    # FIXME: If key is supplied, it must have seqlen <= the seqlen of the KV cache
     # out, softmax_lse = flash_attn_gpu.fwd_kvcache(
     #     q,
     #     k_cache,
@@ -1343,6 +1189,8 @@ def flash_attn_with_kvcache(
     #     blockmask,
     #     block_window_size,
     # )
+
+    # out = attn.forward(q, k, v, forward_batch)
 
     from sgl_kernel.flash_attn import (
         flash_attn_with_kvcache as flash_attn_with_kvcache_kernel,
@@ -1385,14 +1233,15 @@ class MiniCPMSparseFlashAttention2(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
-        layer_idx,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        **kwargs,
     ):
         super().__init__()
 
         self.config = config
-        self.layer_idx = layer_idx
+        self.layer_idx = layer_id
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = config.num_attention_heads
         num_kv_heads = config.num_key_value_heads
@@ -1412,9 +1261,8 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
         self.rope_theta = rope_theta
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.max_position_embeddings = max_position_embeddings
@@ -1461,81 +1309,49 @@ class MiniCPMSparseFlashAttention2(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # self.rotary_emb = get_rope(
-        #     self.head_dim,
-        #     rotary_dim=self.head_dim,
-        #     max_position=max_position_embeddings,
-        #     base=rope_theta,
-        #     rope_scaling=rope_scaling,
-        # )
-        # set rope as fp32 instead of bf16
-        # self.rotary_emb.cos_sin_cache = self.rotary_emb._compute_cos_sin_cache()
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
-            layer_id=layer_idx,
+            layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
         self.hidden_size = hidden_size
-        self._init_rope()
-        self.is_causal = True
-
-    def _init_rope(self):
-        if self.config.rope_scaling is None:
-            self.rotary_emb = MiniCPMRotaryEmbedding(
+        # set rope as fp32 instead of bf16
+        scaling_type = self.config.rope_scaling["rope_type"]
+        if scaling_type == "longrope":
+            # self.rotary_emb = MiniCPMLongRoPE(
+            self.rotary_emb = MiniCPMScaledRotaryEmbedding(
+                self.head_dim,
                 self.head_dim,
                 max_position_embeddings=self.max_position_embeddings,
+                short_factor=self.config.rope_scaling["short_factor"],
+                long_factor=self.config.rope_scaling["long_factor"],
                 base=self.rope_theta,
+                original_max_position_embeddings=self.config.rope_scaling[
+                    "original_max_position_embeddings"
+                ],
             )
         else:
-            scaling_type = self.config.rope_scaling["rope_type"]
-            scaling_factor = self.config.rope_scaling.get("factor", None)
-            if scaling_type == "linear":
-                self.rotary_emb = MiniCPMLinearScalingRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                    base=self.rope_theta,
-                )
-            elif scaling_type == "dynamic":
-                self.rotary_emb = MiniCPMDynamicNTKScalingRotaryEmbedding(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                    base=self.rope_theta,
-                )
-            elif scaling_type == "longrope":
-                self.rotary_emb = MiniCPMLongRoPE(
-                    self.head_dim,
-                    max_position_embeddings=self.max_position_embeddings,
-                    short_factor=self.config.rope_scaling["short_factor"],
-                    long_factor=self.config.rope_scaling["long_factor"],
-                    base=self.rope_theta,
-                    original_max_position_embeddings=self.config.rope_scaling[
-                        "original_max_position_embeddings"
-                    ],
-                )
-            else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+            raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+        self.is_causal = True
 
     def nsa_forward(
         self,
-        query_layer,
-        key_layer,
-        value_layer,
+        q,
+        k,
+        v,
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_in_batch_q,
         max_seqlen_in_batch_k,
+        forward_batch,
         no_rope_param=None,
         past_key_value=None,
     ):
-        stage1_k = (
-            key_layer if no_rope_param is None else no_rope_param["key_states_no_rope"]
-        )
+        stage1_k = k if no_rope_param is None else no_rope_param["key_states_no_rope"]
         compressed_k, compressed_cu_seqlens = self.compress_k(stage1_k, cu_seqlens_k)
         compressed_v = compressed_k.clone()
         if past_key_value is not None:
@@ -1543,16 +1359,12 @@ class MiniCPMSparseFlashAttention2(nn.Module):
             no_compress_k_start = compressed_k.shape[0] * self.kernel_stride
             past_key_value.update_compress_k(compressed_k, self.layer_idx)
             past_key_value.update_no_compress_k(
-                key_layer[no_compress_k_start:], self.layer_idx, no_compress_k_start
+                k[no_compress_k_start:], self.layer_idx, no_compress_k_start
             )
             past_key_value.cached_compressed_cu_seqlens.append(compressed_cu_seqlens)
         compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
         topk_idx = compressed_attention(
-            (
-                query_layer
-                if no_rope_param is None
-                else no_rope_param["query_states_no_rope"]
-            ),
+            (q if no_rope_param is None else no_rope_param["query_states_no_rope"]),
             compressed_k,
             compressed_v,
             self.kernel_size,
@@ -1568,11 +1380,17 @@ class MiniCPMSparseFlashAttention2(nn.Module):
             local_blocks=self.local_blocks,
         )
 
-        from flash_attn import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
+        from flash_attn import (
+            flash_attn_func,
+            flash_attn_varlen_func,
+            flash_attn_with_kvcache,
+        )
+
+        # topk_attn_output = self.attn.forward(q, k, v, forward_batch)
         topk_attn_output = flash_attn_varlen_func(
-            query_layer,
-            key_layer,
-            value_layer,
+            q,
+            k,
+            v,
             cu_seqlens_q,
             cu_seqlens_k,
             max_seqlen_in_batch_q,
@@ -1583,7 +1401,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
             causal=True,
             return_attn_probs=False,
             block_window_size=self.window_size // self.block_size,
-            topk_idx=topk_idx
+            topk_idx=topk_idx,
         )
 
         # from sgl_kernel.flash_attn import flash_attn_varlen_func
@@ -1611,65 +1429,113 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         self, query_layer, key_layer, value_layer, attention_mask, query_length
     ):
 
-        def _get_unpad_data(attention_mask):
-            import torch.nn.functional as F
+        def unpad_input(
+            hidden_states: torch.Tensor,  # Shape (batch_size, seq_len, *other_dims)
+            attention_mask,
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+            """
+            处理一个矩形且完全填充的序列批次的 'unpadding'。
+            这意味着批处理中的每个序列都具有相同的长度 'seq_len'，
+            并且该长度内的所有token都是有效的（没有padding）。
 
-            seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-            indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-            max_seqlen_in_batch = seqlens_in_batch.max().item()
-            cu_seqlens = F.pad(
-                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0)
-            )
-            return (
-                indices,
-                cu_seqlens,
-                max_seqlen_in_batch,
+            Args:
+                hidden_states (torch.Tensor):
+                    输入张量，形状为 (batch_size, seq_len, *other_dims)。
+
+            Returns:
+                一个元组: (unpadded_tensor, indices, cu_seqlens, max_seqlen)
+                    - unpadded_tensor (torch.Tensor):
+                        重塑后的 hidden_states。形状为 (batch_size * seq_len, *other_dims)。
+                    - indices (torch.Tensor):
+                        将 unpadded_tensor 中的token映射回概念上的原始扁平化张量的索引。
+                        形状为 (batch_size * seq_len,)。
+                    - cu_seqlens (torch.Tensor):
+                        累积序列长度。形状为 (batch_size + 1,)。
+                    - max_seqlen (int):
+                        序列长度，在此即为最大实际序列长度。
+            """
+            batch_size, seq_len, *other_dims = hidden_states.shape
+            device = hidden_states.device
+
+            # 1. 创建 unpadded_tensor (扁平化)
+            # 这是一个 reshape 操作，通常是 CUDA Graph 友好的。
+            # 输出形状 (batch_size * seq_len) 仅依赖于输入形状。
+            unpadded_tensor = hidden_states.reshape(batch_size * seq_len, *other_dims)
+
+            # 2. 创建 cu_seqlens
+            # 对于一个矩形批次，其中每个序列长度为 'seq_len':
+            # cu_seqlens 将是 [0, seq_len, 2*seq_len, ..., batch_size*seq_len]
+            # 这可以使用 torch.arange 生成。其形状 (batch_size + 1) 是固定的。
+            cu_seqlens = torch.arange(
+                0, (batch_size * seq_len) + 1, seq_len, dtype=torch.int32, device=device
             )
 
-        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+            # 3. 确定 max_seqlen
+            # 因为所有序列长度都为 'seq_len' 且完全填充。
+            max_seqlen = seq_len  # 这是一个 Python int，对于 CUDA Graph 是可以的。
+
+            # 4. 创建 indices
+            # 这些索引将 unpadded_tensor 中的每个token映射回其在概念上的
+            # 原始扁平化张量 (形状 (batch_size * seq_len_dim, *other_dims)) 中的位置。
+            # 在这里, seq_len_dim 就是 seq_len。
+            # 所以, indices 就是 0, 1, ..., (batch_size * seq_len - 1)。
+            # 其形状 (batch_size * seq_len) 仅依赖于输入形状。
+            indices = torch.arange(
+                batch_size * seq_len, dtype=torch.long, device=device
+            )
+
+            return unpadded_tensor, indices, cu_seqlens, max_seqlen, None
+
+        # from flash_attn.bert_padding import unpad_input  # Import moved here for clarity in diff, ideally top-level
+
         batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
-        from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
+        # Unpad K and V using unpad_input
+        # The unpad_input function expects (batch, seqlen, ...)
+        # key_layer and value_layer are (batch_size, kv_seq_len, num_kv_heads, head_dim)
+        # attention_mask is (batch_size, kv_seq_len)
 
-        key_layer = index_first_axis(
-            key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim),
-            indices_k,
+        key_layer_unpadded, indices_k, cu_seqlens_k, max_seqlen_in_batch_k, _ = (
+            unpad_input(key_layer, attention_mask)
         )
-        value_layer = index_first_axis(
-            value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim),
-            indices_k,
-        )
+        value_layer_unpadded, _, _, _, _ = unpad_input(
+            value_layer, attention_mask
+        )  # Indices and seqlens are the same for K and V
+
         if query_length == kv_seq_len:
-            query_layer = index_first_axis(
-                query_layer.reshape(batch_size * kv_seq_len, self.num_heads, head_dim),
-                indices_k,
+            # If query_length is the same as kv_seq_len, Q uses the same mask and hence same unpadding logic
+            query_layer_unpadded, indices_q, cu_seqlens_q, max_seqlen_in_batch_q, _ = (
+                unpad_input(query_layer, attention_mask)
             )
-            cu_seqlens_q = cu_seqlens_k
-            max_seqlen_in_batch_q = max_seqlen_in_batch_k
-            indices_q = indices_k
         elif query_length == 1:
             max_seqlen_in_batch_q = 1
             cu_seqlens_q = torch.arange(
                 batch_size + 1, dtype=torch.int32, device=query_layer.device
-            )  # There is a memcpy here, that is very bad.
-            indices_q = cu_seqlens_q[:-1]
-            query_layer = query_layer.squeeze(1)
+            )
+            indices_q = cu_seqlens_q[
+                :-1
+            ]  # For query_length == 1, indices_q are just batch indices 0, 1, ...
+            query_layer_unpadded = query_layer.squeeze(
+                1
+            )  # Query is already effectively unpadded
         else:
             # The -q_len: slice assumes left padding.
-            attention_mask = attention_mask[:, -query_length:]
-            # print(f"{attention_mask.shape=}")
-            # print(f"{query_layer.shape=}")
-            result = unpad_input(query_layer, attention_mask)
-            # print(f"{result=}")
-            query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q, _ = result
+            attention_mask_q = attention_mask[:, -query_length:]
+            query_layer_unpadded, indices_q, cu_seqlens_q, max_seqlen_in_batch_q, _ = (
+                unpad_input(query_layer, attention_mask_q)
+            )
+
+        # Ensure cu_seqlens are 1D tensors
         if cu_seqlens_q.dim() != 1:
             cu_seqlens_q = cu_seqlens_q.view(cu_seqlens_q.numel())
-        if cu_seqlens_k.dim() != 1:
+        if (
+            cu_seqlens_k.dim() != 1
+        ):  # This was from the original _get_unpad_data, unpad_input should return 1D
             cu_seqlens_k = cu_seqlens_k.view(cu_seqlens_k.numel())
 
         return (
-            query_layer,
-            key_layer,
-            value_layer,
+            query_layer_unpadded,
+            key_layer_unpadded,
+            value_layer_unpadded,
             indices_q,
             (cu_seqlens_q, cu_seqlens_k),
             (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
@@ -1682,6 +1548,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         value_states,
         attention_mask,
         query_length,
+        forward_batch: ForwardBatch,
         dropout=0.0,
         softmax_scale=None,
         no_rope_param=None,
@@ -1765,6 +1632,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
                 cu_seqlens_k,
                 max_seqlen_in_batch_q,
                 max_seqlen_in_batch_k,
+                forward_batch=forward_batch,
                 no_rope_param=no_rope_param,
                 past_key_value=past_key_value,
             )
@@ -1781,6 +1649,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
         attention_mask: Optional[torch.LongTensor] = None,
         positions: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
@@ -1792,7 +1661,6 @@ class MiniCPMSparseFlashAttention2(nn.Module):
             hidden_states = hidden_states.unsqueeze(0)
         bsz, q_len, _ = hidden_states.size()
         assert bsz == 1, "Only batch_size=1 is supported at the moment."
-        print(f"{hidden_states.shape=}")
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # ! save no rope
@@ -1812,9 +1680,8 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         kv_seq_len = k.shape[-2]
         if past_key_value is not None:
             usable_length = past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-            # print(f"{usable_length=}")
             kv_seq_len += usable_length
-        cos, sin = self.rotary_emb(v.to(torch.float32), seq_len=kv_seq_len)
+        # cos, sin = self.rotary_emb(v.to(torch.float32), seq_len=kv_seq_len)
 
         # print(f"{cos.shape=}")
         # print(f"{sin.shape=}")
@@ -1828,16 +1695,20 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         k_shape = k.shape
         q = q.reshape(-1, self.num_heads, self.head_dim)
         k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+
+        # q, k = apply_rotary_pos_emb(q, k, cos, sin, positions)
+
         # print(f"{q.shape=}")
         # print(f"{k.shape=}")
-        q, k = apply_rotary_pos_emb(q, k, cos, sin, positions)
+
+        q, k = self.rotary_emb(positions, q, k)
+
         q = q.view(q_shape)
         k = k.view(k_shape)
         if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            print(f"pre {k.shape=}")
-            k, v = past_key_value.update(k, v, self.layer_idx, cache_kwargs)
-            print(f"after {k.shape=}")
+            #     cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+            k, v = past_key_value.update(k, v, self.layer_idx)
+            # k, v = past_key_value.update(k, v, self.layer_idx, cache_kwargs)
 
         # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
         # to be able to avoid many of these transpose/reshape/view.
@@ -1885,6 +1756,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
                 v,
                 attention_mask,
                 q_len,
+                forward_batch=forward_batch,
                 dropout=dropout_rate,
                 no_rope_param=no_rope_param,  # if past_key_value is not None else None,
                 past_key_value=past_key_value,
@@ -1896,6 +1768,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
                 v,
                 attention_mask,
                 q_len,
+                forward_batch=forward_batch,
                 dropout=dropout_rate,
                 no_rope_param=no_rope_param,
                 past_key_value=past_key_value,
@@ -1908,11 +1781,12 @@ class MiniCPMSparseFlashAttention2(nn.Module):
 
     def _flash_attention_forward_with_kv_cache(
         self,
-        query_states,
-        key_states,
-        value_states,
+        q,
+        k,
+        v,
         attention_mask,
         query_length,
+        forward_batch: ForwardBatch,
         dropout=0.0,
         softmax_scale=None,
         no_rope_param=None,
@@ -1923,11 +1797,11 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         first unpad the input, then computes the attention scores and pad the final attention scores.
 
         Args:
-            query_states (`torch.Tensor`):
+            q (`torch.Tensor`):
                 Input query states to be passed to Flash Attention API
-            key_states (`torch.Tensor`):
+            k (`torch.Tensor`):
                 Input key states to be passed to Flash Attention API
-            value_states (`torch.Tensor`):
+            v (`torch.Tensor`):
                 Input value states to be passed to Flash Attention API
             attention_mask (`torch.Tensor`):
                 The padding mask - corresponds to a tensor of size `(batch_size, seq_len)` where 0 stands for the
@@ -1945,7 +1819,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         # Contains at least one padding token in the sequence
         if attention_mask is not None:
 
-            batch_size = query_states.shape[0]
+            batch_size = q.shape[0]
 
             # query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
             #     query_states, key_states, value_states, attention_mask, query_length=query_length
@@ -1953,14 +1827,13 @@ class MiniCPMSparseFlashAttention2(nn.Module):
 
             assert batch_size == 1, "Only batch_size=1 is supported at the moment."
             # prepare past kv ,new kv
-            new_q = query_states
+            new_q = q
 
-            print(f"{key_states.shape=}")
-            new_k = key_states[:, -1:, :, :].contiguous()
-            new_v = value_states[:, -1:, :, :].contiguous()
+            new_k = k[:, -1:, :, :].contiguous()
+            new_v = v[:, -1:, :, :].contiguous()
 
-            past_k = key_states[:, :-1, :, :].contiguous()
-            past_v = value_states[:, :-1, :, :].contiguous()
+            past_k = k[:, :-1, :, :].contiguous()
+            past_v = v[:, :-1, :, :].contiguous()
             if no_rope_param is not None:
                 # nope unpad
                 no_rope_param["query_states_no_rope"] = no_rope_param[
@@ -1979,8 +1852,8 @@ class MiniCPMSparseFlashAttention2(nn.Module):
                 batch_size=batch_size,
                 no_rope_param=no_rope_param,
                 past_key_value=past_key_value,
+                forward_batch=forward_batch,
             )
-
             # attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
         else:
             raise ValueError("need attention mask")
@@ -1989,6 +1862,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
 
     def nsa_forward_with_kv_cache(
         self,
+        forward_batch: ForwardBatch,
         past_k=None,
         past_v=None,
         new_k=None,
@@ -2026,8 +1900,8 @@ class MiniCPMSparseFlashAttention2(nn.Module):
                 self.layer_idx
             ]
         else:
-            print(f"{self.layer_idx=}")
-            print(f"{len(past_key_value.compress_k_cache)=}")
+            # print(f"{self.layer_idx=}")
+            # print(f"{len(past_key_value.compress_k_cache)=}")
             compressed_k = past_key_value.compress_k_cache[
                 self.layer_idx
             ]  # [seqlen, nheads_k, head_dim]
@@ -2063,7 +1937,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
             init_blocks=self.init_blocks,
             local_blocks=self.local_blocks,
             total_seq_lens=past_k.shape[1]
-                           + 1,  # ! Only batch_size=1 is supported at the moment.
+            + 1,  # ! Only batch_size=1 is supported at the moment.
         )
 
         repeat_times = 1
@@ -2091,6 +1965,8 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         ).contiguous()  # Append one zero vector to avoid potential out-of-bounds access
 
         topk_attn_output = flash_attn_with_kvcache(
+            attn=self.attn,
+            forward_batch=forward_batch,
             q=new_q,
             k_cache=past_k,
             v_cache=past_v,
@@ -2109,6 +1985,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
 
 MINICPM_ATTENTION_CLASSES = {
     "eager": MiniCPMAttention,
+    "flash_attention_2": MiniCPMSparseFlashAttention2,
 }
 
 
@@ -2127,24 +2004,25 @@ class MiniCPMDecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # FIXME: for testing
-        config._attn_implementation = "flash_attention_2"
-        if hasattr(config, "sparse_config") and config.sparse_config is not None:
-            self.self_attn = MiniCPMSparseFlashAttention2(
-                config=config, layer_idx=layer_id
-            )
-        else:
-            self.self_attn = MINICPM_ATTENTION_CLASSES[config._attn_implementation](
-                hidden_size=self.hidden_size,
-                num_heads=config.num_attention_heads,
-                num_kv_heads=config.num_key_value_heads,
-                layer_id=layer_id,
-                rope_theta=rope_theta,
-                rope_scaling=rope_scaling,
-                max_position_embeddings=max_position_embeddings,
-                quant_config=quant_config,
-                prefix=add_prefix("self_attn", prefix),
-                config=config,
-            )
+        # print(f"{config._attn_implementation=}")
+        # config._attn_implementation = "flash_attention_2"
+        # if hasattr(config, "sparse_config") and config.sparse_config is not None:
+        #     self.self_attn = MiniCPMSparseFlashAttention2(
+        #         config=config, layer_id=layer_id
+        #     )
+        # else:
+        self.self_attn = MINICPM_ATTENTION_CLASSES[config._attn_implementation](
+            hidden_size=self.hidden_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            layer_id=layer_id,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            max_position_embeddings=max_position_embeddings,
+            quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
+            config=config,
+        )
         self.mlp = MiniCPMMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -2231,11 +2109,8 @@ class MiniCPMModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        # print(f"{input_ids.tolist()=}")
         # FIXME
-        print(f"{forward_batch.forward_mode=}")
-        seq_length = input_ids.shape[0]
-        past_key_values_length = self.past_key_values.get_usable_length(seq_length)
-        # if past_key_values_length == 0:
         if forward_batch.forward_mode.is_extend():
             self.past_key_values = DynamicCacheQKV()
 
