@@ -171,7 +171,7 @@ typename Gemm::Arguments prepare_sm89_fp8_args(
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   using ElementT = typename Gemm::ElementA;
   using ElementOutput = typename Gemm::ElementD;
   using ElementComputeEpilogue = float;
@@ -249,7 +249,7 @@ void launch_sm89_fp8_scaled_mm(
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   auto args = prepare_sm89_fp8_args<Gemm, WithBias>(out, a, b, scales_a, scales_b, bias);
   Gemm gemm_op;
 
@@ -272,7 +272,7 @@ void sm89_fp8_dispatch_bias(
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   using ElementInput = cutlass::float_e4m3_t;
   using ElementOutput = OutType;
   using AccumElementType = float;
@@ -306,7 +306,7 @@ void sm89_fp8_dispatch_shape(
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   uint32_t const m = a.size(0);
   uint32_t const n = out.size(1);
 
@@ -602,7 +602,7 @@ typename Gemm::Arguments prepare_sm90_fp8_args(
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   using ElementT = typename Gemm::ElementA;
   using ElementOutput = typename Gemm::ElementD;
   using ElementComputeEpilogue = float;
@@ -671,7 +671,7 @@ void launch_sm90_fp8_scaled_mm(
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   auto args = prepare_sm90_fp8_args<Gemm, WithBias>(out, a, b, scales_a, scales_b, bias);
   Gemm gemm_op;
 
@@ -700,7 +700,7 @@ void sm90_fp8_dispatch_bias(
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias,
+    const std::optional<torch::Tensor>& bias,
     bool fast_accum = true,
     bool use_persistent = false) {
   using ElementInput = cutlass::float_e4m3_t;
@@ -742,7 +742,7 @@ void sm90_fp8_dispatch_shape(
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   uint32_t const m = a.size(0);
   using FastPingpongScheduler = cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
   using FastBasicScheduler = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
@@ -934,7 +934,7 @@ typename GemmType::Gemm::Arguments prepare_sm100_fp8_args(
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   using Gemm = typename GemmType::Gemm;
   using ElementT = typename Gemm::ElementA;
   using ElementC = typename Gemm::ElementC;
@@ -969,7 +969,7 @@ typename GemmType::Gemm::Arguments prepare_sm100_fp8_args(
 
   auto ptr_c = static_cast<ElementOutput*>(out.data_ptr());
 
-  auto prepare_epilogue_args = [&](const c10::optional<torch::Tensor>& bias = c10::nullopt) {
+  auto prepare_epilogue_args = [&](const std::optional<torch::Tensor>& bias = c10::nullopt) {
     if constexpr (WithBias) {
       TORCH_CHECK(bias.has_value(), "Bias tensor is required but not provided.");
       return typename GemmKernel::EpilogueArguments{
@@ -997,7 +997,7 @@ void launch_sm100_fp8_scaled_mm(
     torch::Tensor const& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   auto args = prepare_sm100_fp8_args<Gemm, WithBias>(out, a, b, scales_a, scales_b, bias);
 
   typename Gemm::Gemm gemm_op;
@@ -1018,7 +1018,7 @@ void sm100_fp8_dispatch_bias(
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   using CTAShape = Shape<_256, _128, _64>;
   using ClusterShape = Shape<_2, _2, _1>;
   using MainloopScheduleType = cutlass::gemm::collective::KernelScheduleAuto;
@@ -1063,7 +1063,7 @@ void sm100_fp8_dispatch_shape(
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   return sm100_fp8_dispatch_bias<OutType>(out, a, b, scales_a, scales_b, bias);
 }
 #endif
@@ -1074,7 +1074,7 @@ torch::Tensor fp8_scaled_mm(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype,
-    const c10::optional<torch::Tensor>& bias) {
+    const std::optional<torch::Tensor>& bias) {
   TORCH_CHECK(mat_a.is_cuda(), "mat_a must be a CUDA tensor");
   TORCH_CHECK(mat_b.is_cuda(), "mat_b must be a CUDA tensor");
   TORCH_CHECK(mat_a.dim() == 2, "mat_a must be a 2D tensor");
