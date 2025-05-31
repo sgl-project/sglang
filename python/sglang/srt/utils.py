@@ -2230,9 +2230,13 @@ def bind_or_assign(target, source):
 def support_triton(backend: str) -> bool:
     return backend not in ["torch_native", "intel_amx"]
 
+
 try:
     import sgl_kernel
-    is_intel_amx_backend_available = hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
+
+    is_intel_amx_backend_available = hasattr(
+        torch.ops.sgl_kernel, "convert_weight_packed"
+    )
 except:
     is_intel_amx_backend_available = False
 
