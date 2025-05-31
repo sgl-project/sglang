@@ -305,98 +305,90 @@ class MooncakeKVManager(BaseKVManager):
             prefill_kv_indices, dst_kv_indices
         )
 
-        # prefill config
+        # rank/kv_head config
         local_tp_rank = self.kv_args.engine_rank
         local_tp_size = self.tp_size // self.dp_size
-
-        # decode config
-        decode_rank_registered_item_lens = [(item * local_tp_size //  decode_tp_world_size) for item in self.kv_args.kv_item_lens]
-        
         num_kv_heads = self.kv_args.kv_head_num
         num_layers = len(self.kv_args.kv_data_ptrs)
 
         heads_per_decode_rank = num_kv_heads * local_tp_size // decode_tp_world_size
-        heads_per_prefill_rank = num_kv_heads 
-        decode_rank_global_start_head_idx = target_tp_rank * heads_per_decode_rank
-        prefill_rank_global_start_head_idx = local_tp_rank * heads_per_prefill_rank
+        heads_per_prefill_rank = num_kv_heads
+        decode_global_head_start = target_tp_rank * heads_per_decode_rank
+        prefill_global_head_start = local_tp_rank * heads_per_prefill_rank
 
+        # decode config
+        decode_rank_item_lens = [(item * local_tp_size //  decode_tp_world_size) for item in self.kv_args.kv_item_lens]
+        
         if local_tp_size > decode_tp_world_size:
-            head_idx_for_rank = 0   
-            num_heads_in_sub_slice = heads_per_prefill_rank   
-            head_idx_in_group = prefill_rank_global_start_head_idx - decode_rank_global_start_head_idx
-
+            src_head_offset = 0
+            num_heads_to_send = heads_per_prefill_rank
+            dst_head_offset = prefill_global_head_start - decode_global_head_start
         else:
-            head_idx_for_rank = \
-            decode_rank_global_start_head_idx - prefill_rank_global_start_head_idx
-            num_heads_in_sub_slice = heads_per_decode_rank
-            head_idx_in_group = 0
+            src_head_offset = decode_global_head_start - prefill_global_head_start
+            num_heads_to_send = heads_per_decode_rank
+            dst_head_offset = 0
 
-        layers_params_for_processing = []
+        layer_transfer_params = []
         for layer_id in range(num_layers): 
             item_len_of_prefill_rank_page = self.kv_args.kv_item_lens[layer_id]  
             
             # Page stride on the target Decode rank for its slice pages
-            item_len_of_decode_rank_page = decode_rank_registered_item_lens[layer_id] 
+            item_len_of_decode_rank_page = decode_rank_item_lens[layer_id] 
 
             if item_len_of_prefill_rank_page == 0 or num_kv_heads == 0:
                 logger.error(f"Invalid item_len_of_prefill_rank_page or num_kv_heads for layer {layer_id}")
                 return -1
 
-            bytes_per_head_in_prefill_rank_page = item_len_of_prefill_rank_page // heads_per_prefill_rank
+            bytes_per_head = item_len_of_prefill_rank_page // heads_per_prefill_rank
 
             # Calculate precise byte offset and length for the sub-slice within Prefill page data
-            offset_in_prefill_page = \
-                head_idx_for_rank * bytes_per_head_in_prefill_rank_page
-            byte_length_per_page = \
-                num_heads_in_sub_slice * bytes_per_head_in_prefill_rank_page
-            offset_in_decode_page = head_idx_in_group * bytes_per_head_in_prefill_rank_page
+            src_slice_offset = \
+                src_head_offset * bytes_per_head
+            dst_slice_offset = dst_head_offset * bytes_per_head
+            slice_lens_per_page = \
+                num_heads_to_send * bytes_per_head
 
             # Sanity check: The data sub-slice we intend to send should fit into D_n's page.
-            # This means byte_length_per_page <= item_len_of_decode_rank_page
-            if byte_length_per_page > item_len_of_decode_rank_page:
-                self.logger.error(f"[{mooncake_session_id}] Calculated sub-slice byte length per page "
-                                  f"({byte_length_per_page}) "
-                                  f"exceeds target Decode Rank's page item_len/stride ({item_len_of_decode_rank_page}) "
-                                  f"for layer {layer_id}.")
-                return -1  
-
-            layers_params_for_processing.append(
+            # This means slice_lens_per_page <= item_len_of_decode_rank_page
+            if slice_lens_per_page > item_len_of_decode_rank_page:
+                logger.error(
+                    f"[{mooncake_session_id}] Layer {layer_id}: "
+                    f"slice size ({slice_lens_per_page}) exceeds "
+                    f"target page size ({item_len_of_decode_rank_page})"
+                )
+                return -1
+            layer_transfer_params.append(
                 (
                     self.kv_args.kv_data_ptrs[layer_id],      # Prefill base ptr (all heads)
                     dst_kv_ptrs[layer_id],                    # Decode base ptr (for its slice for this layer)
                     item_len_of_prefill_rank_page,            # Prefill page size (all heads)2048
                     item_len_of_decode_rank_page,             # Decode page stride (for its slice page) 1024
-                    offset_in_prefill_page,                   # Offset to slice data in Prefill page
-                    offset_in_decode_page,
-                    byte_length_per_page,                     # Length of slice data per page (actual data to send)
+                    src_slice_offset,                   # Offset to slice data in Prefill page
+                    dst_slice_offset,
+                    slice_lens_per_page,                     # Length of slice data per page (actual data to send)
                 )
             )
 
-        # Helper method for processing each layer (must be per-page within blocks)
-        def process_layer_tp_aware(layer_processing_params_tuple):
+        def process_layer_tp_aware(layer_params):
             (src_ptr, dst_ptr,
             src_item_len, dst_item_len,
-            slice_offset_in_prefill_page, slice_offset_in_decode_page, slice_len_per_page) = layer_processing_params_tuple
+            src_offset, dst_offset, slice_lens_per_page) = layer_params
 
-            for prefill_page_indices_in_block, decode_page_indices_in_block in zip(prefill_kv_blocks, dst_kv_blocks):
-                for i in range(len(prefill_page_indices_in_block)):
-                    prefill_page_idx = prefill_page_indices_in_block[i]
-                    decode_page_idx = decode_page_indices_in_block[i]
+            for prefill_block, dst_block in zip(prefill_kv_blocks, dst_kv_blocks):
+                for prefill_page_idx, decode_page_idx in zip(prefill_block, dst_block):
 
-                    src_full_page_addr = src_ptr + prefill_page_idx * src_item_len
-                    src_addr_for_this_page_slice = src_full_page_addr + slice_offset_in_prefill_page
+                    src_page_addr = src_ptr + prefill_page_idx * src_item_len
+                    src_slice_addr = src_page_addr + src_offset
 
-                    dst_addr_for_this_page_slice = dst_ptr + decode_page_idx * dst_item_len + slice_offset_in_decode_page
+                    dst_slice_addr = dst_ptr + decode_page_idx * dst_item_len + dst_offset
                     
-                    length_for_this_page_slice = slice_len_per_page
-
                     logger.debug(f"SYNC: sid={mooncake_session_id}, "
-                                f"src={src_addr_for_this_page_slice}, dst={dst_addr_for_this_page_slice}, len={length_for_this_page_slice}")
+                                f"src={src_slice_addr}, dst={dst_slice_addr}, len={slice_lens_per_page}")
                     status = self.engine.transfer_sync(
                         mooncake_session_id,
-                        src_addr_for_this_page_slice,
-                        dst_addr_for_this_page_slice,
-                        length_for_this_page_slice
+                        src_slice_addr,
+                        dst_slice_addr,
+                        slice_lens_per_page
                     )
                     if status != 0:
                         logger.error(f"transfer_sync failed with status {status} for session {mooncake_session_id}")
@@ -406,9 +398,9 @@ class MooncakeKVManager(BaseKVManager):
         futures = [
             executor.submit(
                 process_layer_tp_aware,  
-                layer_processing_params_tuple,
+                layer_params,
             )
-            for layer_processing_params_tuple in layers_params_for_processing
+            for layer_params in layer_transfer_params
         ]
 
         for future in concurrent.futures.as_completed(futures):
