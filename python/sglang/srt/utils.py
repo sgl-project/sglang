@@ -2090,6 +2090,14 @@ def get_local_ip_by_remote() -> str:
     except Exception:
         pass
 
+    try:
+        hostname = socket.gethostname()
+        ip = socket.gethostbyname(hostname)
+        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+            return ip
+    except Exception:
+        pass
+
     # try ipv6
     try:
         s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
