@@ -469,6 +469,10 @@ class Req:
         self.return_hidden_states = return_hidden_states
         self.lora_path = lora_path
 
+        if self.sampling_params.stop_strs:
+            self.stop_buffer = ""
+            self.max_buffer_size = max(20, self.sampling_params.stop_str_max_len * 2)
+
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
 
@@ -724,14 +728,15 @@ class Req:
 
         # Check stop strings
         if len(self.sampling_params.stop_strs) > 0:
-            tail_str = self.tokenizer.decode(
-                self.output_ids[-(self.sampling_params.stop_str_max_len + 1) :]
-            )
+            tail_str = self.tokenizer.decode(self.output_ids[-1:])
+            self.stop_buffer += tail_str
 
             for stop_str in self.sampling_params.stop_strs:
-                if stop_str in tail_str or stop_str in self.decoded_text:
+                if stop_str in self.stop_buffer or stop_str in self.decoded_text:
                     self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
                     return
+            if len(self.stop_buffer) > self.max_buffer_size:
+                self.stop_buffer = self.stop_buffer[-self.max_buffer_size :]
 
     def reset_for_retract(self):
         self.prefix_indices = []
