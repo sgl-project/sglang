@@ -12,6 +12,16 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 try:
     from deep_gemm import fp8_m_grouped_gemm_nt_masked, m_grouped_fp8_gemm_nt_contiguous
+except ImportError:
+    from deep_gemm import (
+        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
+        m_grouped_gemm_fp8_fp8_bf16_nt_masked,
+    )
+
+    m_grouped_fp8_gemm_nt_contiguous = m_grouped_gemm_fp8_fp8_bf16_nt_contiguous
+    fp8_m_grouped_gemm_nt_masked = m_grouped_gemm_fp8_fp8_bf16_nt_masked
+
+try:
     from sgl_kernel import silu_and_mul
 
     from sglang.srt.layers.quantization.fp8_kernel import (
