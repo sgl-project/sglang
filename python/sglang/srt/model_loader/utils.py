@@ -2,12 +2,14 @@
 
 """Utilities for selecting and loading models."""
 import contextlib
-from typing import Tuple, Type
+from abc import ABC
+from typing import Iterable, Iterator, Tuple, Type
 
 import torch
 from torch import nn
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.utils import get_layer_id
 
 
 @contextlib.contextmanager
@@ -39,3 +41,40 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
 
 def get_architecture_class_name(model_config: ModelConfig) -> str:
     return get_model_architecture(model_config)[1]
+
+
+class SupportsPP(ABC):
+    """Base class for PipelineParallel models with lazy weight filtering"""
+
+    @property
+    def start_layer(self) -> int:
+        if hasattr(self, "model") and hasattr(self.model, "start_layer"):
+            return self.model.start_layer
+        return 0
+
+    @property
+    def end_layer(self) -> int:
+        if hasattr(self, "model") and hasattr(self.model, "end_layer"):
+            return self.model.end_layer
+        if hasattr(self, "config") and hasattr(self.config, "num_hidden_layers"):
+            return self.config.num_hidden_layers
+        raise AttributeError(
+            "No end_layer implementation found and config.num_hidden_layers not available"
+        )
+
+    @property
+    def num_effective_layers(self) -> int:
+        self.num_effective_layers = self.end_layer - self.start_layer
+
+    def should_skip_layer(self, name: str) -> bool:
+        """Check if a layer should be skipped based on pipeline stage"""
+        layer_id = get_layer_id(name)
+        return layer_id is not None and (
+            layer_id < self.start_layer or layer_id >= self.end_layer
+        )
+
+    def filter_weights_by_layers(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> Iterator[Tuple[str, torch.Tensor]]:
+        """Lazily filter weights based on pipeline stage"""
+        return filter(lambda item: not self.should_skip_layer(item[0]), weights)
