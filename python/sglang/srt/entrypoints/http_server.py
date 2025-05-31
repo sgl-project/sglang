@@ -841,7 +841,8 @@ def _wait_and_warmup(
             json_data["input_ids"] = json_data["input_ids"][0]
     else:
         # json_data["text"] = ["The capital city of France is"] * server_args.dp_size
-        json_data["text"] = [f"{index + 1}+1=" for index in range(server_args.dp_size)]
+        # json_data["text"] = [f"{index + 1}+1=" for index in range(server_args.dp_size)]
+        json_data["text"] = [f"1+1="]  # TODO deliberately only send one
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]

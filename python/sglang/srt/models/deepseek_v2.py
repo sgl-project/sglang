@@ -436,11 +436,24 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights=topk_weights,
                 forward_mode=forward_mode,
             )
+        debug_utils.dumper.dump(
+            "moe_after_combine__final_hidden_states",
+            final_hidden_states,
+            layer_id=self.layer_id,
+        )
         final_hidden_states *= self.routed_scaling_factor
 
+        debug_utils.dumper.dump(
+            "moe_shared_output", shared_output, layer_id=self.layer_id
+        )
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
+        debug_utils.dumper.dump(
+            "moe_output_final_hidden_states",
+            final_hidden_states,
+            layer_id=self.layer_id,
+        )
         return final_hidden_states
 
     def _forward_shared_experts(self, hidden_states):
