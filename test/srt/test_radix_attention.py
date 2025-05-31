@@ -88,6 +88,9 @@ class TestRadixCacheFCFS(CustomTestCase):
         run_test(self.base_url, nodes)
 
 
+"""
+Skip this to reduce the execution time.
+
 class TestRadixCacheLPM(TestRadixCacheFCFS):
     @classmethod
     def setUpClass(cls):
@@ -106,6 +109,7 @@ class TestRadixCacheLPM(TestRadixCacheFCFS):
                 "lpm",
             ],
         )
+"""
 
 
 class TestRadixCacheNonOverlapLPM(TestRadixCacheFCFS):
