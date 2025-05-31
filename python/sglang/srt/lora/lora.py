@@ -209,4 +209,12 @@ class LoRAAdapter(nn.Module):
                 gate_up_name = weight_name
                 if "lora_A" in weight_name:
                     weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
-                # else: "lora_B" is already stacked, no operations is needed.
+                else:
+                    output_dim = weights[gate_up_name].shape[0] // 2
+                    weights[gate_up_name] = torch.stack(
+                        [
+                            weights[gate_up_name][:output_dim, :],
+                            weights[gate_up_name][output_dim:, :],
+                        ],
+                        dim=0,
+                    )
