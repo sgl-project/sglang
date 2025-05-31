@@ -34,7 +34,6 @@ import zmq
 from torch.distributed import barrier
 
 from sglang.global_config import global_config
-from sglang.srt import two_batch_overlap
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
 from sglang.srt.disaggregation.decode import (
@@ -63,7 +62,6 @@ from sglang.srt.hf_transformers_utils import (
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.expert_distribution import (
-    ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.managers.io_struct import (
@@ -140,6 +138,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
     disable_request_logging,
+    get_available_gpu_memory,
     get_bool_env_var,
     get_zmq_socket,
     kill_itself_when_parent_died,
@@ -213,7 +212,6 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.page_size = server_args.page_size
-        # Distributed rank info
         self.dp_size = server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
@@ -333,12 +331,16 @@ class Scheduler(
 
         # Print debug info
         if tp_rank == 0:
+            avail_mem = get_available_gpu_memory(
+                self.device, self.gpu_id, empty_cache=False
+            )
             logger.info(
                 f"max_total_num_tokens={self.max_total_num_tokens}, "
                 f"chunked_prefill_size={server_args.chunked_prefill_size}, "
                 f"max_prefill_tokens={self.max_prefill_tokens}, "
                 f"max_running_requests={self.max_running_requests}, "
-                f"context_len={self.model_config.context_len}"
+                f"context_len={self.model_config.context_len}, "
+                f"available_gpu_mem={avail_mem:.2f} GB"
             )
 
         # Init memory pool and cache
