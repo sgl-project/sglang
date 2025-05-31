@@ -3,7 +3,6 @@ import time
 from pathlib import Path
 
 import torch
-
 from sglang.srt.utils import get_bool_env_var
 
 
@@ -52,17 +51,24 @@ class _Dumper:
         if not isinstance(value, torch.Tensor):
             return None
 
-        if value.numel() < 100:
+        if value.numel() < 200:
             return value
 
-        if ("topk_idx" in name) or ("input_ids" in name) or ("positions" in name):
+        FULL_SAMPLE_NAMES = [
+            "topk_idx",
+            "topk_weights",
+            "input_ids",
+            "positions",
+        ]
+        if any(x in name for x in FULL_SAMPLE_NAMES):
             return value
 
-        if (
-            ("hidden_states" in name)
-            or ("residual" in name)
-            or ("shared_output" in name)
-        ):
+        PARTIAL_SAMPLE_NAMES = [
+            "hidden_states",
+            "residual",
+            "shared_output",
+        ]
+        if any(x in name for x in PARTIAL_SAMPLE_NAMES):
             return value[:, :3]
 
         return None
