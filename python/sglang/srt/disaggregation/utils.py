@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import os
 import random
@@ -316,3 +317,20 @@ def group_concurrent_contiguous(
     dst_groups = [g.tolist() for g in dst_groups]
 
     return src_groups, dst_groups
+
+
+def check_gdr_support():
+    lib = ctypes.CDLL("libcuda.so")
+    if not hasattr(lib, "cuDeviceGetAttribute"):
+        return False
+    CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED = 116
+    retval = ctypes.c_int()
+    current_device = torch.cuda.current_device()
+    result = lib.cuDeviceGetAttribute(
+        ctypes.byref(retval),
+        CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED,
+        current_device,
+    )
+    if result != 0:
+        return False
+    return bool(retval.value)
