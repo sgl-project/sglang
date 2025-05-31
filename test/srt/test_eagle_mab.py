@@ -117,8 +117,10 @@ class TestEAGLEMABServer(TestEAGLEServer):
         print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.20)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
-        avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
+        server_info = requests.get(self.base_url + "/get_server_info").json()
+        avg_spec_accept_length = server_info["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
         print(f"{avg_spec_accept_length=}")
 
         # Use a lower threshold for MAB since it's learning which strategies work best
