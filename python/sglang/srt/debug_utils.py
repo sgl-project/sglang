@@ -36,7 +36,7 @@ class _Dumper:
         if (value is None) or (not isinstance(value, torch.Tensor)):
             return None
 
-        if ('hidden_states' in name) or ('residual' in name):
+        if ("hidden_states" in name) or ("residual" in name):
             return value[:, :3]
 
         return None
