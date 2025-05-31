@@ -1491,11 +1491,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+
+        hidden_states = self.mlp(hidden_states, forward_batch)
         debug_utils.dumper.dump(
             "after_mlp_hidden_states", hidden_states, layer_id=self.layer_id
         )
-
-        hidden_states = self.mlp(hidden_states, forward_batch)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
