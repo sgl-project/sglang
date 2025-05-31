@@ -41,7 +41,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.minicpm4 import rotate_half
 from sglang.srt.utils import add_prefix, logger
 
 
@@ -922,30 +921,6 @@ def compressed_attention(
     return topk_idx
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, positions):
-    """
-    Apply rotary position embeddings to query and key tensors.
-
-    Args:
-        q (torch.Tensor): Query tensor.
-        k (torch.Tensor): Key tensor.
-        cos (torch.Tensor): Cosine values.
-        sin (torch.Tensor): Sine values.
-        positions (torch.Tensor): Position IDs.
-
-    Returns:
-        torch.Tensor: Query and key tensors with rotary position embeddings applied.
-    """
-    assert q.dim() == 3
-    cos = cos.squeeze(1).squeeze(0)
-    sin = sin.squeeze(1).squeeze(0)
-    cos = cos[positions].unsqueeze(1)
-    sin = sin[positions].unsqueeze(1)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
@@ -1165,60 +1140,60 @@ def flash_attn_with_kvcache(
     # print(f"{k.shape=}")
     # print(f"{k_cache.shape=}")
     # FIXME: If key is supplied, it must have seqlen <= the seqlen of the KV cache
-    # out, softmax_lse = flash_attn_gpu.fwd_kvcache(
-    #     q,
-    #     k_cache,
-    #     v_cache,
-    #     k,
-    #     v,
-    #     cache_seqlens,
-    #     rotary_cos,
-    #     rotary_sin,
-    #     cache_batch_idx,
-    #     cache_leftpad,
-    #     block_table,
-    #     alibi_slopes,
-    #     None,
-    #     softmax_scale,
-    #     causal,
-    #     window_size[0],
-    #     window_size[1],
-    #     softcap,
-    #     rotary_interleaved,
-    #     num_splits,
-    #     blockmask,
-    #     block_window_size,
-    # )
-
-    # out = attn.forward(q, k, v, forward_batch)
-
-    from sgl_kernel.flash_attn import (
-        flash_attn_with_kvcache as flash_attn_with_kvcache_kernel,
-    )
-
-    out = flash_attn_with_kvcache_kernel(
+    out, softmax_lse = flash_attn_gpu.fwd_kvcache(
         q,
         k_cache,
         v_cache,
         k,
         v,
-        qv=None,
-        rotary_cos=rotary_cos,
-        rotary_sin=rotary_sin,
-        cache_seqlens=cache_seqlens,
-        cache_batch_idx=cache_batch_idx,
-        cache_leftpad=cache_leftpad,
-        page_table=block_table,
-        # None,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size=window_size,
-        softcap=softcap,
-        rotary_interleaved=rotary_interleaved,
-        num_splits=num_splits,
-        # blockmask=blockmask,
-        # block_window_size=block_window_size,
+        cache_seqlens,
+        rotary_cos,
+        rotary_sin,
+        cache_batch_idx,
+        cache_leftpad,
+        block_table,
+        alibi_slopes,
+        None,
+        softmax_scale,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        rotary_interleaved,
+        num_splits,
+        blockmask,
+        block_window_size,
     )
+
+    # out = attn.forward(q, k, v, forward_batch)
+
+    # from sgl_kernel.flash_attn import (
+    #     flash_attn_with_kvcache as flash_attn_with_kvcache_kernel,
+    # )
+    #
+    # out = flash_attn_with_kvcache_kernel(
+    #     q,
+    #     k_cache,
+    #     v_cache,
+    #     k,
+    #     v,
+    #     qv=None,
+    #     rotary_cos=rotary_cos,
+    #     rotary_sin=rotary_sin,
+    #     cache_seqlens=cache_seqlens,
+    #     cache_batch_idx=cache_batch_idx,
+    #     cache_leftpad=cache_leftpad,
+    #     page_table=block_table,
+    #     # None,
+    #     softmax_scale=softmax_scale,
+    #     causal=causal,
+    #     window_size=window_size,
+    #     softcap=softcap,
+    #     rotary_interleaved=rotary_interleaved,
+    #     num_splits=num_splits,
+    #     # blockmask=blockmask,
+    #     # block_window_size=block_window_size,
+    # )
     return (out, softmax_lse) if return_softmax_lse else out
 
 
@@ -1268,7 +1243,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         self.max_position_embeddings = max_position_embeddings
 
         # TODO: Should be removed once Flash Attention for RoCm is bumped to 2.1.
-        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignement, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
+        # flash_attn<2.1 generates top-left aligned causal mask, while what is needed here is bottom-right alignment, that was made default for flash_attn>=2.1. This attribute is used to handle this difference. Reference: https://github.com/Dao-AILab/flash-attention/releases/tag/v2.1.0.
         # Beware that with flash_attn<2.1, using q_seqlen != k_seqlen (except for the case q_seqlen == 1) produces a wrong mask (top-left).
         self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
 
@@ -1321,8 +1296,19 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         self.hidden_size = hidden_size
         # set rope as fp32 instead of bf16
         scaling_type = self.config.rope_scaling["rope_type"]
+        self.rotary_emb1 = MiniCPMLongRoPE(
+            self.head_dim,
+            max_position_embeddings=self.max_position_embeddings,
+            short_factor=self.config.rope_scaling["short_factor"],
+            long_factor=self.config.rope_scaling["long_factor"],
+            base=self.rope_theta,
+            original_max_position_embeddings=self.config.rope_scaling[
+                "original_max_position_embeddings"
+            ],
+        )
         if scaling_type == "longrope":
             # self.rotary_emb = MiniCPMLongRoPE(
+
             self.rotary_emb = MiniCPMScaledRotaryEmbedding(
                 self.head_dim,
                 self.head_dim,
@@ -1406,9 +1392,9 @@ class MiniCPMSparseFlashAttention2(nn.Module):
 
         # from sgl_kernel.flash_attn import flash_attn_varlen_func
         # topk_attn_output = flash_attn_varlen_func(
-        #     query_layer,
-        #     key_layer,
-        #     value_layer,
+        #     q,
+        #     k,
+        #     v,
         #     cu_seqlens_q,
         #     cu_seqlens_k,
         #     max_seqlen_in_batch_q,
@@ -1429,64 +1415,66 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         self, query_layer, key_layer, value_layer, attention_mask, query_length
     ):
 
-        def unpad_input(
-            hidden_states: torch.Tensor,  # Shape (batch_size, seq_len, *other_dims)
-            attention_mask,
-        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-            """
-            处理一个矩形且完全填充的序列批次的 'unpadding'。
-            这意味着批处理中的每个序列都具有相同的长度 'seq_len'，
-            并且该长度内的所有token都是有效的（没有padding）。
+        # def unpad_input(
+        #     hidden_states: torch.Tensor,  # Shape (batch_size, seq_len, *other_dims)
+        #     attention_mask,
+        # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        #     """
+        #     处理一个矩形且完全填充的序列批次的 'unpadding'。
+        #     这意味着批处理中的每个序列都具有相同的长度 'seq_len'，
+        #     并且该长度内的所有token都是有效的（没有padding）。
+        #
+        #     Args:
+        #         hidden_states (torch.Tensor):
+        #             输入张量，形状为 (batch_size, seq_len, *other_dims)。
+        #
+        #     Returns:
+        #         一个元组: (unpadded_tensor, indices, cu_seqlens, max_seqlen)
+        #             - unpadded_tensor (torch.Tensor):
+        #                 重塑后的 hidden_states。形状为 (batch_size * seq_len, *other_dims)。
+        #             - indices (torch.Tensor):
+        #                 将 unpadded_tensor 中的token映射回概念上的原始扁平化张量的索引。
+        #                 形状为 (batch_size * seq_len,)。
+        #             - cu_seqlens (torch.Tensor):
+        #                 累积序列长度。形状为 (batch_size + 1,)。
+        #             - max_seqlen (int):
+        #                 序列长度，在此即为最大实际序列长度。
+        #     """
+        #     batch_size, seq_len, *other_dims = hidden_states.shape
+        #     device = hidden_states.device
+        #
+        #     # 1. 创建 unpadded_tensor (扁平化)
+        #     # 这是一个 reshape 操作，通常是 CUDA Graph 友好的。
+        #     # 输出形状 (batch_size * seq_len) 仅依赖于输入形状。
+        #     unpadded_tensor = hidden_states.reshape(batch_size * seq_len, *other_dims)
+        #
+        #     # 2. 创建 cu_seqlens
+        #     # 对于一个矩形批次，其中每个序列长度为 'seq_len':
+        #     # cu_seqlens 将是 [0, seq_len, 2*seq_len, ..., batch_size*seq_len]
+        #     # 这可以使用 torch.arange 生成。其形状 (batch_size + 1) 是固定的。
+        #     cu_seqlens = torch.arange(
+        #         0, (batch_size * seq_len) + 1, seq_len, dtype=torch.int32, device=device
+        #     )
+        #
+        #     # 3. 确定 max_seqlen
+        #     # 因为所有序列长度都为 'seq_len' 且完全填充。
+        #     max_seqlen = seq_len  # 这是一个 Python int，对于 CUDA Graph 是可以的。
+        #
+        #     # 4. 创建 indices
+        #     # 这些索引将 unpadded_tensor 中的每个token映射回其在概念上的
+        #     # 原始扁平化张量 (形状 (batch_size * seq_len_dim, *other_dims)) 中的位置。
+        #     # 在这里, seq_len_dim 就是 seq_len。
+        #     # 所以, indices 就是 0, 1, ..., (batch_size * seq_len - 1)。
+        #     # 其形状 (batch_size * seq_len) 仅依赖于输入形状。
+        #     indices = torch.arange(
+        #         batch_size * seq_len, dtype=torch.long, device=device
+        #     )
+        #
+        #     return unpadded_tensor, indices, cu_seqlens, max_seqlen, None
 
-            Args:
-                hidden_states (torch.Tensor):
-                    输入张量，形状为 (batch_size, seq_len, *other_dims)。
-
-            Returns:
-                一个元组: (unpadded_tensor, indices, cu_seqlens, max_seqlen)
-                    - unpadded_tensor (torch.Tensor):
-                        重塑后的 hidden_states。形状为 (batch_size * seq_len, *other_dims)。
-                    - indices (torch.Tensor):
-                        将 unpadded_tensor 中的token映射回概念上的原始扁平化张量的索引。
-                        形状为 (batch_size * seq_len,)。
-                    - cu_seqlens (torch.Tensor):
-                        累积序列长度。形状为 (batch_size + 1,)。
-                    - max_seqlen (int):
-                        序列长度，在此即为最大实际序列长度。
-            """
-            batch_size, seq_len, *other_dims = hidden_states.shape
-            device = hidden_states.device
-
-            # 1. 创建 unpadded_tensor (扁平化)
-            # 这是一个 reshape 操作，通常是 CUDA Graph 友好的。
-            # 输出形状 (batch_size * seq_len) 仅依赖于输入形状。
-            unpadded_tensor = hidden_states.reshape(batch_size * seq_len, *other_dims)
-
-            # 2. 创建 cu_seqlens
-            # 对于一个矩形批次，其中每个序列长度为 'seq_len':
-            # cu_seqlens 将是 [0, seq_len, 2*seq_len, ..., batch_size*seq_len]
-            # 这可以使用 torch.arange 生成。其形状 (batch_size + 1) 是固定的。
-            cu_seqlens = torch.arange(
-                0, (batch_size * seq_len) + 1, seq_len, dtype=torch.int32, device=device
-            )
-
-            # 3. 确定 max_seqlen
-            # 因为所有序列长度都为 'seq_len' 且完全填充。
-            max_seqlen = seq_len  # 这是一个 Python int，对于 CUDA Graph 是可以的。
-
-            # 4. 创建 indices
-            # 这些索引将 unpadded_tensor 中的每个token映射回其在概念上的
-            # 原始扁平化张量 (形状 (batch_size * seq_len_dim, *other_dims)) 中的位置。
-            # 在这里, seq_len_dim 就是 seq_len。
-            # 所以, indices 就是 0, 1, ..., (batch_size * seq_len - 1)。
-            # 其形状 (batch_size * seq_len) 仅依赖于输入形状。
-            indices = torch.arange(
-                batch_size * seq_len, dtype=torch.long, device=device
-            )
-
-            return unpadded_tensor, indices, cu_seqlens, max_seqlen, None
-
-        # from flash_attn.bert_padding import unpad_input  # Import moved here for clarity in diff, ideally top-level
+        from flash_attn.bert_padding import (
+            unpad_input,  # Import moved here for clarity in diff, ideally top-level
+        )
 
         batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
         # Unpad K and V using unpad_input
@@ -1621,7 +1609,6 @@ class MiniCPMSparseFlashAttention2(nn.Module):
                     "key_states_no_rope"
                 ].squeeze(0)
 
-            # print(f"{cu_seq_lens=}")
             cu_seqlens_q, cu_seqlens_k = cu_seq_lens
             max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
             attn_output_unpad = self.nsa_forward(
@@ -1678,13 +1665,13 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         v = v.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = k.shape[-2]
+
         if past_key_value is not None:
             usable_length = past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
             kv_seq_len += usable_length
-        # cos, sin = self.rotary_emb(v.to(torch.float32), seq_len=kv_seq_len)
 
-        # print(f"{cos.shape=}")
-        # print(f"{sin.shape=}")
+        # cos, sin = self.rotary_emb1(v.to(torch.float32), seq_len=kv_seq_len)
+
         # print(f"{q.shape=}")
         # print(f"{k.shape=}")
         # print(f"{v.shape=}")
@@ -1696,12 +1683,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         q = q.reshape(-1, self.num_heads, self.head_dim)
         k = k.reshape(-1, self.num_kv_heads, self.head_dim)
 
-        # q, k = apply_rotary_pos_emb(q, k, cos, sin, positions)
-
-        # print(f"{q.shape=}")
-        # print(f"{k.shape=}")
-
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self.rotary_emb(positions, q, k, kv_seq_len)
 
         q = q.view(q_shape)
         k = k.view(k_shape)
