@@ -395,6 +395,9 @@ class TokenizerManager:
                 self.server_args.disaggregation_bootstrap_port
             )
 
+        self.current_load = 0
+        self.current_load_lock = asyncio.Lock()
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -807,6 +810,7 @@ class TokenizerManager:
         return await self._execute_profile(req)
 
     async def stop_profile(self):
+        self.auto_create_handle_loop()
         req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
         return await self._execute_profile(req)
 
@@ -815,11 +819,6 @@ class TokenizerManager:
         if not result.success:
             raise RuntimeError(result.message)
         return result
-
-    def stop_profile(self):
-        self.auto_create_handle_loop()
-        req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
-        self.send_to_scheduler.send_pyobj(req)
 
     async def start_expert_distribution_record(self):
         self.auto_create_handle_loop()
@@ -897,8 +896,8 @@ class TokenizerManager:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for update weights from distributed"
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         # This means that weight sync
         # cannot run while requests are in progress.
@@ -913,8 +912,8 @@ class TokenizerManager:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for update weights from distributed"
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
 
         # This means that weight sync
         # cannot run while requests are in progress.
@@ -986,6 +985,14 @@ class TokenizerManager:
         )
         # Many DP ranks
         return [res.internal_state for res in responses]
+
+    async def get_load(self) -> dict:
+        # TODO(lsyin): fake load report server
+        if not self.current_load_lock.locked():
+            async with self.current_load_lock:
+                internal_state = await self.get_internal_state()
+                self.current_load = internal_state[0]["load"]
+        return {"load": self.current_load}
 
     async def set_internal_state(
         self, obj: SetInternalStateReq

@@ -47,7 +47,7 @@ from sglang.srt.disaggregation.utils import (
     register_disaggregation_server,
 )
 from sglang.srt.entrypoints.engine import _launch_subprocesses
-from sglang.srt.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -227,6 +227,11 @@ async def get_server_info():
         "internal_states": internal_states,
         "version": __version__,
     }
+
+
+@app.get("/get_load")
+async def get_load():
+    return await _global_state.tokenizer_manager.get_load()
 
 
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
