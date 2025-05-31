@@ -24,7 +24,13 @@ class _Dumper:
         path = (
             self._base_dir / f"sglang_dump_{self._partial_name}_{rank}" / full_filename
         )
-        print(f"Dump {type(value)} to {path}")
+
+        if ('hidden_states' in name) or ('residual' in name):
+            sample_value = value[:, :3]
+        else:
+            sample_value = None
+
+        print(f"Dump {type(value)} to {path} (sample_value={sample_value})")
 
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(value, str(path))
