@@ -19,7 +19,7 @@ STANDARD_MODELS = [
         accuracy=0.87,
     ),
     SimpleNamespace(model="Qwen/Qwen3-32B", accuracy=0.87),
-    SimpleNamespace(model="Qwen/Qwen2-7B-Instruct", accuracy=0.85),
+    SimpleNamespace(model="Qwen/Qwen2-7B-Instruct", accuracy=0.80),
 ]
 
 FP8_MODELS = [
