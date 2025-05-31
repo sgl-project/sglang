@@ -1473,6 +1473,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        debug_utils.dumper.dump(
+            "layer_start_hidden_states", hidden_states, layer_id=self.layer_id
+        )
+        debug_utils.dumper.dump(
+            "layer_start_residual", hidden_states, layer_id=self.layer_id
+        )
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -1735,6 +1741,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        debug_utils.dumper.dump("causal_lm__input_ids", input_ids)
+        debug_utils.dumper.dump("causal_lm__positions", positions)
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
         return self.logits_processor(
