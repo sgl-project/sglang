@@ -3,11 +3,13 @@ import time
 from pathlib import Path
 
 import torch
+from sglang.srt.utils import get_bool_env_var
 
 
 class _Dumper:
     def __init__(self):
         self._base_dir = Path(os.environ.get("SGLANG_DUMPER_DIR", "/tmp"))
+        self._enable_write_file = get_bool_env_var("SGLANG_DUMPER_WRITE_FILE", "1")
         self._partial_name = str(time.time())
         self.forward_pass_id = None
 
@@ -28,14 +30,16 @@ class _Dumper:
         sample_value = self._get_sample_value(name, value)
 
         print(
-            f"[{rank}, {time.time()}] Dump {type(value)} to {path} "
+            f"[{rank}, {time.time()}] {path} "
+            f"type={type(value)} "
             f"shape={value.shape if isinstance(value, torch.Tensor) else None} "
             f"dtype={value.dtype if isinstance(value, torch.Tensor) else None} "
             f"sample_value={sample_value}"
         )
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(value, str(path))
+        if self._enable_write_file:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(value, str(path))
 
     def _get_sample_value(self, name, value):
         if (value is None) or (not isinstance(value, torch.Tensor)):
