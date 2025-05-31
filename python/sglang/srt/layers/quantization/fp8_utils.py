@@ -143,7 +143,9 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _is_hip and use_aiter_moe:
         return aiter_w8a8_block_fp8_linear
-    elif _ENABLE_JIT_DEEPGEMM and not get_bool_env_var("SGLANG_HACK_W8A8_BLOCK_FP8_DISABLE_DEEPGEMM"):
+    elif _ENABLE_JIT_DEEPGEMM and not get_bool_env_var(
+        "SGLANG_HACK_W8A8_BLOCK_FP8_DISABLE_DEEPGEMM"
+    ):
         return deepgemm_w8a8_block_fp8_linear_with_fallback
     else:
         return triton_w8a8_block_fp8_linear

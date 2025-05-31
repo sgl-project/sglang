@@ -233,6 +233,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        raise Exception("should not visit here")
         topk_idx = topk_idx.to(torch.int64)
         if _ENABLE_JIT_DEEPGEMM:
             # TODO hard code 128 block quant,use fp8 communication
@@ -241,6 +242,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return hidden_states, topk_idx, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
+        raise Exception("should not visit here")
         if _ENABLE_JIT_DEEPGEMM:
             (
                 hidden_states,
@@ -407,6 +409,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        raise Exception("should not visit here")
         if _ENABLE_JIT_DEEPGEMM:
             output = hidden_states
         else:
@@ -437,6 +440,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return output, previous_event
 
     def combine_b(self, output, previous_event):
+        raise Exception("should not visit here")
         hidden_states, event = self._combine_core(output, previous_event)
         event.current_stream_wait() if self.async_finish else ()
         self.handle = None
