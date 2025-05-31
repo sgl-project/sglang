@@ -18,7 +18,7 @@ if [ ${ARCH} = "aarch64" ]; then
 else
    LIBCUDA_ARCH=${ARCH}
    if [ ${CUDA_VERSION} = "12.8" ]; then
-      BUILDER_NAME="pytorch/manylinux2_28-builder"
+      BUILDER_NAME="pytorch/manylinux2_27-builder"
    else
       BUILDER_NAME="pytorch/manylinux-builder"
    fi
