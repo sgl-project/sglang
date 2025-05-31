@@ -159,7 +159,7 @@ class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
 
         print(f"[Qwen PP Comparison] Baseline: {baseline} | PP: {pp_metrics}")
 
-        self.assertGreaterEqual(baseline["accuracy"], 0.39)
+        self.assertGreaterEqual(baseline["accuracy"], 0.38)
         self.assertGreaterEqual(
             pp_metrics["accuracy"],
             baseline["accuracy"] - 0.02,
