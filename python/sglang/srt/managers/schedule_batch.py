@@ -60,7 +60,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, get_compiler_backend
+from sglang.srt.utils import flatten_nested_list, get_compiler_backend, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -1257,7 +1257,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         # Write to req_to_token_pool
-        if global_server_args_dict["attention_backend"] != "torch_native":
+        if support_triton(global_server_args_dict.get("attention_backend")):
             # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
 
             write_req_to_token_pool_triton[(bs,)](
