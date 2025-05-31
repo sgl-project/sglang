@@ -46,16 +46,19 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
             max_req_input_len=max_req_input_len,
         )
 
-        images_are_preprocessed = self.mm_inputs_are_preprocessed(base_output.images)
-        if not images_are_preprocessed:
+        combined_mm_item = self.get_combined_mm_item(base_output)
+
+        if combined_mm_item is None:
             ret = self.process_mm_data(
                 input_text=base_output.input_text,
                 images=base_output.images,
             )
+            combined_mm_item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                pixel_values=ret["pixel_values"],
+                image_grid_hws=ret["image_grid_hws"],
+            )
             input_ids = ret["input_ids"].flatten()
-            image_grid_thws = ret["image_grid_hws"]
-            pixel_values = ret["pixel_values"]
-            precomputed_features = None
         else:
             input_ids = self._processor.tokenizer(
                 base_output.input_text,
@@ -63,31 +66,13 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
                 add_special_tokens=True,
             ).input_ids.flatten()
 
-            image_grid_thws = self._extract_processor_features(
-                base_output.images, "image_grid_thws"
-            )
-            precomputed_features = self._extract_processor_features(
-                base_output.images, "precomputed_features"
-            )
-            pixel_values = self._extract_processor_features(
-                base_output.images, "pixel_values"
-            )
-
-        image_offsets = self.get_mm_items_offset(
+        combined_mm_item.image_offsets = self.get_mm_items_offset(
             input_ids=input_ids,
             mm_token_id=self.im_token_id,
         )
 
         return {
             "input_ids": input_ids.tolist(),
-            "mm_items": [
-                MultimodalDataItem(
-                    pixel_values=pixel_values,
-                    image_grid_thws=image_grid_thws,
-                    precomputed_features=precomputed_features,
-                    modality=Modality.IMAGE,
-                    image_offsets=image_offsets,
-                )
-            ],
+            "mm_items": [combined_mm_item],
             "im_token_id": self.im_token_id,
         }

@@ -170,8 +170,6 @@ class BaseMultimodalProcessor(ABC):
     ):
         """Static method that can be pickled for multiprocessing"""
         if isinstance(data, dict):
-            return MultimodalDataItem.from_dict(data)
-        if isinstance(data, MultimodalDataItem):
             return data
         try:
             if is_audio:
@@ -370,29 +368,101 @@ class BaseMultimodalProcessor(ABC):
 
         return list(zip(indices_start.tolist(), indices_end.tolist()))
 
-    def mm_inputs_are_preprocessed(self, mm_inputs: Optional[list]):
-        """Returns true if all images are preprocessed, false if all are not, and error otherwise."""
+    def get_combined_mm_item(
+        self, base_output: BaseMultiModalProcessorOutput
+    ) -> MultimodalDataItem:
+        mm_inputs = base_output.images
         if not mm_inputs:
-            return True
-        ret = any(isinstance(mm_input, MultimodalDataItem) for mm_input in mm_inputs)
-        if ret and not all(
-            isinstance(mm_input, MultimodalDataItem) for mm_input in mm_inputs
-        ):
+            return None
+
+        # ------------------------------------------------------------
+        # 1. Check each input and categorize
+        # ------------------------------------------------------------
+        has_image = False
+        has_pixel_values = False
+        has_precomputed_features = False
+
+        for mm_input in mm_inputs:
+            if isinstance(mm_input, Image.Image):
+                has_image = True
+            elif isinstance(mm_input, dict):
+                if mm_input.get("precomputed_features", None) is not None:
+                    has_precomputed_features = True
+                elif mm_input.get("pixel_values", None) is not None:
+                    has_pixel_values = True
+                else:
+                    raise ValueError(
+                        f"Invalid multimodal input: {mm_input}, expected dict with pixel_values or precomputed_features"
+                    )
+            else:
+                raise ValueError(
+                    f"Invalid multimodal input: {mm_input}, expected Image.Image or dict"
+                )
+
+        # Count how many different formats we found
+        format_count = sum([has_image, has_pixel_values, has_precomputed_features])
+
+        if format_count > 1:
             raise ValueError(
-                "Unsupported: mixture of multimodal inputs where some but not all are preprocessed."
+                "Unsupported: mixture of multimodal input formats. "
+                f"Found formats: image={has_image}, pixel_values={has_pixel_values}, "
+                f"precomputed_features={has_precomputed_features}"
             )
-        return ret
+
+        if has_image:
+            return None
+
+        # ------------------------------------------------------------
+        # 2. Combine the inputs into a single MultimodalDataItem
+        # ------------------------------------------------------------
+
+        if has_precomputed_features:
+            combined_mm_item = MultimodalDataItem(modality=Modality.IMAGE)
+            combined_mm_item.precomputed_features = self._extract_processor_features(
+                mm_inputs, "precomputed_features"
+            )
+        elif has_pixel_values:
+            values = self._extract_processor_features_from_all_attributes(mm_inputs)
+            combined_mm_item = MultimodalDataItem.from_dict(values)
+        else:
+            raise ValueError(f"Invalid multimodal inputs: {mm_inputs}")
+        return combined_mm_item
 
     @staticmethod
     def _extract_processor_features(
-        items: List[Any], attr_name: str
+        items: List[dict], attr_name: str
     ) -> Optional[torch.Tensor]:
         """
         Helper function to concat extracted attributes from processor output.
         """
-        values = [
-            getattr(item, attr_name)
-            for item in items
-            if getattr(item, attr_name) is not None
-        ]
-        return torch.concat(values) if values else None
+        values = [value for item in items if (value := item.get(attr_name)) is not None]
+        return torch.cat(values) if values else None
+
+    # When we assume that all the items have the same attributes
+    def _extract_processor_features_from_all_attributes(
+        self, items: List[dict]
+    ) -> dict:
+        values = {}
+        # Verify all items have the same keys
+        first_keys = set(items[0].keys())
+        for item in items[1:]:
+            if set(item.keys()) != first_keys:
+                raise ValueError(
+                    f"All items must have the same attributes. "
+                    f"First item has {first_keys}, but found {set(item.keys())}"
+                )
+
+        # Process each attribute
+        for k, v in items[0].items():
+            if isinstance(v, list):
+                values[k] = self._extract_processor_features(items, k)
+            else:
+                # Verify all items have the same value for non-list attributes
+                for item in items[1:]:
+                    if item[k] != v:
+                        raise ValueError(
+                            f"All items must have the same value for attribute {k}. "
+                            f"First item has {v}, but found {item[k]}"
+                        )
+                values[k] = v
+        return values

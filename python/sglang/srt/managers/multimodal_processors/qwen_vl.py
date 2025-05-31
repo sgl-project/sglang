@@ -53,6 +53,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
     ):
         if isinstance(image_data, str):
             image_data = [image_data]
+        print(f"DEBUG: image_data: {image_data}")
 
         base_output = self.load_mm_data(
             prompt=input_text,
@@ -63,6 +64,9 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             ),
             max_req_input_len=max_req_input_len,
         )
+        if base_output.images is None:
+            print(f"DEBUG: base_output.images is None")
+            return None
 
         def smart_resize(
             height: int,
@@ -125,48 +129,47 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         async def resize_image_async(image):
             return resize_image(image)
 
-        images_are_preprocessed = self.mm_inputs_are_preprocessed(base_output.images)
-        if base_output.images and not images_are_preprocessed:
+        if base_output.images and isinstance(base_output.images[0], Image.Image):
             resize_tasks = [resize_image_async(image) for image in base_output.images]
             base_output.images = await asyncio.gather(*resize_tasks)
 
-        ret = self.process_mm_data(
-            input_text=base_output.input_text,
-            images=None if images_are_preprocessed else base_output.images,
-        )
-        input_ids = ret["input_ids"].flatten().tolist()
-        image_offsets = self.get_mm_items_offset(
-            input_ids=ret["input_ids"].flatten(), mm_token_id=self.image_token_id
-        )
-        image_grid_thw = None
         video_grid_thw = None  # TODO
-        items = []
-
         if base_output.images:
-            if images_are_preprocessed:
-                image_grid_thw = self._extract_processor_features(
-                    base_output.images, "image_grid_thws"
-                )
-                precomputed_features = self._extract_processor_features(
-                    base_output.images, "precomputed_features"
-                )
-                pixel_values = self._extract_processor_features(
-                    base_output.images, "pixel_values"
-                )
-            else:
-                image_grid_thw = ret["image_grid_thw"]
-                pixel_values = ret["pixel_values"]
-                precomputed_features = None
-            items += [
-                MultimodalDataItem(
-                    pixel_values=pixel_values,
-                    image_grid_thws=image_grid_thw,
-                    video_grid_thws=video_grid_thw,
-                    precomputed_features=precomputed_features,
-                    image_offsets=image_offsets,
-                    modality=Modality.IMAGE,
-                )
-            ]
+            print(f"DEBUG: base_output.images: {base_output.images}")
+            print(f"DEBUG: base_output.images[0]: {base_output.images[0]}")
+
+        combined_mm_item = self.get_combined_mm_item(base_output)
+
+        if (
+            combined_mm_item is None
+        ):  # if the images are not preprocessed, we need to process them
+            if not base_output.images:
+                print(f"DEBUG: No images to process")
+                return None
+
+            ret = self.process_mm_data(
+                input_text=base_output.input_text,
+                images=base_output.images,
+            )
+            combined_mm_item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                pixel_values=ret["pixel_values"],
+                image_grid_thws=ret["image_grid_thw"],
+            )
+            input_ids = ret["input_ids"].flatten()
+            second_per_grid_ts = ret.get("second_per_grid_ts", None)
+        else:
+            input_ids = self._processor.tokenizer(
+                base_output.input_text,
+                return_tensors="pt",
+                add_special_tokens=True,
+            ).input_ids.flatten()
+            second_per_grid_ts = getattr(combined_mm_item, "second_per_grid_ts", None)
+
+        combined_mm_item.image_offsets = self.get_mm_items_offset(
+            input_ids=input_ids,
+            mm_token_id=self.image_token_id,
+        )
 
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
@@ -177,16 +180,16 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             tokens_per_second=getattr(
                 self.hf_config.vision_config, "tokens_per_second", None
             ),
-            input_ids=torch.tensor(input_ids).unsqueeze(0),
-            image_grid_thw=image_grid_thw,
+            input_ids=input_ids.unsqueeze(0),
+            image_grid_thw=combined_mm_item.image_grid_thws,
             video_grid_thw=video_grid_thw,
-            second_per_grid_ts=ret.get("second_per_grid_ts", None),
+            second_per_grid_ts=second_per_grid_ts,
         )
         mrope_positions = mrope_positions.squeeze(1)
 
         return {
-            "input_ids": input_ids,
-            "mm_items": items,
+            "input_ids": input_ids.tolist(),
+            "mm_items": [combined_mm_item],
             "im_start_id": self.IM_START_TOKEN_ID,
             "im_end_id": self.IM_END_TOKEN_ID,
             "im_token_id": self.image_token_id,

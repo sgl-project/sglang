@@ -196,6 +196,9 @@ class MultimodalDataItem:
     # [num_images, (n, w, h)]
     tgt_size: Tuple[int, int] = None
 
+    # kimi-vl related
+    image_grid_hws: Optional[List[torch.Tensor]] = None
+
     audio_features: Union[torch.Tensor, np.ndarray] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
     audio_offsets: Optional[List[Tuple[int, int]]] = None
