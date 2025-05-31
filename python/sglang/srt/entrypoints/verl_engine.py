@@ -112,6 +112,7 @@ class VerlEngine:
         else:
             output = None
 
+        dist.barrier(group=self._device_mesh_cpu.get_group())
         # Most naive implementation, can extract tensor and send via gloo if too slow
         [output] = broadcast_pyobj(
             data=[output],
@@ -156,6 +157,7 @@ class VerlEngine:
                     load_format=load_format,
                     flush_cache=False,
                 )
+            dist.barrier(group=self._device_mesh_cpu.get_group())
 
         if self._tp_rank == 0:
             self._engine.flush_cache()
@@ -163,10 +165,12 @@ class VerlEngine:
     def release_memory_occupation(self):
         if self._tp_rank == 0:
             self._engine.release_memory_occupation()
+        dist.barrier(group=self._device_mesh_cpu.get_group())
 
     def resume_memory_occupation(self):
         if self._tp_rank == 0:
             self._engine.resume_memory_occupation()
+        dist.barrier(group=self._device_mesh_cpu.get_group())
 
     def shutdown(self):
         if self._engine is not None:
