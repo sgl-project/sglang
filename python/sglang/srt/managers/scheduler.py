@@ -423,7 +423,7 @@ class Scheduler(
         # Init profiler
         self.torch_profiler = None
         self.torch_profiler_output_dir: Optional[str] = None
-        self.torch_profiler_activities: Optional[List[str]] = None
+        self.profiler_activities: Optional[List[str]] = None
         self.profiler_id: Optional[str] = None
         self.profiler_target_forward_ct: Optional[int] = None
         self.profiler_target_prefill_ct: Optional[int] = None
@@ -2168,9 +2168,9 @@ class Scheduler(
             activities = ["CPU", "GPU"]
 
         self.torch_profiler_output_dir = output_dir
-        self.torch_profiler_activities = activities
         self.torch_profiler_with_stack = with_stack
         self.torch_profiler_record_shapes = record_shapes
+        self.profiler_activities = activities
 
         if num_steps:
             self.profile_steps = num_steps
@@ -2190,18 +2190,12 @@ class Scheduler(
     def start_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
-        if self.profiler_activities:
-            return ProfileReqOutput(
-                success=False,
-                message="Profiling is already in progress. Call /stop_profile first.",
-            )
-
         stage_str = f" for {stage.__str__()}" if stage else ""
         logger.info(
             f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir}",
         )
 
-        activities = self.torch_profiler_activities
+        activities = self.profiler_activities
         with_stack = self.torch_profiler_with_stack
         record_shapes = self.torch_profiler_record_shapes
 
@@ -2297,10 +2291,7 @@ class Scheduler(
             self.rpd_profiler = None
             self.rpd_profiler_path = None
 
-        if (
-            self.torch_profiler_activities is not None
-            and "MEM" in self.torch_profiler_activities
-        ):
+        if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
                 self.torch_profiler_output_dir,
                 str(time.time())
