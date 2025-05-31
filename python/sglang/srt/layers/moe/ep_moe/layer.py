@@ -4,6 +4,7 @@ from typing import Callable, List, Optional, Tuple
 import torch
 from torch.nn import Module
 
+from sglang.srt import debug_utils
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -1137,6 +1138,10 @@ class DeepEPMoE(EPMoE):
         assert self.quant_method is not None
         assert self.activation == "silu"
 
+        debug_utils.dumper.dump(
+            "deepepmoe__input_hidden_states", hidden_states_fp8, layer_id=self.layer_id
+        )
+
         # GroupGemm-0
         num_groups, m, k = hidden_states_fp8[0].size()
         n = self.w13_weight.size(1)
@@ -1148,6 +1153,10 @@ class DeepEPMoE(EPMoE):
             hidden_states_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
         )
         dispose_tensor(hidden_states_fp8[0])
+
+        debug_utils.dumper.dump(
+            "deepepmoe__input_gateup_output", gateup_output, layer_id=self.layer_id
+        )
 
         # Act
         down_input = torch.empty(
@@ -1178,6 +1187,10 @@ class DeepEPMoE(EPMoE):
         )
         del gateup_output
 
+        debug_utils.dumper.dump(
+            "deepepmoe__input_down_input", down_input, layer_id=self.layer_id
+        )
+
         # GroupGemm-1
         n = self.w2_weight.size(1)
         down_input_fp8 = (
@@ -1189,6 +1202,10 @@ class DeepEPMoE(EPMoE):
         )
         fp8_m_grouped_gemm_nt_masked(
             down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
+        )
+
+        debug_utils.dumper.dump(
+            "deepepmoe__input_down_output", down_output, layer_id=self.layer_id
         )
 
         return down_output

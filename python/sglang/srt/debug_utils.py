@@ -55,24 +55,10 @@ class _Dumper:
         if value.numel() < 200:
             return value
 
-        FULL_SAMPLE_NAMES = [
-            "topk_idx",
-            "topk_weights",
-            "input_ids",
-            "positions",
+        slices = [
+            slice(0, 5) if dim_size > 200 else slice(None) for dim_size in value.shape
         ]
-        if any(x in name for x in FULL_SAMPLE_NAMES):
-            return value
-
-        PARTIAL_SAMPLE_NAMES = [
-            "hidden_states",
-            "residual",
-            "shared_output",
-        ]
-        if any(x in name for x in PARTIAL_SAMPLE_NAMES):
-            return value[:, :3]
-
-        return None
+        return value[tuple(slices)]
 
 
 dumper = _Dumper()
