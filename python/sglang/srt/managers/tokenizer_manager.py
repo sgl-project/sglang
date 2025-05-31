@@ -566,6 +566,7 @@ class TokenizerManager:
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
                 return_hidden_states=obj.return_hidden_states,
+                dp_rank=obj.dp_rank,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -1146,6 +1147,7 @@ class TokenizerManager:
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
+                "dp_rank": recv_obj.dp_ranks[i] if isinstance(recv_obj, (BatchStrOut, BatchTokenIDOut)) else None,
             }
 
             if getattr(state.obj, "return_logprob", False):

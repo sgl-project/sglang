@@ -461,6 +461,7 @@ class SchedulerOutputProcessorMixin:
         skip_req: Optional[Req] = None,
     ):
         rids = []
+        dp_ranks = []
         finished_reasons: List[BaseFinishReason] = []
 
         decoded_texts = []
@@ -534,6 +535,7 @@ class SchedulerOutputProcessorMixin:
                     req.send_output_token_logprobs_offset
                 )
                 rids.append(req.rid)
+                dp_ranks.append(req.dp_rank)
                 finished_reasons.append(
                     req.finished_reason.to_json() if req.finished_reason else None
                 )
@@ -675,6 +677,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_val,
                     output_token_ids_logprobs_idx,
                     output_hidden_states,
+                    dp_ranks,
                 )
             )
 
