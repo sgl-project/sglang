@@ -27,7 +27,9 @@ class _Dumper:
 
         sample_value = self._get_sample_value(name, value)
 
-        print(f"Dump {type(value)} to {path} (sample_value={sample_value})")
+        print(
+            f"[{rank}, {time.time()}] Dump {type(value)} to {path} (sample_value={sample_value})"
+        )
 
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(value, str(path))
@@ -35,6 +37,9 @@ class _Dumper:
     def _get_sample_value(self, name, value):
         if (value is None) or (not isinstance(value, torch.Tensor)):
             return None
+
+        if "topk_idx" in name:
+            return value
 
         if ("hidden_states" in name) or ("residual" in name):
             return value[:, :3]

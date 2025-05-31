@@ -376,6 +376,15 @@ class DeepseekV2MoE(nn.Module):
             topk_weights = torch.empty(
                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
+        debug_utils.dumper.dump(
+            "mlp_shared_output", shared_output, layer_id=self.layer_id
+        )
+        debug_utils.dumper.dump(
+            "mlp_before_dispatch_hidden_states", hidden_states, layer_id=self.layer_id
+        )
+        debug_utils.dumper.dump(
+            "mlp_before_dispatch_topk_idx", topk_idx, layer_id=self.layer_id
+        )
         if self.ep_size > 1:
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             (
@@ -393,6 +402,12 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights=topk_weights,
                 forward_mode=forward_mode,
             )
+        debug_utils.dumper.dump(
+            "mlp_before_moe_hidden_states", hidden_states, layer_id=self.layer_id
+        )
+        debug_utils.dumper.dump(
+            "mlp_before_moe_topk_idx", topk_idx, layer_id=self.layer_id
+        )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
@@ -404,6 +419,9 @@ class DeepseekV2MoE(nn.Module):
             num_recv_tokens_per_expert=num_recv_tokens_per_expert,
             forward_mode=forward_mode,
         )
+        debug_utils.dumper.dump(
+            "mlp_before_combine_hidden_states", hidden_states, layer_id=self.layer_id
+        )
         if self.ep_size > 1:
             final_hidden_states = self.deepep_dispatcher.combine(
                 hidden_states=final_hidden_states,
@@ -411,6 +429,9 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights=topk_weights,
                 forward_mode=forward_mode,
             )
+        debug_utils.dumper.dump(
+            "mlp_after_combine_hidden_states", hidden_states, layer_id=self.layer_id
+        )
         final_hidden_states *= self.routed_scaling_factor
 
         if shared_output is not None:
@@ -1450,6 +1471,9 @@ class DeepseekV2DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         debug_utils.dumper.dump(
             "layer_start_hidden_states", hidden_states, layer_id=self.layer_id
+        )
+        debug_utils.dumper.dump(
+            "layer_start_residual", residual, layer_id=self.layer_id
         )
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
