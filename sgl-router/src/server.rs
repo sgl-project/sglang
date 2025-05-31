@@ -153,6 +153,17 @@ async fn remove_worker(
     HttpResponse::Ok().body(format!("Successfully removed worker: {}", worker_url))
 }
 
+#[post("/abort_request")]
+async fn abort_request(
+    req: HttpRequest,
+    body: Bytes,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    data.router
+        .route_abort_request(&data.client, &req, &body)
+        .await
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -274,6 +285,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
             .service(add_worker)
             .service(remove_worker)
             .service(list_workers)
+            .service(abort_request)
             // Default handler for unmatched routes.
             .default_service(web::route().to(sink_handler))
     })
