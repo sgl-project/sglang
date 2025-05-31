@@ -57,8 +57,11 @@ CI_MODELS = [
 # the complete set of models to test sglang's generation model
 ALL_MODELS = [
     *CI_MODELS,
+    ModelCase("Qwen/Qwen2.5-14B-Instruct"),
     ModelCase("Qwen/Qwen3-4B"),
     ModelCase("Qwen/Qwen3-14B"),
+    ModelCase("Qwen/Qwen3-32B"),
+    ModelCase("Qwen/Qwen3-30B-A3B"),
     ModelCase("HuggingFaceTB/SmolLM-135M-Instruct", skip_long_prompt=True),
     ModelCase("allenai/OLMo-1B-0724-hf", decode_tolerance=8e-2, skip_long_prompt=True),
     ModelCase(
