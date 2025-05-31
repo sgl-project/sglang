@@ -158,7 +158,7 @@ def run_one_case(
             url, 3, ["CPU", "GPU"], None, None, profile_by_stage
         )
 
-    tic = time.time()
+    tic = time.perf_counter()
     response = requests.post(
         url + "/generate",
         json={
@@ -207,8 +207,8 @@ def run_one_case(
     print(f"output_len: {output_len}")
     print(f"latency: {latency:.2f} s")
     print(f"ttft: {ttft:.2f} s")
-    print(f"Last generation throughput: {last_gen_throughput:.2f} tok/s")
-    print(f"Input throughput: {input_throughput:.2f} tok/s")
+    print(f"last generation throughput: {last_gen_throughput:.2f} tok/s")
+    print(f"input throughput: {input_throughput:.2f} tok/s")
     if output_len != 1:
         print(f"output throughput: {output_throughput:.2f} tok/s")
 
@@ -283,6 +283,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                     input_len_step_percentage=bench_args.input_len_step_percentage,
                     run_name=bench_args.run_name,
                     result_filename=bench_args.result_filename,
+                    tokenizer=tokenizer,
                 )
             )
 
@@ -303,6 +304,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
                                 input_len_step_percentage=bench_args.input_len_step_percentage,
                                 run_name=bench_args.run_name,
                                 result_filename=bench_args.result_filename,
+                                tokenizer=tokenizer,
                                 profile=bench_args.profile,
                                 profile_by_stage=bench_args.profile_by_stage,
                             )[-1],
@@ -321,7 +323,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         return
 
     summary = (
-        f"Input lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
+        f"\nInput lens: {bench_args.input_len}. Output lens: {bench_args.output_len}.\n"
     )
     summary += "| batch size | latency (s) | input throughput (tok/s)  | output throughput (tok/s) | acc length | ITL (ms) | input cost ($/1M) | output cost ($/1M) |"
 
