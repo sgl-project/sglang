@@ -1534,6 +1534,9 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 ZMQ_TCP_PORT_DELTA = 233
 
 
+dp_controller_zmq_ports: dict[int, int] = {}
+
+
 @dataclasses.dataclass
 class PortArgs:
     # The ipc filename for tokenizer to receive inputs from detokenizer (zmq)
@@ -1548,6 +1551,11 @@ class PortArgs:
 
     # The ipc filename for rpc call between Engine and Scheduler
     rpc_ipc_name: str
+
+    @staticmethod
+    def register_dp_controller_to_attn_tp_rk0_port(ports: dict[int, int]):
+        global dp_controller_zmq_ports
+        dp_controller_zmq_ports = ports
 
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
@@ -1590,7 +1598,7 @@ class PortArgs:
                     port_base + 3
                 )  # TokenizerManager to DataParallelController
             else:
-                scheduler_input_port = port_base + 3 + 1 + dp_rank
+                scheduler_input_port = dp_controller_zmq_ports[dp_rank]
 
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
