@@ -67,9 +67,9 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
 )
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+from sglang.srt.layers.quantization.ptpc_fp8 import PTPCFp8Config
+from sglang.srt.layers.quantization.ptpc_int8 import PTPCInt8Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
-from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
-from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
 # Base quantization methods that don't depend on vllm
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
@@ -77,8 +77,8 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "blockwise_int8": BlockInt8Config,
     "modelopt": ModelOptFp8Config,
     "modelopt_fp4": ModelOptFp4Config,
-    "w8a8_int8": W8A8Int8Config,
-    "w8a8_fp8": W8A8Fp8Config,
+    "w8a8_int8": PTPCInt8Config,
+    "w8a8_fp8": PTPCFp8Config,
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
     "qoq": QoQConfig,
