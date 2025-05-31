@@ -56,12 +56,25 @@ class MultimodalSpecialTokens:
     video_token_regex: Optional[re.Pattern] = None
     audio_token_regex: Optional[re.Pattern] = None
 
-    def __post_init__(self):
-        if self.image_token_regex is None and self.image_token is not None:
+    def compile_regex(self):
+        # TODO: move convert_to_strs to here, before compiling regex
+        if (
+            self.image_token_regex is None
+            and self.image_token is not None
+            and isinstance(self.image_token, str)
+        ):
             self.image_token_regex = re.compile(re.escape(self.image_token))
-        if self.video_token_regex is None and self.video_token is not None:
+        if (
+            self.video_token_regex is None
+            and self.video_token is not None
+            and isinstance(self.video_token, str)
+        ):
             self.video_token_regex = re.compile(re.escape(self.video_token))
-        if self.audio_token_regex is None and self.audio_token is not None:
+        if (
+            self.audio_token_regex is None
+            and self.audio_token is not None
+            and isinstance(self.audio_token, str)
+        ):
             self.audio_token_regex = re.compile(re.escape(self.audio_token))
 
     def collect(self) -> re.Pattern:
@@ -209,34 +222,37 @@ class BaseMultimodalProcessor(ABC):
         # Submit all tasks
         futures = []
         task_info = []
-        image_index, audio_index = 0, 0
+        image_iter, audio_iter = None, None
+        if isinstance(image_data, list):
+            image_iter = iter(image_data)
+        if isinstance(audio_data, list):
+            audio_iter = iter(audio_data)
 
         for text_part in text_parts:
             if (
                 multimodal_tokens.image_token_regex
                 and multimodal_tokens.image_token_regex.match(text_part)
             ):
-                data = image_data[image_index]
+                assert image_iter
+                data = next(image_iter)
                 is_video = isinstance(data, str) and data.startswith("video:")
-                estimated_frames = estimated_frames_list[image_index]
-                frame_count_limit = max(1, int(estimated_frames * scaling_factor))
                 futures.append(
                     self.io_executor.submit(
                         BaseMultimodalProcessor._load_single_item,
                         data,
                         is_video,
                         False,
-                        frame_count_limit,
+                        None,
                         discard_alpha_channel,
                     )
                 )
-                task_info.append((Modality.IMAGE, data, frame_count_limit))
-                image_index += 1
+                task_info.append((Modality.IMAGE, data, None))
             elif (
                 multimodal_tokens.audio_token_regex
                 and multimodal_tokens.audio_token_regex.match(text_part)
             ):
-                data = audio_data[audio_index]
+                assert audio_iter
+                data = next(audio_iter)
                 futures.append(
                     self.io_executor.submit(
                         BaseMultimodalProcessor._load_single_item,
@@ -248,7 +264,6 @@ class BaseMultimodalProcessor(ABC):
                     )
                 )
                 task_info.append((Modality.AUDIO, data, None))
-                audio_index += 1
 
         return futures, task_info
 
@@ -277,6 +292,8 @@ class BaseMultimodalProcessor(ABC):
             image_data = []
 
         multimodal_tokens.convert_to_strs(self._processor)
+        # TODO: remove this
+        multimodal_tokens.compile_regex()
         multimodal_tokens_pattern = multimodal_tokens.collect()
 
         if isinstance(prompt, list) and return_text:
@@ -354,6 +371,8 @@ class BaseMultimodalProcessor(ABC):
             mm_token_id = 3
             return result = [(2,4),(6,7)]
         """
+        assert isinstance(mm_token_id, int), type(mm_token_id)
+        assert isinstance(input_ids, torch.Tensor), type(input_ids)
         mask = input_ids == mm_token_id
 
         start_positions = (mask & ~torch.roll(mask, 1)).nonzero(as_tuple=True)[0]

@@ -566,9 +566,9 @@ def generate_chat_conv(
                     image_token = conv.image_token
                 else:
                     image_token = (
-                        conv.image_token + "\n"
-                        if conv.name != "qwen2-vl"
-                        else conv.image_token
+                        conv.image_token
+                        if "qwen2" in conv.name
+                        else conv.image_token + "\n"
                     )
                 add_token_as_needed: bool = (
                     conv.name in _MODELS_REQUIRING_MODALITY_SUPPLEMENT
@@ -788,6 +788,22 @@ register_conv_template(
     )
 )
 
+# Reference: https://huggingface.co/docs/transformers/main/model_doc/qwen2_vl#usage-example
+register_conv_template(
+    Conversation(
+        name="qwen2-5-o",
+        system_message="You are a helpful assistant.",
+        system_template="<|im_start|>system\n{system_message}",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<|im_end|>"],
+        image_token="<|vision_bos|><|IMAGE|><|vision_eos|>",
+        # video_token="<|vision_bos|><|VIDEO|><|vision_eos|>",
+        audio_token="<|audio_bos|><|AUDIO|><|audio_eos|>",
+    )
+)
+
 register_conv_template(
     Conversation(
         name="deepseek-vl2",
@@ -948,6 +964,8 @@ def match_qwen_chat_ml(model_path: str):
         return "gme-qwen2-vl"
     if re.search(r"qwen.*vl", model_path, re.IGNORECASE):
         return "qwen2-vl"
+    if re.search(r"qwen2.5.*omni.*", model_path, re.IGNORECASE):
+        return "qwen2-5-o"
     if re.search(
         r"llava-v1\.6-34b|llava-v1\.6-yi-34b|llava-next-video-34b|llava-onevision-qwen2",
         model_path,
