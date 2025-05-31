@@ -1252,4 +1252,18 @@ def _copied_get_tma_aligned_size(x: int, element_size: int) -> int:
     tma_alignment_bytes = 16
     assert tma_alignment_bytes % element_size == 0
     alignment = tma_alignment_bytes // element_size
-    return ceil_div(x, alignment) * alignment
+    return _copied_ceil_div(x, alignment) * alignment
+
+
+def _copied_ceil_div(x: int, y: int) -> int:
+    """
+    Perform ceiling division of two integers.
+
+    Args:
+        x: the dividend.
+        y: the divisor.
+
+    Returns:
+        The result of the ceiling division.
+    """
+    return (x + y - 1) // y
