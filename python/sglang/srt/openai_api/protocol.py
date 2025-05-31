@@ -490,6 +490,7 @@ class EmbeddingResponse(BaseModel):
     object: str = "list"
     usage: Optional[UsageInfo] = None
 
+
 class RerankResponse(BaseModel):
     score: float
     document: str
