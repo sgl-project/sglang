@@ -26,6 +26,8 @@ def launch_server(args):
     cmd += f"--tp-size {args.tp_size} "
     if args.disable_custom_all_reduce:
         cmd += "--disable-custom-all-reduce"
+    if args.disable_quick_all_reduce:
+        cmd += "--disable-quick-all-reduce"
     print(cmd)
     os.system(cmd)
 
@@ -62,6 +64,12 @@ if __name__ == "__main__":
         "--disable-custom-all-reduce",
         action="store_true",
         help="Disable custom all reduce when device does not support p2p communication",
+    )
+    # disable_quick_all_reduce
+    parser.add_argument(
+        "--disable-quick-all-reduce",
+        action="store_true",
+        help="Disable quick all reduce when device does not support P2P communication or when accuracy needs to be maintained",
     )
     args = parser.parse_args()
 

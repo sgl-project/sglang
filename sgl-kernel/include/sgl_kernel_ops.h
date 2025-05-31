@@ -63,6 +63,15 @@ void register_graph_buffers(
     fptr_t _fa, const std::vector<std::string>& handles, const std::vector<std::vector<int64_t>>& offsets);
 torch::Tensor allocate_meta_buffer(int64_t size);
 torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor& inp);
+
+// ROCM quick allreduce
+fptr_t init_quick_ar(int64_t world_size, int64_t rank);
+torch::Tensor qr_get_comm_handle(fptr_t _fa);
+void qr_set_comm_handles(fptr_t _fa, std::vector<torch::Tensor> const& comm_handles);
+void qr_all_reduce(fptr_t _fa, int64_t profile, torch::Tensor const& inp, torch::Tensor& out);
+void qr_destroy(fptr_t _fa);
+void is_quickreduce_available();
+
 #else
 // custom allreduce
 fptr_t

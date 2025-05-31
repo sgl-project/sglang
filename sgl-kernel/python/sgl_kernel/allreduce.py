@@ -49,6 +49,33 @@ if torch.version.hip is not None:
     def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor:
         return torch.ops.sgl_kernel.get_meta_buffer_ipc_handle.default(inp)
 
+    # ROCM quick allreduce
+    def init_quick_ar(world_size: int, rank: int) -> int:
+        """Initialize the QuickReduce environment and return a Device Comms Handle api."""
+        return torch.ops.sgl_kernel.init_quick_ar.default(world_size, rank)
+
+    def qr_get_comm_handle(fa: int) -> torch.Tensor:
+        """Return a Tensor handle"""
+        return torch.ops.sgl_kernel.qr_get_comm_handle.default(fa)
+
+    def qr_set_comm_handles(fa: int, handles: list[torch.Tensor]) -> None:
+        """Set the communication handle list."""
+        torch.ops.sgl_kernel.qr_set_comm_handles.default(fa, handles)
+
+    def qr_all_reduce(
+        fa: int, profile: int, inp: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """Perform all-reduce across devices with optional profile."""
+        torch.ops.sgl_kernel.qr_all_reduce.default(fa, profile, inp, out)
+
+    def qr_destroy(fa: int) -> None:
+        """Clean up and destroy the Device Comms Handle."""
+        torch.ops.sgl_kernel.qr_destroy.default(fa)
+
+    def is_quickreduce_available() -> None:
+        """Only used to test whether module was properly imported."""
+        torch.ops.sgl_kernel.is_quickreduce_available.default()
+
 else:
 
     def init_custom_ar(
