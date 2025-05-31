@@ -53,6 +53,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
     ):
         if isinstance(image_data, str):
             image_data = [image_data]
+        print(f"DEBUG: image_data: {image_data}")
 
         base_output = self.load_mm_data(
             prompt=input_text,
@@ -63,6 +64,9 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             ),
             max_req_input_len=max_req_input_len,
         )
+        if base_output.images is None:
+            print(f"DEBUG: base_output.images is None")
+            return None
 
         def smart_resize(
             height: int,
@@ -130,12 +134,19 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             base_output.images = await asyncio.gather(*resize_tasks)
 
         video_grid_thw = None  # TODO
+        if base_output.images:
+            print(f"DEBUG: base_output.images: {base_output.images}")
+            print(f"DEBUG: base_output.images[0]: {base_output.images[0]}")
 
         combined_mm_item = self.get_combined_mm_item(base_output)
 
         if (
             combined_mm_item is None
         ):  # if the images are not preprocessed, we need to process them
+            if not base_output.images:
+                print(f"DEBUG: No images to process")
+                return None
+
             ret = self.process_mm_data(
                 input_text=base_output.input_text,
                 images=base_output.images,
