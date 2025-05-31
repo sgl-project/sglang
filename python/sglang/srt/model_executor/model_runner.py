@@ -1025,10 +1025,6 @@ class ModelRunner:
 
             return AiterAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
-            assert self.sliding_window_size is None, (
-                "Window attention is not supported in the triton attention backend. "
-                "Please use `--attention-backend flashinfer`."
-            )
             assert not self.model_config.is_encoder_decoder, (
                 "Cross attention is not supported in the triton attention backend. "
                 "Please use `--attention-backend flashinfer`."
