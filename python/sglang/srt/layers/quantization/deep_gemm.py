@@ -12,22 +12,24 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var, get_device_sm, get_int_env_var, is_cuda
 
 logger = logging.getLogger(__name__)
-_ENABLE_JIT_DEEPGEMM = False
+# _ENABLE_JIT_DEEPGEMM = False
+#
+# try:
+#     import deep_gemm
+#     from deep_gemm import get_num_sms
+#     from deep_gemm.jit.compiler import get_nvcc_compiler
+#     from deep_gemm.jit_kernels.gemm import get_best_configs
+#     from deep_gemm.jit_kernels.runtime import FP8GemmRuntime, GemmType
+#     from deep_gemm.jit_kernels.tuner import jit_tuner
+#
+#     sm_version = get_device_sm()
+#     if sm_version == 90:
+#         if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
+#             _ENABLE_JIT_DEEPGEMM = True
+# except ImportError:
+#     logger.warning("Failed to import deepgemm, disable _ENABLE_JIT_DEEPGEMM.")
 
-try:
-    import deep_gemm
-    from deep_gemm import get_num_sms
-    from deep_gemm.jit.compiler import get_nvcc_compiler
-    from deep_gemm.jit_kernels.gemm import get_best_configs
-    from deep_gemm.jit_kernels.runtime import FP8GemmRuntime, GemmType
-    from deep_gemm.jit_kernels.tuner import jit_tuner
-
-    sm_version = get_device_sm()
-    if sm_version == 90:
-        if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
-            _ENABLE_JIT_DEEPGEMM = True
-except ImportError:
-    logger.warning("Failed to import deepgemm, disable _ENABLE_JIT_DEEPGEMM.")
+_ENABLE_JIT_DEEPGEMM = True
 
 
 def get_enable_jit_deepgemm():
@@ -284,7 +286,6 @@ def _maybe_compile_deep_gemm_one_type_all(
     num_groups: int,
     m_list: Optional[List[int]] = None,
 ) -> None:
-
     global _INITIALIZATION_DICT
     global _BUILTIN_M_LIST
 
