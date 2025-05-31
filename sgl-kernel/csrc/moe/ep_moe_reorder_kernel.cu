@@ -3,6 +3,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include <THC/THCAtomics.cuh>
+#include <flashinfer/vec_dtypes.cuh>
 
 #include "utils.h"
 
@@ -19,7 +20,7 @@ __global__ void ep_pre_reorder_cuda_kernel(
   int token_idx = blockIdx.x;
   int tid = threadIdx.x;
 
-  const float* src_ptr = input_ptr + token_idx * hidden_size;
+  const float* src_ptr = input_ptr + int64_t(token_idx) * hidden_size;
   const int* token_src2dst = src2dst_ptr + token_idx * topk;
   const int* token_topk_ids = topk_ids_ptr + token_idx * topk;
 
@@ -33,10 +34,20 @@ __global__ void ep_pre_reorder_cuda_kernel(
     }
 
     int dst_idx = token_src2dst[k];
-    float* dst_ptr = gateup_input_ptr + dst_idx * hidden_size;
+    float* dst_ptr = gateup_input_ptr + int64_t(dst_idx) * hidden_size;
 
-    for (int i = tid; i < hidden_size; i += blockDim.x) {
-      dst_ptr[i] = src_ptr[i] * scale;
+    constexpr uint32_t vec_size = 16 / sizeof(float);
+    using vec_t = flashinfer::vec_t<float, vec_size>;
+
+    for (int idx = tid; idx < hidden_size / vec_size; idx += blockDim.x) {
+      vec_t input_vec, output_vec;
+      input_vec.cast_load(src_ptr + idx * vec_size);
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        float val = static_cast<float>(input_vec[i]);
+        output_vec[i] = val * scale;
+      }
+      output_vec.cast_store(dst_ptr + idx * vec_size);
     }
   }
 }
