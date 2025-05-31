@@ -55,22 +55,12 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_quant_fp8,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import (
-    DeepEPMode,
-    dispose_tensor,
-    is_cuda,
-    is_hip,
-    set_weight_attrs,
-)
+from sglang.srt.utils import DeepEPMode, dispose_tensor, is_hip, set_weight_attrs
 
 _is_hip = is_hip()
-_is_cuda = is_cuda()
 
 if _is_hip:
     from vllm._custom_ops import scaled_fp8_quant
-
-if _is_cuda:
-    from sgl_kernel import ep_moe_pre_reorder as sgl_ep_moe_pre_reorder
 
 logger = logging.getLogger(__name__)
 
@@ -294,31 +284,19 @@ class EPMoE(torch.nn.Module):
                 self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
 
         # PreReorder
-        if _is_cuda:
-            sgl_ep_moe_pre_reorder(
-                hidden_states,
-                gateup_input,
-                src2dst,
-                topk_ids,
-                self.w13_input_scale,
-                self.start_expert_id,
-                self.end_expert_id,
-                self.top_k,
-            )
-        else:
-            pre_reorder_triton_kernel[(hidden_states.shape[0],)](
-                hidden_states,
-                gateup_input,
-                src2dst,
-                topk_ids,
-                self.w13_input_scale,
-                self.start_expert_id,
-                self.end_expert_id,
-                self.top_k,
-                hidden_states.shape[1],
-                BLOCK_SIZE=512,
-            )
-
+        pre_reorder_triton_kernel[(hidden_states.shape[0],)](
+            hidden_states,
+            gateup_input,
+            src2dst,
+            topk_ids,
+            self.w13_input_scale,
+            self.start_expert_id,
+            self.end_expert_id,
+            self.top_k,
+            hidden_states.shape[1],
+            BLOCK_SIZE=512,
+            use_per_token_if_dynamic=self.use_per_token_if_dynamic,
+        )
         dispose_tensor(hidden_states)
 
         if (

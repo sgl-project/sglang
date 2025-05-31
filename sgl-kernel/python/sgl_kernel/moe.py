@@ -62,7 +62,7 @@ def moe_fused_gate(
     )
 
 
-def moe_pre_reorder(
+def ep_moe_pre_reorder(
     input_tensor,
     gateup_input,
     src2dst,
@@ -72,7 +72,7 @@ def moe_pre_reorder(
     end_expert_id,
     topk,
 ):
-    return torch.ops.sgl_kernel.moe_pre_reorder.default(
+    return torch.ops.sgl_kernel.ep_moe_pre_reorder.default(
         input_tensor,
         gateup_input,
         src2dst,
