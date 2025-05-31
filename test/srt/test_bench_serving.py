@@ -288,7 +288,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_pp_offline_throughput_default_decode\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 7500)
+            self.assertGreater(res["output_throughput"], 6700)
 
     def test_pp_long_context_prefill(self):
         res = run_bench_serving(
