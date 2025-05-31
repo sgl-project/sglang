@@ -1182,9 +1182,7 @@ class DeepEPMoE(EPMoE):
         n = self.w2_weight.size(1)
         down_input_fp8 = (
             down_input,
-            # NOTE MODIFIED
-            # get_col_major_tma_aligned_tensor(down_input_scale),
-            down_input_scale,
+            _copied_get_col_major_tma_aligned_tensor(down_input_scale),
         )
         down_output = torch.empty(
             (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16
@@ -1202,3 +1200,56 @@ def get_moe_impl_class():
     if global_server_args_dict["enable_ep_moe"]:
         return EPMoE
     return FusedMoE
+
+
+def _copied_get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
+    """
+    Returns TMA-aligned transposed format of the input tensor. `torch.transpose` will be called if necessary.
+    If the input tensor is already column-major layout and 16-byte aligned along the M axis
+        (thus meets the requirement of LHS scaling tensor in DeepGEMM), this function will do nothing.
+
+    Arguments:
+        x: usually the LHS scaling tensor in GEMM.
+
+    Returns:
+        The LHS scaling tensor of TMA-aligned transposed format.
+    """
+    # NOTES: for the extreme performance, you may rewrite/fuse this function in CUDA
+    assert x.dim() in (2, 3)
+    remove_dim = False
+    if x.dim() == 2:
+        x, remove_dim = x.unsqueeze(0), True
+
+    b, m, n = x.shape
+    aligned_m = _copied_get_tma_aligned_size(m, x.element_size())
+
+    # The last kernel gives a column-major TMA aligned layout
+    if x.stride(0) == aligned_m * n and x.stride(1) == 1 and x.stride(2) == aligned_m:
+        return x.squeeze(0) if remove_dim else x
+
+    # Normal layout requires transposing
+    aligned_x = torch.transpose(
+        torch.empty((b, n, aligned_m), device=x.device, dtype=x.dtype), 1, 2
+    )
+    aligned_x[:, :m, :] = x
+    aligned_x = aligned_x[:, :m, :]
+    return aligned_x.squeeze(0) if remove_dim else aligned_x
+
+
+def _copied_get_tma_aligned_size(x: int, element_size: int) -> int:
+    """
+    Global memory address of TMA must be 16-byte aligned.
+    Since we use column-major layout for the LHS scaling tensor,
+        the M-axis of the LHS scaling tensor needs to be padded to a multiple of 16 bytes.
+
+    Arguments:
+        x: original M-axis shape of the LHS scaling tensor.
+        element_size: element size of the LHS scaling tensor.
+
+    Returns:
+        M-axis shape of the LHS scaling tensor after padding.
+    """
+    tma_alignment_bytes = 16
+    assert tma_alignment_bytes % element_size == 0
+    alignment = tma_alignment_bytes // element_size
+    return ceil_div(x, alignment) * alignment
