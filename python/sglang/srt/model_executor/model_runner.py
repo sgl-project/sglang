@@ -118,7 +118,7 @@ from sglang.srt.utils import (
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
-    set_cuda_arch,
+    set_cuda_arch, print_warning_once,
 )
 
 _is_hip = is_hip()
@@ -216,7 +216,7 @@ class ModelRunner:
         )
 
         # CPU offload
-        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
+        set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024 ** 3))
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
@@ -1308,8 +1308,8 @@ class ModelRunner:
             return FlashMLABackend(self)
         elif self.server_args.attention_backend == "fa3":
             assert (
-                torch.cuda.get_device_capability()[0] == 8 and not self.use_mla_backend
-            ) or torch.cuda.get_device_capability()[0] == 9, (
+                       torch.cuda.get_device_capability()[0] == 8 and not self.use_mla_backend
+                   ) or torch.cuda.get_device_capability()[0] == 9, (
                 "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
                 "Please use `--attention-backend flashinfer`."
             )
@@ -1347,7 +1347,7 @@ class ModelRunner:
             key = "model.layers." + str(i) + ".self_attn" + selected_channel
             self.sorted_channels.append(
                 torch.tensor(channel_config[key])[
-                    :, : self.server_args.ds_heavy_channel_num
+                :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
                 .cuda()

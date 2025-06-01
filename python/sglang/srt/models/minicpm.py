@@ -39,9 +39,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, logger
+from sglang.srt.utils import add_prefix, logger, print_warning_once
 
 
 class MiniCPMMLP(nn.Module):
@@ -572,8 +573,6 @@ class DynamicCacheQKV(DynamicCache):
         Parameters:
             key_states (`torch.Tensor`):
                 The new key states to cache.
-            value_states (`torch.Tensor`):
-                The new value states to cache.
             layer_idx (`int`):
                 The index of the layer to cache the states for.
             cache_kwargs (`Dict[str, Any]`, `optional`):
@@ -612,8 +611,6 @@ class DynamicCacheQKV(DynamicCache):
         Parameters:
             key_states (`torch.Tensor`):
                 The new key states to cache.
-            value_states (`torch.Tensor`):
-                The new value states to cache.
             layer_idx (`int`):
                 The index of the layer to cache the states for.
             cache_kwargs (`Dict[str, Any]`, `optional`):
@@ -1107,10 +1104,10 @@ def flash_attn_with_kvcache(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     # if cache_seqlens is not None and isinstance(cache_seqlens, int):
-        # cache_seqlens = torch.full(
-        #     (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
-        # )
-        # cache_seqlens = maybe_contiguous(cache_seqlens)
+    # cache_seqlens = torch.full(
+    #     (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+    # )
+    # cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
     if topk_idx is not None:
@@ -1123,11 +1120,7 @@ def flash_attn_with_kvcache(
         seq_len = forward_batch.seq_lens_sum
         blockmask, _ = cuda_topk_to_uint64(
             topk_idx,
-            (
-                seq_len
-                if block_table is None
-                else block_table.shape[1] * seq_len
-            ),
+            (seq_len if block_table is None else block_table.shape[1] * seq_len),
             64,
         )  # N_BLOCK_DIM=64
     else:
@@ -1218,8 +1211,11 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         prefix: str = "",
         **kwargs,
     ):
+        if global_server_args_dict["attention_backend"] != "fa3":
+            print_warning_once(
+                global_server_args_dict["attention_backend"] + " is not available for MiniCPM-4, defaults to fa3")
+            global_server_args_dict["attention_backend"] = "fa3"
         super().__init__()
-
         self.config = config
         self.layer_idx = layer_id
         tp_size = get_tensor_model_parallel_world_size()
@@ -1331,6 +1327,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         no_rope_param=None,
         past_key_value=None,
     ):
+        assert forward_batch.forward_mode.is_extend()
         stage1_k = k if no_rope_param is None else no_rope_param["key_states_no_rope"]
         compressed_k, compressed_cu_seqlens = self.compress_k(stage1_k, cu_seqlens_k)
         compressed_v = compressed_k.clone()
@@ -1375,42 +1372,6 @@ class MiniCPMSparseFlashAttention2(nn.Module):
             block_window_size=self.window_size // self.block_size,
             topk_idx=topk_idx,
         )
-        # topk_attn_output = flash_attn_varlen_func(
-        #     q,
-        #     k,
-        #     v,
-        #     cu_seqlens_q,
-        #     cu_seqlens_k,
-        #     max_seqlen_in_batch_q,
-        #     max_seqlen_in_batch_k,
-        #     dropout_p=0.0,
-        #     deterministic=False,
-        #     softmax_scale=None,
-        #     causal=True,
-        #     return_attn_probs=False,
-        #     block_window_size=self.window_size // self.block_size,
-        #     topk_idx=topk_idx,
-        # )
-
-        # from sgl_kernel.flash_attn import flash_attn_varlen_func
-        # topk_attn_output = flash_attn_varlen_func(
-        #     q,
-        #     k,
-        #     v,
-        #     cu_seqlens_q,
-        #     cu_seqlens_k,
-        #     max_seqlen_in_batch_q,
-        #     max_seqlen_in_batch_k,
-        #     # dropout_p=0.0,
-        #     # deterministic=False,
-        #     softmax_scale=None,
-        #     causal=True,
-        #     # return_attn_probs=False,
-        #     # TODO: we dont have these two params in sgl-kernel
-        #     # block_window_size=self.window_size // self.block_size,
-        #     # topk_idx=topk_idx
-        # )
-
         return topk_attn_output
 
     def _upad_input(
@@ -2085,7 +2046,6 @@ class MiniCPMModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        # print(f"{input_ids.tolist()=}")
         # FIXME
         if forward_batch.forward_mode.is_extend():
             self.past_key_values = DynamicCacheQKV()
@@ -2098,7 +2058,8 @@ class MiniCPMModel(nn.Module):
 
         current_total_tokens = hidden_states.shape[0]
         attention_mask = torch.ones(
-            (1, 1, 1, current_total_tokens),
+            (1, current_total_tokens),
+            # (1, 1, 1, current_total_tokens),
             dtype=torch.long,
             device=hidden_states.device,
         )
