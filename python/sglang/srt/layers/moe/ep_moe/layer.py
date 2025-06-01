@@ -62,7 +62,13 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import DeepEPMode, dispose_tensor, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    DeepEPMode,
+    dispose_tensor,
+    get_bool_env_var,
+    is_hip,
+    set_weight_attrs,
+)
 
 _is_hip = is_hip()
 
@@ -1150,6 +1156,13 @@ class DeepEPMoE(EPMoE):
     ):
         assert self.quant_method is not None
         assert self.activation == "silu"
+
+        debug_utils.dumper.dump(
+            "deepepmoe__hidden_states_raw", hidden_states_fp8, layer_id=self.layer_id
+        )
+
+        if get_bool_env_var("SGLANG_HACK_DEEPEPMOE_EXTRA_NEWVER_QUANT_INPUT", "false"):
+            hidden_states_fp8 = TODO
 
         debug_utils.dumper.dump(
             "deepepmoe__hidden_states_fp8", hidden_states_fp8, layer_id=self.layer_id
