@@ -1,4 +1,5 @@
 import torch
+from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from tqdm import tqdm
 
 
@@ -28,7 +29,7 @@ def hack_requant_moe_weight(that, weights):
                 name_weight_scale_inv = partial_name + ".weight_scale_inv"
 
                 weight_new, weight_scale_inv_new = \
-                    _requant_moe_weight(weights_dict[name_weight], weights_dict[name_weight_scale_inv])
+                    _requant_moe_weight(that, weights_dict[name_weight], weights_dict[name_weight_scale_inv])
 
                 weights_dict[name_weight] = weight_new
                 weights_dict[name_weight_scale_inv] = weight_scale_inv_new
@@ -36,5 +37,19 @@ def hack_requant_moe_weight(that, weights):
     return list(weights_dict.items())
 
 
-def _requant_moe_weight(weight: torch.Tensor, weight_scale_inv: torch.Tensor):
+def _requant_moe_weight(that, weight: torch.Tensor, weight_scale_inv: torch.Tensor):
+    model_dtype = torch.get_default_dtype()
+    weight_block_size = that.quant_config.weight_block_size
+
+    assert model_dtype == torch.bfloat16
+    assert weight_block_size == [128, 128]
+
+    weight_dequant = block_quant_dequant(
+        weight,
+        # TODO does "inv" have trouble?
+        weight_scale_inv,
+        weight_block_size,
+        model_dtype,
+    )
+
     return TODO, TODO
