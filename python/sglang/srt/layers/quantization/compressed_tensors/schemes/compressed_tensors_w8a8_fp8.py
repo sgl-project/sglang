@@ -17,7 +17,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
-    apply_fp8_linear,
+    dispatch_fp8_linear,
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
@@ -30,6 +30,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
     def __init__(self, strategy: str, is_static_input_scheme: bool):
         self.strategy = strategy
         self.is_static_input_scheme = is_static_input_scheme
+        self.fp8_linear = dispatch_fp8_linear(compressed_tensor_quant=True)
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -149,12 +150,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return apply_fp8_linear(
+        return self.fp8_linear(
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale,
             input_scale=layer.input_scale,
             bias=bias,
             use_per_token_if_dynamic=True,
-            compressed_tensor_quant=True,
         )
