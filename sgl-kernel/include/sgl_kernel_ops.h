@@ -248,7 +248,8 @@ void ep_moe_pre_reorder(
     torch::Tensor a1_scales,
     int64_t start_expert_id,
     int64_t end_expert_id,
-    int64_t topk);
+    int64_t topk,
+    bool use_per_token_if_dynamic);
 
 /*
  * From csrc/speculative

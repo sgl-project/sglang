@@ -16,7 +16,8 @@ __global__ void ep_pre_reorder_cuda_kernel(
     int start_expert_id,
     int end_expert_id,
     int topk,
-    int hidden_size) {
+    int hidden_size,
+    bool use_per_token_if_dynamic) {
   int token_idx = blockIdx.x;
   int tid = threadIdx.x;
 
@@ -29,8 +30,15 @@ __global__ void ep_pre_reorder_cuda_kernel(
     if (expert_id < start_expert_id || expert_id > end_expert_id) continue;
 
     float scale = 1.0f;
+
+    if (a1_scales_ptr != nullptr and use_per_token_if_dynamic) {
+      scale = 1.0f / a1_scales_ptr[token_idx];
+    }
+
     if (a1_scales_ptr != nullptr) {
-      scale = 1.0f / a1_scales_ptr[expert_id - start_expert_id];
+      if (!use_per_token_if_dynamic) {
+        scale = 1.0f / a1_scales_ptr[expert_id - start_expert_id];
+      }
     }
 
     int dst_idx = token_src2dst[k];
@@ -60,7 +68,8 @@ void ep_moe_pre_reorder(
     torch::Tensor a1_scales,
     int64_t start_expert_id,
     int64_t end_expert_id,
-    int64_t topk) {
+    int64_t topk,
+    bool use_per_token_if_dynamic) {
   int total_blocks = input.size(0);
   int block_size = 512;
   dim3 grid(total_blocks);
@@ -75,5 +84,6 @@ void ep_moe_pre_reorder(
       start_expert_id,
       end_expert_id,
       topk,
-      hidden_size);
+      hidden_size,
+      use_per_token_if_dynamic);
 }

@@ -71,6 +71,7 @@ def ep_moe_pre_reorder(
     start_expert_id,
     end_expert_id,
     topk,
+    use_per_token_if_dynamic,
 ):
     return torch.ops.sgl_kernel.ep_moe_pre_reorder.default(
         input_tensor,
@@ -81,6 +82,7 @@ def ep_moe_pre_reorder(
         start_expert_id,
         end_expert_id,
         topk,
+        use_per_token_if_dynamic,
     )
 
 
