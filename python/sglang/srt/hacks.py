@@ -1,12 +1,13 @@
 from typing import Tuple
 
 import torch
-from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from tqdm import trange
+
+from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 
 
 def hack_requant_moe_weight(that, weights):
-    print('hi hack_requant_moe_weight')
+    print("hi hack_requant_moe_weight")
 
     weights_dict = dict(list(weights))
     del weights
@@ -24,14 +25,19 @@ def hack_requant_moe_weight(that, weights):
     ]
 
     for moe_layer in moe_layers:
-        for expert_index in trange(that.config.n_routed_experts, desc=f"layer={moe_layer}"):
+        for expert_index in trange(
+            that.config.n_routed_experts, desc=f"layer={moe_layer}"
+        ):
             for module_name in module_names:
-                partial_name = f"model.layers.{moe_layer}.mlp.experts.{expert_index}.{module_name}"
+                partial_name = (
+                    f"model.layers.{moe_layer}.mlp.experts.{expert_index}.{module_name}"
+                )
                 name_weight = partial_name + ".weight"
                 name_weight_scale_inv = partial_name + ".weight_scale_inv"
 
-                weight_new, weight_scale_inv_new = \
-                    _requant_moe_weight(that, weights_dict[name_weight], weights_dict[name_weight_scale_inv])
+                weight_new, weight_scale_inv_new = _requant_moe_weight(
+                    that, weights_dict[name_weight], weights_dict[name_weight_scale_inv]
+                )
 
                 weights_dict[name_weight] = weight_new
                 weights_dict[name_weight_scale_inv] = weight_scale_inv_new
@@ -65,13 +71,17 @@ def ceil_to_ue8m0(x: torch.Tensor):
 def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
-    x_padded = torch.zeros((align(m, 128), align(n, 128)), dtype=x.dtype, device=x.device)
+    x_padded = torch.zeros(
+        (align(m, 128), align(n, 128)), dtype=x.dtype, device=x.device
+    )
     x_padded[:m, :n] = x
     x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
     x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
     sf = ceil_to_ue8m0(x_amax / 448.0)
     x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
-    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(x_view.size(0), x_view.size(2))
+    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(
+        x_view.size(0), x_view.size(2)
+    )
 
 
 def ceil_div(x: int, y: int) -> int:
