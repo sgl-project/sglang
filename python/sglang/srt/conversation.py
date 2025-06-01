@@ -680,8 +680,8 @@ register_conv_template(
 register_conv_template(
     Conversation(
         name="phi-4-mm",
-        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
-        system_template="<|system|>{system_message}<|end|>",
+        system_message="",
+        system_template="{system_message}",
         roles=("<|user|>", "<|assistant|>"),
         sep_style=SeparatorStyle.NO_COLON_SINGLE,
         sep="<|end|>",
