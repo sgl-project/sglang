@@ -31,10 +31,10 @@ class BaseMultiModalProcessorOutput:
     input_text: str
 
     # frames loaded from image and video, in given order
-    images: Optional[list[Union[Image.Image, MultimodalDataItem]]] = None
+    images: Optional[list[Union[Image.Image, dict]]] = None
 
     # audios
-    audios: Optional[list[Union[np.ndarray, MultimodalDataItem]]] = None
+    audios: Optional[list[Union[np.ndarray, dict]]] = None
 
     def normalize(self):
         for field_name in ["images", "audios"]:
@@ -424,7 +424,7 @@ class BaseMultimodalProcessor(ABC):
         Handles all three input formats at the same abstraction level.
 
         Returns:
-            Combined MultimodalDataItem or None if no images
+            Combined MultimodalDataItem
         """
 
         def tokenize_text(input_text: str) -> torch.Tensor:
