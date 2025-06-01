@@ -100,7 +100,8 @@ def _requant_grouped_moe_weight(that, weight: torch.Tensor, weight_scale_inv: to
     out_w_flat, out_s_flat = per_block_cast_to_fp8(weight_dequant_flat)
 
     def _unflatten(x):
-        return einops.rearrange(x, '(num_group n) whatever -> num_group n whatever', num_group=num_group, n=n)
+        return einops.rearrange(x, '(num_group n_div_128) whatever_div_128 -> num_group n_div_128 whatever_div_128',
+                                num_group=num_group)
 
     return _unflatten(out_w_flat), _unflatten(out_s_flat)
 
