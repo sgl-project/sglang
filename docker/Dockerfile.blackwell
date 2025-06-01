@@ -4,9 +4,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /sgl-workspace
 
-RUN pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+RUN pip3 install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128
 
-RUN pip3 install https://github.com/sgl-project/whl/releases/download/v0.1.4/sgl_kernel-0.1.4+cu128-cp39-abi3-manylinux2014_x86_64.whl \
+RUN pip3 install https://github.com/sgl-project/whl/releases/download/v0.1.5/sgl_kernel-0.1.5+cu128-cp39-abi3-manylinux2014_x86_64.whl \
     && pip3 install setuptools==75.0.0 wheel==0.41.0 scikit-build-core
 
 RUN git clone --depth=1 https://github.com/sgl-project/sglang.git \
