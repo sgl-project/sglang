@@ -240,6 +240,37 @@ void prepare_moe_input(
     const int64_t n,
     const int64_t k);
 
+void prepare_moe_input_v2(
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_offsets,
+    torch::Tensor& blockscale_offsets,
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& problem_sizes2,
+    torch::Tensor& input_permutation,
+    torch::Tensor& output_permutation,
+    const int64_t num_experts,
+    const int64_t n,
+    const int64_t k);
+
+void cutlass_fp4_group_mm(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& a_blockscale,
+    const torch::Tensor& b_blockscales,
+    const torch::Tensor& alphas,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& sf_offsets);
+
+void scaled_fp4_experts_quant(
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    torch::Tensor const& input,
+    torch::Tensor const& input_global_scale,
+    torch::Tensor const& input_offset_by_experts,
+    torch::Tensor const& output_scale_offset_by_experts);
+
 /*
  * From csrc/speculative
  */
