@@ -115,7 +115,7 @@ class MiniCPMAttention(nn.Module):
         self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
@@ -221,8 +221,8 @@ def calc_chunks_with_stride(cu_seqlens, moba_chunk_size, kernel_stride):
     del chunk_start_in_seq
     # 5. 生成 filtered_indices
     chunk_indices = torch.arange(0, moba_chunk_size, device=cu_seqlens.device)[
-        None, :
-    ]  # [1, moba_chunk_size]
+                    None, :
+                    ]  # [1, moba_chunk_size]
     filtered_indices = (
         valid_chunk_starts[:, None] + chunk_indices
     )  # [num_valid_chunks, moba_chunk_size]
@@ -357,11 +357,11 @@ class CompressKV(torch.nn.Module):
         if self.compress_func == "meanpool":
             compressed_kv = filtered_kv.mean(dim=1)
             compress_k = compressed_kv[
-                :, 0, :, :
-            ]  # .reshape(-1, self.head_num_k, self.head_dim)
+                         :, 0, :, :
+                         ]  # .reshape(-1, self.head_num_k, self.head_dim)
             compress_v = compressed_kv[
-                :, 1, :, :
-            ]  # .reshape(-1, self.head_num_k, self.head_dim)
+                         :, 1, :, :
+                         ]  # .reshape(-1, self.head_num_k, self.head_dim)
         elif self.compress_func == "mlp":
 
             filtered_kv = filtered_kv.permute(0, 3, 4, 2, 1).reshape(
@@ -369,11 +369,11 @@ class CompressKV(torch.nn.Module):
             )
             compressed_kv = self.kv_compress(filtered_kv)
             compress_k = compressed_kv[
-                :, :, :, 0
-            ]  # .reshape(-1, self.head_num_k, self.head_dim)
+                         :, :, :, 0
+                         ]  # .reshape(-1, self.head_num_k, self.head_dim)
             compress_v = compressed_kv[
-                :, :, :, 1
-            ]  # .reshape(-1, self.head_num_k, self.head_dim)
+                         :, :, :, 1
+                         ]  # .reshape(-1, self.head_num_k, self.head_dim)
         elif self.compress_func == "mlp+residual":
             mean_kv = filtered_kv.mean(dim=1)
             mlp_kv = self.kv_compress(
@@ -550,7 +550,6 @@ class DynamicCacheQKV(DynamicCache):
         elif self.key_cache[layer_idx] == []:
             self.key_cache[layer_idx] = key_states
             self.value_cache[layer_idx] = value_states
-
         else:
             self.key_cache[layer_idx] = torch.cat(
                 [self.key_cache[layer_idx], key_states], dim=-2
@@ -644,8 +643,8 @@ class DynamicCacheQKV(DynamicCache):
             k_chunk = self.no_compress_k_cache[layer_idx][:kernel_size]
 
             self.no_compress_k_cache[layer_idx] = self.no_compress_k_cache[layer_idx][
-                kernel_stride:
-            ]
+                                                  kernel_stride:
+                                                  ]
 
             return k_chunk
         else:
@@ -712,10 +711,10 @@ class DynamicCacheQKV(DynamicCache):
             current_split = DynamicCacheQKV(num_hidden_layers)
             current_split._seen_tokens = self._seen_tokens
             current_split.key_cache = [
-                tensor[i : i + split_size] for tensor in self.key_cache
+                tensor[i: i + split_size] for tensor in self.key_cache
             ]
             current_split.value_cache = [
-                tensor[i : i + split_size] for tensor in self.value_cache
+                tensor[i: i + split_size] for tensor in self.value_cache
             ]
             out.append(current_split)
         return out
@@ -1135,37 +1134,50 @@ def flash_attn_with_kvcache(
     else:
         blockmask = None
 
+    # print(f"{cache_batch_idx=}")
+    # print(f"{block_table=}")
+    # print(f"{cache_seqlens=}")
+    # print(f"{softmax_scale=}")
+    # print(f"{window_size=}")
+    # print(f"{softcap=}")
+    # print(f"{k_cache=}")
+    # print(f"{k_cache.shape=}")
+    # print(f"{v_cache=}")
     softmax_lse = None
     # print(f"{q.shape=}")
     # print(f"{k.shape=}")
     # print(f"{k_cache.shape=}")
     # FIXME: If key is supplied, it must have seqlen <= the seqlen of the KV cache
-    out, softmax_lse = flash_attn_gpu.fwd_kvcache(
-        q,
-        k_cache,
-        v_cache,
-        k,
-        v,
-        cache_seqlens,
-        rotary_cos,
-        rotary_sin,
-        cache_batch_idx,
-        cache_leftpad,
-        block_table,
-        alibi_slopes,
-        None,
-        softmax_scale,
-        causal,
-        window_size[0],
-        window_size[1],
-        softcap,
-        rotary_interleaved,
-        num_splits,
-        blockmask,
-        block_window_size,
-    )
+    # out, softmax_lse = flash_attn_gpu.fwd_kvcache(
+    #     q,
+    #     k_cache,
+    #     v_cache,
+    #     k,
+    #     v,
+    #     cache_seqlens,
+    #     rotary_cos,
+    #     rotary_sin,
+    #     cache_batch_idx,
+    #     cache_leftpad,
+    #     block_table,
+    #     alibi_slopes,
+    #     None,
+    #     softmax_scale,
+    #     causal,
+    #     window_size[0],
+    #     window_size[1],
+    #     softcap,
+    #     rotary_interleaved,
+    #     num_splits,
+    #     blockmask,
+    #     block_window_size,
+    # )
 
-    # out = attn.forward(q, k, v, forward_batch)
+    out = attn(q, k, v, forward_batch,
+               is_sparse=True,
+               blockmask=blockmask,
+               block_window_size=block_window_size, k_cache=k_cache, v_cache=v_cache
+               )
 
     # from sgl_kernel.flash_attn import (
     #     flash_attn_with_kvcache as flash_attn_with_kvcache_kernel,
@@ -1236,7 +1248,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         rope_theta = getattr(config, "rope_theta", 10000)
         self.rope_theta = rope_theta
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
@@ -1296,19 +1308,8 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         self.hidden_size = hidden_size
         # set rope as fp32 instead of bf16
         scaling_type = self.config.rope_scaling["rope_type"]
-        self.rotary_emb1 = MiniCPMLongRoPE(
-            self.head_dim,
-            max_position_embeddings=self.max_position_embeddings,
-            short_factor=self.config.rope_scaling["short_factor"],
-            long_factor=self.config.rope_scaling["long_factor"],
-            base=self.rope_theta,
-            original_max_position_embeddings=self.config.rope_scaling[
-                "original_max_position_embeddings"
-            ],
-        )
         if scaling_type == "longrope":
             # self.rotary_emb = MiniCPMLongRoPE(
-
             self.rotary_emb = MiniCPMScaledRotaryEmbedding(
                 self.head_dim,
                 self.head_dim,
@@ -1372,23 +1373,27 @@ class MiniCPMSparseFlashAttention2(nn.Module):
             flash_attn_with_kvcache,
         )
 
-        # topk_attn_output = self.attn.forward(q, k, v, forward_batch)
-        topk_attn_output = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_in_batch_q,
-            max_seqlen_in_batch_k,
-            dropout_p=0.0,
-            deterministic=False,
-            softmax_scale=None,
-            causal=True,
-            return_attn_probs=False,
-            block_window_size=self.window_size // self.block_size,
-            topk_idx=topk_idx,
-        )
+        topk_attn_output = self.attn.forward(q, k, v, forward_batch,
+                                             is_sparse=True,
+                                             block_window_size=self.window_size // self.block_size,
+                                             topk_idx=topk_idx,
+                                             )
+        # topk_attn_output = flash_attn_varlen_func(
+        #     q,
+        #     k,
+        #     v,
+        #     cu_seqlens_q,
+        #     cu_seqlens_k,
+        #     max_seqlen_in_batch_q,
+        #     max_seqlen_in_batch_k,
+        #     dropout_p=0.0,
+        #     deterministic=False,
+        #     softmax_scale=None,
+        #     causal=True,
+        #     return_attn_probs=False,
+        #     block_window_size=self.window_size // self.block_size,
+        #     topk_idx=topk_idx,
+        # )
 
         # from sgl_kernel.flash_attn import flash_attn_varlen_func
         # topk_attn_output = flash_attn_varlen_func(
@@ -1500,8 +1505,8 @@ class MiniCPMSparseFlashAttention2(nn.Module):
                 batch_size + 1, dtype=torch.int32, device=query_layer.device
             )
             indices_q = cu_seqlens_q[
-                :-1
-            ]  # For query_length == 1, indices_q are just batch indices 0, 1, ...
+                        :-1
+                        ]  # For query_length == 1, indices_q are just batch indices 0, 1, ...
             query_layer_unpadded = query_layer.squeeze(
                 1
             )  # Query is already effectively unpadded
@@ -1639,7 +1644,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         forward_batch: ForwardBatch,
         attention_mask: Optional[torch.LongTensor] = None,
         positions: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_value: Optional[DynamicCacheQKV] = None,
         use_cache: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -1670,12 +1675,6 @@ class MiniCPMSparseFlashAttention2(nn.Module):
             usable_length = past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
             kv_seq_len += usable_length
 
-        # cos, sin = self.rotary_emb1(v.to(torch.float32), seq_len=kv_seq_len)
-
-        # print(f"{q.shape=}")
-        # print(f"{k.shape=}")
-        # print(f"{v.shape=}")
-        # print(f"{kv_seq_len=}")
         # print(f"{positions.shape=}")
         # FIXME: .view() -> .reshape()
         q_shape = q.shape
@@ -1689,7 +1688,10 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         k = k.view(k_shape)
         if past_key_value is not None:
             #     cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+            # print(f"pre {k.shape=}")
             k, v = past_key_value.update(k, v, self.layer_idx)
+            # print(f"after {k.shape=}")
+            # print(f"{k=}")
             # k, v = past_key_value.update(k, v, self.layer_idx, cache_kwargs)
 
         # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
@@ -1731,6 +1733,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
             q = q.to(target_dtype)
             k = k.to(target_dtype)
             v = v.to(target_dtype)
+
         if past_key_value is None or q_len != 1:  # prefilling
             attn_output = self._flash_attention_forward(
                 q,
@@ -1813,9 +1816,11 @@ class MiniCPMSparseFlashAttention2(nn.Module):
 
             new_k = k[:, -1:, :, :].contiguous()
             new_v = v[:, -1:, :, :].contiguous()
+            # print(f"{forward_batch=}")
 
             past_k = k[:, :-1, :, :].contiguous()
             past_v = v[:, :-1, :, :].contiguous()
+
             if no_rope_param is not None:
                 # nope unpad
                 no_rope_param["query_states_no_rope"] = no_rope_param[
@@ -1854,6 +1859,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         no_rope_param=None,
         past_key_value=None,
     ):
+        seq_len = forward_batch.seq_lens_sum
         stage1_k = (
             new_k.squeeze(0)
             if no_rope_param is None
@@ -1918,8 +1924,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
             None,
             init_blocks=self.init_blocks,
             local_blocks=self.local_blocks,
-            total_seq_lens=past_k.shape[1]
-            + 1,  # ! Only batch_size=1 is supported at the moment.
+            total_seq_lens=seq_len,  # ! Only batch_size=1 is supported at the moment.
         )
 
         repeat_times = 1
@@ -1933,7 +1938,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         )
 
         seqlen_k = (
-            past_k.shape[1] + new_k.shape[1]
+            seq_len - 1 + new_k.shape[1]
         )  # ! Only batch_size=1 is supported at the moment.
         seqlens_k = torch.full(
             (batch_size,), seqlen_k - 1, dtype=torch.int32, device=new_q.device
@@ -2025,7 +2030,7 @@ class MiniCPMDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         past_key_value: Optional[Cache] = None,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # Self Attention
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
