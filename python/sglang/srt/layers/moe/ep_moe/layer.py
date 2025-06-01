@@ -2,13 +2,12 @@ import logging
 from typing import Callable, List, Optional, Tuple
 
 import torch
-from torch.nn import Module
-
 from sglang.srt import debug_utils
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from torch.nn import Module
 
 try:
     from deep_gemm import fp8_m_grouped_gemm_nt_masked, m_grouped_fp8_gemm_nt_contiguous
@@ -297,7 +296,7 @@ class EPMoE(torch.nn.Module):
         )
         dispose_tensor(hidden_states)
 
-        seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
+        seg_indptr_cur_rank = seg_indptr[self.start_expert_id: self.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
             0,
             self.num_experts_per_partition,
@@ -496,7 +495,7 @@ class EPMoE(torch.nn.Module):
         elif shard_id == "w1":
             param.data[expert_id][: self.intermediate_size, :] = loaded_weight
         elif shard_id == "w3":
-            param.data[expert_id][self.intermediate_size :, :] = loaded_weight
+            param.data[expert_id][self.intermediate_size:, :] = loaded_weight
         else:
             raise ValueError(f"Expected shard_id w1,w2 or w3 but got {shard_id}")
 
@@ -529,11 +528,11 @@ class EPMoE(torch.nn.Module):
                 block_n, block_k = self.block_shape[0], self.block_shape[1]
                 if shard_id == "w1":
                     param_data[expert_id][
-                        : (self.intermediate_size + block_n - 1) // block_n, :
+                    : (self.intermediate_size + block_n - 1) // block_n, :
                     ] = loaded_weight
                 elif shard_id == "w3":
                     param_data[expert_id][
-                        (self.intermediate_size + block_n - 1) // block_n :, :
+                    (self.intermediate_size + block_n - 1) // block_n:, :
                     ] = loaded_weight
                 else:  # w2
                     param_data[expert_id] = loaded_weight
@@ -1241,7 +1240,9 @@ class DeepEPMoE(EPMoE):
         n = self.w2_weight.size(1)
         down_input_fp8 = (
             down_input,
-            _copied_get_col_major_tma_aligned_tensor(down_input_scale),
+            # NOTE MODIFIED rm tma
+            # get_col_major_tma_aligned_tensor(down_input_scale),
+            down_input_scale,
         )
         # NOTE HACK use zeros instead of empty
         down_output = torch.zeros(
@@ -1274,73 +1275,6 @@ def get_moe_impl_class():
     if global_server_args_dict["enable_ep_moe"]:
         return EPMoE
     return FusedMoE
-
-
-def _copied_get_col_major_tma_aligned_tensor(x: torch.Tensor) -> torch.Tensor:
-    """
-    Returns TMA-aligned transposed format of the input tensor. `torch.transpose` will be called if necessary.
-    If the input tensor is already column-major layout and 16-byte aligned along the M axis
-        (thus meets the requirement of LHS scaling tensor in DeepGEMM), this function will do nothing.
-
-    Arguments:
-        x: usually the LHS scaling tensor in GEMM.
-
-    Returns:
-        The LHS scaling tensor of TMA-aligned transposed format.
-    """
-    # NOTES: for the extreme performance, you may rewrite/fuse this function in CUDA
-    assert x.dim() in (2, 3)
-    remove_dim = False
-    if x.dim() == 2:
-        x, remove_dim = x.unsqueeze(0), True
-
-    b, m, n = x.shape
-    aligned_m = _copied_get_tma_aligned_size(m, x.element_size())
-
-    # The last kernel gives a column-major TMA aligned layout
-    if x.stride(0) == aligned_m * n and x.stride(1) == 1 and x.stride(2) == aligned_m:
-        return x.squeeze(0) if remove_dim else x
-
-    # Normal layout requires transposing
-    aligned_x = torch.transpose(
-        torch.empty((b, n, aligned_m), device=x.device, dtype=x.dtype), 1, 2
-    )
-    aligned_x[:, :m, :] = x
-    aligned_x = aligned_x[:, :m, :]
-    return aligned_x.squeeze(0) if remove_dim else aligned_x
-
-
-def _copied_get_tma_aligned_size(x: int, element_size: int) -> int:
-    """
-    Global memory address of TMA must be 16-byte aligned.
-    Since we use column-major layout for the LHS scaling tensor,
-        the M-axis of the LHS scaling tensor needs to be padded to a multiple of 16 bytes.
-
-    Arguments:
-        x: original M-axis shape of the LHS scaling tensor.
-        element_size: element size of the LHS scaling tensor.
-
-    Returns:
-        M-axis shape of the LHS scaling tensor after padding.
-    """
-    tma_alignment_bytes = 16
-    assert tma_alignment_bytes % element_size == 0
-    alignment = tma_alignment_bytes // element_size
-    return _copied_ceil_div(x, alignment) * alignment
-
-
-def _copied_ceil_div(x: int, y: int) -> int:
-    """
-    Perform ceiling division of two integers.
-
-    Args:
-        x: the dividend.
-        y: the divisor.
-
-    Returns:
-        The result of the ceiling division.
-    """
-    return (x + y - 1) // y
 
 
 def ceil_to_ue8m0(x: torch.Tensor):
