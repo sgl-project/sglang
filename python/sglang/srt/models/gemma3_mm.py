@@ -287,12 +287,20 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         vision_outputs_list = []
 
         for pixel_value in all_pixel_values:
-            # Add batch dimension for single image processing
-            pixel_value_batch = pixel_value.unsqueeze(0)
-            pixel_value_batch = pixel_value_batch.to(device=self.vision_tower.device)
-            pixel_value_batch = pixel_value_batch.to(dtype=self.language_model.dtype())
+            # Ensure pixel_value has the correct shape [batch_size, channels, height, width]
+            if pixel_value.dim() == 5:
+                # Remove extra dimension if present: [1, 1, 3, 896, 896] -> [1, 3, 896, 896]
+                pixel_value = pixel_value.squeeze(0)
+            elif pixel_value.dim() == 3:
+                # Add batch dimension if missing: [3, 896, 896] -> [1, 3, 896, 896]
+                pixel_value = pixel_value.unsqueeze(0)
+            assert (
+                pixel_value.dim() == 4
+            ), f"Pixel value has wrong shape: {pixel_value.shape}"
+            pixel_value = pixel_value.to(device=self.vision_tower.device)
+            pixel_value = pixel_value.to(dtype=self.language_model.dtype())
 
-            vision_output = self.vision_tower(pixel_values=pixel_value_batch)
+            vision_output = self.vision_tower(pixel_values=pixel_value)
             vision_outputs_list.append(vision_output)
 
         # Concatenate all vision outputs

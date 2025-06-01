@@ -54,37 +54,33 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
             discard_alpha_channel=True,
         )
 
-        images_are_preprocessed = self.mm_inputs_are_preprocessed(base_output.images)
-        ret = self.process_mm_data(
-            input_text=base_output.input_text,
-            images=None if images_are_preprocessed else base_output.images,
-        )
+        combined_mm_item = self.get_combined_mm_item(base_output)
 
-        items = []
-        input_ids = ret["input_ids"].flatten()
-        image_offsets = self.get_mm_items_offset(
+        if combined_mm_item is None:
+            ret = self.process_mm_data(
+                input_text=base_output.input_text,
+                images=base_output.images,
+            )
+            combined_mm_item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                pixel_values=ret["pixel_values"],
+            )
+            input_ids = ret["input_ids"].flatten()
+        else:
+            input_ids = self._processor.tokenizer(
+                base_output.input_text,
+                return_tensors="pt",
+                add_special_tokens=True,
+            ).input_ids.flatten()
+
+        combined_mm_item.image_offsets = self.get_mm_items_offset(
             input_ids=input_ids,
             mm_token_id=self.hf_config.image_token_index,
         )
-        for i, image in enumerate(base_output.images):
-            if images_are_preprocessed:
-                pixel_values = image.pixel_values
-                precomputed_features = image.precomputed_features
-            else:
-                pixel_values = ret["pixel_values"][i]
-                precomputed_features = None
-
-            item = MultimodalDataItem(
-                pixel_values=pixel_values,
-                precomputed_features=precomputed_features,
-                modality=Modality.IMAGE,
-                image_offsets=image_offsets[i],
-            )
-            items += [item]
 
         return {
-            "mm_items": items,
             "input_ids": input_ids.tolist(),
+            "mm_items": [combined_mm_item],
             "im_start_id": self.IM_START_TOKEN_ID,
             "im_end_id": self.IM_END_TOKEN_ID,
         }
