@@ -23,10 +23,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-from tqdm import tqdm
-from transformers import PretrainedConfig
-
 from sglang.srt import debug_utils, hacks
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -102,6 +98,9 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     log_info_on_rank0,
 )
+from torch import nn
+from tqdm import tqdm
+from transformers import PretrainedConfig
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -1943,7 +1942,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        weights = hacks.hack_model_load_weights(weights)
+        weights = hacks.hack_model_load_weights(self, weights)
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
