@@ -39,10 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
-from sglang.srt.two_batch_overlap import (
-    TboCudaGraphRunnerPlugin,
-    TboForwardBatchPreparer,
-)
+from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
     get_available_gpu_memory,
     get_device_memory_capacity,
@@ -149,6 +146,8 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         gpu_mem = get_device_memory_capacity()
         if gpu_mem is not None and gpu_mem > 96 * 1024:
             capture_bs += list(range(160, 257, 8))
+        if gpu_mem is not None and gpu_mem > 180 * 1000:
+            capture_bs += list(range(256, 528, 16))
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests

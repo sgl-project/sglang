@@ -93,6 +93,11 @@ def is_in_ci():
     return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
+def is_in_amd_ci():
+    """Return whether it is in an AMD CI runner."""
+    return get_bool_env_var("SGLANG_AMD_CI")
+
+
 if is_in_ci():
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
         5000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
