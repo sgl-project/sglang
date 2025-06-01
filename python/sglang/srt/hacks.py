@@ -24,16 +24,16 @@ def hack_model_load_weights(that, weights):
             for module_name in module_names:
                 partial_name = f"model.layers.{moe_layer}.mlp.experts.{expert_index}.{module_name}"
                 name_weight = partial_name + ".weight"
-                name_scale_inv = partial_name + ".weight_scale_inv"
+                name_weight_scale_inv = partial_name + ".weight_scale_inv"
 
                 weight = weights_dict[name_weight]
-                scale_inv = weights_dict[name_scale_inv]
-                weight_new, scale_inv_new = _transform_moe_weight(weight, scale_inv)
+                weight_scale_inv = weights_dict[name_weight_scale_inv]
+                weight_new, weight_scale_inv_new = _transform_moe_weight(weight, weight_scale_inv)
                 weight[...] = weight_new
-                scale_inv[...] = scale_inv_new
+                weight_scale_inv[...] = weight_scale_inv_new
 
     return weights_list
 
 
-def _transform_moe_weight(weight: torch.Tensor, scale_inv: torch.Tensor):
+def _transform_moe_weight(weight: torch.Tensor, weight_scale_inv: torch.Tensor):
     return TODO, TODO
