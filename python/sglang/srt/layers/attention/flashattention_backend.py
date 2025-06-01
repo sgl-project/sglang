@@ -915,8 +915,6 @@ class FlashAttentionBackend(AttentionBackend):
         is_sparse: Optional[bool] = False,
         blockmask: Optional[torch.Tensor] = None,
         block_window_size: Optional[int] = None,
-        k_cache: Optional[torch.Tensor] = None,
-        v_cache: Optional[int] = None,
     ) -> torch.Tensor:
         if k is not None:
             assert v is not None
@@ -1049,6 +1047,26 @@ class FlashAttentionBackend(AttentionBackend):
                         + 1 : forward_batch.out_cache_loc,
                         :,
                     ].view(1, -1, layer.tp_k_head_num, layer.head_dim)
+
+                    # from sgl_kernel.flash_attn import flash_attn_varlen_func
+                    # topk_attn_output = flash_attn_varlen_func(
+                    #     q,
+                    #     k,
+                    #     v,
+                    #     cu_seqlens_q,
+                    #     cu_seqlens_k,
+                    #     max_seqlen_in_batch_q,
+                    #     max_seqlen_in_batch_k,
+                    #     # dropout_p=0.0,
+                    #     # deterministic=False,
+                    #     softmax_scale=None,
+                    #     causal=True,
+                    #     # return_attn_probs=False,
+                    #     # TODO: we dont have these two params in sgl-kernel
+                    #     # block_window_size=self.window_size // self.block_size,
+                    #     # topk_idx=topk_idx
+                    # )
+
                     # TODO: handle the in-place update of key_cache & v_cache
                     result, _softmax_lse = flash_attn_gpu.fwd_kvcache(
                         q,
