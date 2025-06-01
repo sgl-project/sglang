@@ -24,6 +24,7 @@ def hack_model_load_weights(that, weights):
             partial_name = f"model.layers.{moe_layer}.mlp.shared_experts.{module_name}"
             name_weight = partial_name + ".weight"
             name_scale_inv = partial_name + ".weight_scale_inv"
+
             weight = weights_dict[name_weight]
             scale_inv = weights_dict[name_scale_inv]
             weight_new, scale_inv_new = _transform_moe_weight(weight, scale_inv)
