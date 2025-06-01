@@ -1,5 +1,6 @@
 from typing import Tuple
 
+import einops
 import torch
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
@@ -80,6 +81,8 @@ def _requant_grouped_moe_weight(that, weight: torch.Tensor, weight_scale_inv: to
     weight_block_size = that.quant_config.weight_block_size
     assert weight_block_size == [128, 128]
 
+    num_group, n, k = weight.shape
+
     print(
         f'requant_grouped_moe_weight {weight.shape=} {weight.dtype=} {weight_scale_inv.shape=} {weight_scale_inv.dtype=}')
 
@@ -91,7 +94,14 @@ def _requant_grouped_moe_weight(that, weight: torch.Tensor, weight_scale_inv: to
         torch.bfloat16,
     )
 
-    return per_block_cast_to_fp8(weight_dequant)
+    assert n % 128 == 0
+    weight_dequant_flat = einops.rearrange(weight_dequant, 'num_group n k -> (num_group n) k')
+    out_w_flat, out_s_flat = per_block_cast_to_fp8(weight_dequant_flat)
+
+    def _unflatten(x):
+        return einops.rearrange(x, '(num_group n) whatever -> num_group n whatever', num_group=num_group, n=n)
+
+    return _unflatten(out_w_flat), _unflatten(out_s_flat)
 
 
 def ceil_to_ue8m0(x: torch.Tensor):
