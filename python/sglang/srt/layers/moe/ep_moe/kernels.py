@@ -3,7 +3,6 @@ from typing import List, Optional
 
 import torch
 import triton
-
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import dispose_tensor, is_cuda, get_bool_env_var
 
@@ -252,7 +251,9 @@ def silu_and_mul_triton_kernel(
             tl.store(down_input_ptr + offset, silu_mul_output, mask=mask)
 
 
-HACK_SILU_AND_MUL_POST_QUANT_KERNEL_EXTRA_CEIL = get_bool_env_var('SGLANG_HACK_SILU_AND_MUL_POST_QUANT_KERNEL_EXTRA_CEIL')
+HACK_SILU_AND_MUL_POST_QUANT_KERNEL_EXTRA_CEIL = get_bool_env_var(
+    'SGLANG_HACK_SILU_AND_MUL_POST_QUANT_KERNEL_EXTRA_CEIL')
+
 
 # copy from https://github.com/ModelTC/lightllm/blob/a000ab69098654df4731f5b12587dd4e7f0a4f41/lightllm/common/fused_moe/moe_silu_and_mul_mix_quant_ep.py
 @triton.jit
@@ -317,7 +318,7 @@ def _silu_and_mul_post_quant_kernel(
         _absmax = tl.maximum(tl.max(tl.abs(gate_up)), 1e-10)
         output_s = _absmax / fp8_max
         if HACK_SILU_AND_MUL_POST_QUANT_KERNEL_EXTRA_CEIL:
-            output_s = tl.pow(2.0, tl.ceil(tl.log2(tl.abs(output_s))))
+            output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
         output_q = tl.clamp(gate_up / output_s, fp8_min, fp8_max).to(
             output_ptr.dtype.element_ty
         )
@@ -450,12 +451,12 @@ def gelu_and_mul_triton_kernel(
                 * (
                     1
                     + tanh(
-                        kAlpha
-                        * (
-                            gate_output
-                            + 0.044715 * gate_output * gate_output * gate_output
-                        )
+                    kAlpha
+                    * (
+                        gate_output
+                        + 0.044715 * gate_output * gate_output * gate_output
                     )
+                )
                 )
             )
             gate_output = gate_output.to(InDtype)
