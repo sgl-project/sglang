@@ -40,10 +40,8 @@ def hack_requant_moe_weight(that, weights):
 
 
 def _requant_moe_weight(that, weight: torch.Tensor, weight_scale_inv: torch.Tensor):
-    model_dtype = torch.get_default_dtype()
     weight_block_size = that.quant_config.weight_block_size
 
-    assert model_dtype == torch.bfloat16
     assert weight_block_size == [128, 128]
 
     weight_dequant = block_quant_dequant(
@@ -51,7 +49,8 @@ def _requant_moe_weight(that, weight: torch.Tensor, weight_scale_inv: torch.Tens
         # TODO does "inv" have trouble?
         weight_scale_inv,
         weight_block_size,
-        model_dtype,
+        # TODO correct?
+        torch.float32,
     )
 
     return per_block_cast_to_fp8(weight_dequant)
