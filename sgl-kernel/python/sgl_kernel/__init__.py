@@ -12,6 +12,7 @@ if os.path.exists(cuda_path):
 
 from sgl_kernel import common_ops
 from sgl_kernel.allreduce import *
+from sgl_kernel.alltoall import *
 from sgl_kernel.attention import (
     cutlass_mla_decode,
     cutlass_mla_get_workspace_size,
