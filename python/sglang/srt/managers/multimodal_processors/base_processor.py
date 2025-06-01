@@ -5,6 +5,7 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -14,6 +15,14 @@ from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import encode_video, load_audio, load_image
+
+
+class MultimodalInputFormat(Enum):
+    """Enum for different multimodal input formats."""
+
+    RAW_IMAGES = "raw_images"
+    PRECOMPUTED_FEATURES = "precomputed_features"
+    PIXEL_VALUES = "pixel_values"
 
 
 @dataclasses.dataclass
@@ -426,7 +435,7 @@ class BaseMultimodalProcessor(ABC):
                 add_special_tokens=True,
             ).input_ids.flatten()
 
-        def categorize_mm_inputs(mm_inputs: List) -> str:
+        def categorize_mm_inputs(mm_inputs: List) -> MultimodalInputFormat:
             """Categorize multimodal inputs and validate consistency."""
             try:
                 has_image = False
@@ -462,11 +471,11 @@ class BaseMultimodalProcessor(ABC):
                     )
 
                 if has_image:
-                    return "raw_images"
+                    return MultimodalInputFormat.RAW_IMAGES
                 elif has_precomputed_features:
-                    return "precomputed_features"
+                    return MultimodalInputFormat.PRECOMPUTED_FEATURES
                 elif has_pixel_values:
-                    return "pixel_values"
+                    return MultimodalInputFormat.PIXEL_VALUES
                 else:
                     raise ValueError("No valid multimodal input format found")
             except Exception as e:
@@ -535,11 +544,11 @@ class BaseMultimodalProcessor(ABC):
         input_format = categorize_mm_inputs(mm_inputs)
 
         # Process based on format
-        if input_format == "raw_images":
+        if input_format == MultimodalInputFormat.RAW_IMAGES:
             combined_mm_item = process_raw_images(base_output)
-        elif input_format == "precomputed_features":
+        elif input_format == MultimodalInputFormat.PRECOMPUTED_FEATURES:
             combined_mm_item = process_precomputed_features(base_output)
-        elif input_format == "pixel_values":
+        elif input_format == MultimodalInputFormat.PIXEL_VALUES:
             combined_mm_item = process_pixel_values(base_output)
         else:
             raise ValueError(f"Unknown input format: {input_format}")
