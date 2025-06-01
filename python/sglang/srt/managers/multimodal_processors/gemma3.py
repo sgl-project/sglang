@@ -57,7 +57,7 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
 
         return {
             "input_ids": combined_mm_item.input_ids.tolist(),
-            "mm_items": [combined_mm_item] if combined_mm_item is not None else [],
+            "mm_items": [combined_mm_item],
             "im_start_id": self.IM_START_TOKEN_ID,
             "im_end_id": self.IM_END_TOKEN_ID,
         }

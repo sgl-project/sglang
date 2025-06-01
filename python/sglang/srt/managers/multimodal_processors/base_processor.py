@@ -409,7 +409,7 @@ class BaseMultimodalProcessor(ABC):
 
     def process_and_combine_mm_data(
         self, base_output: BaseMultiModalProcessorOutput
-    ) -> Optional[MultimodalDataItem]:
+    ) -> MultimodalDataItem:
         """
         Process multimodal data and return the combined multimodal item.
         Handles all three input formats at the same abstraction level.

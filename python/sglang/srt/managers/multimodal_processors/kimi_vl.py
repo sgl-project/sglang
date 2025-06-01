@@ -50,6 +50,6 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
 
         return {
             "input_ids": combined_mm_item.input_ids.tolist(),
-            "mm_items": [combined_mm_item] if combined_mm_item is not None else [],
+            "mm_items": [combined_mm_item],
             "im_token_id": self.IM_TOKEN_ID,
         }
