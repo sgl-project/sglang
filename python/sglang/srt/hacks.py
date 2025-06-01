@@ -80,6 +80,9 @@ def _requant_grouped_moe_weight(that, weight: torch.Tensor, weight_scale_inv: to
     weight_block_size = that.quant_config.weight_block_size
     assert weight_block_size == [128, 128]
 
+    print(
+        f'requant_grouped_moe_weight {weight.shape=} {weight.dtype=} {weight_scale_inv.shape=} {weight_scale_inv.dtype=}')
+
     weight_dequant = block_quant_dequant(
         weight,
         weight_scale_inv,
