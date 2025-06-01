@@ -1047,12 +1047,14 @@ class Scheduler(
             elif req.sampling_params.ebnf is not None:
                 key_type = "ebnf"
                 key_string = req.sampling_params.ebnf
-            elif req.sampling_params.structural_tag:
+            elif req.sampling_params.structural_tag is not None:
                 key_type = "structural_tag"
                 key_string = req.sampling_params.structural_tag
 
-            if self.server_args.reasoning_parser and self.tokenizer:
-                key = (key_type, key_string, req.sampling_params.expect_thinking)
+            if self.server_args.reasoning_parser and hasattr(
+                self.tokenizer, "think_end_id"
+            ):
+                key = (key_type, key_string, req.sampling_params.enable_thinking)
             else:
                 key = (key_type, key_string)
 

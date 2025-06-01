@@ -26,12 +26,12 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self,
         grammar: BaseGrammarObject,
         think_end_id: int,
-        expect_thinking: bool,
+        enable_thinking: bool,
     ):
         super().__init__()
         self.grammar = grammar
         self.think_end_id = think_end_id
-        self.is_in_reasoning = expect_thinking
+        self.is_in_reasoning = enable_thinking
 
     def accept_token(self, token: int):
         if token == self.think_end_id:
@@ -99,15 +99,15 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         self,
         key: Tuple[str, str, bool],
     ) -> Optional[ReasonerGrammarObject]:
-        key_type, key_string, expect_thinking = key
+        key_type, key_string, enable_thinking = key
         base_key = (key_type, key_string)
         ret = self.grammar_backend._init_value_dispatch(base_key)
         if ret is None:
             return None
-        return ReasonerGrammarObject(ret, self.think_end_id, expect_thinking)
+        return ReasonerGrammarObject(ret, self.think_end_id, enable_thinking)
 
     def get_cached_or_future_value(
-        self, key: Tuple[str, str, str]
+        self, key: Tuple[str, str, bool]
     ) -> Tuple[Future[ReasonerGrammarObject], bool]:
         value = self.cache.get(key)
         if value:

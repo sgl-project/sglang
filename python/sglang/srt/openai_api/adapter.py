@@ -929,7 +929,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
     return response
 
 
-def _get_enable_thinking_from_request(request_obj):
+def _get_enable_thinking_from_request(request_obj: ChatCompletionRequest) -> bool:
     """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
 
     Args:
@@ -1179,10 +1179,8 @@ def v1_chat_generate_request(
                 )
             else:
                 sampling_params[constraint_type] = constraint_value
-        elif has_existing_constraints:
-            sampling_params["expect_thinking"] = _get_enable_thinking_from_request(
-                request
-            )
+
+        sampling_params["enable_thinking"] = _get_enable_thinking_from_request(request)
 
         sampling_params_list.append(sampling_params)
 
