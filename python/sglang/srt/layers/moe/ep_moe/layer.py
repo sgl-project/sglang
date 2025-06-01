@@ -3,12 +3,13 @@ from typing import Callable, List, Optional, Tuple
 
 import einops
 import torch
+from torch.nn import Module
+
 from sglang.srt import debug_utils
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from torch.nn import Module
 
 try:
     from deep_gemm import fp8_m_grouped_gemm_nt_masked, m_grouped_fp8_gemm_nt_contiguous
@@ -297,7 +298,7 @@ class EPMoE(torch.nn.Module):
         )
         dispose_tensor(hidden_states)
 
-        seg_indptr_cur_rank = seg_indptr[self.start_expert_id: self.end_expert_id + 2]
+        seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
             0,
             self.num_experts_per_partition,
@@ -496,7 +497,7 @@ class EPMoE(torch.nn.Module):
         elif shard_id == "w1":
             param.data[expert_id][: self.intermediate_size, :] = loaded_weight
         elif shard_id == "w3":
-            param.data[expert_id][self.intermediate_size:, :] = loaded_weight
+            param.data[expert_id][self.intermediate_size :, :] = loaded_weight
         else:
             raise ValueError(f"Expected shard_id w1,w2 or w3 but got {shard_id}")
 
@@ -529,11 +530,11 @@ class EPMoE(torch.nn.Module):
                 block_n, block_k = self.block_shape[0], self.block_shape[1]
                 if shard_id == "w1":
                     param_data[expert_id][
-                    : (self.intermediate_size + block_n - 1) // block_n, :
+                        : (self.intermediate_size + block_n - 1) // block_n, :
                     ] = loaded_weight
                 elif shard_id == "w3":
                     param_data[expert_id][
-                    (self.intermediate_size + block_n - 1) // block_n:, :
+                        (self.intermediate_size + block_n - 1) // block_n :, :
                     ] = loaded_weight
                 else:  # w2
                     param_data[expert_id] = loaded_weight
@@ -1297,12 +1298,17 @@ def _modified_construct_masked_grouped_x(x):
     num_groups, m, k = x.shape
     assert k % 128 == 0
 
-    x_flat = einops.rearrange(x, 'num_group num_token hidden -> (num_group num_token) hidden')
+    x_flat = einops.rearrange(
+        x, "num_group num_token hidden -> (num_group num_token) hidden"
+    )
     out_w_flat, out_s_flat = per_token_cast_to_fp8(x_flat)
 
     def _unflatten(x):
-        return einops.rearrange(x, '(num_group num_token) whatever_div_128 -> num_group num_token whatever_div_128',
-                                num_group=num_groups)
+        return einops.rearrange(
+            x,
+            "(num_group num_token) whatever_div_128 -> num_group num_token whatever_div_128",
+            num_group=num_groups,
+        )
 
     return _unflatten(out_w_flat), _unflatten(out_s_flat)
 

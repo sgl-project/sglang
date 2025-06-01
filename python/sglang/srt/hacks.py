@@ -2,10 +2,10 @@ from typing import Tuple
 
 import einops
 import torch
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
-from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from tqdm import tqdm
 
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 
 # def hack_requant_moe_weight(that, weights):
 #     print("hi hack_requant_moe_weight")
@@ -63,6 +63,7 @@ from tqdm import tqdm
 #     return per_block_cast_to_fp8(weight_dequant)
 #
 
+
 def hack_requant_moe_weight_at_post_load_weights(that):
     moe_layers = range(
         that.config.first_k_dense_replace,
@@ -72,20 +73,25 @@ def hack_requant_moe_weight_at_post_load_weights(that):
     for layer_id in tqdm(moe_layers):
         experts = that.model.layers[layer_id].mlp.experts
         assert isinstance(experts, DeepEPMoE)
-        experts.w13_weight_fp8[0][...], experts.w13_weight_fp8[1][...] = \
+        experts.w13_weight_fp8[0][...], experts.w13_weight_fp8[1][...] = (
             _requant_grouped_moe_weight(that, *experts.w13_weight_fp8)
-        experts.w2_weight_fp8[0][...], experts.w2_weight_fp8[1][...] = \
+        )
+        experts.w2_weight_fp8[0][...], experts.w2_weight_fp8[1][...] = (
             _requant_grouped_moe_weight(that, *experts.w2_weight_fp8)
+        )
 
 
-def _requant_grouped_moe_weight(that, weight: torch.Tensor, weight_scale_inv: torch.Tensor):
+def _requant_grouped_moe_weight(
+    that, weight: torch.Tensor, weight_scale_inv: torch.Tensor
+):
     weight_block_size = that.quant_config.weight_block_size
     assert weight_block_size == [128, 128]
 
     num_group, n, k = weight.shape
 
     print(
-        f'requant_grouped_moe_weight {weight.shape=} {weight.dtype=} {weight_scale_inv.shape=} {weight_scale_inv.dtype=}')
+        f"requant_grouped_moe_weight {weight.shape=} {weight.dtype=} {weight_scale_inv.shape=} {weight_scale_inv.dtype=}"
+    )
 
     weight_dequant = block_quant_dequant(
         weight,
@@ -97,12 +103,17 @@ def _requant_grouped_moe_weight(that, weight: torch.Tensor, weight_scale_inv: to
 
     assert n % 128 == 0
     assert k % 128 == 0
-    weight_dequant_flat = einops.rearrange(weight_dequant, 'num_group n k -> (num_group n) k')
+    weight_dequant_flat = einops.rearrange(
+        weight_dequant, "num_group n k -> (num_group n) k"
+    )
     out_w_flat, out_s_flat = per_block_cast_to_fp8(weight_dequant_flat)
 
     def _unflatten(x):
-        return einops.rearrange(x, '(num_group n_div_128) whatever_div_128 -> num_group n_div_128 whatever_div_128',
-                                num_group=num_group)
+        return einops.rearrange(
+            x,
+            "(num_group n_div_128) whatever_div_128 -> num_group n_div_128 whatever_div_128",
+            num_group=num_group,
+        )
 
     return _unflatten(out_w_flat), _unflatten(out_s_flat)
 
