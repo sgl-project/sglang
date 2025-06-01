@@ -1,8 +1,6 @@
 from typing import Tuple
 
 import torch
-from tqdm import trange
-
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 
@@ -72,7 +70,28 @@ def hack_requant_moe_weight_at_post_load_weights(that):
     for layer_id in moe_layers:
         experts = that.model.layers[layer_id].mlp.experts
         assert isinstance(experts, DeepEPMoE)
-        TODO
+        experts.w13_weight_fp8[0][...], experts.w13_weight_fp8[1][...] = \
+            _requant_grouped_moe_weight(that, *experts.w13_weight_fp8)
+        experts.w2_weight_fp8[0][...], experts.w2_weight_fp8[1][...] = \
+            _requant_grouped_moe_weight(that, *experts.w2_weight_fp8)
+
+
+def _requant_grouped_moe_weight(that, weight: torch.Tensor, weight_scale_inv: torch.Tensor):
+    weight_block_size = that.quant_config.weight_block_size
+
+    assert weight_block_size == [128, 128]
+
+    weight_dequant = block_quant_dequant(
+        weight,
+        # TODO does "inv" have trouble?
+        weight_scale_inv,
+        weight_block_size,
+        # TODO correct?
+        torch.float32,
+    )
+
+    return per_block_cast_to_fp8(weight_dequant)
+
 
 def ceil_to_ue8m0(x: torch.Tensor):
     assert x.view(-1).amax().item() > 0
