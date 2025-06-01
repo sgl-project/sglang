@@ -1764,6 +1764,9 @@ class DeepseekV2ForCausalLM(nn.Module):
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
 
+        if get_bool_env_var("SGLANG_HACK_REQUANT_MOE_WEIGHT"):
+            hacks.hack_requant_moe_weight_at_post_load_weights(self)
+
         # Perform post-processing after loading weights
         if is_nextn:
             layer_ids = [self.config.num_hidden_layers]

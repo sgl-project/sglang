@@ -3,6 +3,7 @@ from typing import Tuple
 import torch
 from tqdm import trange
 
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 
 
@@ -61,6 +62,17 @@ from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 #
 #     return per_block_cast_to_fp8(weight_dequant)
 #
+
+def hack_requant_moe_weight_at_post_load_weights(that):
+    moe_layers = range(
+        that.config.first_k_dense_replace,
+        that.config.num_hidden_layers,
+        that.config.moe_layer_freq,
+    )
+    for layer_id in moe_layers:
+        experts = that.model.layers[layer_id].mlp.experts
+        assert isinstance(experts, DeepEPMoE)
+        TODO
 
 def ceil_to_ue8m0(x: torch.Tensor):
     assert x.view(-1).amax().item() > 0
