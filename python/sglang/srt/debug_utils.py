@@ -9,12 +9,16 @@ from sglang.srt.utils import get_bool_env_var
 
 class _Dumper:
     def __init__(self):
+        self._enable = get_bool_env_var("SGLANG_DUMPER_ENABLE", "true")
         self._base_dir = Path(os.environ.get("SGLANG_DUMPER_DIR", "/tmp"))
         self._enable_write_file = get_bool_env_var("SGLANG_DUMPER_WRITE_FILE", "1")
         self._partial_name = str(time.time())
         self.forward_pass_id = None
 
     def dump(self, name, value, **kwargs):
+        if not self._enable:
+            return
+
         from sglang.srt.distributed import get_tensor_model_parallel_rank
 
         rank = get_tensor_model_parallel_rank()

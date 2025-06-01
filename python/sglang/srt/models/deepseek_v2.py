@@ -1757,6 +1757,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         debug_utils.dumper.dump("causal_lm__input_ids", input_ids)
         debug_utils.dumper.dump("causal_lm__positions", positions)
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        debug_utils.dumper.dump("causal_lm__output_hidden_states", hidden_states)
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

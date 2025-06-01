@@ -3,8 +3,9 @@ from typing import List, Optional
 
 import torch
 import triton
+
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
-from sglang.srt.utils import dispose_tensor, is_cuda, get_bool_env_var
+from sglang.srt.utils import dispose_tensor, get_bool_env_var, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -251,8 +252,9 @@ def silu_and_mul_triton_kernel(
             tl.store(down_input_ptr + offset, silu_mul_output, mask=mask)
 
 
-CONSTEXPR_HACK_SILU_AND_MUL_POST_QUANT_KERNEL_EXTRA_CEIL = tl.constexpr(get_bool_env_var(
-    'SGLANG_HACK_SILU_AND_MUL_POST_QUANT_KERNEL_EXTRA_CEIL'))
+CONSTEXPR_HACK_SILU_AND_MUL_POST_QUANT_KERNEL_EXTRA_CEIL = tl.constexpr(
+    get_bool_env_var("SGLANG_HACK_SILU_AND_MUL_POST_QUANT_KERNEL_EXTRA_CEIL")
+)
 
 
 # copy from https://github.com/ModelTC/lightllm/blob/a000ab69098654df4731f5b12587dd4e7f0a4f41/lightllm/common/fused_moe/moe_silu_and_mul_mix_quant_ep.py
@@ -451,12 +453,12 @@ def gelu_and_mul_triton_kernel(
                 * (
                     1
                     + tanh(
-                    kAlpha
-                    * (
-                        gate_output
-                        + 0.044715 * gate_output * gate_output * gate_output
+                        kAlpha
+                        * (
+                            gate_output
+                            + 0.044715 * gate_output * gate_output * gate_output
+                        )
                     )
-                )
                 )
             )
             gate_output = gate_output.to(InDtype)
