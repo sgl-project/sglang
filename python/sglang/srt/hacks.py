@@ -78,16 +78,14 @@ def hack_requant_moe_weight_at_post_load_weights(that):
 
 def _requant_grouped_moe_weight(that, weight: torch.Tensor, weight_scale_inv: torch.Tensor):
     weight_block_size = that.quant_config.weight_block_size
-
     assert weight_block_size == [128, 128]
 
     weight_dequant = block_quant_dequant(
         weight,
-        # TODO does "inv" have trouble?
         weight_scale_inv,
         weight_block_size,
-        # TODO correct?
-        torch.float32,
+        # TODO is it ok?
+        torch.bfloat16,
     )
 
     return per_block_cast_to_fp8(weight_dequant)
