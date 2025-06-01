@@ -3,8 +3,7 @@ from tqdm import tqdm
 
 
 def hack_model_load_weights(that, weights):
-    weights_list = list(weights)
-    weights_dict = dict(weights_list)
+    weights_dict = dict(list(weights))
     del weights
 
     moe_layers = range(
@@ -26,13 +25,13 @@ def hack_model_load_weights(that, weights):
                 name_weight = partial_name + ".weight"
                 name_weight_scale_inv = partial_name + ".weight_scale_inv"
 
-                weight = weights_dict[name_weight]
-                weight_scale_inv = weights_dict[name_weight_scale_inv]
-                weight_new, weight_scale_inv_new = _transform_moe_weight(weight, weight_scale_inv)
-                weight[...] = weight_new
-                weight_scale_inv[...] = weight_scale_inv_new
+                weight_new, weight_scale_inv_new = \
+                    _transform_moe_weight(weights_dict[name_weight], weights_dict[name_weight_scale_inv])
 
-    return weights_list
+                weights_dict[name_weight] = weight_new
+                weights_dict[name_weight_scale_inv] = weight_scale_inv_new
+
+    return list(weights_dict.items())
 
 
 def _transform_moe_weight(weight: torch.Tensor, weight_scale_inv: torch.Tensor):
