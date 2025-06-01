@@ -1186,7 +1186,8 @@ class DeepEPMoE(EPMoE):
         num_groups, m, k = hidden_states_fp8[0].size()
         n = self.w13_weight.size(1)
         expected_m = min(expected_m, m)
-        gateup_output = torch.empty(
+        # NOTE HACK use zeros instead of empty
+        gateup_output = torch.zeros(
             (num_groups, m, n), device=hidden_states_fp8[0].device, dtype=torch.bfloat16
         )
         fp8_m_grouped_gemm_nt_masked(
@@ -1199,7 +1200,8 @@ class DeepEPMoE(EPMoE):
         )
 
         # Act
-        down_input = torch.empty(
+        # NOTE HACK use zeros instead of empty
+        down_input = torch.zeros(
             (
                 gateup_output.shape[0],
                 gateup_output.shape[1],
@@ -1209,7 +1211,8 @@ class DeepEPMoE(EPMoE):
             dtype=self.fp8_dtype,
         )
         scale_block_size = 128
-        down_input_scale = torch.empty(
+        # NOTE HACK use zeros instead of empty
+        down_input_scale = torch.zeros(
             (
                 gateup_output.shape[0],
                 gateup_output.shape[1],
@@ -1240,7 +1243,8 @@ class DeepEPMoE(EPMoE):
             down_input,
             _copied_get_col_major_tma_aligned_tensor(down_input_scale),
         )
-        down_output = torch.empty(
+        # NOTE HACK use zeros instead of empty
+        down_output = torch.zeros(
             (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16
         )
         fp8_m_grouped_gemm_nt_masked(
