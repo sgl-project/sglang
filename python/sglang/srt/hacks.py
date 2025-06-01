@@ -2,7 +2,7 @@ from typing import Tuple
 
 import torch
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
-from tqdm import tqdm
+from tqdm import trange
 
 
 def hack_requant_moe_weight(that, weights):
@@ -23,8 +23,8 @@ def hack_requant_moe_weight(that, weights):
         "up_proj",
     ]
 
-    for moe_layer in tqdm(moe_layers):
-        for expert_index in range(that.config.n_routed_experts):
+    for moe_layer in moe_layers:
+        for expert_index in trange(that.config.n_routed_experts):
             for module_name in module_names:
                 partial_name = f"model.layers.{moe_layer}.mlp.experts.{expert_index}.{module_name}"
                 name_weight = partial_name + ".weight"
