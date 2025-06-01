@@ -6,7 +6,12 @@ from sglang.srt.managers.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import DeepEPMode, get_int_env_var, load_json_config
+from sglang.srt.utils import (
+    DeepEPMode,
+    get_bool_env_var,
+    get_int_env_var,
+    load_json_config,
+)
 
 try:
     from deep_ep import Buffer, Config
@@ -497,7 +502,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
-            use_fp8=True,
+            use_fp8=get_bool_env_var("SGLANG_HACK_DEEPEP_DISPATCH_LL_FP8", "true"),
         )
         return (
             hidden_states,
