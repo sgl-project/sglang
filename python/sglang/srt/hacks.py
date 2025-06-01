@@ -2,7 +2,9 @@ import torch
 from tqdm import tqdm
 
 
-def hack_model_load_weights(that, weights):
+def hack_requant_moe_weight(that, weights):
+    print('hi hack_requant_moe_weight')
+
     weights_dict = dict(list(weights))
     del weights
 
@@ -26,7 +28,7 @@ def hack_model_load_weights(that, weights):
                 name_weight_scale_inv = partial_name + ".weight_scale_inv"
 
                 weight_new, weight_scale_inv_new = \
-                    _transform_moe_weight(weights_dict[name_weight], weights_dict[name_weight_scale_inv])
+                    _requant_moe_weight(weights_dict[name_weight], weights_dict[name_weight_scale_inv])
 
                 weights_dict[name_weight] = weight_new
                 weights_dict[name_weight_scale_inv] = weight_scale_inv_new
@@ -34,5 +36,5 @@ def hack_model_load_weights(that, weights):
     return list(weights_dict.items())
 
 
-def _transform_moe_weight(weight: torch.Tensor, weight_scale_inv: torch.Tensor):
+def _requant_moe_weight(weight: torch.Tensor, weight_scale_inv: torch.Tensor):
     return TODO, TODO

@@ -1942,7 +1942,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        weights = hacks.hack_model_load_weights(self, weights)
+        if get_bool_env_var("SGLANG_HACK_REQUANT_MOE_WEIGHT"):
+            weights = hacks.hack_requant_moe_weight(self, weights)
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
