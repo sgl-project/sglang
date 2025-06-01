@@ -562,14 +562,11 @@ def generate_chat_conv(
                     if content.type == "image_url":
                         num_image_url += 1
                         conv.modalities.append(content.modalities)
-                if num_image_url > 1:
-                    image_token = conv.image_token
-                else:
-                    image_token = (
-                        conv.image_token + "\n"
-                        if conv.name != "qwen2-vl"
-                        else conv.image_token
-                    )
+                image_token = (
+                    conv.image_token + "\n"
+                    if conv.name != "qwen2-vl"
+                    else conv.image_token
+                )
                 add_token_as_needed: bool = (
                     conv.name in _MODELS_REQUIRING_MODALITY_SUPPLEMENT
                 )
