@@ -39,10 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
-from sglang.srt.two_batch_overlap import (
-    TboCudaGraphRunnerPlugin,
-    TboForwardBatchPreparer,
-)
+from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
     get_available_gpu_memory,
     get_device_memory_capacity,
