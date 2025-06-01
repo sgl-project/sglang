@@ -994,8 +994,6 @@ def topk_to_uint64(
 def flash_attn_with_kvcache(
     attn: RadixAttention,
     q,
-    k_cache,
-    v_cache,
     forward_batch: ForwardBatch,
     k=None,
     v=None,
@@ -1103,16 +1101,16 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
-    assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    # assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
+    # assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
-    if cache_seqlens is not None and isinstance(cache_seqlens, int):
-        cache_seqlens = torch.full(
-            (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
-        )
-        cache_seqlens = maybe_contiguous(cache_seqlens)
+    # if cache_seqlens is not None and isinstance(cache_seqlens, int):
+        # cache_seqlens = torch.full(
+        #     (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+        # )
+        # cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
     if topk_idx is not None:
@@ -1122,31 +1120,20 @@ def flash_attn_with_kvcache(
         )
 
         # blockmask, _ = topk_to_uint64(
+        seq_len = forward_batch.seq_lens_sum
         blockmask, _ = cuda_topk_to_uint64(
             topk_idx,
             (
-                k_cache.shape[1]
+                seq_len
                 if block_table is None
-                else block_table.shape[1] * k_cache.shape[1]
+                else block_table.shape[1] * seq_len
             ),
             64,
         )  # N_BLOCK_DIM=64
     else:
         blockmask = None
 
-    # print(f"{cache_batch_idx=}")
-    # print(f"{block_table=}")
-    # print(f"{cache_seqlens=}")
-    # print(f"{softmax_scale=}")
-    # print(f"{window_size=}")
-    # print(f"{softcap=}")
-    # print(f"{k_cache=}")
-    # print(f"{k_cache.shape=}")
-    # print(f"{v_cache=}")
     softmax_lse = None
-    # print(f"{q.shape=}")
-    # print(f"{k.shape=}")
-    # print(f"{k_cache.shape=}")
     # FIXME: If key is supplied, it must have seqlen <= the seqlen of the KV cache
     # out, softmax_lse = flash_attn_gpu.fwd_kvcache(
     #     q,
@@ -1173,11 +1160,17 @@ def flash_attn_with_kvcache(
     #     block_window_size,
     # )
 
-    out = attn(q, k, v, forward_batch,
-               is_sparse=True,
-               blockmask=blockmask,
-               block_window_size=block_window_size, k_cache=k_cache, v_cache=v_cache
-               )
+    out = attn(
+        q,
+        k,
+        v,
+        forward_batch,
+        is_sparse=True,
+        blockmask=blockmask,
+        block_window_size=block_window_size,
+        # k_cache=k_cache,
+        # v_cache=v_cache,
+    )
 
     # from sgl_kernel.flash_attn import (
     #     flash_attn_with_kvcache as flash_attn_with_kvcache_kernel,
@@ -1373,11 +1366,15 @@ class MiniCPMSparseFlashAttention2(nn.Module):
             flash_attn_with_kvcache,
         )
 
-        topk_attn_output = self.attn.forward(q, k, v, forward_batch,
-                                             is_sparse=True,
-                                             block_window_size=self.window_size // self.block_size,
-                                             topk_idx=topk_idx,
-                                             )
+        topk_attn_output = self.attn.forward(
+            q,
+            k,
+            v,
+            forward_batch,
+            is_sparse=True,
+            block_window_size=self.window_size // self.block_size,
+            topk_idx=topk_idx,
+        )
         # topk_attn_output = flash_attn_varlen_func(
         #     q,
         #     k,
@@ -1816,10 +1813,6 @@ class MiniCPMSparseFlashAttention2(nn.Module):
 
             new_k = k[:, -1:, :, :].contiguous()
             new_v = v[:, -1:, :, :].contiguous()
-            # print(f"{forward_batch=}")
-
-            past_k = k[:, :-1, :, :].contiguous()
-            past_v = v[:, :-1, :, :].contiguous()
 
             if no_rope_param is not None:
                 # nope unpad
@@ -1831,8 +1824,6 @@ class MiniCPMSparseFlashAttention2(nn.Module):
                 ].squeeze(0)
 
             attn_output = self.nsa_forward_with_kv_cache(
-                past_k=past_k,
-                past_v=past_v,
                 new_k=new_k,
                 new_v=new_v,
                 new_q=new_q,
@@ -1850,8 +1841,6 @@ class MiniCPMSparseFlashAttention2(nn.Module):
     def nsa_forward_with_kv_cache(
         self,
         forward_batch: ForwardBatch,
-        past_k=None,
-        past_v=None,
         new_k=None,
         new_v=None,
         new_q=None,
@@ -1944,19 +1933,19 @@ class MiniCPMSparseFlashAttention2(nn.Module):
             (batch_size,), seqlen_k - 1, dtype=torch.int32, device=new_q.device
         )
 
-        past_k = torch.cat(
-            [past_k, torch.zeros_like(new_k, dtype=new_k.dtype)], dim=1
-        ).contiguous()  # Append one zero vector to avoid potential out-of-bounds access
-        past_v = torch.cat(
-            [past_v, torch.zeros_like(new_v, dtype=new_v.dtype)], dim=1
-        ).contiguous()  # Append one zero vector to avoid potential out-of-bounds access
+        # past_k = torch.cat(
+        #     [past_k, torch.zeros_like(new_k, dtype=new_k.dtype)], dim=1
+        # ).contiguous()  # Append one zero vector to avoid potential out-of-bounds access
+        # past_v = torch.cat(
+        #     [past_v, torch.zeros_like(new_v, dtype=new_v.dtype)], dim=1
+        # ).contiguous()  # Append one zero vector to avoid potential out-of-bounds access
 
         topk_attn_output = flash_attn_with_kvcache(
             attn=self.attn,
             forward_batch=forward_batch,
             q=new_q,
-            k_cache=past_k,
-            v_cache=past_v,
+            # k_cache=past_k,
+            # v_cache=past_v,
             topk_idx=topk_idx,
             block_window_size=self.window_size // self.block_size,
             k=new_k,  # [batch_size, 1, nheads_k, d]
