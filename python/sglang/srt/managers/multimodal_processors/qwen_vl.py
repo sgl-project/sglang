@@ -32,8 +32,8 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         )
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
-        self.image_token_id = hf_config.image_token_id
-        self.video_token_id = hf_config.video_token_id
+        self.IM_TOKEN_ID = hf_config.image_token_id
+        self.VIDEO_TOKEN_ID = hf_config.video_token_id
         self.vision_start_token_id = hf_config.vision_start_token_id
         self.vision_end_token_id = hf_config.vision_end_token_id
         self.NUM_TOKEN_PER_FRAME = 770
@@ -129,6 +129,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         async def resize_image_async(image):
             return resize_image(image)
 
+        # Qwen-specific: resize images if they are raw Image objects
         if base_output.images and isinstance(base_output.images[0], Image.Image):
             resize_tasks = [resize_image_async(image) for image in base_output.images]
             base_output.images = await asyncio.gather(*resize_tasks)
@@ -138,50 +139,23 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             print(f"DEBUG: base_output.images: {base_output.images}")
             print(f"DEBUG: base_output.images[0]: {base_output.images[0]}")
 
-        combined_mm_item = self.get_combined_mm_item(base_output)
+        combined_mm_item = self.process_and_combine_mm_data(base_output)
+        input_ids = combined_mm_item.input_ids
 
-        if (
-            combined_mm_item is None
-        ):  # if the images are not preprocessed, we need to process them
-            if not base_output.images:
-                print(f"DEBUG: No images to process")
-                return None
-
-            ret = self.process_mm_data(
-                input_text=base_output.input_text,
-                images=base_output.images,
-            )
-            combined_mm_item = MultimodalDataItem(
-                modality=Modality.IMAGE,
-                pixel_values=ret["pixel_values"],
-                image_grid_thws=ret["image_grid_thw"],
-            )
-            input_ids = ret["input_ids"].flatten()
-            second_per_grid_ts = ret.get("second_per_grid_ts", None)
-        else:
-            input_ids = self._processor.tokenizer(
-                base_output.input_text,
-                return_tensors="pt",
-                add_special_tokens=True,
-            ).input_ids.flatten()
-            second_per_grid_ts = getattr(combined_mm_item, "second_per_grid_ts", None)
-
-        combined_mm_item.image_offsets = self.get_mm_items_offset(
-            input_ids=input_ids,
-            mm_token_id=self.image_token_id,
-        )
+        video_grid_thw = None  # TODO
+        second_per_grid_ts = getattr(combined_mm_item, "second_per_grid_ts", None)
 
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
-            image_token_id=self.image_token_id,
-            video_token_id=self.video_token_id,
+            image_token_id=self.IM_TOKEN_ID,
+            video_token_id=self.VIDEO_TOKEN_ID,
             vision_start_token_id=self.vision_start_token_id,
             model_type=self.hf_config.model_type,
             tokens_per_second=getattr(
                 self.hf_config.vision_config, "tokens_per_second", None
             ),
             input_ids=input_ids.unsqueeze(0),
-            image_grid_thw=combined_mm_item.image_grid_thws,
+            image_grid_thw=combined_mm_item.image_grid_thw,
             video_grid_thw=video_grid_thw,
             second_per_grid_ts=second_per_grid_ts,
         )
@@ -192,8 +166,8 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             "mm_items": [combined_mm_item],
             "im_start_id": self.IM_START_TOKEN_ID,
             "im_end_id": self.IM_END_TOKEN_ID,
-            "im_token_id": self.image_token_id,
-            "video_token_id": self.video_token_id,
+            "im_token_id": self.IM_TOKEN_ID,
+            "video_token_id": self.VIDEO_TOKEN_ID,
             "mrope_positions": mrope_positions,
             "mrope_position_delta": mrope_position_delta,
         }

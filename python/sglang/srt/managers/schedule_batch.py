@@ -174,6 +174,8 @@ class MultimodalDataItem:
 
     modality: Modality
 
+    input_ids: Optional[torch.Tensor] = None
+
     hash: int = None
     pad_value: int = None
 
@@ -186,7 +188,7 @@ class MultimodalDataItem:
     # the real data, pixel_values or audio_features
     # data: Union[List[torch.Tensor], List[np.ndarray]]
     pixel_values: Union[torch.Tensor, np.ndarray] = None
-    image_grid_thws: Union[torch.Tensor, np.ndarray] = None
+    image_grid_thw: Union[torch.Tensor, np.ndarray] = None
     video_grid_thws: Union[torch.Tensor, np.ndarray] = None
 
     image_emb_mask: Optional[torch.Tensor] = None
