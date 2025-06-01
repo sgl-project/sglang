@@ -91,6 +91,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -317,6 +318,16 @@ class ModelRunner:
     def model_specific_adjustment(self):
         server_args = self.server_args
 
+        if (
+            server_args.attention_backend == "intel_amx"
+            and server_args.device == "cpu"
+            and not cpu_has_amx_support()
+        ):
+            logger.info(
+                "The current platform does not support Intel AMX, will fallback to torch_native backend."
+            )
+            server_args.attention_backend = "torch_native"
+
         if server_args.attention_backend is None:
             """
             Auto select the fastest attention backend.
@@ -369,7 +380,10 @@ class ModelRunner:
                         f"Invalid attention backend for MLA: {server_args.attention_backend}"
                     )
             else:
-                raise ValueError("MLA optimization not supported on CPU.")
+                if server_args.attention_backend != "intel_amx":
+                    raise ValueError(
+                        "MLA optimization not supported on CPU except for intel_amx backend."
+                    )
 
         if (
             server_args.attention_backend == "fa3"
@@ -1045,10 +1059,6 @@ class ModelRunner:
 
             return AiterAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
-            assert self.sliding_window_size is None, (
-                "Window attention is not supported in the triton attention backend. "
-                "Please use `--attention-backend flashinfer`."
-            )
             assert not self.model_config.is_encoder_decoder, (
                 "Cross attention is not supported in the triton attention backend. "
                 "Please use `--attention-backend flashinfer`."
@@ -1091,6 +1101,13 @@ class ModelRunner:
             )
 
             return CutlassMLABackend(self)
+        elif self.server_args.attention_backend == "intel_amx":
+            from sglang.srt.layers.attention.intel_amx_backend import (
+                IntelAMXAttnBackend,
+            )
+
+            logger.info(f"Intel AMX attention backend is enabled.")
+            return IntelAMXAttnBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
