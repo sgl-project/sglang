@@ -220,7 +220,7 @@ class ForwardBatch:
     input_embeds: Optional[torch.tensor] = None
 
     # For cross-encoder model
-    token_type_ids: Optional[int] = None
+    token_type_ids: Optional[torch.Tensor] = None
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
