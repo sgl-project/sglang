@@ -451,8 +451,8 @@ class Phi4MMForCausalLM(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens([im_token_id])
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
-    def should_apply_lora(self, module_name: str) -> Optional[str]:
-        return self.lora_pattern.match(module_name)
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self.lora_pattern.match(module_name))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
