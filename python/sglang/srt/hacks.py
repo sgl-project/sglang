@@ -95,6 +95,7 @@ def _requant_grouped_moe_weight(that, weight: torch.Tensor, weight_scale_inv: to
     )
 
     assert n % 128 == 0
+    assert k % 128 == 0
     weight_dequant_flat = einops.rearrange(weight_dequant, 'num_group n k -> (num_group n) k')
     out_w_flat, out_s_flat = per_block_cast_to_fp8(weight_dequant_flat)
 
