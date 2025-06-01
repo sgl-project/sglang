@@ -1,6 +1,7 @@
 import logging
 from typing import Callable, List, Optional, Tuple
 
+import einops
 import torch
 from sglang.srt import debug_utils
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
@@ -1294,15 +1295,16 @@ def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 
 def _modified_construct_masked_grouped_x(x):
     num_groups, m, k = x.shape
-    x_fp8 = (
-        torch.empty_like(x, dtype=torch.float8_e4m3fn),
-        torch.empty(
-            (num_groups, m, ceil_div(k, 128)), device="cuda", dtype=torch.float
-        ),
-    )
-    for i in range(num_groups):
-        x_fp8[0][i], x_fp8[1][i] = per_token_cast_to_fp8(x[i])
-    return x_fp8
+    assert k % 128 == 0
+
+    x_flat = einops.rearrange(x, 'num_group num_token hidden -> (num_group num_token) hidden')
+    out_w_flat, out_s_flat = per_token_cast_to_fp8(x_flat)
+
+    def _unflatten(x):
+        return einops.rearrange(x, '(num_group num_token) whatever_div_128 -> num_group num_token whatever_div_128',
+                                num_group=num_groups)
+
+    return _unflatten(out_w_flat), _unflatten(out_s_flat)
 
 
 def ceil_div(x: int, y: int) -> int:
