@@ -371,12 +371,19 @@ class ChatCompletionRequest(BaseModel):
     )  # noqa
 
     @root_validator(pre=True)
-    def set_tool_choice_default(cls, values):
+    def set_default(cls, values):
+        if values.get("presence_penalty") is None:
+            values["presence_penalty"] = 0.0
+
+        if values.get("frequency_penalty") is None:
+            values["frequency_penalty"] = 0.0
+
         if values.get("tool_choice") is None:
             if values.get("tools") is None:
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
+
         return values
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
