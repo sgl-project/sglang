@@ -24,7 +24,7 @@ def hack_requant_moe_weight(that, weights):
     ]
 
     for moe_layer in moe_layers:
-        for expert_index in trange(that.config.n_routed_experts):
+        for expert_index in trange(that.config.n_routed_experts, desc=f"layer={moe_layer}"):
             for module_name in module_names:
                 partial_name = f"model.layers.{moe_layer}.mlp.experts.{expert_index}.{module_name}"
                 name_weight = partial_name + ".weight"
