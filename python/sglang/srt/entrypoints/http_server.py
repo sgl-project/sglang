@@ -229,6 +229,11 @@ async def get_server_info():
     }
 
 
+@app.get("/get_load")
+async def get_load():
+    return await _global_state.tokenizer_manager.get_load()
+
+
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
@@ -345,6 +350,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         activities=obj.activities,
         with_stack=obj.with_stack,
         record_shapes=obj.record_shapes,
+        profile_by_stage=obj.profile_by_stage,
     )
     return Response(
         content="Start profiling.\n",
