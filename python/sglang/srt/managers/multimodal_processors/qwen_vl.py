@@ -53,7 +53,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
     ):
         if isinstance(image_data, str):
             image_data = [image_data]
-        print(f"DEBUG: image_data: {image_data}")
 
         base_output = self.load_mm_data(
             prompt=input_text,
@@ -64,9 +63,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             ),
             max_req_input_len=max_req_input_len,
         )
-        if base_output.images is None:
-            print(f"DEBUG: base_output.images is None")
-            return None
 
         def smart_resize(
             height: int,
@@ -135,9 +131,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             base_output.images = await asyncio.gather(*resize_tasks)
 
         video_grid_thw = None  # TODO
-        if base_output.images:
-            print(f"DEBUG: base_output.images: {base_output.images}")
-            print(f"DEBUG: base_output.images[0]: {base_output.images[0]}")
 
         combined_mm_item = self.process_and_combine_mm_data(base_output)
         input_ids = combined_mm_item.input_ids
