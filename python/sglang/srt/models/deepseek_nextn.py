@@ -21,6 +21,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.dp_attention import dp_gather_weight
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -77,6 +78,7 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+
         zero_allocator = BumpAllocator(
             buffer_size=2,
             dtype=torch.float32,
@@ -89,16 +91,16 @@ class DeepseekModelNextN(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-
-        hidden_states = self.eh_proj(
-            torch.cat(
-                (
-                    self.enorm(hidden_states),
-                    self.hnorm(forward_batch.spec_info.hidden_states),
-                ),
-                dim=-1,
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states = self.eh_proj(
+                torch.cat(
+                    (
+                        self.enorm(hidden_states),
+                        self.hnorm(forward_batch.spec_info.hidden_states),
+                    ),
+                    dim=-1,
+                )
             )
-        )
 
         residual = None
         hidden_states, residual = self.decoder(
@@ -107,6 +109,7 @@ class DeepseekModelNextN(nn.Module):
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+
         return hidden_states
 
 
@@ -159,6 +162,23 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        if global_server_args_dict["enable_dp_attention"]:
+            global_head_data, local_head_data = (
+                torch.empty_like(self.lm_head.weight.data),
+                head.data,
+            )
+            use_attn_tp_group = global_server_args_dict["enable_dp_lm_head"]
+            dp_gather_weight(global_head_data, local_head_data, use_attn_tp_group)
+            self.lm_head.weight.data = global_head_data
+        else:
+            del self.lm_head.weight
+            self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
 EntryClass = [DeepseekV3ForCausalLMNextN]
