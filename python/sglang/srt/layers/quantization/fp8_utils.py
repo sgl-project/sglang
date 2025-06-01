@@ -42,9 +42,9 @@ _is_fp8_fnuz = is_fp8_fnuz()
 
 
 if _is_cuda:
-    scaled_fp8_quant_fn = ops.scaled_fp8_quant
-else:
     scaled_fp8_quant_fn = scaled_fp8_quant
+else:
+    scaled_fp8_quant_fn = ops.scaled_fp8_quant
 
 
 use_aiter_moe = get_bool_env_var("SGLANG_AITER_MOE")
@@ -481,7 +481,6 @@ def cutlass_gemm_dq_fp8_linear_compressed(
 ) -> torch.Tensor:
 
     if weight_scale.numel() != weight.shape[1]:
-        ## changyi mark
         return torch_fallback_fp8_linear_compressed(
             input,
             weight,
@@ -540,7 +539,7 @@ def cutlass_fp8_linear_compressed(
     qinput, x_scale = scaled_fp8_quant(
         input_2d,
         input_scale,
-        use_per_token_if_dynamic=True,
+        use_per_token_if_dynamic=use_per_token_if_dynamic,
     )
     output = fp8_scaled_mm(
         qinput,
@@ -579,7 +578,9 @@ def torch_fp8_linear_compressed(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[1]]
 
-    output_padding = 17 if (pad_output is None or pad_output) else None
+    if pad_output is None:
+        pad_output = not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
+    output_padding = 17 if pad_output else None
 
     qinput, x_scale = scaled_fp8_quant_fn(
         input_2d,
@@ -656,7 +657,9 @@ def torch_fallback_fp8_linear_compressed(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[1]]
 
-    output_padding = 17 if (pad_output is None or pad_output) else None
+    if pad_output is None:
+        pad_output = not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
+    output_padding = 17 if pad_output else None
 
     qinput, x_scale = scaled_fp8_quant_fn(
         input_2d,
