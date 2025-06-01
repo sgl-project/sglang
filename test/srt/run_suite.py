@@ -19,6 +19,8 @@ suites = {
         TestFile("models/lora/test_lora_cuda_graph.py", 250),
         TestFile("models/test_embedding_models.py", 73),
         # TestFile("models/test_clip_models.py", 52),
+        TestFile("models/test_encoder_embedding_models.py", 100),
+        TestFile("models/test_cross_encoder_models.py", 100),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_generation_models.py", 103),
         # TestFile("models/test_gme_qwen_models.py", 45),
