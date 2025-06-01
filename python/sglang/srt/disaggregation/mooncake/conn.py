@@ -108,6 +108,8 @@ class KVArgsRegisterInfo:
     mooncake_session_id: str
     dst_kv_ptrs: list[int]
     dst_aux_ptrs: list[int]
+    tp_rank_id_in_group: int        
+    tp_world_size_of_group: int     
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -118,6 +120,8 @@ class KVArgsRegisterInfo:
             mooncake_session_id=msg[3].decode("ascii"),
             dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
+            tp_rank_id_in_group=int(msg[6].decode("ascii")),
+            tp_world_size_of_group=int(msg[7].decode("ascii"))
         )
 
 
@@ -286,6 +290,128 @@ class MooncakeKVManager(BaseKVManager):
 
         return 0
 
+    def send_kvcache_slice(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int64],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int64],
+        target_tp_rank: int,
+        decode_tp_world_size: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ):
+        # Group by indices
+        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
+            prefill_kv_indices, dst_kv_indices
+        )
+
+        # rank/kv_head config
+        local_tp_rank = self.kv_args.engine_rank
+        local_tp_size = self.tp_size // self.dp_size
+        num_kv_heads = self.kv_args.kv_head_num
+        num_layers = len(self.kv_args.kv_data_ptrs)
+
+        heads_per_decode_rank = num_kv_heads * local_tp_size // decode_tp_world_size
+        heads_per_prefill_rank = num_kv_heads
+        decode_global_head_start = target_tp_rank * heads_per_decode_rank
+        prefill_global_head_start = local_tp_rank * heads_per_prefill_rank
+
+        # decode config
+        decode_rank_item_lens = [(item * local_tp_size //  decode_tp_world_size) for item in self.kv_args.kv_item_lens]
+        
+        if local_tp_size > decode_tp_world_size:
+            src_head_offset = 0
+            num_heads_to_send = heads_per_prefill_rank
+            dst_head_offset = prefill_global_head_start - decode_global_head_start
+        else:
+            src_head_offset = decode_global_head_start - prefill_global_head_start
+            num_heads_to_send = heads_per_decode_rank
+            dst_head_offset = 0
+
+        layer_transfer_params = []
+        for layer_id in range(num_layers): 
+            item_len_of_prefill_rank_page = self.kv_args.kv_item_lens[layer_id]  
+            
+            # Page stride on the target Decode rank for its slice pages
+            item_len_of_decode_rank_page = decode_rank_item_lens[layer_id] 
+
+            if item_len_of_prefill_rank_page == 0 or num_kv_heads == 0:
+                logger.error(f"Invalid item_len_of_prefill_rank_page or num_kv_heads for layer {layer_id}")
+                return -1
+
+            bytes_per_head = item_len_of_prefill_rank_page // heads_per_prefill_rank
+
+            # Calculate precise byte offset and length for the sub-slice within Prefill page data
+            src_slice_offset = \
+                src_head_offset * bytes_per_head
+            dst_slice_offset = dst_head_offset * bytes_per_head
+            slice_lens_per_page = \
+                num_heads_to_send * bytes_per_head
+
+            # Sanity check: The data sub-slice we intend to send should fit into D_n's page.
+            # This means slice_lens_per_page <= item_len_of_decode_rank_page
+            if slice_lens_per_page > item_len_of_decode_rank_page:
+                logger.error(
+                    f"[{mooncake_session_id}] Layer {layer_id}: "
+                    f"slice size ({slice_lens_per_page}) exceeds "
+                    f"target page size ({item_len_of_decode_rank_page})"
+                )
+                return -1
+            layer_transfer_params.append(
+                (
+                    self.kv_args.kv_data_ptrs[layer_id],      # Prefill base ptr (all heads)
+                    dst_kv_ptrs[layer_id],                    # Decode base ptr (for its slice for this layer)
+                    item_len_of_prefill_rank_page,            # Prefill page size (all heads)2048
+                    item_len_of_decode_rank_page,             # Decode page stride (for its slice page) 1024
+                    src_slice_offset,                   # Offset to slice data in Prefill page
+                    dst_slice_offset,
+                    slice_lens_per_page,                     # Length of slice data per page (actual data to send)
+                )
+            )
+
+        def process_layer_tp_aware(layer_params):
+            (src_ptr, dst_ptr,
+            src_item_len, dst_item_len,
+            src_offset, dst_offset, slice_lens_per_page) = layer_params
+
+            for prefill_block, dst_block in zip(prefill_kv_blocks, dst_kv_blocks):
+                for prefill_page_idx, decode_page_idx in zip(prefill_block, dst_block):
+
+                    src_page_addr = src_ptr + prefill_page_idx * src_item_len
+                    src_slice_addr = src_page_addr + src_offset
+
+                    dst_slice_addr = dst_ptr + decode_page_idx * dst_item_len + dst_offset
+                    
+                    logger.debug(f"SYNC: sid={mooncake_session_id}, "
+                                f"src={src_slice_addr}, dst={dst_slice_addr}, len={slice_lens_per_page}")
+                    status = self.engine.transfer_sync(
+                        mooncake_session_id,
+                        src_slice_addr,
+                        dst_slice_addr,
+                        slice_lens_per_page
+                    )
+                    if status != 0:
+                        logger.error(f"transfer_sync failed with status {status} for session {mooncake_session_id}")
+                        return status
+            return 0
+
+        futures = [
+            executor.submit(
+                process_layer_tp_aware,  
+                layer_params,
+            )
+            for layer_params in layer_transfer_params
+        ]
+
+        for future in concurrent.futures.as_completed(futures):
+            status = future.result()
+            if status != 0:
+                for f in futures:
+                    f.cancel()
+                return status
+
+        return 0
+
     def send_aux(
         self,
         mooncake_session_id: str,
@@ -360,15 +486,27 @@ class MooncakeKVManager(BaseKVManager):
                                 f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
                             )
 
-                        ret = self.send_kvcache(
-                            req.mooncake_session_id,
-                            kv_chunk.prefill_kv_indices,
-                            self.decode_kv_args_table[
-                                req.mooncake_session_id
-                            ].dst_kv_ptrs,
-                            chunked_dst_kv_indice,
-                            executor,
-                        )
+                        target_rank_registration_info: KVArgsRegisterInfo = \
+                                self.decode_kv_args_table[req.mooncake_session_id]
+                        local_tp_rank = self.tp_size // self.dp_size
+                        if self.is_mla_backend or local_tp_rank == target_rank_registration_info.tp_world_size_of_group:
+                            ret = self.send_kvcache(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                executor,
+                                )
+                        else:
+                            ret = self.send_kvcache_slice(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                target_rank_registration_info.tp_rank_id_in_group,
+                                target_rank_registration_info.tp_world_size_of_group,
+                                executor,
+                                )
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
@@ -806,9 +944,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.required_dst_info_num = 1
             self.target_tp_ranks = [self.target_tp_rank]
         elif local_tp_size_per_dp_rank > prefill_tp_size_per_dp_rank:
-            assert (
-                self.kv_mgr.is_mla_backend
-            ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
             self.target_tp_rank = (
                 self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
             ) // (local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank)
@@ -817,10 +952,6 @@ class MooncakeKVReceiver(BaseKVReceiver):
             )
             self.target_tp_ranks = [self.target_tp_rank]
         else:
-            assert (
-                self.kv_mgr.is_mla_backend
-            ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
-
             # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks for non MLA models;
             self.target_tp_ranks = [
                 rank
@@ -853,11 +984,16 @@ class MooncakeKVReceiver(BaseKVReceiver):
                     self.target_dp_group,
                 )
                 if bootstrap_info is not None:
-                    # NOTE: only support MLA for now: select one prefill rank as real rank
-                    bootstrap_info["is_dummy"] = not bool(
-                        target_tp_rank == self.target_tp_rank
-                        or self.target_tp_rank is None
-                    )
+                    if self.kv_mgr.is_mla_backend:
+                        # MLA :select one prefill rank as real rank
+                        bootstrap_info["is_dummy"] = not bool(
+                            target_tp_rank == self.target_tp_rank
+                            or self.target_tp_rank is None
+                        )
+                    else:
+                        # no-MLA：select all prefill ranks
+                        bootstrap_info["is_dummy"] = False
+
                     logger.debug(
                         f"Fetched bootstrap info: {bootstrap_info} for DP {self.target_dp_group} TP {target_tp_rank}"
                     )
@@ -931,6 +1067,10 @@ class MooncakeKVReceiver(BaseKVReceiver):
             packed_aux_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
             )
+            tp_rank = self.kv_mgr.kv_args.engine_rank
+            tp_size = self.kv_mgr.tp_size // self.kv_mgr.dp_size
+            tp_rank_id_bytes = str(tp_rank).encode("ascii")
+            tp_world_size_bytes = str(tp_size).encode("ascii")
 
             sock, lock = self._connect("tcp://" + self.prefill_server_url)
             with lock:
@@ -942,6 +1082,8 @@ class MooncakeKVReceiver(BaseKVReceiver):
                         self.session_id.encode("ascii"),
                         packed_kv_data_ptrs,
                         packed_aux_data_ptrs,
+                        tp_rank_id_bytes,
+                        tp_world_size_bytes,
                     ]
                 )
 
