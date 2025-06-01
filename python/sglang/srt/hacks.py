@@ -20,16 +20,17 @@ def hack_model_load_weights(that, weights):
     ]
 
     for moe_layer in tqdm(moe_layers):
-        for module_name in module_names:
-            partial_name = f"model.layers.{moe_layer}.mlp.shared_experts.{module_name}"
-            name_weight = partial_name + ".weight"
-            name_scale_inv = partial_name + ".weight_scale_inv"
+        for expert_index in range(that.config.n_routed_experts):
+            for module_name in module_names:
+                partial_name = f"model.layers.{moe_layer}.mlp.experts.{expert_index}.{module_name}"
+                name_weight = partial_name + ".weight"
+                name_scale_inv = partial_name + ".weight_scale_inv"
 
-            weight = weights_dict[name_weight]
-            scale_inv = weights_dict[name_scale_inv]
-            weight_new, scale_inv_new = _transform_moe_weight(weight, scale_inv)
-            weight[...] = weight_new
-            scale_inv[...] = scale_inv_new
+                weight = weights_dict[name_weight]
+                scale_inv = weights_dict[name_scale_inv]
+                weight_new, scale_inv_new = _transform_moe_weight(weight, scale_inv)
+                weight[...] = weight_new
+                scale_inv[...] = scale_inv_new
 
     return weights_list
 
