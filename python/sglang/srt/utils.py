@@ -1268,15 +1268,25 @@ def get_hpu_memory_capacity():
 
 
 def get_device_memory_capacity(device: str = None):
-    if is_cuda():
-        gpu_mem = get_nvgpu_memory_capacity()
-    elif is_hip():
-        gpu_mem = get_amdgpu_memory_capacity()
-    elif device == "hpu":
-        gpu_mem = get_hpu_memory_capacity()
-    else:
-        # GPU memory is not known yet or no GPU is available.
-        gpu_mem = None
+    try:
+        if is_hip():
+            gpu_mem = get_amdgpu_memory_capacity()
+        elif torch.cuda.is_available():
+            gpu_mem = get_nvgpu_memory_capacity()
+        elif device == "hpu":
+            gpu_mem = get_hpu_memory_capacity()
+        else:
+            # GPU memory is not known yet or no GPU is available.
+            gpu_mem = None
+    except ValueError as e:
+        fallback_value = os.environ.get("SGLANG_GPU_MEMORY_TOTAL_FALLBACK", None)
+        if fallback_value:
+            gpu_mem = float(fallback_value)
+        else:
+            logger.info(
+                "Impossible to get the memory capacity, you might set it manually via SGLANG_GPU_MEMORY_TOTAL_FALLBACK environment"
+            )
+            raise e
 
     return gpu_mem
 
