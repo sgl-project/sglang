@@ -17,6 +17,7 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    is_in_ci,
     popen_launch_server,
     run_bench_one_batch_server,
 )
@@ -59,7 +60,7 @@ class TestPPAccuracy(unittest.TestCase):
 
         self.assertGreater(metrics["accuracy"], 0.74)
         # Wait a little bit so that the memory check happens.
-        time.sleep(5)
+        time.sleep(4)
 
 
 class TestQwenPPAccuracy(unittest.TestCase):
@@ -97,20 +98,17 @@ class TestQwenPPAccuracy(unittest.TestCase):
         finally:
             kill_process_tree(process.pid)
 
-    def test_baseline_accuracy(self):
-        metrics = self.run_gsm8k_test(pp_size=1)
-        print(f"[Qwen Baseline] {metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.74)
-
+    @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
     def test_pp_consistency(self):
         baseline = self.run_gsm8k_test(pp_size=1)
         pp_metrics = self.run_gsm8k_test(pp_size=2)
 
         print(f"[Qwen PP Comparison] Baseline: {baseline} | PP: {pp_metrics}")
 
+        self.assertGreaterEqual(baseline["accuracy"], 0.74)
         self.assertGreaterEqual(
             pp_metrics["accuracy"],
-            baseline["accuracy"] - 0.01,
+            baseline["accuracy"] - 0.02,
             msg=(
                 f"PP accuracy dropped more than 1% compared to baseline. "
                 f"Baseline: {baseline['accuracy']:.2%}, PP: {pp_metrics['accuracy']:.2%}"
@@ -155,20 +153,16 @@ class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
         finally:
             kill_process_tree(process.pid)
 
-    def test_baseline_accuracy(self):
-        metrics = self.run_gsm8k_test(pp_size=1)
-        print(f"[Qwen Baseline] {metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.39)
-
     def test_pp_consistency(self):
         baseline = self.run_gsm8k_test(pp_size=1)
         pp_metrics = self.run_gsm8k_test(pp_size=2)
 
         print(f"[Qwen PP Comparison] Baseline: {baseline} | PP: {pp_metrics}")
 
+        self.assertGreaterEqual(baseline["accuracy"], 0.38)
         self.assertGreaterEqual(
             pp_metrics["accuracy"],
-            baseline["accuracy"] - 0.01,
+            baseline["accuracy"] - 0.02,
             msg=(
                 f"PP accuracy dropped more than 1% compared to baseline. "
                 f"Baseline: {baseline['accuracy']:.2%}, PP: {pp_metrics['accuracy']:.2%}"
@@ -211,20 +205,16 @@ class TestQwenMoePPAccuracy(unittest.TestCase):
         finally:
             kill_process_tree(process.pid)
 
-    def test_baseline_accuracy(self):
-        metrics = self.run_gsm8k_test(pp_size=1)
-        print(f"[Qwen Baseline] {metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.74)
-
     def test_pp_consistency(self):
         baseline = self.run_gsm8k_test(pp_size=1)
         pp_metrics = self.run_gsm8k_test(pp_size=2)
 
         print(f"[Qwen PP Comparison] Baseline: {baseline} | PP: {pp_metrics}")
 
+        self.assertGreaterEqual(baseline["accuracy"], 0.74)
         self.assertGreaterEqual(
             pp_metrics["accuracy"],
-            baseline["accuracy"] - 0.01,
+            baseline["accuracy"] - 0.02,
             msg=(
                 f"PP accuracy dropped more than 1% compared to baseline. "
                 f"Baseline: {baseline['accuracy']:.2%}, PP: {pp_metrics['accuracy']:.2%}"

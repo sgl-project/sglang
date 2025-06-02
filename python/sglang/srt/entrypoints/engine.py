@@ -506,7 +506,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda:
         assert_pkg_version(
             "sgl-kernel",
-            "0.1.4",
+            "0.1.5",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
@@ -514,9 +514,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         pid, exitcode = os.waitpid(0, os.WNOHANG)
         if exitcode != 0:
             logger.warning(
-                "Child process unexpectedly failed with an exit code %d. pid=%d",
-                exitcode,
-                pid,
+                f"Child process unexpectedly failed with {exitcode=}. {pid=}"
             )
 
     signal.signal(signal.SIGCHLD, sigchld_handler)

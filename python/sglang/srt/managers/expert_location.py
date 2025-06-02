@@ -401,7 +401,6 @@ def compute_initial_expert_location_metadata(
 ) -> ExpertLocationMetadata:
     data = server_args.init_expert_location
     if data == "trivial":
-        logger.info("init_expert_location from trivial")
         return ExpertLocationMetadata.init_trivial(server_args, model_config)
 
     # TODO unify with the utils function

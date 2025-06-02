@@ -35,10 +35,6 @@ def validate_input_length(
                 f"the maximum allowed length ({max_req_input_len} tokens). "
                 f"Use a shorter input or enable --allow-auto-truncate."
             )
-            logger.error(error_msg)
-            req.finished_reason = FINISH_ABORT(
-                error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
-            )
             return error_msg
 
     return None
