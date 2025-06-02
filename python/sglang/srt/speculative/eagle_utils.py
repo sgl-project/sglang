@@ -535,9 +535,9 @@ class EagleVerifyInput:
             output_size,  # [1] - output
         )
 
-        output_size_val = output_size.item()
-        verified_id = verified_id[:output_size_val]
-        accept_index = filtered_accept_index[:output_size_val]
+        # Use output_size directly from kernel (no additional GPU operations needed)
+        verified_id = verified_id[:output_size]
+        accept_index = filtered_accept_index[:output_size]
 
         if has_finished:
             accept_length = tmp_accept_length

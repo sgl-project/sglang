@@ -313,9 +313,6 @@ __global__ void ProcessAcceptIndexKernel(
   }
 
   __syncthreads();
-  if (bx == 0) {
-    __threadfence();  // Ensure writes are visible to other blocks
-  }
 
   uint32_t valid_count = 0;
   if (tx == 0) {
@@ -355,9 +352,19 @@ __global__ void ProcessAcceptIndexKernel(
     }
   }
 
-  if (bx == batch_size - 1 && tx == 0) {
-    uint32_t total_accepted = global_offset + valid_count;
-    *output_size = total_accepted;
+  if (bx == 0) {
+    __syncthreads();
+
+    if (tx == 0) {
+      uint32_t total_accept_length = 0;
+      for (uint32_t b = 0; b < batch_size; ++b) {
+        IdType accept_len = accept_length[b];
+        if (accept_len >= 0) {
+          total_accept_length += (accept_len + 1);  // +1 because accept_length = valid_count - 1
+        }
+      }
+      *output_size = total_accept_length;
+    }
   }
 }
 
