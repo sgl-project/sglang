@@ -77,11 +77,7 @@ from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
-from sglang.srt.model_loader.loader import (
-    DefaultModelLoader,
-    device_loading_context,
-    get_model_loader,
-)
+from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
@@ -91,6 +87,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -317,6 +314,16 @@ class ModelRunner:
     def model_specific_adjustment(self):
         server_args = self.server_args
 
+        if (
+            server_args.attention_backend == "intel_amx"
+            and server_args.device == "cpu"
+            and not cpu_has_amx_support()
+        ):
+            logger.info(
+                "The current platform does not support Intel AMX, will fallback to torch_native backend."
+            )
+            server_args.attention_backend = "torch_native"
+
         if server_args.attention_backend is None:
             """
             Auto select the fastest attention backend.
@@ -369,7 +376,10 @@ class ModelRunner:
                         f"Invalid attention backend for MLA: {server_args.attention_backend}"
                     )
             else:
-                raise ValueError("MLA optimization not supported on CPU.")
+                if server_args.attention_backend != "intel_amx":
+                    raise ValueError(
+                        "MLA optimization not supported on CPU except for intel_amx backend."
+                    )
 
         if (
             server_args.attention_backend == "fa3"
@@ -906,7 +916,7 @@ class ModelRunner:
 
         if self.req_to_token_pool is None:
             self.req_to_token_pool = ReqToTokenPool(
-                size=max_num_reqs + 1,
+                size=max_num_reqs,
                 max_context_len=self.model_config.context_len + 4,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
@@ -1065,6 +1075,13 @@ class ModelRunner:
             )
 
             return CutlassMLABackend(self)
+        elif self.server_args.attention_backend == "intel_amx":
+            from sglang.srt.layers.attention.intel_amx_backend import (
+                IntelAMXAttnBackend,
+            )
+
+            logger.info(f"Intel AMX attention backend is enabled.")
+            return IntelAMXAttnBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
