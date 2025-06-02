@@ -34,9 +34,11 @@ import zmq
 from torch.distributed import barrier
 
 from sglang.global_config import global_config
-from sglang.srt import two_batch_overlap
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
+from sglang.srt.constrained.base_grammar_backend import (
+    INVALID_GRAMMAR_OBJ,
+    create_grammar_backend,
+)
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -63,7 +65,6 @@ from sglang.srt.hf_transformers_utils import (
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.expert_distribution import (
-    ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.managers.io_struct import (
@@ -140,6 +141,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
     disable_request_logging,
+    get_available_gpu_memory,
     get_bool_env_var,
     get_zmq_socket,
     kill_itself_when_parent_died,
@@ -213,7 +215,6 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.page_size = server_args.page_size
-        # Distributed rank info
         self.dp_size = server_args.dp_size
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
@@ -333,12 +334,16 @@ class Scheduler(
 
         # Print debug info
         if tp_rank == 0:
+            avail_mem = get_available_gpu_memory(
+                self.device, self.gpu_id, empty_cache=False
+            )
             logger.info(
                 f"max_total_num_tokens={self.max_total_num_tokens}, "
                 f"chunked_prefill_size={server_args.chunked_prefill_size}, "
                 f"max_prefill_tokens={self.max_prefill_tokens}, "
                 f"max_running_requests={self.max_running_requests}, "
-                f"context_len={self.model_config.context_len}"
+                f"context_len={self.model_config.context_len}, "
+                f"available_gpu_mem={avail_mem:.2f} GB"
             )
 
         # Init memory pool and cache
@@ -362,6 +367,7 @@ class Scheduler(
         self.current_stream = torch.get_device_module(self.device).current_stream()
         if self.device == "cpu":
             self.current_stream.synchronize = lambda: None  # No-op for CPU
+        self.forward_sleep_time = None
 
         # Init session info
         self.sessions: Dict[str, Session] = {}
@@ -423,10 +429,16 @@ class Scheduler(
         self.torch_profiler = None
         self.torch_profiler_output_dir: Optional[str] = None
         self.profiler_activities: Optional[List[str]] = None
-        self.profiler_id: Optional[str] = None
+        self.profile_id: Optional[str] = None
         self.profiler_target_forward_ct: Optional[int] = None
-
-        self.forward_sleep_time = None
+        self.profiler_target_prefill_ct: Optional[int] = None
+        self.profiler_target_decode_ct: Optional[int] = None
+        self.profiler_prefill_ct: Optional[int] = None
+        self.profiler_decode_ct: Optional[int] = None
+        self.profile_by_stage: bool = False
+        self.profile_steps: Optional[int] = None
+        self.profile_in_progress: bool = False
+        self.rpd_profiler = None
 
         # Init metrics stats
         self.init_metrics()
@@ -940,12 +952,12 @@ class Scheduler(
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if recv_req.bootstrap_room is None:
-                    error_message = (
+                    error_msg = (
                         f"Invalid request: Disaggregated request received without "
                         f"boostrap room id. {req.rid=}"
                     )
-                    logger.error(error_message)
-                    prepare_abort(req, error_message)
+                    logger.error(error_msg)
+                    prepare_abort(req, error_msg)
                     self.stream_output([req], req.return_logprob)
                     return
 
@@ -976,29 +988,23 @@ class Scheduler(
             req.extend_image_inputs(image_inputs)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
-                error_msg = (
-                    "Multimodal prompt is too long after expanding multimodal tokens. "
-                    f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
-                )
-                logger.error(error_msg)
-                req.origin_input_ids = [0]
-                req.multimodal_inputs = None
-                req.sampling_params.max_new_tokens = 0
-                req.finished_reason = FINISH_ABORT(
-                    error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+                req.set_finish_with_abort(
+                    error_msg=(
+                        "Multimodal prompt is too long after expanding multimodal tokens. "
+                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                    )
                 )
                 self._add_request_to_queue(req)
                 return
 
-        # Validate prompts length
+        # Validate prompt length
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
             self.server_args.allow_auto_truncate,
         )
         if error_msg:
-            req.origin_input_ids = [0]
-            req.sampling_params.max_new_tokens = 0
+            req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
 
@@ -1010,12 +1016,9 @@ class Scheduler(
             req.logprob_start_len = recv_req.logprob_start_len
 
         if req.logprob_start_len >= len(req.origin_input_ids):
-            req.finished_reason = FINISH_ABORT(
-                f"logprob_start_len, ({req.logprob_start_len}) is higher than the number of input tokens ({len(req.origin_input_ids)}). Request with a lower logprob_start_len.",
-                HTTPStatus.BAD_REQUEST,
-                "BadRequestError",
-            )
+            error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
             req.logprob_start_len = len(req.origin_input_ids) - 1
+            req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
 
@@ -1052,6 +1055,10 @@ class Scheduler(
             if not cache_hit:
                 req.grammar_key = key
                 add_to_grammar_queue = True
+            else:
+                if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
+                    error_msg = f"Invalid grammar request with cache hit: {key=}"
+                    req.set_finish_with_abort(error_msg)
 
         if add_to_grammar_queue:
             req.queue_time_start = time.perf_counter()
@@ -1099,19 +1106,13 @@ class Scheduler(
             req.extend_image_inputs(image_inputs)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
-                error_msg = (
-                    "Multimodal prompt is too long after expanding multimodal tokens. "
-                    f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                req.set_finish_with_abort(
+                    error_msg=(
+                        "Multimodal prompt is too long after expanding multimodal tokens. "
+                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                    )
                 )
-                logger.error(error_msg)
-                req.origin_input_ids = [0]
-                req.multimodal_inputs = None
-                req.sampling_params.max_new_tokens = 0
-                req.finished_reason = FINISH_ABORT(
-                    error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
-                )
-                req.queue_time_start = time.perf_counter()
-                self.waiting_queue.append(req)
+                self._add_request_to_queue(req)
                 return
 
         # Validate prompts length
@@ -1157,7 +1158,8 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
-            f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)} "
+            f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)}, "
+            f += f"time: {gap_latency:.2f} "
         else:
             f += f"#queue-req: {len(self.waiting_queue)}"
 
@@ -1518,7 +1520,7 @@ class Scheduler(
             self.new_token_ratio = new_token_ratio
 
             logger.info(
-                "Decode out of memory happened. "
+                "KV cache pool is full. Retract requests. "
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
@@ -1542,13 +1544,8 @@ class Scheduler(
         """Run a batch."""
         self.forward_ct += 1
 
-        # Check profiler
-        if (
-            self.profiler_target_forward_ct
-            and self.profiler_target_forward_ct <= self.forward_ct
-        ):
-            self.send_to_tokenizer.send_pyobj(self.stop_profile())
-
+        # Whether to run the profiler
+        self._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
@@ -1781,17 +1778,25 @@ class Scheduler(
         """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
 
         num_ready_reqs = 0
-        num_abort_reqs = 0
+        num_timeout_reqs = 0
         for req in self.grammar_queue:
             try:
+                if req.finished():  # It is aborted by AbortReq
+                    num_ready_reqs += 1
+                    continue
                 req.grammar = req.grammar.result(timeout=0.03)
-                if req.grammar:
-                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                if req.grammar is INVALID_GRAMMAR_OBJ:
+                    req.set_finish_with_abort(
+                        f"Invalid grammar request: {req.grammar_key=}"
+                    )
                 num_ready_reqs += 1
             except futures._base.TimeoutError:
                 req.grammar_wait_ct += 1
+                # NOTE(lianmin): this timeout is the waiting time of the above line. It is
+                # not the waiting time from it enters the grammar queue.
                 if req.grammar_wait_ct > GRAMMAR_TIMEOUT / 0.03:
-                    num_abort_reqs = 1
+                    num_timeout_reqs = 1
                 break
 
         if self.server_args.enable_dp_attention:
@@ -1803,28 +1808,33 @@ class Scheduler(
 
         if tp_size > 1:
             # Sync across TP ranks to make sure they have the same number of ready requests
-            tensor = torch.tensor([num_ready_reqs, num_abort_reqs], dtype=torch.int32)
+            tensor = torch.tensor([num_ready_reqs, num_timeout_reqs], dtype=torch.int32)
             torch.distributed.all_reduce(
                 tensor, op=torch.distributed.ReduceOp.MAX, group=tp_group
             )
-            num_ready_reqs_max, num_abort_reqs_max = tensor.tolist()
+            num_ready_reqs_max, num_timeout_reqs_max = tensor.tolist()
 
             for i in range(num_ready_reqs, num_ready_reqs_max):
                 req = self.grammar_queue[i]
+                if req.finished():  # It is aborted by AbortReq
+                    continue
                 req.grammar = req.grammar.result()
-                if req.grammar:
-                    self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+                if req.grammar is INVALID_GRAMMAR_OBJ:
+                    req.set_finish_with_abort(
+                        f"Invalid grammar request: {req.grammar_key=}"
+                    )
+        else:
+            num_ready_reqs_max = num_ready_reqs
+            num_timeout_reqs_max = num_timeout_reqs
 
-            for i in range(num_ready_reqs, num_ready_reqs + num_abort_reqs_max):
-                req = self.grammar_queue[i]
-                req.grammar.cancel()
-                req.grammar = None
-                error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
-                logger.error(error_msg)
-                req.finished_reason = FINISH_ABORT(
-                    error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
-                )
-            num_ready_reqs = num_ready_reqs_max + num_abort_reqs_max
+        for i in range(num_ready_reqs, num_ready_reqs + num_timeout_reqs_max):
+            req = self.grammar_queue[i]
+            req.grammar.cancel()
+            error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
+            req.set_finish_with_abort(error_msg)
+            self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
+        num_ready_reqs = num_ready_reqs_max + num_timeout_reqs_max
 
         self._extend_requests_to_queue(self.grammar_queue[:num_ready_reqs])
         self.grammar_queue = self.grammar_queue[num_ready_reqs:]
@@ -1911,6 +1921,27 @@ class Scheduler(
             if_success = False
         return if_success
 
+    def get_load(self):
+        # TODO(lsyin): use dynamically maintained num_waiting_tokens
+        load = (
+            self.max_total_num_tokens
+            - self.token_to_kv_pool_allocator.available_size()
+            - self.tree_cache.evictable_size()
+        )
+        load += sum(len(req.origin_input_ids) for req in self.waiting_queue)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            load += sum(
+                len(req.origin_input_ids)
+                for req in self.disagg_prefill_bootstrap_queue.queue
+            )
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            load += sum(
+                len(req.req.origin_input_ids)
+                for req in self.disagg_decode_prealloc_queue.queue
+            )
+
+        return load
+
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
         ret["last_gen_throughput"] = self.last_gen_throughput
@@ -1920,9 +1951,10 @@ class Scheduler(
             )
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
-        return GetInternalStateReqOutput(
-            internal_state=ret,
-        )
+
+        ret["load"] = self.get_load()
+
+        return GetInternalStateReqOutput(internal_state=ret)
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
@@ -1998,8 +2030,6 @@ class Scheduler(
         )
 
     def abort_request(self, recv_req: AbortReq):
-        # TODO(lmzheng): abort the requests in the grammar queue.
-
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
@@ -2021,7 +2051,15 @@ class Scheduler(
         for req in reqs:
             if req.rid.startswith(recv_req.rid) and not req.finished():
                 logger.debug(f"Abort running request. {req.rid=}")
+                # We must use to_abort because it is in a running batch
                 req.to_abort = True
+
+        # Delete the requests in the grammar queue
+        for req in self.grammar_queue:
+            if req.rid.startswith(recv_req.rid):
+                logger.debug(f"Abort grammar queue request. {req.rid=}")
+                req.grammar.cancel()
+                req.set_finish_with_abort("Aborted by AbortReq.")
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -2099,31 +2137,47 @@ class Scheduler(
 
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
-            return self.start_profile(
-                recv_req.output_dir,
-                recv_req.num_steps,
-                recv_req.activities,
-                recv_req.with_stack,
-                recv_req.record_shapes,
-                recv_req.profile_id,
-            )
+            if recv_req.profile_by_stage:
+                return self.init_profile(
+                    recv_req.output_dir,
+                    recv_req.num_steps,
+                    recv_req.activities,
+                    recv_req.with_stack,
+                    recv_req.record_shapes,
+                    recv_req.profile_by_stage,
+                    recv_req.profile_id,
+                )
+            else:
+                self.init_profile(
+                    recv_req.output_dir,
+                    recv_req.num_steps,
+                    recv_req.activities,
+                    recv_req.with_stack,
+                    recv_req.record_shapes,
+                    recv_req.profile_by_stage,
+                    recv_req.profile_id,
+                )
+                return self.start_profile(True)
         else:
             return self.stop_profile()
 
-    def start_profile(
+    def init_profile(
         self,
         output_dir: Optional[str],
         num_steps: Optional[int],
         activities: Optional[List[str]],
         with_stack: Optional[bool],
         record_shapes: Optional[bool],
-        profile_id: Optional[str],
-    ) -> None:
-        if self.profiler_activities:
+        profile_by_stage: bool,
+        profile_id: str,
+    ) -> ProfileReqOutput:
+        if self.profile_in_progress:
             return ProfileReqOutput(
                 success=False,
                 message="Profiling is already in progress. Call /stop_profile first.",
             )
+
+        self.profile_by_stage = profile_by_stage
 
         if output_dir is None:
             output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
@@ -2131,13 +2185,37 @@ class Scheduler(
             activities = ["CPU", "GPU"]
 
         self.torch_profiler_output_dir = output_dir
+        self.torch_profiler_with_stack = with_stack
+        self.torch_profiler_record_shapes = record_shapes
         self.profiler_activities = activities
-        self.profiler_id = profile_id
+        self.profile_id = profile_id
+
+        if num_steps:
+            self.profile_steps = num_steps
+            if self.profile_by_stage:
+                self.profiler_target_prefill_ct = num_steps
+                self.profiler_target_decode_ct = num_steps
+                self.profiler_prefill_ct = 0
+                self.profiler_decode_ct = 0
+            else:
+                self.profiler_target_forward_ct = self.forward_ct + num_steps
+            # The caller will be notified when reaching profiler_target_forward_ct
+        else:
+            self.profiler_target_forward_ct = None
+
+        return ProfileReqOutput(success=True, message="Succeeded")
+
+    def start_profile(
+        self, stage: Optional[ForwardMode] = None
+    ) -> ProfileReqOutput | None:
+        stage_str = f" for {stage.__str__()}" if stage else ""
         logger.info(
-            "Profiling starts. Traces will be saved to: %s (with id %s)",
-            self.torch_profiler_output_dir,
-            self.profiler_id,
+            f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir}",
         )
+
+        activities = self.profiler_activities
+        with_stack = self.torch_profiler_with_stack
+        record_shapes = self.torch_profiler_record_shapes
 
         activity_map = {
             "CPU": torch.profiler.ProfilerActivity.CPU,
@@ -2147,48 +2225,97 @@ class Scheduler(
             activity_map[a] for a in activities if a in activity_map
         ]
 
-        if torchprof_activities:
+        if "RPD" in activities:
+            from rpdTracerControl import rpdTracerControl
+
+            rpdTracerControl.skipCreate()
+
+            self.rpd_profile_path = os.path.join(
+                self.torch_profiler_output_dir,
+                "rpd-" + str(time.time()) + f"-TP-{self.tp_rank}" + ".trace.json.gz",
+            )
+
+            if self.tp_rank == 0:
+                import sqlite3
+
+                from rocpd.schema import RocpdSchema
+
+                if os.path.exists("trace.rpd"):
+                    os.unlink("trace.rpd")
+                schema = RocpdSchema()
+                connection = sqlite3.connect("trace.rpd")
+                schema.writeSchema(connection)
+                connection.commit()
+                del connection
+            torch.distributed.barrier(self.tp_cpu_group)
+
+            self.rpd_profiler = rpdTracerControl()
+            self.rpd_profiler.setPythonTrace(True)
+            self.rpd_profiler.start()
+            self.rpd_profiler.rangePush("", "rpd profile range", "")
+            self.profile_in_progress = True
+        elif torchprof_activities:
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,
                 record_shapes=record_shapes if record_shapes is not None else False,
             )
             self.torch_profiler.start()
+            self.profile_in_progress = True
 
         if "MEM" in activities:
             torch.cuda.memory._record_memory_history(max_entries=100000)
+            self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
             torch.cuda.cudart().cudaProfilerStart()
 
-        if num_steps:
-            self.profiler_target_forward_ct = self.forward_ct + num_steps
-            # The caller will be notified when reaching profiler_target_forward_ct
-        else:
-            self.profiler_target_forward_ct = None
-            return ProfileReqOutput(success=True, message="Succeeded")
+        return ProfileReqOutput(success=True, message="Succeeded")
 
-    def stop_profile(self) -> None:
-        if self.profiler_activities is None:
+    def stop_profile(
+        self, stage: Optional[ForwardMode] = None
+    ) -> ProfileReqOutput | None:
+        if not self.profile_in_progress:
             return ProfileReqOutput(
                 success=False,
                 message="Profiling is not in progress. Call /start_profile first.",
             )
 
-        logger.info("Stop profiling...")
+        stage_suffix = f"-{stage.__str__()}" if stage else ""
+        logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
             self.torch_profiler.export_chrome_trace(
                 os.path.join(
                     self.torch_profiler_output_dir,
-                    self.profiler_id + f"-TP-{self.tp_rank}" + ".trace.json.gz",
+                    self.profile_id
+                    + f"-TP-{self.tp_rank}"
+                    + stage_suffix
+                    + ".trace.json.gz",
                 )
             )
+            torch.distributed.barrier(self.tp_cpu_group)
 
-        if "MEM" in self.profiler_activities:
+        if self.rpd_profiler is not None:
+            self.rpd_profiler.rangePop()
+            self.rpd_profiler.stop()
+            self.rpd_profiler.flush()
+
+            torch.distributed.barrier(self.tp_cpu_group)
+            if self.tp_rank == 0:
+                from sglang.srt.utils import rpd_to_chrome_trace
+
+                rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
+            self.rpd_profiler = None
+            self.rpd_profiler_path = None
+
+        if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
                 self.torch_profiler_output_dir,
-                self.profiler_id + f"-TP-{self.tp_rank}-memory" + ".pickle",
+                str(time.time())
+                + f"-TP-{self.tp_rank}-memory"
+                + stage_suffix
+                + ".pickle",
             )
             torch.cuda.memory._dump_snapshot(memory_profile_path)
             torch.cuda.memory._record_memory_history(enabled=None)
@@ -2201,11 +2328,38 @@ class Scheduler(
             self.torch_profiler_output_dir,
         )
         self.torch_profiler = None
-        self.torch_profiler_output_dir = None
-        self.profiler_activities = None
-        self.profiler_target_forward_ct = None
+        self.profile_in_progress = False
 
-        return ProfileReqOutput(success=True, message="Succeeded")
+        return ProfileReqOutput(success=True, message="Succeeded.")
+
+    def _profile_batch_predicate(self, batch):
+        if self.profile_by_stage:
+            if batch.forward_mode.is_prefill():
+                if self.profiler_prefill_ct == 0:
+                    self.start_profile(batch.forward_mode)
+                self.profiler_prefill_ct += 1
+                if self.profiler_prefill_ct > self.profiler_target_prefill_ct:
+                    if self.profile_in_progress:
+                        self.stop_profile(stage=ForwardMode.EXTEND)
+            elif batch.forward_mode.is_decode():
+                if self.profiler_decode_ct == 0:
+                    if self.profile_in_progress:
+                        # force trace flush
+                        self.stop_profile(ForwardMode.EXTEND)
+                    self.start_profile(batch.forward_mode)
+                self.profiler_decode_ct += 1
+                if self.profiler_decode_ct > self.profiler_target_decode_ct:
+                    if self.profile_in_progress:
+                        self.stop_profile(stage=ForwardMode.DECODE)
+            else:
+                raise RuntimeError("unsupported profile stage")
+        else:
+            # Check profiler
+            if (
+                self.profiler_target_forward_ct
+                and self.profiler_target_forward_ct <= self.forward_ct
+            ):
+                self.stop_profile()
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         if recv_req == ExpertDistributionReq.START_RECORD:
