@@ -363,7 +363,9 @@ class EPMoE(torch.nn.Module):
 
     def forward_normal(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
-
+        hidden_states_shape = hidden_states.shape
+        hidden_states_dtype = hidden_states.dtype
+        hidden_states_device = hidden_states.device
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device,

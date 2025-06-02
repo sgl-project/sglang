@@ -1211,12 +1211,7 @@ def moe_ep_deepgemm_preproess(
     if block_shape is not None:
         assert len(block_shape) == 2
         block_n, block_k = block_shape[0], block_shape[1]
-        if _is_cuda:
-            hidden_states, scale = sglang_per_token_group_quant_fp8(
-                hidden_states, block_k
-            )
-        else:
-            hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+        hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
 
         gateup_input_scale = torch.empty(
             (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
