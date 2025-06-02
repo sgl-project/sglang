@@ -1,4 +1,4 @@
-""" CUTLASS based Fused MoE kernels."""
+"""CUTLASS based Fused MoE kernels."""
 
 import functools
 import json
@@ -220,6 +220,10 @@ def cutlass_moe_fp4(
     w2_fp4: torch.Tensor,
     w2_blockscale: torch.Tensor,
     w2_alphas: torch.Tensor,
+    ab_strides_13: torch.Tensor,
+    ab_strides_2: torch.Tensor,
+    c_strides_13: torch.Tensor,
+    c_strides_2: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     m: int,
@@ -247,11 +251,28 @@ def cutlass_moe_fp4(
     w2_fp4: [e, k, n // 2], dtype: torch.uint8 (stacked E2M1)
     w2_blockscale: [e, k, n // block_size], dtype: float8_e4m3
 
+    Strides for activations, weights and output in logical number of elements.
+    The activations & output stride is the number of elements to the next row.
+    The weights stride is the number of elements to the next row per expert.
+    For example, if the weight is [e, n, k], then the b_stride is a tensor of
+    shape [e] with each element being k. Similarly for activations, if the
+    shape is [m, k], then the a_stride has shape [e] with each value k.
+    Similarly for output, if the output is [m, n], then the c_stride is a
+    tensor of shape [e] with each element being k.
+
+    Note: cutlass_fp4_group_mm is designed to accept the strides of
+    activations and weights to be the same, so it is passed in as a single
+    tensor.
+    ab_strides_13: [e] dtype: int64 [Gemm 1: Activation / Weight strides]
+    ab_strides_2: [e] dtype: int64 [Gemm 2: Activation / Weight strides]
+    c_strides_13: [e] dtype: int64 [Gemm 1: Output Strides]
+    c_strides_2: [e] dtype: int64 [Gemm 1: Output Strides]
+
     topk_weights: [m, topk] dtype: float8
     topk_ids: [m, topk] dtype: float8
 
     m, n, k: Unquantized weight shapes, dtype: int
-    e: number of experts, dtype: int
+    e: number of experts for the current rank, dtype: int
     assumes that topk < k < n to satisfy - up/down projection expectations.
     """
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
@@ -320,6 +341,8 @@ def cutlass_moe_fp4(
         rep_a_blockscale,
         w1_blockscale,
         w1_alphas,
+        ab_strides_13,
+        c_strides_13,
         problem_sizes1,
         expert_offsets[:-1],
         blockscale_offsets[:-1],
@@ -343,6 +366,8 @@ def cutlass_moe_fp4(
         int_blockscale,
         w2_blockscale,
         w2_alphas,
+        ab_strides_2,
+        c_strides_2,
         problem_sizes2,
         expert_offsets[:-1],
         blockscale_offsets[:-1],

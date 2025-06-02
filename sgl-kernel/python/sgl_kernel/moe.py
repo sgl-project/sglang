@@ -142,31 +142,28 @@ def prepare_moe_input(
     k,
     blockscale_offsets: Optional[torch.Tensor] = None,
 ):
-    if blockscale_offsets is None:
-        torch.ops.sgl_kernel.prepare_moe_input.default(
-            topk_ids,
-            expert_offsets,
-            problem_sizes1,
-            problem_sizes2,
-            input_permutation,
-            output_permutation,
-            num_experts,
-            n,
-            k,
-        )
-    else:
-        torch.ops.sgl_kernel.prepare_moe_input_v2.default(
-            topk_ids,
-            expert_offsets,
-            blockscale_offsets,
-            problem_sizes1,
-            problem_sizes2,
-            input_permutation,
-            output_permutation,
-            num_experts,
-            n,
-            k,
-        )
+    torch.ops.sgl_kernel.prepare_moe_input.default(
+        topk_ids,
+        expert_offsets,
+        blockscale_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        input_permutation,
+        output_permutation,
+        num_experts,
+        n,
+        k,
+    )
+
+
+def shuffle_rows(input_tensor, dst2src_map, output_tensor_shape):
+    output_tensor = torch.empty(
+        output_tensor_shape,
+        device=input_tensor.device,
+        dtype=input_tensor.dtype,
+    )
+    torch.ops.sgl_kernel.shuffle_rows.default(input_tensor, dst2src_map, output_tensor)
+    return output_tensor
 
 
 def cutlass_fp4_group_mm(
@@ -175,6 +172,8 @@ def cutlass_fp4_group_mm(
     a_blockscale,
     b_blockscale,
     alphas,
+    ab_strides,
+    c_strides,
     problem_sizes,
     expert_offsets,
     blockscale_offsets,
@@ -189,6 +188,7 @@ def cutlass_fp4_group_mm(
     - a/b_tensors: the NVFP4 a_ptrs and b_ptrs tensors which are quantized
                      input and expert weights.
     - a_/b_scales: The blockscales in FP8-E4M3 precision
+    - ab_strides/c_strides: Strides for the a/b tensors between rows.
     - expert_offsets/sf_offsets: Indices that mark at which token index
                     each expert begins its computation. The number of tokens
                     computed with expert E is expert_offsets[E + 1] -
@@ -208,6 +208,8 @@ def cutlass_fp4_group_mm(
         a_blockscale,
         b_blockscale,
         alphas,
+        ab_strides,
+        c_strides,
         problem_sizes,
         expert_offsets,
         blockscale_offsets,

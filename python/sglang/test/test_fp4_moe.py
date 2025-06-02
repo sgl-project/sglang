@@ -168,7 +168,17 @@ def test_cutlass_fp4_moe_no_graph(
 
     a1_gs = torch.ones((e,), device="cuda", dtype=torch.float32)
     a2_gs = torch.ones((e,), device="cuda", dtype=torch.float32)
-
+    # strides for the cutlass moe_fp4 kernel
+    ab_strides_13 = torch.full(
+        (e,), w1_q.shape[2] * 2, dtype=torch.int64, device=w1_q.device
+    )
+    c_strides_13 = torch.full(
+        (e,), w1_q.shape[1], dtype=torch.int64, device=w1_q.device
+    )
+    ab_strides_2 = torch.full(
+        (e,), w2_q.shape[2] * 2, dtype=torch.int64, device=w2_q.device
+    )
+    c_strides_2 = torch.full((e,), w2_q.shape[1], dtype=torch.int64, device=w2_q.device)
     cutlass_output = cutlass_moe_fp4(
         a=a,
         a1_gscale=a1_gs,
@@ -179,6 +189,10 @@ def test_cutlass_fp4_moe_no_graph(
         w2_fp4=w2_q,
         w2_blockscale=w2_blockscale,
         w2_alphas=(1 / w2_gs),
+        ab_strides_13=ab_strides_13,
+        ab_strides_2=ab_strides_2,
+        c_strides_13=c_strides_13,
+        c_strides_2=c_strides_2,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         m=m,
@@ -230,4 +244,4 @@ def test_cutlass_fp4_moe_no_graph(
 
 
 if __name__ == "__main__":
-    test_cutlass_fp4_moe_no_graph((2, 1024, 1024), 40, 1, torch.half)
+    test_cutlass_fp4_moe_no_graph(224, 1024, 1024, 256, 8, torch.half)

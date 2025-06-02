@@ -186,6 +186,8 @@ void run_fp4_blockwise_scaled_group_mm(
     const torch::Tensor& a_blockscale,
     const torch::Tensor& b_blockscales,
     const torch::Tensor& alphas,
+    const torch::Tensor& ab_strides,
+    const torch::Tensor& c_strides,
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& sf_offsets,
@@ -284,9 +286,6 @@ void run_fp4_blockwise_scaled_group_mm(
   torch::Tensor alpha_ptrs = torch::empty(num_experts, options_int);
   torch::Tensor layout_sfa = torch::empty({num_experts, 5}, options_int);
   torch::Tensor layout_sfb = torch::empty({num_experts, 5}, options_int);
-  torch::Tensor c_strides1 = torch::full({num_experts}, output.stride(0), options_int);
-  torch::Tensor a_strides1 = torch::full({num_experts}, a.stride(0) * 2, options_int);
-  torch::Tensor b_strides1 = torch::full({num_experts}, b.stride(1) * 2, options_int);
 
   run_get_group_gemm_starts<LayoutSFA, LayoutSFB, ScaleConfig>(
       a_ptrs,
@@ -323,8 +322,6 @@ void run_fp4_blockwise_scaled_group_mm(
   typename Gemm::GemmKernel::TileSchedulerArguments scheduler;
   scheduler.raster_order = RasterOrderOptions::AlongM;
   hw_info.device_id = a.get_device();
-  hw_info.cluster_shape = 2;
-  hw_info.cluster_shape_fallback = 2;
   static std::unordered_map<int, int> cached_sm_counts;
   if (cached_sm_counts.find(hw_info.device_id) == cached_sm_counts.end()) {
     cached_sm_counts[hw_info.device_id] =
@@ -335,9 +332,9 @@ void run_fp4_blockwise_scaled_group_mm(
   // Mainloop Arguments
   typename GemmKernel::MainloopArguments mainloop_args{
       static_cast<const ElementType**>(a_ptrs.data_ptr()),
-      static_cast<StrideA*>(a_strides1.data_ptr()),
+      static_cast<StrideA*>(ab_strides.data_ptr()),
       static_cast<const ElementType**>(b_ptrs.data_ptr()),
-      static_cast<StrideB*>(b_strides1.data_ptr()),
+      static_cast<StrideB*>(ab_strides.data_ptr()),
       static_cast<const ElementSFType**>(a_scales_ptrs.data_ptr()),
       reinterpret_cast<LayoutSFA*>(layout_sfa.data_ptr()),
       static_cast<const ElementSFType**>(b_scales_ptrs.data_ptr()),
@@ -347,9 +344,9 @@ void run_fp4_blockwise_scaled_group_mm(
   typename GemmKernel::EpilogueArguments epilogue_args{
       {},  // epilogue.thread
       nullptr,
-      static_cast<StrideC*>(c_strides1.data_ptr()),
+      static_cast<StrideC*>(c_strides.data_ptr()),
       static_cast<ElementD**>(out_ptrs.data_ptr()),
-      static_cast<StrideC*>(c_strides1.data_ptr())};
+      static_cast<StrideC*>(c_strides.data_ptr())};
   auto& fusion_args = epilogue_args.thread;
   fusion_args.alpha_ptr_array = reinterpret_cast<float**>(alpha_ptrs.data_ptr());
   fusion_args.dAlpha = {_0{}, _0{}, 1};
@@ -394,6 +391,8 @@ void cutlass_fp4_group_mm(
     const torch::Tensor& a_blockscale,
     const torch::Tensor& b_blockscales,
     const torch::Tensor& alphas,
+    const torch::Tensor& ab_strides,
+    const torch::Tensor& c_strides,
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& sf_offsets) {
@@ -431,15 +430,41 @@ void cutlass_fp4_group_mm(
 
   if (output.scalar_type() == torch::kBFloat16) {
     run_fp4_blockwise_scaled_group_mm<cutlass::bfloat16_t>(
-        output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes, expert_offsets, sf_offsets, M, N, K);
+        output,
+        a,
+        b,
+        a_blockscale,
+        b_blockscales,
+        alphas,
+        ab_strides,
+        c_strides,
+        problem_sizes,
+        expert_offsets,
+        sf_offsets,
+        M,
+        N,
+        K);
   } else {
     run_fp4_blockwise_scaled_group_mm<cutlass::half_t>(
-        output, a, b, a_blockscale, b_blockscales, alphas, problem_sizes, expert_offsets, sf_offsets, M, N, K);
+        output,
+        a,
+        b,
+        a_blockscale,
+        b_blockscales,
+        alphas,
+        ab_strides,
+        c_strides,
+        problem_sizes,
+        expert_offsets,
+        sf_offsets,
+        M,
+        N,
+        K);
   }
 #else
   TORCH_CHECK_NOT_IMPLEMENTED(
       false,
-      "No compiled cutlass_fp4_group_mm kernel, vLLM must "
+      "No compiled cutlass_fp4_group_mm kernel, sgl-kernel must "
       "be compiled with ENABLE_NVFP4 for SM100+ and CUDA "
       "12.8 or above.");
 #endif

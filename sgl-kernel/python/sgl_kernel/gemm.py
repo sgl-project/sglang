@@ -267,8 +267,12 @@ def scaled_fp4_experts_quant(
     assert (
         input_tensor.ndim == 2
     ), f"input.ndim needs to be == 2, but got {input_tensor.ndim}."
-
-    input_tensor = input_tensor[expert_map] if expert_map is not None else input_tensor
+    if expert_map is not None:
+        (m, k) = input_tensor.shape
+        output_tensor_shape = (m * topk, k)
+        input_tensor = torch.ops.sgl_kernel.shuffle_rows.default(
+            input_tensor, expert_map, output_tensor_shape
+        )
     m_numtopk, k = input_tensor.shape
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE Expert Quantization. This is used to prevent the kernel

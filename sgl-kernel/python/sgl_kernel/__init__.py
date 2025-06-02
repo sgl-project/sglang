@@ -53,6 +53,7 @@ from sgl_kernel.moe import (
     moe_align_block_size,
     moe_fused_gate,
     prepare_moe_input,
+    shuffle_rows,
     topk_softmax,
 )
 from sgl_kernel.sampling import (
