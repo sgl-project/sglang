@@ -65,8 +65,7 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
         if isinstance(sub, CustomOp):
             if reverse:
                 # Restore forward_method
-                sub._forward_method = sub._origin_forward_method
-                delattr(sub, "_origin_forward_method")
+                sub._forward_method = getattr(sub, "_origin_forward_method")
                 setattr(sub, "is_torch_compile", False)
             else:
                 # Record forward_method
