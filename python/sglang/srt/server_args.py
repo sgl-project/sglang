@@ -28,6 +28,7 @@ from sglang.srt.utils import (
     configure_ipv6,
     get_device,
     get_device_memory_capacity,
+    is_cuda,
     is_flashinfer_available,
     is_hip,
     is_port_available,
@@ -262,7 +263,7 @@ class ServerArgs:
                     self.mem_fraction_static = 0.88
             else:
                 self.mem_fraction_static = 0.88
-            if gpu_mem is not None and gpu_mem > 180 * 1000:
+            if gpu_mem is not None and gpu_mem > 180 * 1000 and is_cuda():
                 self.mem_fraction_static = 0.79
             elif gpu_mem is not None and gpu_mem > 96 * 1024:
                 mem_fraction = self.mem_fraction_static
@@ -323,6 +324,11 @@ class ServerArgs:
             self.sampling_backend = "pytorch"
 
         # Set kernel backends
+        if self.device == "cpu":
+            if self.attention_backend is None:
+                self.attention_backend = "intel_amx"
+            self.sampling_backend = "pytorch"
+
         if self.sampling_backend is None:
             self.sampling_backend = (
                 "flashinfer" if is_flashinfer_available() else "pytorch"
@@ -993,6 +999,7 @@ class ServerArgs:
                 "fa3",
                 "flashmla",
                 "cutlass_mla",
+                "intel_amx",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
@@ -1643,7 +1650,7 @@ def auto_choose_speculative_params(arch: str):
         return (5, 4, 8)
     elif arch in ["DeepseekV3ForCausalLM", "DeepseekV2ForCausalLM"]:
         # The default value for deepseek
-        return (5, 4, 8)
+        return (3, 1, 4)
     elif arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)
     else:
