@@ -169,10 +169,12 @@ def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
 
 
 def silu_and_mul(
-    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = False
+    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = None
 ) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
+    if enable_pdl is None:
+        enable_pdl = is_hopper_arch()
     if out is not None:
         _check_shape(input, out)
     else:
@@ -186,10 +188,12 @@ def silu_and_mul(
 
 
 def gelu_tanh_and_mul(
-    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = False
+    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = None
 ) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
+    if enable_pdl is None:
+        enable_pdl = is_hopper_arch()
     if out is not None:
         _check_shape(input, out)
     else:
@@ -203,10 +207,12 @@ def gelu_tanh_and_mul(
 
 
 def gelu_and_mul(
-    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = False
+    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = None
 ) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
+    if enable_pdl is None:
+        enable_pdl = is_hopper_arch()
     if out is not None:
         _check_shape(input, out)
     else:
