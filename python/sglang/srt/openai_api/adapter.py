@@ -1939,13 +1939,11 @@ async def v1_score(tokenizer_manager, raw_request):
 
         # Use tokenizer_manager's score_request method directly
         scores = await tokenizer_manager.score_request(
-            output_prob_token_ids=request.output_prob_token_ids,
-            text_1=request.text_1,
-            text_2=request.text_2,
-            token_ids_1=request.token_ids_1,
-            token_ids_2=request.token_ids_2,
+            query=request.query,
+            items=request.items,
+            label_token_ids=request.label_token_ids,
             apply_softmax=request.apply_softmax,
-            prepend=request.prepend,
+            item_first=request.item_first,
             request=request,
         )
 

@@ -1419,23 +1419,27 @@ class TokenizerManager:
 
     async def score_request(
         self,
-        text_1: Optional[str] = None,
-        text_2: Optional[Union[str, List[str]]] = None,
-        token_ids_1: Optional[List[int]] = None,
-        token_ids_2: Optional[List[List[int]]] = None,
+        query: Optional[Union[str, List[int]]] = None,
+        items: Optional[Union[str, List[str], List[List[int]]]] = None,
         label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
-        prepend: bool = False,
+        item_first: bool = False,
         request: Optional[Any] = None,
     ) -> List[Dict[int, float]]:
-        # Validate inputs
+        """
+        See Engine.score() for more details.
+        """
         if label_token_ids is None:
             raise ValueError("label_token_ids must be provided")
 
-        # Prepare inputs based on whether we have text or token IDs
-        if text_1 is not None and text_2 is not None:
-            # Text-based inputs - combine them directly
-            prompts = [f"{text}{text_1}" for text in text_2] if prepend else [f"{text_1}{text}" for text in text_2]
+        # Handle string or tokenized query/items
+        if isinstance(query, str) and (isinstance(items, str) or (isinstance(items, list) and (not items or isinstance(items[0], str)))):
+            # Both query and items are text
+            items_list = [items] if isinstance(items, str) else items
+            if item_first:
+                prompts = [f"{item}{query}" for item in items_list]
+            else:
+                prompts = [f"{query}{item}" for item in items_list]
             batch_request = GenerateReqInput(
                 text=prompts,
                 return_logprob=True,
@@ -1443,20 +1447,17 @@ class TokenizerManager:
                 stream=False,
                 sampling_params={"max_new_tokens": 1},
             )
-        else:
-            # Token ID-based inputs
-            if token_ids_1 is None or token_ids_2 is None:
-                raise ValueError("Both token_ids_1 and token_ids_2 must be provided for token ID-based inputs")
-                
-            # Combine token IDs based on prepend flag
-            input_ids_list = [token_ids_2[i] + token_ids_1 for i in range(len(token_ids_2))] if prepend else [token_ids_1 + token_ids_2[i] for i in range(len(token_ids_2))]
-            
+        elif isinstance(query, list) and isinstance(items, list) and items and isinstance(items[0], list):
+            # Both query and items are token IDs
+            if item_first:
+                input_ids_list = [item + query for item in items]
+            else:
+                input_ids_list = [query + item for item in items]
             if self.tokenizer is not None:
                 vocab_size = self.tokenizer.vocab_size
                 for token_id in label_token_ids:
                     if token_id >= vocab_size:
                         raise ValueError(f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})")
-
             batch_request = GenerateReqInput(
                 input_ids=input_ids_list,
                 return_logprob=True,
@@ -1464,23 +1465,20 @@ class TokenizerManager:
                 stream=False,
                 sampling_params={"max_new_tokens": 1},
             )
+        else:
+            raise ValueError("Invalid combination of query/items types for score_request.")
 
         scores = []
         results = await self.generate_request(batch_request, request).__anext__()
         for result in results:
             output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
-                
-            # Get logprobs for first position and convert to probabilities
             first_position = output_logprobs[0]
-            probs = {token_id: math.exp(logprob) for logprob, token_id, _ in first_position 
-                    if token_id in label_token_ids}
+            probs = {token_id: math.exp(logprob) for logprob, token_id, _ in first_position if token_id in label_token_ids}
             if apply_softmax:
                 total = sum(probs.values())
                 if total > 0:
                     probs = {tid: p/total for tid, p in probs.items()}
-            
             scores.append(probs)
-
         return scores
 
 

@@ -1,10 +1,8 @@
 import unittest
 import torch
-import math
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sglang.srt.entrypoints.engine import Engine
 from sglang.test.test_utils import CustomTestCase, DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-import gc
 
 TEST_MODEL_NAME = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
@@ -79,8 +77,8 @@ class TestScoreAPI(CustomTestCase):
         del tokenizer 
         # Get scores from SGLang first
         sglang_scores = self.engine.score(
-            text_1=prompt,
-            text_2=texts,
+            query=prompt,
+            items=texts,
             label_token_ids=label_token_ids,
             apply_softmax=True
         )
@@ -120,8 +118,8 @@ class TestScoreAPI(CustomTestCase):
         for batch_size in batch_sizes:
             texts = [f"test {i}" for i in range(batch_size)]
             scores = self.engine.score(
-                text_1="The test was",
-                text_2=texts,
+                query="The test was",
+                items=texts,
                 label_token_ids=label_token_ids,
                 apply_softmax=True
             )

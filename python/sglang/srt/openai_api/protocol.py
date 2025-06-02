@@ -487,13 +487,11 @@ class EmbeddingResponse(BaseModel):
 
 
 class ScoringRequest(BaseModel):
-    text_1: Optional[str] = None
-    text_2: Optional[List[str]] = None
-    token_ids_1: Optional[List[int]] = None  # Pre-tokenized text_1
-    token_ids_2: Optional[List[List[int]]] = None  # Pre-tokenized text_2
+    query: Optional[Union[str, List[int]]] = None  # Query text or pre-tokenized token IDs
+    items: Optional[Union[str, List[str], List[List[int]]]] = None  # Item text(s) or pre-tokenized token IDs
     label_token_ids: Optional[List[int]] = None  # Token IDs to compute probabilities for
     apply_softmax: bool = False
-    prepend: bool = False
+    item_first: bool = False
     model: str
 
 

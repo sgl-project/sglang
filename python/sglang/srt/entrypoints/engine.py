@@ -474,57 +474,62 @@ class Engine(EngineBase):
 
     def score(
         self,
-        text_1: Optional[str] = None,
-        text_2: Optional[Union[str, List[str]]] = None,
-        token_ids_1: Optional[List[int]] = None,
-        token_ids_2: Optional[List[List[int]]] = None,
+        query: Optional[Union[str, List[int]]] = None,
+        items: Optional[Union[str, List[str], List[List[int]]]] = None,
         label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
-        prepend: bool = False,
+        item_first: bool = False,
     ) -> List[Dict[int, float]]:
         """
-        Score the probability of specified token IDs appearing after the given text.
+        Score the probability of specified token IDs appearing after the given query and item are appended together. For example:  
+        query = "<|user|>Is the following city the capital of France? "
+        items = ["Paris <|assistant|>", "London <|assistant|>", "Berlin <|assistant|>"]
+        label_token_ids = [2332, 1223] # Token IDs for "Yes" and "No"
+        item_first = False
+        
+        This would pass the following prompts to the model:
+        "<|user|>Is the following city the capital of France? Paris <|assistant|>"
+        "<|user|>Is the following city the capital of France? London <|assistant|>"
+        "<|user|>Is the following city the capital of France? Berlin <|assistant|>"
+        The api would then return the probabilities of the model producing "Yes" and "No" as the next token.
+        The output would look like:
+        [{"Yes": 0.9, "No": 0.1}, {"Yes": 0.2, "No": 0.8}, {"Yes": 0.1, "No": 0.9}]
+   
         
         Args:
-            text_1: The first part of the text. Either text_1 or token_ids_1 must be provided.
-            text_2: The second part of the text or a list of second parts. Either text_2 or token_ids_2 must be provided.
-            token_ids_1: Pre-tokenized first part of the text. Either text_1 or token_ids_1 must be provided.
-            token_ids_2: Pre-tokenized second part of the text. Either text_2 or token_ids_2 must be provided.
+            query: The query text or pre-tokenized query token IDs. Must be provided.
+            items: The item text(s) or pre-tokenized item token IDs. Must be provided.
             label_token_ids: List of token IDs to compute probabilities for. If None, no token probabilities will be computed.
             apply_softmax: Whether to normalize probabilities using softmax.
-            prepend: If True, prepend text_2 to text_1. Otherwise append text_2 to text_1.
+            item_first: If True, prepend items to query. Otherwise append items to query.
 
         Returns:
-            List of dictionaries mapping token IDs to their probabilities for each text_2.
-            Each dictionary in the list corresponds to one text_2 input.
+            List of dictionaries mapping token IDs to their probabilities for each item.
+            Each dictionary in the list corresponds to one item input.
 
         Raises:
-            ValueError: If neither text_1 nor token_ids_1 is provided, or if neither text_2 nor token_ids_2 is provided,
+            ValueError: If query is not provided, or if items is not provided,
                       or if token IDs are out of vocabulary, or if logprobs are not available for the specified tokens.
         """
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.score_request(
-                text_1=text_1,
-                text_2=text_2,
-                token_ids_1=token_ids_1,
-                token_ids_2=token_ids_2,
+                query=query,
+                items=items,
                 label_token_ids=label_token_ids,
                 apply_softmax=apply_softmax,
-                prepend=prepend,
+                item_first=item_first,
                 request=None
             )
         )
 
     async def async_score(
         self,
-        text_1: Optional[str] = None,
-        text_2: Optional[Union[str, List[str]]] = None,
-        token_ids_1: Optional[List[int]] = None,
-        token_ids_2: Optional[List[List[int]]] = None,
+        query: Optional[Union[str, List[int]]] = None,
+        items: Optional[Union[str, List[str], List[List[int]]]] = None,
         label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
-        prepend: bool = False,
+        item_first: bool = False,
     ) -> List[Dict[int, float]]:
         """
         Asynchronous version of score method.
@@ -532,13 +537,11 @@ class Engine(EngineBase):
         See score() for detailed documentation.
         """
         return await self.tokenizer_manager.score_request(
-            text_1=text_1,
-            text_2=text_2,
-            token_ids_1=token_ids_1,
-            token_ids_2=token_ids_2,
+            query=query,
+            items=items,
             label_token_ids=label_token_ids,
             apply_softmax=apply_softmax,
-            prepend=prepend,
+            item_first=item_first,
             request=None
         )
 
