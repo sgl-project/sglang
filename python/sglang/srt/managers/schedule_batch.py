@@ -37,6 +37,7 @@ import hashlib
 import logging
 import threading
 from enum import Enum, auto
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -51,6 +52,7 @@ from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -60,7 +62,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, get_compiler_backend
+from sglang.srt.utils import flatten_nested_list, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -771,6 +773,16 @@ class Req:
         logger.info(f"{prefix}: {self.time_stats}")
         self.has_log_time_stats = True
 
+    def set_finish_with_abort(self, error_msg: str):
+        if get_tensor_model_parallel_rank() == 0:
+            logger.error(f"{error_msg}, {self.rid=}")
+        self.multimodal_inputs = None
+        self.grammar = None
+        self.origin_input_ids = [0]  # set it to one token to skip the long prefill
+        self.finished_reason = FINISH_ABORT(
+            error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+        )
+
     def __repr__(self):
         return (
             f"Req(rid={self.rid}, "
@@ -1257,7 +1269,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         # Write to req_to_token_pool
-        if global_server_args_dict["attention_backend"] != "torch_native":
+        if support_triton(global_server_args_dict.get("attention_backend")):
             # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
 
             write_req_to_token_pool_triton[(bs,)](
@@ -1810,10 +1822,72 @@ def write_req_to_token_pool_triton(
         )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def get_last_loc(req_to_token, req_pool_indices_tensor, prefix_lens_tensor):
+def get_last_loc(
+    req_to_token: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+) -> torch.Tensor:
+    if global_server_args_dict["attention_backend"] != "torch_native":
+        impl = get_last_loc_triton
+    else:
+        impl = get_last_loc_torch
+
+    return impl(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
+
+
+def get_last_loc_torch(
+    req_to_token: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+) -> torch.Tensor:
     return torch.where(
         prefix_lens_tensor > 0,
         req_to_token[req_pool_indices_tensor, prefix_lens_tensor - 1],
         torch.full_like(prefix_lens_tensor, -1),
     )
+
+
+@triton.jit
+def get_last_loc_kernel(
+    req_to_token,
+    req_pool_indices_tensor,
+    prefix_lens_tensor,
+    result,
+    num_tokens,
+    req_to_token_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offset = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
+    mask = offset < num_tokens
+
+    prefix_lens = tl.load(prefix_lens_tensor + offset, mask=mask, other=0)
+    req_pool_indices = tl.load(req_pool_indices_tensor + offset, mask=mask, other=0)
+
+    token_mask = prefix_lens > 0
+    token_index = req_pool_indices * req_to_token_stride + (prefix_lens - 1)
+    tokens = tl.load(req_to_token + token_index, mask=token_mask, other=-1)
+
+    tl.store(result + offset, tokens, mask=mask)
+
+
+def get_last_loc_triton(
+    req_to_token: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+) -> torch.Tensor:
+    BLOCK_SIZE = 256
+    num_tokens = prefix_lens_tensor.shape[0]
+    result = torch.empty_like(prefix_lens_tensor)
+    grid = (triton.cdiv(num_tokens, BLOCK_SIZE),)
+
+    get_last_loc_kernel[grid](
+        req_to_token,
+        req_pool_indices_tensor,
+        prefix_lens_tensor,
+        result,
+        num_tokens,
+        req_to_token.stride(0),
+        BLOCK_SIZE,
+    )
+    return result
