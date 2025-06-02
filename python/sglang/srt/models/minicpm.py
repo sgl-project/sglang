@@ -39,10 +39,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, logger, print_warning_once
+from sglang.srt.utils import add_prefix, logger
 
 
 class MiniCPMMLP(nn.Module):
@@ -116,7 +115,7 @@ class MiniCPMAttention(nn.Module):
         self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
@@ -222,8 +221,8 @@ def calc_chunks_with_stride(cu_seqlens, moba_chunk_size, kernel_stride):
     del chunk_start_in_seq
     # 5. 生成 filtered_indices
     chunk_indices = torch.arange(0, moba_chunk_size, device=cu_seqlens.device)[
-                    None, :
-                    ]  # [1, moba_chunk_size]
+        None, :
+    ]  # [1, moba_chunk_size]
     filtered_indices = (
         valid_chunk_starts[:, None] + chunk_indices
     )  # [num_valid_chunks, moba_chunk_size]
@@ -246,194 +245,6 @@ def calc_chunks_with_stride(cu_seqlens, moba_chunk_size, kernel_stride):
         chunk_indices,
     )
     return filtered_indices, cu_seqlens_compressed
-
-
-class CompressKV(torch.nn.Module):
-    def __init__(
-        self,
-        head_num_k,
-        head_dim,
-        kernel_size,
-        compress_func,
-        add_pos_embed=False,
-        kernel_stride=16,
-    ):
-        """
-        压缩KV模块，支持多种压缩方式
-        Args:
-            head_num_k: KV头的数量
-            head_dim: 每个头的维度
-            kernel_size: 每个chunk的大小
-            compress_func: 压缩方式（如meanpool, mlp, conv1d等）
-            add_pos_embed: 是否添加位置编码
-        """
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.compress_func = compress_func
-        self.head_num_k = head_num_k
-        self.head_dim = head_dim
-        self.kernel_stride = kernel_stride  # 新增stride参数
-
-        # 定义不同的压缩方式
-        if compress_func == "mlp" or compress_func == "mlp+residual":
-            self.kv_compress = nn.Sequential(
-                nn.Linear(kernel_size * 2, kernel_size * 4),
-                nn.ReLU(),
-                nn.Linear(kernel_size * 4, 2),
-            )
-        elif compress_func == "conv1d":
-            self.k_conv = nn.Conv1d(
-                in_channels=self.head_dim,
-                out_channels=self.head_dim,
-                kernel_size=kernel_size,
-            )
-            self.v_conv = nn.Conv1d(
-                in_channels=self.head_dim,
-                out_channels=self.head_dim,
-                kernel_size=kernel_size,
-            )
-        elif compress_func == "weighted_sum":
-            self.weight_net_v = nn.Linear(self.head_dim, 1)
-            self.weight_net_k = nn.Linear(self.head_dim, 1)
-        elif compress_func == "weighted_sum+proj":
-            self.weight_net_v = nn.Linear(self.head_dim, 1)
-            self.weight_net_k = nn.Linear(self.head_dim, 1)
-            self.k_proj = nn.Linear(self.head_dim, self.head_dim)
-            self.v_proj = nn.Linear(self.head_dim, self.head_dim)
-
-        if add_pos_embed:
-            # 修改位置编码层：为每个头创建独立的位置编码
-            self.pos_embed = nn.Embedding(
-                kernel_size,
-                head_num_k * head_dim,  # 维度扩展为 [kernel_size, num_heads * head_dim]
-            )
-        else:
-            self.pos_embed = None
-
-    def forward(self, kv: torch.Tensor, cu_seqlens):
-        """
-        前向传播，压缩KV
-        Args:
-            kv: 输入的KV张量
-            cu_seqlens: 累积序列长度
-        Returns:
-            compress_k: 压缩后的K
-            compress_v: 压缩后的V
-            cu_seqlens_compressed: 压缩后的累积序列长度
-        """
-
-        # 计算chunk相关信息，支持stride
-        filtered_kv_indices, cu_seqlens_compressed = calc_chunks_with_stride(
-            cu_seqlens, self.kernel_size, self.kernel_stride
-        )
-
-        # 提取过滤后的kv
-        filtered_kv = kv.index_select(0, filtered_kv_indices.view(-1))
-
-        # 分块
-        filtered_kv = filtered_kv.view(
-            filtered_kv.shape[0] // self.kernel_size,
-            self.kernel_size,
-            2,
-            self.head_num_k,
-            self.head_dim,
-        )  # [l, block_size,2,h,d]
-        if self.pos_embed is not None:
-            positions = torch.arange(self.kernel_size, device=kv.device)
-            pos_emb = self.pos_embed(positions)  # [kernel_size, num_heads * head_dim]
-
-            # 重塑形状以匹配多头结构
-            pos_emb = pos_emb.view(
-                self.kernel_size,
-                self.head_num_k,  # 使用实际头数参数（需在__init__中保存）
-                self.head_dim,
-            )  # [kernel_size, num_heads, head_dim]
-
-            # 添加维度用于广播
-            pos_emb = pos_emb.reshape(
-                1, self.kernel_size, 1, self.head_num_k, self.head_dim
-            )  # [1, block_size, 1, num_heads, head_dim]
-            filtered_kv = filtered_kv + pos_emb
-
-        if self.compress_func == "meanpool":
-            compressed_kv = filtered_kv.mean(dim=1)
-            compress_k = compressed_kv[
-                         :, 0, :, :
-                         ]  # .reshape(-1, self.head_num_k, self.head_dim)
-            compress_v = compressed_kv[
-                         :, 1, :, :
-                         ]  # .reshape(-1, self.head_num_k, self.head_dim)
-        elif self.compress_func == "mlp":
-
-            filtered_kv = filtered_kv.permute(0, 3, 4, 2, 1).reshape(
-                filtered_kv.shape[0], self.head_num_k, self.head_dim, -1
-            )
-            compressed_kv = self.kv_compress(filtered_kv)
-            compress_k = compressed_kv[
-                         :, :, :, 0
-                         ]  # .reshape(-1, self.head_num_k, self.head_dim)
-            compress_v = compressed_kv[
-                         :, :, :, 1
-                         ]  # .reshape(-1, self.head_num_k, self.head_dim)
-        elif self.compress_func == "mlp+residual":
-            mean_kv = filtered_kv.mean(dim=1)
-            mlp_kv = self.kv_compress(
-                filtered_kv.permute(0, 3, 4, 2, 1).reshape(
-                    filtered_kv.shape[0], self.head_num_k, self.head_dim, -1
-                )
-            ).permute(
-                0, 3, 1, 2
-            )  # [l, h,d,2]->[l,2,h,d]
-            compressed_kv = mean_kv + mlp_kv
-            compress_k = compressed_kv[:, 0, :, :]
-            compress_v = compressed_kv[:, 1, :, :]
-        elif self.compress_func == "conv1d":
-            k = filtered_kv[:, :, 0, :, :]
-            k = rearrange(k, "l block_size h d -> (l h) d block_size")  # 只能3维
-            v = filtered_kv[:, :, 1, :, :]
-            v = rearrange(v, "l block_size h d -> (l h) d block_size")
-            compress_k = self.k_conv(k).squeeze(-1)  # [(l h), d]
-            compress_v = self.v_conv(v).squeeze(-1)  # [(l h), d]
-            compress_k = rearrange(compress_k, "(l h) d -> l h d", h=self.head_num_k)
-            compress_v = rearrange(compress_v, "(l h) d -> l h d", h=self.head_num_k)
-
-        elif self.compress_func == "weighted_sum":
-            k = filtered_kv[:, :, 0, :, :]
-            k = rearrange(k, "l block_size h d -> l h block_size d")
-            v = filtered_kv[:, :, 1, :, :]
-            v = rearrange(v, "l block_size h d -> l h block_size d")
-            weight_k = torch.softmax(
-                self.weight_net_k(k), dim=2
-            )  # [l, h, block_size, 1]
-            weight_v = torch.softmax(
-                self.weight_net_v(v), dim=2
-            )  # [l, h, block_size, 1]
-
-            compress_k = (weight_k * k).sum(dim=2)  # [l, h, d]
-            compress_v = (weight_v * v).sum(dim=2)  # [l, h, d]
-        elif self.compress_func == "weighted_sum+proj":
-            k = filtered_kv[:, :, 0, :, :]
-            k = rearrange(k, "l block_size h d -> l h block_size d")
-            v = filtered_kv[:, :, 1, :, :]
-            v = rearrange(v, "l block_size h d -> l h block_size d")
-            weight_k = torch.softmax(
-                self.weight_net_k(k), dim=2
-            )  # [l, h, block_size, 1]
-            weight_v = torch.softmax(
-                self.weight_net_v(v), dim=2
-            )  # [l, h, block_size, 1]
-
-            compress_k = (weight_k * self.k_proj(k)).sum(dim=2)  # [l, h, d]
-            compress_v = (weight_v * self.v_proj(v)).sum(dim=2)  # [l, h, d]
-
-        else:
-            raise ValueError(f"Unsupported compress type: {self.compress_func}")
-
-        del filtered_kv
-        if "compressed_kv" in locals():
-            del compressed_kv
-
-        return compress_k, compress_v, cu_seqlens_compressed
 
 
 class DynamicCacheQKV(DynamicCache):
@@ -470,7 +281,7 @@ class DynamicCacheQKV(DynamicCache):
             self.no_compress_k_cache: List[torch.Tensor] = []
             self.cached_compressed_cu_seqlens: List[torch.Tensor] = []
         else:
-            self.key_cache: List[torch.Tensor] = [[] for _ in range(num_hidden_layers)]
+            self.key_cache = [[] for _ in range(num_hidden_layers)]
             self.value_cache: List[torch.Tensor] = [
                 [] for _ in range(num_hidden_layers)
             ]
@@ -561,6 +372,25 @@ class DynamicCacheQKV(DynamicCache):
 
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
+    def get_compressed_k(
+        self,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        if len(self.compress_k_cache) <= layer_idx:
+            return None
+            # self.compress_k_cache.append(torch.zeros((0, 0), dtype=torch.bfloat16))
+
+        return self.compress_k_cache[layer_idx]
+
+    def get_compressed_cu_seqlens(
+        self,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        if len(self.cached_compressed_cu_seqlens) <= layer_idx:
+            self.cached_compressed_cu_seqlens.append(torch.zeros(2, dtype=torch.int32))
+
+        return self.cached_compressed_cu_seqlens[layer_idx]
+
     def update_compress_k(
         self,
         key_states: torch.Tensor,
@@ -585,7 +415,6 @@ class DynamicCacheQKV(DynamicCache):
         # Update the cache
         if len(self.compress_k_cache) <= layer_idx:
             self.compress_k_cache.append(key_states)
-
         # content on layer cache can be a tensor and checking not tensor causes errors
         # so we explicitly check for the empty list
         elif self.compress_k_cache[layer_idx] == []:
@@ -640,8 +469,8 @@ class DynamicCacheQKV(DynamicCache):
             k_chunk = self.no_compress_k_cache[layer_idx][:kernel_size]
 
             self.no_compress_k_cache[layer_idx] = self.no_compress_k_cache[layer_idx][
-                                                  kernel_stride:
-                                                  ]
+                kernel_stride:
+            ]
 
             return k_chunk
         else:
@@ -708,10 +537,10 @@ class DynamicCacheQKV(DynamicCache):
             current_split = DynamicCacheQKV(num_hidden_layers)
             current_split._seen_tokens = self._seen_tokens
             current_split.key_cache = [
-                tensor[i: i + split_size] for tensor in self.key_cache
+                tensor[i : i + split_size] for tensor in self.key_cache
             ]
             current_split.value_cache = [
-                tensor[i: i + split_size] for tensor in self.value_cache
+                tensor[i : i + split_size] for tensor in self.value_cache
             ]
             out.append(current_split)
         return out
@@ -809,6 +638,9 @@ class CompressK(torch.nn.Module):
             self.head_num_k,
             self.head_dim,
         )  # [l, block_size,h,d]
+        # print(f"{filtered_k.shape=}")
+        # print(f"{k.shape=}")
+        # print(f"{cu_seqlens_compressed=}")
 
         compressed_k = filtered_k.mean(dim=1)
 
@@ -1152,7 +984,9 @@ def flash_attn_with_kvcache(
     #     blockmask,
     #     block_window_size,
     # )
-
+    # print(f"{q.shape=}")
+    # print(f"{k.shape=}")
+    # print(f"{v.shape=}")
     out = attn(
         q,
         k,
@@ -1211,10 +1045,6 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         prefix: str = "",
         **kwargs,
     ):
-        if global_server_args_dict["attention_backend"] != "fa3":
-            print_warning_once(
-                global_server_args_dict["attention_backend"] + " is not available for MiniCPM-4, defaults to fa3")
-            global_server_args_dict["attention_backend"] = "fa3"
         super().__init__()
         self.config = config
         self.layer_idx = layer_id
@@ -1237,7 +1067,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         rope_theta = getattr(config, "rope_theta", 10000)
         self.rope_theta = rope_theta
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
@@ -1323,11 +1153,11 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         cu_seqlens_k,
         max_seqlen_in_batch_q,
         max_seqlen_in_batch_k,
-        forward_batch,
+        forward_batch: ForwardBatch,
         no_rope_param=None,
         past_key_value=None,
     ):
-        assert forward_batch.forward_mode.is_extend()
+        # assert forward_batch.forward_mode.is_extend(), forward_batch.forward_mode
         stage1_k = k if no_rope_param is None else no_rope_param["key_states_no_rope"]
         compressed_k, compressed_cu_seqlens = self.compress_k(stage1_k, cu_seqlens_k)
         compressed_v = compressed_k.clone()
@@ -1338,6 +1168,8 @@ class MiniCPMSparseFlashAttention2(nn.Module):
             past_key_value.update_no_compress_k(
                 k[no_compress_k_start:], self.layer_idx, no_compress_k_start
             )
+            # print(f"{compressed_k.shape=}")
+            # print(f"{k.shape=}")
             past_key_value.cached_compressed_cu_seqlens.append(compressed_cu_seqlens)
         compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
         topk_idx = compressed_attention(
@@ -1463,8 +1295,8 @@ class MiniCPMSparseFlashAttention2(nn.Module):
                 batch_size + 1, dtype=torch.int32, device=query_layer.device
             )
             indices_q = cu_seqlens_q[
-                        :-1
-                        ]  # For query_length == 1, indices_q are just batch indices 0, 1, ...
+                :-1
+            ]  # For query_length == 1, indices_q are just batch indices 0, 1, ...
             query_layer_unpadded = query_layer.squeeze(
                 1
             )  # Query is already effectively unpadded
@@ -1551,6 +1383,7 @@ class MiniCPMSparseFlashAttention2(nn.Module):
             # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in MiniCPMFlashAttention2 __init__.
             causal = self.is_causal and query_length != 1
         # Contains at least one padding token in the sequence
+        # print(f"{attention_mask=}")
         if attention_mask is not None:
             batch_size = query_states.shape[0]
             (
@@ -1692,7 +1525,8 @@ class MiniCPMSparseFlashAttention2(nn.Module):
             k = k.to(target_dtype)
             v = v.to(target_dtype)
 
-        if past_key_value is None or q_len != 1:  # prefilling
+        # if past_key_value is None or q_len != 1:  # prefilling
+        if forward_batch.forward_mode.is_extend():  # prefilling
             attn_output = self._flash_attention_forward(
                 q,
                 k,
@@ -1840,12 +1674,21 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         else:
             # print(f"{self.layer_idx=}")
             # print(f"{len(past_key_value.compress_k_cache)=}")
-            compressed_k = past_key_value.compress_k_cache[
+            # in cuda-graph capturing, this cache might be uniniitalized
+            compressed_k = past_key_value.get_compressed_k(
                 self.layer_idx
-            ]  # [seqlen, nheads_k, head_dim]
-            compressed_cu_seqlens = past_key_value.cached_compressed_cu_seqlens[
+            )  # [seqlen, nheads_k, head_dim]
+            if compressed_k is None:
+                compressed_k = torch.zeros(
+                    (0, self.num_kv_heads, self.head_dim),
+                    dtype=torch.bfloat16,
+                    device=new_k.device,
+                )
+            # print(f"111 {compressed_k.shape=}")
+            compressed_cu_seqlens = past_key_value.get_compressed_cu_seqlens(
                 self.layer_idx
-            ]
+            ).to(device=new_k.device)
+            # print(f"111 {compressed_cu_seqlens=}")
 
         compressed_v = compressed_k.clone()
 
@@ -1855,6 +1698,20 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         assert (
             compressed_k.shape[0] == compressed_seqlens.sum().item()
         ), "The length of compressed_k does not match the sum of compressed_seqlens"
+        # if compressed_k.shape[0] == 0:
+        #     # If there are no compressed keys (e.g., during CUDA graph capture for an uninitialized layer),
+        #     # create a dummy topk_idx indicating no blocks are selected.
+        #     # new_q has shape [bsz=1, q_len=1, num_q_heads, head_dim]
+        #     # topk_idx is expected to be (num_q_heads, q_len, top_k_value)
+        #     # For decode (q_len=1): (self.num_heads, 1, self.topk)
+        #     num_q_heads_for_topk_idx = new_q.shape[2]  # This is self.num_heads for the current TP rank
+        #     topk_idx = torch.full(
+        #         (num_q_heads_for_topk_idx, 1, self.topk),
+        #         -1,
+        #         dtype=torch.int32,
+        #         device=new_q.device
+        #     )
+        # else:
         topk_idx = compressed_attention(
             (
                 new_q.squeeze(0).contiguous()
@@ -2047,6 +1904,7 @@ class MiniCPMModel(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         # FIXME
+        print(f"{forward_batch=}")
         if forward_batch.forward_mode.is_extend():
             self.past_key_values = DynamicCacheQKV()
 
