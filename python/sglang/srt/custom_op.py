@@ -1,9 +1,10 @@
+import os
 from typing import Optional
 
 import torch
 from torch import nn
 
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -23,6 +24,9 @@ class CustomOp(nn.Module):
     def forward_cuda(self, *args, **kwargs):
         raise NotImplementedError
 
+    def forward_triton(self, *args, **kwargs):
+        raise NotImplementedError
+
     def forward_hip(self, *args, **kwargs):
         return self.forward_cuda(*args, **kwargs)
 
@@ -36,6 +40,9 @@ class CustomOp(nn.Module):
         return self.forward_native(*args, **kwargs)
 
     def dispatch_forward(self):
+        if get_bool_env_var("SGL_USE_TRITON_NON_ATTN"):
+            return self.forward_triton
+
         if _is_cuda:
             return self.forward_cuda
         elif _is_hip:

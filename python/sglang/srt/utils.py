@@ -18,6 +18,7 @@ import builtins
 import ctypes
 import dataclasses
 import importlib
+import inspect
 import io
 import ipaddress
 import itertools
