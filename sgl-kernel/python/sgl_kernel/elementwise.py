@@ -11,7 +11,7 @@ def rmsnorm(
     weight: torch.Tensor,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
-    enable_pdl: Optional[bool] = None,
+    enable_pdl: Optional[bool] = is_hopper_arch(),
 ) -> torch.Tensor:
     r"""Root mean square normalization.
 
@@ -30,7 +30,7 @@ def rmsnorm(
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+        Enabled by default on Hopper architecture.
 
     Returns
     -------
@@ -39,8 +39,6 @@ def rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
-    if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
     torch.ops.sgl_kernel.rmsnorm.default(out, input, weight, eps, enable_pdl)
     return out
 
@@ -50,7 +48,7 @@ def fused_add_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    enable_pdl: Optional[bool] = None,
+    enable_pdl: Optional[bool] = is_hopper_arch(),
 ) -> None:
     r"""Fused add root mean square normalization.
 
@@ -73,10 +71,8 @@ def fused_add_rmsnorm(
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+        Enabled by default on Hopper architecture.
     """
-    if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
     torch.ops.sgl_kernel.fused_add_rmsnorm.default(
         input, residual, weight, eps, enable_pdl
     )
@@ -87,7 +83,7 @@ def gemma_rmsnorm(
     weight: torch.Tensor,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
-    enable_pdl: Optional[bool] = None,
+    enable_pdl: Optional[bool] = is_hopper_arch(),
 ) -> torch.Tensor:
     r"""Gemma-style root mean square normalization.
 
@@ -106,7 +102,7 @@ def gemma_rmsnorm(
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+        Enabled by default on Hopper architecture.
 
     Returns
     -------
@@ -115,8 +111,6 @@ def gemma_rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
-    if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
     torch.ops.sgl_kernel.gemma_rmsnorm.default(out, input, weight, eps, enable_pdl)
     return out
 
@@ -126,7 +120,7 @@ def gemma_fused_add_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    enable_pdl: Optional[bool] = None,
+    enable_pdl: Optional[bool] = is_hopper_arch(),
 ) -> None:
     r"""Gemma-style fused add root mean square normalization.
 
@@ -149,10 +143,8 @@ def gemma_fused_add_rmsnorm(
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+        Enabled by default on Hopper architecture.
     """
-    if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
     torch.ops.sgl_kernel.gemma_fused_add_rmsnorm.default(
         input, residual, weight, eps, enable_pdl
     )
@@ -169,12 +161,10 @@ def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
 
 
 def silu_and_mul(
-    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = None
+    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = is_hopper_arch()
 ) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
-    if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
     if out is not None:
         _check_shape(input, out)
     else:
@@ -188,12 +178,10 @@ def silu_and_mul(
 
 
 def gelu_tanh_and_mul(
-    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = None
+    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = is_hopper_arch()
 ) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
-    if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
     if out is not None:
         _check_shape(input, out)
     else:
@@ -207,12 +195,10 @@ def gelu_tanh_and_mul(
 
 
 def gelu_and_mul(
-    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = None
+    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = is_hopper_arch()
 ) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
-    if enable_pdl is None:
-        enable_pdl = is_hopper_arch()
     if out is not None:
         _check_shape(input, out)
     else:
