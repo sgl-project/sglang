@@ -64,9 +64,13 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
         if isinstance(sub, CustomOp):
             if reverse:
-                sub._forward_method = sub.forward_cuda
+                # Restore forward_method
+                sub._forward_method = sub._origin_forward_method
+                delattr(sub, "_origin_forward_method")
                 setattr(sub, "is_torch_compile", False)
             else:
+                # Record forward_method
+                sub._origin_forward_method = sub._forward_method
                 # NOTE: Temporarily workaround MoE
                 if "FusedMoE" in sub.__class__.__name__:
                     if num_tokens == 1:
