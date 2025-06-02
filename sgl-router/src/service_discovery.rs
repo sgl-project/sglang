@@ -239,11 +239,13 @@ async fn handle_pod_event(
                 worker_url
             );
             match router.add_worker(&worker_url).await {
-                Ok(msg) => info!("Router add_worker: {}", msg),
+                Ok(msg) => {
+                    info!("Router add_worker: {}", msg);
+                    let mut tracker = tracked_pods.lock().unwrap();
+                    tracker.insert(pod_info.clone());
+                }
                 Err(e) => error!("Failed to add worker {} to router: {}", worker_url, e),
             }
-            let mut tracker = tracked_pods.lock().unwrap();
-            tracker.insert(pod_info.clone());
         }
     } else if already_tracked {
         // If pod was healthy before but not anymore, remove it
