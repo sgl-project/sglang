@@ -152,7 +152,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
                 # outlines <= 0.0.46
                 guide = RegexGuide(regex, self.outlines_tokenizer)
         except interegular.patterns.InvalidSyntax as e:
-            logger.warning(f"skip invalid regex schema: {regex=}, {e=}")
+            logger.error(f"Hit invalid regex schema: {regex=}, {e=}")
             return INVALID_GRAMMAR_OBJ
 
         jump_forward_map = None
