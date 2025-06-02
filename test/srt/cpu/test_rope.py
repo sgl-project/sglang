@@ -1,6 +1,5 @@
 import unittest
 
-import pytest
 import sgl_kernel
 import torch
 from utils import precision
