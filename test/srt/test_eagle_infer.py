@@ -639,5 +639,59 @@ class TestEAGLEDraftExtend(CustomTestCase):
             self.assertGreater(acc_length, 1.50)
 
 
+class TestEAGLEDraftExtendFlashinfer(TestEAGLEDraftExtend):
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-draft-model-path",
+                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                "--speculative-num-steps",
+                1,
+                "--speculative-eagle-topk",
+                1,
+                "--speculative-num-draft-tokens",
+                2,
+                "--max-running-requests",
+                4,
+                "--attention-backend",
+                "flashinfer",
+            ],
+        )
+
+
+class TestEAGLEDraftExtendTriton(TestEAGLEDraftExtend):
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-draft-model-path",
+                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                "--speculative-num-steps",
+                1,
+                "--speculative-eagle-topk",
+                1,
+                "--speculative-num-draft-tokens",
+                2,
+                "--max-running-requests",
+                4,
+                "--attention-backend",
+                "triton",
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
