@@ -30,6 +30,9 @@ tracing-appender = "0.2.3"
 kube = { version = "0.88.1", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.21.0", features = ["v1_29"] }
 futures = "0.3"
+# Added for metrics
+metrics = "0.24.2"
+metrics-exporter-prometheus = "0.17.0"
 [profile.release]
 lto = "thin"
 codegen-units = 1

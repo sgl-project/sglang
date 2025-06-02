@@ -24,6 +24,7 @@ import warnings
 from argparse import ArgumentParser
 from dataclasses import dataclass, field
 from datetime import datetime
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple, Union
 
@@ -38,7 +39,6 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
-AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 ASSISTANT_SUFFIX = "Assistant:"
 
 global args
@@ -48,6 +48,19 @@ global args
 def _get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
     return value.lower() in ("true", "1")
+
+
+def _create_bench_client_session():
+    # When the pressure is big, the read buffer could be full before aio thread read
+    # the content. We increase the read_bufsize from 64K to 10M.
+    # Define constants for timeout and buffer size for clarity and maintainability
+    BENCH_AIOHTTP_TIMEOUT_SECONDS = 6 * 60 * 60  # 6 hours
+    BENCH_AIOHTTP_READ_BUFSIZE_BYTES = 10 * 1024**2  # 10 MB
+
+    aiohttp_timeout = aiohttp.ClientTimeout(total=BENCH_AIOHTTP_TIMEOUT_SECONDS)
+    return aiohttp.ClientSession(
+        timeout=aiohttp_timeout, read_bufsize=BENCH_AIOHTTP_READ_BUFSIZE_BYTES
+    )
 
 
 @dataclass
@@ -105,7 +118,7 @@ async def async_request_trt_llm(
     api_url = request_func_input.api_url
     assert api_url.endswith("generate_stream")
 
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with _create_bench_client_session() as session:
         payload = {
             "accumulate_tokens": True,
             "text_input": request_func_input.prompt,
@@ -178,7 +191,7 @@ async def async_request_openai_completions(
 
     prompt = request_func_input.prompt
 
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with _create_bench_client_session() as session:
         payload = {
             "model": request_func_input.model,
             "prompt": prompt,
@@ -260,7 +273,7 @@ async def async_request_truss(
 
     prompt = request_func_input.prompt
 
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with _create_bench_client_session() as session:
         payload = {
             "model": request_func_input.model,
             "prompt": prompt,
@@ -337,9 +350,9 @@ async def async_request_sglang_generate(
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
 
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with _create_bench_client_session() as session:
         payload = {
-            "text": prompt,
+            ("text" if isinstance(prompt, str) else "input_ids"): prompt,
             "sampling_params": {
                 "temperature": 0.0,
                 "max_new_tokens": request_func_input.output_len,
@@ -436,7 +449,7 @@ async def async_request_gserver(
 
 
 async def async_request_profile(api_url: str) -> RequestFuncOutput:
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with _create_bench_client_session() as session:
         output = RequestFuncOutput()
         try:
             async with session.post(url=api_url) as response:
@@ -492,7 +505,9 @@ def get_tokenizer(
 
 
 def get_dataset(args, tokenizer):
+    tokenize_prompt = getattr(args, "tokenize_prompt", False)
     if args.dataset_name == "sharegpt":
+        assert not tokenize_prompt
         input_requests = sample_sharegpt_requests(
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
@@ -511,8 +526,10 @@ def get_dataset(args, tokenizer):
             tokenizer=tokenizer,
             dataset_path=args.dataset_path,
             random_sample=args.dataset_name == "random",
+            return_text=not tokenize_prompt,
         )
     elif args.dataset_name == "generated-shared-prefix":
+        assert not tokenize_prompt
         input_requests = sample_generated_shared_prefix_requests(
             num_groups=args.gsp_num_groups,
             prompts_per_group=args.gsp_prompts_per_group,
@@ -523,6 +540,7 @@ def get_dataset(args, tokenizer):
             args=args,
         )
     elif args.dataset_name == "mmmu":
+        assert not tokenize_prompt
         input_requests = sample_mmmu_requests(
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
@@ -588,7 +606,7 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
         filename = os.path.join("/tmp", url.split("/")[-1])
 
     # Check if the cache file already exists
-    if os.path.exists(filename):
+    if is_file_valid_json(filename):
         return filename
 
     print(f"Downloading from {url} to {filename}")
@@ -614,6 +632,22 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
             bar.update(len(chunk))
 
     return filename
+
+
+def is_file_valid_json(path):
+    if not os.path.isfile(path):
+        return False
+
+    # TODO can fuse into the real file open later
+    try:
+        with open(path) as f:
+            json.load(f)
+        return True
+    except JSONDecodeError as e:
+        print(
+            f"{path} exists but json loading fails ({e=}), thus treat as invalid file"
+        )
+        return False
 
 
 @dataclass
@@ -755,7 +789,7 @@ def sample_sharegpt_requests(
         raise ValueError("output_len too small")
 
     # Download sharegpt if necessary
-    if not os.path.isfile(dataset_path) and dataset_path == "":
+    if not is_file_valid_json(dataset_path) and dataset_path == "":
         dataset_path = download_and_cache_file(SHAREGPT_URL)
 
     # Load the dataset.
@@ -853,7 +887,7 @@ def sample_random_requests(
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
 
         # Download sharegpt if necessary
-        if not os.path.isfile(dataset_path):
+        if not is_file_valid_json(dataset_path):
             dataset_path = download_and_cache_file(SHAREGPT_URL)
 
         # Load the dataset.
@@ -1178,7 +1212,7 @@ async def benchmark(
     if "<image>" in test_prompt:
         import re
 
-        image_match = re.search(r"<image>(.*?)</image>(.*)", test_prompt)
+        image_match = re.search(r"<image>(.*?)</image>(.*)", test_prompt, re.DOTALL)
         image_data = image_match.group(1) if image_match else None
         test_prompt = image_match.group(2) if image_match else test_prompt
     else:
@@ -1251,7 +1285,7 @@ async def benchmark(
         if "<image>" in prompt:
             import re
 
-            image_match = re.search(r"<image>(.*?)</image>(.*)", prompt)
+            image_match = re.search(r"<image>(.*?)</image>(.*)", prompt, re.DOTALL)
             image_data = image_match.group(1) if image_match else None
             prompt = image_match.group(2) if image_match else prompt
         else:
@@ -1286,14 +1320,15 @@ async def benchmark(
 
     if "sglang" in backend:
         server_info = requests.get(base_url + "/get_server_info")
-        if pd_separated:
-            accept_length = server_info.json()["decode"][0]["internal_states"][0].get(
+        if server_info.status_code == 200:
+            server_info_json = server_info.json()
+            if "decode" in server_info_json:
+                server_info_json = server_info_json["decode"][0]
+            accept_length = server_info_json["internal_states"][0].get(
                 "avg_spec_accept_length", None
             )
         else:
-            accept_length = server_info.json()["internal_states"][0].get(
-                "avg_spec_accept_length", None
-            )
+            accept_length = None
     else:
         accept_length = None
 
@@ -1477,6 +1512,9 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "output_details"):
         args.output_details = False
 
+    if not hasattr(args, "tokenize_prompt"):
+        args.tokenize_prompt = False
+
     print(f"benchmark_args={args}")
 
     # Set global environments
@@ -1487,6 +1525,11 @@ def run_benchmark(args_: argparse.Namespace):
     extra_request_body = {}
     if args.extra_request_body:
         extra_request_body = json.loads(args.extra_request_body)
+
+    if args.tokenize_prompt:
+        assert (
+            args.backend == "sglang"
+        ), "`--tokenize-prompt` only compatible with `--backend sglang` currently"
 
     # Set url
     if args.port is None:
@@ -1598,6 +1641,7 @@ def run_benchmark(args_: argparse.Namespace):
             profile=args.profile,
             pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
+            warmup_requests=args.warmup_requests,
         )
     )
 
@@ -1792,6 +1836,11 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of warmup requests to run before the benchmark",
+    )
+    parser.add_argument(
+        "--tokenize-prompt",
+        action="store_true",
+        help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
     )
 
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")

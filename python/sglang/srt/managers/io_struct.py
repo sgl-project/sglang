@@ -103,7 +103,7 @@ class GenerateReqInput:
 
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[int], int]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
     def contains_mm_input(self) -> bool:
@@ -407,6 +407,7 @@ class GenerateReqInput:
                 else None
             ),
             return_hidden_states=self.return_hidden_states,
+            # if `__getitem__` is called, the bootstrap_host, bootstrap_port, bootstrap_room must be a list
             bootstrap_host=(
                 self.bootstrap_host[i] if self.bootstrap_host is not None else None
             ),
@@ -847,7 +848,8 @@ class ProfileReqInput:
     # If it is set, profiling is automatically stopped after this step, and
     # the caller doesn't need to run stop_profile.
     num_steps: Optional[int] = None
-    activities: Optional[List[Literal["CPU", "GPU", "MEM", "CUDA_PROFILER"]]] = None
+    activities: Optional[List[str]] = None
+    profile_by_stage: bool = False
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
 
@@ -874,6 +876,7 @@ class ProfileReq:
     output_dir: Optional[str] = None
     num_steps: Optional[int] = None
     activities: Optional[List[str]] = None
+    profile_by_stage: bool = False
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None

@@ -93,6 +93,11 @@ def is_in_ci():
     return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
+def is_in_amd_ci():
+    """Return whether it is in an AMD CI runner."""
+    return get_bool_env_var("SGLANG_AMD_CI")
+
+
 if is_in_ci():
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
         5000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
@@ -485,7 +490,6 @@ def popen_launch_pd_server(
     api_key: Optional[str] = None,
     other_args: list[str] = (),
     env: Optional[dict] = None,
-    return_stdout_stderr: Optional[tuple] = None,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -515,42 +519,9 @@ def popen_launch_pd_server(
 
     print(f"command={' '.join(command)}")
 
-    if return_stdout_stderr:
-        process = subprocess.Popen(
-            command,
-            stdout=return_stdout_stderr[0],
-            stderr=return_stdout_stderr[1],
-            env=env,
-            text=True,
-        )
-    else:
-        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
+    process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
-    start_time = time.perf_counter()
-    with requests.Session() as session:
-        while time.perf_counter() - start_time < timeout:
-            try:
-                headers = {
-                    "Content-Type": "application/json; charset=utf-8",
-                    "Authorization": f"Bearer {api_key}",
-                }
-                response = session.get(
-                    f"{base_url}/health",
-                    headers=headers,
-                )
-                if response.status_code == 200:
-                    return process
-            except requests.RequestException:
-                pass
-
-            return_code = process.poll()
-            if return_code is not None:
-                raise Exception(f"Server unexpectedly exits ({return_code=}).")
-
-            time.sleep(10)
-
-    kill_process_tree(process.pid)
-    raise TimeoutError("Server failed to start within the timeout period.")
+    return process
 
 
 def run_with_timeout(
@@ -910,20 +881,24 @@ def calculate_rouge_l(output_strs_list1, output_strs_list2):
     return rouge_l_scores
 
 
-STDERR_FILENAME = "stderr.txt"
-STDOUT_FILENAME = "stdout.txt"
+STDERR_FILENAME = "/tmp/stderr.txt"
+STDOUT_FILENAME = "/tmp/stdout.txt"
 
 
 def read_output(output_lines: List[str], filename: str = STDERR_FILENAME):
     """Print the output in real time with another thread."""
     while not os.path.exists(filename):
-        time.sleep(1)
+        time.sleep(0.01)
 
     pt = 0
     while pt >= 0:
         if pt > 0 and not os.path.exists(filename):
             break
-        lines = open(filename).readlines()
+        try:
+            lines = open(filename).readlines()
+        except FileNotFoundError:
+            print(f"{pt=}, {os.path.exists(filename)=}")
+            raise
         for line in lines[pt:]:
             print(line, end="", flush=True)
             output_lines.append(line)

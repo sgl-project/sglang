@@ -240,6 +240,17 @@ void prepare_moe_input(
     const int64_t n,
     const int64_t k);
 
+void ep_moe_pre_reorder(
+    torch::Tensor input,
+    torch::Tensor gateup_input,
+    torch::Tensor src2dst,
+    torch::Tensor topk_ids,
+    torch::Tensor a1_scales,
+    int64_t start_expert_id,
+    int64_t end_expert_id,
+    int64_t topk,
+    bool use_per_token_if_dynamic);
+
 /*
  * From csrc/speculative
  */
@@ -404,3 +415,24 @@ void convert_vertical_slash_indexes_mergehead(
  * From XGrammar
  */
 void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt);
+
+/*
+ * From QServe
+ */
+void qserve_w4a8_per_chn_gemm(
+    const torch::Tensor& _in_feats,
+    const torch::Tensor& _kernel,
+    const torch::Tensor& _wscales,
+    const torch::Tensor& _ascales,
+    const torch::Tensor& _w_szs,
+    const torch::Tensor& _a_ssums,
+    torch::Tensor& _out_feats);
+
+void qserve_w4a8_per_group_gemm(
+    const torch::Tensor& _in_feats,
+    const torch::Tensor& _kernel,
+    const torch::Tensor& _zeros,
+    const torch::Tensor& _scales_i8,
+    const torch::Tensor& _wscales,
+    const torch::Tensor& _ascales,
+    torch::Tensor& _out_feats);
