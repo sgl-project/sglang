@@ -174,8 +174,6 @@ class MultimodalDataItem:
 
     modality: Modality
 
-    input_ids: Optional[torch.Tensor] = None
-
     hash: int = None
     pad_value: int = None
 
