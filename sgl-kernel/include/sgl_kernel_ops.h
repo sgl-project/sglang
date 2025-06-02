@@ -252,8 +252,7 @@ void ep_moe_pre_reorder(
     int64_t topk,
     bool use_per_token_if_dynamic);
 
-void shuffle_rows(const torch::Tensor& input_tensor,
-   const torch::Tensor& dst2src_map, torch::Tensor& output_tensor);
+void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor);
 
 void cutlass_fp4_group_mm(
     torch::Tensor& output,
