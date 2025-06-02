@@ -300,10 +300,6 @@ class MooncakeKVManager(BaseKVManager):
         decode_tp_world_size: int,
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
-        # Group by indices
-        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_kv_indices, dst_kv_indices
-        )
 
         # rank/kv_head config
         local_tp_rank = self.kv_args.engine_rank
@@ -374,25 +370,24 @@ class MooncakeKVManager(BaseKVManager):
             src_item_len, dst_item_len,
             src_offset, dst_offset, slice_lens_per_page) = layer_params
 
-            for prefill_block, dst_block in zip(prefill_kv_blocks, dst_kv_blocks):
-                for prefill_page_idx, decode_page_idx in zip(prefill_block, dst_block):
+            for i in range(len(prefill_kv_indices)):
+                prefill_page_idx =int(prefill_kv_indices[i])
+                decode_page_idx = int(dst_kv_indices[i])
 
-                    src_page_addr = src_ptr + prefill_page_idx * src_item_len
-                    src_slice_addr = src_page_addr + src_offset
-
-                    dst_slice_addr = dst_ptr + decode_page_idx * dst_item_len + dst_offset
+                src_slice_addr = src_ptr + prefill_page_idx * src_item_len + src_offset
+                dst_slice_addr = dst_ptr + decode_page_idx * dst_item_len + dst_offset
                     
-                    logger.debug(f"SYNC: sid={mooncake_session_id}, "
-                                f"src={src_slice_addr}, dst={dst_slice_addr}, len={slice_lens_per_page}")
-                    status = self.engine.transfer_sync(
-                        mooncake_session_id,
-                        src_slice_addr,
-                        dst_slice_addr,
-                        slice_lens_per_page
-                    )
-                    if status != 0:
-                        logger.error(f"transfer_sync failed with status {status} for session {mooncake_session_id}")
-                        return status
+                logger.debug(f"SYNC: sid={mooncake_session_id}, "
+                            f"src={src_slice_addr}, dst={dst_slice_addr}, len={slice_lens_per_page}")
+                status = self.engine.transfer_sync(
+                    mooncake_session_id,
+                    src_slice_addr,
+                    dst_slice_addr,
+                    slice_lens_per_page
+                )
+                if status != 0:
+                    logger.error(f"transfer_sync failed with status {status} for session {mooncake_session_id}")
+                    return status
             return 0
 
         futures = [
