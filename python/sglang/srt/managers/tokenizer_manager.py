@@ -47,6 +47,7 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+import torch
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
@@ -1442,12 +1443,18 @@ class TokenizerManager:
         apply_softmax: bool = False,
         item_first: bool = False,
         request: Optional[Any] = None,
-    ) -> List[Dict[int, float]]:
+    ) -> List[List[float]]:
         """
         See Engine.score() for more details.
         """
         if label_token_ids is None:
             raise ValueError("label_token_ids must be provided")
+
+        if self.tokenizer is not None:
+            vocab_size = self.tokenizer.vocab_size
+            for token_id in label_token_ids:
+                if token_id >= vocab_size:
+                    raise ValueError(f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})")
 
         # Handle string or tokenized query/items
         if isinstance(query, str) and (isinstance(items, str) or (isinstance(items, list) and (not items or isinstance(items[0], str)))):
@@ -1470,11 +1477,6 @@ class TokenizerManager:
                 input_ids_list = [item + query for item in items]
             else:
                 input_ids_list = [query + item for item in items]
-            if self.tokenizer is not None:
-                vocab_size = self.tokenizer.vocab_size
-                for token_id in label_token_ids:
-                    if token_id >= vocab_size:
-                        raise ValueError(f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})")
             batch_request = GenerateReqInput(
                 input_ids=input_ids_list,
                 return_logprob=True,
@@ -1485,17 +1487,28 @@ class TokenizerManager:
         else:
             raise ValueError("Invalid combination of query/items types for score_request.")
 
-        scores = []
         results = await self.generate_request(batch_request, request).__anext__()
+        scores = []
+        
         for result in results:
-            output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
-            first_position = output_logprobs[0]
-            probs = {token_id: math.exp(logprob) for logprob, token_id, _ in first_position if token_id in label_token_ids}
+            # Get logprobs for each token
+            logprobs = {}
+            for logprob, token_id, _ in result["meta_info"].get("output_token_ids_logprobs", [])[0]:
+                if token_id in label_token_ids:
+                    logprobs[token_id] = logprob
+            
+            # Get scores in order of label_token_ids
+            score_list = [logprobs.get(token_id, float('-inf')) for token_id in label_token_ids]
+            
+            # Apply softmax to logprobs if needed
             if apply_softmax:
-                total = sum(probs.values())
-                if total > 0:
-                    probs = {tid: p/total for tid, p in probs.items()}
-            scores.append(probs)
+                score_list = torch.softmax(torch.tensor(score_list), dim=0).tolist()
+            else:
+                # Convert logprobs to probabilities if not using softmax
+                score_list = [math.exp(x) if x != float('-inf') else 0.0 for x in score_list]
+                
+            scores.append(score_list)
+            
         return scores
 
 

@@ -722,8 +722,8 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
 
 
 @app.post("/v1/score")
-async def openai_v1_score(raw_request: Request):
-    """OpenAI-compatible endpoint for the scoring API. See Engine.score() for detailed documentation."""
+async def v1_score_request(raw_request: Request):
+    """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
     return await v1_score(_global_state.tokenizer_manager, raw_request)
 
 

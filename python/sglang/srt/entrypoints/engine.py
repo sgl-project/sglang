@@ -479,9 +479,9 @@ class Engine(EngineBase):
         label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
-    ) -> List[Dict[int, float]]:
+    ) -> List[List[float]]:
         """
-        Score the probability of specified token IDs appearing after the given query and item are appended together. For example:  
+        Score the probability of specified token IDs appearing after the given (query + item) pair. For example:  
         query = "<|user|>Is the following city the capital of France? "
         items = ["Paris <|assistant|>", "London <|assistant|>", "Berlin <|assistant|>"]
         label_token_ids = [2332, 1223] # Token IDs for "Yes" and "No"
@@ -493,7 +493,7 @@ class Engine(EngineBase):
         "<|user|>Is the following city the capital of France? Berlin <|assistant|>"
         The api would then return the probabilities of the model producing "Yes" and "No" as the next token.
         The output would look like:
-        [{"Yes": 0.9, "No": 0.1}, {"Yes": 0.2, "No": 0.8}, {"Yes": 0.1, "No": 0.9}]
+        [[0.9, 0.1], [0.2, 0.8], [0.1, 0.9]]
    
         
         Args:
@@ -530,7 +530,7 @@ class Engine(EngineBase):
         label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
-    ) -> List[Dict[int, float]]:
+    ) -> List[List[float]]:
         """
         Asynchronous version of score method.
 

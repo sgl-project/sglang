@@ -501,7 +501,7 @@ class ScoringRequest(BaseModel):
 
 
 class ScoringResponse(BaseModel):
-    scores: List[Dict[int, float]]  # List of dicts mapping token IDs to probabilities
+    scores: List[List[float]]  # List of lists of probabilities, each in the order of label_token_ids
     model: str
     usage: Optional[UsageInfo] = None
     object: str = "scoring"

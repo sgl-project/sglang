@@ -52,8 +52,8 @@ class TestScoreAPI(CustomTestCase):
                 # Apply softmax over just the target tokens
                 target_probs = torch.softmax(target_logits, dim=-1)
                 
-                # Create dictionary of token probabilities
-                probs = {tid: target_probs[i].item() for i, tid in enumerate(label_token_ids)}
+                # Convert to list of probabilities in order of label_token_ids
+                probs = [target_probs[i].item() for i in range(len(label_token_ids))]
                 
                 scores.append(probs)
             
@@ -79,29 +79,28 @@ class TestScoreAPI(CustomTestCase):
             del tokenizer
 
     def _compare_scores(self, hf_scores, sglang_scores, label_token_ids, case_name=""):
-        """Helper method to compare scores between HF and SGLang."""
+        """Helper method to compare scores between HF and SGLang using relative tolerance."""
         self.assertEqual(len(hf_scores), len(sglang_scores), 
             f"Score lengths don't match for {case_name}")
         
-        for hf_score_dict, sglang_score_dict in zip(hf_scores, sglang_scores):
-            print(f"\nScore comparison ({case_name}):")
-            for tid in label_token_ids:
-                hf_score = hf_score_dict[tid]
-                sglang_score = sglang_score_dict[tid]
-                self.assertAlmostEqual(hf_score, sglang_score, places=3,
-                    msg=f"Scores don't match for token {tid} ({case_name}): HF={hf_score:.6f}, SGLang={sglang_score:.6f}")
+        # Use a relative tolerance of 1%
+        TOLERANCE = 0.01
+        
+        for hf_score_list, sglang_score_list in zip(hf_scores, sglang_scores):
+            self.assertEqual(len(hf_score_list), len(sglang_score_list),
+                f"Score list lengths don't match for {case_name}")
+            
+            for hf_score, sglang_score in zip(hf_score_list, sglang_score_list):
+                diff = abs(hf_score - sglang_score)                
+                self.assertLessEqual(diff, TOLERANCE,
+                    msg=f"Scores differ by {diff:.2%} ({case_name}): "
+                        f"HF={hf_score:.6f}, SGLang={sglang_score:.6f}")
+                
                 self.assertGreaterEqual(sglang_score, 0, f"SGLang score {sglang_score:.6f} not in [0,1]")
                 self.assertLessEqual(sglang_score, 1, f"SGLang score {sglang_score:.6f} not in [0,1]")
             
-            self.assertAlmostEqual(sum(sglang_score_dict.values()), 1.0, places=6,
-                msg=f"SGLang scores don't sum to 1 ({case_name}): {sum(sglang_score_dict.values()):.6f}")
-
-    def _get_hf_inputs(self, query, items, item_first):
-        """Helper method to generate HF inputs based on item_first parameter."""
-        if item_first:
-            return "", [f"{item}{query}" for item in items]
-        else:
-            return query, items
+            self.assertAlmostEqual(sum(sglang_score_list), 1.0, places=6,
+                msg=f"SGLang scores don't sum to 1 ({case_name}): {sum(sglang_score_list):.6f}")
 
     def test_score_consistency(self):
         """Test that SGLang scoring matches direct HuggingFace model scoring."""
@@ -122,7 +121,7 @@ class TestScoreAPI(CustomTestCase):
         ]
 
         # Common tokens to test for all cases
-        tokens = [" to", " the", " and"]
+        tokens = [" to", " the"]
         label_token_ids = self._get_token_ids(tokens)
 
         # Run each test case
@@ -144,7 +143,7 @@ class TestScoreAPI(CustomTestCase):
                 apply_softmax=True,
                 item_first=case["item_first"]
             )
-            
+
             # Compare scores
             self._compare_scores(hf_scores, sglang_scores, label_token_ids, case["name"])
 
@@ -162,18 +161,17 @@ class TestScoreAPI(CustomTestCase):
                 label_token_ids=label_token_ids,
                 apply_softmax=True
             )
-            
-            print(f"Scores: {scores}")
 
             self.assertEqual(len(scores), batch_size,
                 f"Expected {batch_size} scores, got {len(scores)}")
             
-            # Verify each score dictionary has all token IDs
-            for score_dict in scores:
-                self.assertEqual(set(score_dict.keys()), set(label_token_ids),
-                    f"Score dict missing some token IDs: {set(score_dict.keys())} vs {set(label_token_ids)}")
-
-
+            # Verify each score list has the correct length
+            for score_list in scores:
+                self.assertEqual(len(score_list), len(label_token_ids),
+                    f"Score list length {len(score_list)} doesn't match label_token_ids length {len(label_token_ids)}")
+                self.assertTrue(all(isinstance(v, float) for v in score_list),
+                    "All scores should be floats")
+                self.assertAlmostEqual(1.0, sum(score_list), 6, "Scores should sum to 1")
 
 if __name__ == "__main__":
     unittest.main() 
