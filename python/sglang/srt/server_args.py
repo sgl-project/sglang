@@ -2106,6 +2106,8 @@ class ServerArgs:
             args.hip_attention_config = HiPAttentionConfig(
                 json_or_path=args.hip_attention_config
             )
+            logger.info(f'attention_backend changed {args.attention_backend} -> hip_attention')
+            args.attention_backend = "hip_attention"
         else:
             args.hip_attention_config = None
 

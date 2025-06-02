@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
+import os
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
@@ -20,6 +21,25 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
+
+try:
+    from sglang.srt.distributed import (
+        get_tensor_model_parallel_world_size,
+        get_tensor_model_parallel_rank,
+        tensor_model_parallel_all_gather,
+        model_parallel_is_initialized,
+    )
+
+    SGLANG_DIST_AVAILABLE = True
+    
+except:
+    SGLANG_DIST_AVAILABLE = False
+
+def get_local_rank():
+    if SGLANG_DIST_AVAILABLE:
+        return get_tensor_model_parallel_rank() if model_parallel_is_initialized() else 0
+    else:
+        return 0
 
 @dataclass
 class FlashAttentionMetadata:
@@ -727,6 +747,17 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
+            run_benchmark = (
+                (not torch.cuda.is_current_stream_capturing()) and 
+                os.getenv('HIP_DEBUG_BENCH', '0') == '1' and
+                (get_local_rank() == 0)
+            )
+
+            if run_benchmark:
+                start_event = torch.cuda.Event(True)
+                end_event = torch.cuda.Event(True)
+                start_event.record()
+
             result = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
@@ -774,6 +805,13 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 o = result
+            
+            if run_benchmark:
+                end_event.record()
+                end_event.synchronize()
+
+                elapsed = start_event.elapsed_time(end_event)
+                print(f'layer {layer.layer_id} took {elapsed:.2f} ms')
         else:
             if (
                 not global_server_args_dict["disable_chunked_prefix_cache"]
