@@ -429,7 +429,7 @@ class Scheduler(
         self.torch_profiler = None
         self.torch_profiler_output_dir: Optional[str] = None
         self.profiler_activities: Optional[List[str]] = None
-        self.profiler_id: Optional[str] = None
+        self.profile_id: Optional[str] = None
         self.profiler_target_forward_ct: Optional[int] = None
         self.profiler_target_prefill_ct: Optional[int] = None
         self.profiler_target_decode_ct: Optional[int] = None
@@ -2144,6 +2144,7 @@ class Scheduler(
                     recv_req.with_stack,
                     recv_req.record_shapes,
                     recv_req.profile_by_stage,
+                    recv_req.profile_id,
                 )
             else:
                 self.init_profile(
@@ -2153,6 +2154,7 @@ class Scheduler(
                     recv_req.with_stack,
                     recv_req.record_shapes,
                     recv_req.profile_by_stage,
+                    recv_req.profile_id,
                 )
                 return self.start_profile(True)
         else:
@@ -2166,6 +2168,7 @@ class Scheduler(
         with_stack: Optional[bool],
         record_shapes: Optional[bool],
         profile_by_stage: bool,
+        profile_id: str,
     ) -> ProfileReqOutput:
         if self.profile_in_progress:
             return ProfileReqOutput(
@@ -2184,6 +2187,7 @@ class Scheduler(
         self.torch_profiler_with_stack = with_stack
         self.torch_profiler_record_shapes = record_shapes
         self.profiler_activities = activities
+        self.profile_id = profile_id
 
         if num_steps:
             self.profile_steps = num_steps
@@ -2283,7 +2287,7 @@ class Scheduler(
             self.torch_profiler.export_chrome_trace(
                 os.path.join(
                     self.torch_profiler_output_dir,
-                    str(time.time())
+                    self.profile_id
                     + f"-TP-{self.tp_rank}"
                     + stage_suffix
                     + ".trace.json.gz",
