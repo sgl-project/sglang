@@ -132,8 +132,11 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
         video_grid_thw = None  # TODO
 
-        combined_mm_item = self.process_and_combine_mm_data(base_output)
-        input_ids = combined_mm_item.input_ids
+        combined_mm_item, input_ids = self.process_and_combine_mm_data(base_output)
+
+        if combined_mm_item is None:
+            # Note(Xinyuan): This is the case where image loading fails.
+            return None
 
         video_grid_thw = None  # TODO
         second_per_grid_ts = getattr(combined_mm_item, "second_per_grid_ts", None)

@@ -418,13 +418,13 @@ class BaseMultimodalProcessor(ABC):
 
     def process_and_combine_mm_data(
         self, base_output: BaseMultiModalProcessorOutput
-    ) -> MultimodalDataItem:
+    ) -> Tuple[Optional[MultimodalDataItem], torch.Tensor]:
         """
-        Process multimodal data and return the combined multimodal item.
+        Process multimodal data and return the combined multimodal item and input_ids.
         Handles all three input formats at the same abstraction level.
 
         Returns:
-            Combined MultimodalDataItem
+            Tuple of (combined_mm_item, input_ids)
         """
 
         def tokenize_text(input_text: str) -> torch.Tensor:
@@ -483,7 +483,7 @@ class BaseMultimodalProcessor(ABC):
 
         def process_raw_images(
             base_output: BaseMultiModalProcessorOutput,
-        ) -> MultimodalDataItem:
+        ) -> Tuple[MultimodalDataItem, torch.Tensor]:
             """Process raw Image.Image objects using transformers processor."""
             ret = self.process_mm_data(
                 input_text=base_output.input_text,
@@ -491,43 +491,42 @@ class BaseMultimodalProcessor(ABC):
             )
             combined_mm_item = MultimodalDataItem(modality=Modality.IMAGE)
 
-            # Copy all fields from processor output
+            # Copy all fields from processor output except input_ids
             for key, value in ret.items():
-                if hasattr(combined_mm_item, key):
-                    if key == "input_ids":
-                        combined_mm_item.input_ids = value.flatten()
-                    else:
-                        setattr(combined_mm_item, key, value)
-            return combined_mm_item
+                if key != "input_ids" and hasattr(combined_mm_item, key):
+                    setattr(combined_mm_item, key, value)
+
+            input_ids = ret["input_ids"].flatten()
+            return combined_mm_item, input_ids
 
         def process_precomputed_features(
             base_output: BaseMultiModalProcessorOutput,
-        ) -> MultimodalDataItem:
+        ) -> Tuple[MultimodalDataItem, torch.Tensor]:
             """Process inputs with precomputed features."""
             combined_mm_item = MultimodalDataItem(modality=Modality.IMAGE)
             combined_mm_item.precomputed_features = self._extract_processor_features(
                 base_output.images, "precomputed_features"
             )
-            combined_mm_item.input_ids = tokenize_text(base_output.input_text)
-            return combined_mm_item
+            input_ids = tokenize_text(base_output.input_text)
+            return combined_mm_item, input_ids
 
         def process_pixel_values(
             base_output: BaseMultiModalProcessorOutput,
-        ) -> MultimodalDataItem:
+        ) -> Tuple[MultimodalDataItem, torch.Tensor]:
             """Process inputs with pixel values."""
             values = self._extract_processor_features_from_all_attributes(
                 base_output.images
             )
             combined_mm_item = MultimodalDataItem.from_dict(values)
-            combined_mm_item.input_ids = tokenize_text(base_output.input_text)
-            return combined_mm_item
+            input_ids = tokenize_text(base_output.input_text)
+            return combined_mm_item, input_ids
 
         def finalize_mm_item(
-            combined_mm_item: MultimodalDataItem,
+            combined_mm_item: MultimodalDataItem, input_ids: torch.Tensor
         ) -> MultimodalDataItem:
             """Apply common post-processing to the multimodal item."""
             combined_mm_item.image_offsets = self.get_mm_items_offset(
-                input_ids=combined_mm_item.input_ids,
+                input_ids=input_ids,
                 mm_token_id=self.IM_TOKEN_ID,
             )
             return combined_mm_item
@@ -535,23 +534,23 @@ class BaseMultimodalProcessor(ABC):
         # Main logic
         mm_inputs = base_output.images
         if not mm_inputs:
-            # Return a text-only item
-            combined_mm_item = MultimodalDataItem(modality=Modality.IMAGE)
-            combined_mm_item.input_ids = tokenize_text(base_output.input_text)
-            return combined_mm_item
+            # Return text-only case
+            input_ids = tokenize_text(base_output.input_text)
+            return None, input_ids
 
         # Categorize input formats
         input_format = categorize_mm_inputs(mm_inputs)
 
         # Process based on format
         if input_format == MultimodalInputFormat.RAW_IMAGES:
-            combined_mm_item = process_raw_images(base_output)
+            combined_mm_item, input_ids = process_raw_images(base_output)
         elif input_format == MultimodalInputFormat.PRECOMPUTED_FEATURES:
-            combined_mm_item = process_precomputed_features(base_output)
+            combined_mm_item, input_ids = process_precomputed_features(base_output)
         elif input_format == MultimodalInputFormat.PIXEL_VALUES:
-            combined_mm_item = process_pixel_values(base_output)
+            combined_mm_item, input_ids = process_pixel_values(base_output)
         else:
             raise ValueError(f"Unknown input format: {input_format}")
 
         # Finalize with common processing
-        return finalize_mm_item(combined_mm_item)
+        combined_mm_item = finalize_mm_item(combined_mm_item, input_ids)
+        return combined_mm_item, input_ids

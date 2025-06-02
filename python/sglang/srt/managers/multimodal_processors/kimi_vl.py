@@ -46,10 +46,10 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
             max_req_input_len=max_req_input_len,
         )
 
-        combined_mm_item = self.process_and_combine_mm_data(base_output)
+        combined_mm_item, input_ids = self.process_and_combine_mm_data(base_output)
 
         return {
-            "input_ids": combined_mm_item.input_ids.tolist(),
-            "mm_items": [combined_mm_item],
+            "input_ids": input_ids.tolist(),
+            "mm_items": [combined_mm_item] if combined_mm_item is not None else [],
             "im_token_id": self.IM_TOKEN_ID,
         }
