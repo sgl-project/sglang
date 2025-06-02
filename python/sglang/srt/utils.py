@@ -69,9 +69,9 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
+from PIL import Image
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
-from PIL import Image
 from starlette.routing import Mount
 from torch import nn
 from torch.func import functional_call
@@ -292,7 +292,7 @@ def calculate_time(show=False, min_cost_ms=0.0):
 
 
 def get_available_gpu_memory(
-    device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
+        device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
 ):
     """
     Get available memory for cuda:gpu_id device.
@@ -438,12 +438,12 @@ class LayerFn(Protocol):
 
 
 def make_layers(
-    num_hidden_layers: int,
-    layer_fn: LayerFn,
-    pp_rank: Optional[int] = None,
-    pp_size: Optional[int] = None,
-    prefix: str = "",
-    return_tuple: bool = False,
+        num_hidden_layers: int,
+        layer_fn: LayerFn,
+        pp_rank: Optional[int] = None,
+        pp_size: Optional[int] = None,
+        prefix: str = "",
+        return_tuple: bool = False,
 ) -> Tuple[int, int, torch.nn.ModuleList]:
     """Make a list of layers with the given layer function"""
     # circula imports
@@ -521,14 +521,14 @@ def decode_video_base64(video_base64):
         while i < len(video_bytes) - 7:  # Adjusted for the length of the PNG signature
             # Check if we found the start of a PNG file
             if (
-                video_bytes[i] == 0x89
-                and video_bytes[i + 1] == 0x50
-                and video_bytes[i + 2] == 0x4E
-                and video_bytes[i + 3] == 0x47
-                and video_bytes[i + 4] == 0x0D
-                and video_bytes[i + 5] == 0x0A
-                and video_bytes[i + 6] == 0x1A
-                and video_bytes[i + 7] == 0x0A
+                    video_bytes[i] == 0x89
+                    and video_bytes[i + 1] == 0x50
+                    and video_bytes[i + 2] == 0x4E
+                    and video_bytes[i + 3] == 0x47
+                    and video_bytes[i + 4] == 0x0D
+                    and video_bytes[i + 5] == 0x0A
+                    and video_bytes[i + 6] == 0x1A
+                    and video_bytes[i + 7] == 0x0A
             ):
                 img_starts.append(i)
                 i += 8  # Skip the PNG signature
@@ -538,7 +538,7 @@ def decode_video_base64(video_base64):
         # Find each JPEG start (0xFFD8) to isolate images
         i = 0
         while (
-            i < len(video_bytes) - 1
+                i < len(video_bytes) - 1
         ):  # Adjusted for the length of the JPEG SOI signature
             # Check if we found the start of a JPEG file
             if video_bytes[i] == 0xFF and video_bytes[i + 1] == 0xD8:
@@ -641,7 +641,7 @@ def encode_video(video_path, frame_count_limit=None):
 
 
 def load_image(
-    image_file: Union[Image.Image, str, bytes],
+        image_file: Union[Image.Image, str, bytes],
 ) -> tuple[Image.Image, tuple[int, int]]:
     image = image_size = None
     if isinstance(image_file, Image.Image):
@@ -776,7 +776,7 @@ def monkey_patch_vllm_gguf_config():
     from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
     def get_quant_method_with_embedding_replaced(
-        self, layer: torch.nn.Module, prefix: str
+            self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
         if isinstance(layer, LinearBase):
             return GGUFLinearMethod(self)
@@ -815,7 +815,7 @@ class CustomCacheManager(FileCacheManager):
         else:
             # create cache directory if it doesn't exist
             self.cache_dir = (
-                os.getenv("TRITON_CACHE_DIR", "").strip() or default_cache_dir()
+                    os.getenv("TRITON_CACHE_DIR", "").strip() or default_cache_dir()
             )
             if self.cache_dir:
                 self.cache_dir = f"{self.cache_dir}_{os.getpid()}"
@@ -886,7 +886,7 @@ def configure_logger(server_args, prefix: str = ""):
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
 def replace_submodule(
-    model: nn.Module, module_name: str, new_module: nn.Module
+        model: nn.Module, module_name: str, new_module: nn.Module
 ) -> nn.Module:
     """Replace a submodule in a model with a new module."""
     parent = model.get_submodule(".".join(module_name.split(".")[:-1]))
@@ -896,8 +896,8 @@ def replace_submodule(
 
 
 def set_weight_attrs(
-    weight: torch.Tensor,
-    weight_attrs: Optional[Dict[str, Any]],
+        weight: torch.Tensor,
+        weight_attrs: Optional[Dict[str, Any]],
 ):
     """Set attributes on a weight tensor.
 
@@ -916,11 +916,11 @@ def set_weight_attrs(
 
 
 def broadcast_pyobj(
-    data: List[Any],
-    rank: int,
-    dist_group: Optional[torch.distributed.ProcessGroup] = None,
-    src: int = 0,
-    force_cpu_device: bool = True,
+        data: List[Any],
+        rank: int,
+        dist_group: Optional[torch.distributed.ProcessGroup] = None,
+        src: int = 0,
+        force_cpu_device: bool = True,
 ):
     """Broadcast inputs from src rank to all other ranks with torch.dist backend.
     The `rank` here refer to the source rank on global process group (regardless
@@ -963,11 +963,11 @@ def broadcast_pyobj(
 
 
 def point_to_point_pyobj(
-    data: List[Any],
-    rank: int,
-    group: Optional[torch.distributed.ProcessGroup] = None,
-    src: int = 0,
-    dst: int = 1,
+        data: List[Any],
+        rank: int,
+        group: Optional[torch.distributed.ProcessGroup] = None,
+        src: int = 0,
+        dst: int = 1,
 ):
     """Send data from src to dst in group."""
 
@@ -1021,12 +1021,12 @@ def pytorch_profile(name, func, *args, data_size=-1):
     global step_counter
     os.makedirs("trace", exist_ok=True)
     with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        # schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
-        # on_trace_ready=tensorboard_trace_handler('./log_dir'),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            # schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+            # on_trace_ready=tensorboard_trace_handler('./log_dir'),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
     ) as prof:
         with record_function(name):
             with open(f"trace/size_{step_counter}.json", "w") as f:
@@ -1038,13 +1038,13 @@ def pytorch_profile(name, func, *args, data_size=-1):
 
 
 def get_zmq_socket(
-    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
+        context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
 ):
     mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
+    total_mem = mem.total / 1024 ** 3
+    available_mem = mem.available / 1024 ** 3
     if total_mem > 32 and available_mem > 16:
-        buf_size = int(0.5 * 1024**3)
+        buf_size = int(0.5 * 1024 ** 3)
     else:
         buf_size = -1
 
@@ -1285,14 +1285,14 @@ def get_device_memory_capacity(device: str = None):
 # https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/utils/distributed_util.py
 def init_custom_process_group(
-    backend=None,
-    init_method=None,
-    timeout=None,
-    world_size=-1,
-    rank=-1,
-    store=None,
-    group_name=None,
-    pg_options=None,
+        backend=None,
+        init_method=None,
+        timeout=None,
+        world_size=-1,
+        rank=-1,
+        store=None,
+        group_name=None,
+        pg_options=None,
 ):
     from torch.distributed.distributed_c10d import (
         Backend,
@@ -1304,7 +1304,7 @@ def init_custom_process_group(
     )
 
     assert (store is None) or (
-        init_method is None
+            init_method is None
     ), "Cannot specify both init_method and store."
 
     if store is not None:
@@ -1492,11 +1492,11 @@ def supports_custom_op() -> bool:
 
 
 def direct_register_custom_op(
-    op_name: str,
-    op_func: Callable,
-    mutates_args: List[str],
-    fake_impl: Optional[Callable] = None,
-    target_lib: Optional[Library] = None,
+        op_name: str,
+        op_func: Callable,
+        mutates_args: List[str],
+        fake_impl: Optional[Callable] = None,
+        target_lib: Optional[Library] = None,
 ):
     """
     `torch.library.custom_op` can have significant overhead because it
@@ -1531,9 +1531,9 @@ def direct_register_custom_op(
 
 
 def set_gpu_proc_affinity(
-    tp_size: int,
-    nnodes: int,
-    gpu_id: int,
+        tp_size: int,
+        nnodes: int,
+        gpu_id: int,
 ):
     # current process
     pid = os.getpid()
@@ -1570,7 +1570,7 @@ def disable_request_logging() -> bool:
 
 
 def dataclass_to_string_truncated(
-    data, max_length=2048, skip_names: Optional[Set[str]] = None
+        data, max_length=2048, skip_names: Optional[Set[str]] = None
 ):
     if skip_names is None:
         skip_names = set()
@@ -1588,24 +1588,24 @@ def dataclass_to_string_truncated(
             return str(data)
     elif isinstance(data, dict):
         return (
-            "{"
-            + ", ".join(
-                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
-                for k, v in data.items()
-                if k not in skip_names
-            )
-            + "}"
+                "{"
+                + ", ".join(
+            f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
+            for k, v in data.items()
+            if k not in skip_names
+        )
+                + "}"
         )
     elif dataclasses.is_dataclass(data):
         fields = dataclasses.fields(data)
         return (
-            f"{data.__class__.__name__}("
-            + ", ".join(
-                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
-                for f in fields
-                if f.name not in skip_names
-            )
-            + ")"
+                f"{data.__class__.__name__}("
+                + ", ".join(
+            f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
+            for f in fields
+            if f.name not in skip_names
+        )
+                + ")"
         )
     else:
         return str(data)
@@ -1823,7 +1823,7 @@ def configure_ipv6(dist_init_addr):
     port_str = None
     if len(addr) > end + 1:
         if addr[end + 1] == ":":
-            port_str = addr[end + 2 :]
+            port_str = addr[end + 2:]
         else:
             raise ValueError("received IPv6 address format: expected ':' after ']'")
 
@@ -1968,11 +1968,11 @@ def parse_connector_type(url: str) -> str:
 
 
 def retry(
-    fn,
-    max_retry: int,
-    initial_delay: float = 2.0,
-    max_delay: float = 60.0,
-    should_retry: Callable[[Any], bool] = lambda e: True,
+        fn,
+        max_retry: int,
+        initial_delay: float = 2.0,
+        max_delay: float = 60.0,
+        should_retry: Callable[[Any], bool] = lambda e: True,
 ):
     for try_index in itertools.count():
         try:
@@ -1984,8 +1984,8 @@ def retry(
             if not should_retry(e):
                 raise Exception(f"retry() observe errors that should not be retried.")
 
-            delay = min(initial_delay * (2**try_index), max_delay) * (
-                0.75 + 0.25 * random.random()
+            delay = min(initial_delay * (2 ** try_index), max_delay) * (
+                    0.75 + 0.25 * random.random()
             )
 
             logger.warning(
@@ -2028,9 +2028,9 @@ class DeepEPMode(Enum):
 
 def is_non_idle_and_non_empty(forward_mode, hidden_states):
     return (
-        (forward_mode is not None)
-        and not forward_mode.is_idle()
-        and hidden_states.shape[0] > 0
+            (forward_mode is not None)
+            and not forward_mode.is_idle()
+            and hidden_states.shape[0] > 0
     )
 
 
@@ -2110,9 +2110,9 @@ def is_page_size_one(server_args):
 # TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
 def is_no_spec_infer_or_topk_one(server_args):
     return server_args.speculative_eagle_topk is None or (
-        server_args.speculative_eagle_topk is not None
-        and server_args.speculative_eagle_topk == 1
-        and is_page_size_one(server_args)
+            server_args.speculative_eagle_topk is not None
+            and server_args.speculative_eagle_topk == 1
+            and is_page_size_one(server_args)
     )
 
 
@@ -2140,7 +2140,7 @@ class BumpAllocator:
 
     def allocate(self, size: int):
         assert self._pointer + size <= len(self._buffer)
-        output = self._buffer[self._pointer : self._pointer + size]
+        output = self._buffer[self._pointer: self._pointer + size]
         self._pointer += size
         return output
 
@@ -2257,3 +2257,16 @@ except:
 
 def cpu_has_amx_support():
     return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
+
+
+class LazyValue:
+    def __init__(self, creator: Callable):
+        self._creator = creator
+        self._value = None
+
+    @property
+    def value(self):
+        if self._creator is not None:
+            self._value = self._creator()
+            self._creator = None
+        return self._value
