@@ -1166,7 +1166,7 @@ def exp2_upper(num: int) -> int:
     return num
 
 
-def moe_ep_deepgemm_preproess(
+def moe_ep_deepgemm_preprocess(
     topk_ids: torch.Tensor,
     num_experts: int,
     hidden_states: torch.Tensor,

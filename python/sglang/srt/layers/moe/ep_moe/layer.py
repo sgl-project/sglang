@@ -36,7 +36,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_scatter,
     gelu_and_mul_triton_kernel,
     grouped_gemm_triton,
-    moe_ep_deepgemm_preproess,
+    moe_ep_deepgemm_preprocess,
     post_reorder_triton_kernel,
     pre_reorder_triton_kernel,
     run_moe_ep_preproess,
@@ -277,7 +277,7 @@ class EPMoE(torch.nn.Module):
 
         # PreReorder
         m_max, masked_m, expected_m, src2dst, gateup_input, gateup_input_scale = (
-            moe_ep_deepgemm_preproess(
+            moe_ep_deepgemm_preprocess(
                 topk_ids,
                 self.num_experts,
                 hidden_states,
