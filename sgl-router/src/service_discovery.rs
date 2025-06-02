@@ -279,3 +279,163 @@ async fn handle_pod_deletion(
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k8s_openapi::api::core::v1::{Pod, PodSpec, PodStatus, PodCondition};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+    use std::sync::RwLock;
+    use crate::router::Router;
+
+    // Helper function to create a Pod for testing PodInfo::from_pod
+    fn create_k8s_pod(name: Option<&str>, ip: Option<&str>, phase: Option<&str>, ready_status: Option<&str>, deletion_timestamp: Option<Time>) -> Pod {
+        let mut pod = Pod {
+            metadata: ObjectMeta {
+                name: name.map(String::from),
+                deletion_timestamp,
+                ..Default::default()
+            },
+            spec: Some(PodSpec::default()),
+            status: None,
+        };
+
+        if ip.is_some() || phase.is_some() || ready_status.is_some() {
+            let mut pod_status = PodStatus {
+                pod_ip: ip.map(String::from),
+                phase: phase.map(String::from),
+                conditions: None,
+                ..Default::default()
+            };
+
+            if let Some(status_str) = ready_status {
+                let condition = PodCondition {
+                    type_: "Ready".to_string(),
+                    status: status_str.to_string(),
+                    last_probe_time: None,
+                    last_transition_time: None,
+                    message: None,
+                    reason: None,
+                };
+                pod_status.conditions = Some(vec![condition]);
+            }
+            pod.status = Some(pod_status);
+        }
+        pod
+    }
+
+    // Helper to create a Router instance for testing event handlers
+    fn create_test_router() -> Arc<Router> {
+        let worker_urls = Arc::new(RwLock::new(Vec::new()));
+        Arc::new(Router::Random {
+            worker_urls,
+            timeout_secs: 5,
+            interval_secs: 1,
+        })
+    }
+
+    #[test]
+    fn test_service_discovery_config_default() {
+        let config = ServiceDiscoveryConfig::default();
+        assert!(!config.enabled);
+        assert!(config.selector.is_empty());
+        assert_eq!(config.check_interval, Duration::from_secs(60));
+        assert_eq!(config.port, 80);
+        assert!(config.namespace.is_none());
+    }
+
+    #[test]
+    fn test_pod_info_from_pod_valid() {
+        let k8s_pod = create_k8s_pod(Some("test-pod"), Some("10.0.0.1"), Some("Running"), Some("True"), None);
+        let pod_info = PodInfo::from_pod(&k8s_pod).unwrap();
+        assert_eq!(pod_info.name, "test-pod");
+        assert_eq!(pod_info.ip, "10.0.0.1");
+        assert_eq!(pod_info.status, "Running");
+        assert!(pod_info.is_ready);
+    }
+
+    #[test]
+    fn test_pod_info_from_pod_not_ready() {
+        let k8s_pod = create_k8s_pod(Some("test-pod"), Some("10.0.0.1"), Some("Running"), Some("False"), None);
+        let pod_info = PodInfo::from_pod(&k8s_pod).unwrap();
+        assert!(!pod_info.is_ready);
+    }
+
+    #[test]
+    fn test_pod_info_from_pod_no_conditions() {
+        let k8s_pod = create_k8s_pod(Some("test-pod"), Some("10.0.0.1"), Some("Running"), None, None);
+        let pod_info = PodInfo::from_pod(&k8s_pod).unwrap();
+        assert!(!pod_info.is_ready);
+    }
+
+    #[test]
+    fn test_pod_info_from_pod_missing_name() {
+        let k8s_pod = create_k8s_pod(None, Some("10.0.0.1"), Some("Running"), Some("True"), None);
+        assert!(PodInfo::from_pod(&k8s_pod).is_none());
+    }
+
+    #[test]
+    fn test_pod_info_from_pod_missing_ip() {
+        let k8s_pod = create_k8s_pod(Some("test-pod"), None, Some("Running"), Some("True"), None);
+        assert!(PodInfo::from_pod(&k8s_pod).is_none());
+    }
+
+    #[test]
+    fn test_pod_info_from_pod_missing_status_phase() {
+        let k8s_pod = create_k8s_pod(Some("test-pod"), Some("10.0.0.1"), None, Some("True"), None);
+        let pod_info = PodInfo::from_pod(&k8s_pod).unwrap();
+        assert_eq!(pod_info.status, "Unknown");
+    }
+
+    #[test]
+    fn test_pod_info_from_pod_no_status_object() {
+        let mut k8s_pod = create_k8s_pod(Some("test-pod"), None, None, None, None);
+        k8s_pod.status = None;
+        assert!(PodInfo::from_pod(&k8s_pod).is_none());
+    }
+
+    #[test]
+    fn test_pod_info_is_healthy() {
+        let healthy_pod = PodInfo { name: "p1".into(), ip: "1.1.1.1".into(), status: "Running".into(), is_ready: true };
+        assert!(healthy_pod.is_healthy());
+
+        let not_ready_pod = PodInfo { name: "p2".into(), ip: "1.1.1.2".into(), status: "Running".into(), is_ready: false };
+        assert!(!not_ready_pod.is_healthy());
+
+        let not_running_pod = PodInfo { name: "p3".into(), ip: "1.1.1.3".into(), status: "Pending".into(), is_ready: true };
+        assert!(!not_running_pod.is_healthy());
+    }
+
+    #[test]
+    fn test_pod_info_worker_url() {
+        let pod_info = PodInfo { name: "p1".into(), ip: "1.2.3.4".into(), status: "Running".into(), is_ready: true };
+        assert_eq!(pod_info.worker_url(8080), "http://1.2.3.4:8080");
+    }
+
+    #[tokio::test]
+    async fn test_handle_pod_event_add_unhealthy_pod() {
+        let router = create_test_router();
+        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let pod_info = PodInfo { name: "pod1".into(), ip: "1.2.3.4".into(), status: "Pending".into(), is_ready: false };
+        let port = 8080u16;
+
+        handle_pod_event(&pod_info, Arc::clone(&tracked_pods), Arc::clone(&router), port).await;
+
+        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+        assert!(!router.get_worker_urls().read().unwrap().contains(&pod_info.worker_url(port)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_pod_deletion_non_existing_pod() {
+        let router = create_test_router();
+        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let pod_info = PodInfo { name: "pod1".into(), ip: "1.2.3.4".into(), status: "Running".into(), is_ready: true };
+        let port = 8080u16;
+
+        handle_pod_deletion(&pod_info, Arc::clone(&tracked_pods), Arc::clone(&router), port).await;
+
+        assert!(tracked_pods.lock().unwrap().is_empty());
+        assert!(router.get_worker_urls().read().unwrap().is_empty());
+    }
+}
