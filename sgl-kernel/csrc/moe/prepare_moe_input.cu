@@ -59,6 +59,7 @@ __global__ void compute_expert_blockscale_offsets(
   int32_t tot_offset = 0;
   int32_t tot_rounded_offset = 0;
   expert_offsets[0] = 0;
+  blockscale_offsets[0] = 0;
   for (int i = 0; i < num_experts; ++i) {
     atomic_buffer[i] = tot_offset;
     int num_tokens = problem_sizes1[i * 3];

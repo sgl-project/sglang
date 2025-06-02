@@ -44,16 +44,16 @@ from sgl_kernel.gemm import (
     sgl_per_token_group_quant_fp8,
     sgl_per_token_group_quant_int8,
     sgl_per_token_quant_fp8,
+    shuffle_rows,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.moe import (
-    ep_moe_pre_reorder,
     cutlass_fp4_group_mm,
+    ep_moe_pre_reorder,
     fp8_blockwise_scaled_grouped_mm,
     moe_align_block_size,
     moe_fused_gate,
     prepare_moe_input,
-    shuffle_rows,
     topk_softmax,
 )
 from sgl_kernel.sampling import (

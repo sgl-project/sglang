@@ -243,6 +243,16 @@ def qserve_w4a8_per_group_gemm(
     return out_feats
 
 
+def shuffle_rows(input_tensor, dst2src_map, output_tensor_shape):
+    output_tensor = torch.empty(
+        output_tensor_shape,
+        device=input_tensor.device,
+        dtype=input_tensor.dtype,
+    )
+    torch.ops.sgl_kernel.shuffle_rows.default(input_tensor, dst2src_map, output_tensor)
+    return output_tensor
+
+
 def scaled_fp4_experts_quant(
     input_tensor: torch.Tensor,
     input_global_scale: torch.Tensor,
@@ -270,9 +280,7 @@ def scaled_fp4_experts_quant(
     if expert_map is not None:
         (m, k) = input_tensor.shape
         output_tensor_shape = (m * topk, k)
-        input_tensor = torch.ops.sgl_kernel.shuffle_rows.default(
-            input_tensor, expert_map, output_tensor_shape
-        )
+        input_tensor = shuffle_rows(input_tensor, expert_map, output_tensor_shape)
     m_numtopk, k = input_tensor.shape
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE Expert Quantization. This is used to prevent the kernel

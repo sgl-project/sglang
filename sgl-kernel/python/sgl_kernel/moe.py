@@ -156,16 +156,6 @@ def prepare_moe_input(
     )
 
 
-def shuffle_rows(input_tensor, dst2src_map, output_tensor_shape):
-    output_tensor = torch.empty(
-        output_tensor_shape,
-        device=input_tensor.device,
-        dtype=input_tensor.dtype,
-    )
-    torch.ops.sgl_kernel.shuffle_rows.default(input_tensor, dst2src_map, output_tensor)
-    return output_tensor
-
-
 def cutlass_fp4_group_mm(
     a_fp4,
     b_fp4,

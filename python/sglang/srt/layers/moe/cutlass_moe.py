@@ -134,6 +134,9 @@ def cutlass_fused_experts(
     a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
     device = a_q.device
 
+    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+
     prepare_moe_input(
         topk_ids,
         expert_offsets,
@@ -317,7 +320,7 @@ def cutlass_moe_fp4(
 
     # problem shapes should have [m, n, k]
     # Note that problem sizes are based on logical number of elements.
-    blockscale_offsets = torch.zeros(e + 1, dtype=torch.int32, device=device)
+    blockscale_offsets = torch.empty(e + 1, dtype=torch.int32, device=device)
     prepare_moe_input(
         topk_ids,
         expert_offsets,
