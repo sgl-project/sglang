@@ -1760,6 +1760,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 "ascend",
                 "trtllm_mha",
                 "aiter",
+                "hip_attention",
             ]
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
