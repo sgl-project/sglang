@@ -222,7 +222,8 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         config.worker_urls.clone(),
         client.clone(),
         config.policy_config.clone(),
-    ).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    )
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let router_arc = Arc::clone(&app_state_init.router);
     let app_state = web::Data::new(app_state_init);
 
@@ -250,7 +251,10 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     }
 
     info!("✅ Serving router on {}:{}", config.host, config.port);
-    info!("✅ Serving workers on {:?}", app_state.router.get_worker_urls().read().unwrap());
+    info!(
+        "✅ Serving workers on {:?}",
+        app_state.router.get_worker_urls().read().unwrap()
+    );
 
     HttpServer::new(move || {
         App::new()

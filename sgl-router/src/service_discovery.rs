@@ -1,3 +1,5 @@
+use crate::router::Router;
+
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
@@ -7,12 +9,12 @@ use kube::{
     Client,
 };
 use std::collections::{HashMap, HashSet};
-use crate::router::Router;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task;
 use tokio::time;
-use tracing::{error, debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Represents the service discovery configuration
 #[derive(Debug, Clone)]
@@ -182,13 +184,8 @@ pub async fn start_service_discovery(
                                 )
                                 .await;
                             } else {
-                                handle_pod_event(
-                                    &pod_info,
-                                    tracked_pods_inner,
-                                    router_inner,
-                                    port,
-                                )
-                                .await;
+                                handle_pod_event(&pod_info, tracked_pods_inner, router_inner, port)
+                                    .await;
                             }
                         }
                         Ok(())
@@ -235,8 +232,7 @@ async fn handle_pod_event(
         if !already_tracked {
             info!(
                 "Healthy pod found: {}. Adding worker: {}",
-                pod_info.name,
-                worker_url
+                pod_info.name, worker_url
             );
             match router.add_worker(&worker_url).await {
                 Ok(msg) => {
@@ -265,8 +261,7 @@ async fn handle_pod_deletion(
     if tracked.remove(pod_info) {
         info!(
             "Pod deleted: {}. Removing worker: {}",
-            pod_info.name,
-            worker_url
+            pod_info.name, worker_url
         );
         router.remove_worker(&worker_url);
     } else {
@@ -274,8 +269,7 @@ async fn handle_pod_deletion(
         // Or if the event is duplicated. No action needed on the router if it wasn't tracked (and thus not added).
         debug!(
             "Pod deletion event for untracked/already removed pod: {}. Worker URL: {}",
-            pod_info.name,
-            worker_url
+            pod_info.name, worker_url
         );
     }
 }
@@ -283,14 +277,20 @@ async fn handle_pod_deletion(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k8s_openapi::api::core::v1::{Pod, PodSpec, PodStatus, PodCondition};
+    use crate::router::Router;
+    use k8s_openapi::api::core::v1::{Pod, PodCondition, PodSpec, PodStatus};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     use std::sync::RwLock;
-    use crate::router::Router;
 
     // Helper function to create a Pod for testing PodInfo::from_pod
-    fn create_k8s_pod(name: Option<&str>, ip: Option<&str>, phase: Option<&str>, ready_status: Option<&str>, deletion_timestamp: Option<Time>) -> Pod {
+    fn create_k8s_pod(
+        name: Option<&str>,
+        ip: Option<&str>,
+        phase: Option<&str>,
+        ready_status: Option<&str>,
+        deletion_timestamp: Option<Time>,
+    ) -> Pod {
         let mut pod = Pod {
             metadata: ObjectMeta {
                 name: name.map(String::from),
@@ -347,7 +347,13 @@ mod tests {
 
     #[test]
     fn test_pod_info_from_pod_valid() {
-        let k8s_pod = create_k8s_pod(Some("test-pod"), Some("10.0.0.1"), Some("Running"), Some("True"), None);
+        let k8s_pod = create_k8s_pod(
+            Some("test-pod"),
+            Some("10.0.0.1"),
+            Some("Running"),
+            Some("True"),
+            None,
+        );
         let pod_info = PodInfo::from_pod(&k8s_pod).unwrap();
         assert_eq!(pod_info.name, "test-pod");
         assert_eq!(pod_info.ip, "10.0.0.1");
@@ -357,14 +363,26 @@ mod tests {
 
     #[test]
     fn test_pod_info_from_pod_not_ready() {
-        let k8s_pod = create_k8s_pod(Some("test-pod"), Some("10.0.0.1"), Some("Running"), Some("False"), None);
+        let k8s_pod = create_k8s_pod(
+            Some("test-pod"),
+            Some("10.0.0.1"),
+            Some("Running"),
+            Some("False"),
+            None,
+        );
         let pod_info = PodInfo::from_pod(&k8s_pod).unwrap();
         assert!(!pod_info.is_ready);
     }
 
     #[test]
     fn test_pod_info_from_pod_no_conditions() {
-        let k8s_pod = create_k8s_pod(Some("test-pod"), Some("10.0.0.1"), Some("Running"), None, None);
+        let k8s_pod = create_k8s_pod(
+            Some("test-pod"),
+            Some("10.0.0.1"),
+            Some("Running"),
+            None,
+            None,
+        );
         let pod_info = PodInfo::from_pod(&k8s_pod).unwrap();
         assert!(!pod_info.is_ready);
     }
@@ -397,19 +415,39 @@ mod tests {
 
     #[test]
     fn test_pod_info_is_healthy() {
-        let healthy_pod = PodInfo { name: "p1".into(), ip: "1.1.1.1".into(), status: "Running".into(), is_ready: true };
+        let healthy_pod = PodInfo {
+            name: "p1".into(),
+            ip: "1.1.1.1".into(),
+            status: "Running".into(),
+            is_ready: true,
+        };
         assert!(healthy_pod.is_healthy());
 
-        let not_ready_pod = PodInfo { name: "p2".into(), ip: "1.1.1.2".into(), status: "Running".into(), is_ready: false };
+        let not_ready_pod = PodInfo {
+            name: "p2".into(),
+            ip: "1.1.1.2".into(),
+            status: "Running".into(),
+            is_ready: false,
+        };
         assert!(!not_ready_pod.is_healthy());
 
-        let not_running_pod = PodInfo { name: "p3".into(), ip: "1.1.1.3".into(), status: "Pending".into(), is_ready: true };
+        let not_running_pod = PodInfo {
+            name: "p3".into(),
+            ip: "1.1.1.3".into(),
+            status: "Pending".into(),
+            is_ready: true,
+        };
         assert!(!not_running_pod.is_healthy());
     }
 
     #[test]
     fn test_pod_info_worker_url() {
-        let pod_info = PodInfo { name: "p1".into(), ip: "1.2.3.4".into(), status: "Running".into(), is_ready: true };
+        let pod_info = PodInfo {
+            name: "p1".into(),
+            ip: "1.2.3.4".into(),
+            status: "Running".into(),
+            is_ready: true,
+        };
         assert_eq!(pod_info.worker_url(8080), "http://1.2.3.4:8080");
     }
 
@@ -417,23 +455,49 @@ mod tests {
     async fn test_handle_pod_event_add_unhealthy_pod() {
         let router = create_test_router();
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
-        let pod_info = PodInfo { name: "pod1".into(), ip: "1.2.3.4".into(), status: "Pending".into(), is_ready: false };
+        let pod_info = PodInfo {
+            name: "pod1".into(),
+            ip: "1.2.3.4".into(),
+            status: "Pending".into(),
+            is_ready: false,
+        };
         let port = 8080u16;
 
-        handle_pod_event(&pod_info, Arc::clone(&tracked_pods), Arc::clone(&router), port).await;
+        handle_pod_event(
+            &pod_info,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+        )
+        .await;
 
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
-        assert!(!router.get_worker_urls().read().unwrap().contains(&pod_info.worker_url(port)));
+        assert!(!router
+            .get_worker_urls()
+            .read()
+            .unwrap()
+            .contains(&pod_info.worker_url(port)));
     }
 
     #[tokio::test]
     async fn test_handle_pod_deletion_non_existing_pod() {
         let router = create_test_router();
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
-        let pod_info = PodInfo { name: "pod1".into(), ip: "1.2.3.4".into(), status: "Running".into(), is_ready: true };
+        let pod_info = PodInfo {
+            name: "pod1".into(),
+            ip: "1.2.3.4".into(),
+            status: "Running".into(),
+            is_ready: true,
+        };
         let port = 8080u16;
 
-        handle_pod_deletion(&pod_info, Arc::clone(&tracked_pods), Arc::clone(&router), port).await;
+        handle_pod_deletion(
+            &pod_info,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&router),
+            port,
+        )
+        .await;
 
         assert!(tracked_pods.lock().unwrap().is_empty());
         assert!(router.get_worker_urls().read().unwrap().is_empty());
