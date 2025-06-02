@@ -881,20 +881,24 @@ def calculate_rouge_l(output_strs_list1, output_strs_list2):
     return rouge_l_scores
 
 
-STDERR_FILENAME = "stderr.txt"
-STDOUT_FILENAME = "stdout.txt"
+STDERR_FILENAME = "/tmp/stderr.txt"
+STDOUT_FILENAME = "/tmp/stdout.txt"
 
 
 def read_output(output_lines: List[str], filename: str = STDERR_FILENAME):
     """Print the output in real time with another thread."""
     while not os.path.exists(filename):
-        time.sleep(1)
+        time.sleep(0.01)
 
     pt = 0
     while pt >= 0:
         if pt > 0 and not os.path.exists(filename):
             break
-        lines = open(filename).readlines()
+        try:
+            lines = open(filename).readlines()
+        except FileNotFoundError:
+            print(f"{pt=}, {os.path.exists(filename)=}")
+            raise
         for line in lines[pt:]:
             print(line, end="", flush=True)
             output_lines.append(line)
