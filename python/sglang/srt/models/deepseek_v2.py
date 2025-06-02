@@ -91,6 +91,7 @@ from sglang.srt.two_batch_overlap import (
 from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
+    LazyValue,
     add_prefix,
     bind_or_assign,
     get_bool_env_var,
@@ -98,7 +99,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_non_idle_and_non_empty,
-    log_info_on_rank0, LazyValue,
+    log_info_on_rank0,
 )
 
 _is_hip = is_hip()
@@ -1661,16 +1662,17 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.dp_size = get_local_attention_dp_size()
 
-        self._routed_experts_weights_of_layer = LazyValue(lambda: {
-            layer_id: layer.mlp.get_moe_weights()
-            for layer_id, layer in enumerate(self.model.layers)
-            if isinstance(layer.mlp, DeepseekV2MoE)
-        })
-        
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer.mlp, DeepseekV2MoE)
+            }
+        )
+
     @property
     def routed_experts_weights_of_layer(self):
-        return self._routed_experts_weights_of_layer
-
+        return self._routed_experts_weights_of_layer.value
 
     def determine_n_share_experts_fusion(
         self, architecture: str = "DeepseekV3ForCausalLM"

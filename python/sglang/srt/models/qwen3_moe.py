@@ -21,6 +21,8 @@ import logging
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
+from torch import nn
+
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -77,7 +79,6 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.utils import DeepEPMode, add_prefix, is_non_idle_and_non_empty
-from torch import nn
 
 Qwen3MoeConfig = None
 
@@ -86,11 +87,11 @@ logger = logging.getLogger(__name__)
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(
-            self,
-            layer_id: int,
-            config: Qwen3MoeConfig,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        layer_id: int,
+        config: Qwen3MoeConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -103,7 +104,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         self.experts = get_moe_impl_class()(
             num_experts=config.num_experts
-                        + global_server_args_dict["ep_num_redundant_experts"],
+            + global_server_args_dict["ep_num_redundant_experts"],
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -130,7 +131,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_tensor_model_parallel_world_size()
             self.num_experts = (
-                    config.num_experts + global_server_args_dict["ep_num_redundant_experts"]
+                config.num_experts + global_server_args_dict["ep_num_redundant_experts"]
             )
             self.top_k = config.num_experts_per_tok
             self.renormalize = config.norm_topk_prob
@@ -149,7 +150,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
 
     def forward(
-            self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
+        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
     ) -> torch.Tensor:
 
         if not global_server_args_dict["enable_deepep_moe"]:
@@ -179,7 +180,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward_deepep(
-            self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
         forward_mode = forward_batch.forward_mode
         if is_non_idle_and_non_empty(forward_mode, hidden_states):
@@ -242,7 +243,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def op_gate(self, state):
         if is_non_idle_and_non_empty(
-                state.forward_batch.forward_mode, state.hidden_states_mlp_input
+            state.forward_batch.forward_mode, state.hidden_states_mlp_input
         ):
             # router_logits: (num_tokens, n_experts)
             state.router_logits, _ = self.gate(state.hidden_states_mlp_input)
@@ -285,7 +286,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def op_dispatch_b(self, state):
         if self.ep_size > 1:
             with get_global_expert_distribution_recorder().with_current_layer(
-                    self.layer_id
+                self.layer_id
             ):
                 (
                     state.hidden_states_experts_input,
@@ -335,19 +336,19 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
 class Qwen3MoeAttention(nn.Module):
     def __init__(
-            self,
-            hidden_size: int,
-            num_heads: int,
-            num_kv_heads: int,
-            layer_id: int = 0,
-            rope_theta: float = 10000,
-            rope_scaling: Optional[Dict[str, Any]] = None,
-            max_position_embeddings: int = 8192,
-            head_dim: Optional[int] = None,
-            rms_norm_eps: float = 1e-06,
-            attention_bias: bool = False,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        layer_id: int = 0,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        head_dim: Optional[int] = None,
+        rms_norm_eps: float = 1e-06,
+        attention_bias: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -371,7 +372,7 @@ class Qwen3MoeAttention(nn.Module):
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -419,7 +420,7 @@ class Qwen3MoeAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def _apply_qk_norm(
-            self, q: torch.Tensor, k: torch.Tensor
+        self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         q_by_head = q.reshape(-1, self.head_dim)
         q_by_head = self.q_norm(q_by_head)
@@ -442,10 +443,10 @@ class Qwen3MoeAttention(nn.Module):
         )
 
     def forward_prepare(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            forward_batch: ForwardBatch,
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
@@ -465,10 +466,10 @@ class Qwen3MoeAttention(nn.Module):
         return output
 
     def forward(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            forward_batch: ForwardBatch,
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         s = self.forward_prepare(
             positions=positions,
@@ -480,11 +481,11 @@ class Qwen3MoeAttention(nn.Module):
 
 class Qwen3MoeDecoderLayer(nn.Module):
     def __init__(
-            self,
-            config: Qwen3MoeConfig,
-            layer_id: int,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        config: Qwen3MoeConfig,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -556,11 +557,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
         )
 
     def forward(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            forward_batch: ForwardBatch,
-            residual: Optional[torch.Tensor],
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
@@ -587,13 +588,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
         return hidden_states, residual
 
     def op_comm_prepare_attn(
-            self,
-            state,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            forward_batch: ForwardBatch,
-            residual: Optional[torch.Tensor],
-            tbo_subbatch_index: Optional[int] = None,
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        tbo_subbatch_index: Optional[int] = None,
     ):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
@@ -648,10 +649,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
 class Qwen3MoeModel(Qwen2MoeModel):
     def __init__(
-            self,
-            config: Qwen3MoeConfig,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        config: Qwen3MoeConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__(
             config=config,
@@ -665,10 +666,10 @@ class Qwen3MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
     def __init__(
-            self,
-            config: Qwen3MoeConfig,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        config: Qwen3MoeConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.pp_group = get_pp_group()
@@ -688,12 +689,12 @@ class Qwen3MoeForCausalLM(nn.Module):
 
     @torch.no_grad()
     def forward(
-            self,
-            input_ids: torch.Tensor,
-            positions: torch.Tensor,
-            forward_batch: ForwardBatch,
-            input_embeds: torch.Tensor = None,
-            pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         hidden_states = self.model(
             input_ids,
@@ -739,12 +740,12 @@ class Qwen3MoeForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
             if (
-                    layer_id is not None
-                    and hasattr(self.model, "start_layer")
-                    and (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
                     layer_id < self.model.start_layer
                     or layer_id >= self.model.end_layer
-            )
+                )
             ):
                 continue
 
