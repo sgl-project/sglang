@@ -120,7 +120,7 @@ class RotaryEmbedding(CustomOp):
         if torch.compiler.is_compiling():
             return self.forward_native(*args, **kwargs)
         else:
-            return self._forward_method(*args, **kwargs)
+            return super().forward(*args, **kwargs)
 
     def forward_native(
         self,
