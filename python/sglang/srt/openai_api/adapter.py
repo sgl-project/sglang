@@ -1214,7 +1214,6 @@ def v1_chat_generate_request(
                 prompt_kwargs = {"text": input_ids}
             else:
                 prompt_kwargs = {"input_ids": input_ids}
-        request_ids = [req.rid for req in all_requests]
 
     adapted_request = GenerateReqInput(
         **prompt_kwargs,
