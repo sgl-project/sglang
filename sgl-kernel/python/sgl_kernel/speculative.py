@@ -99,3 +99,24 @@ def segment_packbits(
         y,
         torch.cuda.current_stream().cuda_stream,
     )
+
+
+def process_accept_index_evict_mask_fused(
+    accept_index: torch.Tensor,  # [bs, spec_steps + 1] - input
+    predict: torch.Tensor,  # [total_draft_tokens]
+    accept_length: torch.Tensor,  # [bs] - output
+    verified_id: torch.Tensor,  # [output_size] - output
+    evict_mask: torch.Tensor,  # [total_draft_tokens] - output
+    filtered_accept_index: torch.Tensor,  # [output_size] - output
+    output_size: torch.Tensor,  # [1] - output
+) -> None:
+    torch.ops.sgl_kernel.process_accept_index_evict_mask_fused.default(
+        accept_index,
+        predict,
+        accept_length,
+        verified_id,
+        evict_mask,
+        filtered_accept_index,
+        output_size,
+        get_cuda_stream(),
+    )

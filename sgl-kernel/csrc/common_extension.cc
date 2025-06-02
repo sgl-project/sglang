@@ -151,10 +151,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "(Tensor[])");
   m.impl("moe_fused_gate", torch::kCUDA, &moe_fused_gate);
   m.def(
-      "ep_moe_pre_reorder(Tensor input_ptr, Tensor gateup_input_ptr, Tensor src2dst_ptr, Tensor topk_ids_ptr, Tensor "
-      "a1_scales_ptr, int start_expert_id, int end_expert_id, int topk, bool use_per_token_if_dynamic) -> ()");
-  m.impl("ep_moe_pre_reorder", torch::kCUDA, &ep_moe_pre_reorder);
-  m.def(
       "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a_ptrs, Tensor b_ptrs, Tensor out_ptrs, Tensor "
       "a_scales_ptrs, Tensor b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
       "stride_a, Tensor stride_b, Tensor stride_c, Tensor layout_sfa, Tensor layout_sfb, Tensor problem_sizes, Tensor "
@@ -189,6 +185,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("segment_packbits(Tensor x, Tensor input_indptr, Tensor output_indptr, Tensor! y, int cuda_stream) -> ()");
   m.impl("segment_packbits", torch::kCUDA, &segment_packbits);
+
+  m.def(
+      "process_accept_index_evict_mask_fused(Tensor accept_index, Tensor predict, Tensor! accept_length, "
+      "Tensor! verified_id, Tensor! evict_mask, Tensor! filtered_accept_index, Tensor! output_size, "
+      "int cuda_stream) -> ()");
+  m.impl("process_accept_index_evict_mask_fused", torch::kCUDA, &process_accept_index_evict_mask_fused);
 
   /*
    * From FlashInfer

@@ -26,6 +26,7 @@ from sglang.srt.utils import fast_topk, is_cuda, is_hip, next_power_of_2
 
 if is_cuda():
     from sgl_kernel import (
+        process_accept_index_evict_mask_fused,
         top_k_renorm_prob,
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
@@ -511,14 +512,35 @@ class EagleVerifyInput:
                 unfinished_index.append(i)
             req.spec_verify_ct += 1
 
-        if has_finished:
-            accept_length = (accept_index != -1).sum(dim=1) - 1
+        # Use fused kernel to process accept_index and generate evict_mask
+        # Prepare output tensors
+        max_output_size = bs * (self.spec_steps + 1)
+        tmp_accept_length = torch.empty(bs, dtype=torch.int32, device="cuda")
+        verified_id = torch.empty(max_output_size, dtype=torch.int32, device="cuda")
+        evict_mask = torch.empty(
+            self.draft_token.shape[0], dtype=torch.bool, device="cuda"
+        )
+        filtered_accept_index = torch.empty(
+            max_output_size, dtype=torch.int32, device="cuda"
+        )
+        output_size = torch.empty(1, dtype=torch.int32, device="cuda")
 
-        # Free the KV cache for unaccepted tokens
-        accept_index = accept_index[accept_index != -1]
-        verified_id = predict[accept_index]
-        evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
-        evict_mask[accept_index] = False
+        process_accept_index_evict_mask_fused(
+            accept_index,  # [bs, spec_steps + 1] - input
+            predict,  # [total_draft_tokens]
+            tmp_accept_length,  # [bs] - output
+            verified_id,  # [output_size] - output
+            evict_mask,  # [total_draft_tokens] - output
+            filtered_accept_index,  # [output_size] - output
+            output_size,  # [1] - output
+        )
+
+        output_size_val = output_size.item()
+        verified_id = verified_id[:output_size_val]
+        accept_index = filtered_accept_index[:output_size_val]
+
+        if has_finished:
+            accept_length = tmp_accept_length
 
         if page_size != 1:
             align_evict_mask_to_page_size[len(batch.seq_lens),](
