@@ -14,10 +14,9 @@
 """The baseclass of a backend for grammar-guided constrained decoding."""
 
 import logging
-from abc import ABC, abstractmethod
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from threading import Event, Lock
+from threading import Event
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -27,10 +26,41 @@ from sglang.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 
-class BaseGrammarObject(ABC):
+class BaseGrammarObject:
 
     def __init__(self):
         self._finished = False
+
+    def accept_token(self, token: int) -> None:
+        """
+        Accept a token in the grammar.
+        """
+        raise NotImplementedError()
+
+    def rollback(self, k: int):
+        raise NotImplementedError()
+
+    def is_terminated(self):
+        return False
+
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
+        raise NotImplementedError()
+
+    def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        raise NotImplementedError()
+
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        raise NotImplementedError()
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        raise NotImplementedError()
+
+    def copy(self) -> "BaseGrammarObject":
+        return self
 
     @property
     def finished(self):
@@ -40,7 +70,6 @@ class BaseGrammarObject(ABC):
     def finished(self, finished):
         self._finished = finished
 
-    @abstractmethod
     def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
         """
         Try to jump forward in the grammar.
@@ -49,9 +78,8 @@ class BaseGrammarObject(ABC):
             A jump forward helper which may be used in `jump_forward_str_state`.
             None if the jump forward is not possible.
         """
-        raise NotImplementedError
+        raise NotImplementedError()
 
-    @abstractmethod
     def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
         """
         Jump forward for the grammar.
@@ -60,52 +88,23 @@ class BaseGrammarObject(ABC):
             A tuple of the jump forward string and the next state of the grammar
             (which can be used in `jump_and_retokenize` if needed).
         """
-        raise NotImplementedError
+        raise NotImplementedError()
 
-    @abstractmethod
     def jump_and_retokenize(
         self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
     ) -> None:
         """
         Jump forward occurs, and update the grammar state if needed.
         """
-        raise NotImplementedError
+        raise NotImplementedError()
 
-    @abstractmethod
-    def accept_token(self, token: int) -> None:
-        """
-        Accept a token in the grammar.
-        """
-        raise NotImplementedError
 
-    @abstractmethod
-    def allocate_vocab_mask(
-        self, vocab_size: int, batch_size: int, device
-    ) -> torch.Tensor:
-        raise NotImplementedError
-
-    @abstractmethod
-    def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
-        raise NotImplementedError
-
-    @staticmethod
-    @abstractmethod
-    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
-        raise NotImplementedError
-
-    @staticmethod
-    @abstractmethod
-    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        raise NotImplementedError
-
-    @abstractmethod
-    def copy(self) -> "BaseGrammarObject":
-        raise NotImplementedError
+INVALID_GRAMMAR_OBJ = BaseGrammarObject()
 
 
 @dataclass
 class CacheEntry:
-    value: Optional[BaseGrammarObject]
+    value: BaseGrammarObject
     event: Event
 
 
@@ -113,10 +112,9 @@ class BaseGrammarBackend:
     def __init__(self):
         self.executor = ThreadPoolExecutor()
         self.cache: Dict[Tuple[str, str], CacheEntry] = {}
-        self.cache_lock = Lock()
 
     def _not_supported(self, key_type: str, key_string: str) -> None:
-        logger.warning(f"Skip unsupported {key_type}: {key_type}={key_string}")
+        logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
 
     def dispatch_fallback(
         self, key_type: str, key_string: str
@@ -148,40 +146,25 @@ class BaseGrammarBackend:
             return self.dispatch_ebnf(key_string)
         elif key_type == "structural_tag":
             return self.dispatch_structural_tag(key_string)
+        elif key_type == "structural_pattern":
+            return self.dispatch_structural_pattern(key_string)
         else:
             return self.dispatch_fallback(key_type, key_string)
 
-    def _init_value(self, key: Tuple[str, str]) -> Optional[BaseGrammarObject]:
-        with self.cache_lock:
-            if key in self.cache:
-                cache_hit = True
-                entry = self.cache[key]
-            else:
-                cache_hit = False
-                entry = CacheEntry(None, Event())
-                self.cache[key] = entry
+    def get_cached_or_future_value(
+        self, key: Tuple[str, str]
+    ) -> Optional[BaseGrammarObject]:
+        value = self.cache.get(key)
+        if value:
+            return value.copy(), True
+        value = self.executor.submit(self._init_value_dispatch, key)
+        return value, False
 
-        if cache_hit:
-            entry.event.wait()
-        else:
-            entry.value = self._init_value_dispatch(key)
-            entry.event.set()
-        return entry.value.copy() if entry.value else None
-
-    def get_cached_value(self, key: Tuple[str, str]) -> Optional[BaseGrammarObject]:
-        with self.cache_lock:
-            entry = self.cache.get(key)
-            if not entry or not entry.event.is_set():
-                return None
-            val = self.cache[key].value
-            return val.copy() if val else None
-
-    def get_future_value(self, key: Tuple[str, str]) -> Future:
-        return self.executor.submit(self._init_value, key)
+    def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
+        self.cache[key] = value
 
     def reset(self):
-        with self.cache_lock:
-            self.cache.clear()
+        self.cache.clear()
 
 
 def create_grammar_backend(
@@ -211,9 +194,12 @@ def create_grammar_backend(
         raise ValueError(f"Invalid grammar backend: {server_args.grammar_backend}")
 
     if server_args.reasoning_parser and hasattr(tokenizer, "think_end_id"):
-        from .reasoner_grammar_backend import ReasonerGrammarBackend
+        from sglang.srt.constrained.reasoner_grammar_backend import (
+            ReasonerGrammarBackend,
+        )
 
         grammar_backend = ReasonerGrammarBackend(
             grammar_backend, tokenizer.think_end_id
         )
+
     return grammar_backend

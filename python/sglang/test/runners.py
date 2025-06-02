@@ -19,11 +19,14 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+import transformers
 from transformers import (
+    AutoConfig,
     AutoModel,
     AutoModelForCausalLM,
     AutoModelForVision2Seq,
     AutoProcessor,
+    GenerationConfig,
 )
 
 from sglang.srt.entrypoints.engine import Engine
@@ -190,25 +193,18 @@ class HFRunner:
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
-        outputs = self.model.model(
-            input_ids=None,
+        outputs = self.model(
+            input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
+            output_hidden_states=True,
+            return_dict=True,
             inputs_embeds=inputs_embeds,
+            image_grid_thw=image_grid_thw,
         )
 
-        pooling_mask = attention_mask if pooling_mask is None else pooling_mask
-        left_padding = pooling_mask[:, -1].sum() == pooling_mask.shape[0]  # TODO
-        if left_padding:
-            embeddings = outputs.last_hidden_state[:, -1]
-        else:
-            sequence_lengths = pooling_mask.sum(dim=1) - 1
-            batch_size = outputs.last_hidden_state.shape[0]
-            embeddings = outputs.last_hidden_state[
-                torch.arange(batch_size, device=outputs.last_hidden_state.device),
-                sequence_lengths,
-            ]
+        embeddings = outputs.hidden_states[-1][:, -1]
         embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
         return embeddings.contiguous()
 
@@ -218,7 +214,12 @@ class HFRunner:
 
         # Load the model and tokenizer
         if self.model_type == "generation":
-            self.base_model = AutoModelForCausalLM.from_pretrained(
+            config = AutoConfig.from_pretrained(model_path)
+            if model_archs := getattr(config, "architectures"):
+                model_cls = getattr(transformers, model_archs[0])
+            else:
+                model_cls = AutoModelForCausalLM
+            self.base_model = model_cls.from_pretrained(
                 model_path,
                 torch_dtype=torch_dtype,
                 trust_remote_code=self.trust_remote_code,
@@ -382,13 +383,17 @@ class HFRunner:
                 model = base_model
 
             outputs = model.generate(
-                input_ids,
-                do_sample=False,
-                temperature=None,
-                top_p=None,
-                max_new_tokens=max_new_tokens,
-                return_dict_in_generate=True,
-                output_scores=(not output_str_only),
+                input_ids=input_ids,
+                generation_config=GenerationConfig(
+                    do_sample=False,
+                    temperature=None,
+                    top_p=None,
+                    max_new_tokens=max_new_tokens,
+                    return_dict_in_generate=True,
+                    output_scores=(not output_str_only),
+                    # make sure to disable compile
+                    disable_compile=True,
+                ),
             )
 
             text = tokenizer.decode(
@@ -429,6 +434,10 @@ class HFRunner:
                         get_token_ids_logprobs(input_logits, token_ids_logprob).tolist()
                     )
                 del input_logits
+
+            if lora_paths is not None and lora_paths[i] is not None:
+                # Unload the LoRA adapter if it is used
+                model.unload()
 
         return ModelOutput(
             output_strs=output_strs,

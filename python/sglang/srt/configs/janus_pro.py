@@ -290,6 +290,9 @@ class DictOutput(object):
     def __getitem__(self, item):
         return self.__dict__[item]
 
+    def __contains__(self, key):
+        return key in self.__dict__
+
     def __setitem__(self, key, value):
         self.__dict__[key] = value
 

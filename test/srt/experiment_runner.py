@@ -184,9 +184,9 @@ class ExperimentRunner:
         self.logger = logging.getLogger(__name__)
 
     def wait_for_server(self, port: int, timeout: int = 300) -> bool:
-        start_time = time.time()
+        start_time = time.perf_counter()
 
-        while time.time() - start_time < timeout:
+        while time.perf_counter() - start_time < timeout:
             try:
                 response = requests.get(f"http://localhost:{port}/health")
                 if response.status_code == 200:
@@ -197,7 +197,7 @@ class ExperimentRunner:
         return False
 
     def run_task(self, config: TaskConfig) -> TaskResult:
-        start_time = time.time()
+        start_time = time.perf_counter()
         client_output = []
 
         try:
@@ -247,7 +247,7 @@ class ExperimentRunner:
                 name=config.name,
                 success=True,
                 output=formatted_output,
-                runtime=time.time() - start_time,
+                runtime=time.perf_counter() - start_time,
                 timestamp=datetime.now().isoformat(),
             )
 
@@ -256,7 +256,7 @@ class ExperimentRunner:
                 name=config.name,
                 success=False,
                 output=str(e),
-                runtime=time.time() - start_time,
+                runtime=time.perf_counter() - start_time,
                 timestamp=datetime.now().isoformat(),
             )
 

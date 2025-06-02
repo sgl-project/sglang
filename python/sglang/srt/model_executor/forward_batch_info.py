@@ -29,16 +29,17 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import flatten_nested_list, get_compiler_backend, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -58,7 +59,7 @@ class ForwardMode(IntEnum):
     DECODE = auto()
     # Contains both EXTEND and DECODE when doing chunked prefill.
     MIXED = auto()
-    # No sequence to forward. For data parallel attention, some workers wil be IDLE if no sequence are allocated.
+    # No sequence to forward. For data parallel attention, some workers will be IDLE if no sequence are allocated.
     IDLE = auto()
 
     # Used in speculative decoding: verify a batch in the target model.
@@ -239,6 +240,7 @@ class ForwardBatch:
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
+    global_forward_mode: Optional[ForwardMode] = None
 
     # Speculative decoding
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
@@ -247,9 +249,14 @@ class ForwardBatch:
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded
+    num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
+
+    tbo_split_seq_index: Optional[int] = None
+    tbo_parent_token_range: Optional[Tuple[int, int]] = None
+    tbo_children: Optional[List["ForwardBatch"]] = None
 
     @classmethod
     def init_new(
@@ -257,6 +264,8 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
+        from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
+
         device = model_runner.device
         extend_input_logprob_token_ids_gpu = None
         if batch.extend_input_logprob_token_ids is not None:
@@ -280,6 +289,7 @@ class ForwardBatch:
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
+            global_forward_mode=batch.global_forward_mode,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
@@ -290,6 +300,10 @@ class ForwardBatch:
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
+            num_token_non_padded=torch.tensor(
+                len(batch.input_ids), dtype=torch.int32
+            ).to(device, non_blocking=True),
+            tbo_split_seq_index=batch.tbo_split_seq_index,
         )
 
         # For DP attention
@@ -312,6 +326,7 @@ class ForwardBatch:
             )
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
+            TboForwardBatchPreparer.prepare(ret)
             return ret
 
         # Override the positions with spec_info
@@ -336,7 +351,7 @@ class ForwardBatch:
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
-            if model_runner.server_args.attention_backend != "torch_native":
+            if support_triton(model_runner.server_args.attention_backend):
                 ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
                     ret.extend_prefix_lens,
@@ -360,27 +375,29 @@ class ForwardBatch:
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
+        TboForwardBatchPreparer.prepare(ret)
+
         return ret
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """
-        Merge all image inputs in the batch into a single MultiModalInputs object.
+        Merge all multimodal inputs in the batch into a single MultiModalInputs object.
 
         Returns:
-            if none, current batch contains no image input
+            if none, current batch contains no multimodal input
 
         """
         if not self.mm_inputs or all(x is None for x in self.mm_inputs):
             return None
-
         # Filter out None values
         valid_inputs = [x for x in self.mm_inputs if x is not None]
 
-        # Start with the first valid image input
-        merged = valid_inputs[0]
+        # TODO: is it expensive?
+        # a workaround to avoid importing `MultimodalInputs`
+        merged = valid_inputs[0].__class__(mm_items=[])
 
         # Merge remaining inputs
-        for mm_input in valid_inputs[1:]:
+        for mm_input in valid_inputs:
             merged.merge(mm_input)
 
         return merged
@@ -407,104 +424,60 @@ class ForwardBatch:
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
-        device = model_runner.device
-        hf_config = model_runner.model_config.hf_config
-        mrope_positions_list = [None] * self.seq_lens.shape[0]
-        if self.forward_mode.is_decode():
-            for i, _ in enumerate(mrope_positions_list):
-                mrope_position_delta = (
-                    0
-                    if batch.multimodal_inputs[i] is None
-                    else batch.multimodal_inputs[i].mrope_position_delta
+        # batch_size * [3 * seq_len]
+        batch_size = self.seq_lens.shape[0]
+        mrope_positions_list = [[]] * batch_size
+        for batch_idx in range(batch_size):
+            mm_input = batch.multimodal_inputs[batch_idx]
+            if self.forward_mode.is_decode():
+                mrope_position_deltas = (
+                    [0]
+                    if mm_input is None
+                    else flatten_nested_list(mm_input.mrope_position_delta.tolist())
                 )
-                mrope_positions_list[i] = MRotaryEmbedding.get_next_input_positions(
-                    mrope_position_delta,
-                    int(self.seq_lens[i]) - 1,
-                    int(self.seq_lens[i]),
-                )
-        elif self.forward_mode.is_extend():
-            extend_start_loc_cpu = self.extend_start_loc.cpu().numpy()
-            for i, mm_input in enumerate(batch.multimodal_inputs):
-                extend_start_loc, extend_seq_len, extend_prefix_len = (
-                    extend_start_loc_cpu[i],
-                    batch.extend_seq_lens[i],
-                    batch.extend_prefix_lens[i],
+                next_input_positions = []
+                for mrope_position_delta in mrope_position_deltas:
+                    # batched deltas needs to be processed separately
+                    # Convert list of lists to tensor with shape [3, seq_len]
+                    next_input_positions += [
+                        MRotaryEmbedding.get_next_input_positions(
+                            mrope_position_delta,
+                            int(self.seq_lens[batch_idx]) - 1,
+                            int(self.seq_lens[batch_idx]),
+                        )
+                    ]
+                # 3 * N
+                mrope_positions_list[batch_idx] = torch.cat(next_input_positions, dim=1)
+            elif self.forward_mode.is_extend():
+                extend_seq_len, extend_prefix_len = (
+                    batch.extend_seq_lens[batch_idx],
+                    batch.extend_prefix_lens[batch_idx],
                 )
                 if mm_input is None:
                     # text only
-                    mrope_positions = [
+                    mrope_positions = torch.tensor(
                         [
-                            pos
-                            for pos in range(
-                                extend_prefix_len, extend_prefix_len + extend_seq_len
-                            )
+                            [
+                                pos
+                                for pos in range(
+                                    extend_prefix_len,
+                                    extend_prefix_len + extend_seq_len,
+                                )
+                            ]
                         ]
-                    ] * 3
+                        * 3
+                    )
                 else:
-                    image_grid_thws_list = [
-                        item.image_grid_thws
-                        for item in mm_input.mm_items
-                        if item.image_grid_thws is not None
+                    mrope_positions = mm_input.mrope_positions[
+                        :,
+                        extend_prefix_len : extend_prefix_len + extend_seq_len,
                     ]
-                    image_grid_thw = (
-                        None
-                        if len(image_grid_thws_list) == 0
-                        else torch.cat(image_grid_thws_list, dim=0)
-                    )
-
-                    video_grid_thws_list = [
-                        item.video_grid_thws
-                        for item in mm_input.mm_items
-                        if item.video_grid_thws is not None
-                    ]
-                    video_grid_thw = (
-                        None
-                        if len(video_grid_thws_list) == 0
-                        else torch.cat(video_grid_thws_list, dim=0)
-                    )
-
-                    second_per_grid_ts_list = [
-                        item.second_per_grid_ts
-                        for item in mm_input.mm_items
-                        if item.second_per_grid_ts is not None
-                    ]
-                    second_per_grid_ts = (
-                        None
-                        if len(second_per_grid_ts_list) == 0
-                        else torch.cat(second_per_grid_ts_list, dim=0)
-                    )
-
-                    # TODO: current qwen2-vl do not support radix cache since mrope position calculation
-                    mrope_positions, mrope_position_delta = (
-                        MRotaryEmbedding.get_input_positions(
-                            input_tokens=self.input_ids[
-                                extend_start_loc : extend_start_loc + extend_seq_len
-                            ].tolist(),
-                            image_grid_thw=image_grid_thw,
-                            video_grid_thw=video_grid_thw,
-                            image_token_id=hf_config.image_token_id,
-                            video_token_id=hf_config.video_token_id,
-                            vision_start_token_id=hf_config.vision_start_token_id,
-                            vision_end_token_id=hf_config.vision_end_token_id,
-                            spatial_merge_size=hf_config.vision_config.spatial_merge_size,
-                            context_len=0,
-                            seq_len=len(self.input_ids),
-                            second_per_grid_ts=second_per_grid_ts,
-                            tokens_per_second=getattr(
-                                hf_config.vision_config, "tokens_per_second", None
-                            ),
-                        )
-                    )
-                    batch.multimodal_inputs[i].mrope_position_delta = (
-                        mrope_position_delta
-                    )
-                mrope_positions_list[i] = mrope_positions
+                mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(
-            [torch.tensor(pos, device=device) for pos in mrope_positions_list],
-            axis=1,
-        )
-        self.mrope_positions = self.mrope_positions.to(torch.int64)
+            [pos.to(device=model_runner.device) for pos in mrope_positions_list],
+            dim=1,
+        ).to(dtype=torch.int64, device=model_runner.device)
 
     def get_max_chunk_capacity(self):
         # Maximum number of tokens in each chunk
@@ -627,6 +600,40 @@ class ForwardBatch:
 
         # Precompute the kv indices for each chunk
         self.prepare_chunked_kv_indices(device)
+
+    @property
+    def can_run_tbo(self):
+        return self.tbo_split_seq_index is not None
+
+
+class PPProxyTensors:
+    # adapted from https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
+    tensors: Dict[str, torch.Tensor]
+
+    def __init__(self, tensors):
+        # manually define this function, so that
+        # Dynamo knows `IntermediateTensors()` comes from this file.
+        # Otherwise, dataclass will generate this function by evaluating
+        # a string, and we will lose the information about the source file.
+        self.tensors = tensors
+
+    def __getitem__(self, key: Union[str, slice]):
+        if isinstance(key, str):
+            return self.tensors[key]
+        elif isinstance(key, slice):
+            return self.__class__({k: v[key] for k, v in self.tensors.items()})
+
+    def __setitem__(self, key: str, value: torch.Tensor):
+        self.tensors[key] = value
+
+    def __len__(self):
+        return len(self.tensors)
+
+    def __eq__(self, other: object):
+        return isinstance(other, self.__class__) and self
+
+    def __repr__(self) -> str:
+        return f"PPProxyTensors(tensors={self.tensors})"
 
 
 def compute_position_triton(

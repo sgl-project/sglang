@@ -4,6 +4,7 @@ from sglang.test.test_utils import CustomTestCase, is_in_ci, run_bench_one_batch
 
 
 class TestDummyGrok1(CustomTestCase):
+
     def test_dummy_grok_1(self):
         output_throughput = run_bench_one_batch(
             None,
@@ -26,7 +27,7 @@ class TestDummyGrok1(CustomTestCase):
         )
 
         if is_in_ci():
-            assert output_throughput > 0, f"{output_throughput=}"
+            self.assertGreater(output_throughput, 0)
 
 
 if __name__ == "__main__":

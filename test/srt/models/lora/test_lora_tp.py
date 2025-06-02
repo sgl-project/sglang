@@ -23,7 +23,7 @@ from utils import (
     DEFAULT_PROMPTS,
     TORCH_DTYPES,
     LoRAModelCase,
-    run_batch_lora_test,
+    run_lora_test_one_by_one,
 )
 
 from sglang.test.test_utils import CustomTestCase, is_in_ci
@@ -43,7 +43,7 @@ class TestLoRATP(CustomTestCase):
             for tp_size in tp_list:
                 model_case.tp_size = tp_size
                 for torch_dtype in TORCH_DTYPES:
-                    run_batch_lora_test(
+                    run_lora_test_one_by_one(
                         prompts,
                         model_case,
                         torch_dtype,

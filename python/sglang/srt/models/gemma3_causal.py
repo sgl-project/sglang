@@ -189,7 +189,7 @@ class Gemma3Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            logit_cap=getattr(self.config, "attn_logit_softcapping", None),
+            logit_cap=0.0,
             # Module must also define `get_attention_sliding_window_size` to correctly initialize
             # attention backend in `ForwardBatch`.
             sliding_window_size=self.sliding_window,
@@ -277,6 +277,13 @@ class Gemma3Attention(nn.Module):
         k = k.permute(0, 2, 1, 3)
 
         attn_output = self.attn(q, k, v, forward_batch=forward_batch)
+
+        # Compatible with triton backend which returns [1, s, h, head_dim]
+        if attn_output.dim() == 4 and attn_output.shape[0] == 1:
+            attn_output = attn_output.squeeze(0)
+            attn_output = attn_output.flatten(-2, -1)
+        # [s, h * head_dim]
+
         output, _ = self.o_proj(attn_output)
         return output
 

@@ -22,7 +22,9 @@ find_package(CUDAToolkit REQUIRED)
 set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
 message(STATUS "Detected CUDA_VERSION=${CUDA_VERSION}")
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
+    message("CUDA_VERSION ${CUDA_VERSION} >= 13.0")
+elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
     message("CUDA_VERSION ${CUDA_VERSION} >= 12.8")
 elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
     message("CUDA_VERSION ${CUDA_VERSION} >= 12.4")
@@ -43,7 +45,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        5e497243f7ad13a2aa842143f9b10bbb23d98292
+    GIT_TAG        f115c3f85467d5d9619119d1dbeb9c03c3d73864
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -51,7 +53,7 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM
-    GIT_TAG        4499c4ccbb5d3958b1a069f29ef666156a121278
+    GIT_TAG        d75b218b7b8f4a5dd5406ac87905039ead3ae42f
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -81,6 +83,15 @@ if(CCACHE_FOUND AND ENABLE_CCACHE AND DEFINED ENV{CCACHE_DIR})
     set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "ccache")
 endif()
 
+# Enable gencode below SM90
+option(ENABLE_BELOW_SM90 "Enable below SM90" ON)
+
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+    set(ENABLE_BELOW_SM90 OFF)
+    message(STATUS "For aarch64, disable gencode below SM90 by default")
+endif()
+
+
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/csrc
@@ -96,9 +107,6 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-O3"
     "-Xcompiler"
     "-fPIC"
-    "-gencode=arch=compute_75,code=sm_75"
-    "-gencode=arch=compute_80,code=sm_80"
-    "-gencode=arch=compute_89,code=sm_89"
     "-gencode=arch=compute_90,code=sm_90"
     "-std=c++17"
     "-DFLASHINFER_ENABLE_F16"
@@ -112,7 +120,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "--expt-extended-lambda"
     "--threads=32"
 
-    # Supress warnings
+    # Suppress warnings
     "-Xcompiler=-Wconversion"
     "-Xcompiler=-fno-strict-aliasing"
 
@@ -121,17 +129,33 @@ set(SGL_KERNEL_CUDA_FLAGS
     # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
 )
 
-option(SGL_KERNEL_ENABLE_SM100A "Enable SM100A" OFF)
-option(SGL_KERNEL_ENABLE_SM90A  "Enable SM90A"  OFF)
-option(SGL_KERNEL_ENABLE_BF16   "Enable BF16"   ON)
-option(SGL_KERNEL_ENABLE_FP8    "Enable FP8"    ON)
-option(SGL_KERNEL_ENABLE_FP4    "Enable FP4"    OFF)
-option(SGL_KERNEL_ENABLE_FA3    "Enable FA3"    OFF)
+option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
+option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
+option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
+option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
+option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
+option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+if (ENABLE_BELOW_SM90)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-gencode=arch=compute_75,code=sm_75"
+        "-gencode=arch=compute_80,code=sm_80"
+        "-gencode=arch=compute_89,code=sm_89"
+    )
+endif()
+
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0" OR SGL_KERNEL_ENABLE_SM100A)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-gencode=arch=compute_100,code=sm_110"
+        "-gencode=arch=compute_100a,code=sm_110a"
+    )
+elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
+        "-gencode=arch=compute_100,code=sm_101"
+        "-gencode=arch=compute_100,code=sm_101a"
         "-gencode=arch=compute_100a,code=sm_100a"
+        "-gencode=arch=compute_120,code=sm_120"
     )
 else()
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -176,6 +200,7 @@ set(SOURCES
     "csrc/attention/cascade.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
+    "csrc/attention/vertical_slash_index.cu"
     "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/elementwise/activation.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
@@ -192,12 +217,18 @@ set(SOURCES
     "csrc/gemm/per_tensor_quant_fp8.cu"
     "csrc/gemm/per_token_group_quant_8bit.cu"
     "csrc/gemm/per_token_quant_fp8.cu"
+    "csrc/gemm/qserve_w4a8_per_chn_gemm.cu"
+    "csrc/gemm/qserve_w4a8_per_group_gemm.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
+    "csrc/moe/fp8_blockwise_moe_kernel.cu"
+    "csrc/moe/prepare_moe_input.cu"
+    "csrc/moe/ep_moe_reorder_kernel.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/speculative_sampling.cu"
     "csrc/speculative/packbit.cu"
+    "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
     "csrc/common_extension.cc"
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
@@ -229,7 +260,7 @@ install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
 
 # ============================ Optional Install ============================= #
 # set flash-attention sources file
-# BF16 source files
+# Now FA3 support sm80/sm86/sm90
 if (SGL_KERNEL_ENABLE_FA3)
     set(SGL_FLASH_KERNEL_CUDA_FLAGS
         "-DNDEBUG"
@@ -252,6 +283,16 @@ if (SGL_KERNEL_ENABLE_FA3)
         "-Xcompiler=-fno-strict-aliasing"
     )
 
+    if (ENABLE_BELOW_SM90)
+        list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_80,code=sm_80"
+            "-gencode=arch=compute_86,code=sm_86"
+        )
+        # SM8X Logic
+        file(GLOB FA3_SM8X_GEN_SRCS
+            "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim*_sm80.cu")
+    endif()
+
     file(GLOB FA3_BF16_GEN_SRCS
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_bf16*_sm90.cu")
     file(GLOB FA3_BF16_GEN_SRCS_
@@ -272,7 +313,7 @@ if (SGL_KERNEL_ENABLE_FA3)
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
     list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
 
-    set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
+    set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS} ${FA3_SM8X_GEN_SRCS})
 
     set(FLASH_SOURCES
         "csrc/flash_extension.cc"
@@ -291,14 +332,17 @@ if (SGL_KERNEL_ENABLE_FA3)
     target_link_libraries(flash_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 
     install(TARGETS flash_ops LIBRARY DESTINATION "sgl_kernel")
-
-    target_compile_definitions(flash_ops PRIVATE
-        FLASHATTENTION_DISABLE_SM8x
+    set(FLASH_OPS_COMPILE_DEFS
         FLASHATTENTION_DISABLE_BACKWARD
         FLASHATTENTION_DISABLE_DROPOUT
         FLASHATTENTION_DISABLE_UNEVEN_K
         FLASHATTENTION_VARLEN_ONLY
     )
+
+    if(NOT ENABLE_BELOW_SM90)
+        list(APPEND FLASH_OPS_COMPILE_DEFS FLASHATTENTION_DISABLE_SM8x)
+    endif()
+    target_compile_definitions(flash_ops PRIVATE ${FLASH_OPS_COMPILE_DEFS})
 endif()
 
 # JIT Logic
