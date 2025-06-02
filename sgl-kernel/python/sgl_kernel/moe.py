@@ -62,6 +62,30 @@ def moe_fused_gate(
     )
 
 
+def ep_moe_pre_reorder(
+    input_tensor,
+    gateup_input,
+    src2dst,
+    topk_ids,
+    a1_scales,
+    start_expert_id,
+    end_expert_id,
+    topk,
+    use_per_token_if_dynamic,
+):
+    return torch.ops.sgl_kernel.ep_moe_pre_reorder.default(
+        input_tensor,
+        gateup_input,
+        src2dst,
+        topk_ids,
+        a1_scales,
+        start_expert_id,
+        end_expert_id,
+        topk,
+        use_per_token_if_dynamic,
+    )
+
+
 def fp8_blockwise_scaled_grouped_mm(
     output,
     a_ptrs,
