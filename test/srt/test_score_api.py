@@ -19,9 +19,16 @@ class TestScoreAPI(CustomTestCase):
             self.engine.shutdown()
             torch.cuda.empty_cache()
 
-    def compute_hf_scores(self, prompt, texts, label_token_ids, apply_softmax=False):
+    def compute_hf_scores(self, query, items, label_token_ids, apply_softmax=False, item_first=False):
         """Compute scores using direct HuggingFace model inference.
         Returns probabilities for each token ID, optionally normalized with softmax.
+        
+        Args:
+            query: The query text
+            items: List of item texts
+            label_token_ids: List of token IDs to compute probabilities for
+            apply_softmax: Whether to normalize probabilities using softmax
+            item_first: If True, prepend items to query. Otherwise append items to query.
         """
         # Initialize HF model and tokenizer
         tokenizer = AutoTokenizer.from_pretrained(TEST_MODEL_NAME, trust_remote_code=True)
@@ -29,9 +36,9 @@ class TestScoreAPI(CustomTestCase):
         
         try:
             scores = []
-            for text in texts:
-                # Combine prompt and text directly without newline
-                full_text = f"{prompt}{text}"
+            for item in items:
+                # Construct full text based on item_first parameter
+                full_text = f"{item}{query}" if item_first else f"{query}{item}"
                 inputs = tokenizer(full_text, return_tensors="pt").to(model.device)
                 
                 # Get logits for the last token
@@ -58,56 +65,88 @@ class TestScoreAPI(CustomTestCase):
             del tokenizer
             torch.cuda.empty_cache()
 
-    def test_score_consistency(self):
-        """Test that SGLang scoring matches direct HuggingFace model scoring.
-        """
-     
-        # Single test case
-        prompt = "I pledge allegiance"
-        texts = ["", " to"] 
-        tokens = [" to", " the", " and"]
-        
-        # Get token IDs using HF tokenizer temporarily
+    def _get_token_ids(self, tokens):
+        """Helper method to get token IDs for a list of tokens."""
         tokenizer = AutoTokenizer.from_pretrained(TEST_MODEL_NAME, trust_remote_code=True)
-        label_token_ids = []
-        for token in tokens:
-            encoding = tokenizer.encode_plus(token, add_special_tokens=False)
-            token_ids = encoding['input_ids']
-            label_token_ids.append(token_ids[0])
-        del tokenizer 
-        # Get scores from SGLang first
-        sglang_scores = self.engine.score(
-            query=prompt,
-            items=texts,
-            label_token_ids=label_token_ids,
-            apply_softmax=True
-        )
+        try:
+            label_token_ids = []
+            for token in tokens:
+                encoding = tokenizer.encode_plus(token, add_special_tokens=False)
+                token_ids = encoding['input_ids']
+                label_token_ids.append(token_ids[0])
+            return label_token_ids
+        finally:
+            del tokenizer
 
-        print(f"\nSGLang scores: {sglang_scores}")
+    def _compare_scores(self, hf_scores, sglang_scores, label_token_ids, case_name=""):
+        """Helper method to compare scores between HF and SGLang."""
+        self.assertEqual(len(hf_scores), len(sglang_scores), 
+            f"Score lengths don't match for {case_name}")
         
-        # Get scores from HuggingFace
-        hf_scores = self.compute_hf_scores(
-            prompt, texts,
-            label_token_ids
-        )
-        
-        print(f"\nHF scores: {hf_scores}")
-        
-        # Compare scores
-        self.assertEqual(len(hf_scores), len(sglang_scores), "Score lengths don't match")
         for hf_score_dict, sglang_score_dict in zip(hf_scores, sglang_scores):
-            print(f"\nScore comparison:")
+            print(f"\nScore comparison ({case_name}):")
             for tid in label_token_ids:
                 hf_score = hf_score_dict[tid]
                 sglang_score = sglang_score_dict[tid]
                 self.assertAlmostEqual(hf_score, sglang_score, places=3,
-                    msg=f"Scores don't match for token {tid}: HF={hf_score:.6f}, SGLang={sglang_score:.6f}")
+                    msg=f"Scores don't match for token {tid} ({case_name}): HF={hf_score:.6f}, SGLang={sglang_score:.6f}")
                 self.assertGreaterEqual(sglang_score, 0, f"SGLang score {sglang_score:.6f} not in [0,1]")
                 self.assertLessEqual(sglang_score, 1, f"SGLang score {sglang_score:.6f} not in [0,1]")
             
-                self.assertAlmostEqual(sum(sglang_score_dict.values()), 1.0, places=6,
-                    msg=f"SGLang scores don't sum to 1: {sum(sglang_score_dict.values()):.6f}")
+            self.assertAlmostEqual(sum(sglang_score_dict.values()), 1.0, places=6,
+                msg=f"SGLang scores don't sum to 1 ({case_name}): {sum(sglang_score_dict.values()):.6f}")
 
+    def _get_hf_inputs(self, query, items, item_first):
+        """Helper method to generate HF inputs based on item_first parameter."""
+        if item_first:
+            return "", [f"{item}{query}" for item in items]
+        else:
+            return query, items
+
+    def test_score_consistency(self):
+        """Test that SGLang scoring matches direct HuggingFace model scoring."""
+        # Define test cases
+        test_cases = [
+            {
+                "name": "default case",
+                "query": "I pledge allegiance",
+                "items": ["", " to"],
+                "item_first": False
+            },
+            {
+                "name": "item_first case",
+                "query": " is a city",
+                "items": ["Tokyo", "Japan"],
+                "item_first": True
+            }
+        ]
+
+        # Common tokens to test for all cases
+        tokens = [" to", " the", " and"]
+        label_token_ids = self._get_token_ids(tokens)
+
+        # Run each test case
+        for case in test_cases:
+            # Get scores from SGLang
+            sglang_scores = self.engine.score(
+                query=case["query"],
+                items=case["items"],
+                label_token_ids=label_token_ids,
+                apply_softmax=True,
+                item_first=case["item_first"]
+            )
+            
+            # Get scores from HuggingFace using the same parameters
+            hf_scores = self.compute_hf_scores(
+                query=case["query"],
+                items=case["items"],
+                label_token_ids=label_token_ids,
+                apply_softmax=True,
+                item_first=case["item_first"]
+            )
+            
+            # Compare scores
+            self._compare_scores(hf_scores, sglang_scores, label_token_ids, case["name"])
 
     def test_score_batch_handling(self):
         """Test that batch scoring works correctly."""
