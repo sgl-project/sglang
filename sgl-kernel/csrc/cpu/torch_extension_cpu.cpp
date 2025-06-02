@@ -193,10 +193,7 @@ void shm_allreduce(
 at::Tensor shm_allgather(at::Tensor& data, c10::intrusive_ptr<c10d::ProcessGroup> process_group, int64_t dim);
 
 // rope
-std::tuple<at::Tensor, at::Tensor>
-rotary_position_embedding_cpu(at::Tensor& t_pos, at::Tensor& q_pe, at::Tensor& k_pe, at::Tensor& t_emb_pos);
-
-void rotary_embedding_origin_cpu(
+std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& positions,
     at::Tensor& query,
     at::Tensor& key,
@@ -316,12 +313,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("shm_allgather", torch::kCPU, &shm_allgather);
 
   // rope
-  m.def("rotary_position_embedding_cpu(Tensor t_pos, Tensor q_pe, Tensor k_pe, Tensor t_emb_pos) -> (Tensor, Tensor)");
-  m.impl("rotary_position_embedding_cpu", torch::kCPU, &rotary_position_embedding_cpu);
   m.def(
-      "rotary_embedding_origin_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
-      "bool is_neox) -> ()");
-  m.impl("rotary_embedding_origin_cpu", torch::kCPU, &rotary_embedding_origin_cpu);
+      "rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
+      "bool is_neox) -> (Tensor, Tensor)");
+  m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
 }
 
 REGISTER_EXTENSION(common_ops)
