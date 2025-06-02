@@ -306,10 +306,9 @@ __global__ void ProcessAcceptIndexKernel(
   IdType* shared_indices = (IdType*)shared_mem;
   uint32_t* shared_counts = (uint32_t*)(shared_mem + spec_steps_plus_one);
 
-  if (bx == 0) {
-    for (uint32_t i = tx; i < total_draft_tokens; i += blockDim.x) {
-      evict_mask[i] = true;
-    }
+  uint32_t start = bx * blockDim.x + tx;
+  for (uint32_t i = start; i < total_draft_tokens; i += gridDim.x * blockDim.x) {
+    evict_mask[i] = true;
   }
 
   __syncthreads();
@@ -342,11 +341,9 @@ __global__ void ProcessAcceptIndexKernel(
 
     for (uint32_t i = 0; i < valid_count; ++i) {
       IdType idx = shared_indices[i];
-      // Bounds check
       if (idx < total_draft_tokens && (global_offset + i) < total_draft_tokens) {
         verified_id[global_offset + i] = predict[idx];
         filtered_accept_index[global_offset + i] = idx;
-        // Set evict_mask to false for accepted tokens
         evict_mask[idx] = false;
       }
     }
@@ -360,7 +357,7 @@ __global__ void ProcessAcceptIndexKernel(
       for (uint32_t b = 0; b < batch_size; ++b) {
         IdType accept_len = accept_length[b];
         if (accept_len >= 0) {
-          total_accept_length += (accept_len + 1);  // +1 because accept_length = valid_count - 1
+          total_accept_length += (accept_len + 1);
         }
       }
       *output_size = total_accept_length;
