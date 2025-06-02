@@ -492,16 +492,24 @@ class EmbeddingResponse(BaseModel):
 
 
 class ScoringRequest(BaseModel):
-    query: Optional[Union[str, List[int]]] = None  # Query text or pre-tokenized token IDs
-    items: Optional[Union[str, List[str], List[List[int]]]] = None  # Item text(s) or pre-tokenized token IDs
-    label_token_ids: Optional[List[int]] = None  # Token IDs to compute probabilities for
+    query: Optional[Union[str, List[int]]] = (
+        None  # Query text or pre-tokenized token IDs
+    )
+    items: Optional[Union[str, List[str], List[List[int]]]] = (
+        None  # Item text(s) or pre-tokenized token IDs
+    )
+    label_token_ids: Optional[List[int]] = (
+        None  # Token IDs to compute probabilities for
+    )
     apply_softmax: bool = False
     item_first: bool = False
     model: str
 
 
 class ScoringResponse(BaseModel):
-    scores: List[List[float]]  # List of lists of probabilities, each in the order of label_token_ids
+    scores: List[
+        List[float]
+    ]  # List of lists of probabilities, each in the order of label_token_ids
     model: str
     usage: Optional[UsageInfo] = None
     object: str = "scoring"

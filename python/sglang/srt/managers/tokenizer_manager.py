@@ -43,11 +43,11 @@ from typing import (
 )
 
 import fastapi
+import torch
 import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-import torch
 
 from sglang.srt.aio_rwlock import RWLock
 from sglang.srt.configs.model_config import ModelConfig
@@ -1454,10 +1454,15 @@ class TokenizerManager:
             vocab_size = self.tokenizer.vocab_size
             for token_id in label_token_ids:
                 if token_id >= vocab_size:
-                    raise ValueError(f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})")
+                    raise ValueError(
+                        f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})"
+                    )
 
         # Handle string or tokenized query/items
-        if isinstance(query, str) and (isinstance(items, str) or (isinstance(items, list) and (not items or isinstance(items[0], str)))):
+        if isinstance(query, str) and (
+            isinstance(items, str)
+            or (isinstance(items, list) and (not items or isinstance(items[0], str)))
+        ):
             # Both query and items are text
             items_list = [items] if isinstance(items, str) else items
             if item_first:
@@ -1471,7 +1476,12 @@ class TokenizerManager:
                 stream=False,
                 sampling_params={"max_new_tokens": 1},
             )
-        elif isinstance(query, list) and isinstance(items, list) and items and isinstance(items[0], list):
+        elif (
+            isinstance(query, list)
+            and isinstance(items, list)
+            and items
+            and isinstance(items[0], list)
+        ):
             # Both query and items are token IDs
             if item_first:
                 input_ids_list = [item + query for item in items]
@@ -1485,30 +1495,38 @@ class TokenizerManager:
                 sampling_params={"max_new_tokens": 1},
             )
         else:
-            raise ValueError("Invalid combination of query/items types for score_request.")
+            raise ValueError(
+                "Invalid combination of query/items types for score_request."
+            )
 
         results = await self.generate_request(batch_request, request).__anext__()
         scores = []
-        
+
         for result in results:
             # Get logprobs for each token
             logprobs = {}
-            for logprob, token_id, _ in result["meta_info"].get("output_token_ids_logprobs", [])[0]:
+            for logprob, token_id, _ in result["meta_info"].get(
+                "output_token_ids_logprobs", []
+            )[0]:
                 if token_id in label_token_ids:
                     logprobs[token_id] = logprob
-            
+
             # Get scores in order of label_token_ids
-            score_list = [logprobs.get(token_id, float('-inf')) for token_id in label_token_ids]
-            
+            score_list = [
+                logprobs.get(token_id, float("-inf")) for token_id in label_token_ids
+            ]
+
             # Apply softmax to logprobs if needed
             if apply_softmax:
                 score_list = torch.softmax(torch.tensor(score_list), dim=0).tolist()
             else:
                 # Convert logprobs to probabilities if not using softmax
-                score_list = [math.exp(x) if x != float('-inf') else 0.0 for x in score_list]
-                
+                score_list = [
+                    math.exp(x) if x != float("-inf") else 0.0 for x in score_list
+                ]
+
             scores.append(score_list)
-            
+
         return scores
 
 

@@ -481,12 +481,12 @@ class Engine(EngineBase):
         item_first: bool = False,
     ) -> List[List[float]]:
         """
-        Score the probability of specified token IDs appearing after the given (query + item) pair. For example:  
+        Score the probability of specified token IDs appearing after the given (query + item) pair. For example:
         query = "<|user|>Is the following city the capital of France? "
         items = ["Paris <|assistant|>", "London <|assistant|>", "Berlin <|assistant|>"]
         label_token_ids = [2332, 1223] # Token IDs for "Yes" and "No"
         item_first = False
-        
+
         This would pass the following prompts to the model:
         "<|user|>Is the following city the capital of France? Paris <|assistant|>"
         "<|user|>Is the following city the capital of France? London <|assistant|>"
@@ -494,8 +494,8 @@ class Engine(EngineBase):
         The api would then return the probabilities of the model producing "Yes" and "No" as the next token.
         The output would look like:
         [[0.9, 0.1], [0.2, 0.8], [0.1, 0.9]]
-   
-        
+
+
         Args:
             query: The query text or pre-tokenized query token IDs. Must be provided.
             items: The item text(s) or pre-tokenized item token IDs. Must be provided.
@@ -519,7 +519,7 @@ class Engine(EngineBase):
                 label_token_ids=label_token_ids,
                 apply_softmax=apply_softmax,
                 item_first=item_first,
-                request=None
+                request=None,
             )
         )
 
@@ -542,7 +542,7 @@ class Engine(EngineBase):
             label_token_ids=label_token_ids,
             apply_softmax=apply_softmax,
             item_first=item_first,
-            request=None
+            request=None,
         )
 
 

@@ -69,11 +69,11 @@ from sglang.srt.openai_api.protocol import (
     FunctionResponse,
     LogProbs,
     MultimodalEmbeddingInput,
+    ScoringRequest,
+    ScoringResponse,
     ToolCall,
     TopLogprob,
     UsageInfo,
-    ScoringRequest,
-    ScoringResponse,
 )
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.utils import convert_json_schema_to_str, get_exception_traceback
