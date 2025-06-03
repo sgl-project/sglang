@@ -402,6 +402,12 @@ class TokenizerMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        self.num_aborted_requests_total = Counter(
+            name="sglang:num_aborted_requests",
+            documentation="Number of requests aborted.",
+            labelnames=labels.keys(),
+        )
+
         if bucket_time_to_first_token is None:
             bucket_time_to_first_token = [
                 0.1,
@@ -533,3 +539,6 @@ class TokenizerMetricsCollector:
             if adjusted_interval <= bound:
                 his._buckets[i].inc(num_new_tokens)
                 break
+
+    def observe_one_aborted_request(self):
+        self.num_aborted_requests_total.labels(**self.labels).inc(1)

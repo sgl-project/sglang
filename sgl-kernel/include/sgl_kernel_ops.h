@@ -232,6 +232,7 @@ void fp8_blockwise_scaled_grouped_mm(
 void prepare_moe_input(
     const torch::Tensor& topk_ids,
     torch::Tensor& expert_offsets,
+    const std::optional<torch::Tensor>& blockscale_offsets,
     torch::Tensor& problem_sizes1,
     torch::Tensor& problem_sizes2,
     torch::Tensor& input_permutation,
@@ -239,6 +240,40 @@ void prepare_moe_input(
     const int64_t num_experts,
     const int64_t n,
     const int64_t k);
+
+void ep_moe_pre_reorder(
+    torch::Tensor input,
+    torch::Tensor gateup_input,
+    torch::Tensor src2dst,
+    torch::Tensor topk_ids,
+    torch::Tensor a1_scales,
+    int64_t start_expert_id,
+    int64_t end_expert_id,
+    int64_t topk,
+    bool use_per_token_if_dynamic);
+
+void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor);
+
+void cutlass_fp4_group_mm(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& a_blockscale,
+    const torch::Tensor& b_blockscales,
+    const torch::Tensor& alphas,
+    const torch::Tensor& ab_strides,
+    const torch::Tensor& c_strides,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& sf_offsets);
+
+void scaled_fp4_experts_quant(
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    torch::Tensor const& input,
+    torch::Tensor const& input_global_scale,
+    torch::Tensor const& input_offset_by_experts,
+    torch::Tensor const& output_scale_offset_by_experts);
 
 /*
  * From csrc/speculative

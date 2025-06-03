@@ -25,7 +25,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 class ExpertLocationDispatchInfo:
     ep_dispatch_algorithm: Literal["static", "random"]
     # (num_logical_experts,)
-    partial_logical_to_rank_dispatch_physical_map: torch.Tensor
+    partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # (num_logical_experts, X)
     partial_logical_to_all_physical_map: torch.Tensor
     # (num_logical_experts,)
@@ -42,9 +42,14 @@ class ExpertLocationDispatchInfo:
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
-            partial_logical_to_rank_dispatch_physical_map=expert_location_metadata.logical_to_rank_dispatch_physical_map[
-                layer_id, :
-            ],
+            partial_logical_to_rank_dispatch_physical_map=(
+                expert_location_metadata.logical_to_rank_dispatch_physical_map[
+                    layer_id, :
+                ]
+                if expert_location_metadata.logical_to_rank_dispatch_physical_map
+                is not None
+                else None
+            ),
             partial_logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map[
                 layer_id, :
             ],

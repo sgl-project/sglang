@@ -178,6 +178,7 @@ def pre_reorder_triton_kernel(
     topk,
     hidden_size,
     BLOCK_SIZE: tl.constexpr,
+    use_per_token_if_dynamic: tl.constexpr,
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
 
@@ -188,11 +189,15 @@ def pre_reorder_triton_kernel(
 
     vec = tl.arange(0, BLOCK_SIZE)
 
+    if a1_scales_ptr is not None and use_per_token_if_dynamic:
+        scale = 1.0 / tl.load(a1_scales_ptr + src_idx)
+
     for idx in range(topk):
         expert_id = tl.load(topk_ids_ptr + idx)
         if expert_id >= start_expert_id and expert_id <= end_expert_id:
             if a1_scales_ptr is not None:
-                scale = 1.0 / tl.load(a1_scales_ptr + expert_id - start_expert_id)
+                if not use_per_token_if_dynamic:
+                    scale = 1.0 / tl.load(a1_scales_ptr + expert_id - start_expert_id)
             else:
                 scale = 1.0
 
@@ -558,6 +563,7 @@ def grouped_gemm_triton_kernel(
     bs_stride_0: tl.constexpr,
     bs_stride_2: tl.constexpr,
     bs_stride_1: tl.constexpr,
+    use_per_token_if_dynamic: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -621,7 +627,10 @@ def grouped_gemm_triton_kernel(
         b_ptr += BLOCK_SIZE_K
 
     if use_fp8_w8a8 and not (group_k > 0 and group_n > 0):
-        scale_a_value = tl.load(scale_a + expert_id)
+        if use_per_token_if_dynamic:
+            scale_a_value = tl.load(scale_a + (m_range_start + offs_am[:, None]))
+        else:
+            scale_a_value = tl.load(scale_a + expert_id)
         scale_b_value = tl.load(scale_b + expert_id)
         accumulator *= scale_a_value * scale_b_value
 
@@ -658,6 +667,7 @@ def grouped_gemm_triton(
     scale_b: torch.Tensor = None,
     block_shape: Optional[List[int]] = None,
     c_dtype=None,
+    use_per_token_if_dynamic: bool = True,
 ):
     assert weight_column_major == True  # TODO: more
     if use_fp8_w8a8 and block_shape is None:
@@ -698,6 +708,11 @@ def grouped_gemm_triton(
         triton.cdiv(b.size(1), META["BLOCK_SIZE_N"]),
     )
 
+    if use_fp8_w8a8 and block_shape is None and use_per_token_if_dynamic:
+        assert (
+            scale_a.shape[0] == a.shape[0]
+        ), f"scale_a.shape: {scale_a.shape}, a.shape: {a.shape}"
+
     grouped_gemm_triton_kernel[grid](
         a,
         b,
@@ -721,6 +736,7 @@ def grouped_gemm_triton(
         scale_b.stride(0) if scale_b is not None and scale_b.ndim >= 2 else 0,
         scale_b.stride(2) if scale_b is not None and scale_b.ndim == 3 else 0,
         scale_b.stride(1) if scale_b is not None and scale_b.ndim >= 2 else 0,
+        use_per_token_if_dynamic,
         **config,
     )
     return c

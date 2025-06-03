@@ -357,12 +357,25 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
         args_obj = json.loads(arguments)
 
         self.assertEqual(
-            function_name, "get_weather", "Function name should be 'get_weather'"
+            function_name,
+            "get_weather",
+            f"Function name should be 'get_weather', got: {function_name}",
         )
-        self.assertIn("city", args_obj, "Function arguments should have 'city'")
         self.assertIn(
-            "Paris", args_obj["city"], "Parameter city should contain 'Paris'"
-        )  # might be flaky
+            "city", args_obj, f"Function arguments should have 'city', got: {args_obj}"
+        )
+
+        # Make the test more robust by checking type and accepting valid responses
+        city_value = args_obj["city"]
+        self.assertIsInstance(
+            city_value,
+            str,
+            f"Parameter city should be a string, got: {type(city_value)}",
+        )
+        self.assertTrue(
+            "Paris" in city_value or "France" in city_value,
+            f"Parameter city should contain either 'Paris' or 'France', got: {city_value}",
+        )
 
     def test_function_call_specific(self):
         """

@@ -221,7 +221,7 @@ class TokenizerManager:
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
         else:
-            self.mm_processor = get_dummy_processor()
+            self.mm_processor = None
 
             if server_args.skip_tokenizer_init:
                 self.tokenizer = self.processor = None
@@ -395,6 +395,9 @@ class TokenizerManager:
                 self.server_args.disaggregation_bootstrap_port
             )
 
+        self.current_load = 0
+        self.current_load_lock = asyncio.Lock()
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -422,8 +425,8 @@ class TokenizerManager:
             is_single = obj.is_single
             if is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
-                self._send_one_request(obj, tokenized_obj, created_time)
-                async for response in self._wait_one_response(obj, request):
+                state = self._send_one_request(obj, tokenized_obj, created_time)
+                async for response in self._wait_one_response(obj, state, request):
                     yield response
             else:
                 async for response in self._handle_batch_request(
@@ -459,8 +462,7 @@ class TokenizerManager:
                 )
             input_ids = self.tokenizer.encode(input_text)
 
-        image_inputs: Optional[Dict] = None
-        if obj.contains_mm_input():
+        if self.mm_processor and obj.contains_mm_input():
             image_inputs = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
                 input_text=input_text or input_ids,
@@ -469,6 +471,8 @@ class TokenizerManager:
             )
             if image_inputs and "input_ids" in image_inputs:
                 input_ids = image_inputs["input_ids"]
+        else:
+            image_inputs: Optional[Dict] = None
 
         self._validate_token_len(obj, input_ids)
         return self._create_tokenized_object(
@@ -628,15 +632,15 @@ class TokenizerManager:
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
+        return state
 
     async def _wait_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
+        state: ReqState,
         request: Optional[fastapi.Request] = None,
     ):
         """Wait for the response of one request."""
-        state = self.rid_to_state[obj.rid]
-
         while True:
             try:
                 await asyncio.wait_for(state.event.wait(), timeout=4)
@@ -706,16 +710,16 @@ class TokenizerManager:
 
                 for i, tokenized_obj in enumerate(tokenized_objs):
                     tmp_obj = obj[i]
-                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, request))
+                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
                 for i in range(batch_size):
                     tmp_obj = obj[i]
                     tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, request))
+                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
@@ -740,8 +744,8 @@ class TokenizerManager:
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
-                self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                await self._wait_one_response(tmp_obj, request).__anext__()
+                state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                await self._wait_one_response(tmp_obj, state, request).__anext__()
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
@@ -749,8 +753,8 @@ class TokenizerManager:
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, request))
+                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)
 
         # Wait for all requests
@@ -786,6 +790,9 @@ class TokenizerManager:
         req = AbortReq(rid)
         self.send_to_scheduler.send_pyobj(req)
 
+        if self.enable_metrics:
+            self.metrics_collector.observe_one_aborted_request()
+
     async def start_profile(
         self,
         output_dir: Optional[str] = None,
@@ -793,6 +800,7 @@ class TokenizerManager:
         activities: Optional[List[str]] = None,
         with_stack: Optional[bool] = None,
         record_shapes: Optional[bool] = None,
+        profile_by_stage: bool = False,
     ):
         self.auto_create_handle_loop()
         req = ProfileReq(
@@ -802,6 +810,7 @@ class TokenizerManager:
             activities=activities,
             with_stack=with_stack,
             record_shapes=record_shapes,
+            profile_by_stage=profile_by_stage,
             profile_id=str(time.time()),
         )
         return await self._execute_profile(req)
@@ -982,6 +991,14 @@ class TokenizerManager:
         )
         # Many DP ranks
         return [res.internal_state for res in responses]
+
+    async def get_load(self) -> dict:
+        # TODO(lsyin): fake load report server
+        if not self.current_load_lock.locked():
+            async with self.current_load_lock:
+                internal_state = await self.get_internal_state()
+                self.current_load = internal_state[0]["load"]
+        return {"load": self.current_load}
 
     async def set_internal_state(
         self, obj: SetInternalStateReq

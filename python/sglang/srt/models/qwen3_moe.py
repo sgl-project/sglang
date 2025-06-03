@@ -812,9 +812,9 @@ class Qwen3MoeForCausalLM(nn.Module):
                         logger.warning(f"Parameter {name} not found in params_dict")
 
         self.routed_experts_weights_of_layer = {
-            layer_id: layer.mlp.get_moe_weights()
-            for layer_id, layer in enumerate(self.model.layers)
-            if isinstance(layer.mlp, Qwen3MoeSparseMoeBlock)
+            layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+            for layer_id in range(self.start_layer, self.end_layer)
+            if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
         }
 
     @classmethod

@@ -1,0 +1,28 @@
+[package]
+edition = "2024"
+name = "sgl-pdlb"
+version = "0.1.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "sgl_pdlb_rs"
+
+[dependencies]
+actix-web = "4.11"
+bytes = "1.8.0"
+chrono = "0.4.38"
+clap = { version = "4.4", features = ["derive"] }
+dashmap = "6.1.0"
+env_logger = "0.11.5"
+futures = "0.3"
+futures-util = "0.3"
+http = "1.3.1"
+log = "0.4.22"
+pyo3 = { version = "0.25.0", features = ["extension-module"] }
+rand = "0.9.0"
+reqwest = { version = "0.12.8", features = ["stream", "blocking", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.34", features = ["full"] }
+anyhow = "1.0.98"
+typetag = "0.2.20"

@@ -21,7 +21,7 @@ serde_json = "1.0"
 pyo3 = { version = "0.22.5", features = ["extension-module"] }
 dashmap = "6.1.0"
 http = "1.1.0"
-tokio = "1.42.0"
+tokio = { version = "1.42.0", features = ["macros", "rt-multi-thread"] }
 # Added for enhanced logging system
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
