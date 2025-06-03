@@ -132,9 +132,10 @@ __global__ void __launch_bounds__(256) dequantize_weights(
     int group_size,
     int qweight_cols) {
 #if CUDA_VERSION >= 12000
-  int col = blockIdx.x * blockDim.x + threadIdx.x;
-  int row = blockIdx.y * blockDim.y + threadIdx.y;
-
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (col >= cols || row >= rows) return;
+    
   int group_idx = row / group_size;
   int scale_offset = 8 * col + group_idx * qweight_cols * 8;
   uint4 loaded_scale = *(uint4*)(scales + scale_offset);
@@ -188,8 +189,10 @@ torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch:
 
   int x_num_threads = 16;
   int y_num_threads = 16;
-  int x_blocks = qweight_cols / x_num_threads;
-  int y_blocks = qweight_rows / y_num_threads;
+  // int x_blocks = qweight_cols / x_num_threads;
+  // int y_blocks = qweight_rows / y_num_threads;
+  int x_blocks = (qweight_cols + x_num_threads - 1) / x_num_threads;
+  int y_blocks = (qweight_rows + y_num_threads - 1) / y_num_threads;
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(qweight));
 
