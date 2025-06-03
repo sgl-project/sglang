@@ -19,11 +19,9 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.utils import (
-    get_actual_shard_size,
     get_bool_env_var,
     is_hip,
     narrow_padded_param_and_loaded_weight,
-    reset_param_data_if_needed,
     set_weight_attrs,
 )
 
