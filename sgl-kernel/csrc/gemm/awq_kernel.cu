@@ -190,8 +190,6 @@ torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch:
 
   int x_num_threads = 16;
   int y_num_threads = 16;
-  // int x_blocks = qweight_cols / x_num_threads;
-  // int y_blocks = qweight_rows / y_num_threads;
   int x_blocks = (qweight_cols + x_num_threads - 1) / x_num_threads;
   int y_blocks = (qweight_rows + y_num_threads - 1) / y_num_threads;
 
