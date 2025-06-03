@@ -2,7 +2,6 @@ import base64
 import io
 import json
 import os
-import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np

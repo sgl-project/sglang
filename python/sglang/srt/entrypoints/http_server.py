@@ -258,7 +258,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     ) + b"\n\n"
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
-                logger.error(f"Error: {e}")
+                logger.error(f"[http_server] Error: {e}")
                 yield b"data: " + orjson.dumps(
                     out, option=orjson.OPT_NON_STR_KEYS
                 ) + b"\n\n"
@@ -276,7 +276,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ).__anext__()
             return ret
         except ValueError as e:
-            logger.error(f"Error: {e}")
+            logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
 
 
@@ -352,6 +352,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         activities=obj.activities,
         with_stack=obj.with_stack,
         record_shapes=obj.record_shapes,
+        profile_by_stage=obj.profile_by_stage,
     )
     return Response(
         content="Start profiling.\n",
