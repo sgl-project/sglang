@@ -1240,8 +1240,7 @@ class GGUFModelLoader(BaseModelLoader):
             raise RuntimeError(f"Unknown gguf model_type: {model_type}")
         num_layers = config.num_hidden_layers
         name_map = gguf.get_tensor_name_map(arch, num_layers)
-        from accelerate import init_empty_weights
-        with  init_empty_weights():
+        with torch.device("meta"):
             dummy_model = AutoModelForCausalLM.from_config(config, trust_remote_code=model_config.trust_remote_code)
         state_dict = dummy_model.state_dict()
 
