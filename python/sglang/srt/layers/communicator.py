@@ -377,7 +377,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
     ):
         if residual_input_mode == ScatterMode.SCATTERED:
             residual, local_residual = (
-                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]].clone(),
+                forward_batch.gathered_buffer[
+                    : forward_batch.input_ids.shape[0]
+                ].clone(),
                 residual,
             )
             attn_tp_all_gather(
