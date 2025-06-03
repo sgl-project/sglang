@@ -462,22 +462,35 @@ class RadixCache(BasePrefixCache):
 
     def _record_store_event(self, node: TreeNode):
         if self.enable_kv_cache_events:
-            block_hash = hash(tuple(node.key))
-            parent_block_hash = hash(tuple(node.parent.key))
-            self.kv_event_queue.append(
-                BlockStored(
-                    block_hashes=[block_hash],
-                    parent_block_hash=parent_block_hash,
-                    token_ids=node.key,
-                    block_size=len(node.key),
-                    lora_id=None,
+            # Emit one BlockStored event per fixed-size page so that every event
+            # describes exactly ``self.page_size`` contiguous tokens.  This
+            # keeps the wire contract simple for consumers (e.g. Dynamo).
+            parent_block_hash = hash(tuple(node.parent.key)) if node.parent else None
+            for start in range(0, len(node.key), self.page_size):
+                page_tokens = node.key[start : start + self.page_size]
+                if not page_tokens:
+                    continue
+                block_hash = hash(tuple(page_tokens))
+                self.kv_event_queue.append(
+                    BlockStored(
+                        block_hashes=[block_hash],
+                        parent_block_hash=parent_block_hash,
+                        token_ids=page_tokens,
+                        block_size=len(page_tokens),
+                        lora_id=None,
+                    )
                 )
-            )
 
     def _record_remove_event(self, node: TreeNode):
         if self.enable_kv_cache_events:
-            block_hash = hash(tuple(node.key))
-            self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
+            # For symmetry with _record_store_event we also emit one
+            # BlockRemoved event per page.
+            for start in range(0, len(node.key), self.page_size):
+                page_tokens = node.key[start : start + self.page_size]
+                if not page_tokens:
+                    continue
+                block_hash = hash(tuple(page_tokens))
+                self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
 
     def _record_all_cleared_event(self):
         if self.enable_kv_cache_events:
