@@ -2340,3 +2340,7 @@ class LazyValue:
             self._value = self._creator()
             self._creator = None
         return self._value
+
+
+def is_shm_available(dtype):
+    return cpu_has_amx_support() and dtype in [torch.bfloat16, torch.float]
