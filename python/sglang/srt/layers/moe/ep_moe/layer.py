@@ -313,7 +313,7 @@ class EPMoE(torch.nn.Module):
                 gateup_output.shape[1],
                 gateup_output.shape[2] // 2,
             ),
-            device=gateup_output.device,
+            device=hidden_states_device,
             dtype=self.fp8_dtype,
         )
         scale_block_size = 128
@@ -323,7 +323,7 @@ class EPMoE(torch.nn.Module):
                 gateup_output.shape[1],
                 gateup_output.shape[2] // 2 // scale_block_size,
             ),
-            device=gateup_output.device,
+            device=hidden_states_device,
             dtype=torch.float32,
         )
         silu_and_mul_masked_post_quant_fwd(
@@ -342,7 +342,7 @@ class EPMoE(torch.nn.Module):
             get_col_major_tma_aligned_tensor(down_input_scale),
         )
         down_output = torch.empty(
-            (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16
+            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
         m_grouped_gemm_fp8_fp8_bf16_nt_masked(
             down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
