@@ -183,12 +183,17 @@ class CompletionRequest(BaseModel):
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
 
+    # For PD disaggregation
+    bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
+    bootstrap_room: Optional[int] = None
+
 
 class CompletionResponseChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Literal["stop", "length", "content_filter"]
+    finish_reason: Literal["stop", "length", "content_filter", "abort"]
     matched_stop: Union[None, int, str] = None
 
 
@@ -413,7 +418,7 @@ class ChatCompletionResponseChoice(BaseModel):
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Literal[
-        "stop", "length", "tool_calls", "content_filter", "function_call"
+        "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
     ]
     matched_stop: Union[None, int, str] = None
 
