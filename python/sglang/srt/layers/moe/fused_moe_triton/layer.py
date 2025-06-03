@@ -665,7 +665,7 @@ class FusedMoE(torch.nn.Module):
         # Matrix multiply.
         kwargs = {}
         if self.quant_config.get_name() != "gguf":
-            kwargs = {"routed_scaling_facto": self.routed_scaling_factor}
+            kwargs = {"routed_scaling_factor": self.routed_scaling_factor}
         final_hidden_states = self.quant_method.apply(
             layer=self,
             x=hidden_states,
