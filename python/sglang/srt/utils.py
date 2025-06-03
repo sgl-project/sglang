@@ -2666,7 +2666,7 @@ def narrow_padded_param_and_loaded_weight(
     reset_param_data_if_needed(
         param_data,
         dim,
-        actual_shard_size,
+        param_data_start + actual_shard_size,
         shard_size - actual_shard_size,
     )
 

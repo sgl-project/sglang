@@ -539,36 +539,35 @@ class FusedMoE(torch.nn.Module):
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         shard_size = expert_data.shape[shard_dim] // 2
-        loaded_weight_shard_dim = loaded_weight.size(shard_dim)
-        start_idx = shard_size * tp_rank
-        actual_shard_size = get_actual_shard_size(
-            shard_size, start_idx, loaded_weight_shard_dim
-        )
-        length = shard_size - actual_shard_size
-
-        if not self.use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, start_idx, actual_shard_size
-            )
 
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         # w3, up_proj: Load into second logical weight of w13.
-        # trtllm cutlass kernel assumes differently
+        # trtllm cutlass kernel assumes differently        
         assert shard_id in ("w1", "w3")
         switch_w13 = getattr(self.quant_method, "load_up_proj_weight_first", False)
         if (switch_w13 and shard_id == "w1") or (not switch_w13 and shard_id == "w3"):
             start = shard_size
         else:
             start = 0
-        # See [Note] Reset padded weights to zero.
-        reset_param_data_if_needed(
-            expert_data,
-            shard_dim,
-            start + actual_shard_size,
-            length,
-        )
-        expert_data = expert_data.narrow(shard_dim, start, actual_shard_size)
+
+        if _is_cpu:
+            expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                expert_data,
+                loaded_weight,
+                start,
+                shard_size * tp_rank,
+                shard_dim,
+                shard_size,
+                not self.use_presharded_weights,
+            )            
+        else:
+            if not self.use_presharded_weights:
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, shard_size * tp_rank, shard_size
+                )
+
+            expert_data = expert_data.narrow(shard_dim, start, shard_size)
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
