@@ -10,8 +10,17 @@ class CustomOp(nn.Module):
     def __init__(self):
         super().__init__()
         self._forward_method = self.dispatch_forward()
+        self.is_torch_compile = False
 
     def enter_torch_compile(self, num_tokens: int):
+        # Skip if Op is already entered compile mode
+        # NOTE(alcanderian): Some Ops(for example RotaryEmbedding) will be reused
+        # among layers and `enter_torch_compile` will be called many times.
+        # And then self._origin_forward_method will be override when it is not
+        # the first time `enter_torch_compile` called.
+        if self.is_torch_compile == True:
+            return
+
         self._origin_forward_method = self._forward_method
         # NOTE: Temporarily workaround MoE
         if "FusedMoE" in self.__class__.__name__:
@@ -28,6 +37,10 @@ class CustomOp(nn.Module):
         self.is_torch_compile = True
 
     def leave_torch_compile(self):
+        # Skip if Op is already exited compile mode
+        if self.is_torch_compile == False:
+            return
+
         self._forward_method = self._origin_forward_method
         self._origin_forward_method = None
         self.is_torch_compile = False
