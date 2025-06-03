@@ -13,11 +13,11 @@ class CustomOp(nn.Module):
         self.is_torch_compile = False
 
     def enter_torch_compile(self, num_tokens: int):
-        # Skip if Op is already entered compile mode
+        # Skip if Op is already entered compile mode.
         # NOTE(alcanderian): Some Ops(for example RotaryEmbedding) will be reused
         # among layers and `enter_torch_compile` will be called many times.
-        # And then self._origin_forward_method will be override when it is not
-        # the first time `enter_torch_compile` called.
+        # We should prevent `self._origin_forward_method` from being overrided when
+        # it is not the first time `enter_torch_compile` called.
         if self.is_torch_compile == True:
             return
 
@@ -37,7 +37,7 @@ class CustomOp(nn.Module):
         self.is_torch_compile = True
 
     def leave_torch_compile(self):
-        # Skip if Op is already exited compile mode
+        # Skip if Op is already exited compile mode.
         if self.is_torch_compile == False:
             return
 
