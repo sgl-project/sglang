@@ -785,6 +785,26 @@ class TestOpenAIV1Score(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    def run_score(
+        self, query, items, label_token_ids, apply_softmax=False, item_first=False
+    ):
+        response = requests.post(
+            self.base_url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.model,
+                "query": query,
+                "items": items,
+                "label_token_ids": label_token_ids,
+                "apply_softmax": apply_softmax,
+                "item_first": item_first,
+            },
+        )
+        return response.json()
+
     def test_score_text_input(self):
         """Test scoring with text input"""
         query = "The capital of France is"
