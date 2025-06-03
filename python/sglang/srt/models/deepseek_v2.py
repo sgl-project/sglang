@@ -2170,13 +2170,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
-<<<<<<< HEAD
-        if self.quant_config.get_name() != 'gguf':
-            self.post_load_weights(is_nextn=is_nextn)
-=======
-        # if self.quant_config.get_name() != 'gguf':
+
         self.post_load_weights(is_nextn=is_nextn)
->>>>>>> 3ce75d06 (MHA for gguf)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
