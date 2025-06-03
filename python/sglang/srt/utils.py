@@ -1212,9 +1212,7 @@ def get_nvgpu_memory_capacity():
         for i in range(num_devices):
             device = torch.cuda.get_device_properties(i)
             total_vram = device.total_memory / (1024 ** 3)  # Convert bytes to GB
-            used_vram = torch.cuda.memory_allocated(i) / (1024 ** 3)  # Convert bytes to GB
-            available_vram = total_vram - used_vram
-            memory_values.append(available_vram)
+            memory_values.append(total_vram)
         return min(memory_values)
     else:
         raise RuntimeError("CUDA is not available.")
