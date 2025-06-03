@@ -2055,6 +2055,12 @@ is_ampere_with_cuda_12_3 = lambda: _check(8)
 is_hopper_with_cuda_12_3 = lambda: _check(9)
 
 
+def is_blackwell():
+    if not is_cuda():
+        return False
+    return torch.cuda.get_device_capability()[0] == 10
+
+
 def get_free_port():
     # try ipv4
     try:

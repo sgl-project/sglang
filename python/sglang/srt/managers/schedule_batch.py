@@ -37,6 +37,7 @@ import hashlib
 import logging
 import threading
 from enum import Enum, auto
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -51,6 +52,7 @@ from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -60,7 +62,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, get_compiler_backend, support_triton
+from sglang.srt.utils import flatten_nested_list, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -770,6 +772,16 @@ class Req:
             prefix = f"Req Time Stats(rid={self.rid}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.get_type().value})"
         logger.info(f"{prefix}: {self.time_stats}")
         self.has_log_time_stats = True
+
+    def set_finish_with_abort(self, error_msg: str):
+        if get_tensor_model_parallel_rank() == 0:
+            logger.error(f"{error_msg}, {self.rid=}")
+        self.multimodal_inputs = None
+        self.grammar = None
+        self.origin_input_ids = [0]  # set it to one token to skip the long prefill
+        self.finished_reason = FINISH_ABORT(
+            error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+        )
 
     def __repr__(self):
         return (
