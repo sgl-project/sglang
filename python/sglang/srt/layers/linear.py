@@ -674,6 +674,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                     not use_bitsandbytes_4bit and not self.use_presharded_weights,
                 )
             else:
+                # bitsandbytes loads the weights of the specific portion
+                # no need to narrow here
                 if not use_bitsandbytes_4bit and not self.use_presharded_weights:
                     loaded_weight = loaded_weight.narrow(
                         output_dim, start_idx, shard_size
