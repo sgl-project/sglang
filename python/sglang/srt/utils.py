@@ -2545,3 +2545,7 @@ def align(x: int, y: int) -> int:
 # COPIED FROM DeepGEMM
 def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
+
+
+def is_shm_available(dtype):
+    return cpu_has_amx_support() and dtype in [torch.bfloat16, torch.float]
