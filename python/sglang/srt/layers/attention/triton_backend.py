@@ -83,6 +83,7 @@ class ForwardMetadata:
     qo_indptr: torch.Tensor
     custom_mask: torch.Tensor
     mask_indptr: torch.Tensor
+    kv_last_page_len: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -191,6 +192,7 @@ class TritonAttnBackend(AttentionBackend):
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
         spec_info = forward_batch.spec_info
+        kv_last_page_len = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None:
@@ -226,10 +228,14 @@ class TritonAttnBackend(AttentionBackend):
 
             self.get_num_kv_splits(num_kv_splits, forward_batch.seq_lens)
 
-            qo_indptr = None
+            qo_indptr = self.qo_indptr
+            # qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
+            qo_indptr[1 : bs + 1] = torch.cumsum(torch.ones(bs), dim=0)
+            qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
             mask_indptr = None
             max_extend_len = None
+            kv_last_page_len = torch.ones(bs, dtype=torch.int)
         elif forward_batch.forward_mode.is_target_verify():
             bs = len(forward_batch.req_pool_indices)
             qo_indptr = torch.arange(
@@ -312,6 +318,7 @@ class TritonAttnBackend(AttentionBackend):
             attn_lse = None
             max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
             num_kv_splits = None
+            kv_last_page_len = torch.ones(bs, dtype=torch.int)
 
         self.forward_metadata = ForwardMetadata(
             attn_logits,
@@ -323,6 +330,7 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr,
             custom_mask,
             mask_indptr,
+            kv_last_page_len,
         )
 
     def init_cuda_graph_state(
@@ -391,9 +399,13 @@ class TritonAttnBackend(AttentionBackend):
             attn_lse = self.cuda_graph_attn_lse
             max_extend_len = None
             num_kv_splits = self.cuda_graph_num_kv_splits
-            qo_indptr = None
+            qo_indptr = self.qo_indptr
+            # qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
+            qo_indptr[1 : bs + 1] = torch.cumsum(torch.ones(bs), dim=0)
+            qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
             mask_indptr = None
+            kv_last_page_len = torch.ones(bs, dtype=torch.int)
         elif forward_mode.is_target_verify():
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -439,6 +451,7 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr,
             custom_mask,
             mask_indptr,
+            kv_last_page_len,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -584,8 +597,10 @@ class TritonAttnBackend(AttentionBackend):
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
             o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            self.forward_metadata.qo_indptr,
             self.forward_metadata.kv_indptr,
             self.forward_metadata.kv_indices,
+            self.forward_metadata.kv_last_page_len,
             self.forward_metadata.attn_logits,
             self.forward_metadata.attn_lse,
             self.forward_metadata.num_kv_splits,

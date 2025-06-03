@@ -24,6 +24,7 @@ import logging
 
 import triton
 import triton.language as tl
+from aiter.mla import mla_decode_fwd
 
 from sglang.srt.utils import is_hip
 
@@ -684,8 +685,10 @@ def decode_attention_fwd(
     k_buffer,
     v_buffer,
     o,
+    qo_indptr,
     kv_indptr,
     kv_indices,
+    kv_last_page_len,
     attn_logits,
     attn_lse,
     num_kv_splits,
@@ -715,6 +718,20 @@ def decode_attention_fwd(
             sm_scale,
             logit_cap,
         )
+    elif _is_hip:
+        mla_decode_fwd(
+            q,
+            k_buffer.view(-1, 1, 1, q.shape[-1]),
+            o,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            1,
+            sm_scale,
+            logit_cap,
+        )
+        k_buffer = k_buffer.reshape(-1, 1, q.shape[-1])
     else:
         # GQA/MQA/MLA
         decode_attention_fwd_grouped(
