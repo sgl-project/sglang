@@ -1205,35 +1205,19 @@ def get_device_sm():
 
 
 def get_nvgpu_memory_capacity():
-    try:
-        # Run nvidia-smi and capture the output
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(f"nvidia-smi error: {result.stderr.strip()}")
-
-        # Parse the output to extract memory values
-        memory_values = [
-            float(mem)
-            for mem in result.stdout.strip().split("\n")
-            if re.match(r"^\d+(\.\d+)?$", mem.strip())
-        ]
-
-        if not memory_values:
-            raise ValueError("No GPU memory values found.")
-
-        # Return the minimum memory value
+    if is_cuda():
+        num_devices = torch.cuda.device_count()
+        memory_values = []
+        
+        for i in range(num_devices):
+            device = torch.cuda.get_device_properties(i)
+            total_vram = device.total_memory / (1024 ** 3)  # Convert bytes to GB
+            used_vram = torch.cuda.memory_allocated(i) / (1024 ** 3)  # Convert bytes to GB
+            available_vram = total_vram - used_vram
+            memory_values.append(available_vram)
         return min(memory_values)
-
-    except FileNotFoundError:
-        raise RuntimeError(
-            "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
-        )
+    else:
+        raise RuntimeError("CUDA is not available.")
 
 
 def get_hpu_memory_capacity():
