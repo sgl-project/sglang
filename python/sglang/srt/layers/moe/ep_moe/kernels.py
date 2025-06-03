@@ -1158,14 +1158,6 @@ def fill_gateup_input_triton_kernel(
                 tl.store(scale_dst_ptr + offset, in_scale, mask=mask)
 
 
-def exp2_upper(num: int) -> int:
-    for i in range(2, 31):
-        value = pow(2, i)
-        if num <= value:
-            return value
-    return num
-
-
 def moe_ep_deepgemm_preprocess(
     topk_ids: torch.Tensor,
     num_experts: int,
@@ -1190,7 +1182,8 @@ def moe_ep_deepgemm_preprocess(
         seg_indptr, masked_m, num_experts, reorder_topk_ids.numel()
     )
 
-    m_max = exp2_upper(hidden_states.size(0))
+    # For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m}) https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/jit_kernels/m_grouped_gemm.py#L165
+    m_max = (hidden_states.size(0) + 255) // 256 * 256
     expected_m = (topk_ids.numel() + num_experts - 1) // num_experts
     gateup_input = torch.empty(
         (int(end_expert_id - start_expert_id + 1), m_max, hidden_states.size(1)),
