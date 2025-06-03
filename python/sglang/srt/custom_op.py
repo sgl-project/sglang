@@ -38,7 +38,7 @@ class CustomOp(nn.Module):
 
     def leave_torch_compile(self):
         # Skip if Op is already exited compile mode.
-        if self.is_torch_compile == False:
+        if not self.is_torch_compile:
             return
 
         self._forward_method = self._origin_forward_method
