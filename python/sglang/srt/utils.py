@@ -2259,6 +2259,19 @@ def cpu_has_amx_support():
     return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
 
 
+class LazyValue:
+    def __init__(self, creator: Callable):
+        self._creator = creator
+        self._value = None
+
+    @property
+    def value(self):
+        if self._creator is not None:
+            self._value = self._creator()
+            self._creator = None
+        return self._value
+
+
 def get_numa_id_for_gpu(gpu_id: int) -> Optional[str]:
     """Get NUMA node ID for a specific GPU using nvidia-smi topo command.
 
