@@ -357,6 +357,10 @@ class AiterAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInfo],
     ):
         if forward_mode.is_decode_or_idle():
+            qo_indptr = None
+            kv_last_page_len = None
+            max_extend_len = None
+
             if spec_info is None:
                 kv_indptr = self.kv_indptr
                 kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
@@ -476,9 +480,19 @@ class AiterAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                )
+                if self.use_mla:
+                    if k_rope is not None:
+                        forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                            layer, cache_loc, k, k_rope
+                        )
+                    else:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v
+                        )
+                else:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    )
 
         if self.use_mla:
             max_extend_len = self.forward_metadata.max_extend_len
@@ -736,6 +750,7 @@ class AiterIndicesUpdaterPrefill:
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices,
                     paged_kernel_lens,
+                    paged_kernel_lens_sum,
                     self.req_to_token,
                 )
             )
@@ -819,6 +834,7 @@ class AiterMlaIndicesUpdaterPrefill:
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices,
                     paged_kernel_lens,
+                    paged_kernel_lens_sum,
                     self.req_to_token,
                 )
             )
