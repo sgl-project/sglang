@@ -1212,7 +1212,7 @@ async def benchmark(
     if "<image>" in test_prompt:
         import re
 
-        image_match = re.search(r"<image>(.*?)</image>(.*)", test_prompt)
+        image_match = re.search(r"<image>(.*?)</image>(.*)", test_prompt, re.DOTALL)
         image_data = image_match.group(1) if image_match else None
         test_prompt = image_match.group(2) if image_match else test_prompt
     else:
@@ -1285,7 +1285,7 @@ async def benchmark(
         if "<image>" in prompt:
             import re
 
-            image_match = re.search(r"<image>(.*?)</image>(.*)", prompt)
+            image_match = re.search(r"<image>(.*?)</image>(.*)", prompt, re.DOTALL)
             image_data = image_match.group(1) if image_match else None
             prompt = image_match.group(2) if image_match else prompt
         else:
