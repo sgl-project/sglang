@@ -744,8 +744,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 return AttnForwardMethod.MLA
 
-        #if self.quant_config.get_name() == 'gguf':
-        #    return AttnForwardMethod.MHA
         if self.attention_backend == "flashinfer":
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
             if (
@@ -881,8 +879,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
                 )
             else:
-                q_c = self.q_a_proj(hidden_states)[0]
-                q = self.q_a_layernorm(q_c)
+                q = self.q_a_proj(hidden_states)[0]
             q = self.q_a_layernorm(q)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
@@ -1079,11 +1076,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                     [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
                 )
+                q = self.q_a_layernorm(q)
             else:
                 q_c = self.q_a_proj(hidden_states)[0]
                 q = self.q_a_layernorm(q_c)
                 latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-            q = self.q_a_layernorm(q)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
             q = self.q_proj(hidden_states)[0].view(
@@ -2176,7 +2173,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         )
                         weight_loader(param, loaded_weight)
 
-        self.post_load_weights(is_nextn=is_nextn)
+        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
