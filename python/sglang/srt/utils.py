@@ -774,8 +774,8 @@ def monkey_patch_vllm_gguf_config():
         return
 
     from sglang.srt.layers.linear import LinearBase
-    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
     def get_quant_method_with_embedding_replaced(
         self, layer: torch.nn.Module, prefix: str

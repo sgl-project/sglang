@@ -21,12 +21,13 @@ import os
 from enum import IntEnum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+import gguf
 import torch
 import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
-import gguf
+from vllm._custom_ops import ggml_dequantize
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -102,7 +103,6 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     log_info_on_rank0,
 )
-from vllm._custom_ops import ggml_dequantize
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -581,7 +581,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
-        self.fuse_qkv_a_proj = self.q_lora_rank is not None and (not quant_config or quant_config.get_name() != 'gguf')
+        self.fuse_qkv_a_proj = self.q_lora_rank is not None and (
+            not quant_config or quant_config.get_name() != "gguf"
+        )
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
 
@@ -594,7 +596,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         # For tensor parallel attention
         if self.q_lora_rank is not None:
-            if self.fuse_qkv_a_proj :
+            if self.fuse_qkv_a_proj:
                 self.fused_qkv_a_proj_with_mqa = ReplicatedLinear(
                     self.hidden_size,
                     self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
@@ -603,11 +605,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                     prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
                 )
             else:
-                self.q_a_proj = ReplicatedLinear(self.hidden_size,
+                self.q_a_proj = ReplicatedLinear(
+                    self.hidden_size,
                     self.q_lora_rank,
                     bias=False,
                     quant_config=quant_config,
-                    prefix=f"{prefix}.q_a_proj"
+                    prefix=f"{prefix}.q_a_proj",
                 )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
@@ -875,8 +878,11 @@ class DeepseekV2AttentionMLA(nn.Module):
     ):
         if self.q_lora_rank is not None:
             if self.fuse_qkv_a_proj:
-                q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
-                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
+                q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[
+                    0
+                ].split(
+                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    dim=-1,
                 )
             else:
                 q = self.q_a_proj(hidden_states)[0]
@@ -931,8 +937,11 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if self.q_lora_rank is not None:
             if self.fuse_qkv_a_proj:
-                q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
-                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
+                q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[
+                    0
+                ].split(
+                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    dim=-1,
                 )
             else:
                 q_c = self.q_a_proj(hidden_states)[0]
@@ -1073,8 +1082,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
         if self.q_lora_rank is not None:
             if self.fuse_qkv_a_proj:
-                q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
-                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
+                q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[
+                    0
+                ].split(
+                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    dim=-1,
                 )
                 q = self.q_a_layernorm(q)
             else:
@@ -1781,11 +1793,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                 else self.model.decoder.self_attn
             )
             if hasattr(self_attn.kv_b_proj, "qweight"):
-                if self.quant_config.get_name() == 'gguf':
+                if self.quant_config.get_name() == "gguf":
                     qweight = self_attn.kv_b_proj.qweight
                     qweight_type = self_attn.kv_b_proj.qweight_type
                     block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type.item()]
-                    shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
+                    shape = (
+                        qweight.shape[0],
+                        qweight.shape[1] // type_size * block_size,
+                    )
                     w = ggml_dequantize(qweight, qweight_type, *shape, model_dtype)
                 else:
                     # AWQ compatible
@@ -2032,7 +2047,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         )
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
-        if self.quant_config.get_name() != 'gguf':
+        if self.quant_config.get_name() != "gguf":
             fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
                 self.config.q_lora_rank is not None
             )

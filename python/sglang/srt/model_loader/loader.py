@@ -1222,14 +1222,18 @@ class GGUFModelLoader(BaseModelLoader):
             # GGUF layer map assumes that we will have a merged expert weights
             # so we need to map them manually
             for idx in range(config.num_hidden_layers):
-                gguf_to_hf_name_map[f"blk.{idx}.exp_probs_b.bias"] = \
-                        f"model.layers.{idx}.mlp.gate.e_score_correction_bias"
-                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = \
-                        f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
-                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = \
-                        f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
-                gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = \
-                        f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
+                gguf_to_hf_name_map[f"blk.{idx}.exp_probs_b.bias"] = (
+                    f"model.layers.{idx}.mlp.gate.e_score_correction_bias"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
+                    f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
+                )
 
         arch = None
         for key, value in gguf.MODEL_ARCH_NAMES.items():
@@ -1241,7 +1245,9 @@ class GGUFModelLoader(BaseModelLoader):
         num_layers = config.num_hidden_layers
         name_map = gguf.get_tensor_name_map(arch, num_layers)
         with torch.device("meta"):
-            dummy_model = AutoModelForCausalLM.from_config(config, trust_remote_code=model_config.trust_remote_code)
+            dummy_model = AutoModelForCausalLM.from_config(
+                config, trust_remote_code=model_config.trust_remote_code
+            )
         state_dict = dummy_model.state_dict()
 
         for hf_name in state_dict:
