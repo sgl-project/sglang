@@ -320,7 +320,7 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
 
     } else {
       TORCH_CHECK(
-          is_neox == false, " Query/Key with 3D [num_tokens, num_heads, head_size] does not suport neox rope yet");
+          is_neox == false, " Query/Key with 3D [num_tokens, num_heads, head_size] does not support neox rope yet");
       // TODO: add neox style support for rope impl with 3D inputs
       rotary_embedding_3D_kernel_impl<scalar_t>(
           query_out.data_ptr<scalar_t>(),
