@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
+import gguf
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -101,6 +102,7 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     log_info_on_rank0,
 )
+from vllm._custom_ops import ggml_dequantize
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -742,8 +744,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 return AttnForwardMethod.MLA
 
-        if self.quant_config.get_name() == 'gguf':
-            return AttnForwardMethod.MHA
+        #if self.quant_config.get_name() == 'gguf':
+        #    return AttnForwardMethod.MHA
         if self.attention_backend == "flashinfer":
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
             if (
@@ -1774,6 +1776,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         if layer_id != self.config.num_hidden_layers:
                             layer_ids.add(layer_id)
 
+        model_dtype = torch.get_default_dtype()
         for layer_id in layer_ids:
             self_attn = (
                 self.model.layers[layer_id].self_attn
@@ -1781,10 +1784,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                 else self.model.decoder.self_attn
             )
             if hasattr(self_attn.kv_b_proj, "qweight"):
-                # AWQ compatible
                 if self.quant_config.get_name() == 'gguf':
-                    w = self_attn.kv_b_proj.qweight
+                    qweight = self_attn.kv_b_proj.qweight
+                    qweight_type = self_attn.kv_b_proj.qweight_type
+                    block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type.item()]
+                    shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
+                    w = ggml_dequantize(qweight, qweight_type, *shape, model_dtype)
                 else:
+                    # AWQ compatible
                     if _is_cuda:
                         w = awq_dequantize(
                             self_attn.kv_b_proj.qweight,
@@ -1806,7 +1813,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             # This may affect the accuracy of fp8 model.
             # Fix deepseek v3 blockwise bmm by using deep_gemm
             use_deep_gemm_bmm = False
-            model_dtype = torch.get_default_dtype()
 
             if w.dtype in (
                 torch.float8_e4m3fn,
