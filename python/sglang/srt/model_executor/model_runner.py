@@ -354,6 +354,8 @@ class ModelRunner:
                 # MLA architecture
                 if is_hopper_with_cuda_12_3():
                     server_args.attention_backend = "fa3"
+                elif _is_hip:
+                    server_args.attention_backend = "aiter"
                 else:
                     server_args.attention_backend = "triton"
             logger.info(
@@ -362,6 +364,7 @@ class ModelRunner:
         elif self.use_mla_backend:
             if server_args.device != "cpu":
                 if server_args.attention_backend in [
+                    "aiter",
                     "flashinfer",
                     "fa3",
                     "triton",

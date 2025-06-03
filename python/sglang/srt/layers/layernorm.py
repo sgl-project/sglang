@@ -20,10 +20,11 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
     from sgl_kernel import (
@@ -33,7 +34,10 @@ if _is_cuda:
         rmsnorm,
     )
 
-if _is_hip:
+if _use_aiter:
+    from aiter import rmsnorm2d_fwd as rms_norm
+    from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
+elif _is_hip:
     from vllm._custom_ops import fused_add_rms_norm, rms_norm
 
 logger = logging.getLogger(__name__)
@@ -54,6 +58,8 @@ class RMSNorm(CustomOp):
             return self.forward_native(*args, **kwargs)
         if _is_cuda:
             return self.forward_cuda(*args, **kwargs)
+        elif _use_aiter:
+            return self.forward_aiter(*args, **kwargs)
         elif _is_hip:
             return self.forward_hip(*args, **kwargs)
         else:
@@ -69,6 +75,25 @@ class RMSNorm(CustomOp):
             return x, residual
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         return out
+
+    def forward_aiter(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None:
+            residual_out = torch.empty_like(x)
+            output = torch.empty_like(x)
+            fused_add_rms_norm(
+                output,
+                x,
+                residual,
+                residual_out,
+                self.weight.data,
+                self.variance_epsilon,
+            )
+            return output, residual_out
+        return rms_norm(x, self.weight.data, self.variance_epsilon)
 
     def forward_hip(
         self,
