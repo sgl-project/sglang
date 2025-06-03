@@ -261,7 +261,9 @@ class EPMoE(torch.nn.Module):
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ):
         assert self.quant_method is not None
-
+        hidden_states_shape = hidden_states.shape
+        hidden_states_dtype = hidden_states.dtype
+        hidden_states_device = hidden_states.device
         topk_weights, topk_ids = select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -296,12 +298,13 @@ class EPMoE(torch.nn.Module):
         num_groups, m, k = gateup_input_fp8[0].size()
         n = self.w13_weight.size(1)
         gateup_output = torch.empty(
-            (num_groups, m, n), device=hidden_states.device, dtype=torch.bfloat16
+            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
 
         m_grouped_gemm_fp8_fp8_bf16_nt_masked(
             gateup_input_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
         )
+        del gateup_input
 
         # Act
         down_input = torch.empty(
@@ -330,6 +333,7 @@ class EPMoE(torch.nn.Module):
             scale_block_size,
             masked_m,
         )
+        del gateup_output
 
         # GroupGemm-1
         n = self.w2_weight.size(1)
@@ -345,8 +349,10 @@ class EPMoE(torch.nn.Module):
         )
 
         # PostReorder
-        output = torch.empty_like(hidden_states)
-        deepgemm_post_reorder_triton_kernel[(hidden_states.size(0),)](
+        output = torch.empty(
+            hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
+        )
+        deepgemm_post_reorder_triton_kernel[(hidden_states_shape[0],)](
             down_output,
             output,
             src2dst,
@@ -355,7 +361,7 @@ class EPMoE(torch.nn.Module):
             self.start_expert_id,
             self.end_expert_id,
             self.top_k,
-            hidden_states.size(1),
+            hidden_states_shape[1],
             m_max,
             BLOCK_SIZE=512,
         )
