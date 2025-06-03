@@ -1262,8 +1262,10 @@ def deepgemm_post_reorder_triton_kernel(
 
     computed = False
     store_ptr = output_ptr + src_idx * hidden_size
+
+    vec = tl.arange(0, BLOCK_SIZE)
     for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
-        offset = start_offset + tl.arange(0, BLOCK_SIZE)
+        offset = start_offset + vec
         mask = offset < hidden_size
 
         sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
@@ -1282,7 +1284,7 @@ def deepgemm_post_reorder_triton_kernel(
 
     if not computed:
         for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
-            offset = start_offset + tl.arange(0, BLOCK_SIZE)
+            offset = start_offset + vec
             mask = offset < hidden_size
             tl.store(
                 store_ptr + offset, tl.zeros([BLOCK_SIZE], dtype=InDtype), mask=mask
