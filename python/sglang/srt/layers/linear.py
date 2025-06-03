@@ -30,12 +30,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.utils import (
-    get_actual_shard_size,
-    narrow_padded_param_and_loaded_weight,
-    reset_param_data_if_needed,
-    set_weight_attrs,
-)
+from sglang.srt.utils import narrow_padded_param_and_loaded_weight, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
