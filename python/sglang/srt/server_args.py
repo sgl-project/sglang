@@ -178,6 +178,7 @@ class ServerArgs:
     enable_eplb: bool = False
     eplb_algorithm: str = "auto"
     eplb_rebalance_num_iterations: int = 1000
+    eplb_rebalance_layers_per_chunk: Optional[int] = None
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "per_pass", "per_token"]
     ] = None
@@ -1347,6 +1348,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.eplb_rebalance_num_iterations,
             help="Number of iterations to automatically trigger a EPLB re-balance.",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-layers-per-chunk",
+            type=int,
+            default=ServerArgs.eplb_rebalance_layers_per_chunk,
+            help="Number of layers to rebalance per forward pass.",
         )
         parser.add_argument(
             "--expert-distribution-recorder-mode",
