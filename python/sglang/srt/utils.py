@@ -2642,3 +2642,34 @@ def reset_param_data_if_needed(param_data, dim, start, length):
 
     param_data.narrow(dim, start, length).zero_()
     return
+
+
+def narrow_padded_param_and_loaded_weight(
+    param_data,
+    loaded_weight,
+    param_data_start,
+    weight_start,
+    dim,
+    shard_size,
+    use_presharded_weights,
+):
+    actual_shard_size = get_actual_shard_size(
+        shard_size, weight_start, loaded_weight.size(dim)
+    )
+
+    if not use_presharded_weights:
+        loaded_weight = loaded_weight.narrow(dim, weight_start, actual_shard_size)
+
+    # [Note] Reset padded weights to zero.
+    # If the actual shard size is less than the shard size, we need to reset
+    # the padded param_data to zero and then copy the loaded_weight into it.
+    reset_param_data_if_needed(
+        param_data,
+        dim,
+        actual_shard_size,
+        shard_size - actual_shard_size,
+    )
+
+    param_data = param_data.narrow(dim, param_data_start, actual_shard_size)
+
+    return param_data, loaded_weight
