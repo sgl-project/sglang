@@ -18,7 +18,7 @@ class CustomOp(nn.Module):
         # among layers and `enter_torch_compile` will be called many times.
         # We should prevent `self._origin_forward_method` from being overridden when
         # it is not the first time `enter_torch_compile` called.
-        if self.is_torch_compile == True:
+        if self.is_torch_compile:
             return
 
         self._origin_forward_method = self._forward_method
