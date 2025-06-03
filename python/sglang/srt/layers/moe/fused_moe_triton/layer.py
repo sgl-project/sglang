@@ -18,7 +18,13 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    get_actual_shard_size,
+    get_bool_env_var,
+    is_hip,
+    reset_param_data_if_needed,
+    set_weight_attrs,
+)
 
 if torch.cuda.is_available():
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
@@ -427,20 +433,40 @@ class FusedMoE(torch.nn.Module):
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         shard_size = expert_data.shape[shard_dim] // 2
+        loaded_weight_shard_dim = loaded_weight.size(shard_dim)
+        start_idx = shard_size * tp_rank
+        actual_shard_size = get_actual_shard_size(
+            shard_size, start_idx, loaded_weight_shard_dim
+        )
+        length = shard_size - actual_shard_size
 
         if not self.use_presharded_weights:
             loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
+                shard_dim, start_idx, actual_shard_size
             )
 
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         if shard_id == "w1":
-            expert_data = expert_data.narrow(shard_dim, 0, shard_size)
+            # See [Note] Reset padded weights to zero.
+            reset_param_data_if_needed(
+                expert_data,
+                shard_dim,
+                actual_shard_size,
+                length,
+            )
+            expert_data = expert_data.narrow(shard_dim, 0, actual_shard_size)
         # w3, up_proj: Load into second logical weight of w13.
         else:
             assert shard_id == "w3"
-            expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+            # See [Note] Reset padded weights to zero.
+            reset_param_data_if_needed(
+                expert_data,
+                shard_dim,
+                shard_size + actual_shard_size,
+                length,
+            )
+            expert_data = expert_data.narrow(shard_dim, shard_size, actual_shard_size)
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
@@ -458,11 +484,21 @@ class FusedMoE(torch.nn.Module):
         shard_size = expert_data.shape[shard_dim]
 
         if not self.use_presharded_weights:
+            loaded_weight_shard_dim = loaded_weight.size(shard_dim)
+            start_idx = shard_size * tp_rank
+            actual_shard_size = get_actual_shard_size(
+                shard_size, start_idx, loaded_weight_shard_dim
+            )
             loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
+                shard_dim, start_idx, actual_shard_size
             )
 
         # w2, down_proj: Load into only logical weight of w2.
+        # See [Note] Reset padded weights to zero.
+        reset_param_data_if_needed(
+            expert_data, shard_dim, actual_shard_size, shard_size - actual_shard_size
+        )
+        expert_data = expert_data.narrow(shard_dim, 0, actual_shard_size)
         expert_data.copy_(loaded_weight)
 
     def _load_single_value(
