@@ -682,10 +682,7 @@ def v1_generate_response(
         elif (not isinstance(request, list)) and request.return_hidden_states:
             hidden_states = ret_item["meta_info"].get("hidden_states", None)
         if hidden_states is not None:
-            hidden_states = hidden_states[1:]  # trim off the prefill
-            hidden_states = (
-                hidden_states[-1] if len(hidden_states) > 0 else []
-            )  # slice out the last token
+           hidden_states = hidden_states[-1] if len(hidden_states) > 1 else []
 
         finish_reason = ret_item["meta_info"]["finish_reason"]
 
