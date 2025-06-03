@@ -12,6 +12,7 @@ class CustomOp(nn.Module):
         self._forward_method = self.dispatch_forward()
 
     def enter_torch_compile(self, num_tokens: int):
+        self._origin_forward_method = self._forward_method
         # NOTE: Temporarily workaround MoE
         if "FusedMoE" in self.__class__.__name__:
             if num_tokens == 1:
@@ -27,7 +28,8 @@ class CustomOp(nn.Module):
         self.is_torch_compile = True
 
     def leave_torch_compile(self):
-        self._forward_method = self.forward_cuda
+        self._forward_method = self._origin_forward_method
+        self._origin_forward_method = None
         self.is_torch_compile = False
 
     # Please do not override this method, because `self._forward_method` can change when in torch compile mode
