@@ -2631,6 +2631,9 @@ def update_config(
 
 
 def get_actual_shard_size(shard_size, weight_start, weight_end):
+    if weight_end < weight_start:
+        return 0
+
     return min(shard_size, weight_end - weight_start)
 
 
@@ -2658,7 +2661,13 @@ def narrow_padded_param_and_loaded_weight(
     )
 
     if narrow_weight:
-        loaded_weight = loaded_weight.narrow(dim, weight_start, actual_shard_size)
+        if actual_shard_size > 0:
+            loaded_weight = loaded_weight.narrow(dim, weight_start, actual_shard_size)
+        else:
+            # No real data to load; create a dummy tensor filled with zeros
+            loaded_weight = torch.zeros_like(
+                param_data.narrow(dim, param_data_start, actual_shard_size)
+            )
 
     # [Note] Reset padded weights to zero.
     # If the actual shard size is less than the shard size, we need to reset
