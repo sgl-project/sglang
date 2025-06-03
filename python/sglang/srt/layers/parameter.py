@@ -94,7 +94,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         if not use_presharded_weights:
             shard_size = self.data.shape[self.output_dim]
 
-            from sglang.srt.cpu_utils import (
+            from sglang.srt.utils import (
                 get_actual_shard_size,
                 reset_param_data_if_needed,
             )
@@ -137,10 +137,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
 
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
 
-        from sglang.srt.cpu_utils import (
-            get_actual_shard_size,
-            reset_param_data_if_needed,
-        )
+        from sglang.srt.utils import get_actual_shard_size, reset_param_data_if_needed
 
         actual_shard_size = get_actual_shard_size(
             shard_size, tp_rank * shard_size, loaded_weight.size(self.output_dim)
@@ -220,7 +217,7 @@ class RowvLLMParameter(BasevLLMParameter):
         if not use_presharded_weights:
             shard_size = self.data.shape[self.input_dim]
 
-            from sglang.srt.cpu_utils import (
+            from sglang.srt.utils import (
                 get_actual_shard_size,
                 reset_param_data_if_needed,
             )
