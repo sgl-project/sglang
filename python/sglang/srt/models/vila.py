@@ -1,20 +1,17 @@
 import logging
-from typing import Dict, Iterable, List, Optional, Tuple, cast
+from typing import Any, Dict, Iterable, List, Optional, Tuple, cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from transformers.configuration_utils import PretrainedConfig
-from transformers.generation.utils import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPooling
-from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
-from transformers.models.qwen2.modeling_qwen2 import (
-    Qwen2ForCausalLM as Qwen2ForCausalLMHF,
-)
 from transformers.models.siglip import SiglipVisionConfig, SiglipVisionModel
 
 import sglang.srt.managers.mm_utils as mm_utils
+import sglang.srt.model_loader.weight_utils as weight_utils
 import sglang.srt.utils as utils
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -31,6 +28,14 @@ logger = logging.getLogger(__name__)
 
 
 class VILAConfig(PretrainedConfig):
+    # Class attributes.
+    model_type: str = "vila"
+    sub_configs: Dict[str, PretrainedConfig] = {
+        "text_config": Qwen2Config(),
+        "vision_config": SiglipVisionConfig(),
+    }
+    _auto_class: Optional[str] = "AutoConfig"
+
     # Configuration for sub-modules.
     text_config: Qwen2Config = Qwen2Config()
     vision_config: SiglipVisionConfig = SiglipVisionConfig()
@@ -38,12 +43,42 @@ class VILAConfig(PretrainedConfig):
     # Model configuration.
     hidden_size: int
     image_token_id: int
-    image_end_token_id: int
     mm_hidden_size: int
     mm_projector_type: str
     mm_vision_select_feature: str
     mm_vision_select_layer: int
     video_token_id: int
+
+    def __init__(
+        self,
+        text_config: Optional[Dict[str, Any]] = None,
+        vision_config: Optional[Dict[str, Any]] = None,
+        *,
+        hidden_size: int = 1536,
+        image_token_id: int = 151649,
+        mm_hidden_size: int = 1152,
+        mm_projector_type: str = "mlp_downsample_3x3_fix",
+        mm_vision_select_feature: str = "cls_patch",
+        mm_vision_select_layer: int = -2,
+        video_token_id: int = 151650,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        self.text_config = Qwen2Config(**text_config) if text_config else Qwen2Config()
+        self.vision_config = (
+            SiglipVisionConfig(**vision_config)
+            if vision_config
+            else SiglipVisionConfig()
+        )
+
+        self.hidden_size = hidden_size
+        self.image_token_id = image_token_id
+        self.mm_hidden_size = mm_hidden_size
+        self.mm_projector_type = mm_projector_type
+        self.mm_vision_select_feature = mm_vision_select_feature
+        self.mm_vision_select_layer = mm_vision_select_layer
+        self.video_token_id = video_token_id
 
 
 ##### END COPY configuration.py #####
@@ -51,72 +86,38 @@ class VILAConfig(PretrainedConfig):
 ##### BEGIN COPY modeling_vila.py #####
 
 
-class DownSampleBlock(nn.Module):
-    @staticmethod
-    def flat_square(x: Tensor) -> Tensor:
-        n, w, h, c = x.size()
-        if w % 2 == 1:
-            x = torch.concat(
-                [x, torch.zeros((n, 1, h, c), device=x.device, dtype=x.dtype)], dim=1
-            ).contiguous()
-            n, w, h, c = x.size()
-        if h % 2 == 1:
-            x = torch.concat(
-                [x, torch.zeros((n, w, 1, c), device=x.device, dtype=x.dtype)], dim=2
-            ).contiguous()
-            n, w, h, c = x.size()
-        x = x.contiguous()
-        x = x.view(n, w, int(h / 2), int(c * 2))
-        x = x.permute(0, 2, 1, 3).contiguous()
-        x = x.view(n, int(h / 2), int(w / 2), int(c * 4))
-        x = x.permute(0, 2, 1, 3).contiguous()
-        return x
-
-    def forward(self, x: Tensor) -> Tensor:
-        vit_embeds = x
-        h = w = int(vit_embeds.shape[1] ** 0.5)
-        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
-        vit_embeds = self.flat_square(vit_embeds)
-        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
-        return vit_embeds
-
-
 class DownSample3x3BlockFix(nn.Module):
-    @staticmethod
-    def flat_square_3x3(x: Tensor) -> Tensor:
-        n, w, h, c = x.size()
-        if w % 3 != 0:
-            x = torch.concat(
-                [
-                    x,
-                    torch.zeros((n, 3 - (w % 3), h, c), device=x.device, dtype=x.dtype),
-                ],
-                dim=1,
-            ).contiguous()
-            n, w, h, c = x.size()
-        x = x.contiguous()
-        if h % 3 != 0:
-            x = torch.concat(
-                [
-                    x,
-                    torch.zeros((n, w, 3 - (h % 3), c), device=x.device, dtype=x.dtype),
-                ],
-                dim=2,
-            ).contiguous()
-            n, w, h, c = x.size()
-        x = x.view(n, w, int(h / 3), int(c * 3))
-        x = x.permute(0, 2, 1, 3).contiguous()
-        x = x.view(n, int(h / 3), int(w / 3), int(c * 9))
-        x = x.permute(0, 2, 1, 3).contiguous()
-        return x
-
     def forward(self, x: Tensor) -> Tensor:
-        vit_embeds = x
-        h = w = int(vit_embeds.shape[1] ** 0.5)
-        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
-        vit_embeds = self.flat_square_3x3(vit_embeds)
-        vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
-        return vit_embeds
+        """
+        Args:
+            x: The input tensor of shape (batch_size, sequence_length, mm_hidden_size).
+
+        Returns:
+            The output tensor of shape (batch_size, image_pad_len, mm_hidden_size * 9).
+        """
+
+        batch_size, sequence_length, hidden_size = x.shape
+
+        feat_size = int(sequence_length**0.5)
+        if feat_size**2 != sequence_length:
+            raise ValueError(
+                f"Cannot take square root: sequence_length {sequence_length} is not a perfect square"
+            )
+
+        features = x.reshape(batch_size, feat_size, feat_size, hidden_size)
+
+        pad_after = (3 - feat_size % 3) % 3
+        if pad_after > 0:
+            features = F.pad(features, (0, 0, 0, pad_after, 0, pad_after))
+            feat_size = feat_size + pad_after
+
+        features = features.reshape(
+            batch_size, feat_size // 3, 3, feat_size // 3, 3, hidden_size
+        )
+        features = features.permute(0, 1, 3, 2, 4, 5).contiguous()
+        features = features.reshape(batch_size, -1, 9 * hidden_size)
+
+        return features
 
 
 class MultimodalProjector(nn.Module):
@@ -131,18 +132,6 @@ class MultimodalProjector(nn.Module):
         super().__init__(*args, **kwargs)
 
         match config.mm_projector_type:
-            case "linear":
-                self.layers = nn.Sequential(
-                    nn.Linear(config.vision_config.hidden_size, config.hidden_size),
-                )
-            case "mlp_downsample":
-                self.layers = nn.Sequential(
-                    DownSampleBlock(),
-                    nn.LayerNorm(config.mm_hidden_size * 4),
-                    nn.Linear(config.mm_hidden_size * 4, config.hidden_size),
-                    nn.GELU(),
-                    nn.Linear(config.hidden_size, config.hidden_size),
-                )
             case "mlp_downsample_3x3_fix":
                 self.layers = nn.Sequential(
                     DownSample3x3BlockFix(),
@@ -159,10 +148,10 @@ class MultimodalProjector(nn.Module):
                 )
             case _:
                 raise NotImplementedError(
-                    f"mm_projector_type={config.mm_projector_type} not implemented."
+                    f"Unsupported mm_projector_type: {config.mm_projector_type}"
                 )
 
-        self.layers.to(dtype=config.torch_dtype)
+        self.layers.type(config.torch_dtype)
 
     @property
     def device(self) -> torch.device:
@@ -173,18 +162,18 @@ class MultimodalProjector(nn.Module):
         return next(self.parameters()).dtype
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.layers(x)
+        """
+        Args:
+            x: The input tensor of shape (batch_size, sequence_length, mm_hidden_size).
+
+        Returns:
+            The output tensor of shape (batch_size, image_pad_len, hidden_size).
+        """
+
+        return self.layers(x.to(device=self.device, dtype=self.dtype))
 
 
 ##### END COPY modeling_vila.py #####
-
-
-class VILAForConditionalGenerationHF(PreTrainedModel, GenerationMixin):
-    config: VILAConfig
-
-    llm: Qwen2ForCausalLMHF
-    mm_projector: MultimodalProjector
-    vision_tower: SiglipVisionModel
 
 
 class VILAForConditionalGeneration(nn.Module):
@@ -197,8 +186,6 @@ class VILAForConditionalGeneration(nn.Module):
     llm: Qwen2ForCausalLM
     mm_projector: MultimodalProjector
     vision_tower: SiglipVisionModel
-
-    image_end_token_embedding: Optional[Tensor] = None
 
     def __init__(
         self,
@@ -245,17 +232,17 @@ class VILAForConditionalGeneration(nn.Module):
         return cast(LogitsProcessorOutput, output)
 
     def load_weights(self, weights: Iterable[Tuple[str, Tensor]]) -> None:
-        llm_state_dict: Dict[str, Tensor] = {}
-        other_state_dict: Dict[str, Tensor] = {}
+        params_dict = dict(self.named_parameters())
 
-        for name, param in weights:
+        for name, loaded_weight in weights:
             if name.startswith("llm."):
-                llm_state_dict[name[len("llm.") :]] = param
+                self.llm.load_weights([(name[len("llm.") :], loaded_weight)])
             else:
-                other_state_dict[name] = param
-
-        self.load_state_dict(other_state_dict, strict=False)
-        self.llm.load_weights(llm_state_dict.items())
+                param = params_dict[name]
+                weight_loader = getattr(
+                    param, "weight_loader", weight_utils.default_weight_loader
+                )
+                weight_loader(param, loaded_weight)
 
     def pad_input_ids(
         self,
@@ -269,69 +256,52 @@ class VILAForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, image_inputs)
 
     def _embed_image_data(self, mm_input: List[MultimodalDataItem]) -> Tensor:
-        pixel_values = torch.cat([mm_item.pixel_values for mm_item in mm_input], dim=0)
+        pixel_values = cast(Tensor, mm_input[0].pixel_values)
 
-        ##### BEGIN COPY AND MODIFY modeling_vila.py #####
+        ##### BEGIN COPY modeling_vila.py #####
 
-        image_features: BaseModelOutputWithPooling = self.vision_tower.__call__(
+        vision_tower_output: BaseModelOutputWithPooling = self.vision_tower.__call__(
             pixel_values.to(
-                device=self.vision_tower.device,
-                dtype=self.vision_tower.dtype,
+                device=self.vision_tower.device, dtype=self.vision_tower.dtype
             ),
             output_hidden_states=True,
         )
-        assert image_features.hidden_states is not None
 
-        # Select image feature.
-        selected_layer_output = image_features.hidden_states[
-            self.config.mm_vision_select_layer
-        ]
-        match self.config.mm_vision_select_feature:
-            case "cls_patch":
-                selected_feature = selected_layer_output
-            case _:
-                raise NotImplementedError(
-                    f"mm_vision_select_feature={self.config.mm_vision_select_feature} not implemented."
-                )
-
-        # TODO: Support dynamic_s2.
+        mm_projector_input = self._vision_tower_output_to_mm_projector_input(
+            vision_tower_output
+        )
 
         image_embedding: Tensor = self.mm_projector.__call__(
-            selected_feature.to(
-                device=self.mm_projector.device,
-                dtype=self.mm_projector.dtype,
+            mm_projector_input.to(
+                device=self.mm_projector.device, dtype=self.mm_projector.dtype
             )
         )
 
-        ##### END COPY AND MODIFY modeling_vila.py #####
-
-        # Append the image end token to every image embedding.
-        if self.image_end_token_embedding is None:
-            image_end_token_embedding: (
-                Tensor
-            ) = self.llm.get_input_embeddings().__call__(
-                torch.tensor(
-                    self.config.image_end_token_id,
-                    device=next(self.llm.parameters()).device,
-                    dtype=torch.long,
-                ).view(1, -1)
-            )  # Shape: (1, 1, dim_feature)
-            self.image_end_token_embedding = image_end_token_embedding
-        else:
-            image_end_token_embedding = self.image_end_token_embedding
-
-        image_end_token_embedding = image_end_token_embedding.expand(
-            image_embedding.shape[0], 1, -1
-        )  # Shape: (n_images, 1, dim_feature)
-        image_embedding = torch.concat(
-            [
-                image_embedding.to(device=image_end_token_embedding.device),
-                image_end_token_embedding,
-            ],
-            dim=1,
-        )
+        ##### END COPY modeling_vila.py #####
 
         return image_embedding
+
+    ##### BEGIN COPY modeling_vila.py #####
+
+    def _vision_tower_output_to_mm_projector_input(
+        self,
+        vision_tower_output: BaseModelOutputWithPooling,
+    ) -> Tensor:
+        assert vision_tower_output.hidden_states is not None
+
+        selected_layer_hidden_states = vision_tower_output.hidden_states[
+            self.config.mm_vision_select_layer
+        ]
+
+        match self.config.mm_vision_select_feature:
+            case "cls_patch":
+                return selected_layer_hidden_states
+            case _:
+                raise NotImplementedError(
+                    f"Unsupported mm_vision_select_feature: {self.config.mm_vision_select_feature}"
+                )
+
+    ##### END COPY modeling_vila.py #####
 
 
 EntryClass = [VILAForConditionalGeneration]
