@@ -99,8 +99,10 @@ class EAGLEWorker(TpModelWorker):
                     "Speculative token map specified, but EAGLE3 models already have this. Ignoring the specified token map."
                 )
             self.hot_token_id = None
+            logger.info(f"EAGLE3 model - hot_token_id not used")
         elif server_args.speculative_token_map is not None:
             self.hot_token_id = load_token_map(server_args.speculative_token_map)
+            logger.info(f"Loaded hot_token_id (first 100): {self.hot_token_id[:100].tolist()}")
             server_args.json_model_override_args = (
                 f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
             )
@@ -134,8 +136,24 @@ class EAGLEWorker(TpModelWorker):
         else:
             if self.hot_token_id is not None:
                 head = head.clone()
-                self.hot_token_id = self.hot_token_id.to(head.device)
-                head.data = head.data[self.hot_token_id]
+                # Handle tensor parallelism: gather full lm_head before indexing
+                tp_world_size = get_tensor_model_parallel_world_size()
+                if tp_world_size > 1:
+                    # Gather the full lm_head from all tensor parallel ranks
+                    full_head = tensor_model_parallel_all_gather(head.data, dim=0)
+                    # Index with hot_token_id to get the subset we need
+                    selected_head = full_head[self.hot_token_id]
+                    # Re-shard the selected head for the draft model
+                    # Since the draft model expects the same sharding as the original head,
+                    # we need to split the selected tokens across ranks
+                    vocab_size_per_rank = selected_head.shape[0] // tp_world_size
+                    tp_rank = get_tensor_model_parallel_rank()
+                    start_idx = tp_rank * vocab_size_per_rank
+                    end_idx = (tp_rank + 1) * vocab_size_per_rank if tp_rank < tp_world_size - 1 else selected_head.shape[0]
+                    head.data = selected_head[start_idx:end_idx].contiguous()
+                else:
+                    # No tensor parallelism, direct indexing works
+                    head.data = head.data[self.hot_token_id]
 
             # Share the embedding and lm_head
             self.draft_model_runner.model.set_embed_and_head(embed, head)
