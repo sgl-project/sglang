@@ -1088,7 +1088,7 @@ def tma_align_input_scale(input_scale: torch.Tensor):
 
 
 @triton.jit
-def compute_masked_m_triton_kernel(seg_indptr, masked_m, num_experts, N):
+def compute_masked_m_triton_kernel(seg_indptr, masked_m):
     expert_id = tl.program_id(0)
     start = tl.load(seg_indptr + expert_id)
     end = tl.load(seg_indptr + expert_id + 1)
@@ -1178,9 +1178,7 @@ def moe_ep_deepgemm_preprocess(
     )
 
     grid = lambda meta: (triton.cdiv(topk_ids.numel(), meta["BLOCK_SIZE"]),)
-    compute_masked_m_triton_kernel[(num_experts,)](
-        seg_indptr, masked_m, num_experts, reorder_topk_ids.numel()
-    )
+    compute_masked_m_triton_kernel[(num_experts,)](seg_indptr, masked_m)
 
     # For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m}) https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/jit_kernels/m_grouped_gemm.py#L165
     m_max = (hidden_states.size(0) + 255) // 256 * 256
