@@ -1383,7 +1383,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         page_size = self.token_to_kv_pool_allocator.page_size
         if page_size == 1:
             return len(self.reqs)
-        return sum(1 for req in self.reqs if req.seqlen % page_size == 0)
+        # In the decoding phase, the length of a request's KV cache should be
+        # the total length of the request minus 1
+        return sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
 
     def check_decode_mem(self, buf_multiplier=1):
         tokens_required = (
