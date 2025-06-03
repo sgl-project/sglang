@@ -16,7 +16,7 @@ class CustomOp(nn.Module):
         # Skip if Op is already entered compile mode.
         # NOTE(alcanderian): Some Ops(for example RotaryEmbedding) will be reused
         # among layers and `enter_torch_compile` will be called many times.
-        # We should prevent `self._origin_forward_method` from being overrided when
+        # We should prevent `self._origin_forward_method` from being overridden when
         # it is not the first time `enter_torch_compile` called.
         if self.is_torch_compile == True:
             return
