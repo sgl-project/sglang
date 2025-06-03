@@ -1199,16 +1199,16 @@ def moe_ep_deepgemm_preprocess(
         BLOCK_SIZE=256,
     )
 
-    if block_shape is not None:
-        assert len(block_shape) == 2
-        block_n, block_k = block_shape[0], block_shape[1]
-        hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+    assert block_shape is not None, "block_shape is not None"
+    assert len(block_shape) == 2
+    block_n, block_k = block_shape[0], block_shape[1]
+    hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
 
-        gateup_input_scale = torch.empty(
-            (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
-            device=hidden_states.device,
-            dtype=scale.dtype,
-        )
+    gateup_input_scale = torch.empty(
+        (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
+        device=hidden_states.device,
+        dtype=scale.dtype,
+    )
 
     fill_gateup_input_triton_kernel[(hidden_states.shape[0],)](
         hidden_states,
@@ -1276,7 +1276,7 @@ def deepgemm_post_reorder_triton_kernel(
                 sum_vec += in_data * weigh_scale
         tl.store(store_ptr + offset, sum_vec, mask=mask)
 
-    if computed == False:
+    if not computed:
         for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
             offset = start_offset + tl.arange(0, BLOCK_SIZE)
             mask = offset < hidden_size
