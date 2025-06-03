@@ -223,5 +223,21 @@ class Llama4ForConditionalGeneration(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
+    def set_eagle3_layers_to_capture(self):  
+        if hasattr(self.language_model, 'set_eagle3_layers_to_capture'):  
+            self.language_model.set_eagle3_layers_to_capture()
+            
+    def get_embed_and_head(self):
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed, head):
+        return self.language_model.set_embed_and_head(embed, head)
+
+    def get_embed(self):
+        return self.language_model.get_embed()
+
+    def set_embed(self, embed):
+        return self.language_model.set_embed(embed)
+
 
 EntryClass = Llama4ForConditionalGeneration

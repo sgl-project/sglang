@@ -35,7 +35,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.models.llama import LlamaAttention, LlamaDecoderLayer, LlamaForCausalLM
+from sglang.srt.models.llama import LlamaAttention, LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -57,6 +57,14 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
+        )
+
+        self.mlp = LlamaMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
         )
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -195,6 +203,5 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
     def get_hot_token_id(self):
         return self.hot_token_id
-
 
 EntryClass = [LlamaForCausalLMEagle3]
