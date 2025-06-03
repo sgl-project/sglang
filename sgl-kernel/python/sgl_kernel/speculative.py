@@ -118,5 +118,22 @@ def process_accept_index_evict_mask_fused(
         evict_mask,
         filtered_accept_index,
         output_size,
-        get_cuda_stream(),
+    )
+
+
+def process_out_cache_loc_with_masks_and_indices(
+    out_cache_loc: torch.Tensor,  # [total_size] - input
+    evict_mask: torch.Tensor,  # [total_size] - input
+    accept_index: torch.Tensor,  # [num_accept] - input
+    evicted_cache_loc: torch.Tensor,  # [num_evicted] - output
+    accepted_cache_loc: torch.Tensor,  # [num_accept] - output
+    num_evicted: torch.Tensor,  # [1] - output
+) -> None:
+    torch.ops.sgl_kernel.process_out_cache_loc_with_masks_and_indices.default(
+        out_cache_loc,
+        evict_mask,
+        accept_index,
+        evicted_cache_loc,
+        accepted_cache_loc,
+        num_evicted,
     )

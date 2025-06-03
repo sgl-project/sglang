@@ -372,15 +372,14 @@ void process_accept_index_evict_mask_fused(
     at::Tensor verified_id,            // [output_size] - output
     at::Tensor evict_mask,             // [total_draft_tokens] - output
     at::Tensor filtered_accept_index,  // [output_size] - output
-    at::Tensor output_size,            // [1] - output
-    int64_t cuda_stream = 0) {
+    at::Tensor output_size) {          // [1] - output
   uint32_t batch_size = accept_index.size(0);
   uint32_t spec_steps_plus_one = accept_index.size(1);
   uint32_t total_draft_tokens = predict.size(0);
 
   CHECK_EQ(batch_size, accept_length.size(0));
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   size_t shared_mem_size = spec_steps_plus_one * sizeof(int) + sizeof(uint32_t);
 
@@ -398,4 +397,88 @@ void process_accept_index_evict_mask_fused(
       batch_size,
       spec_steps_plus_one,
       total_draft_tokens);
+}
+
+template <typename T>
+__global__ void ProcessOutCacheLocKernel(
+    T* out_cache_loc,       // [total_size] - input
+    bool* evict_mask,       // [total_size] - input
+    int32_t* accept_index,  // [num_accept] - input
+    T* evicted_cache_loc,   // [num_evicted] - output
+    T* accepted_cache_loc,  // [num_accept] - output
+    int32_t* num_evicted,   // [1] - output
+    uint32_t total_size,
+    uint32_t num_accept) {
+  uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (idx < total_size) {
+    if (evict_mask[idx]) {
+      uint32_t evicted_idx = 0;
+      for (uint32_t i = 0; i < idx; ++i) {
+        if (evict_mask[i]) {
+          evicted_idx++;
+        }
+      }
+      evicted_cache_loc[evicted_idx] = out_cache_loc[idx];
+    }
+  }
+
+  if (idx < num_accept) {
+    int32_t index = accept_index[idx];
+    if (index >= 0 && index < total_size) {
+      accepted_cache_loc[idx] = out_cache_loc[index];
+    }
+  }
+
+  if (idx == 0) {
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < total_size; ++i) {
+      if (evict_mask[i]) {
+        count++;
+      }
+    }
+    *num_evicted = count;
+  }
+}
+
+void process_out_cache_loc_with_masks_and_indices(
+    at::Tensor out_cache_loc,       // [total_size] - input
+    at::Tensor evict_mask,          // [total_size] - input
+    at::Tensor accept_index,        // [num_accept] - input
+    at::Tensor evicted_cache_loc,   // [num_evicted] - output
+    at::Tensor accepted_cache_loc,  // [num_accept] - output
+    at::Tensor num_evicted) {       // [1] - output
+  uint32_t total_size = out_cache_loc.size(0);
+  uint32_t num_accept = accept_index.size(0);
+
+  CHECK_EQ(total_size, evict_mask.size(0));
+
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  dim3 block(256);
+  dim3 grid((max(total_size, num_accept) + block.x - 1) / block.x);
+
+  if (out_cache_loc.scalar_type() == at::kInt) {
+    ProcessOutCacheLocKernel<int><<<grid, block, 0, stream>>>(
+        static_cast<int*>(out_cache_loc.data_ptr()),
+        static_cast<bool*>(evict_mask.data_ptr()),
+        static_cast<int32_t*>(accept_index.data_ptr()),
+        static_cast<int*>(evicted_cache_loc.data_ptr()),
+        static_cast<int*>(accepted_cache_loc.data_ptr()),
+        static_cast<int32_t*>(num_evicted.data_ptr()),
+        total_size,
+        num_accept);
+  } else if (out_cache_loc.scalar_type() == at::kLong) {
+    ProcessOutCacheLocKernel<int64_t><<<grid, block, 0, stream>>>(
+        static_cast<int64_t*>(out_cache_loc.data_ptr()),
+        static_cast<bool*>(evict_mask.data_ptr()),
+        static_cast<int32_t*>(accept_index.data_ptr()),
+        static_cast<int64_t*>(evicted_cache_loc.data_ptr()),
+        static_cast<int64_t*>(accepted_cache_loc.data_ptr()),
+        static_cast<int32_t*>(num_evicted.data_ptr()),
+        total_size,
+        num_accept);
+  } else {
+    throw std::runtime_error("Unsupported data type for out_cache_loc");
+  }
 }
