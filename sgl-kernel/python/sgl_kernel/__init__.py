@@ -38,14 +38,18 @@ from sgl_kernel.gemm import (
     int8_scaled_mm,
     qserve_w4a8_per_chn_gemm,
     qserve_w4a8_per_group_gemm,
+    scaled_fp4_experts_quant,
     scaled_fp4_quant,
     sgl_per_tensor_quant_fp8,
     sgl_per_token_group_quant_fp8,
     sgl_per_token_group_quant_int8,
     sgl_per_token_quant_fp8,
+    shuffle_rows,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.moe import (
+    cutlass_fp4_group_mm,
+    ep_moe_pre_reorder,
     fp8_blockwise_scaled_grouped_mm,
     moe_align_block_size,
     moe_fused_gate,

@@ -848,7 +848,8 @@ class ProfileReqInput:
     # If it is set, profiling is automatically stopped after this step, and
     # the caller doesn't need to run stop_profile.
     num_steps: Optional[int] = None
-    activities: Optional[List[Literal["CPU", "GPU", "MEM", "CUDA_PROFILER"]]] = None
+    activities: Optional[List[str]] = None
+    profile_by_stage: bool = False
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
 
@@ -875,6 +876,7 @@ class ProfileReq:
     output_dir: Optional[str] = None
     num_steps: Optional[int] = None
     activities: Optional[List[str]] = None
+    profile_by_stage: bool = False
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None
