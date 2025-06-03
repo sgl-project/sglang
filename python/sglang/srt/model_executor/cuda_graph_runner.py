@@ -24,12 +24,10 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 import torch
 import tqdm
 
-from sglang.srt import two_batch_overlap
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import (
@@ -61,18 +59,9 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
         if isinstance(sub, CustomOp):
             if reverse:
-                sub._forward_method = sub.forward_cuda
-                setattr(sub, "is_torch_compile", False)
+                sub.leave_torch_compile()
             else:
-                # NOTE: Temporarily workaround MoE
-                if "FusedMoE" in sub.__class__.__name__:
-                    if num_tokens == 1:
-                        # The performance of torch.compile on this layer is not always good when bs > 1,
-                        # so we decide to only use torch.compile when bs =1
-                        sub._forward_method = fused_moe_forward_native
-                else:
-                    sub._forward_method = sub.forward_native
-                setattr(sub, "is_torch_compile", True)
+                sub.enter_torch_compile(num_tokens=num_tokens)
         if isinstance(sub, torch.nn.Module):
             _to_torch(sub, reverse, num_tokens)
 
@@ -133,28 +122,27 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     if capture_bs is None:
         if server_args.speculative_algorithm is None:
             if server_args.disable_cuda_graph_padding:
-                capture_bs = list(range(1, 33)) + list(range(40, 161, 16))
+                capture_bs = list(range(1, 33)) + list(range(48, 161, 16))
             else:
                 capture_bs = [1, 2, 4, 8] + list(range(16, 161, 8))
         else:
             # Since speculative decoding requires more cuda graph memory, we
             # capture less.
             capture_bs = (
-                list(range(1, 9)) + list(range(10, 33, 2)) + list(range(40, 161, 16))
+                list(range(1, 9))
+                + list(range(10, 33, 2))
+                + list(range(40, 64, 8))
+                + list(range(80, 161, 16))
             )
 
         gpu_mem = get_device_memory_capacity()
         if gpu_mem is not None and gpu_mem > 96 * 1024:
             capture_bs += list(range(160, 257, 8))
-        if gpu_mem is not None and gpu_mem > 180 * 1000:
-            capture_bs += list(range(256, 528, 16))
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
-        # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
+        # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.
-        capture_bs += [model_runner.req_to_token_pool.size - 1] + [
-            model_runner.req_to_token_pool.size
-        ]
+        capture_bs += [model_runner.req_to_token_pool.size]
 
     if server_args.enable_two_batch_overlap:
         capture_bs = [bs for bs in capture_bs if bs >= 2]
@@ -167,7 +155,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
             )
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
-    assert len(capture_bs) > 0 and capture_bs[0] > 0
+    assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
         if server_args.enable_torch_compile
