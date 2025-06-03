@@ -1101,7 +1101,7 @@ def deepgemm_compute_src2dst_triton_kernel(
     reorder_ids,
     seg_indptr,
     src2dst,
-    max_m,
+    m_max,
     num_toks,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -1112,7 +1112,7 @@ def deepgemm_compute_src2dst_triton_kernel(
     expert_id = tl.load(topk_ids + src_id, mask=(src_id < num_toks))
     expert_dst_start = tl.load(seg_indptr + expert_id)
     expert_dst_offset = dst_id - expert_dst_start
-    dst_id = expert_id * max_m + expert_dst_offset
+    dst_id = expert_id * m_max + expert_dst_offset
     tl.store(src2dst + src_id, dst_id, mask=mask)
 
 
@@ -1133,7 +1133,8 @@ def fill_gateup_input_triton_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
 
-    src_idx = tl.program_id(0)
+    src_idx_int32 = tl.program_id(0)
+    src_idx = src_idx_int32.to(tl.int64)
     src2dst_ptr = src2dst_ptr + src_idx * topk
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
     src_ptr = input_ptr + src_idx * hidden_size
@@ -1142,7 +1143,8 @@ def fill_gateup_input_triton_kernel(
     for idx in range(topk):
         expert_id = tl.load(topk_ids_ptr + idx)
         if expert_id >= start_expert_id and expert_id <= end_expert_id:
-            dst_idx = tl.load(src2dst_ptr + idx)
+            dst_idx_int32 = tl.load(src2dst_ptr + idx)
+            dst_idx = dst_idx_int32.to(tl.int64)
             dst_idx = dst_idx - start_expert_id * m_max
             dst_ptr = gateup_input_ptr + dst_idx * hidden_size
             for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
@@ -1252,7 +1254,8 @@ def deepgemm_post_reorder_triton_kernel(
 ):
     InDtype = down_output_ptr.dtype.element_ty
 
-    src_idx = tl.program_id(0)
+    src_idx_int32 = tl.program_id(0)
+    src_idx = src_idx_int32.to(tl.int64)
     src2dst_ptr = src2dst_ptr + src_idx * topk
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
     topk_weights_ptr = topk_weights_ptr + src_idx * topk
@@ -1268,7 +1271,8 @@ def deepgemm_post_reorder_triton_kernel(
             expert_id = tl.load(topk_ids_ptr + idx)
             if expert_id >= start_expert_id and expert_id <= end_expert_id:
                 computed = True
-                dst_idx = tl.load(src2dst_ptr + idx)
+                dst_idx_int32 = tl.load(src2dst_ptr + idx)
+                dst_idx = dst_idx_int32.to(tl.int64)
                 dst_idx = dst_idx - start_expert_id * max_m
                 weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
                 load_ptr = down_output_ptr + dst_idx * hidden_size
