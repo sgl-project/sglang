@@ -1366,6 +1366,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
+        self.speculative_algorithm = global_server_args_dict["speculative_algorithm"]
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         self.self_attn = DeepseekV2AttentionMLA(
@@ -1467,7 +1468,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
-        hidden_states = hidden_states.clone()
+
+        if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
+            hidden_states = hidden_states.clone()
 
         return hidden_states, residual
 
@@ -1691,11 +1694,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                 and self.config.architectures[0] == architecture
                 and self.config.n_routed_experts == 256
                 and (not global_server_args_dict["enable_deepep_moe"])
+                and (not global_server_args_dict["enable_ep_moe"])
             ):
-                # self.n_share_experts_fusion = self.tp_size
-                # global_server_args_dict["n_share_experts_fusion"] = self.tp_size
-                self.n_share_experts_fusion = 0
-                global_server_args_dict["n_share_experts_fusion"] = 0
+                self.n_share_experts_fusion = self.tp_size
+                global_server_args_dict["n_share_experts_fusion"] = self.tp_size
                 log_info_on_rank0(
                     logger,
                     "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled.",
