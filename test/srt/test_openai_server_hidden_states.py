@@ -209,7 +209,7 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
 
 
 class TestOpenAIServerWithHiddenStatesEnabled(
-    unittest.TestCase, BaseTestOpenAIServerWithHiddenStates
+    CustomTestCase, BaseTestOpenAIServerWithHiddenStates
 ):
     @classmethod
     def setUpClass(cls):
@@ -235,7 +235,7 @@ class TestOpenAIServerWithHiddenStatesEnabled(
 
 
 class TestOpenAIServerWithHiddenStatesEnabledAndCUDAGraphDisabled(
-    unittest.TestCase, BaseTestOpenAIServerWithHiddenStates
+    CustomTestCase, BaseTestOpenAIServerWithHiddenStates
 ):
     @classmethod
     def setUpClass(cls):
@@ -261,7 +261,7 @@ class TestOpenAIServerWithHiddenStatesEnabledAndCUDAGraphDisabled(
 
 
 class TestOpenAIServerWithEAGLEAndHiddenStatesEnabled(
-    unittest.TestCase, BaseTestOpenAIServerWithHiddenStates
+    CustomTestCase, BaseTestOpenAIServerWithHiddenStates
 ):
     @classmethod
     def setUpClass(cls):
@@ -306,7 +306,7 @@ class TestOpenAIServerWithEAGLEAndHiddenStatesEnabled(
 
 
 class TestOpenAIServerWithEAGLE3AndHiddenStatesEnabled(
-    unittest.TestCase, BaseTestOpenAIServerWithHiddenStates
+    CustomTestCase, BaseTestOpenAIServerWithHiddenStates
 ):
     @classmethod
     def setUpClass(cls):
