@@ -94,30 +94,25 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         if not use_presharded_weights:
             shard_size = self.data.shape[self.output_dim]
 
-            from sglang.srt.utils import (
-                get_actual_shard_size,
-                reset_param_data_if_needed,
-            )
+            from sglang.srt.managers.schedule_batch import global_server_args_dict
+            from sglang.srt.utils import narrow_padded_param_and_loaded_weight
 
-            actual_shard_size = get_actual_shard_size(
-                shard_size, tp_rank * shard_size, loaded_weight.size(self.output_dim)
-            )
+            if global_server_args_dict["device"] == "cpu":
+                self.data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                    self.data,
+                    loaded_weight,
+                    0,  # param_data_start
+                    tp_rank * shard_size,
+                    self.output_dim,
+                    shard_size,
+                )
+            else:
+                loaded_weight = loaded_weight.narrow(
+                    self.output_dim, tp_rank * shard_size, shard_size
+                )
 
-            loaded_weight = loaded_weight.narrow(
-                self.output_dim, tp_rank * shard_size, actual_shard_size
-            )
-
-        param_data = self.data
-        # See [Note] Reset padded weights to zero.
-        reset_param_data_if_needed(
-            param_data,
-            self.output_dim,
-            actual_shard_size,
-            shard_size - actual_shard_size,
-        )
-        param_data = param_data.narrow(self.output_dim, 0, actual_shard_size)
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        assert self.data.shape == loaded_weight.shape
+        self.data.copy_(loaded_weight)
 
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
 
