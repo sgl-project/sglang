@@ -49,10 +49,6 @@ class RMSNorm(CustomOp):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-        # Re-dispatch
-        if _is_hip:
-            self._forward_method = self.forward_hip
-
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -110,10 +106,6 @@ class GemmaRMSNorm(CustomOp):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
-
-        # Re-dispatch
-        if _is_hip:
-            self._forward_method = self.forward_hip
 
     def forward_native(
         self,
