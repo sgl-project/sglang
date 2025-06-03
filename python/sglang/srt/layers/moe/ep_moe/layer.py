@@ -293,6 +293,7 @@ class EPMoE(torch.nn.Module):
             gateup_input,
             get_col_major_tma_aligned_tensor(gateup_input_scale),
         )
+        del gateup_input, gateup_input_scale
 
         # GroupGemm-0
         num_groups, m, k = gateup_input_fp8[0].size()
@@ -341,6 +342,7 @@ class EPMoE(torch.nn.Module):
             down_input,
             get_col_major_tma_aligned_tensor(down_input_scale),
         )
+        del down_input, down_input_scale
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
