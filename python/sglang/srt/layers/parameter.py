@@ -98,7 +98,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             from sglang.srt.utils import narrow_padded_param_and_loaded_weight
 
             if global_server_args_dict["device"] == "cpu":
-                self.data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     self.data,
                     loaded_weight,
                     0,  # param_data_start
@@ -106,6 +106,9 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     self.output_dim,
                     shard_size,
                 )
+                assert param_data.shape == loaded_weight.shape
+                param_data.copy_(loaded_weight)
+                return            
             else:
                 loaded_weight = loaded_weight.narrow(
                     self.output_dim, tp_rank * shard_size, shard_size
