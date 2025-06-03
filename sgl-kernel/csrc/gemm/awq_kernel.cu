@@ -130,11 +130,12 @@ __global__ void __launch_bounds__(256) dequantize_weights(
     int* __restrict__ qzeros,
     OutputT* __restrict__ output,
     int group_size,
-    int qweight_cols) {
+    int qweight_cols,
+    int qweight_rows) {
 #if CUDA_VERSION >= 12000
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    if (col >= cols || row >= rows) return;
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (col >= qweight_cols || row >= qweight_rows) return;
     
   int group_idx = row / group_size;
   int scale_offset = 8 * col + group_idx * qweight_cols * 8;
@@ -210,12 +211,12 @@ torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch:
     auto _scales = reinterpret_cast<half*>(scales.data_ptr<at::Half>());
     auto _output = reinterpret_cast<half*>(output.data_ptr<at::Half>());
     dequantize_weights<half>
-        <<<num_blocks, threads_per_block, 0, stream>>>(_qweight, _scales, _zeros, _output, group_size, qweight_cols);
+        <<<num_blocks, threads_per_block, 0, stream>>>(_qweight, _scales, _zeros, _output, group_size, qweight_cols, qweight_rows);
   } else {
     auto _scales = reinterpret_cast<__nv_bfloat16*>(scales.data_ptr<at::BFloat16>());
     auto _output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr<at::BFloat16>());
     dequantize_weights<__nv_bfloat16>
-        <<<num_blocks, threads_per_block, 0, stream>>>(_qweight, _scales, _zeros, _output, group_size, qweight_cols);
+        <<<num_blocks, threads_per_block, 0, stream>>>(_qweight, _scales, _zeros, _output, group_size, qweight_cols, qweight_rows);
   }
 
   return output;
