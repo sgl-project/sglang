@@ -91,6 +91,7 @@ from sglang.srt.two_batch_overlap import (
 from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
+    LazyValue,
     add_prefix,
     bind_or_assign,
     get_bool_env_var,
@@ -1661,6 +1662,18 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.dp_size = get_local_attention_dp_size()
 
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer.mlp, DeepseekV2MoE)
+            }
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
+
     def determine_n_share_experts_fusion(
         self, architecture: str = "DeepseekV3ForCausalLM"
     ):
@@ -1873,14 +1886,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
-        # TODO support nextn later
-        if not is_nextn:
-            self.routed_experts_weights_of_layer = {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, DeepseekV2MoE)
-            }
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -1903,23 +1908,49 @@ class DeepseekV2ForCausalLM(nn.Module):
         if self.n_share_experts_fusion > 0:
             weights_list = list(weights)
             weights_dict = dict(weights_list)
-            if self.quant_config is None or self.quant_config.get_name() == "w8a8_int8":
-                suffix_list = [
-                    "down_proj.weight",
-                    "down_proj.weight_scale",
-                    "gate_proj.weight",
-                    "gate_proj.weight_scale",
-                    "up_proj.weight",
-                    "up_proj.weight_scale",
-                ]
+            if self.quant_config is not None:
+                if self.quant_config.get_name() == "w8a8_int8":
+                    suffix_list = [
+                        "down_proj.weight",
+                        "down_proj.weight_scale",
+                        "gate_proj.weight",
+                        "gate_proj.weight_scale",
+                        "up_proj.weight",
+                        "up_proj.weight_scale",
+                    ]
+                elif (
+                    self.quant_config.get_name() == "fp8"
+                    or self.quant_config.get_name() == "blockwise_int8"
+                ):
+                    suffix_list = [
+                        "down_proj.weight",
+                        "down_proj.weight_scale_inv",
+                        "gate_proj.weight",
+                        "gate_proj.weight_scale_inv",
+                        "up_proj.weight",
+                        "up_proj.weight_scale_inv",
+                    ]
+                elif self.quant_config.get_name() == "awq":
+                    suffix_list = [
+                        "down_proj.qweight",
+                        "down_proj.qzeros",
+                        "down_proj.scales",
+                        "gate_proj.qweight",
+                        "gate_proj.qzeros",
+                        "gate_proj.scales",
+                        "up_proj.qweight",
+                        "up_proj.qzeros",
+                        "up_proj.scales",
+                    ]
+                else:
+                    raise ValueError(
+                        f"Unsupported shared expert fusion for quantization: {self.quant_config.get_name()}."
+                    )
             else:
                 suffix_list = [
                     "down_proj.weight",
-                    "down_proj.weight_scale_inv",
                     "gate_proj.weight",
-                    "gate_proj.weight_scale_inv",
                     "up_proj.weight",
-                    "up_proj.weight_scale_inv",
                 ]
             names_to_remove = []
 
