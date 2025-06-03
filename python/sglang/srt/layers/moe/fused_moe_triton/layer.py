@@ -25,6 +25,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_hip,
     get_actual_shard_size,
+    narrow_padded_param_and_loaded_weight,
     reset_param_data_if_needed,
     set_weight_attrs,
 )
@@ -584,22 +585,25 @@ class FusedMoE(torch.nn.Module):
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
 
-        if not self.use_presharded_weights:
-            loaded_weight_shard_dim = loaded_weight.size(shard_dim)
-            start_idx = shard_size * tp_rank
-            actual_shard_size = get_actual_shard_size(
-                shard_size, start_idx, loaded_weight_shard_dim
+        from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+        if global_server_args_dict["device"] == "cpu":
+            expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                expert_data,
+                loaded_weight,
+                0,  # param_data_start
+                shard_size * tp_rank,
+                shard_dim,
+                shard_size,
+                not self.use_presharded_weights,
             )
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, start_idx, actual_shard_size
-            )
+        else:
+            if not self.use_presharded_weights:
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, shard_size * tp_rank, shard_size
+                )
 
         # w2, down_proj: Load into only logical weight of w2.
-        # See [Note] Reset padded weights to zero.
-        reset_param_data_if_needed(
-            expert_data, shard_dim, actual_shard_size, shard_size - actual_shard_size
-        )
-        expert_data = expert_data.narrow(shard_dim, 0, actual_shard_size)
         expert_data.copy_(loaded_weight)
 
     def _load_single_value(
