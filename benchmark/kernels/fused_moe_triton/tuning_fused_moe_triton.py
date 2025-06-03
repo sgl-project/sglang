@@ -408,7 +408,9 @@ def main(args: argparse.Namespace):
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
     elif config.architectures[0] == "Llama4ForConditionalGeneration":
-        E = config.text_config.num_local_experts + (0 if args.disable_shared_experts_fusion else 1)
+        E = config.text_config.num_local_experts + (
+            0 if args.disable_shared_experts_fusion else 1
+        )
         topk = config.text_config.num_experts_per_tok
         intermediate_size = config.text_config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
