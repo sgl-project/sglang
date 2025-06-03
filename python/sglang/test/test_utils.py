@@ -98,6 +98,11 @@ def is_in_ci():
     return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
+def is_in_amd_ci():
+    """Return whether it is in an AMD CI runner."""
+    return get_bool_env_var("SGLANG_AMD_CI")
+
+
 if is_in_ci():
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
         5000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
@@ -881,20 +886,24 @@ def calculate_rouge_l(output_strs_list1, output_strs_list2):
     return rouge_l_scores
 
 
-STDERR_FILENAME = "stderr.txt"
-STDOUT_FILENAME = "stdout.txt"
+STDERR_FILENAME = "/tmp/stderr.txt"
+STDOUT_FILENAME = "/tmp/stdout.txt"
 
 
 def read_output(output_lines: List[str], filename: str = STDERR_FILENAME):
     """Print the output in real time with another thread."""
     while not os.path.exists(filename):
-        time.sleep(1)
+        time.sleep(0.01)
 
     pt = 0
     while pt >= 0:
         if pt > 0 and not os.path.exists(filename):
             break
-        lines = open(filename).readlines()
+        try:
+            lines = open(filename).readlines()
+        except FileNotFoundError:
+            print(f"{pt=}, {os.path.exists(filename)=}")
+            raise
         for line in lines[pt:]:
             print(line, end="", flush=True)
             output_lines.append(line)
