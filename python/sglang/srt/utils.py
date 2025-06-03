@@ -2651,7 +2651,7 @@ def narrow_padded_param_and_loaded_weight(
     weight_start,
     dim,
     shard_size,
-    narrow_weight,
+    narrow_weight=True,
 ):
     actual_shard_size = get_actual_shard_size(
         shard_size, weight_start, loaded_weight.size(dim)

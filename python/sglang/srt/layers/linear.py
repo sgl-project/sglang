@@ -1290,18 +1290,20 @@ class RowParallelLinear(LinearBase):
         ):
             shard_size = param_data.shape[input_dim]
             start_idx = self.tp_rank * shard_size
-            actual_shard_size = get_actual_shard_size(
-                shard_size, start_idx, loaded_weight.size(input_dim)
-            )
-            loaded_weight = loaded_weight.narrow(
-                input_dim, start_idx, actual_shard_size
-            )
 
-            # See [Note] Reset padded weights to zero.
-            reset_param_data_if_needed(
-                param_data, input_dim, actual_shard_size, shard_size - actual_shard_size
-            )
-            param_data = param_data.narrow(input_dim, 0, actual_shard_size)
+            from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+            if global_server_args_dict["device"] == "cpu":
+                param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                    param_data,
+                    loaded_weight,
+                    0,  # param_data_start
+                    start_idx,
+                    input_dim,
+                    shard_size,
+                )
+            else:
+                loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
 
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
