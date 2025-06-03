@@ -439,7 +439,7 @@ class ColumnParallelLinear(LinearBase):
                     start_idx,
                     output_dim,
                     shard_size,
-                    self.use_presharded_weights,
+                    not self.use_presharded_weights,
                 )
             else:
                 if not self.use_presharded_weights:
@@ -662,25 +662,25 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size
-            actual_shard_size = get_actual_shard_size(
-                shard_size, start_idx, loaded_weight.size(output_dim)
-            )
-            # bitsandbytes loads the weights of the specific portion
-            # no need to narrow here
-            if not use_bitsandbytes_4bit and not self.use_presharded_weights:
-                loaded_weight = loaded_weight.narrow(
-                    output_dim, start_idx, actual_shard_size
+
+            from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+            if global_server_args_dict["device"] == "cpu":
+                param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                    param_data,
+                    loaded_weight,
+                    0,  # param_data_start
+                    start_idx,
+                    output_dim,
+                    shard_size,
+                    not use_bitsandbytes_4bit and not self.use_presharded_weights,
                 )
+            else:
+                if not use_bitsandbytes_4bit and not self.use_presharded_weights:
+                    loaded_weight = loaded_weight.narrow(
+                        output_dim, start_idx, shard_size
+                    )
 
-            # See [Note] Reset padded weights to zero.
-            reset_param_data_if_needed(
-                param_data,
-                output_dim,
-                actual_shard_size,
-                shard_size - actual_shard_size,
-            )
-
-            param_data = param_data.narrow(output_dim, 0, actual_shard_size)
         # Special case for AQLM codebooks.
         elif is_metadata:
             # metadata indicates fixed size concatenated along dim 0

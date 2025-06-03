@@ -2651,13 +2651,13 @@ def narrow_padded_param_and_loaded_weight(
     weight_start,
     dim,
     shard_size,
-    use_presharded_weights,
+    narrow_weight,
 ):
     actual_shard_size = get_actual_shard_size(
         shard_size, weight_start, loaded_weight.size(dim)
     )
 
-    if not use_presharded_weights:
+    if narrow_weight:
         loaded_weight = loaded_weight.narrow(dim, weight_start, actual_shard_size)
 
     # [Note] Reset padded weights to zero.
