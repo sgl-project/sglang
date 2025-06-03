@@ -785,8 +785,11 @@ def sample_sharegpt_requests(
     prompt_suffix: Optional[str] = "",
     apply_chat_template=False,
 ) -> List[DatasetRow]:
-    if fixed_output_len is not None and fixed_output_len < 4:
-        raise ValueError("output_len too small")
+    if fixed_output_len is not None:
+        if fixed_output_len < 4:
+            raise ValueError("output_len too small")
+        if context_len is not None and context_len <= fixed_output_len:
+            raise ValueError("context_len should be greater than output_len")
 
     # Download sharegpt if necessary
     if not is_file_valid_json(dataset_path) and dataset_path == "":
