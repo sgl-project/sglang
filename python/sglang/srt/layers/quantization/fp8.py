@@ -442,8 +442,8 @@ class Fp8LinearMethod(LinearMethodBase):
                     bias,
                     x.dtype,
                     True,  # is_vnni
-                )            
-            
+                )
+
             return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
