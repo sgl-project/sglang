@@ -544,6 +544,6 @@ class Llama4ForCausalLM(LlamaForCausalLM):
 
         self.capture_aux_hidden_states = True
         num_layers = self.config.num_hidden_layers
-        self.model.layers_to_capture = [1, num_layers // 2 - 1, num_layers - 3]
+        self.model.layers_to_capture = [1, 23, 44]
 
 EntryClass = [Llama4ForCausalLM]
