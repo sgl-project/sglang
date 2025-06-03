@@ -1337,13 +1337,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
 
-    def new_page_count_next_decode(self):
+    def new_page_count_next_decode(self, indices: List[int] = None):
         page_size = self.token_to_kv_pool_allocator.page_size
         if page_size == 1:
-            return len(self.reqs)
+            return len(self.reqs) if indices is None else len(indices)
         # In the decoding phase, the length of a request's KV cache should be
         # the total length of the request minus 1
-        return sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
+        return (
+            (
+                sum(1 for req in self.reqs if req.seqlen % page_size == 0)
+                if indices is None
+                else sum(1 for idx in indices if self.reqs[idx].seqlen % page_size == 0)
+            )
+            if self.enable_overlap
+            else (
+                sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
+                if indices is None
+                else sum(
+                    1 for idx in indices if (self.reqs[idx].seqlen - 1) % page_size == 0
+                )
+            )
+        )
 
     def check_decode_mem(self, buf_multiplier=1):
         tokens_required = (
@@ -1393,13 +1407,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
         first_iter = True
+        wait_write = False
         while (
             self.token_to_kv_pool_allocator.available_size()
             < get_required_tokens(len(sorted_indices))
+            or (
+                self.token_to_kv_pool_allocator.available_size()
+                < self.new_page_count_next_decode(sorted_indices)
+                * server_args.page_size
+            )
             or first_iter
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
+                if server_args.enable_hierarchical_cache and not wait_write:
+                    logger.warn(
+                        "retract_decode only one request left, "
+                        "wait for completion of hicache activities to release memory"
+                    )
+                    wait_write = True
+                    self.tree_cache.writing_check(block=True)
+                    self.tree_cache.loading_check(block=True)
+
+                    residual_size = (
+                        len(sorted_indices) * global_config.retract_decode_steps
+                        - self.token_to_kv_pool_allocator.available_size()
+                    )
+                    residual_size = max(0, residual_size)
+                    self.tree_cache.evict(residual_size)
+
+                    continue
                 assert (
                     self.token_to_kv_pool_allocator.available_size() > 0
                 ), "No space left for only one request"
