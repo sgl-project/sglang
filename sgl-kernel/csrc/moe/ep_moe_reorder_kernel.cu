@@ -67,6 +67,62 @@ __global__ void ep_pre_reorder_cuda_kernel(
   }
 }
 
+__global__ void ep_post_reorder_cuda_kernel(
+    const float* __restrict__ down_output_ptr,
+    float* __restrict__ output_ptr,
+    const int* __restrict__ src2dst_ptr,
+    const int* __restrict__ topk_ids_ptr,
+    const float* __restrict__ topk_weights_ptr,
+    int start_expert_id,
+    int end_expert_id,
+    int topk,
+    int hidden_size) {
+  const int token_idx = blockIdx.x;
+  const int tid = threadIdx.x;
+
+  const int* token_src2dst = src2dst_ptr + token_idx * topk;
+  const int* token_topk_ids = topk_ids_ptr + token_idx * topk;
+  const float* token_topk_weights = topk_weights_ptr + token_idx * topk;
+
+  float* dst_ptr = output_ptr + static_cast<int64_t>(token_idx) * hidden_size;
+
+  constexpr uint32_t vec_size = 16 / sizeof(float);
+  using vec_t = flashinfer::vec_t<float, vec_size>;
+
+  const int vec_iters = hidden_size / vec_size;
+  for (int idx = tid; idx < vec_iters; idx += blockDim.x) {
+    vec_t acc;
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i)
+      acc[i] = 0.f;
+
+    bool computed = false;
+
+    for (int k = 0; k < topk; ++k) {
+      const int expert_id = token_topk_ids[k];
+      if (expert_id < start_expert_id || expert_id > end_expert_id) continue;
+      computed = true;
+      const int src_row = token_src2dst[k];
+      const float* src_ptr = down_output_ptr + static_cast<int64_t>(src_row) * hidden_size;
+      const float weight = token_topk_weights[k];
+
+      vec_t src_vec;
+      src_vec.cast_load(src_ptr + idx * vec_size);
+
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        acc[i] += static_cast<float>(src_vec[i]) * weight;
+      }
+    }
+    vec_t out_vec;
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      out_vec[i] = computed ? acc[i] : 0.f;
+    }
+    out_vec.cast_store(dst_ptr + idx * vec_size);
+  }
+}
+
 void ep_moe_pre_reorder(
     torch::Tensor input,
     torch::Tensor gateup_input,
@@ -77,8 +133,8 @@ void ep_moe_pre_reorder(
     int64_t end_expert_id,
     int64_t topk,
     bool use_per_token_if_dynamic) {
-  int total_blocks = input.size(0);
-  int block_size = 512;
+  const int total_blocks = input.size(0);
+  const int block_size = 512;
   dim3 grid(total_blocks);
   dim3 block(block_size);
   int hidden_size = input.size(1);
@@ -95,6 +151,36 @@ void ep_moe_pre_reorder(
         topk,
         hidden_size,
         use_per_token_if_dynamic);
+    return true;
+  });
+}
+
+void ep_moe_post_reorder(
+    torch::Tensor down_output,
+    torch::Tensor output,
+    torch::Tensor src2dst,
+    torch::Tensor topk_ids,
+    torch::Tensor topk_weights,
+    int64_t start_expert_id,
+    int64_t end_expert_id,
+    int64_t topk) {
+  const int total_tokens = output.size(0);
+  const int block_size = 512;
+  dim3 grid(total_tokens);
+  dim3 block(block_size);
+  const int hidden_size = output.size(1);
+
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(down_output.scalar_type(), scalar_t, [&] {
+    ep_post_reorder_cuda_kernel<scalar_t><<<grid, block>>>(
+        static_cast<scalar_t*>(down_output.data_ptr()),
+        static_cast<scalar_t*>(output.data_ptr()),
+        src2dst.data_ptr<int>(),
+        topk_ids.data_ptr<int>(),
+        topk_weights.data_ptr<float>(),
+        static_cast<int>(start_expert_id),
+        static_cast<int>(end_expert_id),
+        static_cast<int>(topk),
+        hidden_size);
     return true;
   });
 }
