@@ -16,7 +16,7 @@ import torch
 from safetensors.torch import load as safetensors_load
 from safetensors.torch import save as safetensors_save
 
-DEFAULT_GLOBAL_SEGMENT_SIZE = 3200 * 1024 * 1024  # 3.125 GiB
+DEFAULT_GLOBAL_SEGMENT_SIZE = 0  # 3.125 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 1024  # 1.0 GiB
 
 logger = logging.getLogger(__name__)

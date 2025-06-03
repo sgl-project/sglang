@@ -408,9 +408,10 @@ class Scheduler(
         t.start()
         self.parent_process = psutil.Process().parent()
 
+        self.enable_mooncake_store_l3_cache = server_args.enable_mooncake_store_l3_cache
         # Init loading l3 cache thread
         if self.enable_hierarchical_cache and self.enable_mooncake_store_l3_cache:
-            loading_l3_cache_thread = threading.Thread(target=self.loading_l3_cache(), daemon=True)
+            loading_l3_cache_thread = threading.Thread(target=self.loading_l3_cache, daemon=True)
             loading_l3_cache_thread.start()
 
         # Init memory saver
@@ -1350,6 +1351,8 @@ class Scheduler(
             # check for completion of hierarchical cache activities to release memory
             self.tree_cache.writing_check()
             self.tree_cache.loading_check()
+            if self.enable_mooncake_store_l3_cache:
+                self.tree_cache.l3_loading_check()
 
         # Get priority queue
         prefix_computed = self.policy.calc_priority(self.waiting_queue)
@@ -1393,14 +1396,15 @@ class Scheduler(
             if (
                 self.enable_hierarchical_cache
                 and self.enable_mooncake_store_l3_cache
-                and req.waiting_status != WaitingStatus.READY
             ):
-                continue
+                if not self.tree_cache.waiting_status_check(req):
+                    continue
 
-            req.init_next_round_input(
-                None if prefix_computed else self.tree_cache,
-                self.enable_hierarchical_cache,
-            )
+            if not self.enable_mooncake_store_l3_cache:
+                req.init_next_round_input(
+                    None if prefix_computed else self.tree_cache,
+                    self.enable_hierarchical_cache,
+                )
 
             res = adder.add_one_req(
                 req, self.chunked_req, self.enable_hierarchical_cache
@@ -1797,9 +1801,7 @@ class Scheduler(
 
     def loading_l3_cache(self):
         while True:
-            if len(self.waiting_queue) == 0:
-                time.sleep(0.002)
-            else:
+            if len(self.waiting_queue) > 0:
                 for req in self.waiting_queue:
                     if req.waiting_status == WaitingStatus.READY:
                         continue
@@ -1808,16 +1810,8 @@ class Scheduler(
                         self.tree_cache,
                         self.enable_hierarchical_cache,
                     )
-                    if (
-                        req.last_node_global is not None
-                        and not req.last_node_global.l2_backuped
-                        and req.last_node_global.l3_backuped
-                    ):
-                        self.tree_cache.l3_load_back(req, req.last_node_global)
-                    else:
-                        req.waiting_status = WaitingStatus.READY
-
-                self.tree_cache.l3_loading_check()
+                    self.tree_cache.l3_load_back(req, req.last_node_global)
+            time.sleep(0.001)
 
 
     def watchdog_thread(self):

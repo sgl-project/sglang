@@ -496,7 +496,7 @@ class HiCacheController:
                 offset = 0
                 for key in keys:
                     data = self.mooncake_l3_kv_pool.get(key)
-                    self.mem_pool_host.transfer(operation.device_indices[offset: offset + self.page_size], data)
+                    self.mem_pool_host.transfer(operation.host_indices[offset: offset + self.page_size], data)
                     offset += self.page_size
 
                 self.mem_pool_host.complete_io(operation.host_indices)
@@ -570,9 +570,6 @@ class HiCacheController:
                 continue
 
             self.layer_done_counter.reset()
-            if self.enable_mooncake_store_l3_cache:
-                self.l2_layer_counter.reset()
-
             for i in range(self.mem_pool_host.layer_num):
                 if self.page_size == 1:
                     flat_data = self.mem_pool_host.get_flat_data_by_layer(
@@ -589,13 +586,7 @@ class HiCacheController:
                         i,
                     )
                     self.load_stream.synchronize()
-
-                if self.enable_mooncake_store_l3_cache:
-                    self.l2_layer_counter.increment()
-                    self.layer_done_counter.compare_increment(min(
-                        self.l3_layer_counter.get_value(), self.l2_layer_counter.get_value()))
-                else:
-                    self.layer_done_counter.increment()
+                self.layer_done_counter.increment()
 
             self.mem_pool_host.complete_io(batch_operation.host_indices)
             for node_id in batch_operation.node_ids:

@@ -214,6 +214,22 @@ class HiRadixCache(RadixCache):
             self.dec_lock_ref(self.ongoing_write_through[ack_id])
             del self.ongoing_write_through[ack_id]
 
+    def waiting_status_check(self, req: Req):
+        if torch.distributed.get_world_size(group=self.tp_group) > 1:
+            check_ready = torch.tensor([req.waiting_status == WaitingStatus.READY])
+            torch.distributed.all_reduce(
+                check_ready,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            if not check_ready.item():
+                return False
+        else:
+            if req.waiting_status != WaitingStatus.READY:
+                return False
+
+        return True
+
     def l3_loading_check(self):
         while not self.cache_controller.mooncake_l3_ack_load_queue.empty():
             try:
@@ -330,6 +346,9 @@ class HiRadixCache(RadixCache):
         self, req: Req, node: TreeNode
     ):
         last_hit_node = node
+        if last_hit_node.id in self.l3_ongoing_load_back.keys():
+            return
+
         l3_nodes_to_load = []
         while not node.l2_backuped and node.l3_backuped:
             l3_nodes_to_load.insert(0, node)
@@ -341,13 +360,17 @@ class HiRadixCache(RadixCache):
 
         self.l3_ongoing_load_back[last_hit_node.id] = (ancester_node, last_hit_node, req)
 
+        if last_hit_node == ancester_node:
+            self.cache_controller.mooncake_l3_ack_load_queue.put(last_hit_node.id)
+            return
+
         l3_keys = [key for n in l3_nodes_to_load for key in n.l3_keys]
-        host_indices = self.cache_controller.load(
+        host_indices = self.cache_controller.l3_load(
             node_id=last_hit_node.id, l3_keys=l3_keys
         )
         if host_indices is None:
             self.evict_host(len(l3_keys) * self.page_size)
-            host_indices = self.cache_controller.load(
+            host_indices = self.cache_controller.l3_load(
                 node_id=last_hit_node.id, l3_keys=l3_keys
             )
 
@@ -355,6 +378,7 @@ class HiRadixCache(RadixCache):
         for node in l3_nodes_to_load:
             node.host_value = host_indices[offset: offset + len(node.l3_keys) * self.page_size]
             offset += len(node.l3_keys) * self.page_size
+            node.loading = True
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
@@ -521,10 +545,9 @@ class HiRadixCache(RadixCache):
                 l3_keys = get_node_l3_keys(total_key, len(key),
                                            torch.cuda.current_device(), self.page_size)
                 l3_exist_keys = []
-                for item in l3_keys:
-                    key_ = f"{item}_{0}"
-                    if self.mooncake_l3_kv_pool.is_exist(key_):
-                        l3_exist_keys.append(item)
+                for l3_key in l3_keys:
+                    if self.mooncake_l3_kv_pool.is_exist(l3_key):
+                        l3_exist_keys.append(l3_key)
                     else:
                         break
 
