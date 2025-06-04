@@ -188,7 +188,7 @@ class MultimodalDataItem:
     # the real data, pixel_values or audio_features
     # data: Union[List[torch.Tensor], List[np.ndarray]]
     pixel_values: Union[torch.Tensor, np.ndarray] = None
-    image_grid_thws: Union[torch.Tensor, np.ndarray] = None
+    image_grid_thw: Union[torch.Tensor, np.ndarray] = None
     video_grid_thws: Union[torch.Tensor, np.ndarray] = None
 
     image_emb_mask: Optional[torch.Tensor] = None
@@ -197,6 +197,9 @@ class MultimodalDataItem:
 
     # [num_images, (n, w, h)]
     tgt_size: Tuple[int, int] = None
+
+    # kimi-vl related
+    image_grid_hws: Optional[List[torch.Tensor]] = None
 
     audio_features: Union[torch.Tensor, np.ndarray] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
