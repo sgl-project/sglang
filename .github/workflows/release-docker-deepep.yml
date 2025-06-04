@@ -39,3 +39,8 @@ jobs:
         run: |
           docker build . -f docker/Dockerfile.deepep --build-arg BASE_IMAGE=lmsysorg/sglang:dev -t lmsysorg/sglang:dev-deepep --no-cache
           docker push lmsysorg/sglang:dev-deepep
+
+      - name: Build and Push blackwell-deepep
+        run: |
+          docker build . -f docker/Dockerfile.deepep --build-arg BASE_IMAGE=lmsysorg/sglang:blackwell -t lmsysorg/sglang:blackwell-deepep --no-cache
+          docker push lmsysorg/sglang:blackwell-deepep
