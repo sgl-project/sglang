@@ -178,26 +178,33 @@ def pre_reorder_triton_kernel(
     topk,
     hidden_size,
     BLOCK_SIZE: tl.constexpr,
+    use_per_token_if_dynamic: tl.constexpr,
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
 
     src_idx = tl.program_id(0)
     src2dst_ptr = src2dst_ptr + src_idx * topk
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
-
     src_ptr = input_ptr + src_idx * hidden_size
+
+    vec = tl.arange(0, BLOCK_SIZE)
+
+    if a1_scales_ptr is not None and use_per_token_if_dynamic:
+        scale = 1.0 / tl.load(a1_scales_ptr + src_idx)
+
     for idx in range(topk):
         expert_id = tl.load(topk_ids_ptr + idx)
         if expert_id >= start_expert_id and expert_id <= end_expert_id:
             if a1_scales_ptr is not None:
-                scale = 1.0 / tl.load(a1_scales_ptr + expert_id - start_expert_id)
+                if not use_per_token_if_dynamic:
+                    scale = 1.0 / tl.load(a1_scales_ptr + expert_id - start_expert_id)
             else:
                 scale = 1.0
 
             dst_idx = tl.load(src2dst_ptr + idx)
             dst_ptr = gateup_input_ptr + dst_idx * hidden_size
             for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
-                offset = start_offset + tl.arange(0, BLOCK_SIZE)
+                offset = start_offset + vec
                 mask = offset < hidden_size
                 in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
                 out_data = (in_data * scale).to(OutDtype)
@@ -481,8 +488,11 @@ def post_reorder_triton_kernel(
 
     computed = False
     store_ptr = output_ptr + src_idx * hidden_size
+
+    vec = tl.arange(0, BLOCK_SIZE)
+
     for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
-        offset = start_offset + tl.arange(0, BLOCK_SIZE)
+        offset = start_offset + vec
         mask = offset < hidden_size
 
         sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
@@ -499,7 +509,7 @@ def post_reorder_triton_kernel(
 
     if computed == False:
         for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
-            offset = start_offset + tl.arange(0, BLOCK_SIZE)
+            offset = start_offset + vec
             mask = offset < hidden_size
             tl.store(
                 store_ptr + offset, tl.zeros([BLOCK_SIZE], dtype=InDtype), mask=mask
@@ -553,6 +563,7 @@ def grouped_gemm_triton_kernel(
     bs_stride_0: tl.constexpr,
     bs_stride_2: tl.constexpr,
     bs_stride_1: tl.constexpr,
+    use_per_token_if_dynamic: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -616,7 +627,10 @@ def grouped_gemm_triton_kernel(
         b_ptr += BLOCK_SIZE_K
 
     if use_fp8_w8a8 and not (group_k > 0 and group_n > 0):
-        scale_a_value = tl.load(scale_a + expert_id)
+        if use_per_token_if_dynamic:
+            scale_a_value = tl.load(scale_a + (m_range_start + offs_am[:, None]))
+        else:
+            scale_a_value = tl.load(scale_a + expert_id)
         scale_b_value = tl.load(scale_b + expert_id)
         accumulator *= scale_a_value * scale_b_value
 
@@ -653,6 +667,7 @@ def grouped_gemm_triton(
     scale_b: torch.Tensor = None,
     block_shape: Optional[List[int]] = None,
     c_dtype=None,
+    use_per_token_if_dynamic: bool = True,
 ):
     assert weight_column_major == True  # TODO: more
     if use_fp8_w8a8 and block_shape is None:
@@ -693,6 +708,11 @@ def grouped_gemm_triton(
         triton.cdiv(b.size(1), META["BLOCK_SIZE_N"]),
     )
 
+    if use_fp8_w8a8 and block_shape is None and use_per_token_if_dynamic:
+        assert (
+            scale_a.shape[0] == a.shape[0]
+        ), f"scale_a.shape: {scale_a.shape}, a.shape: {a.shape}"
+
     grouped_gemm_triton_kernel[grid](
         a,
         b,
@@ -716,6 +736,7 @@ def grouped_gemm_triton(
         scale_b.stride(0) if scale_b is not None and scale_b.ndim >= 2 else 0,
         scale_b.stride(2) if scale_b is not None and scale_b.ndim == 3 else 0,
         scale_b.stride(1) if scale_b is not None and scale_b.ndim >= 2 else 0,
+        use_per_token_if_dynamic,
         **config,
     )
     return c
@@ -791,19 +812,23 @@ def _fwd_kernel_ep_scatter_2(
     offset_in_s = tl.arange(0, SCALE_HIDDEN_SIZE_PAD)
     mask_s = offset_in_s < SCALE_HIDDEN_SIZE
 
-    for token_id in range(start_token_id, total_token_num, grid_num):
+    for token_id_int32 in range(start_token_id, total_token_num, grid_num):
+        token_id = token_id_int32.to(tl.int64)
         to_copy = tl.load(recv_x + token_id * recv_x_stride0 + offset_in, mask=mask)
         to_copy_s = tl.load(
             recv_x_scale + token_id * recv_x_scale_stride0 + offset_in_s, mask=mask_s
         )
 
-        for topk_index in tl.range(0, topk_num, 1, num_stages=4):
+        for topk_idx_int32 in tl.range(0, topk_num, 1, num_stages=4):
+            topk_index = topk_idx_int32.to(tl.int64)
             expert_id = tl.load(recv_topk + token_id * recv_topk_stride0 + topk_index)
             if expert_id >= 0:
-                dest_token_index = tl.atomic_add(expert_start_loc + expert_id, 1)
+                dest_token_index_int32 = tl.atomic_add(expert_start_loc + expert_id, 1)
+                dest_token_index = dest_token_index_int32.to(tl.int64)
+
                 tl.store(
                     output_index + token_id * output_index_stride0 + topk_index,
-                    dest_token_index,
+                    dest_token_index_int32,
                 )
                 output_tensor_ptr = (
                     output_tensor + dest_token_index * output_tensor_stride0
@@ -902,21 +927,31 @@ def _fwd_kernel_ep_gather(
     topk_num: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    cur_block = tl.program_id(0)
-    start_cur_token = tl.program_id(1)
+    cur_block_int32 = tl.program_id(0)
+    cur_block = cur_block_int32.to(tl.int64)
+
+    start_cur_token_int32 = tl.program_id(1)
+
     grid_num = tl.num_programs(1)
 
-    for cur_token in range(start_cur_token, total_token_num, grid_num):
+    for cur_token_int32 in range(start_cur_token_int32, total_token_num, grid_num):
+        cur_token = cur_token_int32.to(tl.int64)
+
         off_d = tl.arange(0, BLOCK_D)
         accumulator = tl.zeros([BLOCK_D], dtype=tl.float32)
-        for topk_index in range(0, topk_num):
+
+        for topk_index_int32 in range(0, topk_num):
+            topk_index = topk_index_int32.to(tl.int64)
+
             expert_id = tl.load(
                 recv_topk_ids + cur_token * recv_topk_ids_stride0 + topk_index
             )
             if expert_id >= 0:
-                source_token_index = tl.load(
+                source_token_index_int32 = tl.load(
                     input_index + cur_token * input_index_stride0 + topk_index
                 )
+                source_token_index = source_token_index_int32.to(tl.int64)
+
                 acc_weight = tl.load(
                     recv_topk_weight + cur_token * recv_topk_weight_stride0 + topk_index
                 )

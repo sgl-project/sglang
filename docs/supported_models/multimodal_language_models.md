@@ -1,7 +1,6 @@
 # Multimodal Language Models
 
-These models accept multi-modal inputs (e.g., images and text) and generate text output. They augment language models
-with multimodal encoders.
+These models accept multi-modal inputs (e.g., images and text) and generate text output. They augment language models with multimodal encoders.
 
 ## Example launch Command
 
@@ -12,7 +11,18 @@ python3 -m sglang.launch_server \
   --port 30000 \
 ```
 
-## Supporting Metrics
+## Supported models
+
+Below the supported models are summarized in a table.
+
+If you are unsure if a specific architecture is implemented, you can search for it via GitHub. For example, to search for `Qwen2_5_VLForConditionalGeneration`, use the expression:
+
+```
+repo:sgl-project/sglang path:/^python\/sglang\/srt\/models\// Qwen2_5_VLForConditionalGeneration
+```
+
+in the GitHub search bar.
+
 
 | Model Family (Variants)    | Example HuggingFace Identifier             | Chat Template    | Description                                                                                                                                                                                                     |
 |----------------------------|--------------------------------------------|------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -24,5 +34,6 @@ python3 -m sglang.launch_server \
 | **LLaVA** (v1.5 & v1.6)    | *e.g.* `liuhaotian/llava-v1.5-13b`         | `vicuna_v1.1`    | Open vision-chat models that add an image encoder to LLaMA/Vicuna (e.g. LLaMA2 13B) for following multimodal instruction prompts.                                                                               |
 | **LLaVA-NeXT** (8B, 72B)   | `lmms-lab/llava-next-72b`                  | `chatml-llava`   | Improved LLaVA models (with an 8B Llama3 version and a 72B version) offering enhanced visual instruction-following and accuracy on multimodal benchmarks.                                                       |
 | **LLaVA-OneVision**        | `lmms-lab/llava-onevision-qwen2-7b-ov`     | `chatml-llava`   | Enhanced LLaVA variant integrating Qwen as the backbone; supports multiple images (and even video frames) as inputs via an OpenAI Vision API-compatible format.                                                 |
-| **Gemma 3 (Multimodal)**   | `google/gemma-3-4b-it`                     | `gemma-it`       | Gemma 3’s larger models (4B, 12B, 27B) accept images (each image encoded as 256 tokens) alongside text in a combined 128K-token context.                                                                        |
+| **Gemma 3 (Multimodal)**   | `google/gemma-3-4b-it`                     | `gemma-it`       | Gemma 3's larger models (4B, 12B, 27B) accept images (each image encoded as 256 tokens) alongside text in a combined 128K-token context.                                                                        |
 | **Kimi-VL** (A3B)          | `moonshotai/Kimi-VL-A3B-Instruct`          | `kimi-vl`        | Kimi-VL is a multimodal model that can understand and generate text from images.                                                                                                                                |
+| **Mistral-Small-3.1-24B**  | `mistralai/Mistral-Small-3.1-24B-Instruct-2503` | `mistral`   | Mistral 3.1 is a multimodal model that can generate text from text or images input. It also supports tool calling and structured output. |

@@ -154,7 +154,7 @@ class SchedulerMetricsCollector:
         from prometheus_client import Counter, Gauge
 
         self.labels = labels
-        self.last_log_time = time.time()
+        self.last_log_time = time.perf_counter()
 
         self.num_running_reqs = Gauge(
             name="sglang:num_running_reqs",
@@ -294,7 +294,7 @@ class SchedulerMetricsCollector:
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
 
-        self.last_log_time = time.time()
+        self.last_log_time = time.perf_counter()
 
 
 class TokenizerMetricsCollector:
@@ -399,6 +399,12 @@ class TokenizerMetricsCollector:
         self.num_so_requests_total = Counter(
             name="sglang:num_so_requests_total",
             documentation="Number of structured output requests processed.",
+            labelnames=labels.keys(),
+        )
+
+        self.num_aborted_requests_total = Counter(
+            name="sglang:num_aborted_requests",
+            documentation="Number of requests aborted.",
             labelnames=labels.keys(),
         )
 
@@ -533,3 +539,6 @@ class TokenizerMetricsCollector:
             if adjusted_interval <= bound:
                 his._buckets[i].inc(num_new_tokens)
                 break
+
+    def observe_one_aborted_request(self):
+        self.num_aborted_requests_total.labels(**self.labels).inc(1)
