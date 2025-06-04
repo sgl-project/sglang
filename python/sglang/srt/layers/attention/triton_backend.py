@@ -467,7 +467,7 @@ class TritonAttnBackend(AttentionBackend):
         )
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
-                (max_bs * self.max_context_len),
+                (max_num_tokens * self.max_context_len),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -484,7 +484,7 @@ class TritonAttnBackend(AttentionBackend):
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             if kv_indices_buf is None:
                 self.cuda_graph_window_kv_indices = torch.zeros(
-                    (max_bs * self.sliding_window_size),
+                    (max_num_tokens * self.sliding_window_size),
                     dtype=torch.int32,
                     device=self.device,
                 )
@@ -942,7 +942,7 @@ class TritonMultiStepDraftBackend:
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, max_bs * self.max_context_len),
+            (self.speculative_num_steps, max_num_tokens * self.max_context_len),
             dtype=torch.int32,
             device=self.device,
         )

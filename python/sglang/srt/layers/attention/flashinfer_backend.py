@@ -265,7 +265,7 @@ class FlashInferAttnBackend(AttentionBackend):
     ):
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
-                (max_bs * self.max_context_len,),
+                (max_num_token * self.max_context_len,),
                 dtype=torch.int32,
                 device="cuda",
             )
@@ -284,7 +284,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_bs * self.max_context_len),
+                (max_num_token * self.max_context_len),
                 dtype=torch.uint8,
                 device="cuda",
             )
