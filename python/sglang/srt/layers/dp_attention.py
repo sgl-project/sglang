@@ -164,7 +164,7 @@ def disable_dp_size():
 
 
 def get_dp_local_info(forward_batch: ForwardBatch):
-    # `get_dp_local_info`` is only called in global DP gather and scatter. We use global DP rank here.
+    # `get_dp_local_info` is only called in global DP gather and scatter. We use global DP rank here.
     dp_rank = get_attention_dp_rank()
 
     if forward_batch.dp_local_start_pos is None:

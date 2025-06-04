@@ -11,6 +11,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+
 class TestDPAttentionDP4TP8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -63,6 +64,7 @@ class TestDPAttentionDP4TP8(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.8)
+
 
 class TestDPAttention1(CustomTestCase):
     @classmethod
@@ -118,6 +120,7 @@ class TestDPAttention1(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.8)
+
 
 class TestDPAttention2(CustomTestCase):
     @classmethod
@@ -229,7 +232,6 @@ class TestDPAttention3(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.8)
-
 
 
 class TestDPAttention4(CustomTestCase):
@@ -344,7 +346,6 @@ class TestDPAttention5(CustomTestCase):
         self.assertGreater(metrics["score"], 0.8)
 
 
-
 class TestDPAttention6(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -399,8 +400,6 @@ class TestDPAttention6(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.8)
-
-
 
 
 if __name__ == "__main__":
