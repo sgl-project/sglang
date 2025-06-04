@@ -30,7 +30,12 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and Push DeepEP Image
+      - name: Build and Push deepep
         run: |
           docker build . -f docker/Dockerfile.deepep -t lmsysorg/sglang:deepep --no-cache
           docker push lmsysorg/sglang:deepep
+
+      - name: Build and Push dev-deepep
+        run: |
+          docker build . -f docker/Dockerfile.deepep -t lmsysorg/sglang:dev-deepep --no-cache
+          docker push lmsysorg/sglang:dev-deepep
