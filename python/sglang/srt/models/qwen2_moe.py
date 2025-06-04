@@ -452,7 +452,7 @@ class Qwen2MoeModel(nn.Module):
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
                 enable_tbo=True,
-                input_data_scatter_mode=ScatterMode.model_input_mode(),
+                input_data_scatter_mode=ScatterMode.model_input_output(),
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
