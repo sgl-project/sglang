@@ -56,6 +56,9 @@ RUN tar -xf nvshmem_src_3.2.5-1.txz \
 WORKDIR /sgl-workspace/nvshmem
 RUN git apply /sgl-workspace/DeepEP/third-party/nvshmem.patch
 
+RUN sed -i '1i#include <unistd.h>' /sgl-workspace/nvshmem/examples/moe_shuffle.cu && \
+    cat /sgl-workspace/nvshmem/examples/moe_shuffle.cu
+
 WORKDIR /sgl-workspace/nvshmem
 ENV CUDA_HOME=/usr/local/cuda
 RUN NVSHMEM_SHMEM_SUPPORT=0 \
