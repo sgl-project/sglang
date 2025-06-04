@@ -92,28 +92,29 @@ __global__ void ep_post_reorder_cuda_kernel(
 
   const int vec_iters = hidden_size / vec_size;
   for (int idx = tid; idx < vec_iters; idx += blockDim.x) {
-    vec_t acc;
-#pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i) {
-      acc[i] = scalar_t(0);
-    }
+    float acc[vec_size] = {0};
 
     for (int k = 0; k < topk; ++k) {
       const int expert_id = token_topk_ids[k];
       if (expert_id < start_expert_id || expert_id > end_expert_id) continue;
       const int src_row = token_src2dst[k];
       const scalar_t* src_ptr = down_output_ptr + static_cast<int64_t>(src_row) * hidden_size;
-      const scalar_t weight = token_topk_weights[k];
+      const float weight = static_cast<float>(token_topk_weights[k]);
 
       vec_t src_vec;
       src_vec.cast_load(src_ptr + idx * vec_size);
 
 #pragma unroll
       for (uint32_t i = 0; i < vec_size; ++i) {
-        acc[i] += src_vec[i] * weight;
+        acc[i] += static_cast<float>(src_vec[i]) * weight;
       }
     }
-    acc.cast_store(dst_ptr + idx * vec_size);
+    vec_t out_vec;
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i)
+      out_vec[i] = static_cast<scalar_t>(acc[i]);
+
+    out_vec.cast_store(dst_ptr + idx * vec_size);
   }
 }
 
