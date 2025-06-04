@@ -89,7 +89,7 @@ global_server_args_dict = {
     "max_micro_batch_size": ServerArgs.max_micro_batch_size,
     "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
     "ep_dispatch_algorithm": ServerArgs.ep_dispatch_algorithm,
-    "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
+    "num_fused_shared_experts": ServerArgs.num_fused_shared_experts,
     "sampling_backend": ServerArgs.sampling_backend,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
@@ -1333,7 +1333,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         page_size = self.token_to_kv_pool_allocator.page_size
         if page_size == 1:
             return len(self.reqs)
-        return sum(1 for req in self.reqs if req.seqlen % page_size == 0)
+        # In the decoding phase, the length of a request's KV cache should be
+        # the total length of the request minus 1
+        return sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
 
     def check_decode_mem(self, buf_multiplier=1):
         tokens_required = (
