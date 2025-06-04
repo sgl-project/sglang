@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from functools import lru_cache, wraps
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, print_info_once
 
 _is_cuda = is_cuda()
 
@@ -29,29 +29,11 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import add_prefix, logger
+from sglang.srt.utils import add_prefix
 
 ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
 }
-
-
-def execute_once(func):
-    has_run = None
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        nonlocal has_run
-        if not has_run:
-            func(*args, **kwargs)
-            has_run = True
-
-    return wrapper
-
-
-@execute_once
-def info_once(message: str):
-    logger.info(message)
 
 
 class VisionSdpaAttention(nn.Module):
@@ -346,11 +328,11 @@ class VisionAttention(nn.Module):
         if global_server_args_dict["mm_attention_backend"] is None:
             if qkv_backend is None:
                 qkv_backend = "sdpa"
-            info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
+            print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
         else:
             qkv_backend = global_server_args_dict["mm_attention_backend"]
 
-        info_once(f"Using {qkv_backend} as multimodal attention backend.")
+        print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
         self.qkv_backend = QKV_BACKEND_IMPL[qkv_backend](
             head_dim=self.head_size,
