@@ -30,6 +30,7 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.distributed import (
+    get_pp_indices,
     get_tp_group,
     get_world_group,
     init_distributed_environment,
@@ -563,6 +564,10 @@ class ModelRunner:
                     "model %s does not support pipeline parallelism now.",
                     model_class,
                 )
+
+        if self.support_pp:
+            # try to get the indices, to check the SGLANG_PP_LAYER_PARTITION quickly
+            get_pp_indices(self.model_config.num_hidden_layers, 0, self.pp_size)
 
         with self.memory_saver_adapter.region():
             self.model = get_model(

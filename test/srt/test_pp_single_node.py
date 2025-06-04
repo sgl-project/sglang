@@ -5,11 +5,13 @@ python3 -m unittest test_pp_single_node.TestQwenPPAccuracy.test_pp_consistency
 python3 -m unittest test_pp_single_node.TestFixedBugs.test_chunked_prefill_with_small_bs
 """
 
+import os
 import time
 import unittest
 from types import SimpleNamespace
 
 from sglang.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
@@ -21,6 +23,88 @@ from sglang.test.test_utils import (
     popen_launch_server,
     run_bench_one_batch_server,
 )
+
+
+class TestPPIndices(unittest.TestCase):
+    """
+    python3 -m unittest test_pp_single_node.TestPPIndices.test_get_pp_indices
+    python3 -m unittest test_pp_single_node.TestPPIndices.test_custom_layer_partition
+    """
+
+    def test_get_pp_indices(self):
+        test_cases = [
+            # (num_hidden_layers, pp_size, pp_rank, expected_indices)
+            # pp_size 2
+            (2, 2, 0, (0, 1)),
+            (2, 2, 1, (1, 2)),
+            (3, 2, 0, (0, 2)),
+            (3, 2, 1, (2, 3)),
+            # pp_size 3
+            (3, 3, 0, (0, 1)),
+            (3, 3, 1, (1, 2)),
+            (3, 3, 2, (2, 3)),
+            (4, 3, 0, (0, 1)),
+            (4, 3, 1, (1, 3)),
+            (4, 3, 2, (3, 4)),
+            (5, 3, 0, (0, 2)),
+            (5, 3, 1, (2, 4)),
+            (5, 3, 2, (4, 5)),
+        ]
+
+        for num_hidden_layers, pp_size, pp_rank, expected_indices in test_cases:
+            with self.subTest(
+                num_hidden_layers=num_hidden_layers, pp_size=pp_size, pp_rank=pp_rank
+            ):
+                actual_indices = get_pp_indices(num_hidden_layers, pp_rank, pp_size)
+                self.assertEqual(
+                    actual_indices,
+                    expected_indices,
+                    msg=f"Failed for layers={num_hidden_layers}, pp_size={pp_size}, pp_rank={pp_rank}",
+                )
+
+    def test_custom_layer_partition(self):
+        def _verify(partition_str, num_layers, pp_size, goldens):
+            bak = os.environ.get("SGLANG_PP_LAYER_PARTITION", None)
+            os.environ["SGLANG_PP_LAYER_PARTITION"] = partition_str
+            try:
+                for pp_rank, golden in enumerate(goldens):
+                    actual = get_pp_indices(num_layers, pp_rank, pp_size)
+                    self.assertEqual(
+                        actual,
+                        golden,
+                        msg=f"Failed for partition_str={partition_str}, pp_rank={pp_rank}",
+                    )
+            finally:
+                if bak is not None:
+                    os.environ["SGLANG_PP_LAYER_PARTITION"] = bak
+                else:
+                    os.environ.pop("SGLANG_PP_LAYER_PARTITION", None)
+
+        # Test valid partition strings
+        _verify("5,5,5,5", 20, 4, [(0, 5), (5, 10), (10, 15), (15, 20)])
+        _verify("4,6,6,4", 20, 4, [(0, 4), (4, 10), (10, 16), (16, 20)])
+        _verify("5,6,5,6", 22, 4, [(0, 5), (5, 11), (11, 16), (16, 22)])
+
+        # Test invalid partition strings
+        invalid_cases = [
+            ("5,5,5,5,", 20, 4, "Invalid partition string"),
+            ("5,5,5,a", 20, 4, "Non-integer layer count"),
+            ("5,5,5", 20, 4, "Wrong number of partitions"),
+            ("5,5,5,5", 21, 4, "Wrong number of layers"),
+        ]
+
+        for partition_str, num_layers, pp_size, msg in invalid_cases:
+            with self.subTest(partition_str=partition_str, msg=msg):
+                bak = os.environ.get("SGLANG_PP_LAYER_PARTITION", None)
+                os.environ["SGLANG_PP_LAYER_PARTITION"] = partition_str
+                try:
+                    with self.assertRaises(ValueError):
+                        get_pp_indices(num_layers, 0, pp_size)
+                finally:
+                    if bak is not None:
+                        os.environ["SGLANG_PP_LAYER_PARTITION"] = bak
+                    else:
+                        os.environ.pop("SGLANG_PP_LAYER_PARTITION", None)
 
 
 class TestPPAccuracy(unittest.TestCase):
