@@ -53,17 +53,8 @@ class RMSNorm(CustomOp):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, *args, **kwargs):
-        if torch.compiler.is_compiling():
-            return self.forward_native(*args, **kwargs)
-        if _is_cuda:
-            return self.forward_cuda(*args, **kwargs)
-        elif _use_aiter:
-            return self.forward_aiter(*args, **kwargs)
-        elif _is_hip:
-            return self.forward_hip(*args, **kwargs)
-        else:
-            return self.forward_native(*args, **kwargs)
+    if _use_aiter:
+        self._forward_method = self.forward_aiter
 
     def forward_cuda(
         self,
@@ -142,13 +133,9 @@ class GemmaRMSNorm(CustomOp):
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, *args, **kwargs):
-        if torch.compiler.is_compiling():
-            return self.forward_native(*args, **kwargs)
-        if _is_cuda:
-            return self.forward_cuda(*args, **kwargs)
-        else:
-            return self.forward_native(*args, **kwargs)
+        # Re-dispatch
+        if _is_hip:
+            self._forward_method = self.forward_native
 
     def forward_native(
         self,
