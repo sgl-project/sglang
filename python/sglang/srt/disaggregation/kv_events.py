@@ -43,6 +43,7 @@ class EventBatch(
 ):
     ts: float
     events: list[Any]
+    attn_dp_rank: Optional[int] = None
 
 
 class KVCacheEvent(
@@ -187,6 +188,8 @@ class ZmqEventPublisher(EventPublisher):
     def publish(self, events: EventBatch) -> None:
         if not self._running:
             raise RuntimeError("Publisher is closed")
+        if events.attn_dp_rank is None:
+            events.attn_dp_rank = self._dp_rank
         self._event_queue.put(events)
 
     def shutdown(self) -> None:

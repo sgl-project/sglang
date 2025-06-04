@@ -537,7 +537,6 @@ class Scheduler(
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
-                    dp_attention_rank=self.attn_dp_rank,
                 )
 
         self.decode_mem_cache_buf_multiplier = (
