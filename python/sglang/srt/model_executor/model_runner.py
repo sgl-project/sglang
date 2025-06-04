@@ -223,6 +223,10 @@ class ModelRunner:
         # Get memory before model loading
         if not self.is_draft_worker:
             self.available_memory = self.init_torch_distributed()
+            if self.server_args.speculative_algorithm is not None:
+                self.available_memory = (
+                    self.available_memory * 0.85
+                )  # reserve 10% for draft worker model and KV pool
         else:
             assert main_worker_avail_memory is not None
             self.available_memory = main_worker_avail_memory
