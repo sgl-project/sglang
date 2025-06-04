@@ -396,9 +396,9 @@ class Scheduler(
             self.tree_cache,
             self.enable_hierarchical_cache,
         )
-        assert server_args.schedule_conservativeness >= 0, (
-            "Invalid schedule_conservativeness"
-        )
+        assert (
+            server_args.schedule_conservativeness >= 0
+        ), "Invalid schedule_conservativeness"
         self.init_new_token_ratio = min(
             global_config.default_init_new_token_ratio
             * server_args.schedule_conservativeness,
