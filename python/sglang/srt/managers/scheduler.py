@@ -148,6 +148,7 @@ from sglang.srt.utils import (
     point_to_point_pyobj,
     pyspy_dump_schedulers,
     require_gathered_buffer,
+    require_mlp_tp_gather,
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
@@ -1643,7 +1644,6 @@ class Scheduler(
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
-            moe_dense_tp_size=self.server_args.moe_dense_tp_size,
             tp_cpu_group=self.tp_cpu_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
@@ -1652,6 +1652,7 @@ class Scheduler(
             enable_two_batch_overlap=self.server_args.enable_two_batch_overlap,
             enable_deepep_moe=self.server_args.enable_deepep_moe,
             deepep_mode=DeepEPMode[self.server_args.deepep_mode],
+            require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
         )
 
     @staticmethod
@@ -1659,7 +1660,6 @@ class Scheduler(
         local_batch: ScheduleBatch,
         dp_size,
         attn_tp_size: int,
-        moe_dense_tp_size: Optional[int],
         tp_cpu_group,
         get_idle_batch,
         disable_cuda_graph: bool,
@@ -1668,6 +1668,7 @@ class Scheduler(
         enable_two_batch_overlap: bool,
         enable_deepep_moe: bool,
         deepep_mode: DeepEPMode,
+        require_mlp_tp_gather: bool,
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -1744,7 +1745,7 @@ class Scheduler(
 
         if local_batch is not None:
             # TODO: handle the case when moe_dense_tp_size != 1
-            if moe_dense_tp_size == 1 and global_server_args_dict["enable_dp_lm_head"]:
+            if not require_mlp_tp_gather:
                 local_batch.global_num_tokens = [num_tokens]
                 local_batch.global_num_tokens_for_logprob = [num_tokens_for_logprob]
             else:

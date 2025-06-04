@@ -2198,7 +2198,7 @@ def require_mlp_tp_gather(server_args):
         elif not server_args.enable_dp_lm_head:
             return True
         elif not server_args.enable_deepep_moe:
-            return False
+            return True
         else:
             return (
                 server_args.moe_dense_tp_size
@@ -2213,7 +2213,7 @@ def require_attn_tp_gather(server_args):
     Check if the input of attention is scattered.
     """
     assert server_args.moe_dense_tp_size in [1, None]
-    if server_args.enable_deepep_moe or server_args.moe_dense_tp_size is not None:
+    if server_args.enable_deepep_moe or server_args.moe_dense_tp_size == 1:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:

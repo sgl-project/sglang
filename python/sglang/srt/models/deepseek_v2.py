@@ -1575,8 +1575,6 @@ class DeepseekV2Model(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.dp_size = get_local_attention_dp_size()
-
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
@@ -1660,7 +1658,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
         )
         self.logits_processor = LogitsProcessor(config)
-        self.dp_size = get_local_attention_dp_size()
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
