@@ -223,7 +223,7 @@ class GroupCoordinator:
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
-
+        self.local_size = int(os.environ.get("LOCAL_SIZE", "0"))
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend
@@ -441,7 +441,7 @@ class GroupCoordinator:
             return input_
 
         if input_.is_cpu:
-            if is_shm_available(input_.dtype):
+            if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 torch.ops.sgl_kernel.shm_allreduce(
                     input_, torch.distributed.ReduceOp.SUM
                 )
@@ -568,7 +568,7 @@ class GroupCoordinator:
         )
 
         if input_.is_cpu:
-            if is_shm_available(input_.dtype):
+            if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 return torch.ops.sgl_kernel.shm_allgather(input_, dim)
             else:
                 torch.distributed.all_gather_into_tensor(
