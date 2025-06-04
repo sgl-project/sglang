@@ -565,10 +565,6 @@ class ModelRunner:
                     model_class,
                 )
 
-        if self.support_pp:
-            # try to get the indices, to check the SGLANG_PP_LAYER_PARTITION quickly
-            get_pp_indices(self.model_config.num_hidden_layers, 0, self.pp_size)
-
         with self.memory_saver_adapter.region():
             self.model = get_model(
                 model_config=self.model_config,
