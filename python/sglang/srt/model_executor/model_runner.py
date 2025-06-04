@@ -191,6 +191,7 @@ class ModelRunner:
         global_server_args_dict.update(
             {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
             | {
+                # TODO it is indeed not a "server args"
                 "use_mla_backend": self.use_mla_backend,
             }
         )
