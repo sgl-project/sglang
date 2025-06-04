@@ -159,6 +159,13 @@ pub struct ServerConfig {
     pub worker_urls: Vec<String>,
     pub policy_config: PolicyConfig,
     pub verbose: bool,
+    // FIXME: The dp_awareness is duplicated with the same filed inside
+    // PolicyConfig.
+    // It is introduced to let the server startup process can easily
+    // tackle with the service_discovery_config status.  Should be
+    // removed after the dp_awareness feature in service_discovery is
+    // fully supported.
+    pub dp_awareness: bool,
     pub max_payload_size: usize,
     pub log_dir: Option<String>,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
@@ -207,8 +214,12 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
 
     // Log service discovery status
     if let Some(service_discovery_config) = &config.service_discovery_config {
-        info!("🚧 Service discovery enabled");
-        info!("🚧 Selector: {:?}", service_discovery_config.selector);
+        if config.dp_awareness {
+            info!("🚧 Service discovery disabled (conflict with dp_awareness)");
+        } else {
+            info!("🚧 Service discovery enabled");
+            info!("🚧 Selector: {:?}", service_discovery_config.selector);
+        }
     } else {
         info!("🚧 Service discovery disabled");
     }
@@ -229,7 +240,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
 
     // Start the service discovery if enabled
     if let Some(service_discovery_config) = config.service_discovery_config {
-        if service_discovery_config.enabled {
+        if service_discovery_config.enabled && !config.dp_awareness {
             info!("🚧 Initializing Kubernetes service discovery");
             // Pass the Arc<Router> directly
             match start_service_discovery(service_discovery_config, router_arc).await {

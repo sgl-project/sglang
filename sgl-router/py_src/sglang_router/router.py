@@ -32,6 +32,7 @@ class Router:
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
         verbose: Enable verbose logging. Default: False
         log_dir: Directory to store log files. If None, logs are only output to console. Default: None
+        dp_awareness: Enable data parallelism aware schedule. Default: False
         service_discovery: Enable Kubernetes service discovery. When enabled, the router will
             automatically discover worker pods based on the selector. Default: False
         selector: Dictionary mapping of label keys to values for Kubernetes pod selection.
@@ -60,6 +61,7 @@ class Router:
         max_payload_size: int = 4 * 1024 * 1024,  # 4MB
         verbose: bool = False,
         log_dir: Optional[str] = None,
+        dp_awareness: bool = False,
         service_discovery: bool = False,
         selector: Dict[str, str] = None,
         service_discovery_port: int = 80,
@@ -85,6 +87,7 @@ class Router:
             max_payload_size=max_payload_size,
             verbose=verbose,
             log_dir=log_dir,
+            dp_awareness=dp_awareness,
             service_discovery=service_discovery,
             selector=selector,
             service_discovery_port=service_discovery_port,
