@@ -203,6 +203,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = True
+        self.hot_token_id = None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
