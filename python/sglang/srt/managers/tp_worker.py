@@ -58,7 +58,9 @@ class TpModelWorker:
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
-        main_worker_avail_memory: Optional[float] = None,
+        main_worker_avail_memory: Optional[
+            float
+        ] = None,  # For draft worker: the available memory before main worker loads the model
     ):
         # Parse args
         self.tp_size = server_args.tp_size

@@ -145,9 +145,7 @@ class ModelRunner:
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
-        main_worker_avail_memory: Optional[
-            float
-        ] = None,  # For draft worker: the available memory before main worker loads the model
+        main_worker_avail_memory: Optional[float] = None,
     ):
         # Parse args
         self.model_config = model_config
@@ -843,7 +841,7 @@ class ModelRunner:
         )
         assert (
             rest_memory > 0
-        ), "No memory available for KV pool. Please try to increase --mem-fraction-static."
+        ), "No remaining memory available for KV pool. Please try to increase --mem-fraction-static."
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
