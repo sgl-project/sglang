@@ -423,7 +423,13 @@ class ServerArgs:
                 "Overlap scheduler is disabled because of using "
                 "eagle speculative decoding."
             )
-
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using "
+                    "eagle speculative decoding."
+                )
+            
             model_arch = get_model_arch(self)
 
             # Auto set draft_model_path DeepSeek-V3/R1
