@@ -1000,20 +1000,67 @@ def v1_chat_generate_request(
 
             if chat_template_name is None:
                 openai_compatible_messages = []
+                image_data = []
+                audio_data = []
+                modalities = []
 
                 for message in request.messages:
                     if message.content is None:
                         message.content = ""
-                    msg_dict = message.dict()
+                    msg_dict = message.model_dump()
                     if isinstance(msg_dict.get("content"), list):
-                        for chunk in msg_dict["content"]:
-                            if isinstance(chunk, dict) and chunk.get("type") == "text":
-                                new_msg = msg_dict.copy()
-                                new_msg["content"] = chunk["text"]
-                                new_msg = {
-                                    k: v for k, v in new_msg.items() if v is not None
-                                }
-                                openai_compatible_messages.append(new_msg)
+                        if is_multimodal:
+                            # Extract image and audio data for mm processing while keeping full content for jinja template
+                            # NOTE: We assume common conventions: content['type'] == 'image'/'audio'/'text' but templates may vary.
+                            # This assumes the jinja template accepts message["content"] is a list. And it tries to parse
+                            # the content into a list of dictionaries with the following keys: "type", "image_url", "audio_url", "text".
+                            # TODO: Need to auto-detect template requirements by parsing jinja code or use template metadata.
+                            # Better modularization needed to handle different template content type expectations.
+                            processed_content_parts = []
+                            for chunk in msg_dict["content"]:
+                                if isinstance(chunk, dict):
+                                    chunk_type = chunk.get("type")
+
+                                    # Extract data and create normalized content dictionary
+                                    if chunk_type == "image_url":
+                                        image_data.append(chunk["image_url"]["url"])
+                                        if chunk.get("modalities"):
+                                            modalities.append(chunk.get("modalities"))
+                                        processed_content_parts.append(
+                                            {"type": "image"}
+                                        )
+                                    elif chunk_type == "audio_url":
+                                        audio_data.append(chunk["audio_url"]["url"])
+                                        processed_content_parts.append(
+                                            {"type": "audio"}
+                                        )
+                                    else:
+                                        processed_content_parts.append(chunk)
+
+                            # Create one message with all processed content list
+                            new_msg = {
+                                k: v
+                                for k, v in msg_dict.items()
+                                if v is not None and k != "content"
+                            }
+                            new_msg["content"] = processed_content_parts
+                            openai_compatible_messages.append(new_msg)
+                        else:
+                            # For non-multimodal models, we assume the content should be a string, such as
+                            # deeoseek-v3's jinja chat stemplate.
+                            for chunk in msg_dict["content"]:
+                                if (
+                                    isinstance(chunk, dict)
+                                    and chunk.get("type") == "text"
+                                ):
+                                    new_msg = msg_dict.copy()
+                                    new_msg["content"] = chunk["text"]
+                                    new_msg = {
+                                        k: v
+                                        for k, v in new_msg.items()
+                                        if v is not None
+                                    }
+                                    openai_compatible_messages.append(new_msg)
                     else:
                         msg_dict = {k: v for k, v in msg_dict.items() if v is not None}
                         openai_compatible_messages.append(msg_dict)
@@ -1070,9 +1117,9 @@ def v1_chat_generate_request(
                 if is_multimodal:
                     prompt = tokenizer_manager.tokenizer.decode(prompt_ids)
                 stop = request.stop
-                image_data = None
-                audio_data = None
-                modalities = []
+                image_data = image_data if image_data else None
+                audio_data = audio_data if audio_data else None
+                modalities = modalities if modalities else []
             else:
                 conv = generate_chat_conv(request, chat_template_name)
                 # If we should continue the final assistant message, adjust the conversation.
