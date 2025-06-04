@@ -119,6 +119,7 @@ class EAGLEWorker(TpModelWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                main_worker_avail_memory=self.target_worker.model_runner.available_memory,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()

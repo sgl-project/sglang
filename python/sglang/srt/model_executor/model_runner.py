@@ -145,6 +145,9 @@ class ModelRunner:
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
+        main_worker_avail_memory: Optional[
+            float
+        ] = None,  # For draft worker: the available memory before main worker loads the model
     ):
         # Parse args
         self.model_config = model_config
@@ -220,14 +223,18 @@ class ModelRunner:
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
         # Get memory before model loading
-        min_per_gpu_memory = self.init_torch_distributed()
+        if not self.is_draft_worker:
+            self.available_memory = self.init_torch_distributed()
+        else:
+            assert main_worker_avail_memory is not None
+            self.available_memory = main_worker_avail_memory
 
         # Update deep gemm configure
         if _ENABLE_JIT_DEEPGEMM:
             update_deep_gemm_config(gpu_id, server_args)
 
         # If it is a draft model, tp_group can be different
-        self.initialize(min_per_gpu_memory)
+        self.initialize(self.available_memory)
 
         # temporary cached values
         self.support_pp = (
@@ -830,9 +837,13 @@ class ModelRunner:
                 * 2
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
+
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
+        assert (
+            rest_memory > 0
+        ), "No memory available for KV pool. Please try to increase --mem-fraction-static."
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
@@ -858,7 +869,6 @@ class ModelRunner:
             )
 
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
-
         if max_num_reqs is None:
             max_num_reqs = min(
                 max(

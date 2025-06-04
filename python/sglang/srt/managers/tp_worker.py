@@ -58,6 +58,7 @@ class TpModelWorker:
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
+        main_worker_avail_memory: Optional[float] = None,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
@@ -88,6 +89,7 @@ class TpModelWorker:
             is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            main_worker_avail_memory=main_worker_avail_memory,
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
