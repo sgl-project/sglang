@@ -107,6 +107,10 @@ class GemmaRMSNorm(CustomOp):
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
 
+        # Re-dispatch
+        if _is_hip:
+            self._forward_method = self.forward_native
+
     def forward_native(
         self,
         x: torch.Tensor,
