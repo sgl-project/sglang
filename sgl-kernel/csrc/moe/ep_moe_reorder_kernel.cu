@@ -73,7 +73,7 @@ __global__ void ep_post_reorder_cuda_kernel(
     scalar_t* __restrict__ output_ptr,
     const int* __restrict__ src2dst_ptr,
     const int* __restrict__ topk_ids_ptr,
-    const float* __restrict__ topk_weights_ptr,
+    const scalar_t* __restrict__ topk_weights_ptr,
     int start_expert_id,
     int end_expert_id,
     int topk,
@@ -83,7 +83,7 @@ __global__ void ep_post_reorder_cuda_kernel(
 
   const int* token_src2dst = src2dst_ptr + token_idx * topk;
   const int* token_topk_ids = topk_ids_ptr + token_idx * topk;
-  const float* token_topk_weights = topk_weights_ptr + token_idx * topk;
+  const scalar_t* token_topk_weights = topk_weights_ptr + token_idx * topk;
 
   scalar_t* dst_ptr = output_ptr + static_cast<int64_t>(token_idx) * hidden_size;
 
@@ -94,22 +94,23 @@ __global__ void ep_post_reorder_cuda_kernel(
   for (int idx = tid; idx < vec_iters; idx += blockDim.x) {
     vec_t acc;
 #pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i)
-      acc[i] = 0.f;
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      acc[i] = scalar_t(0);
+    }
 
     for (int k = 0; k < topk; ++k) {
       const int expert_id = token_topk_ids[k];
       if (expert_id < start_expert_id || expert_id > end_expert_id) continue;
       const int src_row = token_src2dst[k];
       const scalar_t* src_ptr = down_output_ptr + static_cast<int64_t>(src_row) * hidden_size;
-      const float weight = token_topk_weights[k];
+      const scalar_t weight = token_topk_weights[k];
 
       vec_t src_vec;
       src_vec.cast_load(src_ptr + idx * vec_size);
 
 #pragma unroll
       for (uint32_t i = 0; i < vec_size; ++i) {
-        acc[i] += static_cast<float>(src_vec[i]) * weight;
+        acc[i] += src_vec[i] * weight;
       }
     }
     acc.cast_store(dst_ptr + idx * vec_size);
@@ -169,7 +170,7 @@ void ep_moe_post_reorder(
         static_cast<scalar_t*>(output.data_ptr()),
         src2dst.data_ptr<int>(),
         topk_ids.data_ptr<int>(),
-        topk_weights.data_ptr<float>(),
+        static_cast<scalar_t*>(topk_weights.data_ptr()),
         static_cast<int>(start_expert_id),
         static_cast<int>(end_expert_id),
         static_cast<int>(topk),
