@@ -355,7 +355,12 @@ class ModelRunner:
                 if is_hopper_with_cuda_12_3():
                     server_args.attention_backend = "fa3"
                 elif _is_hip:
-                    server_args.attention_backend = "aiter"
+                    head_num = self.model_config.get_num_kv_heads(self.tp_size)
+                    # TODO current aiter does not support head number 32
+                    if head_num != 32 and self.spec_algorithm.is_none():
+                        server_args.attention_backend = "aiter"
+                    else:
+                        server_args.attention_backend = "triton"
                 else:
                     server_args.attention_backend = "triton"
             logger.info(
