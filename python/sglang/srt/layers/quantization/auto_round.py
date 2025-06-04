@@ -156,7 +156,9 @@ class AutoRoundConfig(QuantizationConfig):
 
         quantized = True
         if self.block_name_to_quantize:
-            quantized = any(layer_name.startswith(name) for name in self.block_name_to_quantize)
+            quantized = any(
+                layer_name.startswith(name) for name in self.block_name_to_quantize
+            )
         elif isinstance(layer, ParallelLMHead):
             quantized = False
 
