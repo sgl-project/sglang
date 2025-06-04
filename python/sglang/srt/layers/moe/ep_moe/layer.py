@@ -3,13 +3,12 @@ from typing import Callable, List, Optional, Tuple
 
 import einops
 import torch
-from torch.nn import Module
-
 from sglang.srt import debug_utils
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from torch.nn import Module
 
 try:
     from deep_gemm import fp8_m_grouped_gemm_nt_masked, m_grouped_fp8_gemm_nt_contiguous
@@ -298,7 +297,7 @@ class EPMoE(torch.nn.Module):
         )
         dispose_tensor(hidden_states)
 
-        seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
+        seg_indptr_cur_rank = seg_indptr[self.start_expert_id: self.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
             0,
             self.num_experts_per_partition,
@@ -497,7 +496,7 @@ class EPMoE(torch.nn.Module):
         elif shard_id == "w1":
             param.data[expert_id][: self.intermediate_size, :] = loaded_weight
         elif shard_id == "w3":
-            param.data[expert_id][self.intermediate_size :, :] = loaded_weight
+            param.data[expert_id][self.intermediate_size:, :] = loaded_weight
         else:
             raise ValueError(f"Expected shard_id w1,w2 or w3 but got {shard_id}")
 
@@ -530,11 +529,11 @@ class EPMoE(torch.nn.Module):
                 block_n, block_k = self.block_shape[0], self.block_shape[1]
                 if shard_id == "w1":
                     param_data[expert_id][
-                        : (self.intermediate_size + block_n - 1) // block_n, :
+                    : (self.intermediate_size + block_n - 1) // block_n, :
                     ] = loaded_weight
                 elif shard_id == "w3":
                     param_data[expert_id][
-                        (self.intermediate_size + block_n - 1) // block_n :, :
+                    (self.intermediate_size + block_n - 1) // block_n:, :
                     ] = loaded_weight
                 else:  # w2
                     param_data[expert_id] = loaded_weight
@@ -1187,8 +1186,7 @@ class DeepEPMoE(EPMoE):
         num_groups, m, k = hidden_states_fp8[0].size()
         n = self.w13_weight.size(1)
         expected_m = min(expected_m, m)
-        # NOTE HACK use zeros instead of empty
-        gateup_output = torch.zeros(
+        gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_fp8[0].device, dtype=torch.bfloat16
         )
         fp8_m_grouped_gemm_nt_masked(
@@ -1201,8 +1199,7 @@ class DeepEPMoE(EPMoE):
         )
 
         # Act
-        # NOTE HACK use zeros instead of empty
-        down_input = torch.zeros(
+        down_input = torch.empty(
             (
                 gateup_output.shape[0],
                 gateup_output.shape[1],
@@ -1212,8 +1209,7 @@ class DeepEPMoE(EPMoE):
             dtype=self.fp8_dtype,
         )
         scale_block_size = 128
-        # NOTE HACK use zeros instead of empty
-        down_input_scale = torch.zeros(
+        down_input_scale = torch.empty(
             (
                 gateup_output.shape[0],
                 gateup_output.shape[1],
@@ -1246,8 +1242,7 @@ class DeepEPMoE(EPMoE):
             # get_col_major_tma_aligned_tensor(down_input_scale),
             down_input_scale,
         )
-        # NOTE HACK use zeros instead of empty
-        down_output = torch.zeros(
+        down_output = torch.empty(
             (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16
         )
         fp8_m_grouped_gemm_nt_masked(
