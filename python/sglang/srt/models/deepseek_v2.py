@@ -1711,7 +1711,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 global_server_args_dict["num_fused_shared_experts"] = self.tp_size
                 log_info_on_rank0(
                     logger,
-                    "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled.",
+                    "Deepseek V3/R1 with fp8/fp4 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled.",
                 )
 
     def get_input_embeddings(self) -> nn.Embedding:
