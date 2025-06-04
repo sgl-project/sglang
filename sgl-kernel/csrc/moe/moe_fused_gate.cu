@@ -58,7 +58,6 @@ __device__ void moe_fused_gate_impl(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
-    int64_t num_fused_shared_experts,
     double routed_scaling_factor,
     Params params) {
   int tidx = threadIdx.x;
