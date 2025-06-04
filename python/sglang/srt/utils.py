@@ -2614,5 +2614,10 @@ def get_cpu_ids_by_node():
     return cpu_ids
 
 
-def is_shm_available(dtype):
-    return cpu_has_amx_support() and dtype in [torch.bfloat16, torch.float]
+def is_shm_available(dtype, world_size, local_size):
+    return (
+        cpu_has_amx_support()
+        and dtype in [torch.bfloat16, torch.float]
+        and world_size >= 1
+        and world_size == local_size
+    )
