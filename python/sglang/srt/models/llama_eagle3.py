@@ -35,8 +35,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.models.llama import LlamaAttention, LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
-
+from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
     def __init__(
@@ -59,15 +58,20 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             prefix=add_prefix("qkv_proj", prefix),
         )
 
-        self.mlp = LlamaMLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-            quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
-        )
+        if config.model_type == "llama4_text":
+            inter_size = config.intermediate_size_mlp
+        else:
+            inter_size = config.intermediate_size
+
+        self.mlp = LlamaMLP(config.hidden_size, inter_size, config.hidden_act, quant_config, prefix)
+
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+
 
     def forward(
         self,
@@ -113,13 +117,18 @@ class LlamaModel(nn.Module):
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
         )
-        self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
+
         if hasattr(config, "target_hidden_size"):
-            self.fc = torch.nn.Linear(config.target_hidden_size * 3, config.hidden_size)
+            self.hidden_size_in = config.target_hidden_size
         else:
-            self.fc = torch.nn.Linear(config.hidden_size * 3, config.hidden_size)
+            self.hidden_size_in = config.hidden_size
+
+        self.fc = torch.nn.Linear(self.hidden_size_in * 3, config.hidden_size, bias=getattr(config,"bias",False))
+
+        self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
 
     def forward(
         self,
@@ -187,7 +196,6 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = True
-        self.hot_token_id = None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         for name, loaded_weight in weights:

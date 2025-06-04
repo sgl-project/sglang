@@ -535,7 +535,7 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         prefix: str = "",
     ):
         return Llama4Model(config, quant_config=quant_config, prefix=prefix)
-    
+
     def set_eagle3_layers_to_capture(self):
         from sglang.srt.distributed import get_pp_group  
         self.pp_group = get_pp_group()
