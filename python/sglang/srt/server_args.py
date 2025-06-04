@@ -429,7 +429,7 @@ class ServerArgs:
                     "Mixed chunked prefill is disabled because of using "
                     "eagle speculative decoding."
                 )
-            
+
             model_arch = get_model_arch(self)
 
             # Auto set draft_model_path DeepSeek-V3/R1
