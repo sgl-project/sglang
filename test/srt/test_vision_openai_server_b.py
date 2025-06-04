@@ -177,9 +177,26 @@ class TestKimiVLServer(TestOpenAIVisionServer):
 class TestPhi4MMServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
+        # Manually download LoRA adapter_config.json as it's not downloaded by the model loader by default.
+        from huggingface_hub import constants, snapshot_download
+
+        snapshot_download(
+            "microsoft/Phi-4-multimodal-instruct",
+            allow_patterns=["**/adapter_config.json"],
+        )
+
         cls.model = "microsoft/Phi-4-multimodal-instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
+        cls.request_extra_kwargs = {
+            "extra_body": {
+                "lora_path": "vision",
+                "top_k": 1,
+                "top_p": 1.0,
+            }
+        }
+
+        revision = "33e62acdd07cd7d6635badd529aa0a3467bb9c6a"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -188,15 +205,18 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
                 "--trust-remote-code",
                 "--mem-fraction-static",
                 "0.75",
+                "--disable-radix-cache",
+                "--max-loras-per-batch",
+                "1",
+                "--revision",
+                revision,
+                "--lora-paths",
+                f"vision={constants.HF_HUB_CACHE}/models--microsoft--Phi-4-multimodal-instruct/snapshots/{revision}/vision-lora",
             ],
         )
         cls.base_url += "/v1"
 
     def test_video_chat_completion(self):
-        pass
-
-    def test_multi_images_chat_completion(self):
-        # TODO (lifuhuang): support LoRA to enable Phi4MM multi-image understanding capability.
         pass
 
 
