@@ -69,6 +69,8 @@ from sglang.srt.openai_api.protocol import (
     FunctionResponse,
     LogProbs,
     MultimodalEmbeddingInput,
+    ScoringRequest,
+    ScoringResponse,
     ToolCall,
     TopLogprob,
     UsageInfo,
@@ -682,7 +684,9 @@ def v1_generate_response(
         elif (not isinstance(request, list)) and request.return_hidden_states:
             hidden_states = ret_item["meta_info"].get("hidden_states", None)
         if hidden_states is not None:
-            hidden_states = hidden_states[-1] if hidden_states and len(hidden_states) > 1 else []
+            hidden_states = (
+                hidden_states[-1] if hidden_states and len(hidden_states) > 1 else []
+            )
 
         finish_reason = ret_item["meta_info"]["finish_reason"]
 
@@ -883,7 +887,11 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     yield f"data: {chunk.model_dump_json()}\n\n"
                 if request.return_hidden_states and hidden_states:
                     for index, choice_hidden_states in hidden_states.items():
-                        last_token_hidden_states = choice_hidden_states[-1] if choice_hidden_states and len(choice_hidden_states) > 1 else []
+                        last_token_hidden_states = (
+                            choice_hidden_states[-1]
+                            if choice_hidden_states and len(choice_hidden_states) > 1
+                            else []
+                        )
                         hidden_states_chunk = CompletionStreamResponse(
                             id=content["meta_info"]["id"],
                             created=created,
@@ -1337,7 +1345,9 @@ def v1_chat_generate_response(
             include_hidden_states = False
         if include_hidden_states and ret_item["meta_info"].get("hidden_states", None):
             hidden_states = ret_item["meta_info"]["hidden_states"]
-            hidden_states = hidden_states[-1] if hidden_states and len(hidden_states) > 1 else []
+            hidden_states = (
+                hidden_states[-1] if hidden_states and len(hidden_states) > 1 else []
+            )
         else:
             hidden_states = None
 
@@ -1800,14 +1810,20 @@ async def v1_chat_completions(
                     usage = None
                 if request.return_hidden_states and hidden_states:
                     for index, choice_hidden_states in hidden_states.items():
-                        last_token_hidden_states = choice_hidden_states[-1] if choice_hidden_states and len(choice_hidden_states) > 1 else []
+                        last_token_hidden_states = (
+                            choice_hidden_states[-1]
+                            if choice_hidden_states and len(choice_hidden_states) > 1
+                            else []
+                        )
                         hidden_states_chunk = ChatCompletionStreamResponse(
                             id=content["meta_info"]["id"],
                             created=created,
                             choices=[
                                 ChatCompletionResponseStreamChoice(
                                     index=index,
-                                    delta=DeltaMessage(hidden_states=last_token_hidden_states),
+                                    delta=DeltaMessage(
+                                        hidden_states=last_token_hidden_states
+                                    ),
                                     finish_reason=finish_reason_type,
                                 )
                             ],
@@ -2006,3 +2022,31 @@ def to_openai_style_logprobs(
         append_top_logprobs(output_top_logprobs)
 
     return ret_logprobs
+
+
+async def v1_score(tokenizer_manager, raw_request):
+    try:
+        # Parse request
+        request_data = await raw_request.json()
+        request = ScoringRequest(**request_data)
+
+        # Use tokenizer_manager's score_request method directly
+        scores = await tokenizer_manager.score_request(
+            query=request.query,
+            items=request.items,
+            label_token_ids=request.label_token_ids,
+            apply_softmax=request.apply_softmax,
+            item_first=request.item_first,
+            request=request,
+        )
+
+        # Create response with just the scores, without usage info
+        response = ScoringResponse(
+            scores=scores,
+            model=request.model,
+        )
+        return response
+
+    except Exception as e:
+        logger.error(f"Error in v1_score: {str(e)}")
+        return create_error_response(str(e))
