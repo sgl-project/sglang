@@ -197,6 +197,9 @@ class MooncakeKVManager(BaseKVManager):
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker = defaultdict(list)
             self.connection_lock = threading.Lock()
+            self.required_prefill_info_num = 1
+            self.decode_kv_arrive_state: Dict[int, Set[int]] = defaultdict(set)
+            self.decode_kv_expected_num: Dict[int, int] = {}  
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 float(os.getenv("SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL", 5.0)), 2.0
@@ -425,7 +428,7 @@ class MooncakeKVManager(BaseKVManager):
         return status
 
     def sync_status_to_decode_endpoint(
-        self, remote: str, dst_port: int, room: int, status: int
+        self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
         if ":" in remote:
             remote = remote.split(":")[0]
@@ -433,6 +436,7 @@ class MooncakeKVManager(BaseKVManager):
             [
                 str(room).encode("ascii"),
                 str(status).encode("ascii"),
+                str(prefill_rank).encode("ascii"),
             ]
         )
 
@@ -449,6 +453,7 @@ class MooncakeKVManager(BaseKVManager):
                 )
                 polls = []
                 dst_ranks_infos = []
+                local_rank = self.kv_args.engine_rank
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -464,6 +469,7 @@ class MooncakeKVManager(BaseKVManager):
                                     req.dst_port,
                                     req.room,
                                     KVPoll.Failed,
+                                    local_rank,
                                 )
                                 break
 
@@ -517,7 +523,7 @@ class MooncakeKVManager(BaseKVManager):
                             )
                             self.update_status(kv_chunk.room, KVPoll.Failed)
                             self.sync_status_to_decode_endpoint(
-                                req.endpoint, req.dst_port, req.room, KVPoll.Failed
+                                req.endpoint, req.dst_port, req.room, KVPoll.Failed,local_rank
                             )
                             break
 
@@ -542,7 +548,7 @@ class MooncakeKVManager(BaseKVManager):
                                 self.update_status(req.room, status)
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
-                                        endpoint, dst_port, room, status
+                                        endpoint, dst_port, room, status, local_rank
                                     )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
@@ -608,15 +614,24 @@ class MooncakeKVManager(BaseKVManager):
 
         def decode_thread():
             while True:
-                (bootstrap_room, status) = self.server_socket.recv_multipart()
+                (bootstrap_room, status, prefill_rank) = self.server_socket.recv_multipart()
                 status = int(status.decode("ascii"))
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
-                if status == KVPoll.Failed:
+                prefill_rank = int(prefill_rank.decode("ascii"))  
+
+                if status == KVPoll.Success:
+                    # record arrived prefill_rank 
+                    self.decode_kv_arrive_state[bootstrap_room].add(prefill_rank)
+                    arrived_prefill_num = len(self.decode_kv_arrive_state[bootstrap_room])
+                    if (arrived_prefill_num == self.required_prefill_info_num) or self.is_mla_backend :
+                        self.update_status(bootstrap_room, KVPoll.Success)
+                
+                elif status == KVPoll.Failed:
                     self.record_failure(
                         bootstrap_room,
                         f"Failed to get kvcache from prefill instance, it might be dead",
                     )
-                self.update_status(bootstrap_room, status)
+                    self.update_status(bootstrap_room, status)
 
         def heartbeat_checker():
             while True:
@@ -937,6 +952,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
             )
             self.required_dst_info_num = 1
+            self.required_prefill_info_num = 1
             self.target_tp_ranks = [self.target_tp_rank]
         elif local_tp_size_per_dp_rank > prefill_tp_size_per_dp_rank:
             self.target_tp_rank = (
@@ -945,6 +961,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.required_dst_info_num = (
                 local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank
             )
+            self.required_prefill_info_num = 1
             self.target_tp_ranks = [self.target_tp_rank]
         else:
             # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks for non MLA models;
@@ -963,9 +980,12 @@ class MooncakeKVReceiver(BaseKVReceiver):
             # or the KVPoll will never be set correctly
             self.target_tp_rank = self.target_tp_ranks[0]
             self.required_dst_info_num = 1
+            self.required_prefill_info_num = (
+                prefill_tp_size_per_dp_rank // local_tp_size_per_dp_rank
+            )
 
         self.target_dp_group = self.bootstrap_room % self.prefill_dp_size
-
+        self.kv_mgr.required_prefill_info_num = self.required_prefill_info_num
         # NOTE: key distinguished by bootstrap_addr, target_dp_group, and target_tp_rank
         bootstrap_key = (
             f"{self.bootstrap_addr}_{self.target_dp_group}_{self.target_tp_rank}"
