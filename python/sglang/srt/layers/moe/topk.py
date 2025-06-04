@@ -398,12 +398,21 @@ def select_experts(
             num_token_non_padded is None
         ), "num_token_non_padded is not yet supported in fused_topk_native"
         assert expert_location_dispatch_info is None
-        topk_weights, topk_ids = fused_topk_native(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=top_k,
-            renormalize=renormalize,
-        )
+        device = hidden_states.device
+        if device == torch.device("cpu") and _is_cpu_amx:
+            topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+            )
+        else:
+            topk_weights, topk_ids = fused_topk_native(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+            )
     elif custom_routing_function is None:
         # Qwen3MOE uses fused_topk
         topk_weights, topk_ids = fused_topk(
