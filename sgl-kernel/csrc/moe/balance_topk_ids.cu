@@ -17,30 +17,41 @@ __global__ void gpu_workloads_count_kernel(
     const int32_t num_logical_experts,
     const int32_t num_gpus,
     const int32_t num_topk_ids,
-    int32_t* __restrict__ gpu_workloads,         // [num_gpus]
-    int32_t* __restrict__ grouped_gpu_workloads  // [ceil_div(num_topk_ids/GROUP_SIZE), num_gpus]
+    int32_t* __restrict__ gpu_workloads,                // [num_gpus]
+    int32_t* __restrict__ grouped_gpu_workloads,        // [ceil_div(num_topk_ids/GROUP_SIZE), num_gpus]
+    int32_t* __restrict__ cumsum_grouped_gpu_workloads  // [ceil_div(num_topk_ids/GROUP_SIZE), num_gpus]
 ) {
   __shared__ int32_t smem_grouped_gpu_workloads[MAX_NUM_GPUS];
 
-  if (threadIdx.x < num_gpus) {
-    smem_grouped_gpu_workloads[threadIdx.x] = 0;
+  const int32_t num_groups = (num_topk_ids + GROUP_SIZE - 1) / GROUP_SIZE;
+  const int32_t num_logical_experts_per_gpu = num_logical_experts / num_gpus;
+  int32_t previous_cumsum_grouped_gpu_workload = 0;
+
+  for (int32_t group_idx = 0; group_idx < num_groups; ++group_idx) {
+    if (threadIdx.x < num_gpus) {
+      smem_grouped_gpu_workloads[threadIdx.x] = 0;
+    }
+    __syncthreads();
+
+    const int32_t global_idx = group_idx * GROUP_SIZE + threadIdx.x;
+
+    if (global_idx < num_topk_ids) {
+      const int32_t topk_id = topk_ids[global_idx];
+      const int32_t gpu_id = topk_id / num_logical_experts_per_gpu;
+      atomicAdd(&smem_grouped_gpu_workloads[gpu_id], 1);
+    }
+
+    __syncthreads();
+    if (threadIdx.x < num_gpus) {
+      int32_t workload = smem_grouped_gpu_workloads[threadIdx.x];
+      grouped_gpu_workloads[group_idx * num_gpus + threadIdx.x] = workload;
+      previous_cumsum_grouped_gpu_workload += workload;
+      cumsum_grouped_gpu_workloads[group_idx * num_gpus + threadIdx.x] = previous_cumsum_grouped_gpu_workload;
+    }
+    __syncthreads();
   }
-  __syncthreads();
-
-  const int32_t global_id = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (global_id < num_topk_ids) {
-    const int32_t topk_id = topk_ids[global_id];
-    const int32_t num_logical_experts_per_gpu = num_logical_experts / num_gpus;
-    const int32_t gpu_id = topk_id / num_logical_experts_per_gpu;
-    atomicAdd(&smem_grouped_gpu_workloads[gpu_id], 1);
-  }
-
-  __syncthreads();
   if (threadIdx.x < num_gpus) {
-    int32_t workload = smem_grouped_gpu_workloads[threadIdx.x];
-    grouped_gpu_workloads[blockIdx.x * num_gpus + threadIdx.x] = workload;
-    atomicAdd(&gpu_workloads[threadIdx.x], workload);
+    gpu_workloads[threadIdx.x] = previous_cumsum_grouped_gpu_workload;
   }
 }
 
@@ -86,7 +97,6 @@ __global__ void search_balance_mapping_kernel(
       MIN(local_search_interval_left + (num_search_iter - 1) * search_stride, global_search_interval_right);
 
   int32_t headroom_on_gpus_after_balance[MAX_NUM_GPUS];
-  int32_t workload_waiting_for_balance[MAX_NUM_GPUS];
   int32_t i32_max_workload_after_balance = -1;
 
   for (int32_t capacity = local_search_interval_left; capacity <= local_search_interval_right;
@@ -95,7 +105,6 @@ __global__ void search_balance_mapping_kernel(
     // and then verify whether this assumption is true.
     for (int32_t gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
       headroom_on_gpus_after_balance[gpu_id] = capacity;
-      workload_waiting_for_balance[gpu_id] = smem_gpu_workloads_wo_balance[gpu_id];
     }
     int32_t num_balanced_topk_ids = 0;
 
@@ -103,19 +112,18 @@ __global__ void search_balance_mapping_kernel(
       // We start with the GPU with most workload and transfer its workload to other GPUs which loaded redundant
       // experts.
       int32_t gpu_id = (gpu_id_with_max_workload_wo_balance + i) % num_gpus;
+      // how much workload on current GPU
+      int32_t workload_waiting_for_balance = smem_gpu_workloads_wo_balance[gpu_id];
       for (int32_t multiple_idx = expert_copies_multiple - 1; multiple_idx >= 0; --multiple_idx) {
-        // how much workload on current GPU
-        int32_t task = workload_waiting_for_balance[gpu_id];
-
         // the gpu id which we want to transfer workload to
-        int32_t balance_gpu_id = (gpu_id - multiple_idx + num_gpus) % num_gpus;
+        const int32_t balance_gpu_id = (gpu_id - multiple_idx + num_gpus) % num_gpus;
 
         // calculate how many workload balance_gpu_id can actually accept
-        int32_t headroom = headroom_on_gpus_after_balance[balance_gpu_id];
-        int32_t num_tokens_actual_accept = MIN(task, headroom);
+        const int32_t headroom = headroom_on_gpus_after_balance[balance_gpu_id];
+        const int32_t num_tokens_actual_accept = MIN(workload_waiting_for_balance, headroom);
 
         // update the remaining workload and capacity
-        workload_waiting_for_balance[gpu_id] -= num_tokens_actual_accept;
+        workload_waiting_for_balance -= num_tokens_actual_accept;
         headroom_on_gpus_after_balance[balance_gpu_id] -= num_tokens_actual_accept;
         num_balanced_topk_ids += num_tokens_actual_accept;
       }
@@ -139,19 +147,18 @@ __global__ void search_balance_mapping_kernel(
     // The current thread has obtained the optimal answer and needs to output the solution to shared memory.
     for (int32_t gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
       headroom_on_gpus_after_balance[gpu_id] = i32_max_workload_after_balance;
-      workload_waiting_for_balance[gpu_id] = smem_gpu_workloads_wo_balance[gpu_id];
     }
 
     for (int32_t i = 0; i < num_gpus; ++i) {
-      int32_t gpu_id = (gpu_id_with_max_workload_wo_balance + i) % num_gpus;
+      const int32_t gpu_id = (gpu_id_with_max_workload_wo_balance + i) % num_gpus;
+      int32_t workload_waiting_for_balance = smem_gpu_workloads_wo_balance[gpu_id];
       for (int32_t multiple_idx = expert_copies_multiple - 1; multiple_idx >= 0; --multiple_idx) {
-        int32_t task = workload_waiting_for_balance[gpu_id];
-        int32_t balance_gpu_id = (gpu_id - multiple_idx + num_gpus) % num_gpus;
+        const int32_t balance_gpu_id = (gpu_id - multiple_idx + num_gpus) % num_gpus;
 
-        int32_t headroom = headroom_on_gpus_after_balance[balance_gpu_id];
-        int32_t num_tokens_actual_accept = MIN(task, headroom);
+        const int32_t headroom = headroom_on_gpus_after_balance[balance_gpu_id];
+        const int32_t num_tokens_actual_accept = MIN(workload_waiting_for_balance, headroom);
 
-        workload_waiting_for_balance[gpu_id] -= num_tokens_actual_accept;
+        workload_waiting_for_balance -= num_tokens_actual_accept;
         headroom_on_gpus_after_balance[balance_gpu_id] -= num_tokens_actual_accept;
         smem_gpu_workloads_balance_mapping[multiple_idx * MAX_NUM_GPUS + gpu_id] = num_tokens_actual_accept;
       }
@@ -212,6 +219,7 @@ __global__ void rewrite_topk_ids_by_balance_mapping_kernel(
     const int32_t* __restrict__ topk_ids,
     const int32_t* __restrict__ gpu_workloads_balance_mapping,
     const int32_t* __restrict__ grouped_gpu_workloads_wo_balance,
+    const int32_t* __restrict__ cumsum_grouped_gpu_workloads_wo_balance,
     const int32_t num_gpus,
     const int32_t num_topk_ids,
     const int32_t num_logical_experts,
@@ -219,7 +227,6 @@ __global__ void rewrite_topk_ids_by_balance_mapping_kernel(
     int32_t* __restrict__ new_topk_ids) {
   __shared__ int32_t smem_new_topk_ids[GROUP_SIZE];
   __shared__ int32_t smem_gpu_workloads_balance_mapping[MAX_EXPERT_COPIES_MULTIPLE * MAX_NUM_GPUS];
-  __shared__ int32_t smem_group_gpu_workloads_wo_balance[MAX_NUM_GPUS];
 
   __shared__ int32_t smem_target_multiple_indices[MAX_NUM_GPUS];
   __shared__ int32_t smem_num_cases_balance_to_multi_gpus;
@@ -230,124 +237,111 @@ __global__ void rewrite_topk_ids_by_balance_mapping_kernel(
   const int32_t num_physical_experts_per_gpu = num_physical_experts / num_gpus;
 
   const int32_t tid = threadIdx.x;
-  const int32_t num_group = (num_topk_ids + GROUP_SIZE - 1) / GROUP_SIZE;
+  const int32_t global_tid = blockIdx.x * GROUP_SIZE + threadIdx.x;
+  const int32_t group_idx = blockIdx.x;
+
+  if (tid == 0) {
+    smem_num_cases_balance_to_multi_gpus = 0;
+  }
+  __syncthreads();
 
   if (tid < num_gpus) {
-    for (int32_t i = 0; i < expert_copies_multiple; ++i) {
-      smem_gpu_workloads_balance_mapping[i * MAX_NUM_GPUS + tid] = gpu_workloads_balance_mapping[i * num_gpus + tid];
-    }
-  }
-
-  for (int32_t group_idx = 0; group_idx < num_group; ++group_idx) {
-    const int32_t load_idx = group_idx * GROUP_SIZE + tid;
-
-    // load a group of workload
-    if (tid < num_gpus) {
-      smem_group_gpu_workloads_wo_balance[tid] = grouped_gpu_workloads_wo_balance[group_idx * num_gpus + tid];
-    }
-    if (tid == 0) {
-      smem_num_cases_balance_to_multi_gpus = 0;
+    int32_t workload_balanced_by_previous_groups = 0;
+    if (group_idx != 0) {
+      workload_balanced_by_previous_groups = cumsum_grouped_gpu_workloads_wo_balance[(group_idx - 1) * num_gpus + tid];
     }
 
-    __syncthreads();
+    int32_t group_task = grouped_gpu_workloads_wo_balance[group_idx * num_gpus + tid];
+    bool determined = false;
 
     // Determine whether the following situation A exists: In this group of workloads,
     // there is a GPU that wants to distribute its own workload to at least two other GPUs(including itself).
-    if (tid < num_gpus) {
-      int32_t task = smem_group_gpu_workloads_wo_balance[tid];
-      for (int32_t multiple_idx = expert_copies_multiple - 1; multiple_idx >= 0; --multiple_idx) {
-        int32_t headroom = smem_gpu_workloads_balance_mapping[multiple_idx * MAX_NUM_GPUS + tid];
-        if (headroom == 0) {
-          continue;
-        }
-        bool balance_to_exactly_single_gpu = task <= headroom;
-        if (balance_to_exactly_single_gpu) {
-          smem_target_multiple_indices[tid] = multiple_idx;
-        } else {
-          atomicAdd(&smem_num_cases_balance_to_multi_gpus, 1);
-        }
-        break;
+    // If the situation A exists, we will get smem_num_cases_balance_to_multi_gpus > 0.
+    int32_t num_cases_balance_to_multi_gpus = 0;
+    for (int32_t multiple_idx = expert_copies_multiple - 1; multiple_idx >= 0; --multiple_idx) {
+      int32_t headroom = gpu_workloads_balance_mapping[multiple_idx * num_gpus + tid];
+      const int32_t tmp = MIN(headroom, workload_balanced_by_previous_groups);
+      headroom -= tmp;
+      workload_balanced_by_previous_groups -= tmp;
+      smem_gpu_workloads_balance_mapping[multiple_idx * MAX_NUM_GPUS + tid] = headroom;
+      if (headroom == 0 || determined) {
+        continue;
       }
-    }
-    __syncthreads();
 
-    int32_t logical_expert_id = 0;
-    int32_t gpu_id = 0;
-    int32_t physical_expert_id = 0;
-
-    if (load_idx < num_topk_ids) {
-      logical_expert_id = topk_ids[load_idx];
-      gpu_id = logical_expert_id / num_logical_experts_per_gpu;
-      physical_expert_id = logical_expert_id + gpu_id * (num_physical_experts_per_gpu - num_logical_experts_per_gpu);
-    }
-
-    if (smem_num_cases_balance_to_multi_gpus == 0) {
-      // Happy path:
-      // Situation A does not exist. In the current grouped workload,
-      // all GPUs will send their workloads to the corresponding only GPU.
-      // We can achieve maximum concurrency.
-      if (load_idx < num_topk_ids) {
-        // The token originally dispatched to GPU i will be dispatched to GPU (i-target_multiple_idx)
-        const int32_t target_multiple_idx = smem_target_multiple_indices[gpu_id];
-        int32_t new_topk_id =
-            physical_expert_id - target_multiple_idx * (expert_copies_multiple - 1) * num_logical_experts_per_gpu;
-        new_topk_id = (new_topk_id + num_physical_experts) % num_physical_experts;
-        new_topk_ids[load_idx] = new_topk_id;
-        atomicSub(&smem_gpu_workloads_balance_mapping[target_multiple_idx * MAX_NUM_GPUS + gpu_id], 1);
+      const bool balance_to_exactly_single_gpu = group_task <= headroom;
+      if (balance_to_exactly_single_gpu) {
+        smem_target_multiple_indices[tid] = multiple_idx;
+      } else {
+        num_cases_balance_to_multi_gpus += 1;
       }
-      continue;
+      determined = true;
     }
-
-    if (tid < num_gpus) {
-      smem_group_gpu_workloads_counter[tid] = 0;
+    if (num_cases_balance_to_multi_gpus > 0) {
+      atomicAdd(&smem_num_cases_balance_to_multi_gpus, 1);
     }
-    __syncthreads();
+  }
+  __syncthreads();
 
-    if (load_idx < num_topk_ids) {
-      for (int32_t query_gpu_id = 0; query_gpu_id < num_gpus; ++query_gpu_id) {
-        if (query_gpu_id != gpu_id) {
-          continue;
-        }
-        // All threads with topk_id belonging to the same gpu will execute to this point
-        // Get a sequence number by atomicAdd, which determines which gpu the token will transfer to
-        const int32_t idx = static_cast<int32_t>(atomicAdd(&smem_group_gpu_workloads_counter[gpu_id], 1));
-        int32_t acc = 0;
-        int32_t multiple_idx = expert_copies_multiple - 1;
-        for (; multiple_idx >= 0; --multiple_idx) {
-          int32_t headroom = smem_gpu_workloads_balance_mapping[multiple_idx * MAX_NUM_GPUS + gpu_id];
-          int32_t next_acc = acc + headroom;
-          if (acc <= idx && idx < next_acc) {
-            break;
-          }
-          acc = next_acc;
-        }
-        // The token originally dispatched to GPU i will be dispatched to GPU (i-target_multiple_idx)
-        int32_t new_topk_id =
-            physical_expert_id - multiple_idx * (expert_copies_multiple - 1) * num_logical_experts_per_gpu;
-        new_topk_id = (new_topk_id + num_physical_experts) % num_physical_experts;
-        smem_new_topk_ids[tid] = new_topk_id;
+  int32_t logical_expert_id = 0;
+  int32_t gpu_id = 0;
+  int32_t physical_expert_id = 0;
+
+  if (global_tid < num_topk_ids) {
+    logical_expert_id = topk_ids[global_tid];
+    gpu_id = logical_expert_id / num_logical_experts_per_gpu;
+    physical_expert_id = logical_expert_id + gpu_id * (num_physical_experts_per_gpu - num_logical_experts_per_gpu);
+  }
+
+  if (smem_num_cases_balance_to_multi_gpus == 0) {
+    // Happy path:
+    // Situation A does not exist. In the current grouped workload,
+    // all GPUs will send their workloads to the corresponding only GPU.
+    // We can achieve maximum concurrency.
+    if (global_tid < num_topk_ids) {
+      // The token originally dispatched to GPU i will be dispatched to GPU (i-target_multiple_idx)
+      const int32_t target_multiple_idx = smem_target_multiple_indices[gpu_id];
+      int32_t new_topk_id =
+          physical_expert_id - target_multiple_idx * (expert_copies_multiple - 1) * num_logical_experts_per_gpu;
+      new_topk_id = (new_topk_id + num_physical_experts) % num_physical_experts;
+      new_topk_ids[global_tid] = new_topk_id;
+    }
+    return;
+  }
+
+  if (tid < num_gpus) {
+    smem_group_gpu_workloads_counter[tid] = 0;
+  }
+  __syncthreads();
+
+  if (global_tid < num_topk_ids) {
+    for (int32_t query_gpu_id = 0; query_gpu_id < num_gpus; ++query_gpu_id) {
+      if (query_gpu_id != gpu_id) {
+        continue;
       }
-    }
-
-    __syncthreads();
-    // update the remaining workloads and write results to global memory
-    if (tid < num_gpus) {
-      int32_t task = smem_group_gpu_workloads_wo_balance[tid];
-      for (int32_t multiple_idx = expert_copies_multiple - 1; multiple_idx >= 0 && task > 0; --multiple_idx) {
-        int32_t headroom = smem_gpu_workloads_balance_mapping[multiple_idx * MAX_NUM_GPUS + tid];
-        if (headroom == 0) {
-          continue;
+      // All threads with topk_id belonging to the same gpu will execute to this point
+      // Get a sequence number by atomicAdd, which determines which gpu the token will transfer to
+      const int32_t idx = static_cast<int32_t>(atomicAdd(&smem_group_gpu_workloads_counter[gpu_id], 1));
+      int32_t acc = 0;
+      int32_t multiple_idx = expert_copies_multiple - 1;
+      for (; multiple_idx >= 0; --multiple_idx) {
+        int32_t headroom = smem_gpu_workloads_balance_mapping[multiple_idx * MAX_NUM_GPUS + gpu_id];
+        int32_t next_acc = acc + headroom;
+        if (acc <= idx && idx < next_acc) {
+          break;
         }
-        int32_t finished_task = MIN(task, headroom);
-        smem_gpu_workloads_balance_mapping[multiple_idx * MAX_NUM_GPUS + tid] = headroom - finished_task;
-        task -= finished_task;
+        acc = next_acc;
       }
+      // The token originally dispatched to GPU i will be dispatched to GPU (i-target_multiple_idx)
+      int32_t new_topk_id =
+          physical_expert_id - multiple_idx * (expert_copies_multiple - 1) * num_logical_experts_per_gpu;
+      new_topk_id = (new_topk_id + num_physical_experts) % num_physical_experts;
+      smem_new_topk_ids[tid] = new_topk_id;
     }
+  }
 
-    if (load_idx < num_topk_ids) {
-      new_topk_ids[load_idx] = smem_new_topk_ids[tid];
-    }
-    __syncthreads();
+  __syncthreads();
+  if (global_tid < num_topk_ids) {
+    new_topk_ids[global_tid] = smem_new_topk_ids[tid];
   }
 }
 
@@ -375,20 +369,23 @@ void balance_topk_ids(
 
   auto i32_options = torch::TensorOptions().dtype(torch::kInt32).device(topk_ids.device());
   torch::Tensor gpu_workloads_wo_balance = torch::zeros({num_gpus}, i32_options);
-  int32_t num_group = (num_topk_ids + GROUP_SIZE - 1) / GROUP_SIZE;
+  int32_t num_groups = (num_topk_ids + GROUP_SIZE - 1) / GROUP_SIZE;
   torch::Tensor grouped_gpu_workloads_wo_balance =
-      torch::empty({static_cast<int64_t>(num_group), num_gpus}, i32_options);
+      torch::empty({static_cast<int64_t>(num_groups), num_gpus}, i32_options);
+  torch::Tensor cumsum_grouped_gpu_workloads_wo_balance =
+      torch::empty({static_cast<int64_t>(num_groups), num_gpus}, i32_options);
 
   // gpu_workloads_wo_balance[i] indicates the number of tokens received on each gpu after
   // dispatching the token without workload balance.
   // grouped_gpu_workloads_wo_balance: similar to gpu_workloads_wo_balance, but group by GROUP_SIZE.
-  gpu_workloads_count_kernel<<<num_group, GROUP_SIZE, 0, stream>>>(
+  gpu_workloads_count_kernel<<<1, GROUP_SIZE, 0, stream>>>(
       static_cast<const int32_t*>(topk_ids.data_ptr()),
       static_cast<int32_t>(num_logical_experts),
       static_cast<int32_t>(num_gpus),
       num_topk_ids,
       static_cast<int32_t*>(gpu_workloads_wo_balance.data_ptr()),
-      static_cast<int32_t*>(grouped_gpu_workloads_wo_balance.data_ptr()));
+      static_cast<int32_t*>(grouped_gpu_workloads_wo_balance.data_ptr()),
+      static_cast<int32_t*>(cumsum_grouped_gpu_workloads_wo_balance.data_ptr()));
 
   // We traverse the entire solution space and search for how many tokens the GPU
   // with the most loadwork will receive after workload balance (saved in max_workload_after_balance).
@@ -404,10 +401,11 @@ void balance_topk_ids(
       gpu_workloads_balance_mapping);
 
   // do workload balance according to gpu_workloads_balance_mapping
-  rewrite_topk_ids_by_balance_mapping_kernel<<<1, GROUP_SIZE, 0, stream>>>(
+  rewrite_topk_ids_by_balance_mapping_kernel<<<num_groups, GROUP_SIZE, 0, stream>>>(
       static_cast<const int32_t*>(topk_ids.data_ptr()),
       static_cast<const int32_t*>(gpu_workloads_balance_mapping.data_ptr()),
       static_cast<const int32_t*>(grouped_gpu_workloads_wo_balance.data_ptr()),
+      static_cast<const int32_t*>(cumsum_grouped_gpu_workloads_wo_balance.data_ptr()),
       static_cast<int32_t>(num_gpus),
       num_topk_ids,
       static_cast<int32_t>(num_logical_experts),
