@@ -161,7 +161,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
-      "n_share_experts_fusion, float routed_scaling_factor) -> "
+      "num_fused_shared_experts, float routed_scaling_factor) -> "
       "(Tensor[])");
   m.impl("moe_fused_gate", torch::kCUDA, &moe_fused_gate);
   m.def(
