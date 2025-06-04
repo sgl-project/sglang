@@ -77,7 +77,7 @@ def import_model_classes():
                 module = importlib.import_module(name)
             except Exception as e:
                 logger.warning(f"Ignore import error when loading {name}. " f"{e}")
-                traceback.print_stack()
+                traceback.print_exc()
                 continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass
