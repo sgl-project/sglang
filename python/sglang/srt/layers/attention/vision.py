@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import dataclasses
 import functools
 import math
 from functools import lru_cache
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -37,6 +38,21 @@ ROTARY_EMBED_CLASSES = {
 }
 
 
+@dataclasses.dataclass
+class SingletonCache:
+    data: Any = None
+
+    def set_data(self, value: Any) -> None:
+        self.data = value
+
+    def get_data(self) -> Optional[Any]:
+        return self.data
+
+    def empty(self) -> bool:
+        return self.get_data() is None
+
+
+# TODO: requires real seqlens from images
 @functools.lru_cache(maxsize=128)
 def _get_cu_seqlens_for_shape(batch_size: int, seqlen: int, device) -> torch.Tensor:
     """
@@ -264,7 +280,7 @@ class VisionFlash3Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: Optional[torch.Tensor],
+        cu_seqlens: Optional[Union[SingletonCache, torch.Tensor]],
         bsz: int,
         seq_len: int,
         **kwargs,
@@ -277,6 +293,13 @@ class VisionFlash3Attention(nn.Module):
         """
         if cu_seqlens is None:
             cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+        elif isinstance(cu_seqlens, SingletonCache):
+            if cu_seqlens.empty():
+                cu_seqlens.set_data(
+                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+                )
+            cu_seqlens = cu_seqlens.get_data()
+
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).cuda()
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()

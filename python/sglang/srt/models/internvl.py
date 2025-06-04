@@ -11,7 +11,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==========================582====================================================
-
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -25,7 +24,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
@@ -77,8 +76,9 @@ class InternAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
     ) -> torch.Tensor:
-        out = self.attn(hidden_states)
+        out = self.attn(hidden_states, cu_seqlens=cu_seqlens)
         outs = self.proj_drop(out)
         return outs
 
@@ -213,6 +213,7 @@ class InternVisionEncoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
     ) -> Tuple[
         torch.FloatTensor,
         Optional[torch.FloatTensor],
@@ -222,8 +223,12 @@ class InternVisionEncoderLayer(nn.Module):
         Args:
             hidden_states (`Tuple[torch.FloatTensor, Optional[torch.FloatTensor]]`): input to the layer of shape `(batch, seq_len, embed_dim)`
         """
+
         hidden_states = hidden_states + self.drop_path1(
-            self.attn(self.norm1(hidden_states).to(hidden_states.dtype)) * self.ls1
+            self.attn(
+                self.norm1(hidden_states).to(hidden_states.dtype), cu_seqlens=cu_seqlens
+            )
+            * self.ls1
         )
 
         hidden_states = hidden_states + self.drop_path2(
@@ -290,12 +295,12 @@ class InternVisionEncoder(nn.Module):
         encoder_states = () if output_hidden_states else None
         hidden_states = inputs_embeds
 
+        cu_seqlens = SingletonCache()
+
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
-            layer_outputs = encoder_layer(
-                hidden_states,
-            )
+            layer_outputs = encoder_layer(hidden_states, cu_seqlens=cu_seqlens)
             hidden_states = layer_outputs
 
         if output_hidden_states:
@@ -601,7 +606,6 @@ class InternVLChatModel(nn.Module):
             loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
-            pass
             raise RuntimeError(
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
             )
