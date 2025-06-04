@@ -42,7 +42,7 @@ from sglang.srt.configs import (
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
-from sglang.srt.utils import is_remote_url
+from sglang.srt.utils import is_remote_url, print_warning_once
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ChatGLMConfig.model_type: ChatGLMConfig,
@@ -207,6 +207,11 @@ def get_tokenizer(
     # TODO(Xinyuan): Remove this once we have a proper tokenizer for Devstral
     if tokenizer_name == "mistralai/Devstral-Small-2505":
         tokenizer_name = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+    if tokenizer_name.startswith("OpenGVLab/InternVL2_5"):
+        trust_remote_code = False
+        print_warning_once(
+            "For Internvl, trust-remote-code is disabled by default to enable FastTokenizer"
+        )
 
     is_gguf = check_gguf_file(tokenizer_name)
     if is_gguf:
