@@ -197,9 +197,8 @@ class MooncakeKVManager(BaseKVManager):
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker = defaultdict(list)
             self.connection_lock = threading.Lock()
-            self.required_prefill_info_num = 1
+            self.required_prefill_info_num_map = {}  
             self.decode_kv_arrive_state: Dict[int, Set[int]] = defaultdict(set)
-            self.decode_kv_expected_num: Dict[int, int] = {}  
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 float(os.getenv("SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL", 5.0)), 2.0
@@ -490,7 +489,7 @@ class MooncakeKVManager(BaseKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = \
                                 self.decode_kv_args_table[req.mooncake_session_id]
                         local_tp_rank = self.tp_size // self.dp_size
-                        if self.is_mla_backend or local_tp_rank == target_rank_registration_info.tp_world_size_of_group:
+                        if self.is_mla_backend or (local_tp_rank == target_rank_registration_info.tp_world_size_of_group):
                             ret = self.send_kvcache(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
@@ -622,8 +621,9 @@ class MooncakeKVManager(BaseKVManager):
                 if status == KVPoll.Success:
                     # record arrived prefill_rank 
                     self.decode_kv_arrive_state[bootstrap_room].add(prefill_rank)
+                    expected_prefill_num = self.required_prefill_info_num_map[bootstrap_room]
                     arrived_prefill_num = len(self.decode_kv_arrive_state[bootstrap_room])
-                    if (arrived_prefill_num == self.required_prefill_info_num) or self.is_mla_backend :
+                    if (arrived_prefill_num == expected_prefill_num) or self.is_mla_backend :
                         self.update_status(bootstrap_room, KVPoll.Success)
                 
                 elif status == KVPoll.Failed:
@@ -955,6 +955,10 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.required_prefill_info_num = 1
             self.target_tp_ranks = [self.target_tp_rank]
         elif local_tp_size_per_dp_rank > prefill_tp_size_per_dp_rank:
+            if not self.kv_mgr.is_mla_backend:
+                logger.warning_once(
+                    "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
+                )
             self.target_tp_rank = (
                 self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
             ) // (local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank)
@@ -964,6 +968,10 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.required_prefill_info_num = 1
             self.target_tp_ranks = [self.target_tp_rank]
         else:
+            if not self.kv_mgr.is_mla_backend:
+                logger.warning_once(
+                    "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
+                )
             # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks for non MLA models;
             self.target_tp_ranks = [
                 rank
@@ -985,7 +993,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             )
 
         self.target_dp_group = self.bootstrap_room % self.prefill_dp_size
-        self.kv_mgr.required_prefill_info_num = self.required_prefill_info_num
+        self.kv_mgr.required_prefill_info_num_map[self.bootstrap_room] = self.required_prefill_info_num
         # NOTE: key distinguished by bootstrap_addr, target_dp_group, and target_tp_rank
         bootstrap_key = (
             f"{self.bootstrap_addr}_{self.target_dp_group}_{self.target_tp_rank}"
