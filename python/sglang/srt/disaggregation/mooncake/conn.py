@@ -108,8 +108,10 @@ class KVArgsRegisterInfo:
     mooncake_session_id: str
     dst_kv_ptrs: list[int]
     dst_aux_ptrs: list[int]
-    tp_rank_id_in_group: int        
-    tp_world_size_of_group: int     
+    dst_tp_rank: int        
+    dst_tp_size: int
+    dst_kv_item_len: int 
+  
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -120,8 +122,10 @@ class KVArgsRegisterInfo:
             mooncake_session_id=msg[3].decode("ascii"),
             dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
-            tp_rank_id_in_group=int(msg[6].decode("ascii")),
-            tp_world_size_of_group=int(msg[7].decode("ascii"))
+            dst_tp_rank=int(msg[6].decode("ascii")),
+            dst_tp_size=int(msg[7].decode("ascii")),
+            dst_kv_item_len=int(msg[8].decode("ascii"))
+
         )
 
 
@@ -197,7 +201,7 @@ class MooncakeKVManager(BaseKVManager):
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker = defaultdict(list)
             self.connection_lock = threading.Lock()
-            self.required_prefill_info_num_map = {}  
+            self.required_prefill_info_num_map: Dict[int, int] = {}  
             self.decode_kv_arrive_state: Dict[int, Set[int]] = defaultdict(set)
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
@@ -298,8 +302,9 @@ class MooncakeKVManager(BaseKVManager):
         prefill_kv_indices: npt.NDArray[np.int64],
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int64],
-        target_tp_rank: int,
-        decode_tp_world_size: int,
+        dst_tp_rank: int,
+        dst_tp_size: int,
+        dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
 
@@ -309,15 +314,16 @@ class MooncakeKVManager(BaseKVManager):
         num_kv_heads = self.kv_args.kv_head_num
         num_layers = len(self.kv_args.kv_data_ptrs)
 
-        heads_per_decode_rank = num_kv_heads * local_tp_size // decode_tp_world_size
+        heads_per_decode_rank = num_kv_heads * local_tp_size // dst_tp_size
         heads_per_prefill_rank = num_kv_heads
-        decode_global_head_start = target_tp_rank * heads_per_decode_rank
+        decode_global_head_start = dst_tp_rank * heads_per_decode_rank
         prefill_global_head_start = local_tp_rank * heads_per_prefill_rank
 
         # decode config
-        decode_rank_item_lens = [(item * local_tp_size //  decode_tp_world_size) for item in self.kv_args.kv_item_lens]
-        
-        if local_tp_size > decode_tp_world_size:
+        decode_rank_item_lens = [dst_kv_item_len for _ in range(num_layers)]
+        bytes_per_head = dst_kv_item_len // heads_per_decode_rank
+
+        if local_tp_size > dst_tp_size:
             src_head_offset = 0
             num_heads_to_send = heads_per_prefill_rank
             dst_head_offset = prefill_global_head_start - decode_global_head_start
@@ -336,8 +342,6 @@ class MooncakeKVManager(BaseKVManager):
             if item_len_of_prefill_rank_page == 0 or num_kv_heads == 0:
                 logger.error(f"Invalid item_len_of_prefill_rank_page or num_kv_heads for layer {layer_id}")
                 return -1
-
-            bytes_per_head = item_len_of_prefill_rank_page // heads_per_prefill_rank
 
             # Calculate precise byte offset and length for the sub-slice within Prefill page data
             src_slice_offset = \
@@ -361,9 +365,9 @@ class MooncakeKVManager(BaseKVManager):
                     dst_kv_ptrs[layer_id],                    # Decode base ptr (for its slice for this layer)
                     item_len_of_prefill_rank_page,            # Prefill page size (all heads)2048
                     item_len_of_decode_rank_page,             # Decode page stride (for its slice page) 1024
-                    src_slice_offset,                   # Offset to slice data in Prefill page
-                    dst_slice_offset,
-                    slice_lens_per_page,                     # Length of slice data per page (actual data to send)
+                    src_slice_offset,                         # Offset to slice data in Prefill page
+                    dst_slice_offset,                         # Offset to slice data in Decode page
+                    slice_lens_per_page,                      # Length of slice data per page (actual data to send)
                 )
             )
 
@@ -488,8 +492,8 @@ class MooncakeKVManager(BaseKVManager):
 
                         target_rank_registration_info: KVArgsRegisterInfo = \
                                 self.decode_kv_args_table[req.mooncake_session_id]
-                        local_tp_rank = self.tp_size // self.dp_size
-                        if self.is_mla_backend or (local_tp_rank == target_rank_registration_info.tp_world_size_of_group):
+                        local_tp_size = self.tp_size // self.dp_size
+                        if self.is_mla_backend or (local_tp_size == target_rank_registration_info.dst_tp_size):
                             ret = self.send_kvcache(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
@@ -503,8 +507,9 @@ class MooncakeKVManager(BaseKVManager):
                                 kv_chunk.prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
-                                target_rank_registration_info.tp_rank_id_in_group,
-                                target_rank_registration_info.tp_world_size_of_group,
+                                target_rank_registration_info.dst_tp_rank,
+                                target_rank_registration_info.dst_tp_size,
+                                target_rank_registration_info.dst_kv_item_len,
                                 executor,
                                 )
                         if ret != 0:
@@ -1092,8 +1097,11 @@ class MooncakeKVReceiver(BaseKVReceiver):
             )
             tp_rank = self.kv_mgr.kv_args.engine_rank
             tp_size = self.kv_mgr.tp_size // self.kv_mgr.dp_size
-            tp_rank_id_bytes = str(tp_rank).encode("ascii")
-            tp_world_size_bytes = str(tp_size).encode("ascii")
+            kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
+            
+            dst_tp_rank = str(tp_rank).encode("ascii")
+            dst_tp_size = str(tp_size).encode("ascii")
+            dst_kv_item_len = str(kv_item_len).encode("ascii")
 
             sock, lock = self._connect("tcp://" + self.prefill_server_url)
             with lock:
@@ -1105,8 +1113,9 @@ class MooncakeKVReceiver(BaseKVReceiver):
                         self.session_id.encode("ascii"),
                         packed_kv_data_ptrs,
                         packed_aux_data_ptrs,
-                        tp_rank_id_bytes,
-                        tp_world_size_bytes,
+                        dst_tp_rank,
+                        dst_tp_size,
+                        dst_kv_item_len,
                     ]
                 )
 
