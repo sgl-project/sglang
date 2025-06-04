@@ -4,18 +4,18 @@ import dataclasses
 import os
 import random
 import threading
-import time
 import warnings
-from abc import ABC
 from collections import deque
 from enum import Enum
-from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from abc import ABC
+from functools import lru_cache, wraps
 
 import numpy as np
 import requests
 import torch
 import torch.distributed as dist
+import time
 
 from sglang.srt.utils import get_ip, get_local_ip_by_remote
 
@@ -71,168 +71,6 @@ class ReqToMetadataIdxAllocator:
 
     def free(self, free_index: int):
         self.free_slots.append(free_index)
-
-
-def get_ranges_of_block(block_ids):
-    # This function should return a list of ranges of block ids that are contiguous
-    # For example, if block_ids is [0, 1, 2, 4, 5, 6], the function should return [[0, 2], [4, 6]]
-    # The ranges are sorted by the starting block id
-    # The function should also make sure that the block ids are contiguous
-    # If the block ids are not contiguous, the function should raise an error
-    # Convert the block_ids list to a NumPy array
-    block_ids = np.array(block_ids)
-    # Find the indices where the difference between consecutive elements is not 1
-    diff = np.diff(block_ids)
-    change_indices = np.where(diff != 1)[0]
-    # The start of each range is at these indices + 1, and the end is at these indices
-    starts = np.concatenate(([0], change_indices + 1))
-    ends = np.concatenate((change_indices, [len(block_ids) - 1]))
-    # Construct the ranges using these start and end indices
-    ranges = list(zip(block_ids[starts], block_ids[ends]))
-    return ranges
-
-
-def get_same_length_ranges(src_ranges, dst_ranges, return_original_src_ranges=False):
-    # This function should return a list of ranges for both src and dst so that corresponding ranges are the same length
-    # For example, if src_ranges is [[0, 2] [4, 8]] and dst_ranges is [[1, 3], [5, 7], [9, 10]]
-    # The function should return ([[0, 2], [4, 6], [7, 8]], [[1, 3], [5, 7], [9, 10]])
-    src_overlapping_ranges, dst_overlapping_ranges = [], []
-    original_src_ranges = []
-    org_src_range = tuple(src_ranges[0])
-
-    src_idx, dst_idx = 0, 0
-    while src_idx < len(src_ranges) and dst_idx < len(dst_ranges):
-        src_range = src_ranges[src_idx]
-        dst_range = dst_ranges[dst_idx]
-
-        # Calculate the length of each range
-        src_len = src_range[-1] - src_range[0] + 1
-        dst_len = dst_range[-1] - dst_range[0] + 1
-
-        # If ranges have the same length, add them directly
-        if src_len == dst_len:
-            src_overlapping_ranges.append([src_range[0], src_range[-1]])
-            dst_overlapping_ranges.append([dst_range[0], dst_range[-1]])
-            original_src_ranges.append(org_src_range)
-            src_idx += 1
-            dst_idx += 1
-            if src_idx < len(src_ranges):
-                org_src_range = tuple(src_ranges[src_idx])
-        # If source range is longer, split it
-        elif src_len > dst_len:
-            src_overlapping_ranges.append([src_range[0], src_range[0] + dst_len - 1])
-            dst_overlapping_ranges.append([dst_range[0], dst_range[-1]])
-            original_src_ranges.append(org_src_range)
-            # Update source range for next iteration
-            src_ranges[src_idx] = [src_range[0] + dst_len, src_range[-1]]
-            dst_idx += 1
-        # If destination range is longer, split it
-        else:  # src_len < dst_len
-            src_overlapping_ranges.append([src_range[0], src_range[-1]])
-            dst_overlapping_ranges.append([dst_range[0], dst_range[0] + src_len - 1])
-            original_src_ranges.append(org_src_range)
-            # Update destination range for next iteration
-            dst_ranges[dst_idx] = [dst_range[0] + src_len, dst_range[-1]]
-            src_idx += 1
-            if src_idx < len(src_ranges):
-                org_src_range = tuple(src_ranges[src_idx])
-    if return_original_src_ranges:
-        return src_overlapping_ranges, dst_overlapping_ranges, original_src_ranges
-    return src_overlapping_ranges, dst_overlapping_ranges
-
-
-@lru_cache(maxsize=1024)
-def get_src_dst_index_length(
-    src_block_ids: Tuple[int], dst_block_ids: Tuple[int]
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # print(f"call get_src_dst_index_length of {src_block_ids}:{dst_block_ids} stream = {stream}", flush=True)
-    src_block_length = get_ranges_of_block(src_block_ids)
-    dst_block_length = get_ranges_of_block(dst_block_ids)
-    src, dst = get_same_length_ranges(src_block_length, dst_block_length)
-    src_start_blocks = [x[0] for x in src]
-    dst_start_blocks = [x[0] for x in dst]
-    src_block_lens = [x[1] + 1 - x[0] for x in src]
-    dst_block_lens = [x[1] + 1 - x[0] for x in dst]
-    assert src_block_lens == dst_block_lens
-    src_start_blocks_tensor_cpu = torch.tensor(src_start_blocks, dtype=torch.int)
-    dst_start_blocks_tensor_cpu = torch.tensor(dst_start_blocks, dtype=torch.int)
-    block_lens_tensor_cpu = torch.tensor(src_block_lens, dtype=torch.int)
-    return (
-        src_start_blocks_tensor_cpu,
-        dst_start_blocks_tensor_cpu,
-        block_lens_tensor_cpu,
-    )
-
-
-class StreamAsyncSubmitter(ABC):
-    COUNT_NUM_MAX = 2**62
-    """a class to get cuda stream status async and submit jobs after cuda kernel launched"""
-
-    def __init__(self, submit_func: Callable):
-        self._submit_func = submit_func
-        # the step count means the how many layers been call with `step_async`
-        self._step_count = 0
-        # the sent_count means the how many layers is been actually sent
-        self._sent_count = 0
-        # the init value of finished_layer
-        self._finished_layer_init = torch.zeros([1], dtype=torch.int64).cuda()
-        # the counter in cuda
-        self._finished_layer_cuda = torch.zeros([1], dtype=torch.int64).cuda()
-        # the one in cuda
-        self._one_cuda = torch.ones([1], dtype=torch.int64).cuda()
-        # the cpu version of finished_layer cuda
-        self._finished_layer_cpu = torch.zeros([1], dtype=torch.int64, pin_memory=True)
-        self._lock = threading.Lock()
-
-    def flush_step(self):
-        with self._lock:
-            current_finished_layer = int(self._finished_layer_cpu[0])
-            # because the current_finished_layer may be larger than step_count,
-            # so we need to calculate the real count
-            submit_count = (
-                current_finished_layer + self.COUNT_NUM_MAX - self._sent_count
-            ) % self.COUNT_NUM_MAX
-            for _ in range(submit_count):
-                self._submit_func()
-            self._sent_count = current_finished_layer
-
-    def get_sent_count(self):
-        return self._sent_count
-
-    def get_step_count(self):
-        return self._step_count
-
-    def step_async(self):
-        # we using a non blocking copy to sync the cuda and cpu
-        # for example, if we call 5 times of step_async, and 3 layers are finished,
-        # the step_count==5, the finished_layer_cuda==3
-        # and we get the finished_layer_cpu would be 3
-        # if the sent_count==2, in flush_step, we just call self._submit_func once
-        # we need to copy the finished_layer_init to finished_layer_cuda, if the step_count if almost equal to COUNT_NUM_MAX
-        if self._step_count == self.COUNT_NUM_MAX - 1:
-            self._finished_layer_cuda.copy_(
-                self._finished_layer_init, non_blocking=True
-            )
-        else:
-            self._finished_layer_cuda.add_(self._one_cuda)
-        self._finished_layer_cpu.copy_(self._finished_layer_cuda, non_blocking=True)
-        # and we need to update the step_count
-        self._step_count = (self._step_count + 1) % self.COUNT_NUM_MAX
-        self.flush_step()
-
-    def wait_sent_finish(self, task_stop_count):
-        # because COUNT_NUM_MAX is very large, we can make sure that if diff is > COUNT_NUM_MAX / 2 means the flush is finished
-        # and if the current_sent_count == task_stop_count also means the flush is not finished
-        # so if current_sent_count != task_stop_count and diff < COUNT_NUM_MAX / 2, the flush is not finished
-        task_stop_count = task_stop_count % self.COUNT_NUM_MAX
-        current_sent_count = self.get_sent_count()
-        while (task_stop_count != current_sent_count) and (
-            (task_stop_count + self.COUNT_NUM_MAX - current_sent_count)
-            % self.COUNT_NUM_MAX
-        ) < self.COUNT_NUM_MAX / 2:
-            time.sleep(1e-3)
-            self.flush_step()
-            current_sent_count = self.get_sent_count()
 
 
 class TransferBackend(Enum):
@@ -480,8 +318,21 @@ class FastQueue:
             while not self._buf:
                 self._cond.wait()
             return self._buf.popleft()
+def np_cache(function):
+    @lru_cache(maxsize=1024)
+    def cached_wrapper(*hashable_arrays):
+        np_array = (np.array(x) for x in hashable_arrays)
+        return function(*np_array)
 
+    @wraps(function)
+    def wrapper(*arrays):
+        return cached_wrapper(*(tuple(x) for x in arrays))
 
+    # copy lru_cache attributes over too
+    wrapper.cache_info = cached_wrapper.cache_info
+    wrapper.cache_clear = cached_wrapper.cache_clear
+
+    return wrapper
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
 ) -> Tuple[List[npt.NDArray[np.int64]], List[npt.NDArray[np.int64]]]:
@@ -497,3 +348,79 @@ def group_concurrent_contiguous(
     dst_groups = [g.tolist() for g in dst_groups]
 
     return src_groups, dst_groups
+
+@np_cache
+def cached_group_concurrent_contiguous(
+    src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
+) -> Tuple[List[npt.NDArray[np.int64]], List[npt.NDArray[np.int64]]]:
+    return group_concurrent_contiguous(src_indices, dst_indices)
+
+class StreamAsyncSubmitter(ABC):
+    COUNT_NUM_MAX = 2**62
+    """a class to get cuda stream status async and submit jobs after cuda kernel launched"""
+
+    def __init__(self, submit_func: Callable):
+        self._submit_func = submit_func
+        # the step count means the how many layers been call with `step_async`
+        self._step_count = 0
+        # the sent_count means the how many layers is been actually sent
+        self._sent_count = 0
+        # the init value of finished_layer
+        self._finished_layer_init = torch.zeros([1], dtype=torch.int64).cuda()
+        # the counter in cuda
+        self._finished_layer_cuda = torch.zeros([1], dtype=torch.int64).cuda()
+        # the one in cuda
+        self._one_cuda = torch.ones([1], dtype=torch.int64).cuda()
+        # the cpu version of finished_layer cuda
+        self._finished_layer_cpu = torch.zeros([1], dtype=torch.int64, pin_memory=True)
+        self._lock = threading.Lock()
+
+    def flush_step(self):
+        with self._lock:
+            current_finished_layer = int(self._finished_layer_cpu[0])
+            # because the current_finished_layer may be larger than step_count,
+            # so we need to calculate the real count
+            submit_count = (
+                current_finished_layer + self.COUNT_NUM_MAX - self._sent_count
+            ) % self.COUNT_NUM_MAX
+            for _ in range(submit_count):
+                self._submit_func()
+            self._sent_count = current_finished_layer
+
+    def get_sent_count(self):
+        return self._sent_count
+
+    def get_step_count(self):
+        return self._step_count
+
+    def step_async(self):
+        # we using a non blocking copy to sync the cuda and cpu
+        # for example, if we call 5 times of step_async, and 3 layers are finished,
+        # the step_count==5, the finished_layer_cuda==3
+        # and we get the finished_layer_cpu would be 3
+        # if the sent_count==2, in flush_step, we just call self._submit_func once
+        # we need to copy the finished_layer_init to finished_layer_cuda, if the step_count if almost equal to COUNT_NUM_MAX
+        if self._step_count == self.COUNT_NUM_MAX - 1:
+            self._finished_layer_cuda.copy_(
+                self._finished_layer_init, non_blocking=True
+            )
+        else:
+            self._finished_layer_cuda.add_(self._one_cuda)
+        self._finished_layer_cpu.copy_(self._finished_layer_cuda, non_blocking=True)
+        # and we need to update the step_count
+        self._step_count = (self._step_count + 1) % self.COUNT_NUM_MAX
+        self.flush_step()
+
+    def wait_sent_finish(self, task_stop_count):
+        # because COUNT_NUM_MAX is very large, we can make sure that if diff is > COUNT_NUM_MAX / 2 means the flush is finished
+        # and if the current_sent_count == task_stop_count also means the flush is not finished
+        # so if current_sent_count != task_stop_count and diff < COUNT_NUM_MAX / 2, the flush is not finished
+        task_stop_count = task_stop_count % self.COUNT_NUM_MAX
+        current_sent_count = self.get_sent_count()
+        while (task_stop_count != current_sent_count) and (
+            (task_stop_count + self.COUNT_NUM_MAX - current_sent_count)
+            % self.COUNT_NUM_MAX
+        ) < self.COUNT_NUM_MAX / 2:
+            time.sleep(1e-3)
+            self.flush_step()
+            current_sent_count = self.get_sent_count()

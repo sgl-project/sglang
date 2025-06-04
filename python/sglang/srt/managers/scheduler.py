@@ -617,10 +617,10 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 transfer_backend=self.transfer_backend,
             )
-            self.kv_manager = self.disagg_decode_prealloc_queue.kv_manager
 
             # Metric for pre-allocation
             self.num_tokens_pre_allocated = 0
+            self.kv_manager = self.disagg_decode_prealloc_queue.kv_manager
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -646,9 +646,9 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
                 scheduler=self,
             )
-            self.kv_manager = self.disagg_prefill_bootstrap_queue.kv_manager
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+            self.kv_manager = self.disagg_prefill_bootstrap_queue.kv_manager
 
     @DynamicGradMode()
     def event_loop_normal(self):

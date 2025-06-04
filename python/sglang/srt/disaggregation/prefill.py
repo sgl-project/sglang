@@ -24,7 +24,6 @@ import threading
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple
-
 import numpy as np
 import numpy.typing as npt
 import torch
@@ -215,6 +214,7 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler):
         """A normal scheduler loop for prefill worker in disaggregation mode."""
+
         self.kv_manager: BaseKVManager
         if self.kv_manager.is_support_asnyc:
             model = self.tp_worker.worker.model_runner.model
@@ -478,7 +478,6 @@ class SchedulerDisaggregationPrefillMixin:
                 # chunked request keeps its rid but will get a new req_pool_idx
                 self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
                 self.running_batch.batch_is_full = False
-
     def get_kv_chunk_info(
         self: Scheduler,
         req: Req,
