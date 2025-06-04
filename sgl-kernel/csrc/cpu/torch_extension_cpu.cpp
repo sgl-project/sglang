@@ -304,7 +304,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // all reduce
   m.def("initialize(int size, int rank) -> ()");
-  m.impl("initialize", torch::kCPU, &initialize);
   m.def(
       "shm_allreduce(Tensor data, __torch__.torch.classes.c10d.ProcessGroup process_group, "
       "__torch__.torch.classes.c10d.ReduceOp reduce_op) -> ()");
@@ -317,6 +316,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
   m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
+
+  // CPU and memory binding
+  m.def("init_cpu_threads_env(str cpu_ids) -> str");
+}
+
+TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
+  m.impl("init_cpu_threads_env", init_cpu_threads_env);
+  m.impl("initialize", &initialize);
 }
 
 REGISTER_EXTENSION(common_ops)
