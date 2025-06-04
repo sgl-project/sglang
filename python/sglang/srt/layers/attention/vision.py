@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import math
 from functools import lru_cache
 from typing import Optional, Tuple
@@ -34,6 +35,22 @@ from sglang.srt.utils import add_prefix
 ROTARY_EMBED_CLASSES = {
     "normal": apply_rotary_pos_emb,
 }
+
+
+@functools.lru_cache(maxsize=128)
+def _get_cu_seqlens_for_shape(batch_size: int, seqlen: int, device) -> torch.Tensor:
+    """
+    Generates cumulative sequence lengths (cu_seqlens) for a given batch_size, seqlen, and device.
+    Caches the result based on these parameters.
+    """
+    cu_seqlens = torch.arange(
+        0,
+        (batch_size + 1) * seqlen,
+        step=seqlen,
+        dtype=torch.int32,
+        device=device,
+    )
+    return cu_seqlens
 
 
 class VisionSdpaAttention(nn.Module):
@@ -248,7 +265,8 @@ class VisionFlash3Attention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         cu_seqlens: Optional[torch.Tensor],
-        attention_mask: Optional[torch.Tensor] = None,
+        bsz: int,
+        seq_len: int,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -257,6 +275,8 @@ class VisionFlash3Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+        if cu_seqlens is None:
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
         cu_seqlens = cu_seqlens.to(dtype=torch.int32).cuda()
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
@@ -408,12 +428,13 @@ class VisionAttention(nn.Module):
             # [s, b, head * 3 * head_size] --> [s, b, head, 3 * head_size]
             new_x_shape = qkv.size()[:-1] + (
                 head,
-                3 * self.hidden_size_per_attention_head,
+                self.q_size + 2 * self.kv_size,
             )
             qkv = qkv.view(*new_x_shape)
 
             # [s, b, head, 3 * head_size] --> 3 [s, b, head, head_size]
-            q, k, v = dist_utils.split_tensor_along_last_dim(qkv, 3)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
             # [s, b, head, head_size] --> [b, s, head, head_size]
             q, k, v = [
                 rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)
@@ -450,6 +471,7 @@ class VisionAttention(nn.Module):
             k=k,
             v=v,
             bsz=bsz,
+            seq_len=s,
             cu_seqlens=cu_seqlens,
             attention_mask=attention_mask,
         )

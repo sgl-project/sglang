@@ -19,7 +19,6 @@ import torch
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/7f62077af5159c625fe3ad1c812e6c1a2b93ba3b/vllm/model_executor/models/internlm2.py
 # Adapted from https://raw.githubusercontent.com/hehesangsj/sglang/refs/heads/internvl/python/sglang/srt/models/internvl.py
 import torch.nn.functional as F
-from einops import rearrange
 from sgl_kernel.flash_attn import flash_attn_varlen_func
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
@@ -41,73 +40,6 @@ from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.utils import logger
 
 
-class FlashAttention(nn.Module):
-    """Implement the scaled dot product attention with softmax.
-    Arguments
-    ---------
-        softmax_scale: The temperature to use for the softmax attention.
-                      (default: 1/sqrt(d_keys) where d_keys is computed at
-                      runtime)
-        attention_dropout: The dropout rate to apply to the attention
-                           (default: 0.0)
-    """
-
-    def __init__(
-        self, softmax_scale=None, attention_dropout=0.0, device=None, dtype=None
-    ):
-        super().__init__()
-        self.softmax_scale = softmax_scale
-        self.dropout_p = attention_dropout
-
-    def forward(
-        self,
-        qkv,
-        causal=False,
-        max_s=None,
-    ):
-        """Implements the multihead softmax attention.
-        Arguments
-        ---------
-            qkv: The tensor containing the query, key, and value. (B, S, 3, H, D) if key_padding_mask is None
-                if unpadded: (nnz, 3, h, d)
-        """
-        assert qkv.dtype in [torch.float16, torch.bfloat16]
-        assert qkv.is_cuda
-
-        batch_size, seqlen, _, nheads, d = qkv.shape
-        if batch_size == 0 or seqlen == 0:
-            output_shape = (batch_size, seqlen, nheads, d)
-            return (
-                torch.zeros(output_shape, dtype=qkv.dtype, device=qkv.device),
-                None,
-            )
-
-        qkv_reshaped = rearrange(qkv, "b s three h d -> (b s) three h d", three=3)
-        q, k, v = qkv_reshaped.unbind(1)
-
-        max_s = seqlen
-        cu_seqlens = torch.arange(
-            0,
-            (batch_size + 1) * seqlen,
-            step=seqlen,
-            dtype=torch.int32,
-            device=qkv.device,
-        )
-        output_reshaped = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens,
-            cu_seqlens,
-            max_s,
-            max_s,
-            softmax_scale=self.softmax_scale,
-            causal=causal,
-        )
-        output = rearrange(output_reshaped, "(b s) h d -> b s h d", b=batch_size)
-        return output, None
-
-
 class InternAttention(nn.Module):
     def __init__(
         self,
@@ -121,8 +53,6 @@ class InternAttention(nn.Module):
         self.head_dim = self.embed_dim // self.num_heads
 
         self.scale = self.head_dim**-0.5
-
-        # self.qkv = nn.Linear(self.embed_dim, 3 * self.embed_dim, bias=config.qkv_bias)
 
         self.attn = VisionAttention(
             qkv_backend="fa3",
@@ -139,53 +69,16 @@ class InternAttention(nn.Module):
         self.proj_drop = nn.Dropout(config.dropout)
 
         self.qk_normalization = config.qk_normalization
-        # print(f"{self.qk_normalization=}")
 
-        # if self.qk_normalization:
-        #     self.q_norm = InternRMSNorm(self.embed_dim, eps=config.layer_norm_eps)
-        #     self.k_norm = InternRMSNorm(self.embed_dim, eps=config.layer_norm_eps)
-
-        # self.inner_attn = FlashAttention(softmax_scale=self.scale)
-
-        # self.proj = nn.Linear(self.embed_dim, self.embed_dim)
+        if self.qk_normalization:
+            self.q_norm = InternRMSNorm(self.embed_dim, eps=config.layer_norm_eps)
+            self.k_norm = InternRMSNorm(self.embed_dim, eps=config.layer_norm_eps)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # qkv = self.qkv(hidden_states)
-        # qkv = rearrange(
-        #     qkv, "b s (three h d) -> b s three h d", three=3, h=self.num_heads
-        # )
-        #
-        # # if self.qk_normalization:
-        # #     q, k, v = qkv.unbind(2)
-        # #     q = self.q_norm(q.flatten(-2, -1)).view(q.shape)
-        # #     k = self.k_norm(k.flatten(-2, -1)).view(k.shape)
-        # #     qkv = torch.stack([q, k, v], dim=2)
-        #
-        # context, _ = self.inner_attn(
-        #     qkv,
-        # )
-        #
-        #
-        (
-            batch_size,
-            seqlen,
-            _,
-        ) = hidden_states.shape
-
-        cu_seqlens = torch.arange(
-            0,
-            (batch_size + 1) * seqlen,
-            step=seqlen,
-            dtype=torch.int32,
-            device=hidden_states.device,
-        )
-        out = self.attn(hidden_states, cu_seqlens)
-        #
-        # outs = self.proj(rearrange(out, "b s h d -> b s (h d)"))
+        out = self.attn(hidden_states)
         outs = self.proj_drop(out)
         return outs
 
