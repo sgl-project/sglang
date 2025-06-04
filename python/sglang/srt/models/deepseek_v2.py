@@ -57,6 +57,7 @@ from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.layers.quantization.fp8_kernel import (
+    is_fp8_fnuz,
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
@@ -90,7 +91,9 @@ from sglang.srt.two_batch_overlap import (
 from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
+    LazyValue,
     add_prefix,
+    bind_or_assign,
     get_bool_env_var,
     get_int_env_var,
     is_cuda,
@@ -101,6 +104,7 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_fp8_fnuz = is_fp8_fnuz()
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8, merge_state_v2
@@ -220,7 +224,9 @@ class DeepseekV2MoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
-        self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+        self.num_fused_shared_experts = global_server_args_dict[
+            "num_fused_shared_experts"
+        ]
         self.config = config
         self.layer_id = layer_id
 
@@ -240,9 +246,9 @@ class DeepseekV2MoE(nn.Module):
 
         self.experts = get_moe_impl_class()(
             num_experts=config.n_routed_experts
-            + self.n_share_experts_fusion
+            + self.num_fused_shared_experts
             + global_server_args_dict["ep_num_redundant_experts"],
-            top_k=config.num_experts_per_tok + min(self.n_share_experts_fusion, 1),
+            top_k=config.num_experts_per_tok + min(self.num_fused_shared_experts, 1),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=self.layer_id,
@@ -261,7 +267,7 @@ class DeepseekV2MoE(nn.Module):
             ),
         )
 
-        if config.n_shared_experts is not None and self.n_share_experts_fusion == 0:
+        if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
             self.shared_experts = DeepseekV2MLP(
@@ -414,7 +420,7 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def _forward_shared_experts(self, hidden_states):
-        if self.n_share_experts_fusion == 0:
+        if self.num_fused_shared_experts == 0:
             return self.shared_experts(hidden_states)
         else:
             return None
@@ -430,7 +436,7 @@ class DeepseekV2MoE(nn.Module):
 
     def op_shared_experts(self, state):
         hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
-        if (self.n_share_experts_fusion == 0) and is_non_idle_and_non_empty(
+        if (self.num_fused_shared_experts == 0) and is_non_idle_and_non_empty(
             state.forward_batch.forward_mode, hidden_states_mlp_input
         ):
             state.shared_output = self.shared_experts(hidden_states_mlp_input)
@@ -452,6 +458,7 @@ class DeepseekV2MoE(nn.Module):
                 num_expert_group=self.num_expert_group,
                 correction_bias=self.correction_bias,
                 routed_scaling_factor=self.routed_scaling_factor,
+                num_token_non_padded=state.forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -524,9 +531,13 @@ class DeepseekV2MoE(nn.Module):
 
     def op_output(self, state):
         final_hidden_states = state.pop("hidden_states_after_combine")
-        final_hidden_states *= self.routed_scaling_factor
-        if (s := state.pop("shared_output")) is not None:
-            final_hidden_states = final_hidden_states + s
+
+        if (shared_output := state.pop("shared_output")) is not None:
+            x = shared_output
+            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = x
+        else:
+            final_hidden_states *= self.routed_scaling_factor
 
         state.hidden_states_mlp_output = final_hidden_states
 
@@ -684,7 +695,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         self.w_kc = None
         self.w_vc = None
-        self.w_scale = None
+        self.w_scale = 1.0
 
         self.w_scale_k = None
         self.w_scale_v = None
@@ -948,8 +959,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 expected_m,
             )
             q_nope_out = q_nope_out[:, :expected_m, :]
-        elif self.w_kc.dtype == torch.float8_e4m3fnuz:
-            # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
+        elif _is_hip:
+            # TODO(haishaw): add bmm_fp8 to ROCm
             q_nope_out = torch.bmm(
                 q_nope.to(torch.bfloat16).transpose(0, 1),
                 self.w_kc.to(torch.bfloat16) * self.w_scale,
@@ -1000,8 +1011,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 expected_m,
             )
             attn_bmm_output = attn_bmm_output[:, :expected_m, :]
-        elif self.w_vc.dtype == torch.float8_e4m3fnuz:
-            # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
+        elif _is_hip:
+            # TODO(haishaw): add bmm_fp8 to ROCm
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
                 self.w_vc.to(torch.bfloat16) * self.w_scale,
@@ -1052,8 +1063,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        if self.w_kc.dtype == torch.float8_e4m3fnuz:
-            # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
+        if _is_hip:
+            # TODO(haishaw): add bmm_fp8 to ROCm
             q_nope_out = torch.bmm(
                 q_nope.to(torch.bfloat16).transpose(0, 1),
                 self.w_kc.to(torch.bfloat16) * self.w_scale,
@@ -1186,8 +1197,8 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
-        if self.w_vc.dtype == torch.float8_e4m3fnuz:
-            # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
+        if _is_hip:
+            # TODO(haishaw): add bmm_fp8 to ROCm
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
                 self.w_vc.to(torch.bfloat16) * self.w_scale,
@@ -1639,7 +1650,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        self.determine_n_share_experts_fusion()
+        self.determine_num_fused_shared_experts()
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -1653,28 +1664,42 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(config)
         self.dp_size = get_local_attention_dp_size()
 
-    def determine_n_share_experts_fusion(
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer.mlp, DeepseekV2MoE)
+            }
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
+
+    def determine_num_fused_shared_experts(
         self, architecture: str = "DeepseekV3ForCausalLM"
     ):
-        self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
-        if self.n_share_experts_fusion > 0:
+        self.num_fused_shared_experts = global_server_args_dict[
+            "num_fused_shared_experts"
+        ]
+        if self.num_fused_shared_experts > 0:
             # Only Deepseek V3/R1 can use shared experts fusion optimization now.
             if (
                 not _is_cuda
                 or self.config.architectures[0] != architecture
                 or self.config.n_routed_experts != 256
             ):
-                self.n_share_experts_fusion = 0
-                global_server_args_dict["n_share_experts_fusion"] = 0
+                self.num_fused_shared_experts = 0
+                global_server_args_dict["num_fused_shared_experts"] = 0
                 log_info_on_rank0(
                     logger,
                     "Only Deepseek V3/R1 on NV-platform can use shared experts fusion optimization. Shared experts fusion optimization is disabled.",
                 )
             else:
                 assert (
-                    self.n_share_experts_fusion == self.tp_size
+                    self.num_fused_shared_experts == self.tp_size
                 ), f"Shared experts fusion optimization is enabled in DeepSeek V3/R1, set it to {self.tp_size} can get best optimized performance."
-        elif self.n_share_experts_fusion == 0:
+        elif self.num_fused_shared_experts == 0:
             if (
                 _is_cuda
                 and torch.cuda.get_device_capability("cuda") >= (9, 0)
@@ -1682,8 +1707,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 and self.config.n_routed_experts == 256
                 and (not global_server_args_dict["enable_deepep_moe"])
             ):
-                self.n_share_experts_fusion = self.tp_size
-                global_server_args_dict["n_share_experts_fusion"] = self.tp_size
+                self.num_fused_shared_experts = self.tp_size
+                global_server_args_dict["num_fused_shared_experts"] = self.tp_size
                 log_info_on_rank0(
                     logger,
                     "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled.",
@@ -1706,14 +1731,23 @@ class DeepseekV2ForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def post_load_weights(self, is_nextn=False):
+    def post_load_weights(self, is_nextn=False, weight_names=None):
 
         # Perform post-processing after loading weights
-        layer_ids = (
-            range(self.config.num_hidden_layers)
-            if not is_nextn
-            else [self.config.num_hidden_layers]
-        )
+        if is_nextn:
+            layer_ids = [self.config.num_hidden_layers]
+        else:
+            if weight_names is None:
+                layer_ids = range(self.config.num_hidden_layers)
+            else:
+                layer_ids = set()
+                for name in weight_names:
+                    if "kv_b_proj" in name:
+                        layer_id = int(name.split(".")[2])
+                        # filter the nextn layer.
+                        if layer_id != self.config.num_hidden_layers:
+                            layer_ids.add(layer_id)
+
         for layer_id in layer_ids:
             self_attn = (
                 self.model.layers[layer_id].self_attn
@@ -1749,46 +1783,56 @@ class DeepseekV2ForCausalLM(nn.Module):
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
             ):
-                if hasattr(self.quant_config, "weight_block_size"):
+                if (
+                    hasattr(self.quant_config, "weight_block_size")
+                    and self.quant_config.weight_block_size is not None
+                ):
                     weight_block_size = self.quant_config.weight_block_size
-                    if weight_block_size is not None:
-                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                        if _is_hip:
-                            weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                                weight=w,
-                                weight_scale=self_attn.kv_b_proj.weight_scale_inv,
-                                input_scale=None,
-                            )
-                        else:
-                            weight = w
-                            weight_scale = self_attn.kv_b_proj.weight_scale_inv
+                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                    if _is_fp8_fnuz:
+                        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                            weight=w,
+                            weight_scale=self_attn.kv_b_proj.weight_scale_inv,
+                            input_scale=None,
+                        )
+                    else:
+                        weight = w
+                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
 
-                        if (
-                            _is_cuda
-                            and weight_block_size[0] == 128
-                            and weight_block_size[1] == 128
-                            and model_dtype == torch.bfloat16
+                    if (
+                        _is_cuda
+                        and weight_block_size[0] == 128
+                        and weight_block_size[1] == 128
+                        and model_dtype == torch.bfloat16
+                    ):
+                        if _ENABLE_JIT_DEEPGEMM and get_bool_env_var(
+                            "SGL_USE_DEEPGEMM_BMM", "false"
                         ):
-                            if _ENABLE_JIT_DEEPGEMM and get_bool_env_var(
-                                "SGL_USE_DEEPGEMM_BMM", "false"
-                            ):
-                                block_scale = weight_scale
-                                use_deep_gemm_bmm = True
-                            else:
-                                w = block_quant_dequant(
-                                    weight,
-                                    weight_scale,
-                                    weight_block_size,
-                                    model_dtype,
-                                )
+                            block_scale = weight_scale
+                            use_deep_gemm_bmm = True
                         else:
-                            w, scale = block_quant_to_tensor_quant(
-                                weight, weight_scale, weight_block_size
+                            w = block_quant_dequant(
+                                weight,
+                                weight_scale,
+                                weight_block_size,
+                                model_dtype,
                             )
-                            self_attn.w_scale = scale
+                    else:
+                        w, scale = block_quant_to_tensor_quant(
+                            weight, weight_scale, weight_block_size
+                        )
+                        self_attn.w_scale = scale
                 else:
-                    weight = w
-                    weight_scale = self_attn.kv_b_proj.weight_scale
+                    if _is_fp8_fnuz:
+                        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                            weight=w,
+                            weight_scale=self_attn.kv_b_proj.weight_scale,
+                            input_scale=None,
+                        )
+                    else:
+                        weight = w
+                        weight_scale = self_attn.kv_b_proj.weight_scale
+
                     w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
                     self_attn.w_scale = scale
 
@@ -1813,13 +1857,19 @@ class DeepseekV2ForCausalLM(nn.Module):
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
             if not use_deep_gemm_bmm:
-                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+                self_attn.w_kc = bind_or_assign(
+                    self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                )
+                self_attn.w_vc = bind_or_assign(
+                    self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+                )
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None
                 ):
-                    self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+                    self_attn.w_scale = bind_or_assign(
+                        self_attn.w_scale, self_attn.kv_b_proj.weight_scale
+                    )
                     if _is_hip:
                         self_attn.w_scale *= 2.0
             else:
@@ -1828,19 +1878,17 @@ class DeepseekV2ForCausalLM(nn.Module):
                 ws_kc, ws_vc = block_scale.unflatten(
                     0, (-1, (num_tiles_k + num_tiles_n))
                 ).split([num_tiles_k, num_tiles_n], dim=1)
-                self_attn.w_scale_k = ws_kc.transpose(1, 2).contiguous()
-                self_attn.w_scale_v = ws_vc.contiguous()
-                self_attn.w_kc = w_kc.transpose(1, 2).contiguous()
-                self_attn.w_vc = w_vc.contiguous()
+                self_attn.w_scale_k = bind_or_assign(
+                    self_attn.w_scale_k, ws_kc.transpose(1, 2).contiguous()
+                )
+                self_attn.w_scale_v = bind_or_assign(
+                    self_attn.w_scale_v, ws_vc.contiguous()
+                )
+                self_attn.w_kc = bind_or_assign(
+                    self_attn.w_kc, w_kc.transpose(1, 2).contiguous()
+                )
+                self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
-
-        # TODO support nextn later
-        if not is_nextn:
-            self.routed_experts_weights_of_layer = {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, DeepseekV2MoE)
-            }
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         if is_nextn:
@@ -1861,26 +1909,52 @@ class DeepseekV2ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        if self.n_share_experts_fusion > 0:
+        if self.num_fused_shared_experts > 0:
             weights_list = list(weights)
             weights_dict = dict(weights_list)
-            if self.quant_config is None or self.quant_config.get_name() == "w8a8_int8":
-                suffix_list = [
-                    "down_proj.weight",
-                    "down_proj.weight_scale",
-                    "gate_proj.weight",
-                    "gate_proj.weight_scale",
-                    "up_proj.weight",
-                    "up_proj.weight_scale",
-                ]
+            if self.quant_config is not None:
+                if self.quant_config.get_name() == "w8a8_int8":
+                    suffix_list = [
+                        "down_proj.weight",
+                        "down_proj.weight_scale",
+                        "gate_proj.weight",
+                        "gate_proj.weight_scale",
+                        "up_proj.weight",
+                        "up_proj.weight_scale",
+                    ]
+                elif (
+                    self.quant_config.get_name() == "fp8"
+                    or self.quant_config.get_name() == "blockwise_int8"
+                ):
+                    suffix_list = [
+                        "down_proj.weight",
+                        "down_proj.weight_scale_inv",
+                        "gate_proj.weight",
+                        "gate_proj.weight_scale_inv",
+                        "up_proj.weight",
+                        "up_proj.weight_scale_inv",
+                    ]
+                elif self.quant_config.get_name() == "awq":
+                    suffix_list = [
+                        "down_proj.qweight",
+                        "down_proj.qzeros",
+                        "down_proj.scales",
+                        "gate_proj.qweight",
+                        "gate_proj.qzeros",
+                        "gate_proj.scales",
+                        "up_proj.qweight",
+                        "up_proj.qzeros",
+                        "up_proj.scales",
+                    ]
+                else:
+                    raise ValueError(
+                        f"Unsupported shared expert fusion for quantization: {self.quant_config.get_name()}."
+                    )
             else:
                 suffix_list = [
                     "down_proj.weight",
-                    "down_proj.weight_scale_inv",
                     "gate_proj.weight",
-                    "gate_proj.weight_scale_inv",
                     "up_proj.weight",
-                    "up_proj.weight_scale_inv",
                 ]
             names_to_remove = []
 
@@ -1896,14 +1970,14 @@ class DeepseekV2ForCausalLM(nn.Module):
 
             for moe_layer in tqdm(
                 moe_layers,
-                desc=f"Cloning {self.n_share_experts_fusion} "
+                desc=f"Cloning {self.num_fused_shared_experts} "
                 "replicas of the shared expert into MoE",
             ):
                 for suffix in suffix_list:
                     shared_expert_weight_name = (
                         f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
                     )
-                    for num_repeat in range(self.n_share_experts_fusion):
+                    for num_repeat in range(self.num_fused_shared_experts):
                         weights_list.append(
                             (
                                 f"model.layers.{moe_layer}."
@@ -1922,7 +1996,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + self.n_share_experts_fusion,
+            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
@@ -1941,7 +2015,10 @@ class DeepseekV2ForCausalLM(nn.Module):
             ]
 
         params_dict = dict(self.named_parameters())
+        weight_names = []
         for name, loaded_weight in weights:
+            weight_names.append(name)
+
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
@@ -2058,7 +2135,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         )
                         weight_loader(param, loaded_weight)
 
-        self.post_load_weights(is_nextn=is_nextn)
+        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
