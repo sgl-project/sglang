@@ -2033,6 +2033,9 @@ class Scheduler(
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
+            if recv_req.rid == "":
+                to_del.append(i)
+                continue
             if req.rid.startswith(recv_req.rid):
                 to_del.append(i)
 
@@ -2049,6 +2052,9 @@ class Scheduler(
             reqs = self.running_batch.reqs + self.cur_batch.reqs
 
         for req in reqs:
+            if recv_req.rid == "" and not req.finished():
+                req.to_abort = True
+                continue
             if req.rid.startswith(recv_req.rid) and not req.finished():
                 logger.debug(f"Abort running request. {req.rid=}")
                 # We must use to_abort because it is in a running batch
