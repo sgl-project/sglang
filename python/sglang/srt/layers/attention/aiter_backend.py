@@ -74,6 +74,7 @@ class AiterAttnBackend(AttentionBackend):
 
         self.device = model_runner.device
         self.is_multimodal = model_runner.model_config.is_multimodal
+        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
@@ -330,6 +331,7 @@ class AiterAttnBackend(AttentionBackend):
     def init_cuda_graph_state(
         self, max_bs: int, kv_indices_buf: Optional[torch.Tensor] = None
     ):
+        self.cuda_graph_kv_last_page_len = torch.ones(max_bs, dtype=torch.int)
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
                 (max_bs * self.max_context_len),
@@ -380,9 +382,11 @@ class AiterAttnBackend(AttentionBackend):
 
             if self.use_mla:
                 qo_indptr = self.qo_indptr_[: bs + 1]
-                qo_indptr[1 : bs + 1] = torch.cumsum(self.kv_last_page_len[:bs], dim=0)
+                qo_indptr[1 : bs + 1] = torch.cumsum(
+                    self.cuda_graph_kv_last_page_len[:bs], dim=0
+                )
                 max_extend_len = 1
-                kv_last_page_len = self.kv_last_page_len[:bs]
+                kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
 
             self.forward_metadata = ForwardMetadata(
                 kv_indptr,
@@ -396,21 +400,61 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         elif forward_mode.is_target_verify():
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_prefill.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                prefix_lens=None,
-                encoder_lens=encoder_lens,
-                spec_info=spec_info,
-            )
-            self.forward_metadata = ForwardMetadata(
-                self.indices_updater_prefill.kv_indptr,
-                self.indices_updater_prefill.kv_indices,
-                self.indices_updater_prefill.max_q_len,
-                self.indices_updater_prefill.max_kv_len,
-            )
+            if self.use_mla:
+                qo_indptr = self.qo_indptr[: bs + 1]
+                qo_indptr[: bs + 1] = torch.arange(
+                    0,
+                    (1 + bs) * self.num_draft_tokens,
+                    step=self.num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                kv_indices = self.cuda_graph_kv_indices
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
+
+                max_extend_len = self.num_draft_tokens
+                kv_last_page_len = None
+
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_extend_len,
+                    None,
+                    None,
+                    None,
+                )
+            else:
+                seq_lens_sum = seq_lens.sum().item()
+                self.indices_updater_prefill.update(
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens_sum,
+                    prefix_lens=None,
+                    encoder_lens=encoder_lens,
+                    spec_info=spec_info,
+                )
+                self.forward_metadata = ForwardMetadata(
+                    self.indices_updater_prefill.kv_indptr,
+                    self.indices_updater_prefill.kv_indices,
+                    None,
+                    None,
+                    None,
+                    None,
+                    self.indices_updater_prefill.max_q_len,
+                    self.indices_updater_prefill.max_kv_len,
+                )
 
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
@@ -481,14 +525,7 @@ class AiterAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 if self.use_mla:
-                    if k_rope is not None:
-                        forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                            layer, cache_loc, k, k_rope
-                        )
-                    else:
-                        forward_batch.token_to_kv_pool.set_kv_buffer(
-                            layer, cache_loc, k, v
-                        )
+                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
