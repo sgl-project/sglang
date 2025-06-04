@@ -155,8 +155,9 @@ class AiterAttnBackend(AttentionBackend):
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
         spec_info = forward_batch.spec_info
-        max_prefix_extend_len = 0
+        qo_indptr = None
         kv_last_page_len = None
+        max_extend_len = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None:
@@ -184,22 +185,16 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.kv_last_page_len[:bs]
                 max_extend_len = 1
 
-                self.forward_metadata = ForwardMetadata(
-                    kv_indptr,
-                    kv_indices,
-                    qo_indptr,
-                    kv_last_page_len,
-                    max_extend_len,
-                    None,
-                    None,
-                    None,
-                )
-            else:
-                self.forward_metadata = ForwardMetadata(
-                    kv_indptr, kv_indices, None, None, None, None, None, None
-                )
-
-            return
+            self.forward_metadata = ForwardMetadata(
+                kv_indptr,
+                kv_indices,
+                qo_indptr,
+                kv_last_page_len,
+                max_extend_len,
+                None,
+                None,
+                None,
+            )
 
         elif forward_batch.forward_mode.is_draft_extend():
             if self.use_mla:
