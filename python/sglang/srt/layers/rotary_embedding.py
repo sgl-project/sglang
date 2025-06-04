@@ -118,6 +118,16 @@ class RotaryEmbedding(CustomOp):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
+    def forward(self, *args, **kwargs):
+        if torch.compiler.is_compiling():
+            return self.forward_native(*args, **kwargs)
+        if _is_cuda:
+            return self.forward_cuda(*args, **kwargs)
+        elif _is_cpu_amx:
+            return self.forward_cpu(*args, **kwargs)
+        else:
+            return self.forward_native(*args, **kwargs)
+
     def forward_native(
         self,
         positions: torch.Tensor,
@@ -147,6 +157,26 @@ class RotaryEmbedding(CustomOp):
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
+
+    def forward_cpu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        positions = torch.add(positions, offsets) if offsets is not None else positions
+        if positions.device == torch.device("cpu") and _is_cpu_amx:
+            return torch.ops.sgl_kernel.rotary_embedding_cpu(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.cos_sin_cache,
+                self.is_neox_style,
+            )
+        else:
+            return self.forward_native(positions, query, key, offsets)
 
     def forward_cuda(
         self,
