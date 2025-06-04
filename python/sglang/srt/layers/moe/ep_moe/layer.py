@@ -156,7 +156,7 @@ class EPMoE(torch.nn.Module):
         renormalize: bool = True,
         use_grouped_topk: bool = False,
         num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: Optional[int] = 0,
+        num_fused_shared_experts: int = 0,
         topk_group: Optional[int] = None,
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,

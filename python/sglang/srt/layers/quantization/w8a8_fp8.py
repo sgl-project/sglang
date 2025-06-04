@@ -287,7 +287,7 @@ class W8A8FP8MoEMethod:
         use_grouped_topk: bool,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: Optional[int] = 0,
+        num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
