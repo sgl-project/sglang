@@ -35,7 +35,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
+
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
     def __init__(
@@ -63,15 +65,17 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         else:
             inter_size = config.intermediate_size
 
-        self.mlp = LlamaMLP(config.hidden_size, inter_size, config.hidden_act, quant_config, prefix)
+        self.mlp = LlamaMLP(
+            config.hidden_size, inter_size, config.hidden_act, quant_config, prefix
+        )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -123,12 +127,15 @@ class LlamaModel(nn.Module):
         else:
             self.hidden_size_in = config.hidden_size
 
-        self.fc = torch.nn.Linear(self.hidden_size_in * 3, config.hidden_size, bias=getattr(config,"bias",False))
+        self.fc = torch.nn.Linear(
+            self.hidden_size_in * 3,
+            config.hidden_size,
+            bias=getattr(config, "bias", False),
+        )
 
         self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
 
     def forward(
         self,
@@ -197,19 +204,54 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = True
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        params_dict = dict(self.named_parameters())
+        print(f"params_dict keys: {list(params_dict.keys())}")
+        # Define the parameter mapping for stacked parameters
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
+
         for name, loaded_weight in weights:
             if "d2t" in name:
                 # d2t stores diffs between draft id and target id
                 self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
+                continue
 
-            if "d2t" not in name and "t2d" not in name and "lm_head" not in name:
-                new_name = f"model.{name}"
-                super().load_weights([(new_name, loaded_weight)])
-            elif "lm_head" in name:
-                super().load_weights([(name, loaded_weight)])
+            if "t2d" in name:
+                continue
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                param_name = f"model.{name}" if name not in params_dict else name
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Handle regular parameters
+                param_name = name if name in params_dict else f"model.{name}"
+                if param_name in params_dict:
+                    param = params_dict[param_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                else:
+                    print(f"Warning: Parameter {param_name} not found in model")
 
     def get_hot_token_id(self):
         return self.hot_token_id
+
 
 EntryClass = [LlamaForCausalLMEagle3]
