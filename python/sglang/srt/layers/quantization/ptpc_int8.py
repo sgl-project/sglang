@@ -18,7 +18,7 @@ if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 
 
-class W8A8Int8Config(QuantizationConfig):
+class PTPCInt8Config(QuantizationConfig):
     """Config class for W8A8 Int8 Quantization.
 
     - Weight: static, per-channel, symmetric
@@ -45,7 +45,7 @@ class W8A8Int8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "W8A8Int8Config":
+    def from_config(cls, config: Dict[str, Any]) -> "PTPCInt8Config":
         return cls()
 
     def get_quant_method(
@@ -57,18 +57,18 @@ class W8A8Int8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            return W8A8Int8LinearMethod(self)
+            return PTPCInt8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            return W8A8Int8MoEMethod(self)
+            return PTPCInt8MoEMethod(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
         return []
 
 
-class W8A8Int8LinearMethod(LinearMethodBase):
+class PTPCInt8LinearMethod(LinearMethodBase):
 
-    def __init__(self, quantization_config: W8A8Int8Config):
+    def __init__(self, quantization_config: PTPCInt8Config):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -119,7 +119,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         )
 
 
-class W8A8Int8MoEMethod:
+class PTPCInt8MoEMethod:
     """MoE method for INT8.
     Supports loading INT8 checkpoints with static weight scale and
     dynamic/static activation scale.

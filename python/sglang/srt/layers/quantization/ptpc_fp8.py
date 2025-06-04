@@ -25,7 +25,7 @@ from sglang.srt.utils import set_weight_attrs
 _is_fp8_fnuz = is_fp8_fnuz()
 
 
-class W8A8Fp8Config(QuantizationConfig):
+class PTPCFp8Config(QuantizationConfig):
     """Config class for W8A8 FP8 Quantization.
 
     Weight Quantization:
@@ -64,7 +64,7 @@ class W8A8Fp8Config(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "W8A8Fp8Config":
+    def from_config(cls, config: Dict[str, Any]) -> "PTPCFp8Config":
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp8_serialized = (
             "compressed-tensors" in quant_method or "w8a8_fp8" in quant_method
@@ -80,18 +80,18 @@ class W8A8Fp8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            return W8A8Fp8LinearMethod(self)
+            return PTPCFp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            return W8A8FP8MoEMethod(self)
+            return PTPCFP8MoEMethod(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
         return []
 
 
-class W8A8Fp8LinearMethod(LinearMethodBase):
+class PTPCFp8LinearMethod(LinearMethodBase):
 
-    def __init__(self, quantization_config: W8A8Fp8Config):
+    def __init__(self, quantization_config: PTPCFp8Config):
         self.cutlass_fp8_supported = cutlass_fp8_supported()
         self.quantization_config = quantization_config
 
@@ -183,7 +183,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         )
 
 
-class W8A8FP8MoEMethod:
+class PTPCFP8MoEMethod:
     """MoE method for FP8.
     Supports loading FP8 checkpoints with static weight scale and
     dynamic/static activation scale.
