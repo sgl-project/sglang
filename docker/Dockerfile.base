@@ -1,6 +1,6 @@
 ARG CUDA_VERSION=12.4.1
 
-FROM nvcr.io/nvidia/tritonserver:24.04-py3-min AS base
+FROM nvcr.io/nvidia/tritonserver:24.04-py3-min
 
 ARG BUILD_TYPE=all
 ENV DEBIAN_FRONTEND=noninteractive
@@ -16,3 +16,5 @@ RUN echo 'tzdata tzdata/Areas select China' | debconf-set-selections \
     && python3 -m pip --version \
     && rm -rf /var/lib/apt/lists/* \
     && apt clean
+LABEL version=cu124
+LABEL maintainer="slg_base"
