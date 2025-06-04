@@ -64,7 +64,7 @@ from sglang.srt.managers.expert_location import (
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.schedule_batch import global_server_args_dict, GLOBAL_SERVER_ARGS_KEYS
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
@@ -186,34 +186,10 @@ class ModelRunner:
 
         # Global vars
         global_server_args_dict.update(
-            {
-                # "attention_backend": server_args.attention_backend,
-                # "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
-                # "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
-                # "deepep_mode": server_args.deepep_mode,
-                # "device": server_args.device,
-                # "disable_chunked_prefix_cache": server_args.disable_chunked_prefix_cache,
-                # "disable_radix_cache": server_args.disable_radix_cache,
-                # "enable_nan_detection": server_args.enable_nan_detection,
-                # "enable_dp_attention": server_args.enable_dp_attention,
-                # "enable_two_batch_overlap": server_args.enable_two_batch_overlap,
-                # "enable_dp_lm_head": server_args.enable_dp_lm_head,
-                # "enable_ep_moe": server_args.enable_ep_moe,
-                # "enable_deepep_moe": server_args.enable_deepep_moe,
-                # "deepep_config": server_args.deepep_config,
-                # "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
-                # "moe_dense_tp_size": server_args.moe_dense_tp_size,
-                # "ep_dispatch_algorithm": server_args.ep_dispatch_algorithm,
-                # "num_fused_shared_experts": server_args.num_fused_shared_experts,
-                # "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
-                # "torchao_config": server_args.torchao_config,
-                # "sampling_backend": server_args.sampling_backend,
-                # "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
-                # "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
-                "use_mla_backend": self.use_mla_backend,
-                # "mm_attention_backend": server_args.mm_attention_backend,
-                # "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
-            }
+                {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
+                | {
+                    "use_mla_backend": self.use_mla_backend,
+                }
         )
 
         # CPU offload
