@@ -43,11 +43,13 @@ class TestOpenAIVisionServer(CustomTestCase):
             api_key=cls.api_key,
         )
         cls.base_url += "/v1"
-        cls.request_extra_kwargs = {}
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+    def get_request_kwargs(self):
+        return {}
 
     def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -70,7 +72,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                 },
             ],
             temperature=0,
-            **self.request_extra_kwargs,
+            **(self.get_request_kwargs()),
         )
 
         assert response.choices[0].message.role == "assistant"
@@ -133,7 +135,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                 },
             ],
             temperature=0,
-            **self.request_extra_kwargs,
+            **(self.get_request_kwargs()),
         )
 
         assert response.choices[0].message.role == "assistant"
@@ -176,7 +178,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                 },
             ],
             temperature=0,
-            **self.request_extra_kwargs,
+            **(self.get_request_kwargs()),
         )
 
         assert response.choices[0].message.role == "assistant"
@@ -289,7 +291,7 @@ class TestOpenAIVisionServer(CustomTestCase):
             temperature=0,
             max_tokens=1024,
             stream=False,
-            **self.request_extra_kwargs,
+            **(self.get_request_kwargs()),
         )
 
         video_response = response.choices[0].message.content
@@ -330,7 +332,7 @@ class TestOpenAIVisionServer(CustomTestCase):
             + r"""\}"""
         )
 
-        extra_kwargs = copy.deepcopy(self.request_extra_kwargs)
+        extra_kwargs = self.get_request_kwargs()
         extra_kwargs.setdefault("extra_body", {})["regex"] = regex
 
         response = client.chat.completions.create(
@@ -397,7 +399,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                 {"role": "user", "content": content},
             ],
             temperature=0,
-            **self.request_extra_kwargs,
+            **(self.get_request_kwargs()),
         )
 
         assert response.choices[0].message.role == "assistant"
@@ -440,7 +442,7 @@ class TestOpenAIVisionServer(CustomTestCase):
             temperature=0,
             max_tokens=128,
             stream=False,
-            **self.request_extra_kwargs,
+            **(self.get_request_kwargs()),
         )
 
         audio_response = response.choices[0].message.content

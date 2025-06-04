@@ -188,13 +188,6 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
         cls.model = "microsoft/Phi-4-multimodal-instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls.request_extra_kwargs = {
-            "extra_body": {
-                "lora_path": "vision",
-                "top_k": 1,
-                "top_p": 1.0,
-            }
-        }
 
         revision = "33e62acdd07cd7d6635badd529aa0a3467bb9c6a"
         cls.process = popen_launch_server(
@@ -215,6 +208,15 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
             ],
         )
         cls.base_url += "/v1"
+
+    def get_request_kwargs(self):
+        return {
+            "extra_body": {
+                "lora_path": "vision",
+                "top_k": 1,
+                "top_p": 1.0,
+            }
+        }
 
     def test_video_chat_completion(self):
         pass
