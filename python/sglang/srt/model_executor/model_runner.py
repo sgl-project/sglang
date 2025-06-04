@@ -64,7 +64,10 @@ from sglang.srt.managers.expert_location import (
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict, GLOBAL_SERVER_ARGS_KEYS
+from sglang.srt.managers.schedule_batch import (
+    GLOBAL_SERVER_ARGS_KEYS,
+    global_server_args_dict,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
@@ -186,10 +189,10 @@ class ModelRunner:
 
         # Global vars
         global_server_args_dict.update(
-                {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
-                | {
-                    "use_mla_backend": self.use_mla_backend,
-                }
+            {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
+            | {
+                "use_mla_backend": self.use_mla_backend,
+            }
         )
 
         # CPU offload
