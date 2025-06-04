@@ -72,6 +72,8 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 GLOBAL_SERVER_ARGS_KEYS = [
     "attention_backend",
+    "debug_tensor_dump_inject",
+    "debug_tensor_dump_output_folder",
     "chunked_prefill_size",
     "deepep_mode",
     "device",
@@ -95,6 +97,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "torchao_config",
     "triton_attention_reduce_in_fp32",
     "ep_num_redundant_experts",
+    "mm_attention_backend",
 ]
 
 # Put some global args for easy access
