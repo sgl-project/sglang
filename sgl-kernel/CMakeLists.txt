@@ -144,8 +144,8 @@ if (ENABLE_BELOW_SM90)
     )
     if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
         list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_87,code=sm_87"
-    )
+            "-gencode=arch=compute_87,code=sm_87"
+        )
     endif()
 endif()
 
