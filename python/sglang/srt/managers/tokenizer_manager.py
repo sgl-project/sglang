@@ -803,12 +803,23 @@ class TokenizerManager:
         profile_by_stage: bool = False,
     ):
         self.auto_create_handle_loop()
+        env_with_stack_str = os.getenv("SGLANG_PROFILE_WITH_STACK")
+        env_with_stack: Optional[bool] = (
+            None
+            if env_with_stack_str is None
+            else env_with_stack_str.lower() in ["true", "1"]
+        )
+        with_stack = (
+            False
+            if with_stack is False or env_with_stack is False
+            else (True if with_stack is True or env_with_stack is True else None)
+        )
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
             num_steps=num_steps,
             activities=activities,
-            with_stack=False,
+            with_stack=with_stack,
             record_shapes=record_shapes,
             profile_by_stage=profile_by_stage,
             profile_id=str(time.time()),
