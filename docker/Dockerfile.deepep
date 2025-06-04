@@ -1,4 +1,5 @@
-FROM lmsysorg/sglang:latest
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
 
 # CMake
 RUN apt-get update \

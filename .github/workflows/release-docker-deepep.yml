@@ -32,10 +32,10 @@ jobs:
 
       - name: Build and Push deepep
         run: |
-          docker build . -f docker/Dockerfile.deepep -t lmsysorg/sglang:deepep --no-cache
+          docker build . -f docker/Dockerfile.deepep --build-arg BASE_IMAGE=lmsysorg/sglang:latest -t lmsysorg/sglang:deepep --no-cache
           docker push lmsysorg/sglang:deepep
 
       - name: Build and Push dev-deepep
         run: |
-          docker build . -f docker/Dockerfile.deepep -t lmsysorg/sglang:dev-deepep --no-cache
+          docker build . -f docker/Dockerfile.deepep --build-arg BASE_IMAGE=lmsysorg/sglang:dev -t lmsysorg/sglang:dev-deepep --no-cache
           docker push lmsysorg/sglang:dev-deepep
