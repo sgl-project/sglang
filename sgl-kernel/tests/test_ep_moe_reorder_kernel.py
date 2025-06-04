@@ -173,7 +173,7 @@ def test_ep_moe_pre_reorder_vs_triton(
         cuda_output.float(),
         triton_output.float(),
         rtol=1e-5,
-        atol=1e-3,
+        atol=1e-5,
     )
 
 
