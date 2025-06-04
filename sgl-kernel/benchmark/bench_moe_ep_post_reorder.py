@@ -1,6 +1,5 @@
 import torch
 import triton
-import triton.language as tl
 from sgl_kernel import ep_moe_post_reorder
 
 from sglang.srt.layers.moe.ep_moe.kernels import post_reorder_triton_kernel
@@ -23,7 +22,7 @@ configs = [(bs,) for bs in batch_sizes]
     )
 )
 def benchmark(batch_size, provider):
-    dtype = torch.float32
+    dtype = torch.bfloat16
     device = torch.device("cuda")
     hidden_size, topk, start_expert_id, end_expert_id, block_size = 4096, 8, 0, 255, 512
 

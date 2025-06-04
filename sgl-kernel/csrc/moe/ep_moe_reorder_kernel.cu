@@ -67,9 +67,10 @@ __global__ void ep_pre_reorder_cuda_kernel(
   }
 }
 
+template <typename scalar_t>
 __global__ void ep_post_reorder_cuda_kernel(
-    const float* __restrict__ down_output_ptr,
-    float* __restrict__ output_ptr,
+    const scalar_t* __restrict__ down_output_ptr,
+    scalar_t* __restrict__ output_ptr,
     const int* __restrict__ src2dst_ptr,
     const int* __restrict__ topk_ids_ptr,
     const float* __restrict__ topk_weights_ptr,
@@ -84,10 +85,10 @@ __global__ void ep_post_reorder_cuda_kernel(
   const int* token_topk_ids = topk_ids_ptr + token_idx * topk;
   const float* token_topk_weights = topk_weights_ptr + token_idx * topk;
 
-  float* dst_ptr = output_ptr + static_cast<int64_t>(token_idx) * hidden_size;
+  scalar_t* dst_ptr = output_ptr + static_cast<int64_t>(token_idx) * hidden_size;
 
-  constexpr uint32_t vec_size = 16 / sizeof(float);
-  using vec_t = flashinfer::vec_t<float, vec_size>;
+  constexpr uint32_t vec_size = 16 / sizeof(scalar_t);
+  using vec_t = flashinfer::vec_t<scalar_t, vec_size>;
 
   const int vec_iters = hidden_size / vec_size;
   for (int idx = tid; idx < vec_iters; idx += blockDim.x) {
@@ -96,14 +97,11 @@ __global__ void ep_post_reorder_cuda_kernel(
     for (uint32_t i = 0; i < vec_size; ++i)
       acc[i] = 0.f;
 
-    bool computed = false;
-
     for (int k = 0; k < topk; ++k) {
       const int expert_id = token_topk_ids[k];
       if (expert_id < start_expert_id || expert_id > end_expert_id) continue;
-      computed = true;
       const int src_row = token_src2dst[k];
-      const float* src_ptr = down_output_ptr + static_cast<int64_t>(src_row) * hidden_size;
+      const scalar_t* src_ptr = down_output_ptr + static_cast<int64_t>(src_row) * hidden_size;
       const float weight = token_topk_weights[k];
 
       vec_t src_vec;
@@ -114,12 +112,7 @@ __global__ void ep_post_reorder_cuda_kernel(
         acc[i] += static_cast<float>(src_vec[i]) * weight;
       }
     }
-    vec_t out_vec;
-#pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i) {
-      out_vec[i] = computed ? acc[i] : 0.f;
-    }
-    out_vec.cast_store(dst_ptr + idx * vec_size);
+    acc.cast_store(dst_ptr + idx * vec_size);
   }
 }
 
