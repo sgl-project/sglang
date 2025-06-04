@@ -1,10 +1,10 @@
+import unittest
+
 from test_vision_openai_server_common import *
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
     popen_launch_server,
 )
 
@@ -57,28 +57,6 @@ class TestDeepseekVL2Server(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
         cls.model = "deepseek-ai/deepseek-vl2-small"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--context-length",
-                "4096",
-            ],
-        )
-        cls.base_url += "/v1"
-
-    def test_video_chat_completion(self):
-        pass
-
-
-class TestDeepseekVL2TinyServer(TestOpenAIVisionServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "deepseek-ai/deepseek-vl2-tiny"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
@@ -193,6 +171,32 @@ class TestKimiVLServer(TestOpenAIVisionServer):
         cls.base_url += "/v1"
 
     def test_video_chat_completion(self):
+        pass
+
+
+class TestPhi4MMServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "microsoft/Phi-4-multimodal-instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.75",
+            ],
+        )
+        cls.base_url += "/v1"
+
+    def test_video_chat_completion(self):
+        pass
+
+    def test_multi_images_chat_completion(self):
+        # TODO (lifuhuang): support LoRA to enable Phi4MM multi-image understanding capability.
         pass
 
 

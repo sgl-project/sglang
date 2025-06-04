@@ -30,16 +30,24 @@ class MooncakeTransferEngine:
         self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
 
     def register(self, ptr, length):
-        ret_value = self.engine.register_memory(ptr, length)
+        try:
+            ret_value = self.engine.register_memory(ptr, length)
+        except Exception:
+            # Mark register as failed
+            ret_value = -1
+
         if ret_value != 0:
-            logger.error("Mooncake memory registration failed.")
-            raise RuntimeError("Mooncake memory registration failed.")
+            logger.debug("Mooncake memory registration %s failed.", ptr)
 
     def deregister(self, ptr):
-        ret_value = self.engine.unregister_memory(ptr)
+        try:
+            ret_value = self.engine.unregister_memory(ptr)
+        except Exception:
+            # Mark deregister as failed
+            ret_value = -1
+
         if ret_value != 0:
-            logger.error("Mooncake memory deregistration failed.")
-            raise RuntimeError("Mooncake memory deregistration failed.")
+            logger.debug("Mooncake memory deregistration %s failed.", ptr)
 
     def initialize(
         self,
@@ -61,16 +69,27 @@ class MooncakeTransferEngine:
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int
     ) -> int:
         """Synchronously transfer data to the specified address."""
-        # the first time: based on session_id (which contains remote_ip) to construct a queue pair, and cache the queue pair
-        # later: based on the cached queue pair to send data
-        ret = self.engine.transfer_sync_write(
-            session_id, buffer, peer_buffer_address, length
-        )
-        if ret < 0:
-            logger.error("Mooncake Transfer Engine Return Error.")
-            raise RuntimeError("Mooncake Transfer Engine Return Error.")
-        return ret
+        try:
+            # the first time: based on session_id (which contains remote_ip) to construct a queue pair, and cache the queue pair
+            # later: based on the cached queue pair to send data
+            ret = self.engine.transfer_sync_write(
+                session_id, buffer, peer_buffer_address, length
+            )
+        except Exception:
+            # Mark transfer request as failed
+            ret = -1
 
+        if ret < 0:
+            # Do not raise an exception here, since some transfer requests fail should be accepted and the execution thread should not be stopped.
+            logger.debug(
+                "Failed to transfer data from %s to %s - %s.",
+                buffer,
+                session_id,
+                peer_buffer_address,
+            )
+
+        return ret
+    
     def transfer_submit_write(
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int
     ) -> int:
@@ -85,8 +104,6 @@ class MooncakeTransferEngine:
         status = self.engine.transfer_check_status(batch_id)
         return status
 
-    def get_localhost(self):
-        return self.hostname
 
     def get_session_id(self):
         return self.session_id

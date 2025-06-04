@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -144,6 +145,10 @@ class PrefillBootstrapQueue:
         )
         self._process_req(req)
         self.queue.append(req)
+
+    def extend(self, reqs: List[Req]) -> None:
+        for req in reqs:
+            self.add(req)
 
     def _process_req(self, req: Req) -> None:
         """
@@ -282,6 +287,16 @@ class SchedulerDisaggregationPrefillMixin:
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
 
+                if self.last_batch is None:
+                    # Create a dummy first batch to start the pipeline for overlap schedule.
+                    # It is now used for triggering the sampling_info_done event.
+                    tmp_batch = ScheduleBatch(
+                        reqs=None,
+                        forward_mode=ForwardMode.DUMMY_FIRST,
+                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                    )
+                    self.set_next_batch_sampling_info_done(tmp_batch)
+
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
@@ -415,6 +430,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self.tree_cache.cache_finished_req(req)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
+                if hasattr(req.disagg_kv_sender, "clear"):
+                    req.disagg_kv_sender.clear()
                 done_reqs.append(req)
             elif poll == KVPoll.Failed:
                 error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
