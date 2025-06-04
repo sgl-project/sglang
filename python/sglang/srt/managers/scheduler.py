@@ -396,9 +396,9 @@ class Scheduler(
             self.tree_cache,
             self.enable_hierarchical_cache,
         )
-        assert (
-            server_args.schedule_conservativeness >= 0
-        ), "Invalid schedule_conservativeness"
+        assert server_args.schedule_conservativeness >= 0, (
+            "Invalid schedule_conservativeness"
+        )
         self.init_new_token_ratio = min(
             global_config.default_init_new_token_ratio
             * server_args.schedule_conservativeness,
@@ -537,6 +537,7 @@ class Scheduler(
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
+                    dp_attention_rank=self.attn_dp_rank,
                 )
 
         self.decode_mem_cache_buf_multiplier = (
@@ -571,7 +572,9 @@ class Scheduler(
 
     def init_kv_events(self, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
-            self.kv_event_publisher = EventPublisherFactory.create(kv_events_config)
+            self.kv_event_publisher = EventPublisherFactory.create(
+                kv_events_config, self.attn_dp_rank
+            )
 
     def init_disaggregation(self):
         self.transfer_backend = TransferBackend(
@@ -1988,7 +1991,7 @@ class Scheduler(
             self.cum_spec_accept_length = self.cum_spec_accept_count = 0
             for k, v in server_args_dict.items():
                 global_server_args_dict[k] = v
-            logger.info(f"Global server args updated! " f"{global_server_args_dict=}")
+            logger.info(f"Global server args updated! {global_server_args_dict=}")
         return SetInternalStateReqOutput(
             updated=True,
             server_args=global_server_args_dict,
