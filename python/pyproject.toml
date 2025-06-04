@@ -49,7 +49,7 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.1.4",
+    "sgl-kernel==0.1.5",
     "flashinfer_python==0.2.5",
     "torch==2.6.0",
     "torchvision==0.21.0",
@@ -61,8 +61,8 @@ srt = [
 blackwell = [
     "sglang[runtime_common]",
     "sgl-kernel",
-    "torch",
-    "torchvision",
+    "torch==2.7.0",
+    "torchvision==0.22.0",
     "cuda-python",
     "outlines>=0.0.44,<=0.1.11",
     "einops",
