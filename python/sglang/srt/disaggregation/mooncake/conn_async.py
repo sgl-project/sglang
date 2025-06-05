@@ -83,10 +83,11 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         self._init_put_kvcache_thread()
         self._waiting_rooms = deque()
         self._current_kv_chunk_infos: Optional[TransferKVChunkSet] = None
-        self._req_begin_count: Dict[int, int] = {}
+        self._req_begin_count: Dict[int, deque] = {}
         self._req_bids: Dict[int, List[Tuple[int]]] = {}
         self._lock = threading.Lock()
-        self._kv_cache_ntensors = len(self.kv_args.kv_data_ptrs) if is_mla_backend else len(self.kv_args.kv_data_ptrs) / 2
+        self._kv_cache_ntensors = len(self.kv_args.kv_data_ptrs)
+        self._kv_cache_nlayers = len(self.kv_args.kv_data_ptrs) if is_mla_backend else len(self.kv_args.kv_data_ptrs) // 2
     @property
     def is_support_asnyc(self):
         return True
@@ -200,7 +201,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                 # kv_data_ptrs = [
                 #     self.get_key_buffer(i).data_ptr() for i in range(self.layer_num)
                 # ] + [self.get_value_buffer(i).data_ptr() for i in range(self.layer_num)]
-                send_layers.append(layer_id + self._kv_cache_ntensors / 2)
+                send_layers.append(layer_id + self._kv_cache_nlayers)
             self._notify_queue.appendleft(AsyncInfo(layer_ids=tuple(send_layers), kv_chunk_info=self._current_kv_chunk_infos))
             self._async_submitter.step_async()
 
@@ -224,23 +225,25 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         
     def _flush_all_layers(self, rid : int, is_last : bool):
         start_time = time.time()
-        # we have to make sure the send is finished, to do so, we need to get sent count and wait for it
-        begin_count = self._req_begin_count[rid].pop()
-        self._async_submitter.wait_sent_finish(begin_count + self._kv_cache_ntensors)
-        # and we have to make sure all the layers are sent out
-        
-        while not self._is_bids_finished_func(rid):
-            # print(f"self._req_bids[{rid}]({len(self._req_bids[rid])}) == {self._req_bids[rid]}")
-            time.sleep(1e-3)
-        bids = reduce(lambda x, y: list(x) + list(y), self.pop_req_bids(rid, is_last), [])
-        for bid in bids:
-            status = self.engine.transfer_check_status(bid)
-            while status == 0:
-                status = self.engine.transfer_check_status(bid)
-                time.sleep(1e-3)
-            assert status == 1, f"status is {status} in {rid}"
-        #and we need to release reqs
+        # we only flush the transfer when the whole prefill is all finished
         if is_last:
+            # we have to make sure the send is finished, to do so, we need to get sent count and wait for it
+            while len(self._req_begin_count[rid]):
+                begin_count = self._req_begin_count[rid].pop()
+                self._async_submitter.wait_sent_finish(begin_count + self._kv_cache_nlayers)
+                # and we have to make sure all the layers are sent out
+                while not self._is_bids_finished_func(rid):
+                    # print(f"self._req_bids[{rid}]({len(self._req_bids[rid])}) == {self._req_bids[rid]}")
+                    time.sleep(1e-3)
+                current_last = len(self._req_begin_count[rid]) == 0
+                bids = reduce(lambda x, y: list(x) + list(y), self.pop_req_bids(rid, current_last), [])
+                for bid in bids:
+                    status = self.engine.transfer_check_status(bid)
+                    while status == 0:
+                        status = self.engine.transfer_check_status(bid)
+                        time.sleep(1e-3)
+                    assert status == 1, f"status is {status} in {rid}"
+            #and we need to release reqs
             self._req_begin_count.pop(rid)
             logger.info(f"finish send (rid={rid}, n_blocks={len(bids)}) in {1000*(time.time() - start_time)} ms.")
 
