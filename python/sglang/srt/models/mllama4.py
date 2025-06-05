@@ -1,3 +1,4 @@
+import json
 from collections.abc import Iterable
 from typing import List, Optional, Set, Tuple
 
@@ -6,6 +7,7 @@ from torch import nn
 from transformers import Llama4Config, Llama4VisionModel
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization import QuantizationConfig
@@ -37,19 +39,43 @@ class Llama4ForConditionalGeneration(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
-        self.vision_model = Llama4VisionModel(config.vision_config)
-        self.multi_modal_projector = Llama4MultiModalProjector(config)
+        # Check if this is a text-only model (no vision components)
+        self.has_vision = (
+            hasattr(config, "vision_config") and config.vision_config is not None
+        )
+        if get_tensor_model_parallel_rank() == 0:
+            print(f"Debug: has_vision: {self.has_vision}")
+            print(f"Debug: config: {config}")
+
+            with open(
+                "/opt/zhiyuc/checkpoints/Llama-4-Scout-17B-16E-Instruct-fp8/llama4_config_debug.json",
+                "w",
+            ) as f:
+                json.dump(config.__dict__, f, indent=2, default=str)
+            print(
+                f"Debug: config saved to /opt/zhiyuc/checkpoints/Llama-4-Scout-17B-16E-Instruct-fp8/llama4_config_debug.json"
+            )
+
+        if self.has_vision:
+            self.vision_model = Llama4VisionModel(config.vision_config)
+            self.multi_modal_projector = Llama4MultiModalProjector(config)
+        else:
+            # For text-only models, set these to None
+            self.vision_model = None
+            self.multi_modal_projector = None
 
         # Initialize the language model
         from sglang.srt.models.llama4 import Llama4ForCausalLM
 
         self.language_model = Llama4ForCausalLM(
-            config.text_config,
+            config.text_config if hasattr(config, "text_config") else config,
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
 
-        self.logits_processor = LogitsProcessor(config.text_config)
+        self.logits_processor = LogitsProcessor(
+            config.text_config if hasattr(config, "text_config") else config
+        )
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -59,6 +85,10 @@ class Llama4ForConditionalGeneration(nn.Module):
         self,
         items: List[MultimodalDataItem],
     ) -> torch.Tensor:
+        # For text-only models, return None or raise an error
+        if not self.has_vision or self.vision_model is None:
+            raise ValueError("Vision model not available for text-only checkpoint")
+
         pixel_values = (
             torch.concat([item.pixel_values for item in items])
             .to(next(self.vision_model.parameters()).device)
@@ -79,11 +109,14 @@ class Llama4ForConditionalGeneration(nn.Module):
         **kwargs: object,
     ) -> torch.Tensor:
 
+        # For text-only models, pass None for image_data_embedding_func
+        image_embedding_func = self.get_image_feature if self.has_vision else None
+
         hs = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
-            image_data_embedding_func=self.get_image_feature,
+            image_data_embedding_func=image_embedding_func,
             positions=positions,
         )
 
@@ -124,6 +157,13 @@ class Llama4ForConditionalGeneration(nn.Module):
         return name, loaded_weight
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        # Only print debug info from rank 0 to avoid spam with multiple GPUs
+        is_main_rank = get_tensor_model_parallel_rank() == 0
+
+        if is_main_rank:
+            print(
+                f"Debug: Loading weights for {'multimodal' if self.has_vision else 'text-only'} model"
+            )
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -137,8 +177,16 @@ class Llama4ForConditionalGeneration(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        if is_main_rank:
+            print(f"Debug: Model has {len(params_dict)} parameters")
 
-        num_experts = self.config.text_config.num_local_experts
+        num_experts = (
+            self.config.text_config.num_local_experts
+            if hasattr(self.config, "text_config")
+            else self.config.num_local_experts
+        )
+        if is_main_rank:
+            print(f"Debug: Number of experts: {num_experts}")
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -150,6 +198,12 @@ class Llama4ForConditionalGeneration(nn.Module):
         )
 
         for name, loaded_weight in weights:
+            # Skip vision weights if this is a text-only model
+            if "vision" in name and not self.has_vision:
+                # if is_main_rank:
+                #     print(f"Skipping vision weight: {name} (text-only model)")
+                continue
+
             if not "vision" in name:
                 name, loaded_weight = self.permute_qk_weight_for_rotary(
                     name, loaded_weight
@@ -162,6 +216,10 @@ class Llama4ForConditionalGeneration(nn.Module):
                 if "vision" in name:
                     continue
                 name = name.replace(weight_name, param_name)
+                if name not in params_dict:
+                    # if is_main_rank:
+                    #     print(f"Warning: Parameter {name} not found in model, skipping")
+                    break
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -178,6 +236,10 @@ class Llama4ForConditionalGeneration(nn.Module):
                             if weight_name not in name:
                                 continue
                             name = name.replace(weight_name, param_name)
+                            if name not in params_dict:
+                                # if is_main_rank:
+                                #     print(f"Warning: Expert parameter {name} not found in model, skipping")
+                                break
                             param = params_dict[name]
                             weight_loader = param.weight_loader
                             weight_loader(
@@ -190,6 +252,19 @@ class Llama4ForConditionalGeneration(nn.Module):
                             break
                     else:
                         if ".gate_up_proj" in name:
+                            # Add safety checks for tensor dimensions
+                            # if is_main_rank:
+                            #     print(f"Debug: Processing gate_up_proj weight {name}, shape: {loaded_weight.shape}, dtype: {loaded_weight.dtype}")
+
+                            if loaded_weight.dim() == 0:
+                                # if is_main_rank:
+                                #     print(f"Warning: Skipping scalar weight {name}")
+                                continue
+                            elif loaded_weight.size(-1) < 2:
+                                # if is_main_rank:
+                                #     print(f"Warning: Cannot chunk weight {name} with last dimension {loaded_weight.size(-1)}")
+                                continue
+
                             name_list = [
                                 name.replace(
                                     ".experts.gate_up_proj", ".experts.w13_weight"
@@ -198,6 +273,15 @@ class Llama4ForConditionalGeneration(nn.Module):
                             loaded_weight_list = loaded_weight.chunk(2, dim=-1)
                             shard_id_list = ["w1", "w3"]
                         else:
+                            # Add debugging for down_proj as well
+                            # if is_main_rank:
+                            #     print(f"Debug: Processing down_proj weight {name}, shape: {loaded_weight.shape}, dtype: {loaded_weight.dtype}")
+
+                            if loaded_weight.dim() == 0:
+                                # if is_main_rank:
+                                #     print(f"Warning: Skipping scalar weight {name}")
+                                continue
+
                             name_list = [
                                 name.replace(".experts.down_proj", ".experts.w2_weight")
                             ]
@@ -206,6 +290,10 @@ class Llama4ForConditionalGeneration(nn.Module):
                         for name, loaded_weight, shard_id in zip(
                             name_list, loaded_weight_list, shard_id_list
                         ):
+                            if name not in params_dict:
+                                # if is_main_rank:
+                                #     print(f"Warning: Expert parameter {name} not found in model, skipping")
+                                continue
                             param = params_dict[name]
                             weight_loader = param.weight_loader
                             for expert_id in range(num_experts):
@@ -219,6 +307,11 @@ class Llama4ForConditionalGeneration(nn.Module):
                 else:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Skip parameters that don't exist in the text-only model
+                    if name not in params_dict:
+                        # if is_main_rank:
+                        #     print(f"Warning: Parameter {name} not found in model, skipping")
                         continue
                     param = params_dict[name]
                     weight_loader = getattr(
