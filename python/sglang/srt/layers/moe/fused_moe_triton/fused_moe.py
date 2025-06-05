@@ -24,6 +24,7 @@ from sglang.srt.layers.quantization.int8_kernel import (
     sglang_per_token_group_quant_int8,
 )
 from sglang.srt.utils import (
+    cpu_has_amx_support,
     direct_register_custom_op,
     get_bool_env_var,
     get_device_name,
@@ -38,6 +39,8 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
+elif cpu_has_amx_support():
+    pass
 else:
     from vllm import _custom_ops as vllm_ops
     from vllm._custom_ops import scaled_fp8_quant

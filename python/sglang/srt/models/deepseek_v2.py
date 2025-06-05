@@ -94,6 +94,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     bind_or_assign,
+    cpu_has_amx_support,
     get_bool_env_var,
     get_int_env_var,
     is_cuda,
@@ -113,6 +114,8 @@ if _is_cuda:
     from sglang.srt.layers.quantization.deep_gemm import (
         grouped_gemm_nt_f8f8bf16_masked as deep_gemm_grouped_gemm_nt_f8f8bf16_masked,
     )
+elif cpu_has_amx_support():
+    pass
 else:
     from vllm._custom_ops import awq_dequantize
 

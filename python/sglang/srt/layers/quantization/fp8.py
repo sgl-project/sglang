@@ -64,6 +64,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.utils import (
+    cpu_has_amx_support,
     get_bool_env_var,
     is_cuda,
     is_hip,
@@ -85,7 +86,7 @@ if _is_hip:
     from aiter.fused_moe_bf16_asm import asm_moe, ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
 
-if not _is_cuda:
+if not _is_cuda and not cpu_has_amx_support():
     from vllm._custom_ops import scaled_fp8_quant
 
 
