@@ -166,7 +166,7 @@ void sgl_per_token_group_quant_8bit(
             scale_stride);                                                                        \
       }                                                                                           \
     } else {                                                                                      \
-      static_assert(!scale_ue8m0);                                                                \
+      assert(!scale_ue8m0);                                                                \
       per_token_group_quant_8bit_kernel<T, DST_DTYPE, false><<<grid, block, 0, stream>>>(         \
           static_cast<T*>(input.data_ptr()),                                                      \
           output_q.data_ptr(),                                                                    \
