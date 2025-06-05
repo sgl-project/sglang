@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # JINJA TEMPLATE CONTENT FORMAT DETECTION
 # ============================================================================
-# 
+#
 # This adapts vLLM's approach for detecting chat template content format:
 # https://github.com/vllm-project/vllm/blob/02f0c7b220422792f5e53de2a7d51d2d3ff2df28/vllm/entrypoints/chat_utils.py#L296-L313
 # - Analyzes Jinja template AST to detect content iteration patterns
@@ -78,10 +78,10 @@ def _try_extract_ast(chat_template: str):
 def detect_template_content_format(chat_template: str) -> str:
     """
     Detect whether a chat template expects 'string' or 'openai' content format.
-    
+
     - 'string': content is a simple string (like DeepSeek templates)
     - 'openai': content is a list of structured dicts (like Llama4 templates)
-    
+
     Detection logic:
     - If template has loops like {%- for content in message['content'] -%} → 'openai'
     - Otherwise → 'string'
@@ -94,11 +94,11 @@ def detect_template_content_format(chat_template: str) -> str:
         # Look for patterns like: {%- for content in message['content'] -%}
         for loop_ast in jinja_ast.find_all(jinja2.nodes.For):
             loop_iter = loop_ast.iter
-            
+
             # Check if iterating over message['content'] or similar
             if _is_var_or_elems_access(loop_iter, "message", "content"):
                 return "openai"  # Found content iteration → openai format
-                
+
         return "string"  # No content loops found → string format
     except Exception as e:
         logger.debug(f"Error when parsing AST of Jinja template: {e}")
@@ -106,36 +106,36 @@ def detect_template_content_format(chat_template: str) -> str:
 
 
 def process_content_for_template_format(
-    msg_dict: dict, 
+    msg_dict: dict,
     content_format: str,
     image_data: list,
     audio_data: list,
-    modalities: list
+    modalities: list,
 ) -> dict:
     """
     Process message content based on detected template format.
-    
+
     Args:
         msg_dict: Message dictionary with content
         content_format: 'string' or 'openai' (detected via AST analysis)
         image_data: List to append extracted image URLs
         audio_data: List to append extracted audio URLs
         modalities: List to append modalities
-        
+
     Returns:
         Processed message dictionary
     """
     if not isinstance(msg_dict.get("content"), list):
         # Already a string or None, no processing needed
         return {k: v for k, v in msg_dict.items() if v is not None}
-    
+
     if content_format == "openai":
         # OpenAI format: preserve structured content list, normalize types
         processed_content_parts = []
         for chunk in msg_dict["content"]:
             if isinstance(chunk, dict):
                 chunk_type = chunk.get("type")
-                
+
                 if chunk_type == "image_url":
                     image_data.append(chunk["image_url"]["url"])
                     if chunk.get("modalities"):
@@ -149,14 +149,13 @@ def process_content_for_template_format(
                 else:
                     # Keep other content as-is (text, etc.)
                     processed_content_parts.append(chunk)
-        
+
         new_msg = {
-            k: v for k, v in msg_dict.items() 
-            if v is not None and k != "content"
+            k: v for k, v in msg_dict.items() if v is not None and k != "content"
         }
         new_msg["content"] = processed_content_parts
         return new_msg
-        
+
     else:  # content_format == "string"
         # String format: flatten to text only (for templates like DeepSeek)
         text_parts = []
@@ -166,7 +165,7 @@ def process_content_for_template_format(
             # Note: For string format, we ignore images/audio since the template
             # doesn't expect structured content - multimodal placeholders would
             # need to be inserted differently
-        
+
         new_msg = msg_dict.copy()
         new_msg["content"] = " ".join(text_parts) if text_parts else ""
         new_msg = {k: v for k, v in new_msg.items() if v is not None}
