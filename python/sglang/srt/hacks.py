@@ -1,10 +1,10 @@
 from typing import Tuple
 
 import torch
-from tqdm import trange
-
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+from tqdm import trange
+
 
 # def hack_requant_moe_weight(that, weights):
 #     print("hi hack_requant_moe_weight")
@@ -78,7 +78,12 @@ def hack_requant_moe_weight_at_post_load_weights(that):
         # print([(name, param.shape, param.dtype) for name, param in self_attn.named_parameters()])
 
         for module in [
-            layer.self_attn.fused_qkv_a_proj_with_mqa,
+            # TODO
+            # TODO
+            # TODO
+            # TODO
+            # TODO
+            # layer.self_attn.fused_qkv_a_proj_with_mqa,
             layer.self_attn.q_b_proj,
             layer.self_attn.kv_b_proj,
             layer.self_attn.o_proj,
