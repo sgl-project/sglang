@@ -114,6 +114,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
+    get_bool_env_var,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -803,17 +804,8 @@ class TokenizerManager:
         profile_by_stage: bool = False,
     ):
         self.auto_create_handle_loop()
-        env_with_stack_str = os.getenv("SGLANG_PROFILE_WITH_STACK")
-        env_with_stack: Optional[bool] = (
-            None
-            if env_with_stack_str is None
-            else env_with_stack_str.lower() in ["true", "1"]
-        )
-        with_stack = (
-            False
-            if with_stack is False or env_with_stack is False
-            else (True if with_stack is True or env_with_stack is True else None)
-        )
+        env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
+        with_stack = False if with_stack is False or env_with_stack is False else True
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
