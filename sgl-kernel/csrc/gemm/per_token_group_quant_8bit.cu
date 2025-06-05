@@ -96,7 +96,8 @@ void sgl_per_token_group_quant_8bit(
     int64_t group_size,
     double eps,
     double min_8bit,
-    double max_8bit) {
+    double max_8bit,
+    bool scale_ue8m0 = false) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
 
