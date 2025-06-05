@@ -25,6 +25,7 @@ from transformers import MixtralConfig
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
+    get_tensor_model_parallel_rank,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -101,12 +102,23 @@ class MixtralMoE(EPMoETimer, nn.Module):
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
+        start_time = time.time()
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states, router_logits)
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        end_time = time.time()
+        gate_time = (end_time - start_time)
         
-        self.append_by_dict(self.experts.get_timing() if isinstance(self.experts, EPMoETimer) else {})
+        start_time = time.time()
+        final_hidden_states = self.experts(hidden_states, router_logits)
+        end_time = time.time()
+        if self.tp_size > 1:
+            start_time = time.time()
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            end_time = time.time()
+            moe_all_reduce_time = (end_time - start_time)
+        
+        self.update_by_dict(self.experts.get_timing() if isinstance(self.experts, EPMoETimer) else {})
+        self.timing["all_reduce_time"] = moe_all_reduce_time # must be after update
+        self.timing["gate_time"] = gate_time
         
         return final_hidden_states.view(orig_shape)
 
@@ -230,14 +242,18 @@ class MixtralDecoderLayer(nn.Module):
         
         self.timing = {
             "layer_id": self.layer_id,
-            "self_attn_time": [],
-            "block_sparse_moe_time": [],
+            "self_attn_time": 0,
+            "block_sparse_moe_time": 0,
             "moe_timing": {
-                "pre_order_time": [],
-                "group_gemm_0_time": [],
-                "act_time": [],
-                "group_gemm_1_time": [],
-                "post_order_time": [],
+                "gate_time": 0,
+                "pre_order_time": 0,
+                "group_gemm_0_time": 0,
+                "act_time": 0,
+                "group_gemm_1_time": 0,
+                "post_order_time": 0,
+                "group_gemm_0_shape": "",
+                "group_gemm_1_shape": "",
+                "all_reduce_time": 0,
             },
         }
 
@@ -264,23 +280,27 @@ class MixtralDecoderLayer(nn.Module):
         attn_time = end_time - start_time
         # print(f"[Layer {self.layer_id}] SelfAttention time: {attn_time} seconds")
 
-        start_time = time.time()
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        start_time = time.time()
         hidden_states = self.block_sparse_moe(hidden_states)
         end_time = time.time()
         moe_time = end_time - start_time
         # print(f"[Layer {self.layer_id}] BlockSparseMoE time: {moe_time} seconds")
         
-        self.timing["self_attn_time"].extend([attn_time])
-        self.timing["block_sparse_moe_time"].extend([moe_time])
+        self.timing["self_attn_time"] = attn_time
+        self.timing["block_sparse_moe_time"] = moe_time
         if isinstance(self.block_sparse_moe, EPMoETimer):
-            self.timing["moe_timing"]["pre_order_time"].extend(self.block_sparse_moe.get_timing()["pre_order_time"])
-            self.timing["moe_timing"]["group_gemm_0_time"].extend(self.block_sparse_moe.get_timing()["group_gemm_0_time"])
-            self.timing["moe_timing"]["act_time"].extend(self.block_sparse_moe.get_timing()["act_time"])
-            self.timing["moe_timing"]["group_gemm_1_time"].extend(self.block_sparse_moe.get_timing()["group_gemm_1_time"])
-            self.timing["moe_timing"]["post_order_time"].extend(self.block_sparse_moe.get_timing()["post_order_time"])
-        
+            self.timing["moe_timing"]["gate_time"] = self.block_sparse_moe.get_timing()["gate_time"]
+            self.timing["moe_timing"]["pre_order_time"] = self.block_sparse_moe.get_timing()["pre_order_time"]
+            self.timing["moe_timing"]["group_gemm_0_time"] = self.block_sparse_moe.get_timing()["group_gemm_0_time"]
+            self.timing["moe_timing"]["act_time"] = self.block_sparse_moe.get_timing()["act_time"]
+            self.timing["moe_timing"]["group_gemm_1_time"] = self.block_sparse_moe.get_timing()["group_gemm_1_time"]
+            self.timing["moe_timing"]["post_order_time"] = self.block_sparse_moe.get_timing()["post_order_time"]
+            self.timing["moe_timing"]["all_reduce_time"] = self.block_sparse_moe.get_timing()["all_reduce_time"]
+            self.timing["moe_timing"]["group_gemm_0_shape"] = self.block_sparse_moe.get_timing()["group_gemm_0_shape"]
+            self.timing["moe_timing"]["group_gemm_1_shape"] = self.block_sparse_moe.get_timing()["group_gemm_1_shape"]
+            
         return hidden_states, residual
 
 
@@ -336,30 +356,61 @@ class MixtralModel(nn.Module):
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         
-        for i in range(len(self.layers)):
-            info = {
-                "layer_id": i,
-                "self_attn_time": 1000 * sum(self.layers[i].timing["self_attn_time"]) / len(self.layers[i].timing["self_attn_time"]),
-                "block_sparse_moe_time": 1000 * sum(self.layers[i].timing["block_sparse_moe_time"]) / len(self.layers[i].timing["block_sparse_moe_time"]),
-                "moe_timing": {
-                    "pre_order_time": 1000 * sum(self.layers[i].timing["moe_timing"]["pre_order_time"]) / len(self.layers[i].timing["moe_timing"]["pre_order_time"]),
-                    "group_gemm_0_time": 1000 * sum(self.layers[i].timing["moe_timing"]["group_gemm_0_time"]) / len(self.layers[i].timing["moe_timing"]["group_gemm_0_time"]),
-                    "act_time": 1000 * sum(self.layers[i].timing["moe_timing"]["act_time"]) / len(self.layers[i].timing["moe_timing"]["act_time"]),
-                    "group_gemm_1_time": 1000 * sum(self.layers[i].timing["moe_timing"]["group_gemm_1_time"]) / len(self.layers[i].timing["moe_timing"]["group_gemm_1_time"]),
-                    "post_order_time": 1000 * sum(self.layers[i].timing["moe_timing"]["post_order_time"]) / len(self.layers[i].timing["moe_timing"]["post_order_time"]),
-                },
-            }
-            self.model_timings.append(info)
+        # ----------------
+        if get_tensor_model_parallel_rank() == 0:
+            for i in range(len(self.layers)):
+                # 保留3位小数
+                info = {
+                    "layer_id": i,
+                    "self_attn_time(ms, avg)": round(1000 * self.layers[i].timing["self_attn_time"], 3),
+                    "block_sparse_moe_time": round(1000 * self.layers[i].timing["block_sparse_moe_time"], 3),
+                    "moe_timing": {
+                        "gate_time": round(1000 * self.layers[i].timing["moe_timing"]["gate_time"], 3),
+                        "pre_order_time": round(1000 * self.layers[i].timing["moe_timing"]["pre_order_time"], 3),
+                        "group_gemm_0_time": round(1000 * self.layers[i].timing["moe_timing"]["group_gemm_0_time"], 3),
+                        "act_time": round(1000 * self.layers[i].timing["moe_timing"]["act_time"], 3),
+                        "group_gemm_1_time": round(1000 * self.layers[i].timing["moe_timing"]["group_gemm_1_time"], 3),
+                        "post_order_time": round(1000 * self.layers[i].timing["moe_timing"]["post_order_time"], 3),
+                        "all_reduce_time": round(1000 * self.layers[i].timing["moe_timing"]["all_reduce_time"], 3),
+                    },
+                }
+                self.model_timings.append(info)
+            
+            import json
+            import os   
+            tp_size = get_tensor_model_parallel_world_size()
+            batch_size = forward_batch.batch_size
+            run_id = os.environ["RUN_ID"] + "_tp" + str(tp_size) + "_bs" + str(batch_size)
+            
+            # check if the file exists
+            if not os.path.exists(f"MixtralModel_Timing_{run_id}.json"):
+                with open(f"MixtralModel_Timing_{run_id}.json", "w") as f:
+                    json.dump({}, f)
+            
+            
+            with open(f"MixtralModel_Timing_{run_id}.json", "r") as f:
+                content = json.load(f)
+            
+            with open(f"MixtralModel_Timing_{run_id}.json", "w") as f:
+                # if self.forward_times == 0:
+                #     # clear the file
+                #     f.truncate(0)
+                info = {
+                    "forward_id": self.forward_times,
+                    "moe_group_gemm_0_shape": self.layers[0].timing["moe_timing"]["group_gemm_0_shape"],
+                    "moe_group_gemm_1_shape": self.layers[0].timing["moe_timing"]["group_gemm_1_shape"],
+                    "layers_info": self.model_timings,
+                }
+                print("write forward_id: ", self.forward_times, "to file")
+                
+                content.update(info)
+                json.dump(content, f, indent=4)
+            
+            self.forward_times += 1
+            self.model_timings = []
+        # torch.distributed.barrier()
+        # ----------------
         
-        import json
-        with open(f"MixtralModel_Timing.json", "w") as f:
-            info = {
-                "forward_id": self.forward_times,
-                "info": self.model_timings,
-            }
-            json.dump(info, f, indent=4)
-        
-        self.forward_times += 1
         return hidden_states
 
 class MixtralForCausalLM(nn.Module):

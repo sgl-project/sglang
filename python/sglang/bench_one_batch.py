@@ -395,6 +395,7 @@ def latency_test_run_once(
     # Decode
     decode_latencies = []
     for i in range(output_len - 1):
+        print(f"Decode {i} ...")
         synchronize(device)
         tic = time.time()
         next_token_ids, _ = decode(next_token_ids, batch, model_runner)

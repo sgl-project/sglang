@@ -117,41 +117,55 @@ class EPMoETimer:
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.timing = {
-            "pre_order_time": [],
-            "group_gemm_0_time": [],
-            "act_time": [],
-            "group_gemm_1_time": [],
-            "post_order_time": [],
+            "gate_time": 0,
+            "pre_order_time": 0,
+            "group_gemm_0_time": 0,
+            "act_time": 0,
+            "group_gemm_1_time": 0,
+            "post_order_time": 0,
+            "group_gemm_0_shape": "",
+            "group_gemm_1_shape": "",
+            "all_reduce_time": 0,
         }
     
-    def append(self, pre_order_time, group_gemm_0_time, act_time, group_gemm_1_time, post_order_time):
-        self.timing["pre_order_time"].append(pre_order_time)
-        self.timing["group_gemm_0_time"].append(group_gemm_0_time)
-        self.timing["act_time"].append(act_time)
-        self.timing["group_gemm_1_time"].append(group_gemm_1_time)
-        self.timing["post_order_time"].append(post_order_time)
-    
-    def append_by_dict(self, other_timing: dict):
+    def update(self, pre_order_time, group_gemm_0_time, act_time, group_gemm_1_time, post_order_time, group_gemm_0_shape, group_gemm_1_shape):
+        self.timing["pre_order_time"] = pre_order_time
+        self.timing["group_gemm_0_time"] = group_gemm_0_time
+        self.timing["act_time"] = act_time
+        self.timing["group_gemm_1_time"] = group_gemm_1_time
+        self.timing["post_order_time"] = post_order_time
+        self.timing["group_gemm_0_shape"] = group_gemm_0_shape
+        self.timing["group_gemm_1_shape"] = group_gemm_1_shape
+        
+    def update_by_dict(self, other_timing: dict):
         for key, value in other_timing.items():
             # 按照元素添加
-            self.timing[key].extend(value)
+            self.timing[key] = value
     
     def get_timing(self):
         return {
+            "gate_time": self.timing["gate_time"],
             "pre_order_time": self.timing["pre_order_time"],
             "group_gemm_0_time": self.timing["group_gemm_0_time"],
             "act_time": self.timing["act_time"],
             "group_gemm_1_time": self.timing["group_gemm_1_time"],
-            "post_order_time": self.timing["post_order_time"],   
+            "post_order_time": self.timing["post_order_time"],
+            "all_reduce_time": self.timing["all_reduce_time"],
+            "group_gemm_0_shape": self.timing["group_gemm_0_shape"],
+            "group_gemm_1_shape": self.timing["group_gemm_1_shape"],
         }
     
     def clear_timing(self):
         self.timing = {
-            "pre_order_time": [],
-            "group_gemm_0_time": [],    
-            "act_time": [],
-            "group_gemm_1_time": [],
-            "post_order_time": [],
+            "gate_time": 0,
+            "pre_order_time": 0,
+            "group_gemm_0_time": 0,    
+            "act_time": 0,
+            "group_gemm_1_time": 0,
+            "post_order_time": 0,
+            "group_gemm_0_shape": "",
+            "group_gemm_1_shape": "",
+            "all_reduce_time": 0,
         }
 
 
@@ -284,6 +298,7 @@ class EPMoE(torch.nn.Module, EPMoETimer):
             )
             self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
 
+        torch.cuda.synchronize()
         start_time = time.time()
         # PreReorder
         pre_reorder_triton_kernel[(hidden_states.shape[0],)](
@@ -298,6 +313,7 @@ class EPMoE(torch.nn.Module, EPMoETimer):
             hidden_states.shape[1],
             BLOCK_SIZE=512,
         )
+        torch.cuda.synchronize()
         end_time = time.time()
         pre_order_time = end_time - start_time
         # print(f"PreReorder time: {pre_order_time} seconds")
@@ -316,12 +332,13 @@ class EPMoE(torch.nn.Module, EPMoETimer):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
+        torch.cuda.synchronize()
         start_time = time.time()
         gateup_output = self.grouped_gemm_runner(
             a=gateup_input,
             b=self.w13_weight,
             c=gateup_output,
-            batch_size=self.num_experts_per_partition,
+            batch_size=self.num_experts_per_partition, # important!
             weight_column_major=True,
             seg_indptr=seg_indptr_cur_rank,
             weight_indices=weight_indices_cur_rank,
@@ -334,10 +351,12 @@ class EPMoE(torch.nn.Module, EPMoETimer):
             ),
             block_shape=self.block_shape,
         )
+        torch.cuda.synchronize()
         end_time = time.time()
         group_gemm_0_time = end_time - start_time
         # print(f"GroupGemm-0 time: {group_gemm_0_time} seconds")
         # Act
+        torch.cuda.synchronize()
         start_time = time.time()
         down_input = torch.empty(
             gateup_output.shape[0],
@@ -381,10 +400,12 @@ class EPMoE(torch.nn.Module, EPMoETimer):
         else:
             raise ValueError(f"Unsupported activation: {self.activation=}")
 
+        torch.cuda.synchronize()
         end_time = time.time()
         act_time = end_time - start_time
         # print(f"Act time: {act_time} seconds")
 
+        torch.cuda.synchronize()
         start_time = time.time()
         # GroupGemm-1
         down_output = torch.empty(
@@ -410,10 +431,12 @@ class EPMoE(torch.nn.Module, EPMoETimer):
             ),
             block_shape=self.block_shape,
         )
+        torch.cuda.synchronize()
         end_time = time.time()
         group_gemm_1_time = end_time - start_time
         # print(f"GroupGemm-1 time: {group_gemm_1_time} seconds")
 
+        torch.cuda.synchronize()
         start_time = time.time()
         # PostReorder
         output = torch.empty_like(hidden_states)
@@ -429,12 +452,15 @@ class EPMoE(torch.nn.Module, EPMoETimer):
             hidden_states.size(1),
             BLOCK_SIZE=512,
         )
+        torch.cuda.synchronize()
         end_time = time.time()
         post_order_time = end_time - start_time
         # print(f"PostReorder time: {post_order_time} seconds")
         
         self.clear_timing()
-        self.append(pre_order_time, group_gemm_0_time, act_time, group_gemm_1_time, post_order_time)
+        gemm_0_shape = f"A:({gateup_input.shape}), B:({self.w13_weight.shape}), C:({gateup_output.shape})"
+        gemm_1_shape = f"A:({down_input.shape}), B:({self.w2_weight.shape}), C:({down_output.shape})"
+        self.update(pre_order_time, group_gemm_0_time, act_time, group_gemm_1_time, post_order_time, gemm_0_shape, gemm_1_shape)
 
         return output
 
