@@ -41,7 +41,8 @@ def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
 
 
 # Copied from transformers
-def rotate_half(x):
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half the hidden dims of the input tensor."""
     return _rotate_neox(x)
 
 
@@ -1250,8 +1251,6 @@ class MiniCPMScaledRotaryEmbedding(RotaryEmbedding):
 
         def apply_rotary_pos_emb(q, k, cos, sin, positions):
             assert q.dim() == 3
-            cos = cos.squeeze(1).squeeze(0)
-            sin = sin.squeeze(1).squeeze(0)
             cos = cos[positions].unsqueeze(1)
             sin = sin[positions].unsqueeze(1)
             q_embed = (q * cos) + (rotate_half(q) * sin)
