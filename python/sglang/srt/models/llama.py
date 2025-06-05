@@ -279,7 +279,9 @@ class LlamaModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
-        if self.pp_group.is_first_rank:
+        if self.pp_group.is_first_rank or (
+            self.pp_group.is_last_rank and config.tie_word_embeddings
+        ):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
