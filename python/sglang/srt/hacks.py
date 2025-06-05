@@ -2,10 +2,10 @@ from typing import Tuple
 
 import einops
 import torch
-from tqdm import tqdm
-
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+from tqdm import tqdm
+
 
 # def hack_requant_moe_weight(that, weights):
 #     print("hi hack_requant_moe_weight")
@@ -73,12 +73,12 @@ def hack_requant_moe_weight_at_post_load_weights(that):
     for layer_id in tqdm(moe_layers):
         experts = that.model.layers[layer_id].mlp.experts
         assert isinstance(experts, DeepEPMoE)
-        experts.w13_weight_fp8[0][...], experts.w13_weight_fp8[1][...] = (
-            _requant_grouped_moe_weight(that, *experts.w13_weight_fp8)
-        )
-        experts.w2_weight_fp8[0][...], experts.w2_weight_fp8[1][...] = (
-            _requant_grouped_moe_weight(that, *experts.w2_weight_fp8)
-        )
+        _requant_grouped_moe_weight_inplace(that, *experts.w13_weight_fp8)
+        _requant_grouped_moe_weight_inplace(that, experts.w2_weight_fp8)
+
+
+def _requant_grouped_moe_weight_inplace(that, w_fp8):
+    w_fp8[0][...], w_fp8[1][...] = _requant_grouped_moe_weight(that, *w_fp8)
 
 
 def _requant_grouped_moe_weight(
