@@ -1714,7 +1714,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 global_server_args_dict["disable_shared_experts_fusion"] = 0
                 log_info_on_rank0(
                     logger,
-                    "Deepseek V3/R1 with fp8/fp4 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled.",
+                    "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled.",
                 )
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -1894,7 +1894,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.use_deep_gemm_bmm = True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -1950,21 +1949,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                         "up_proj.qweight",
                         "up_proj.qzeros",
                         "up_proj.scales",
-                    ]
-                elif self.quant_config.get_name() == "modelopt_fp4":
-                    suffix_list = [
-                        "down_proj.weight",
-                        "down_proj.weight_scale",
-                        "down_proj.weight_scale_2",
-                        "down_proj.input_scale",
-                        "gate_proj.weight",
-                        "gate_proj.weight_scale",
-                        "gate_proj.weight_scale_2",
-                        "gate_proj.input_scale",
-                        "up_proj.weight",
-                        "up_proj.weight_scale",
-                        "up_proj.weight_scale_2",
-                        "up_proj.input_scale",
                     ]
                 else:
                     raise ValueError(
@@ -2109,6 +2093,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+
                     if fuse_qkv_a_proj and (
                         "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                     ):
@@ -2134,12 +2119,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                             fused_weight = torch.cat(
                                 [q_a_proj_weight, kv_a_proj_weight], dim=0
                             )
-                            param_name = (
-                                name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
-                                if "q_a_proj" in name
-                                else name.replace(
-                                    "kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"
-                                )
+
+                            param_name = name.replace(
+                                "q_a_proj", "fused_qkv_a_proj_with_mqa"
                             )
                             param = params_dict[param_name]
 
