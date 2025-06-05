@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_group_quant_int8
+
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -14,21 +15,21 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 @triton.jit
 def _per_token_group_quant_fp8(
-        # Pointers to inputs and output
-        y_ptr,
-        y_q_ptr,
-        y_s_ptr,
-        # Stride of input
-        y_stride,
-        # Columns of input
-        N,
-        # Avoid to divide zero
-        eps,
-        # Information for float8
-        fp8_min,
-        fp8_max,
-        # Meta-parameters
-        BLOCK: tl.constexpr,
+    # Pointers to inputs and output
+    y_ptr,
+    y_q_ptr,
+    y_s_ptr,
+    # Stride of input
+    y_stride,
+    # Columns of input
+    N,
+    # Avoid to divide zero
+    eps,
+    # Information for float8
+    fp8_min,
+    fp8_max,
+    # Meta-parameters
+    BLOCK: tl.constexpr,
 ):
     """A Triton-accelerated function to perform per-token-group quantization on a
     tensor.
@@ -57,22 +58,22 @@ def _per_token_group_quant_fp8(
 
 @triton.jit
 def _per_token_group_quant_fp8_colmajor(
-        # Pointers to inputs and output
-        y_ptr,
-        y_q_ptr,
-        y_s_ptr,
-        group_size,
-        # Num columns of y
-        y_num_columns,
-        # Stride from one column to the next of y_s
-        y_s_col_stride,
-        # Avoid to divide zero
-        eps,
-        # Information for float8
-        fp8_min,
-        fp8_max,
-        # Meta-parameters
-        BLOCK: tl.constexpr,
+    # Pointers to inputs and output
+    y_ptr,
+    y_q_ptr,
+    y_s_ptr,
+    group_size,
+    # Num columns of y
+    y_num_columns,
+    # Stride from one column to the next of y_s
+    y_s_col_stride,
+    # Avoid to divide zero
+    eps,
+    # Information for float8
+    fp8_min,
+    fp8_max,
+    # Meta-parameters
+    BLOCK: tl.constexpr,
 ):
     """A Triton-accelerated function to perform per-token-group
     quantization on a tensor.
@@ -104,12 +105,12 @@ def _per_token_group_quant_fp8_colmajor(
 
 
 def triton_per_token_group_quant_8bit(
-        x: torch.Tensor,
-        group_size: int,
-        eps: float = 1e-10,
-        dtype: torch.dtype = fp8_type_,
-        column_major_scales: bool = False,
-        scale_tma_aligned: bool = False,
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    dtype: torch.dtype = fp8_type_,
+    column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Function to perform per-token-group quantization on an input tensor `x`.
 
@@ -126,7 +127,7 @@ def triton_per_token_group_quant_8bit(
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
     """
     assert (
-            x.shape[-1] % group_size == 0
+        x.shape[-1] % group_size == 0
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
@@ -208,15 +209,15 @@ def triton_per_token_group_quant_8bit(
 
 
 def sglang_per_token_group_quant_8bit(
-        x: torch.Tensor,
-        group_size: int,
-        eps: float = 1e-10,
-        dtype: torch.dtype = fp8_type_,
-        column_major_scales: bool = False,
-        scale_tma_aligned: bool = False,
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    dtype: torch.dtype = fp8_type_,
+    column_major_scales: bool = False,
+    scale_tma_aligned: bool = False,
 ):
     assert (
-            x.shape[-1] % group_size == 0
+        x.shape[-1] % group_size == 0
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
@@ -254,7 +255,9 @@ def sglang_per_token_group_quant_8bit(
         f8_info = torch.finfo(dtype)
         fp8_max = f8_info.max
         fp8_min = f8_info.min
-        sgl_per_token_group_quant_fp8(x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0)
+        sgl_per_token_group_quant_fp8(
+            x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+        )
 
     return x_q, x_s
 
@@ -273,12 +276,12 @@ def sglang_per_token_group_quant_8bit(
     ),
 )
 def test_per_token_group_quant_with_column_major(
-        num_tokens,
-        hidden_dim,
-        group_size,
-        dst_dtype,
-        column_major_scales,
-        scale_tma_aligned,
+    num_tokens,
+    hidden_dim,
+    group_size,
+    dst_dtype,
+    column_major_scales,
+    scale_tma_aligned,
 ):
     if not column_major_scales and scale_tma_aligned:
         return
