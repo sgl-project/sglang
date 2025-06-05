@@ -41,7 +41,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   const T* group_input = input + block_group_offset;
   DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + block_group_offset;
-  float* scale_output;
+  OutputScaleT* scale_output;
 
   if constexpr (IS_COLUMN_MAJOR) {
     const int row_idx = global_group_id / scale_num_rows;
