@@ -1018,6 +1018,37 @@ def v1_chat_generate_request(
                         msg_dict = {k: v for k, v in msg_dict.items() if v is not None}
                         openai_compatible_messages.append(msg_dict)
                 if (
+                    tools
+                    and tokenizer_manager.server_args.tool_call_parser == "deepseekv3"
+                ):
+                    tool_content = """You are a helpful Assistant.
+                    ## Tools
+                    ### Function
+                    You have the following functions available:
+                    """ + "".join(
+                        [
+                            f"""
+                        - `{tool['name']}`:
+                        ```json
+                        {json.dumps(tool)}
+                        ```
+                        """
+                            for tool in tools
+                        ]
+                    )
+                    system_messages = [
+                        msg
+                        for msg in openai_compatible_messages
+                        if msg["role"] == "system"
+                    ]
+
+                    if system_messages:
+                        system_messages[-1]["content"] += "\n" + tool_content
+                    else:
+                        openai_compatible_messages.insert(
+                            0, {"role": "system", "content": tool_content}
+                        )
+                if (
                     openai_compatible_messages
                     and openai_compatible_messages[-1]["role"] == "assistant"
                 ):
