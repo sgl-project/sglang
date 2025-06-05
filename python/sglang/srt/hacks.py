@@ -112,14 +112,19 @@ def _requant_grouped_moe_weight(
     )
     out_w_flat, out_s_flat = per_block_cast_to_fp8(weight_dequant_flat)
 
-    def _unflatten(x):
-        return einops.rearrange(
-            x,
-            "(num_group n_div_128) whatever_div_128 -> num_group n_div_128 whatever_div_128",
-            num_group=num_group,
-        )
+    # def _unflatten(x):
+    #     return einops.rearrange(
+    #         x,
+    #         "(num_group n_div_128) whatever_div_128 -> num_group n_div_128 whatever_div_128",
+    #         num_group=num_group,
+    #     )
+    #
+    # return _unflatten(out_w_flat), _unflatten(out_s_flat)
 
-    return _unflatten(out_w_flat), _unflatten(out_s_flat)
+    return (
+        out_w_flat.view(weight.shape),
+        out_s_flat.view(weight_scale_inv.shape),
+    )
 
 
 def ceil_to_ue8m0(x: torch.Tensor):
