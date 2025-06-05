@@ -5,7 +5,7 @@ WORKDIR="/sglang-checkout/test/srt"
 declare -A ENV_MAP=(
   [SGLANG_AMD_CI]=1
   [SGLANG_IS_IN_CI]=1
-  [SGLANG_AITER_MOE]=1
+  [SGLANG_USE_AITER]=1
 )
 
 # Parse -w/--workdir and -e ENV=VAL
