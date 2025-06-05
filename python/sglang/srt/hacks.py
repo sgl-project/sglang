@@ -72,9 +72,10 @@ def hack_requant_moe_weight_at_post_load_weights(that):
     for layer_id in tqdm(moe_layers):
         layer = that.model.layers[layer_id]
 
+        shared_experts = layer.mlp.shared_experts
         for module in [
-            layer.mlp.shared_experts.gate_up_proj,
-            layer.mlp.shared_experts.down_proj,
+            shared_experts.gate_up_proj,
+            shared_experts.down_proj,
         ]:
             _requant_grouped_moe_weight_inplace(that, module.weight, module.weight_scale_inv)
 
