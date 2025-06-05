@@ -654,8 +654,8 @@ def moe_align_block_size_triton(
 def init_sorted_ids_and_cumsum_buffer_kernel(
     sorted_ids_ptr,
     cumsum_buffer_ptr,
-    max_num_tokens_padded: tl.constexpr,
-    topk_ids_numel: tl.constexpr,
+    max_num_tokens_padded,
+    topk_ids_numel,
     num_experts: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -682,7 +682,7 @@ def init_sorted_ids_and_cumsum_buffer(
     sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=device)
     cumsum_buffer = torch.empty((num_experts + 1,), dtype=torch.int32, device=device)
 
-    BLOCK_SIZE = 128
+    BLOCK_SIZE = 1024
     sorted_ids_blocks = triton.cdiv(max_num_tokens_padded, BLOCK_SIZE)
     grid = (sorted_ids_blocks + 1,)
 
