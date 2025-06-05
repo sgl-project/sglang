@@ -516,7 +516,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hook,
     ):
         if _DEBUG_LL_INSERT_SLOWNESS:
-            TODO
+            mat_0 = torch.randn((8192, 8192), dtype=torch.float)
+            mat_1 = torch.randn((8192, 8192), dtype=torch.float)
+            mat_0 @ mat_1
 
         hook() if self.return_recv_hook else event.current_stream_wait()
 
@@ -604,7 +606,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
     def combine_b(self, hidden_states, event, hook):
         if _DEBUG_LL_INSERT_SLOWNESS:
-            TODO
+            mat_0 = torch.randn((8192, 8192), dtype=torch.float)
+            mat_1 = torch.randn((8192, 8192), dtype=torch.float)
+            mat_0 @ mat_1
 
         hook() if self.return_recv_hook else event.current_stream_wait()
         return hidden_states
