@@ -1,5 +1,5 @@
-from typing import Optional
-from typing import Dict, Any
+from typing import Any, Dict, Optional
+
 import torch
 
 
@@ -161,7 +161,7 @@ def cutlass_fp4_group_mm(
     b_fp4,
     a_blockscale,
     b_blockscale,
-    alphas, 
+    alphas,
     out_dtype,
     device,
     params: Dict[str, Any],

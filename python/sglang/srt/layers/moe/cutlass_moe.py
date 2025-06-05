@@ -4,11 +4,11 @@ import functools
 import json
 import logging
 import os
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -21,6 +21,7 @@ if _is_cuda:
         scaled_fp4_experts_quant,
         silu_and_mul,
     )
+
 
 def cutlass_fused_experts_fp8(
     a: torch.Tensor,
@@ -291,9 +292,10 @@ def cutlass_moe_fp4(
     assert (
         k_a // 2 == half_k_w1 and params.hidden_size == k_w2
     ), "Hidden size mismatch between a, w1 and w2"
-    assert (nx2_w1 == params.intermediate_size_per_partition * 2 and
-            half_n_w2 == params.intermediate_size_per_partition // 2),(
-                "mismatch in " "expected `n`")
+    assert (
+        nx2_w1 == params.intermediate_size_per_partition * 2
+        and half_n_w2 == params.intermediate_size_per_partition // 2
+    ), ("mismatch in " "expected `n`")
     assert 2 * half_k_w1 == k_w2, "Hidden size mismatch w2 and w1"
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid input dtype"
 
@@ -316,7 +318,12 @@ def cutlass_moe_fp4(
     )
 
     rep_a_fp4, rep_a_blockscale = scaled_fp4_experts_quant(
-        a, a1_gscale, params.expert_offsets, params.blockscale_offsets, num_topk, expert_map=a_map
+        a,
+        a1_gscale,
+        params.expert_offsets,
+        params.blockscale_offsets,
+        num_topk,
+        expert_map=a_map,
     )
     c1 = cutlass_fp4_group_mm(
         rep_a_fp4,
@@ -326,10 +333,10 @@ def cutlass_moe_fp4(
         w1_alphas,
         out_dtype,
         device,
-        params.to_gemm1_args()
+        params.to_gemm1_args(),
     )
     del rep_a_fp4, rep_a_blockscale
-    
+
     # hidden size dimension is split to one halfpytho sized tensor.
     intermediate = torch.empty(
         (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
@@ -337,7 +344,12 @@ def cutlass_moe_fp4(
     silu_and_mul(c1, intermediate)
 
     int_fp4, int_blockscale = scaled_fp4_experts_quant(
-        intermediate, a2_gscale, params.expert_offsets, params.blockscale_offsets, num_topk)
+        intermediate,
+        a2_gscale,
+        params.expert_offsets,
+        params.blockscale_offsets,
+        num_topk,
+    )
     c2 = cutlass_fp4_group_mm(
         int_fp4,
         w2_fp4,
@@ -346,10 +358,10 @@ def cutlass_moe_fp4(
         w2_alphas,
         out_dtype,
         device,
-        params.to_gemm2_args()
+        params.to_gemm2_args(),
     )
     del int_fp4, int_blockscale
-    
+
     c2 = c2[c_map].view(m_a, num_topk, params.hidden_size)
     if not apply_router_weight_on_input:
         c2 = c2 * topk_weights.view(m_a, num_topk, 1).to(out_dtype)

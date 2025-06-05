@@ -980,8 +980,7 @@ class Fp8MoEMethod:
             and self.block_quant
             and is_sm100_supported()
         ):
-            from sglang.srt.layers.moe.cutlass_moe import (
-                cutlass_fused_experts_fp8)
+            from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             return cutlass_fused_experts_fp8(
                 x,
