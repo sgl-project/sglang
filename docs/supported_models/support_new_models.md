@@ -70,7 +70,7 @@ MMMU-Pro, etc.) in your PR.
 This is the command to test a new model on your local machine:
 
 ```bash
-ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels.test_others
+ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels
 ```
 
 ## Port a Model from vLLM to SGLang
