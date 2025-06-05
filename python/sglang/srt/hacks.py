@@ -4,7 +4,7 @@ import einops
 import torch
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
-from tqdm import tqdm
+from tqdm import tqdm, trange
 
 
 # def hack_requant_moe_weight(that, weights):
@@ -75,6 +75,10 @@ def hack_requant_moe_weight_at_post_load_weights(that):
         assert isinstance(experts, DeepEPMoE)
         _requant_grouped_moe_weight_inplace(that, *experts.w13_weight_fp8)
         _requant_grouped_moe_weight_inplace(that, experts.w2_weight_fp8)
+
+    for layer_id in trange(that.config.num_hidden_layers):
+        self_attn = that.model.layers[layer_id].self_attn
+        _requant_grouped_moe_weight_inplace(that, *self_attn.q_b_proj)
 
 
 def _requant_grouped_moe_weight_inplace(that, w_fp8):
