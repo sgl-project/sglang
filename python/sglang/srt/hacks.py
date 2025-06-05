@@ -3,7 +3,6 @@ from typing import Tuple
 import torch
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
-from sglang.srt.models.deepseek_v2 import DeepseekV2MLP
 from tqdm import trange
 
 
@@ -65,6 +64,8 @@ from tqdm import trange
 
 
 def hack_requant_moe_weight_at_post_load_weights(that):
+    from sglang.srt.models.deepseek_v2 import DeepseekV2MLP
+
     moe_layers = list(range(
         that.config.first_k_dense_replace,
         that.config.num_hidden_layers,
