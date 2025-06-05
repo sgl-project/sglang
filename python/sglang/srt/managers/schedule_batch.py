@@ -91,7 +91,6 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
     "disable_shared_experts_fusion",
-    "num_fused_shared_experts",
     "sampling_backend",
     "speculative_accept_threshold_acc",
     "speculative_accept_threshold_single",
