@@ -259,7 +259,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     ) -> torch.Tensor:
         assert activation == "silu", f"activation = {activation} is not supported."
 
-        if layer.use_intel_amx_backend:
+        if layer.use_intel_amx_backend and not apply_router_weight_on_input:
             topk_weights, topk_ids = select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
