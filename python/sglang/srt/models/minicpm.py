@@ -236,7 +236,7 @@ class MiniCPMFlashAttention2(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-
+        assert isinstance(config.sliding_window, list), type(config.sliding_window)
         self.is_sliding = bool((layer_id + 1) % len(config.sliding_window))
         self.sliding_window = (
             (config.sliding_window[0] - 1, 0) if self.is_sliding else (-1, -1)
