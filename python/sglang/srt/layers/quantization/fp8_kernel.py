@@ -289,13 +289,14 @@ def sglang_per_token_group_quant_fp8(
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
     if scale_ue8m0:
         assert column_major_scales and scale_tma_aligned
-        # aligned to 4 * sizeof(float)
-        aligned_size = (x.shape[-2] + 3) // 4 * 4
+        mn, k = x.shape
+        aligned_mn = align(mn, 4)
+        aligned_k = align(k, 4)
         x_s = torch.empty(
-            x.shape[:-2] + (x.shape[-1] // group_size, aligned_size),
+            (aligned_k, aligned_mn),
             device=x.device,
             dtype=torch.uint8,
-        ).permute(-1, -2)[: x.shape[-2], :]
+        ).permute(-1, -2)[:mn, :]
     elif column_major_scales:
         if scale_tma_aligned:
             # TODO extract "align" function
@@ -327,6 +328,16 @@ def sglang_per_token_group_quant_fp8(
         x_s = x_s.view(torch.int32)
 
     return x_q, x_s
+
+
+# TODO move
+def align(x: int, y: int) -> int:
+    return ceil_div(x, y) * y
+
+
+# TODO move
+def ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
 
 
 def sglang_per_token_quant_fp8(
