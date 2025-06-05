@@ -155,10 +155,10 @@ def _requant_grouped_moe_weight(
     #
     # return _unflatten(out_w_flat), _unflatten(out_s_flat)
 
-    return (
-        out_w_flat.view(weight.shape),
-        out_s_flat.view(weight_scale_inv.shape),
-    )
+    out_w = out_w_flat.view(weight.shape)
+    out_s = out_s_flat.view(weight_scale_inv.shape)
+
+    return out_w, out_s
 
 
 def ceil_to_ue8m0(x: torch.Tensor):
