@@ -95,6 +95,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     bind_or_assign,
+    cpu_has_amx_support,
     get_bool_env_var,
     get_int_env_var,
     is_cuda,
@@ -110,6 +111,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8, merge_state_v2
+elif cpu_has_amx_support():
+    pass
 else:
     from vllm._custom_ops import awq_dequantize
 

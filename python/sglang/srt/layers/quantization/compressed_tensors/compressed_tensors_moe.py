@@ -14,6 +14,7 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_qu
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
+    cpu_has_amx_support,
     per_tensor_dequantize,
     replace_parameter,
 )
@@ -22,7 +23,11 @@ from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
+<<<<<<< HEAD
 if not _is_cuda and not _is_npu:
+=======
+if not _is_cuda and not cpu_has_amx_support():
+>>>>>>> a3f5e41b (remove vllm dependency)
     from vllm import _custom_ops as vllm_ops
     from vllm._custom_ops import scaled_fp8_quant
 

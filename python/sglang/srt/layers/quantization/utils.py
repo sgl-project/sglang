@@ -6,12 +6,12 @@ from typing import List, Mapping, Tuple, Union
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import cpu_has_amx_support, is_cuda, is_npu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
-if not _is_cuda and not _is_npu:
+if not (_is_cuda or _is_npu or cpu_has_amx_support()):
     from vllm._custom_ops import scaled_fp8_quant
 
 
