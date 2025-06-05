@@ -15,11 +15,11 @@ _is_cuda = is_cuda()
 if _is_cuda:
     import sgl_kernel
     from sgl_kernel import (
-        shuffle_rows,
         cutlass_fp4_group_mm,
         fp8_blockwise_scaled_grouped_mm,
         prepare_moe_input,
         scaled_fp4_experts_quant,
+        shuffle_rows,
         silu_and_mul,
     )
 
