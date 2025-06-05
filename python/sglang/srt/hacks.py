@@ -1,10 +1,10 @@
 from typing import Tuple
 
 import torch
-from tqdm import trange
-
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+from tqdm import trange
+
 
 # def hack_requant_moe_weight(that, weights):
 #     print("hi hack_requant_moe_weight")
@@ -142,8 +142,6 @@ def _requant_grouped_moe_weight(
         torch.bfloat16,
     )
 
-    assert n % 128 == 0
-    assert k % 128 == 0
     # weight_dequant_flat = einops.rearrange(weight_dequant, "num_group n k -> (num_group n) k")
     weight_dequant_flat = weight_dequant.view((-1, k))
     out_w_flat, out_s_flat = per_block_cast_to_fp8(weight_dequant_flat)
