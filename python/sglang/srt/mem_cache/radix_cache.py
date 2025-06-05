@@ -461,16 +461,25 @@ class RadixCache(BasePrefixCache):
         return ret_list
 
     def _record_store_event(self, node: TreeNode):
+        # Emit one BlockStored event per fixed-size "page" so that each
+        # event always represents exactly ``self.page_size`` contiguous tokens.
+        # This keeps the wire contract simple for downstream consumers like
+        # Dynamo that assume uniform block sizes.
         if self.enable_kv_cache_events:
-            # Emit one BlockStored event per fixed-size page so that every event
-            # describes exactly ``self.page_size`` contiguous tokens.  This
-            # keeps the wire contract simple for consumers (e.g. Dynamo).
-            parent_block_hash = hash(tuple(node.parent.key)) if node.parent else None
+            # The first page inherits its parent from the radix tree; each
+            # subsequent page chains off the previous page we just emitted so
+            # that the receiver can reconstruct the original order.
+            parent_block_hash = (
+                hash(tuple(node.parent.key)) if node.parent else None
+            )
+
             for start in range(0, len(node.key), self.page_size):
                 page_tokens = node.key[start : start + self.page_size]
                 if not page_tokens:
                     continue
+
                 block_hash = hash(tuple(page_tokens))
+
                 self.kv_event_queue.append(
                     BlockStored(
                         block_hashes=[block_hash],
@@ -481,10 +490,12 @@ class RadixCache(BasePrefixCache):
                     )
                 )
 
+                # Next slice's parent is the block we just pushed.
+                parent_block_hash = block_hash
+
     def _record_remove_event(self, node: TreeNode):
+        # Emit one BlockRemoved per page for symmetry with _record_store_event.
         if self.enable_kv_cache_events:
-            # For symmetry with _record_store_event we also emit one
-            # BlockRemoved event per page.
             for start in range(0, len(node.key), self.page_size):
                 page_tokens = node.key[start : start + self.page_size]
                 if not page_tokens:
