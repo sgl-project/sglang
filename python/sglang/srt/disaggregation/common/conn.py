@@ -183,7 +183,7 @@ class CommonKVReceiver(BaseKVReceiver):
             self.required_dst_info_num = 1
 
         if self.target_dp_rank is not None:
-            logger.info(f"[DISAGG] Reciever got rank {self.target_dp_rank}")
+            logger.debug(f"Targeting DP rank: {self.target_dp_rank}")
             self.target_dp_group = self.target_dp_rank
         else:
             self.target_dp_group = bootstrap_room % self.prefill_dp_size

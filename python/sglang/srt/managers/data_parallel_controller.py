@@ -258,7 +258,7 @@ class DataParallelController:
                 )
         else:
             if req.data_parallel_rank is not None:
-                logger.info(f"[DISAGG] Direct routing to DP rank {req.data_parallel_rank}")
+                logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
                 self.workers[req.data_parallel_rank].send_pyobj(req)
             else:
                 self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
