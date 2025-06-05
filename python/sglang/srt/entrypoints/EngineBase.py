@@ -28,7 +28,7 @@ class EngineBase(ABC):
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
-        attn_dp_rank: Optional[int] = None,
+        data_parallel_rank: Optional[int] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """Generate outputs based on given inputs."""
         pass
