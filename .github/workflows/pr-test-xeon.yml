@@ -71,7 +71,7 @@ jobs:
   finish:
     if: always()
     needs: [build-test, unit-test]
-    runs-on: spr-node
+    runs-on: ubuntu-24.04
     steps:
       - name: Check all dependent job statuses
         run: |
