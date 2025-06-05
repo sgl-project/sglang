@@ -911,6 +911,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q = self.q_a_layernorm(q)
+            print(f"hi call q_b_proj {q.shape=} {q.dtype=} {positions=}")
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
             q = self.q_proj(hidden_states)[0].view(
