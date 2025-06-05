@@ -4,6 +4,7 @@ import torch
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from tqdm import trange
+import deep_gemm.utils.layout
 
 
 # def hack_requant_moe_weight(that, weights):
@@ -157,6 +158,8 @@ def _requant_grouped_moe_weight(
 
     out_w = out_w_flat.view(weight.shape)
     out_s = out_s_flat.view(weight_scale_inv.shape)
+
+    out_s = deep_gemm.utils.layout.transform_sf_into_required_layout(out_s)
 
     return out_w, out_s
 
