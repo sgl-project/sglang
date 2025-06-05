@@ -2,7 +2,6 @@ from typing import Callable, List, Optional, Tuple
 
 import einops
 import torch
-
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 
 try:
@@ -247,8 +246,8 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     )
 
     if get_bool_env_var("SGLANG_HACK_W8A8_DEEPGEMM_EXTRA_SANITY_CHECK"):
-        _sanity_check_scale(x_scale, "x_scale")
-        _sanity_check_scale(weight_scale, "weight_scale")
+        _sanity_check_scale("x_scale", x_scale)
+        _sanity_check_scale("weight_scale", weight_scale)
 
     output = w8a8_block_fp8_matmul_deepgemm(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
@@ -362,8 +361,8 @@ def block_quant_to_tensor_quant(
     x_dq_block_tiles = [
         [
             x_dq_block[
-                j * block_n : min((j + 1) * block_n, n),
-                i * block_k : min((i + 1) * block_k, k),
+            j * block_n: min((j + 1) * block_n, n),
+            i * block_k: min((i + 1) * block_k, k),
             ]
             for i in range(k_tiles)
         ]
