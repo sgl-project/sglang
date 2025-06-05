@@ -156,7 +156,7 @@ class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestC
     def _pixel_values_image_data(self, processor_output):
         return dict(
             modality="IMAGE",
-            image_grid_thws=processor_output["image_grid_thw"],
+            image_grid_thw=processor_output["image_grid_thw"],
             pixel_values=processor_output["pixel_values"],
         )
 
@@ -207,8 +207,8 @@ class TestKimiVLImageUnderstandsImage(
     def _pixel_values_image_data(self, processor_output):
         return dict(
             modality="IMAGE",
-            image_grid_thws=processor_output["image_grid_hws"],
             pixel_values=processor_output["pixel_values"],
+            image_grid_hws=processor_output["image_grid_hws"],
         )
 
 
