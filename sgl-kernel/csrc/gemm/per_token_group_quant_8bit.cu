@@ -214,5 +214,5 @@ void sgl_per_token_group_quant_fp8(
     double fp8_min,
     double fp8_max,
     bool scale_ue8m0) {
-  sgl_per_token_group_quant_8bit(input, output_q, output_s, group_size, eps, fp8_min, fp8_max);
+  sgl_per_token_group_quant_8bit(input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0);
 }
