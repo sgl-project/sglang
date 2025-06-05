@@ -296,7 +296,7 @@ def get_benchmark():
             x_vals=configs,
             line_arg="provider",
             line_vals=["reference", "triton", "triton_optimize", "triton_cumsum"],
-            line_names=["Reference", "Triton", "Triton Optimized", "Triton Cumsum"],
+            line_names=["PyTorch", "Triton", "Triton Optimized", "Triton Cumsum"],
             styles=[("blue", "-"), ("green", "-"), ("red", "-"), ("orange", "-")],
             ylabel="us",
             plot_name="write-req-to-token-pool-performance",
