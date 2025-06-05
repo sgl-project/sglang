@@ -293,7 +293,6 @@ class EPMoE(torch.nn.Module):
             gateup_input,
             get_col_major_tma_aligned_tensor(gateup_input_scale),
         )
-        del gateup_input, gateup_input_scale
 
         # GroupGemm-0
         num_groups, m, k = gateup_input_fp8[0].size()
@@ -305,8 +304,8 @@ class EPMoE(torch.nn.Module):
         m_grouped_gemm_fp8_fp8_bf16_nt_masked(
             gateup_input_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
         )
-        dispose_tensor(gateup_input_fp8[0])
-        dispose_tensor(gateup_input_fp8[1])
+        del gateup_input
+        del gateup_input_scale
         del gateup_input_fp8
 
         # Act
@@ -344,15 +343,14 @@ class EPMoE(torch.nn.Module):
             down_input,
             get_col_major_tma_aligned_tensor(down_input_scale),
         )
-        del down_input, down_input_scale
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
         m_grouped_gemm_fp8_fp8_bf16_nt_masked(
             down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
         )
-        dispose_tensor(down_input_fp8[0])
-        dispose_tensor(down_input_fp8[1])
+        del down_input
+        del down_input_scale
         del down_input_fp8
         # PostReorder
         output = torch.empty(
