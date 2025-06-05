@@ -21,7 +21,6 @@ try:
     from deep_gemm.jit.compiler import get_nvcc_compiler
     from deep_gemm.jit_kernels.gemm import get_best_configs
     from deep_gemm.jit_kernels.runtime import FP8GemmRuntime, GemmType
-    from deep_gemm.jit_kernels.tuner import jit_tuner
 
     sm_version = get_device_sm()
     if sm_version == 90:
