@@ -1395,7 +1395,9 @@ def v1_chat_generate_response(
                     "id": ret[i]["meta_info"]["id"],
                     "object": "chat.completion",
                     "created": created,
-                    "model": request[i].model,
+                    "model": (
+                        request[i].model if isinstance(request, list) else request.model
+                    ),
                     "choices": choice,
                     "usage": {
                         "prompt_tokens": ret[i]["meta_info"]["prompt_tokens"],
