@@ -38,6 +38,7 @@ import logging
 import threading
 from enum import Enum, auto
 from http import HTTPStatus
+from itertools import chain
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -1145,13 +1146,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req_pool_indices_tensor = torch.tensor(req_pool_indices, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
-        input_ids_tensor = torch.tensor(sum(input_ids, []), dtype=torch.int64).to(
+        input_ids_tensor = torch.tensor(list(chain.from_iterable(input_ids)), dtype=torch.int64).to(
             self.device, non_blocking=True
         )
-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
+        seq_lens_tensor = torch.as_tensor(seq_lens, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
-        prefix_lens_tensor = torch.tensor(
+        prefix_lens_tensor = torch.as_tensor(
             prefix_lens, dtype=torch.int64, device=self.device
         )
         extend_lens_tensor = seq_lens_tensor - prefix_lens_tensor
