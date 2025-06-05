@@ -52,6 +52,7 @@ class TreeNode:
         self.value = None
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
+        self.child_key = None
 
         self.hit_count = 0
         # indicating the node is loading KV cache from host
@@ -110,6 +111,7 @@ class RadixCache(BasePrefixCache):
         self.disable = disable
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
+        self.evict_heap = []
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -134,6 +136,7 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self._record_all_cleared_event()
+        self.evict_heap.clear()
 
     def match_prefix(self, key: List[int], **kwargs) -> Tuple[torch.Tensor, int]:
         """Find the matching prefix from the radix tree.
@@ -264,26 +267,29 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return
 
-        leaves = self._collect_leaves()
-        heapq.heapify(leaves)
-
         num_evicted = 0
-        while num_evicted < num_tokens and len(leaves):
-            x = heapq.heappop(leaves)
-
-            if x == self.root_node:
-                break
-            if x.lock_ref > 0:
+        while self.evict_heap and num_evicted < num_tokens:
+            node = heapq.heappop(self.evict_heap)
+            if node.lock_ref > 0 or node == self.root_node or node.evicted:
                 continue
 
-            self.token_to_kv_pool_allocator.free(x.value)
-            num_evicted += len(x.value)
-            self._delete_leaf(x)
+            # Free memory and Update state
+            node_value_len = len(node.value)
+            self.token_to_kv_pool_allocator.free(node.value)
+            node.value = None  # Mark node as evicted
+            num_evicted += node_value_len
+            self._delete_leaf(node)
+            self._record_remove_event(node)
 
-            if len(x.parent.children) == 0:
-                heapq.heappush(leaves, x.parent)
-
-            self._record_remove_event(x)
+            # If parent becomes a new leaf and is evictable, push it to heap
+            parent = node.parent
+            if (
+                parent is not None
+                and parent != self.root_node
+                and parent.lock_ref == 0
+                and len(parent.children) == 0
+            ):
+                heapq.heappush(self.evict_heap, parent)
 
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
@@ -309,6 +315,8 @@ class RadixCache(BasePrefixCache):
                 self.evictable_size_ += len(node.value)
                 self.protected_size_ -= len(node.value)
                 delta += len(node.value)
+                if len(node.children) == 0:
+                    heapq.heappush(self.evict_heap, node)
             node.lock_ref -= 1
             node = node.parent
         return delta
@@ -367,10 +375,14 @@ class RadixCache(BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len]
+        new_node.child_key = self.get_child_key_fn(key)
+        new_node.parent.children[new_node.child_key] = new_node
         child.parent = new_node
         child.key = child.key[split_len:]
+        child.child_key = self.get_child_key_fn(child.key)
+        new_node.children[child.child_key] = child
+        child.parent = new_node
         child.value = child.value[split_len:]
-        new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         self._record_store_event(new_node)
         self._record_store_event(child)
@@ -378,7 +390,8 @@ class RadixCache(BasePrefixCache):
         return new_node
 
     def _insert_helper(self, node: TreeNode, key: List, value):
-        node.last_access_time = time.monotonic()
+        now = time.monotonic()
+        node.last_access_time = now
         if len(key) == 0:
             return 0
 
@@ -387,7 +400,7 @@ class RadixCache(BasePrefixCache):
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
-            node.last_access_time = time.monotonic()
+            node.last_access_time = now
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -405,9 +418,12 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value
+            new_node.child_key = child_key
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
             self._record_store_event(new_node)
+            if new_node.lock_ref == 0:
+                heapq.heappush(self.evict_heap, new_node)
         return total_prefix_length
 
     def _print_helper(self, node: TreeNode, indent: int):
@@ -429,10 +445,8 @@ class RadixCache(BasePrefixCache):
                 ), f"{key=}, {self.get_child_key_fn(child.key)=}"
 
     def _delete_leaf(self, node):
-        for k, v in node.parent.children.items():
-            if v == node:
-                break
-        del node.parent.children[k]
+        if node.child_key in node.parent.children:
+            del node.parent.children[node.child_key]
         self.evictable_size_ -= len(node.key)
 
     def _total_size_helper(self):
