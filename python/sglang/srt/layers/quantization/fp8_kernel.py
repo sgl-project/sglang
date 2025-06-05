@@ -287,24 +287,24 @@ def sglang_per_token_group_quant_fp8(
     assert x.is_contiguous(), "`x` is not contiguous"
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
-    if column_major_scales:
+    if scale_ue8m0:
+        assert column_major_scales and scale_tma_aligned
+        # aligned to 4 * sizeof(float)
+        aligned_size = (x.shape[-2] + 3) // 4 * 4
+        x_s = torch.empty(
+            x.shape[:-2] + (x.shape[-1] // group_size, aligned_size),
+            device=x.device,
+            dtype=torch.uint8,
+        ).permute(-1, -2)[: x.shape[-2], :]
+    elif column_major_scales:
         if scale_tma_aligned:
-            if scale_ue8m0:
-                # aligned to 4 * sizeof(float)
-                aligned_size = (x.shape[-2] + 3) // 4 * 4
-                x_s = torch.empty(
-                    x.shape[:-2] + (x.shape[-1] // group_size, aligned_size),
-                    device=x.device,
-                    dtype=torch.uint8,
-                ).permute(-1, -2)[: x.shape[-2], :]
-            else:
-                # aligned to 4 * sizeof(float)
-                aligned_size = (x.shape[-2] + 3) // 4 * 4
-                x_s = torch.empty(
-                    x.shape[:-2] + (x.shape[-1] // group_size, aligned_size),
-                    device=x.device,
-                    dtype=torch.float32,
-                ).permute(-1, -2)[: x.shape[-2], :]
+            # aligned to 4 * sizeof(float)
+            aligned_size = (x.shape[-2] + 3) // 4 * 4
+            x_s = torch.empty(
+                x.shape[:-2] + (x.shape[-1] // group_size, aligned_size),
+                device=x.device,
+                dtype=torch.float32,
+            ).permute(-1, -2)[: x.shape[-2], :]
         else:
             x_s = torch.empty(
                 (x.shape[-1] // group_size,) + x.shape[:-1],
