@@ -1,6 +1,7 @@
+import os
+from curses import flash
 from typing import Callable, List, Optional, Tuple
 
-import einops
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
@@ -36,6 +37,7 @@ from sglang.srt.utils import (
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
+
 
 use_aiter_moe = get_bool_env_var("SGLANG_AITER_MOE")
 
@@ -141,9 +143,7 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _is_hip and use_aiter_moe:
         return aiter_w8a8_block_fp8_linear
-    elif _ENABLE_JIT_DEEPGEMM and not get_bool_env_var(
-        "SGLANG_HACK_W8A8_BLOCK_FP8_DISABLE_DEEPGEMM"
-    ):
+    elif _ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
     else:
         return triton_w8a8_block_fp8_linear
@@ -227,10 +227,8 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     output_dtype = input.dtype
     dtype_supported = output_dtype == torch.bfloat16
 
-    # TODO: add more robust shape check here
-    # shape_supported = weight.shape[0] % 128 == 0 and weight.shape[1] % 128 == 0
-    # NOTE MODIFIED
-    shape_supported = True
+    # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
+    shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
 
     if not (shape_supported and dtype_supported):
         # fall back to triton
@@ -246,32 +244,13 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         block_size[1],
         column_major_scales=True,
         scale_tma_aligned=True,
-        scale_ue8m0=True,
     )
-
-    if get_bool_env_var("SGLANG_HACK_W8A8_DEEPGEMM_EXTRA_SANITY_CHECK"):
-        _sanity_check_scale("x_scale", x_scale)
-        _sanity_check_scale("weight_scale", weight_scale)
-
     output = w8a8_block_fp8_matmul_deepgemm(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
     )
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
-
-
-def _sanity_check_scale(name, x):
-    x_ceil = _ceil_to_ue8m0(x)
-    assert torch.all(x == x_ceil), f"{name=} {x=} {x_ceil=}"
-
-
-# COPIED FROM DEEPGEMM
-def _ceil_to_ue8m0(x: torch.Tensor):
-    # NOTE view -> reshape
-    # NOTE remove to allow cuda graph
-    # assert x.reshape(-1).amax().item() > 0
-    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 
 
 def aiter_w8a8_block_fp8_linear(
@@ -310,7 +289,6 @@ def triton_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    raise Exception("why come to triton_w8a8_block_fp8_linear")
     assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
@@ -400,16 +378,27 @@ def block_quant_dequant(
     The output is an unquantized tensor with dtype.
     """
     block_n, block_k = block_size[0], block_size[1]
-    *_, n, k = x_q_block.shape
+    n, k = x_q_block.shape
+    n_tiles = (n + block_n - 1) // block_n
+    k_tiles = (k + block_k - 1) // block_k
+    assert n_tiles == x_s.shape[0]
+    assert k_tiles == x_s.shape[1]
 
-    x_scale_repeat = einops.repeat(
-        x_s,
-        "... n_scale k_scale -> ... (n_scale block_n) (k_scale block_k)",
-        block_n=block_n,
-        block_k=block_k,
-    )
-    x_scale_repeat = x_scale_repeat[..., :n, :k]
-    return (x_q_block.to(torch.float32) * x_scale_repeat).to(dtype)
+    x_dq_block = torch.empty_like(x_q_block, dtype=dtype)
+
+    for j in range(n_tiles):
+        for i in range(k_tiles):
+            x_q_block_tile = x_q_block[
+                j * block_n : min((j + 1) * block_n, n),
+                i * block_k : min((i + 1) * block_k, k),
+            ]
+            x_dq_block_tile = x_dq_block[
+                j * block_n : min((j + 1) * block_n, n),
+                i * block_k : min((i + 1) * block_k, k),
+            ]
+            x_dq_block_tile[:, :] = x_q_block_tile.to(torch.float32) * x_s[j][i]
+
+    return x_dq_block
 
 
 def channel_quant_to_tensor_quant(
