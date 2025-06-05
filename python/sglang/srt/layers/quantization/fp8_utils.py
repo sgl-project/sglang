@@ -2,6 +2,7 @@ from typing import Callable, List, Optional, Tuple
 
 import einops
 import torch
+
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 
 try:
@@ -363,8 +364,8 @@ def block_quant_to_tensor_quant(
     x_dq_block_tiles = [
         [
             x_dq_block[
-            j * block_n: min((j + 1) * block_n, n),
-            i * block_k: min((i + 1) * block_k, k),
+                j * block_n : min((j + 1) * block_n, n),
+                i * block_k : min((i + 1) * block_k, k),
             ]
             for i in range(k_tiles)
         ]
