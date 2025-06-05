@@ -28,6 +28,7 @@ from sglang.srt.utils import (
     configure_ipv6,
     get_device,
     get_device_memory_capacity,
+    is_cuda,
     is_flashinfer_available,
     is_hip,
     is_port_available,
@@ -60,6 +61,7 @@ class ServerArgs:
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
+    impl: str = "auto"
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -163,6 +165,7 @@ class ServerArgs:
     enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
+    enable_mscclpp: bool = False
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -177,6 +180,7 @@ class ServerArgs:
     enable_eplb: bool = False
     eplb_algorithm: str = "auto"
     eplb_rebalance_num_iterations: int = 1000
+    eplb_rebalance_layers_per_chunk: Optional[int] = None
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "per_pass", "per_token"]
     ] = None
@@ -205,7 +209,7 @@ class ServerArgs:
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
-    n_share_experts_fusion: int = 0
+    disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     mm_attention_backend: Optional[str] = None
@@ -261,7 +265,7 @@ class ServerArgs:
                     self.mem_fraction_static = 0.88
             else:
                 self.mem_fraction_static = 0.88
-            if gpu_mem is not None and gpu_mem > 180 * 1000:
+            if gpu_mem is not None and gpu_mem > 180 * 1000 and is_cuda():
                 self.mem_fraction_static = 0.79
             elif gpu_mem is not None and gpu_mem > 96 * 1024:
                 mem_fraction = self.mem_fraction_static
@@ -322,6 +326,11 @@ class ServerArgs:
             self.sampling_backend = "pytorch"
 
         # Set kernel backends
+        if self.device == "cpu":
+            if self.attention_backend is None:
+                self.attention_backend = "intel_amx"
+            self.sampling_backend = "pytorch"
+
         if self.sampling_backend is None:
             self.sampling_backend = (
                 "flashinfer" if is_flashinfer_available() else "pytorch"
@@ -720,6 +729,18 @@ class ServerArgs:
             default=ServerArgs.page_size,
             help="The number of tokens in a page.",
         )
+        parser.add_argument(
+            "--impl",
+            type=str,
+            default=ServerArgs.impl,
+            help="Which implementation of the model to use.\n\n"
+            '* "auto" will try to use the SGLang implementation if it exists '
+            "and fall back to the Transformers implementation if no SGLang "
+            "implementation is available.\n"
+            '* "sglang" will use the SGLang model implementation.\n'
+            '* "transformers" will use the Transformers model '
+            "implementation.\n",
+        )
 
         # Other runtime options
         parser.add_argument(
@@ -992,6 +1013,7 @@ class ServerArgs:
                 "fa3",
                 "flashmla",
                 "cutlass_mla",
+                "intel_amx",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
@@ -1147,6 +1169,11 @@ class ServerArgs:
             "--disable-custom-all-reduce",
             action="store_true",
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
+        )
+        parser.add_argument(
+            "--enable-mscclpp",
+            action="store_true",
+            help="Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -1342,6 +1369,12 @@ class ServerArgs:
             help="Number of iterations to automatically trigger a EPLB re-balance.",
         )
         parser.add_argument(
+            "--eplb-rebalance-layers-per-chunk",
+            type=int,
+            default=ServerArgs.eplb_rebalance_layers_per_chunk,
+            help="Number of layers to rebalance per forward pass.",
+        )
+        parser.add_argument(
             "--expert-distribution-recorder-mode",
             type=str,
             default=ServerArgs.expert_distribution_recorder_mode,
@@ -1364,13 +1397,10 @@ class ServerArgs:
             default=ServerArgs.deepep_config,
             help="Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.",
         )
-
         parser.add_argument(
-            "--n-share-experts-fusion",
-            type=int,
-            default=0,
-            help="The number of shared_experts need to be replicated to fuse with normal experts in deepseek v3/r1, "
-            "set it to tp_size can get best optimized performance. Note that for architectures with SM==90, we have enabled the shared experts fusion optimization by default for DeepSeek V3/R1, with n_share_experts_fusion automatically set to the TP size.",
+            "--disable-shared-experts-fusion",
+            action="store_true",
+            help="Disable shared experts fusion optimization for deepseek v3/r1.",
         )
         parser.add_argument(
             "--disable-chunked-prefix-cache",
@@ -1636,7 +1666,7 @@ def auto_choose_speculative_params(arch: str):
         return (5, 4, 8)
     elif arch in ["DeepseekV3ForCausalLM", "DeepseekV2ForCausalLM"]:
         # The default value for deepseek
-        return (5, 4, 8)
+        return (3, 1, 4)
     elif arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)
     else:
