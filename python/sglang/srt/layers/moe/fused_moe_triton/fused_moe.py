@@ -30,6 +30,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     log_info_on_rank0,
+    next_power_of_2,
 )
 
 _is_hip = is_hip()
@@ -689,7 +690,6 @@ def init_sorted_ids_and_cumsum_buffer(
     cumsum_buffer = torch.empty((num_experts + 1,), dtype=torch.int32, device=device)
 
     BLOCK_SIZE = 1024
-    ALIGNED_NUM_EXPERTS_P1 = 1024  # ensure num_experts <= ALIGNED_NUM_EXPERTS_P1
     sorted_ids_blocks = triton.cdiv(max_num_tokens_padded, BLOCK_SIZE)
     grid = (sorted_ids_blocks + 1,)
 
@@ -700,7 +700,7 @@ def init_sorted_ids_and_cumsum_buffer(
         topk_ids_numel,
         num_experts,
         BLOCK_SIZE,
-        ALIGNED_NUM_EXPERTS_P1,
+        next_power_of_2(num_experts + 1),
     )
 
     return sorted_ids, cumsum_buffer
