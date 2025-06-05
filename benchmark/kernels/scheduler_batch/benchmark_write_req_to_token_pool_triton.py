@@ -2,6 +2,7 @@ import itertools
 import os
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -86,6 +87,36 @@ def write_req_to_token_pool_triton_optimize(
     tl.store(dst_ptr, value, mask=mask)
 
 
+@triton.jit
+def write_req_to_token_pool_triton_cumsum(
+    req_token_ptr,  # [max_batch, max_context_len]
+    seq_pool_indices,
+    pre_lens,
+    extend_lens,
+    extend_lens_cumsum,
+    out_cache_loc,
+    req_token_ptr_stride: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(0)
+
+    req_pool_index = tl.load(seq_pool_indices + pid)
+    pre_len = tl.load(pre_lens + pid)
+    extend_len = tl.load(extend_lens + pid)
+
+    extend_lens_cumsum = tl.load(extend_lens_cumsum + pid)
+    num_loop = tl.cdiv(extend_len, BLOCK_SIZE)
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = offset < extend_len
+        value = tl.load(out_cache_loc + extend_lens_cumsum + offset, mask=mask)
+        tl.store(
+            req_token_ptr + req_pool_index * req_token_ptr_stride + pre_len + offset,
+            value,
+            mask=mask,
+        )
+
+
 def write_req_to_token_pool_reference(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -128,6 +159,7 @@ def test_write_req_to_token_pool():
     # Create copies for reference implementation
     req_to_token_ref = req_to_token.clone()
     req_to_token_opt = req_to_token.clone()
+    req_to_token_cumsum = req_to_token.clone()
 
     # Run original triton kernel
     write_req_to_token_pool_triton[(batch_size,)](
@@ -156,6 +188,18 @@ def test_write_req_to_token_pool():
         BLOCK_SIZE=512,
     )
 
+    # Run cumulative sum optimized triton kernel
+    extend_lens_cumsums = F.pad(torch.cumsum(extend_lens, dim=0), pad=(1, 0), value=0)
+    write_req_to_token_pool_triton_cumsum[(batch_size,)](
+        req_to_token_cumsum,
+        req_pool_indices,
+        pre_lens,
+        extend_lens,
+        extend_lens_cumsums,
+        out_cache_loc,
+        max_context_len,
+    )
+
     # Run reference implementation
     write_req_to_token_pool_reference(
         req_to_token_ref,
@@ -169,6 +213,7 @@ def test_write_req_to_token_pool():
     # Compare results
     torch.testing.assert_close(req_to_token, req_to_token_ref)
     torch.testing.assert_close(req_to_token_opt, req_to_token_ref)
+    torch.testing.assert_close(req_to_token_cumsum, req_to_token_ref)
 
     # Test case 2: batch size > 1
     batch_size = 3
@@ -186,6 +231,7 @@ def test_write_req_to_token_pool():
 
     req_to_token_ref = req_to_token.clone()
     req_to_token_opt = req_to_token.clone()
+    req_to_token_cumsum = req_to_token.clone()
 
     # Run original triton kernel
     write_req_to_token_pool_triton[(batch_size,)](
@@ -211,6 +257,18 @@ def test_write_req_to_token_pool():
         BLOCK_SIZE=512,
     )
 
+    # Run cumulative sum optimized triton kernel
+    extend_lens_cumsums = F.pad(torch.cumsum(extend_lens, dim=0), pad=(1, 0), value=0)
+    write_req_to_token_pool_triton_cumsum[(batch_size,)](
+        req_to_token_cumsum,
+        req_pool_indices,
+        pre_lens,
+        extend_lens,
+        extend_lens_cumsums,
+        out_cache_loc,
+        max_context_len,
+    )
+
     # Run reference implementation
     write_req_to_token_pool_reference(
         req_to_token_ref,
@@ -224,10 +282,11 @@ def test_write_req_to_token_pool():
     # Compare results
     torch.testing.assert_close(req_to_token, req_to_token_ref)
     torch.testing.assert_close(req_to_token_opt, req_to_token_ref)
+    torch.testing.assert_close(req_to_token_cumsum, req_to_token_ref)
 
 
 def get_benchmark():
-    batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128]
+    batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256]
     extend_lens = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
     configs = list(itertools.product(batch_sizes, extend_lens))
 
@@ -236,9 +295,9 @@ def get_benchmark():
             x_names=["batch_size", "extend_len"],
             x_vals=configs,
             line_arg="provider",
-            line_vals=["reference", "triton", "triton_optimize"],
-            line_names=["PyTorch", "Triton", "Triton Optimized"],
-            styles=[("blue", "-"), ("green", "-"), ("red", "-")],
+            line_vals=["reference", "triton", "triton_optimize", "triton_cumsum"],
+            line_names=["Reference", "Triton", "Triton Optimized", "Triton Cumsum"],
+            styles=[("blue", "-"), ("green", "-"), ("red", "-"), ("orange", "-")],
             ylabel="us",
             plot_name="write-req-to-token-pool-performance",
             args={},
@@ -287,7 +346,7 @@ def get_benchmark():
                 ),
                 quantiles=quantiles,
             )
-        else:
+        elif provider == "triton_optimize":
 
             def run_optimized():
                 block_size = 128 if extend_len <= 1024 else 512
@@ -305,6 +364,23 @@ def get_benchmark():
 
             ms, min_ms, max_ms = triton.testing.do_bench(
                 run_optimized, quantiles=quantiles
+            )
+        elif provider == "triton_cumsum":
+            extend_lens_cumsum = F.pad(
+                torch.cumsum(extend_lens, dim=0), pad=(1, 0), value=0
+            )
+
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                lambda: write_req_to_token_pool_triton_cumsum[(batch_size,)](
+                    req_to_token.clone(),
+                    req_pool_indices,
+                    pre_lens,
+                    extend_lens,
+                    extend_lens_cumsum,
+                    out_cache_loc,
+                    max_context_len,
+                ),
+                quantiles=quantiles,
             )
 
         return 1000 * ms, 1000 * max_ms, 1000 * min_ms
