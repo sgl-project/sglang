@@ -1257,6 +1257,7 @@ class MiniCPMScaledRotaryEmbedding(RotaryEmbedding):
             # seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
             seq_len=max_position_embeddings,
         )
+        print(f"{self.max_seq_len_cached=}")
 
     def _compute_cos_sin_cache(self, seq_len=0) -> torch.Tensor:
         if seq_len <= self.max_seq_len_cached:
@@ -1288,9 +1289,9 @@ class MiniCPMScaledRotaryEmbedding(RotaryEmbedding):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
-        seq_len: int,
+        seq_len: int = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if seq_len > self.max_seq_len_cached:
+        if seq_len is not None and seq_len > self.max_seq_len_cached:
             self._compute_cos_sin_cache(seq_len=seq_len)
 
         def apply_rotary_pos_emb(q, k, cos, sin, positions):
