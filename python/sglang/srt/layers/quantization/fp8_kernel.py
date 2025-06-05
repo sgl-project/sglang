@@ -22,7 +22,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils import (
     direct_register_custom_op,
@@ -68,7 +67,6 @@ else:
 fp8_min = -fp8_max
 
 if supports_custom_op():
-
     def deep_gemm_fp8_fp8_bf16_nt(
         A: torch.Tensor,
         As: torch.Tensor,
@@ -78,6 +76,7 @@ if supports_custom_op():
     ) -> None:
         deep_gemm_gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
+
     def deep_gemm_fp8_fp8_bf16_nt_fake(
         A: torch.Tensor,
         As: torch.Tensor,
@@ -86,6 +85,7 @@ if supports_custom_op():
         C: torch.Tensor,
     ) -> None:
         return
+
 
     direct_register_custom_op(
         op_name="deep_gemm_fp8_fp8_bf16_nt",
@@ -293,9 +293,9 @@ def sglang_per_token_group_quant_fp8(
         aligned_mn = align(mn, 4)
         aligned_k = align(k, 4)
         x_s = torch.empty(
-            (aligned_k, aligned_mn),
+            (aligned_k // 4, aligned_mn),
             device=x.device,
-            dtype=torch.uint8,
+            dtype=torch.int,
         ).permute(-1, -2)[:mn, :]
     elif column_major_scales:
         if scale_tma_aligned:
@@ -323,9 +323,6 @@ def sglang_per_token_group_quant_fp8(
         sgl_per_token_group_quant_fp8(
             x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
         )
-
-    if scale_ue8m0:
-        x_s = x_s.view(torch.int32)
 
     return x_q, x_s
 
@@ -758,6 +755,7 @@ if _is_hip:
             N, META["BLOCK_SIZE_N"]
         )
         num_workgroups <= get_device_core_count()
+
 
     def select_w8a8_block_fp8_matmul_kernel(M, N, META):
         if use_w8a8_block_fp8_matmul_unrolledx4(M, N, META):
