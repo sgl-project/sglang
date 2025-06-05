@@ -51,8 +51,8 @@ def moe_fused_gate(
     # the #experts is decided by the input tensor shape and we currently only support power of 2 #experts
     # and #experts should be divisible by num_expert_group. #expert/num_expert_group <= 32 is limited for now.
     # for non-supported case, we suggest to use the biased_grouped_topk func in sglang.srt.layers.moe.topk
-    # num_fused_shared_experts: if > 0, the last expert will be replaced with a round-robin shared expert
-    # routed_scaling_factor: if > 0, the last expert will be scaled by this factor
+    # num_fused_shared_experts: if > 0, the last several experts will be replaced with shared experts
+    # routed_scaling_factor: if > 0, the shared experts will be scaled by this factor
     return torch.ops.sgl_kernel.moe_fused_gate.default(
         input_tensor,
         bias,
@@ -85,6 +85,28 @@ def ep_moe_pre_reorder(
         end_expert_id,
         topk,
         use_per_token_if_dynamic,
+    )
+
+
+def ep_moe_post_reorder(
+    down_output,
+    output,
+    src2dst,
+    topk_ids,
+    topk_weights,
+    start_expert_id,
+    end_expert_id,
+    topk,
+):
+    return torch.ops.sgl_kernel.ep_moe_post_reorder.default(
+        down_output,
+        output,
+        src2dst,
+        topk_ids,
+        topk_weights,
+        start_expert_id,
+        end_expert_id,
+        topk,
     )
 
 
