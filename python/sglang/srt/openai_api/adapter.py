@@ -69,6 +69,8 @@ from sglang.srt.openai_api.protocol import (
     FunctionResponse,
     LogProbs,
     MultimodalEmbeddingInput,
+    ScoringRequest,
+    ScoringResponse,
     ToolCall,
     TopLogprob,
     UsageInfo,
@@ -1928,3 +1930,31 @@ def to_openai_style_logprobs(
         append_top_logprobs(output_top_logprobs)
 
     return ret_logprobs
+
+
+async def v1_score(tokenizer_manager, raw_request):
+    try:
+        # Parse request
+        request_data = await raw_request.json()
+        request = ScoringRequest(**request_data)
+
+        # Use tokenizer_manager's score_request method directly
+        scores = await tokenizer_manager.score_request(
+            query=request.query,
+            items=request.items,
+            label_token_ids=request.label_token_ids,
+            apply_softmax=request.apply_softmax,
+            item_first=request.item_first,
+            request=request,
+        )
+
+        # Create response with just the scores, without usage info
+        response = ScoringResponse(
+            scores=scores,
+            model=request.model,
+        )
+        return response
+
+    except Exception as e:
+        logger.error(f"Error in v1_score: {str(e)}")
+        return create_error_response(str(e))
