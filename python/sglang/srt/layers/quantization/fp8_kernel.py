@@ -765,7 +765,9 @@ def prepare_block_fp8_matmul_inputs(
     assert Bs.ndim == 2
     N, K = B.shape
     assert triton.cdiv(N, block_n) == Bs.shape[0]
-    assert triton.cdiv(K, block_k) == Bs.shape[1]
+    assert (
+        triton.cdiv(K, block_k) == Bs.shape[1]
+    ), f"{K=} {block_size=} {B.shape=} {Bs.shape=}"
 
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
