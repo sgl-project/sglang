@@ -6,9 +6,10 @@ from enum import IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
+from tqdm.contrib.concurrent import thread_map
+
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var, get_device_sm, get_int_env_var, is_cuda
-from tqdm.contrib.concurrent import thread_map
 
 logger = logging.getLogger(__name__)
 # _ENABLE_JIT_DEEPGEMM = False
