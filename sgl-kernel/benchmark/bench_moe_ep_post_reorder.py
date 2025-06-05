@@ -47,9 +47,9 @@ def benchmark(batch_size, provider):
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "cuda":
+        d_out, out, s2d, tk_ids, tk_weights = alloc_tensors()
 
         def run_cuda():
-            d_out, out, s2d, tk_ids, tk_weights = alloc_tensors()
             ep_moe_post_reorder(
                 d_out,
                 out,
@@ -64,9 +64,9 @@ def benchmark(batch_size, provider):
         ms, min_ms, max_ms = triton.testing.do_bench(run_cuda, quantiles=quantiles)
 
     elif provider == "triton":
+        d_out, out, s2d, tk_ids, tk_weights = alloc_tensors()
 
         def run_triton():
-            d_out, out, s2d, tk_ids, tk_weights = alloc_tensors()
             post_reorder_triton_kernel[(batch_size,)](
                 d_out.view(-1),
                 out.view(-1),

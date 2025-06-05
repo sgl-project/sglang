@@ -93,9 +93,9 @@ def run_triton_kernel(
 def assert_close(a, b):
     a32, b32 = a.float(), b.float()
     if a.dtype is torch.float16:
-        torch.testing.assert_close(a32, b32, rtol=1e-3, atol=1e-2)
+        torch.testing.assert_close(a32, b32, rtol=1e-5, atol=1e-2)
     elif a.dtype is torch.bfloat16:
-        torch.testing.assert_close(a32, b32, rtol=1e-2, atol=1e-1)
+        torch.testing.assert_close(a32, b32, rtol=1e-4, atol=1e-1)
     else:
         torch.testing.assert_close(a32, b32, rtol=1e-5, atol=1e-5)
 
