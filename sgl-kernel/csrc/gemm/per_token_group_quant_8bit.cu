@@ -70,7 +70,10 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   local_absmax = GroupReduceMax(local_absmax, lane_id);
 
-  const float y_s = local_absmax / max_8bit;
+  float y_s = local_absmax / max_8bit;
+  if constexpr (SCALE_UE8M0) {
+    y_s = TODO;
+  }
 
   if (lane_id == 0) {
     *scale_output = y_s;
