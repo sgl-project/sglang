@@ -302,8 +302,8 @@ class DeepseekV2MoE(nn.Module):
             ),
         )
 
-        self.shared_experts_is_int8 = None
-        self.shared_experts_is_fp8 = None
+        self.shared_experts_is_int8 = False
+        self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -389,11 +389,6 @@ class DeepseekV2MoE(nn.Module):
                 and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             ):
                 return self.forward_normal_dual_stream(hidden_states)
-            elif (
-                config.n_shared_experts is not None and self.num_fused_shared_experts == 0
-                and self.shared_experts.gate_up_proj.use_intel_amx_backend
-            ):
-                return self.forward_cpu(hidden_states)
             else:
                 return self.forward_normal(hidden_states)
         else:
@@ -420,6 +415,12 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if (
+            hasattr(self, "shared_experts")
+            and self.shared_experts.gate_up_proj.use_intel_amx_backend
+        ):
+            return self.forward_cpu(hidden_states)
+
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
@@ -2191,6 +2192,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     )
                     if _is_hip:
                         self_attn.w_scale *= 2.0
+                # TODO: remove this after adding FP8 support in bmm cpu kernel
                 if (
                     w_kc.device == torch.device("cpu")
                     and cpu_has_amx_support()
