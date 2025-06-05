@@ -6,9 +6,10 @@ from enum import IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
+from tqdm.contrib.concurrent import thread_map
+
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var, get_device_sm, get_int_env_var, is_cuda
-from tqdm.contrib.concurrent import thread_map
 
 logger = logging.getLogger(__name__)
 # _ENABLE_JIT_DEEPGEMM = False
@@ -378,13 +379,13 @@ def gemm_nt_f8f8bf16(
 
     with _log_jit_build(m, n, k, kernel_type):
         # deep_gemm.gemm_fp8_fp8_bf16_nt(lhs, rhs, out)
-        # print(
-        #     f"hi call deep_gemm_fp8_gemm_nt "
-        #     f"{lhs[0].shape=} {lhs[0].dtype=} "
-        #     f"{lhs[1].shape=} {lhs[1].dtype=} "
-        #     f"{rhs[0].shape=} {rhs[0].dtype=} "
-        #     f"{rhs[1].shape=} {rhs[1].dtype=} "
-        # )
+        print(
+            f"hi call deep_gemm_fp8_gemm_nt "
+            f"{lhs[0].shape=} {lhs[0].dtype=} "
+            f"{lhs[1].shape=} {lhs[1].dtype=} "
+            f"{rhs[0].shape=} {rhs[0].dtype=} "
+            f"{rhs[1].shape=} {rhs[1].dtype=} "
+        )
         deep_gemm_fp8_gemm_nt(lhs, rhs, out)
 
 
