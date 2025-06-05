@@ -16,11 +16,11 @@ __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   return val;
 }
 
-template <typename T, typename OutputScaleT, typename DST_DTYPE, bool IS_COLUMN_MAJOR = false, bool SCALE_UE8M0 = false>
+template <typename T, typename DST_DTYPE, bool IS_COLUMN_MAJOR = false, bool SCALE_UE8M0 = false>
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
     void* __restrict__ output_q,
-    OutputScaleT* __restrict__ output_s,
+    float* __restrict__ output_s,
     const int group_size,
     const int num_groups,
     const int groups_per_block,
@@ -41,7 +41,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   const T* group_input = input + block_group_offset;
   DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + block_group_offset;
-  OutputScaleT* scale_output;
+  float* scale_output;
 
   if constexpr (IS_COLUMN_MAJOR) {
     const int row_idx = global_group_id / scale_num_rows;
@@ -75,16 +75,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     y_s = exp2f(ceilf(log2f(fmaxf(fabsf(y_s), 1e-10f))));
   }
 
-  // TODO can optimize
-  OutputScaleT y_s_quant;
-  if constexpr (SCALE_UE8M0) {
-    y_s_quant = (uint8_t)(((int)log2f(y_s)) + 127);
-  } else {
-    y_s_quant = y_s;
-  }
-
   if (lane_id == 0) {
-    *scale_output = y_s_quant;
+    *scale_output = y_s;
   }
 
   for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
@@ -141,51 +133,51 @@ void sgl_per_token_group_quant_8bit(
   const int scale_num_rows = output_s.size(1);
   const int scale_stride = output_s.stride(1);
 
-#define LAUNCH_KERNEL(T, DST_DTYPE)                                                                       \
-  do {                                                                                                    \
-    dim3 grid(num_blocks);                                                                                \
-    dim3 block(num_threads);                                                                              \
-    if (is_column_major) {                                                                                \
-      if (scale_ue8m0) {                                                                                  \
-        per_token_group_quant_8bit_kernel<T, uint8_t, DST_DTYPE, true, true><<<grid, block, 0, stream>>>( \
-            static_cast<T*>(input.data_ptr()),                                                            \
-            output_q.data_ptr(),                                                                          \
-            static_cast<uint8_t*>(output_s.data_ptr()),                                                   \
-            group_size,                                                                                   \
-            num_groups,                                                                                   \
-            groups_per_block,                                                                             \
-            (float)eps,                                                                                   \
-            (float)min_8bit,                                                                              \
-            (float)max_8bit,                                                                              \
-            scale_num_rows,                                                                               \
-            scale_stride);                                                                                \
-      } else {                                                                                            \
-        per_token_group_quant_8bit_kernel<T, float, DST_DTYPE, true, false><<<grid, block, 0, stream>>>(  \
-            static_cast<T*>(input.data_ptr()),                                                            \
-            output_q.data_ptr(),                                                                          \
-            static_cast<float*>(output_s.data_ptr()),                                                     \
-            group_size,                                                                                   \
-            num_groups,                                                                                   \
-            groups_per_block,                                                                             \
-            (float)eps,                                                                                   \
-            (float)min_8bit,                                                                              \
-            (float)max_8bit,                                                                              \
-            scale_num_rows,                                                                               \
-            scale_stride);                                                                                \
-      }                                                                                                   \
-    } else {                                                                                              \
-      assert(!scale_ue8m0);                                                                               \
-      per_token_group_quant_8bit_kernel<T, float, DST_DTYPE, false><<<grid, block, 0, stream>>>(          \
-          static_cast<T*>(input.data_ptr()),                                                              \
-          output_q.data_ptr(),                                                                            \
-          static_cast<float*>(output_s.data_ptr()),                                                       \
-          group_size,                                                                                     \
-          num_groups,                                                                                     \
-          groups_per_block,                                                                               \
-          (float)eps,                                                                                     \
-          (float)min_8bit,                                                                                \
-          (float)max_8bit);                                                                               \
-    }                                                                                                     \
+#define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
+  do {                                                                                            \
+    dim3 grid(num_blocks);                                                                        \
+    dim3 block(num_threads);                                                                      \
+    if (is_column_major) {                                                                        \
+      if (scale_ue8m0) {                                                                          \
+        per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, true><<<grid, block, 0, stream>>>(  \
+            static_cast<T*>(input.data_ptr()),                                                    \
+            output_q.data_ptr(),                                                                  \
+            static_cast<float*>(output_s.data_ptr()),                                             \
+            group_size,                                                                           \
+            num_groups,                                                                           \
+            groups_per_block,                                                                     \
+            (float)eps,                                                                           \
+            (float)min_8bit,                                                                      \
+            (float)max_8bit,                                                                      \
+            scale_num_rows,                                                                       \
+            scale_stride);                                                                        \
+      } else {                                                                                    \
+        per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, false><<<grid, block, 0, stream>>>( \
+            static_cast<T*>(input.data_ptr()),                                                    \
+            output_q.data_ptr(),                                                                  \
+            static_cast<float*>(output_s.data_ptr()),                                             \
+            group_size,                                                                           \
+            num_groups,                                                                           \
+            groups_per_block,                                                                     \
+            (float)eps,                                                                           \
+            (float)min_8bit,                                                                      \
+            (float)max_8bit,                                                                      \
+            scale_num_rows,                                                                       \
+            scale_stride);                                                                        \
+      }                                                                                           \
+    } else {                                                                                      \
+      assert(!scale_ue8m0);                                                                       \
+      per_token_group_quant_8bit_kernel<T, DST_DTYPE, false><<<grid, block, 0, stream>>>(         \
+          static_cast<T*>(input.data_ptr()),                                                      \
+          output_q.data_ptr(),                                                                    \
+          static_cast<float*>(output_s.data_ptr()),                                               \
+          group_size,                                                                             \
+          num_groups,                                                                             \
+          groups_per_block,                                                                       \
+          (float)eps,                                                                             \
+          (float)min_8bit,                                                                        \
+          (float)max_8bit);                                                                       \
+    }                                                                                             \
   } while (0)
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
