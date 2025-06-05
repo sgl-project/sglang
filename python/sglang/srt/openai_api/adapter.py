@@ -75,12 +75,21 @@ from sglang.srt.openai_api.protocol import (
     TopLogprob,
     UsageInfo,
 )
+from sglang.srt.openai_api.utils import (
+    detect_template_content_format,
+    process_content_for_template_format,
+)
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.utils import convert_json_schema_to_str, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
 chat_template_name = None
+
+# Global cache for template content format detection (one model/template per instance)
+# NOTE: A better approach would be to initialize the chat template format when the endpoint is created
+_cached_chat_template = None
+_cached_template_format = None
 
 
 class FileMetadata:
@@ -1004,66 +1013,38 @@ def v1_chat_generate_request(
                 audio_data = []
                 modalities = []
 
+                # Detect template content format by analyzing the jinja template (cached globally)
+                global _cached_chat_template, _cached_template_format
+                current_template = tokenizer_manager.tokenizer.chat_template
+
+                if current_template != _cached_chat_template:
+                    # Template changed or first time - analyze it
+                    _cached_chat_template = current_template
+                    _cached_template_format = detect_template_content_format(
+                        current_template
+                    )
+                    logger.info(
+                        f"Detected chat template content format: {_cached_template_format}"
+                    )
+
+                template_content_format = _cached_template_format
+
                 for message in request.messages:
                     if message.content is None:
                         message.content = ""
                     msg_dict = message.model_dump()
-                    if isinstance(msg_dict.get("content"), list):
-                        if is_multimodal:
-                            # Extract image and audio data for mm processing while keeping full content for jinja template
-                            # NOTE: We assume common conventions: content['type'] == 'image'/'audio'/'text' but templates may vary.
-                            # This assumes the jinja template accepts message["content"] is a list. And it tries to parse
-                            # the content into a list of dictionaries with the following keys: "type", "image_url", "audio_url", "text".
-                            # TODO: Need to auto-detect template requirements by parsing jinja code or use template metadata.
-                            # Better modularization needed to handle different template content type expectations.
-                            processed_content_parts = []
-                            for chunk in msg_dict["content"]:
-                                if isinstance(chunk, dict):
-                                    chunk_type = chunk.get("type")
 
-                                    # Extract data and create normalized content dictionary
-                                    if chunk_type == "image_url":
-                                        image_data.append(chunk["image_url"]["url"])
-                                        if chunk.get("modalities"):
-                                            modalities.append(chunk.get("modalities"))
-                                        processed_content_parts.append(
-                                            {"type": "image"}
-                                        )
-                                    elif chunk_type == "audio_url":
-                                        audio_data.append(chunk["audio_url"]["url"])
-                                        processed_content_parts.append(
-                                            {"type": "audio"}
-                                        )
-                                    else:
-                                        processed_content_parts.append(chunk)
+                    # Process content based on detected template format
+                    processed_msg = process_content_for_template_format(
+                        msg_dict,
+                        template_content_format,
+                        image_data,
+                        audio_data,
+                        modalities,
+                    )
+                    openai_compatible_messages.append(processed_msg)
 
-                            # Create one message with all processed content list
-                            new_msg = {
-                                k: v
-                                for k, v in msg_dict.items()
-                                if v is not None and k != "content"
-                            }
-                            new_msg["content"] = processed_content_parts
-                            openai_compatible_messages.append(new_msg)
-                        else:
-                            # For non-multimodal models, we assume the content should be a string, such as
-                            # deeoseek-v3's jinja chat stemplate.
-                            for chunk in msg_dict["content"]:
-                                if (
-                                    isinstance(chunk, dict)
-                                    and chunk.get("type") == "text"
-                                ):
-                                    new_msg = msg_dict.copy()
-                                    new_msg["content"] = chunk["text"]
-                                    new_msg = {
-                                        k: v
-                                        for k, v in new_msg.items()
-                                        if v is not None
-                                    }
-                                    openai_compatible_messages.append(new_msg)
-                    else:
-                        msg_dict = {k: v for k, v in msg_dict.items() if v is not None}
-                        openai_compatible_messages.append(msg_dict)
+                # Handle assistant prefix for continue_final_message
                 if (
                     openai_compatible_messages
                     and openai_compatible_messages[-1]["role"] == "assistant"
