@@ -2,10 +2,10 @@ from typing import Tuple
 
 import deep_gemm.utils.layout
 import torch
-from tqdm import trange
-
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+from tqdm import trange
+
 
 # def hack_requant_moe_weight(that, weights):
 #     print("hi hack_requant_moe_weight")
@@ -157,7 +157,7 @@ def _requant_grouped_moe_weight(
     out_w = out_w_flat.view(weight.shape)
     out_s = out_s_flat.view(weight_scale_inv.shape)
 
-    out_s = _transform_scale(out_s)
+    out_s = _transform_scale(out_s, mn=out_w.shape[-2])
 
     print(
         f"requant_grouped_moe_weight "
@@ -171,9 +171,8 @@ def _requant_grouped_moe_weight(
     return out_w, out_s
 
 
-def _transform_scale(sf):
+def _transform_scale(sf, mn: int):
     # NOTE copy and modified from DeepGEMM
-    *_, mn, k = sf.shape
     sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
     sf = deep_gemm.utils.layout.get_col_major_tma_aligned_packed_tensor(sf)
     return sf

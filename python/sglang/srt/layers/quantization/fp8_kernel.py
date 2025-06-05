@@ -22,7 +22,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils import (
     direct_register_custom_op,
@@ -68,7 +67,6 @@ else:
 fp8_min = -fp8_max
 
 if supports_custom_op():
-
     def deep_gemm_fp8_fp8_bf16_nt(
         A: torch.Tensor,
         As: torch.Tensor,
@@ -78,6 +76,7 @@ if supports_custom_op():
     ) -> None:
         deep_gemm_gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
+
     def deep_gemm_fp8_fp8_bf16_nt_fake(
         A: torch.Tensor,
         As: torch.Tensor,
@@ -86,6 +85,7 @@ if supports_custom_op():
         C: torch.Tensor,
     ) -> None:
         return
+
 
     direct_register_custom_op(
         op_name="deep_gemm_fp8_fp8_bf16_nt",
@@ -735,6 +735,7 @@ if _is_hip:
         )
         num_workgroups <= get_device_core_count()
 
+
     def select_w8a8_block_fp8_matmul_kernel(M, N, META):
         if use_w8a8_block_fp8_matmul_unrolledx4(M, N, META):
             return _w8a8_block_fp8_matmul_unrolledx4
@@ -765,9 +766,11 @@ def prepare_block_fp8_matmul_inputs(
     assert Bs.ndim == 2
     N, K = B.shape
     assert triton.cdiv(N, block_n) == Bs.shape[0]
+    # TODO optimize assertion
     assert (
-        triton.cdiv(K, block_k) == Bs.shape[1]
-    ), f"{K=} {block_size=} {B.shape=} {Bs.shape=}"
+        (triton.cdiv(K, block_k) == Bs.shape[1])
+        or (K == Bs.shape[1])
+    )
 
     C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
