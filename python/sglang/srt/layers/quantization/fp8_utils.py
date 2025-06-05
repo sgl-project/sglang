@@ -228,8 +228,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     dtype_supported = output_dtype == torch.bfloat16
 
     # TODO: design shape check here
-    # shape_supported = weight.shape[0] % 128 == 0 and weight.shape[1] % 128 == 0
-    shape_supported = True
+    shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
 
     if not (shape_supported and dtype_supported):
         # fall back to triton
