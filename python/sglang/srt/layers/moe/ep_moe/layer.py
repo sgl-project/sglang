@@ -252,7 +252,7 @@ class EPMoE(torch.nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        if use_deep_gemm and _ENABLE_JIT_DEEPGEMM:
+        if use_deep_gemm and _ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
             return self.forward_deepgemm(hidden_states, router_logits)
         else:
             return self.forward_normal(hidden_states, router_logits)
