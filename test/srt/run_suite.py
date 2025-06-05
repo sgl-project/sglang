@@ -127,6 +127,16 @@ suites = {
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
     ],
+    "per-commit-cpu": [
+        TestFile("cpu/test_activation.py"),
+        TestFile("cpu/test_decode.py"),
+        TestFile("cpu/test_extend.py"),
+        TestFile("cpu/test_gemm.py"),
+        TestFile("cpu/test_moe.py"),
+        TestFile("cpu/test_norm.py"),
+        TestFile("cpu/test_qkv_proj_with_rope.py"),
+        TestFile("cpu/test_shared_expert.py"),
+    ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
     ],
