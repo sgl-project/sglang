@@ -1245,7 +1245,13 @@ class DeepEPMoE(EPMoE):
             (num_groups, m, n), device=hidden_states_fp8[0].device, dtype=torch.bfloat16
         )
         fp8_m_grouped_gemm_nt_masked(
-            hidden_states_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
+            hidden_states_fp8,
+            self.w13_weight_fp8,
+            gateup_output,
+            masked_m,
+            expected_m,
+            # NOTE HACK
+            recipe=(1, 128, 128),
         )
         dispose_tensor(hidden_states_fp8[0])
 
@@ -1301,7 +1307,13 @@ class DeepEPMoE(EPMoE):
             (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16
         )
         fp8_m_grouped_gemm_nt_masked(
-            down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
+            down_input_fp8,
+            self.w2_weight_fp8,
+            down_output,
+            masked_m,
+            expected_m,
+            # NOTE HACK
+            recipe=(1, 128, 128),
         )
         # debug_utils.dumper.dump(
         #     "deepepmoe__w2_weight_fp8_a",

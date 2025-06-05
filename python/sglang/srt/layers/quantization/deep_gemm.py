@@ -386,7 +386,13 @@ def gemm_nt_f8f8bf16(
         #     f"{rhs[0].shape=} {rhs[0].dtype=} "
         #     f"{rhs[1].shape=} {rhs[1].dtype=} "
         # )
-        deep_gemm_fp8_gemm_nt(lhs, rhs, out)
+        deep_gemm_fp8_gemm_nt(
+            lhs,
+            rhs,
+            out,
+            # NOTE HACK
+            recipe=(1, 128, 128),
+        )
 
 
 @contextmanager
