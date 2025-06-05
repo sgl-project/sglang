@@ -1460,30 +1460,62 @@ class MiniCPMSparseFlashAttention2(nn.Module):
         k = k.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        kv_seq_len = k.shape[-2]
+        kv_seq_len = q_len
 
-        if past_key_value is not None:
-            usable_length = past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-            kv_seq_len += usable_length
+        # if past_key_value is not None:
+        #     usable_length = past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        # print(f"{usable_length=}")
+        # kv_seq_len += usable_length
 
-        # print(f"{positions.shape=}")
         # FIXME: .view() -> .reshape()
         q_shape = q.shape
         k_shape = k.shape
         q = q.reshape(-1, self.num_heads, self.head_dim)
         k = k.reshape(-1, self.num_kv_heads, self.head_dim)
 
-        q, k = self.rotary_emb(positions, q, k, kv_seq_len)
+        q, k = self.rotary_emb(positions, q, k, forward_batch.seq_lens_cpu.item())
 
         q = q.view(q_shape)
         k = k.view(k_shape)
         if past_key_value is not None:
-            #     cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            # print(f"pre {k.shape=}")
-            k, v = past_key_value.update(k, v, self.layer_idx)
-            # print(f"after {k.shape=}")
-            # print(f"{k=}")
-            # k, v = past_key_value.update(k, v, self.layer_idx, cache_kwargs)
+            if not forward_batch.forward_mode.is_extend():
+                #     cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+                key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                    self.layer_idx
+                )
+                start_out_cache_loc = (
+                    forward_batch.out_cache_loc - forward_batch.seq_lens_sum + 1
+                )
+                # FIXME: transpose
+                k = torch.cat(
+                    [
+                        key_cache[
+                            start_out_cache_loc : forward_batch.out_cache_loc,
+                            :,
+                        ]
+                        .view(1, -1, self.num_kv_heads, self.head_dim)
+                        .transpose(1, 2),
+                        k,
+                    ],
+                    dim=-2,
+                )
+                v = torch.cat(
+                    [
+                        value_cache[
+                            start_out_cache_loc : forward_batch.out_cache_loc,
+                            :,
+                        ]
+                        .view(1, -1, self.num_kv_heads, self.head_dim)
+                        .transpose(1, 2),
+                        v,
+                    ],
+                    dim=-2,
+                )
+
+                # print(f"{k.shape=}")
+
+                # k, v = past_key_value.update(k, v, self.layer_idx)
+                # k, v = past_key_value.update(k, v, self.layer_idx, cache_kwargs)
 
         # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
         # to be able to avoid many of these transpose/reshape/view.
