@@ -1,10 +1,10 @@
 from typing import Tuple
 
 import torch
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
-from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from tqdm import trange
 
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 
 # def hack_requant_moe_weight(that, weights):
 #     print("hi hack_requant_moe_weight")
@@ -66,20 +66,25 @@ from tqdm import trange
 def hack_requant_moe_weight_at_post_load_weights(that):
     from sglang.srt.models.deepseek_v2 import DeepseekV2MLP
 
-    moe_layers = list(range(
-        that.config.first_k_dense_replace,
-        that.config.num_hidden_layers,
-        that.config.moe_layer_freq,
-    ))
+    moe_layers = list(
+        range(
+            that.config.first_k_dense_replace,
+            that.config.num_hidden_layers,
+            that.config.moe_layer_freq,
+        )
+    )
     for layer_id in trange(that.config.num_hidden_layers):
         layer = that.model.layers[layer_id]
         # print([(name, param.shape, param.dtype) for name, param in self_attn.named_parameters()])
 
         for module in [
             layer.self_attn.q_b_proj,
+            layer.self_attn.kv_b_proj,
             layer.self_attn.o_proj,
         ]:
-            _requant_grouped_moe_weight_inplace(that, module.weight, module.weight_scale_inv)
+            _requant_grouped_moe_weight_inplace(
+                that, module.weight, module.weight_scale_inv
+            )
 
         if layer_id in moe_layers:
             shared_experts = layer.mlp.shared_experts
@@ -87,7 +92,9 @@ def hack_requant_moe_weight_at_post_load_weights(that):
                 shared_experts.gate_up_proj,
                 shared_experts.down_proj,
             ]:
-                _requant_grouped_moe_weight_inplace(that, module.weight, module.weight_scale_inv)
+                _requant_grouped_moe_weight_inplace(
+                    that, module.weight, module.weight_scale_inv
+                )
 
             experts = layer.mlp.experts
             assert isinstance(experts, DeepEPMoE)
@@ -103,11 +110,15 @@ def hack_requant_moe_weight_at_post_load_weights(that):
                 mlp.gate_up_proj,
                 mlp.down_proj,
             ]:
-                _requant_grouped_moe_weight_inplace(that, module.weight, module.weight_scale_inv)
+                _requant_grouped_moe_weight_inplace(
+                    that, module.weight, module.weight_scale_inv
+                )
 
 
 def _requant_grouped_moe_weight_inplace(that, weight, weight_scale_inv):
-    weight[...], weight_scale_inv[...] = _requant_grouped_moe_weight(that, weight, weight_scale_inv)
+    weight[...], weight_scale_inv[...] = _requant_grouped_moe_weight(
+        that, weight, weight_scale_inv
+    )
 
 
 def _requant_grouped_moe_weight(
