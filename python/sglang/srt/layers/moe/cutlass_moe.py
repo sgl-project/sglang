@@ -15,6 +15,7 @@ _is_cuda = is_cuda()
 if _is_cuda:
     import sgl_kernel
     from sgl_kernel import (
+        shuffle_rows,
         cutlass_fp4_group_mm,
         fp8_blockwise_scaled_grouped_mm,
         prepare_moe_input,
@@ -361,8 +362,8 @@ def cutlass_moe_fp4(
         params.to_gemm2_args(),
     )
     del int_fp4, int_blockscale
-
-    c2 = c2[c_map].view(m_a, num_topk, params.hidden_size)
+    c2 = shuffle_rows(c2, c_map, (m_a * num_topk, params.hidden_size))
+    c2 = c2.view(m_a, num_topk, params.hidden_size)
     if not apply_router_weight_on_input:
         c2 = c2 * topk_weights.view(m_a, num_topk, 1).to(out_dtype)
     return c2.sum(dim=1).to(out_dtype)
