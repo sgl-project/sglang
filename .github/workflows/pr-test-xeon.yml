@@ -12,7 +12,7 @@ concurrency:
 jobs:
   build-test:
     if: github.event_name == 'pull_request'
-    runs-on: spr-node
+    runs-on: sgl-kernel-build-node
     environment: 'prod'
     strategy:
       matrix:
