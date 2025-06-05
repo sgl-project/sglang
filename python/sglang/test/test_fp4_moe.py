@@ -5,7 +5,6 @@ from sgl_kernel import scaled_fp4_quant
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
-from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.topk import select_experts
 
 if torch.cuda.get_device_capability() < (10, 0):
@@ -180,13 +179,6 @@ def test_cutlass_fp4_moe_no_graph(
         (e,), w2_q.shape[2] * 2, dtype=torch.int64, device=w2_q.device
     )
     c_strides_2 = torch.full((e,), w2_q.shape[1], dtype=torch.int64, device=w2_q.device)
-    params = CutlassMoEParams(
-        CutlassMoEType.BlockscaledFP4,
-        device=a.device,
-        num_experts=e,
-        intermediate_size_per_partition=n,  # n
-        hidden_size=k,
-    )  # k
     cutlass_output = cutlass_moe_fp4(
         a=a,
         a1_gscale=a1_gs,
@@ -197,10 +189,17 @@ def test_cutlass_fp4_moe_no_graph(
         w2_fp4=w2_q,
         w2_blockscale=w2_blockscale,
         w2_alphas=(1 / w2_gs),
+        ab_strides_13=ab_strides_13,
+        ab_strides_2=ab_strides_2,
+        c_strides_13=c_strides_13,
+        c_strides_2=c_strides_2,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        params=params,
-        apply_router_weight_on_input=False,
+        m=m,
+        n=n,
+        k=k,
+        e=e,
+        device=a.device,
     )
 
     # Reference check:
