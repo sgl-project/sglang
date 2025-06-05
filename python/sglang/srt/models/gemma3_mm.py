@@ -286,14 +286,26 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         all_pixel_values = flatten_nested_list([item.pixel_values for item in items])
         vision_outputs_list = []
 
-        for pixel_value in all_pixel_values:
-            # Add batch dimension for single image processing
-            pixel_value_batch = pixel_value.unsqueeze(0)
-            pixel_value_batch = pixel_value_batch.to(device=self.vision_tower.device)
-            pixel_value_batch = pixel_value_batch.to(dtype=self.language_model.dtype())
+        for pixel_values_batch in all_pixel_values:
+            # Normalize input shape to [batch_size, channels, height, width]
+            if pixel_values_batch.dim() == 5:
+                pixel_values_batch = pixel_values_batch.squeeze(0)
+            elif pixel_values_batch.dim() == 3:
+                pixel_values_batch = pixel_values_batch.unsqueeze(0)
+            elif pixel_values_batch.dim() != 4:
+                raise ValueError(
+                    f"Unexpected pixel_values shape: {pixel_values_batch.shape}"
+                )
 
-            vision_output = self.vision_tower(pixel_values=pixel_value_batch)
-            vision_outputs_list.append(vision_output)
+            # Process each image in the batch
+            batch_size = pixel_values_batch.shape[0]
+            for i in range(batch_size):
+                pixel_value = pixel_values_batch[i : i + 1]  # Keep batch dimension as 1
+                pixel_value = pixel_value.to(
+                    device=self.vision_tower.device, dtype=self.language_model.dtype()
+                )
+                vision_output = self.vision_tower(pixel_values=pixel_value)
+                vision_outputs_list.append(vision_output)
 
         # Concatenate all vision outputs
         vision_outputs = torch.cat(vision_outputs_list, dim=0)

@@ -26,6 +26,7 @@ suites = {
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_vlm_models.py", 437),
+        TestFile("models/test_transformers_models.py", 320),
         TestFile("test_abort.py", 51),
         TestFile("test_block_int8.py", 22),
         TestFile("test_create_kvindices.py", 2),
