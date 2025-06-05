@@ -402,7 +402,7 @@ class ModelRunner:
                 else:
                     server_args.attention_backend = "triton"
             logger.info(
-                f"Attention backend not set. Use {server_args.attention_backend} backend by default."
+                f"Attention backend not explicitly specified. Use {server_args.attention_backend} backend by default."
             )
         elif self.use_mla_backend:
             if server_args.device != "cpu":
@@ -454,8 +454,69 @@ class ModelRunner:
             if not self.is_multimodal_chunked_prefill_supported:
                 server_args.chunked_prefill_size = -1
                 logger.info(
-                    f"Automatically turn of --chunked-prefill-size as it is not supported for "
+                    f"Automatically turn off --chunked-prefill-size as it is not supported for "
                     f"{self.model_config.hf_config.model_type}"
+                )
+
+            # roughly reduce the mem_fraction_static base on params of Vit
+            original_server_arg_mem_fraction = self.mem_fraction_static
+            # a base mem_fraction_static factor for regular Vit
+            base_mem_fraction_reduction_ratio = 0.95
+            if (
+                hasattr(self.model_config.hf_config, "vision_config")
+                and self.model_config.hf_config.vision_config is not None
+            ):
+                vision_config = self.model_config.hf_config.vision_config
+
+                vit_num_layers = getattr(vision_config, "num_hidden_layers", 24)
+                vit_hidden_size = getattr(vision_config, "hidden_size", 1024)
+
+                # baseline ViT params (ViT-L/14)
+                baseline_vit_layers = 24
+                baseline_vit_hidden_size = 1024
+
+                # weight params count
+                current_complexity_score = vit_num_layers * (vit_hidden_size**2)
+                baseline_complexity_score = baseline_vit_layers * (
+                    baseline_vit_hidden_size**2
+                )
+                complexity_ratio = (
+                    current_complexity_score / baseline_complexity_score
+                    if baseline_complexity_score > 0
+                    else 1.0
+                )
+
+                # everytime the complexity grows 100%, adjust final factor for 3%
+                sensitivity_scale = 0.02
+                dynamic_adjustment_factor = 1.0 - sensitivity_scale * (
+                    complexity_ratio - 1.0
+                )
+                print(f"{dynamic_adjustment_factor=}")
+                dynamic_adjustment_factor = max(
+                    0.8, min(1.05, dynamic_adjustment_factor)
+                )
+
+                final_overall_factor = (
+                    base_mem_fraction_reduction_ratio * dynamic_adjustment_factor
+                )
+                self.mem_fraction_static = (
+                    original_server_arg_mem_fraction * final_overall_factor
+                )
+
+                print(f"{vit_hidden_size=}")
+                print(f"{vit_num_layers=}")
+
+                logger.info(
+                    f"Multimodal model: Dynamically adjusted --mem-fraction-static "
+                    f"from: {original_server_arg_mem_fraction:.3f} to: {self.mem_fraction_static:.3f}."
+                )
+            else:
+                self.mem_fraction_static = (
+                    original_server_arg_mem_fraction * base_mem_fraction_reduction_ratio
+                )
+                logger.info(
+                    f"Multimodal model: No detailed vision_config, fixed adjusted --mem-fraction-static "
+                    f"from: {original_server_arg_mem_fraction:.3f} to: {self.mem_fraction_static:.3f}."
                 )
 
         if not self.use_mla_backend:
