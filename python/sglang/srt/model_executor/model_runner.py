@@ -294,6 +294,14 @@ class ModelRunner:
         if server_args.lora_paths is not None:
             self.init_lora_manager()
 
+        # Init Double Sparsity
+        if server_args.enable_double_sparsity:
+            if server_args.ds_heavy_channel_type is None:
+                raise ValueError(
+                    "Please specify the heavy channel type for double sparsity optimization."
+                )
+            self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
+
         # Init memory pool and attention backends
         self.init_memory_pool(
             min_per_gpu_memory,
@@ -398,11 +406,6 @@ class ModelRunner:
             )
             server_args.attention_backend = "triton"
             server_args.disable_cuda_graph = True
-            if server_args.ds_heavy_channel_type is None:
-                raise ValueError(
-                    "Please specify the heavy channel type for double sparsity optimization."
-                )
-            self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
         if self.is_multimodal:
             self.mem_fraction_static *= 0.90
