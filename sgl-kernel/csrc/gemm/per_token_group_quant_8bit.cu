@@ -78,7 +78,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   // TODO can optimize
   OutputScaleT y_s_quant;
   if constexpr (SCALE_UE8M0) {
-    y_s_quant = (uint8_t) ((int) log2f(y_s)) + 127);
+    y_s_quant = (uint8_t) (((int) log2f(y_s)) + 127);
   } else {
     y_s_quant = y_s;
   }
