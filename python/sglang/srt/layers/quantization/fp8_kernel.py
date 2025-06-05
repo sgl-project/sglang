@@ -298,6 +298,7 @@ def sglang_per_token_group_quant_fp8(
         ).permute(-1, -2)[: x.shape[-2], :]
     elif column_major_scales:
         if scale_tma_aligned:
+            # TODO extract "align" function
             # aligned to 4 * sizeof(float)
             aligned_size = (x.shape[-2] + 3) // 4 * 4
             x_s = torch.empty(
