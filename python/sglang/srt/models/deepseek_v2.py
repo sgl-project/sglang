@@ -435,9 +435,6 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_cpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         fused_experts_out = self.experts(
