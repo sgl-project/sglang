@@ -6,7 +6,7 @@ from sglang.srt.managers.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import DeepEPMode, load_json_config
+from sglang.srt.utils import DeepEPMode, load_json_config, get_bool_env_var
 
 try:
     from deep_ep import Buffer, Config
@@ -33,6 +33,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 logger = logging.getLogger(__name__)
+
+_DEBUG_LL_INSERT_SLOWNESS = get_bool_env_var("SGLANG_DEEPEP_DEBUG_LL_INSERT_SLOWNESS")
 
 
 class DeepEPDispatchMode(IntEnum):
@@ -485,9 +487,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_idx = topk_idx.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
-            + self.num_experts
-        ) // self.num_experts
+                         hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+                         + self.num_experts
+                     ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
@@ -513,6 +515,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         event,
         hook,
     ):
+        if _DEBUG_LL_INSERT_SLOWNESS:
+            TODO
+
         hook() if self.return_recv_hook else event.current_stream_wait()
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
@@ -598,6 +603,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return hidden_states, event, hook
 
     def combine_b(self, hidden_states, event, hook):
+        if _DEBUG_LL_INSERT_SLOWNESS:
+            TODO
+
         hook() if self.return_recv_hook else event.current_stream_wait()
         return hidden_states
 
