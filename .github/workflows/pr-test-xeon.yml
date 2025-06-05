@@ -30,7 +30,7 @@ jobs:
   unit-test:
     if: github.event_name == 'pull_request'
     needs: [build-test]
-    runs-on: spr-node
+    runs-on: sgl-kernel-build-node
     steps:
       - name: Run container
         run: |
