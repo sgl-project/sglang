@@ -1891,6 +1891,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.use_deep_gemm_bmm = True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+     
+        
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -1945,6 +1947,21 @@ class DeepseekV2ForCausalLM(nn.Module):
                         "up_proj.qweight",
                         "up_proj.qzeros",
                         "up_proj.scales",
+                    ]
+                elif self.quant_config.get_name() == "modelopt_fp4":
+                    suffix_list = [
+                        "down_proj.weight",
+                        "down_proj.weight_scale",
+                        "down_proj.weight_scale_2",
+                        "down_proj.input_scale",
+                        "gate_proj.weight",
+                        "gate_proj.weight_scale",
+                        "gate_proj.weight_scale_2",
+                        "gate_proj.input_scale",
+                        "up_proj.weight",
+                        "up_proj.weight_scale",
+                        "up_proj.weight_scale_2",
+                        "up_proj.input_scale",
                     ]
                 else:
                     raise ValueError(
@@ -2017,8 +2034,13 @@ class DeepseekV2ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         weight_names = []
         for name, loaded_weight in weights:
+            if "self_attn.kv_a_proj_with_mqa"  in name:
+                print("Testing with name: ", name)
+                if "18" in name:
+                    print("Testing for kv_a_proj_with_mqa for layer 18")
+                    import pdb; pdb.set_trace()
             weight_names.append(name)
-
+            
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
@@ -2090,11 +2112,16 @@ class DeepseekV2ForCausalLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-
+                    if "18.self_attn" in name:
+                        print("In the else block for name: ", name)
+                        print(f"fused q and kv a_proj = {fuse_qkv_a_proj}")
                     if fuse_qkv_a_proj and (
                         "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                     ):
                         cached_a_proj[name] = loaded_weight
+                        if "18.self_attn" in name:
+                            proj_name_cached = "q_a_proj" if "q_a_proj" in name else "kv_a_proj_with_mqa"
+                            print(f"proj_name_cached = {proj_name_cached}")
                         q_a_proj_name = (
                             name
                             if "q_a_proj" in name
