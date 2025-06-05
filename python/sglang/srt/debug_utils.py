@@ -8,6 +8,12 @@ from sglang.srt.utils import get_bool_env_var
 
 
 class _Dumper:
+    """Utility to dump tensors, which can be useful when comparison checking models.
+
+    Example usage:
+    debug_utils.dumper.dump("layer_start_hidden_states", hidden_states, layer_id=self.layer_id)
+    """
+
     def __init__(self):
         self._enable = get_bool_env_var("SGLANG_DUMPER_ENABLE", "true")
         self._base_dir = Path(os.environ.get("SGLANG_DUMPER_DIR", "/tmp"))
