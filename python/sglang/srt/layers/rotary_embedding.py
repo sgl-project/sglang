@@ -1253,7 +1253,6 @@ class MiniCPMScaledRotaryEmbedding(RotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
-        # Build here to make `torch.jit.trace` work.
         self._compute_cos_sin_cache(
             # seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
             seq_len=max_position_embeddings,

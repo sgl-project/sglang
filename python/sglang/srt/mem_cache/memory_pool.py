@@ -397,7 +397,7 @@ class MHATokenToKVPool(KVCache):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
-        print(f"setting kv buffer: {cache_v.shape=} {loc=}")
+        # print(f"setting kv buffer: {cache_v.shape=} {loc=}")
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         if layer_id_override is not None:
