@@ -658,6 +658,7 @@ def init_sorted_ids_and_cumsum_buffer_kernel(
     topk_ids_numel,
     num_experts: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    ALIGNED_NUM_EXPERTS_P1: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -672,8 +673,13 @@ def init_sorted_ids_and_cumsum_buffer_kernel(
             mask=mask,
         )
     elif pid == sorted_ids_blocks:
-        for i in range(num_experts + 1):
-            tl.store(cumsum_buffer_ptr + i, 0)
+        offset_e = tl.arange(0, ALIGNED_NUM_EXPERTS_P1)
+        mask_e = offset_e < num_experts + 1
+        tl.store(
+            cumsum_buffer_ptr + offset_e,
+            tl.zeros((ALIGNED_NUM_EXPERTS_P1,), dtype=tl.int32),
+            mask=mask_e,
+        )
 
 
 def init_sorted_ids_and_cumsum_buffer(
@@ -683,6 +689,7 @@ def init_sorted_ids_and_cumsum_buffer(
     cumsum_buffer = torch.empty((num_experts + 1,), dtype=torch.int32, device=device)
 
     BLOCK_SIZE = 1024
+    ALIGNED_NUM_EXPERTS_P1 = 1024  # ensure num_experts <= ALIGNED_NUM_EXPERTS_P1
     sorted_ids_blocks = triton.cdiv(max_num_tokens_padded, BLOCK_SIZE)
     grid = (sorted_ids_blocks + 1,)
 
@@ -693,6 +700,7 @@ def init_sorted_ids_and_cumsum_buffer(
         topk_ids_numel,
         num_experts,
         BLOCK_SIZE,
+        ALIGNED_NUM_EXPERTS_P1,
     )
 
     return sorted_ids, cumsum_buffer
