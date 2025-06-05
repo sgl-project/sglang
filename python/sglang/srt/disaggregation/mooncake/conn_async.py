@@ -76,11 +76,10 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
-        self._sem = threading.Semaphore(0)
-        submit_func = lambda: self._sem.release()
+        #because the put_kvcache_func is very fast, there is no need to setup a new thread to run it.
+        submit_func = lambda: self._put_kvcache_func()
         self._async_submitter = StreamAsyncSubmitter(submit_func)
         self._notify_queue = deque()
-        self._init_put_kvcache_thread()
         self._waiting_rooms = deque()
         self._current_kv_chunk_infos: Optional[TransferKVChunkSet] = None
         self._req_begin_count: Dict[int, deque] = {}
@@ -91,28 +90,20 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
     @property
     def is_support_asnyc(self):
         return True
+    
+    def _put_kvcache_func(self):
+        try:
+            info = self._notify_queue.pop()
+            self._put_kv_cache_internal(info)
+        except Exception as e:
+            import traceback
 
-    def _put_kvcache_thread_func(self):
-        while True:
-            self._sem.acquire()
-            try:
-                info = self._notify_queue.pop()
-                self._put_kv_cache_internal(info)
-            except Exception as e:
-                import traceback
+            traceback.print_exc()
+            logger.info(f"Error in put_kvcache_thread: {e}")
+            import os
 
-                traceback.print_exc()
-                logger.info(f"Error in put_kvcache_thread: {e}")
-                import os
+            os._exit(1)
 
-                os._exit(1)
-
-    def _init_put_kvcache_thread(self):
-        self._put_kvcache_thread = threading.Thread(
-            target=self._put_kvcache_thread_func, daemon=True
-        )
-        self._put_kvcache_thread.start()
-        logger.info(f"start put_kvcache_thread : {self._put_kvcache_thread}")
 
     def get_info_with_risk(self, room : int)-> TransferInfo:
         """
@@ -138,7 +129,6 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         prefill_kv_blocks = [x[0] for x in prefill_kv_blocks_tmp]
         dst_kv_blocks = [x[0] for x in dst_kv_blocks_tmp]
         block_lengths = [len(x) for x in prefill_kv_blocks_tmp]
-        # [TODO] support the blocks == 1 for now
         assert len(prefill_kv_blocks) == len(dst_kv_blocks)
         bids = []
         for prefill_index, decode_index, block_length in zip(
