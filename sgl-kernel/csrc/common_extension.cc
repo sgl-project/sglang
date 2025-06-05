@@ -38,6 +38,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
   m.impl("all_reduce", torch::kCUDA, &all_reduce);
+
+  m.def("all_to_all(int fa, Tensor! out, Tensor inp, Tensor plan_meta, int _reg_buffer) -> ()");
+  m.impl("all_to_all", torch::kCUDA, &all_to_all);
+
+  m.def(
+      "all_to_all_plan(int fa, Tensor out, Tensor inp, Tensor output_split_sizes, "
+      "Tensor input_split_sizes, int chunk_size, Tensor output_split_offsets, Tensor input_split_offsets, "
+      "Tensor !plan_meta) -> ()");
+  m.impl("all_to_all_plan", torch::kCUDA, &all_to_all_plan);
   /*
    * From csrc/attention
    */
