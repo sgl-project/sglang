@@ -70,12 +70,9 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   local_absmax = GroupReduceMax(local_absmax, lane_id);
 
-  float y_s_raw = local_absmax / max_8bit;
-  OutputScaleT y_s;
+  float y_s = local_absmax / max_8bit;
   if constexpr (SCALE_UE8M0) {
-    y_s = (uint8_t) ((int) ceilf(log2f(fmaxf(fabsf(y_s_raw), 1e-10f)))) + 127);
-  } else {
-    y_s = y_s_raw;
+    y_s = exp2f(ceilf(log2f(fmaxf(fabsf(y_s), 1e-10f))));
   }
 
   if (lane_id == 0) {
