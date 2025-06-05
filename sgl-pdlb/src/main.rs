@@ -6,6 +6,7 @@ mod strategy_lb;
 use lb_state::{LBConfig, LBState};
 use server::{periodic_logging, startup};
 use tokio::signal;
+use tracing::info;
 
 fn main() -> anyhow::Result<()> {
     // FIXME: test code, move to test folder
@@ -37,7 +38,7 @@ fn main() -> anyhow::Result<()> {
                 unreachable!()
             }
             _ = signal::ctrl_c() => {
-                println!("Received Ctrl+C, shutting down");
+                info!("Received Ctrl+C, shutting down");
                 std::process::exit(0);
             }
         }

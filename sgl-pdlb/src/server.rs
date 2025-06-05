@@ -4,7 +4,9 @@ use crate::strategy_lb::EngineType;
 use actix_web::{HttpRequest, HttpResponse, HttpServer, get, post, web};
 use reqwest::Method;
 use serde_json::json;
-use std::io::Write;
+use crate::logging::{self, LoggingConfig};
+use tracing::{error, info, Level};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[get("/health")]
 pub async fn health(_req: HttpRequest, _: web::Data<LBState>) -> HttpResponse {
@@ -17,10 +19,10 @@ pub async fn health_generate(
     app_state: web::Data<LBState>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let servers = app_state.strategy_lb.get_all_servers();
-    app_state
+    let responses = app_state
         .route_collect(&servers, Method::GET, "/health_generate", None)
         .await?;
-    // FIXME: log the response
+    info!("Health check responses from {} servers", responses.len());
     Ok(HttpResponse::Ok().body("Health check passed on all servers"))
 }
 
@@ -114,7 +116,7 @@ pub async fn periodic_logging(lb_state: LBState) {
         let (prefill_loads, decode_loads) = match lb_state.get_engine_loads().await {
             Ok((prefill_loads, decode_loads)) => (prefill_loads, decode_loads),
             Err(e) => {
-                log::error!("Failed to get engine loads: {}", e);
+                error!("Failed to get engine loads: {}", e);
                 continue;
             }
         };
@@ -126,29 +128,32 @@ pub async fn periodic_logging(lb_state: LBState) {
             .into_iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>();
-        log::info!("Prefill loads: {}", prefill_loads.join(", "));
-        log::info!("Decode loads: {}", decode_loads.join(", "));
+        info!("Prefill loads: {}", prefill_loads.join(", "));
+        info!("Decode loads: {}", decode_loads.join(", "));
     }
 }
 
 pub async fn startup(lb_config: LBConfig, lb_state: LBState) -> std::io::Result<()> {
+    // Only initialize logging if not already done (for Python bindings support)
+    static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+    let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
+        Some(logging::init_logging(LoggingConfig {
+            level: Level::INFO,  // or DEBUG if verbose
+            json_format: false,
+            log_dir: Some("logs".to_string()),
+            colorize: true,
+            log_file_name: "sgl-pdlb".to_string(),
+            log_targets: Some(vec!["sgl_pdlb_rs".to_string()]),
+        }))
+    } else {
+        None
+    };
+
+    info!("🚧 Starting server at {}:{}", lb_config.host, lb_config.port);
+    info!("🚧 Initializing load balancer with config: {:?}", lb_config);
+
     let app_state = web::Data::new(lb_state);
-
-    println!("Starting server at {}:{}", lb_config.host, lb_config.port);
-
-    // default level is info
-    env_logger::Builder::new()
-        .format(|buf, record| {
-            writeln!(
-                buf,
-                "{} - {} - {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                record.level(),
-                record.args()
-            )
-        })
-        .filter(None, log::LevelFilter::Info)
-        .init();
 
     HttpServer::new(move || {
         actix_web::App::new()
@@ -167,5 +172,6 @@ pub async fn startup(lb_config: LBConfig, lb_state: LBState) -> std::io::Result<
     .run()
     .await?;
 
+    info!("✅ Server stopped");
     std::io::Result::Ok(())
 }

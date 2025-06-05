@@ -2,7 +2,11 @@ pub mod io_struct;
 pub mod lb_state;
 pub mod server;
 pub mod strategy_lb;
+pub mod logging;
+
+pub use logging::{LoggingConfig, LogGuard, init_logging};
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
+use tracing::info;
 
 use lb_state::{LBConfig, LBState};
 use server::{periodic_logging, startup};
@@ -52,7 +56,7 @@ impl LoadBalancer {
                     unreachable!()
                 }
                 _ = signal::ctrl_c() => {
-                    println!("Received Ctrl+C, shutting down");
+                    info!("Received Ctrl+C, shutting down");
                     std::process::exit(0);
                 }
             }
