@@ -70,7 +70,15 @@ def hack_requant_moe_weight_at_post_load_weights(that):
         that.config.moe_layer_freq,
     )
     for layer_id in tqdm(moe_layers):
-        experts = that.model.layers[layer_id].mlp.experts
+        layer = that.model.layers[layer_id]
+
+        for module in [
+            layer.mlp.shared_experts.gate_up_proj,
+            layer.mlp.shared_experts.down_proj,
+        ]:
+            _requant_grouped_moe_weight_inplace(that, module.weight, module.weight_scale_inv)
+
+        experts = layer.mlp.experts
         assert isinstance(experts, DeepEPMoE)
         for w in [
             experts.w13_weight_fp8,
@@ -81,11 +89,10 @@ def hack_requant_moe_weight_at_post_load_weights(that):
     for layer_id in trange(that.config.num_hidden_layers):
         layer = that.model.layers[layer_id]
         # print([(name, param.shape, param.dtype) for name, param in self_attn.named_parameters()])
+
         for module in [
             layer.self_attn.q_b_proj,
             layer.self_attn.o_proj,
-            layer.mlp.shared_experts.gate_up_proj,
-            layer.mlp.shared_experts.down_proj,
         ]:
             _requant_grouped_moe_weight_inplace(that, module.weight, module.weight_scale_inv)
 
