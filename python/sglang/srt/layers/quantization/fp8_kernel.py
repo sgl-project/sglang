@@ -289,14 +289,15 @@ def sglang_per_token_group_quant_fp8(
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
     if scale_ue8m0:
         assert column_major_scales and scale_tma_aligned
-        mn, k = x.shape
-        aligned_mn = align(mn, 4)
-        aligned_k = align(k, 4)
+        x_q_mn, x_q_k = x.shape
+        x_s_mn, x_s_k = x_q_mn, x_q_k // 128
+        aligned_mn = align(x_s_mn, 4)
+        aligned_k = align(x_s_k, 4)
         x_s = torch.empty(
             (aligned_k // 4, aligned_mn),
             device=x.device,
             dtype=torch.int,
-        ).permute(-1, -2)[:mn, :]
+        ).permute(-1, -2)[:x_s_mn, :]
     elif column_major_scales:
         if scale_tma_aligned:
             # TODO extract "align" function
@@ -782,7 +783,8 @@ def prepare_block_fp8_matmul_inputs(
     if As.dtype == torch.float:
         assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
     elif Bs.dtype == torch.int:
-        assert triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1]
+        assert triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[
+            -1], f"{A.shape=} {As.shape=} {block_size=}"
     else:
         raise NotImplementedError
 
