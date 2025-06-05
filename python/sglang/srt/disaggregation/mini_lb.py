@@ -281,7 +281,7 @@ async def handle_generate_request(request_data: dict):
                 "bootstrap_host": [hostname] * batch_size,
                 "bootstrap_port": [bootstrap_port] * batch_size,
                 "bootstrap_room": [
-                    _generate_bootstrap_room() for _ in range(batch_size)
+                    (await _generate_next_bootstrap_room(prefill_server) if neat_room else _generate_bootstrap_room()) for _ in range(batch_size)
                 ],
             }
         )
@@ -290,7 +290,7 @@ async def handle_generate_request(request_data: dict):
             {
                 "bootstrap_host": hostname,
                 "bootstrap_port": bootstrap_port,
-                "bootstrap_room": _generate_bootstrap_room(),
+                "bootstrap_room": await _generate_next_bootstrap_room(prefill_server) if neat_room else _generate_bootstrap_room(),
             }
         )
 
@@ -315,7 +315,7 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
         {
             "bootstrap_host": hostname,
             "bootstrap_port": bootstrap_port,
-            "bootstrap_room": _generate_bootstrap_room(),
+            "bootstrap_room": await _generate_next_bootstrap_room(prefill_server) if neat_room else _generate_bootstrap_room(),
         }
     )
 
@@ -356,6 +356,23 @@ def _get_request_batch_size(request):
     if (input_ids := request.get("input_ids")) is not None:
         return None if isinstance(input_ids[0], int) else len(input_ids)
     return None
+
+_counter_lock = asyncio.Lock()
+bootstrap_room_counters = {}
+MAX_ROOMS_PER_SERVER = 2**32  # Each server gets 2^32 rooms
+
+async def _generate_next_bootstrap_room(prefill_url: str):
+    global bootstrap_room_counters
+    async with _counter_lock:
+        if prefill_url not in bootstrap_room_counters:
+            # For two prefill servers, first one starts at 0, second one starts at 2^32
+            server_index = len(bootstrap_room_counters)
+            bootstrap_room_counters[prefill_url] = server_index * MAX_ROOMS_PER_SERVER
+        
+        room = bootstrap_room_counters[prefill_url]
+        bootstrap_room_counters[prefill_url] = (bootstrap_room_counters[prefill_url] + 1) % (2**63)
+        print(f"[hanhan] mini lb bootstrap room for {prefill_url}: {room}")
+        return room
 
 
 @app.get("/v1/models")
@@ -400,8 +417,10 @@ async def register(obj: PDRegistryRequest):
     return Response(status_code=200)
 
 
-def run(prefill_configs, decode_addrs, host, port):
+def run(prefill_configs, decode_addrs, host, port, neat_=False):
     global load_balancer
+    global neat_room 
+    neat_room = neat_
     load_balancer = MiniLoadBalancer(prefill_configs, decode_addrs)
     uvicorn.run(app, host=host, port=port)
 
@@ -411,4 +430,3 @@ if __name__ == "__main__":
     from sglang.srt.disaggregation.launch_lb import main
 
     main()
-    
