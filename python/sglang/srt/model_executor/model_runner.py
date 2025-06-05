@@ -421,11 +421,10 @@ class ModelRunner:
             if self.model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
 
-        if self.model_config.hf_config.architectures[
-            0
-        ] == "MiniCPMForCausalLM" and hasattr(
-            self.model_config.hf_config, "sparse_config"
-        ):
+        if self.model_config.hf_config.architectures[0] == "MiniCPMForCausalLM":
+            #     and hasattr(
+            #     self.model_config.hf_config, "sparse_config"
+            # ):
             if server_args.attention_backend != "fa3":
                 print_warning_once(
                     f"{server_args.attention_backend} is not available for MiniCPM-4, defaults to fa3"
