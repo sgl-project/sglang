@@ -778,7 +778,13 @@ def prepare_block_fp8_matmul_inputs(
     assert A.shape[-1] == B.shape[-1]
     assert A.shape[:-1] == As.shape[:-1]
     assert A.is_contiguous()
-    assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+
+    if As.dtype == torch.float:
+        assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+    elif Bs.dtype == torch.int:
+        assert triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1]
+    else:
+        raise NotImplementedError
 
     M = A.numel() // A.shape[-1]
 
