@@ -40,21 +40,51 @@ class Llama4ForConditionalGeneration(nn.Module):
         self.quant_config = quant_config
 
         # Check if this is a text-only model (no vision components)
-        self.has_vision = (
-            hasattr(config, "vision_config") and config.vision_config is not None
-        )
+        # We need a more robust check since transformers auto-generates vision_config
+        # for Llama4ForConditionalGeneration even for text-only models
+
+        # First check the original config.json to see if vision_config was explicitly defined
+        import json as json_lib
+        import os
+
+        # Get the model path from the config if available
+        model_path = getattr(config, "_name_or_path", None)
+        original_has_vision = False
+
+        if model_path and os.path.exists(os.path.join(model_path, "config.json")):
+            try:
+                with open(os.path.join(model_path, "config.json"), "r") as f:
+                    original_config = json_lib.load(f)
+                # Check if vision_config exists in the original file
+                original_has_vision = "vision_config" in original_config
+                if get_tensor_model_parallel_rank() == 0:
+                    print(
+                        f"Debug: Original config has explicit vision_config: {original_has_vision}"
+                    )
+            except:
+                # Fallback to checking the processed config
+                original_has_vision = (
+                    hasattr(config, "vision_config")
+                    and config.vision_config is not None
+                )
+                if get_tensor_model_parallel_rank() == 0:
+                    print(
+                        f"Debug: Could not read original config, using processed config"
+                    )
+        else:
+            # Fallback to checking the processed config
+            original_has_vision = (
+                hasattr(config, "vision_config") and config.vision_config is not None
+            )
+            if get_tensor_model_parallel_rank() == 0:
+                print(
+                    f"Debug: No model path or config.json found, using processed config"
+                )
+
+        self.has_vision = original_has_vision
         if get_tensor_model_parallel_rank() == 0:
             print(f"Debug: has_vision: {self.has_vision}")
-            print(f"Debug: config: {config}")
-
-            with open(
-                "/opt/zhiyuc/checkpoints/Llama-4-Scout-17B-16E-Instruct-fp8/llama4_config_debug.json",
-                "w",
-            ) as f:
-                json.dump(config.__dict__, f, indent=2, default=str)
-            print(
-                f"Debug: config saved to /opt/zhiyuc/checkpoints/Llama-4-Scout-17B-16E-Instruct-fp8/llama4_config_debug.json"
-            )
+            print(f"Debug: model_path: {model_path}")
 
         if self.has_vision:
             self.vision_model = Llama4VisionModel(config.vision_config)
