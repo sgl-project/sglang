@@ -937,6 +937,7 @@ class Fp8MoEMethod:
         use_grouped_topk: bool,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
@@ -957,6 +958,7 @@ class Fp8MoEMethod:
             renormalize=renormalize,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
+            num_fused_shared_experts=num_fused_shared_experts,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
@@ -980,9 +982,9 @@ class Fp8MoEMethod:
             and self.block_quant
             and is_sm100_supported()
         ):
-            from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts
+            from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
-            return cutlass_fused_experts(
+            return cutlass_fused_experts_fp8(
                 x,
                 layer.w13_weight.transpose(1, 2),
                 layer.w2_weight.transpose(1, 2),
