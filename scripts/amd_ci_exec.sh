@@ -6,7 +6,7 @@ WORKDIR="/sglang-checkout/test/srt"
 ENV_ARGS=(
   -e SGLANG_AMD_CI=1
   -e SGLANG_IS_IN_CI=1
-  -e SGLANG_USE_AITER=1
+  -e SGLANG_USE_AITER=0
 )
 
 # Parse optional -w/--workdir and -e ENV=VAL flags
