@@ -611,11 +611,14 @@ class ModelRunner:
             ) from None
 
     def update_expert_location(
-        self, new_expert_location_metadata: ExpertLocationMetadata
+        self,
+        new_expert_location_metadata: ExpertLocationMetadata,
+        update_layer_ids: List[int],
     ):
         self.expert_location_updater.update(
             self.model.routed_experts_weights_of_layer,
             new_expert_location_metadata,
+            update_layer_ids=update_layer_ids,
             nnodes=self.server_args.nnodes,
             rank=self.tp_rank,
         )
@@ -1203,7 +1206,7 @@ class ModelRunner:
             )
 
         if self.eplb_manager is not None:
-            self.eplb_manager.on_forward_pass_end(self.forward_pass_id)
+            self.eplb_manager.on_forward_pass_end()
 
         return output
 

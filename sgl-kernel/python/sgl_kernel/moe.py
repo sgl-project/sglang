@@ -88,6 +88,28 @@ def ep_moe_pre_reorder(
     )
 
 
+def ep_moe_post_reorder(
+    down_output,
+    output,
+    src2dst,
+    topk_ids,
+    topk_weights,
+    start_expert_id,
+    end_expert_id,
+    topk,
+):
+    return torch.ops.sgl_kernel.ep_moe_post_reorder.default(
+        down_output,
+        output,
+        src2dst,
+        topk_ids,
+        topk_weights,
+        start_expert_id,
+        end_expert_id,
+        topk,
+    )
+
+
 def fp8_blockwise_scaled_grouped_mm(
     output,
     a_ptrs,
