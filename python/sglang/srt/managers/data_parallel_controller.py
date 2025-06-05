@@ -257,7 +257,11 @@ class DataParallelController:
                     self.workers
                 )
         else:
-            self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+            if req.data_parallel_rank is not None:
+                logger.info(f"[DISAGG] Direct routing to DP rank {req.data_parallel_rank}")
+                self.workers[req.data_parallel_rank].send_pyobj(req)
+            else:
+                self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, input_requests):
         raise NotImplementedError()
