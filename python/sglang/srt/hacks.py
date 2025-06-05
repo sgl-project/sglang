@@ -131,10 +131,6 @@ def _requant_grouped_moe_weight(
 
     *_, n, k = weight.shape
 
-    print(
-        f"requant_grouped_moe_weight {weight.shape=} {weight.dtype=} {weight_scale_inv.shape=} {weight_scale_inv.dtype=}"
-    )
-
     weight_dequant = block_quant_dequant(
         weight,
         weight_scale_inv,
@@ -159,7 +155,15 @@ def _requant_grouped_moe_weight(
     out_w = out_w_flat.view(weight.shape)
     out_s = out_s_flat.view(weight_scale_inv.shape)
 
-    out_s = deep_gemm.utils.layout.transform_sf_into_required_layout(out_s)
+    out_s = _transform_scale(out_s)
+
+    print(
+        f"requant_grouped_moe_weight "
+        f"{weight.shape=} {weight.dtype=} "
+        f"{weight_scale_inv.shape=} {weight_scale_inv.dtype=} "
+        f"{out_w.shape=} {out_w.dtype=} "
+        f"{out_s.shape=} {out_s.dtype=} "
+    )
 
     return out_w, out_s
 
