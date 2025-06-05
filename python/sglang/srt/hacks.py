@@ -79,11 +79,13 @@ def hack_requant_moe_weight_at_post_load_weights(that):
             _requant_grouped_moe_weight_inplace(that, w[0], w[1])
 
     for layer_id in trange(that.config.num_hidden_layers):
-        self_attn = that.model.layers[layer_id].self_attn
+        layer = that.model.layers[layer_id]
         # print([(name, param.shape, param.dtype) for name, param in self_attn.named_parameters()])
         for module in [
-            self_attn.q_b_proj,
-            self_attn.o_proj,
+            layer.self_attn.q_b_proj,
+            layer.self_attn.o_proj,
+            layer.shared_experts.gate_up_proj,
+            layer.shared_experts.down_proj,
         ]:
             _requant_grouped_moe_weight_inplace(that, module.weight, module.weight_scale_inv)
 
