@@ -1,10 +1,10 @@
 from typing import Tuple
 
 import torch
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
-from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from tqdm import trange
 
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 
 # def hack_requant_moe_weight(that, weights):
 #     print("hi hack_requant_moe_weight")
