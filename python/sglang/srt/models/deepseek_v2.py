@@ -1697,10 +1697,17 @@ class DeepseekV2ForCausalLM(nn.Module):
                 or self.config.n_routed_experts != 256
             ):
                 self.num_fused_shared_experts = 0
-                global_server_args_dict["disable_shared_experts_fusion"] = 1
+                global_server_args_dict["disable_shared_experts_fusion"] = True
                 log_info_on_rank0(
                     logger,
                     "Only Deepseek V3/R1 on NV-platform can use shared experts fusion optimization. Shared experts fusion optimization is disabled.",
+                )
+            elif (global_server_args_dict["enable_deepep_moe"] or global_server_args_dict["enable_ep_moe"]):
+                self.num_fused_shared_experts = 0
+                global_server_args_dict["disable_shared_experts_fusion"] = True
+                log_info_on_rank0(
+                    logger,
+                    "Deepseek V3/R1 can not use shared experts fusion optimization when in deepep_moe or ep_moe mode. Shared experts fusion optimization is disabled.",
                 )
         elif self.num_fused_shared_experts == 0:
             if (
@@ -1716,7 +1723,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
             ):
                 self.num_fused_shared_experts = self.config.n_shared_experts
-                global_server_args_dict["disable_shared_experts_fusion"] = 0
+                global_server_args_dict["disable_shared_experts_fusion"] = False
                 log_info_on_rank0(
                     logger,
                     "Deepseek V3/R1 with fp8 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled.",
