@@ -2,7 +2,6 @@ from typing import Callable, List, Optional, Tuple
 
 import einops
 import torch
-
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 
 try:
@@ -228,7 +227,9 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     dtype_supported = output_dtype == torch.bfloat16
 
     # TODO: add more robust shape check here
-    shape_supported = weight.shape[0] % 128 == 0 and weight.shape[1] % 128 == 0
+    # shape_supported = weight.shape[0] % 128 == 0 and weight.shape[1] % 128 == 0
+    # NOTE MODIFIED
+    shape_supported = True
 
     if not (shape_supported and dtype_supported):
         # fall back to triton
@@ -308,6 +309,7 @@ def triton_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    raise Exception("why come to triton_w8a8_block_fp8_linear")
     assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
@@ -365,8 +367,8 @@ def block_quant_to_tensor_quant(
     x_dq_block_tiles = [
         [
             x_dq_block[
-                j * block_n : min((j + 1) * block_n, n),
-                i * block_k : min((i + 1) * block_k, k),
+            j * block_n: min((j + 1) * block_n, n),
+            i * block_k: min((i + 1) * block_k, k),
             ]
             for i in range(k_tiles)
         ]
