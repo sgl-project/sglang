@@ -11,24 +11,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==========================582====================================================
-import dataclasses
-from typing import Any, Iterable, List, Optional, Set, Tuple, Union
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/7f62077af5159c625fe3ad1c812e6c1a2b93ba3b/vllm/model_executor/models/internlm2.py
 # Adapted from https://raw.githubusercontent.com/hehesangsj/sglang/refs/heads/internvl/python/sglang/srt/models/internvl.py
 import torch.nn.functional as F
-from sgl_kernel.flash_attn import flash_attn_varlen_func
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 
-from sglang.srt.layers.attention.vision import (
-    VisionAttention,
-    _get_cu_seqlens_for_shape,
-)
+from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
@@ -299,11 +294,7 @@ class InternVisionEncoder(nn.Module):
         encoder_states = () if output_hidden_states else None
         hidden_states = inputs_embeds
 
-        cu_seqlens = _get_cu_seqlens_for_shape(
-            batch_size=hidden_states.shape[0],
-            seqlen=hidden_states.shape[1],
-            device=hidden_states.device,
-        )
+        cu_seqlens = SingletonCache()
 
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:

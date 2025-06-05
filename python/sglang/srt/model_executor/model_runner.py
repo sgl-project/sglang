@@ -77,11 +77,7 @@ from sglang.srt.model_executor import expert_location_updater
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
-from sglang.srt.model_loader.loader import (
-    DefaultModelLoader,
-    device_loading_context,
-    get_model_loader,
-)
+from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
@@ -349,7 +345,7 @@ class ModelRunner:
                 else:
                     server_args.attention_backend = "triton"
             logger.info(
-                f"Attention backend not set. Use {server_args.attention_backend} backend by default."
+                f"Attention backend not explicitly specified. Use {server_args.attention_backend} backend by default."
             )
         elif self.use_mla_backend:
             if server_args.device != "cpu":
@@ -393,16 +389,70 @@ class ModelRunner:
             self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
         if self.is_multimodal:
-            self.mem_fraction_static *= 0.90
-            logger.info(
-                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} "
-                f"because this is a multimodal model."
-            )
             if not self.is_multimodal_chunked_prefill_supported:
                 server_args.chunked_prefill_size = -1
                 logger.info(
-                    f"Automatically turn of --chunked-prefill-size as it is not supported for "
+                    f"Automatically turn off --chunked-prefill-size as it is not supported for "
                     f"{self.model_config.hf_config.model_type}"
+                )
+
+            # roughly reduce the mem_fraction_static base on params of Vit
+            original_server_arg_mem_fraction = self.mem_fraction_static
+            # a base mem_fraction_static factor for regular Vit
+            base_mem_fraction_reduction_ratio = 0.90
+            try:
+                if (
+                    hasattr(self.model_config.hf_config, "vision_config")
+                    and self.model_config.hf_config.vision_config is not None
+                ):
+                    vision_config = self.model_config.hf_config.vision_config
+
+                    vit_num_layers = getattr(vision_config, "num_hidden_layers", 24)
+                    vit_hidden_size = getattr(vision_config, "hidden_size", 1024)
+
+                    # baseline ViT params (ViT-L/14)
+                    baseline_vit_layers = 24
+                    baseline_vit_hidden_size = 1024
+
+                    # weight params count
+                    current_complexity_score = vit_num_layers * (vit_hidden_size**2)
+                    baseline_complexity_score = baseline_vit_layers * (
+                        baseline_vit_hidden_size**2
+                    )
+                    complexity_ratio = (
+                        current_complexity_score / baseline_complexity_score
+                        if baseline_complexity_score > 0
+                        else 1.0
+                    )
+
+                    # everytime the complexity grows 100%, adjust final factor for 5%
+                    sensitivity_scale = 0.05
+                    dynamic_adjustment_factor = 1.0 - sensitivity_scale * (
+                        complexity_ratio - 1.0
+                    )
+
+                    dynamic_adjustment_factor = max(
+                        0.8, min(1.05, dynamic_adjustment_factor)
+                    )
+
+                    final_overall_factor = (
+                        base_mem_fraction_reduction_ratio * dynamic_adjustment_factor
+                    )
+                    self.mem_fraction_static = (
+                        original_server_arg_mem_fraction * final_overall_factor
+                    )
+
+                    logger.info(
+                        f"Multimodal model: Dynamically adjusted --mem-fraction-static "
+                        f"from: {original_server_arg_mem_fraction:.3f} to: {self.mem_fraction_static:.3f}."
+                    )
+            finally:
+                self.mem_fraction_static = (
+                    original_server_arg_mem_fraction * base_mem_fraction_reduction_ratio
+                )
+                logger.info(
+                    f"Multimodal model: No detailed vision_config, fixed adjusted --mem-fraction-static "
+                    f"from: {original_server_arg_mem_fraction:.3f} to: {self.mem_fraction_static:.3f}."
                 )
 
         if not self.use_mla_backend:

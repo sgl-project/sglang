@@ -65,7 +65,7 @@ def _get_cu_seqlens_for_shape(batch_size: int, seqlen: int, device) -> torch.Ten
         step=seqlen,
         dtype=torch.int32,
         device=device,
-    )
+        )
     return cu_seqlens
 
 
@@ -298,8 +298,9 @@ class VisionFlash3Attention(nn.Module):
                 cu_seqlens.set_data(
                     _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
                 )
+            cu_seqlens = cu_seqlens.get_data()
 
-        cu_seqlens = cu_seqlens.to(dtype=torch.int32).cuda()
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
         output = flash_attn_varlen_func(
