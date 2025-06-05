@@ -118,7 +118,9 @@ def hack_requant_moe_weight_at_post_load_weights(that):
 
 
 def _requant_grouped_moe_weight_inplace(that, weight, weight_scale_inv):
-    weight[...], weight_scale_inv[...] = _requant_grouped_moe_weight(
+    assert isinstance(weight, torch.nn.Parameter)
+    assert isinstance(weight_scale_inv, torch.nn.Parameter)
+    weight.data, weight_scale_inv.data = _requant_grouped_moe_weight(
         that, weight, weight_scale_inv
     )
 
@@ -159,6 +161,7 @@ def _requant_grouped_moe_weight(
 
     print(
         f"requant_grouped_moe_weight "
+        f"{type(weight)=} {type(weight_scale_inv)=} "
         f"{weight.shape=} {weight.dtype=} "
         f"{weight_scale_inv.shape=} {weight_scale_inv.dtype=} "
         f"{out_w.shape=} {out_w.dtype=} "
