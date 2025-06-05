@@ -3,18 +3,17 @@ from typing import Callable, List, Optional, Tuple
 
 import einops
 import torch
-from torch.nn import Module
-
 from sglang.srt import debug_utils
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from torch.nn import Module
 
 try:
     from deep_gemm import fp8_m_grouped_gemm_nt_masked, m_grouped_fp8_gemm_nt_contiguous
 
-    print("hi use deep_gemm new version")
+    print("hi layer.py use deep_gemm new version")
 except ImportError:
     from deep_gemm import (
         m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
@@ -23,7 +22,7 @@ except ImportError:
 
     m_grouped_fp8_gemm_nt_contiguous = m_grouped_gemm_fp8_fp8_bf16_nt_contiguous
     fp8_m_grouped_gemm_nt_masked = m_grouped_gemm_fp8_fp8_bf16_nt_masked
-    print("hi use deep_gemm old version")
+    print("hi layer.py use deep_gemm old version")
 
 try:
     from sgl_kernel import silu_and_mul
@@ -337,7 +336,7 @@ class EPMoE(torch.nn.Module):
             )
             self.w13_input_scale = scale
 
-        seg_indptr_cur_rank = seg_indptr[self.start_expert_id : self.end_expert_id + 2]
+        seg_indptr_cur_rank = seg_indptr[self.start_expert_id: self.end_expert_id + 2]
         weight_indices_cur_rank = torch.arange(
             0,
             self.num_experts_per_partition,
@@ -549,7 +548,7 @@ class EPMoE(torch.nn.Module):
         elif shard_id == "w1":
             param.data[expert_id][: self.intermediate_size, :] = loaded_weight
         elif shard_id == "w3":
-            param.data[expert_id][self.intermediate_size :, :] = loaded_weight
+            param.data[expert_id][self.intermediate_size:, :] = loaded_weight
         else:
             raise ValueError(f"Expected shard_id w1,w2 or w3 but got {shard_id}")
 
@@ -582,11 +581,11 @@ class EPMoE(torch.nn.Module):
                 block_n, block_k = self.block_shape[0], self.block_shape[1]
                 if shard_id == "w1":
                     param_data[expert_id][
-                        : (self.intermediate_size + block_n - 1) // block_n, :
+                    : (self.intermediate_size + block_n - 1) // block_n, :
                     ] = loaded_weight
                 elif shard_id == "w3":
                     param_data[expert_id][
-                        (self.intermediate_size + block_n - 1) // block_n :, :
+                    (self.intermediate_size + block_n - 1) // block_n:, :
                     ] = loaded_weight
                 else:  # w2
                     param_data[expert_id] = loaded_weight

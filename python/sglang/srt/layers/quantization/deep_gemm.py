@@ -6,10 +6,9 @@ from enum import IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-from tqdm.contrib.concurrent import thread_map
-
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var, get_device_sm, get_int_env_var, is_cuda
+from tqdm.contrib.concurrent import thread_map
 
 logger = logging.getLogger(__name__)
 # _ENABLE_JIT_DEEPGEMM = False
@@ -28,6 +27,16 @@ logger = logging.getLogger(__name__)
 #             _ENABLE_JIT_DEEPGEMM = True
 # except ImportError:
 #     logger.warning("Failed to import deepgemm, disable _ENABLE_JIT_DEEPGEMM.")
+
+
+try:
+    from deep_gemm import fp8_gemm_nt as deep_gemm_fp8_gemm_nt
+
+    print("hi deep_gemm.py use deep_gemm new version")
+except ImportError:
+    from deep_gemm import gemm_fp8_fp8_bf16_nt as deep_gemm_fp8_gemm_nt
+
+    print("hi deep_gemm.py use deep_gemm old version")
 
 _ENABLE_JIT_DEEPGEMM = True
 
@@ -368,7 +377,8 @@ def gemm_nt_f8f8bf16(
     _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, 1)
 
     with _log_jit_build(m, n, k, kernel_type):
-        deep_gemm.gemm_fp8_fp8_bf16_nt(lhs, rhs, out)
+        # deep_gemm.gemm_fp8_fp8_bf16_nt(lhs, rhs, out)
+        deep_gemm_fp8_gemm_nt(lhs, rhs, out)
 
 
 @contextmanager
