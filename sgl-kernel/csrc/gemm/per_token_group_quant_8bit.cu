@@ -84,7 +84,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   }
 
   if (lane_id == 0) {
-    *scale_output = y_s;
+    *scale_output = y_s_quant;
   }
 
   for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
