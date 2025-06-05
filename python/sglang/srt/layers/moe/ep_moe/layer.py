@@ -180,7 +180,9 @@ class EPMoE(torch.nn.Module):
         self.layer_id = layer_id
         self.num_experts = num_experts
         assert self.num_experts % self.tp_size == 0
-        assert num_fused_shared_experts == 0, "num_fused_shared_experts is not supported in EP"
+        assert (
+            num_fused_shared_experts == 0
+        ), "num_fused_shared_experts is not supported in EP"
         self.num_experts_per_partition = self.num_experts // self.tp_size
         self.start_expert_id = self.tp_rank * self.num_experts_per_partition
         self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1
