@@ -383,14 +383,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "   bool causal) -> ()");
   m.impl("convert_vertical_slash_indexes_mergehead", torch::kCUDA, &convert_vertical_slash_indexes_mergehead);
 
-  m.def(
-      "topk_to_uint64("
-      "   Tensor! topk_idx, "
-      "   Tensor! result, int batch_size, "
-      "   int k, int k_blocks, "
-      "   int n_uint64_per_row, int cuda_stream) -> ()");
-  m.impl("topk_to_uint64", torch::kCUDA, &topk_to_uint64);
-
   /*
    * From XGrammar
    */

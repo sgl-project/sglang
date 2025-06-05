@@ -636,24 +636,6 @@ void convert_vertical_slash_indexes_mergehead(
     int64_t block_size_N,
     bool causal);
 
-void topk_to_uint64_func(
-    at::Tensor& topk_idx,      // Input topk indices
-    at::Tensor& result,        // Output uint64 array
-    int64_t batch_size,        // Total number of rows (flattened batch dimensions)
-    int64_t k,                 // Number of topk values per row
-    int64_t k_blocks,          // Number of key blocks
-    int64_t n_uint64_per_row,  // Number of uint64 needed per row
-    int64_t cuda_stream = 0);
-
-void topk_to_uint64(
-    at::Tensor& topk_idx,      // Input topk indices
-    at::Tensor& result,        // Output uint64 array
-    int64_t batch_size,        // Total number of rows (flattened batch dimensions)
-    int64_t k,                 // Number of topk values per row
-    int64_t k_blocks,          // Number of key blocks
-    int64_t n_uint64_per_row,  // Number of uint64 needed per row
-    int64_t cuda_stream = 0);
-
 /*
  * From XGrammar
  */
