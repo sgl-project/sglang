@@ -73,12 +73,12 @@ def hack_requant_moe_weight_at_post_load_weights(that):
     for layer_id in tqdm(moe_layers):
         experts = that.model.layers[layer_id].mlp.experts
         assert isinstance(experts, DeepEPMoE)
-        _requant_grouped_moe_weight_inplace(that, *experts.w13_weight_fp8)
+        _requant_grouped_moe_weight_inplace(that, experts.w13_weight_fp8)
         _requant_grouped_moe_weight_inplace(that, experts.w2_weight_fp8)
 
     for layer_id in trange(that.config.num_hidden_layers):
         self_attn = that.model.layers[layer_id].self_attn
-        _requant_grouped_moe_weight_inplace(that, *self_attn.q_b_proj)
+        _requant_grouped_moe_weight_inplace(that, self_attn.q_b_proj)
 
 
 def _requant_grouped_moe_weight_inplace(that, w_fp8):
