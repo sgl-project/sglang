@@ -1,6 +1,5 @@
 from typing import Tuple
 
-import einops
 import torch
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
@@ -78,7 +77,7 @@ def hack_requant_moe_weight_at_post_load_weights(that):
 
     for layer_id in trange(that.config.num_hidden_layers):
         self_attn = that.model.layers[layer_id].self_attn
-        _requant_grouped_moe_weight_inplace(that, self_attn.q_b_proj)
+        _requant_grouped_moe_weight_inplace(that, self_attn.q_b_proj.weight)
 
 
 def _requant_grouped_moe_weight_inplace(that, w_fp8):
@@ -91,7 +90,7 @@ def _requant_grouped_moe_weight(
     weight_block_size = that.quant_config.weight_block_size
     assert weight_block_size == [128, 128]
 
-    num_group, n, k = weight.shape
+    *_, n, k = weight.shape
 
     print(
         f"requant_grouped_moe_weight {weight.shape=} {weight.dtype=} {weight_scale_inv.shape=} {weight_scale_inv.dtype=}"
@@ -107,9 +106,8 @@ def _requant_grouped_moe_weight(
 
     assert n % 128 == 0
     assert k % 128 == 0
-    weight_dequant_flat = einops.rearrange(
-        weight_dequant, "num_group n k -> (num_group n) k"
-    )
+    # weight_dequant_flat = einops.rearrange(weight_dequant, "num_group n k -> (num_group n) k")
+    weight_dequant_flat = weight_dequant.view((-1, k))
     out_w_flat, out_s_flat = per_block_cast_to_fp8(weight_dequant_flat)
 
     # def _unflatten(x):
