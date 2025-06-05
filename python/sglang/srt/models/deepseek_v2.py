@@ -321,13 +321,13 @@ class DeepseekV2MoE(nn.Module):
                     else {}
                 ),
             )
-            if self.shared_experts.gate_up_proj.weight.dtype == torch.int8:
-                assert self.shared_experts.down_proj.weight.dtype == torch.int8
-                self.shared_experts_is_int8 = True
-
-            if self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn:
-                assert self.shared_experts.down_proj.weight.dtype == torch.float8_e4m3fn
-
+            self.shared_experts_is_int8 = (
+                self.shared_experts.gate_up_proj.weight.dtype == torch.int8
+            )
+            self.shared_experts_is_fp8 = (
+                self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+            )
+            if self.shared_experts_is_fp8:
                 assert (
                     self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
                     == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
@@ -335,8 +335,6 @@ class DeepseekV2MoE(nn.Module):
                 self.shared_experts_weight_block_size = (
                     self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
                 )
-
-                self.shared_experts_is_fp8 = True
 
         self.top_k = config.num_experts_per_tok
 
@@ -437,7 +435,6 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_cpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # TODO: the below 2 lines are not on main. Check if can be removed
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
