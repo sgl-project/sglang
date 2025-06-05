@@ -84,8 +84,8 @@ def hack_requant_moe_weight_at_post_load_weights(that):
         for module in [
             layer.self_attn.q_b_proj,
             layer.self_attn.o_proj,
-            layer.shared_experts.gate_up_proj,
-            layer.shared_experts.down_proj,
+            layer.mlp.shared_experts.gate_up_proj,
+            layer.mlp.shared_experts.down_proj,
         ]:
             _requant_grouped_moe_weight_inplace(that, module.weight, module.weight_scale_inv)
 
