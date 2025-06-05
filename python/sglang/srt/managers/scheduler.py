@@ -24,6 +24,7 @@ from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -2285,6 +2286,9 @@ class Scheduler(
                 success=False,
                 message="Profiling is not in progress. Call /start_profile first.",
             )
+
+        if not Path(self.torch_profiler_output_dir).exists():
+            Path(self.torch_profiler_output_dir).mkdir(parents=True, exist_ok=True)
 
         stage_suffix = f"-{stage.__str__()}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
