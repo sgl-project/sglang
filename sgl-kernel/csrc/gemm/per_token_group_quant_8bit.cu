@@ -72,7 +72,8 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   float y_s = local_absmax / max_8bit;
   if constexpr (SCALE_UE8M0) {
-    y_s = exp2f(ceilf(log2f(fmaxf(fabsf(y_s), 1e-10f))));;
+    y_s = exp2f(ceilf(log2f(fmaxf(fabsf(y_s), 1e-10f))));
+    ;
   }
 
   if (lane_id == 0) {
