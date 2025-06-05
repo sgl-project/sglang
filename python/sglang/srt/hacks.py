@@ -84,7 +84,7 @@ def hack_requant_moe_weight_at_post_load_weights(that):
         for module in [
             self_attn.q_b_proj,
         ]:
-            _requant_grouped_moe_weight_inplace(that, module.weight, module.weight_scale)
+            _requant_grouped_moe_weight_inplace(that, module.weight, module.weight_scale_inv)
 
 
 def _requant_grouped_moe_weight_inplace(that, weight, weight_scale_inv):
