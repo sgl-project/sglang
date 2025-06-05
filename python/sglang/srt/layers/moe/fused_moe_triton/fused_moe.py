@@ -1540,6 +1540,7 @@ def fused_moe(
     activation: str = "silu",
     use_grouped_topk: bool = False,
     num_expert_group: Optional[int] = None,
+    num_fused_shared_experts: int = 0,
     topk_group: Optional[int] = None,
     custom_routing_function: Optional[Callable] = None,
     use_fp8_w8a8: bool = False,
@@ -1609,6 +1610,7 @@ def fused_moe(
         renormalize=renormalize,
         topk_group=topk_group,
         num_expert_group=num_expert_group,
+        num_fused_shared_experts=num_fused_shared_experts,
         custom_routing_function=custom_routing_function,
         routed_scaling_factor=routed_scaling_factor,
     )
