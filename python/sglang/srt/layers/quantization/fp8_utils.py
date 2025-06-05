@@ -244,7 +244,8 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     )
 
     if get_bool_env_var("SGLANG_HACK_W8A8_DEEPGEMM_EXTRA_SANITY_CHECK"):
-        TODO
+        _sanity_check_scale(x_scale, "x_scale")
+        _sanity_check_scale(weight_scale, "weight_scale")
 
     output = w8a8_block_fp8_matmul_deepgemm(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
@@ -252,6 +253,11 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
+
+
+def _sanity_check_scale(name, x):
+    x_ceil = _ceil_to_ue8m0(x)
+    assert torch.all(x == x_ceil), f"{name=} {x=} {x_ceil=}"
 
 
 # COPIED FROM DEEPGEMM
