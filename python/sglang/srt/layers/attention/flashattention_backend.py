@@ -626,9 +626,6 @@ class FlashAttentionBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
-        is_sparse: Optional[bool] = False,
-        block_window_size: Optional[int] = None,
-        topk_idx: Optional[torch.Tensor] = None,
     ):
         if k is not None:
             assert v is not None
@@ -717,43 +714,23 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
-            if is_sparse:
-                from flash_attn import flash_attn_varlen_func
-
-                result = flash_attn_varlen_func(
-                    q,
-                    k,
-                    v,
-                    cu_seqlens_q,
-                    cu_seqlens_k,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    dropout_p=0.0,
-                    deterministic=False,
-                    softmax_scale=None,
-                    causal=True,
-                    return_attn_probs=False,
-                    block_window_size=block_window_size,
-                    topk_idx=topk_idx,
-                )
-            else:
-                result = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
-                    max_seqlen_q=max_seqlen_q,
-                    softmax_scale=layer.scaling,
-                    causal=False if use_cascade_attn else causal,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    return_softmax_lse=use_cascade_attn,
-                )
+            result = flash_attn_with_kvcache(
+                q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                k_cache=key_cache,
+                v_cache=value_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                max_seqlen_q=max_seqlen_q,
+                softmax_scale=layer.scaling,
+                causal=False if use_cascade_attn else causal,
+                window_size=window_size,
+                softcap=layer.logit_cap,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                return_softmax_lse=use_cascade_attn,
+            )
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -912,9 +889,6 @@ class FlashAttentionBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
-        is_sparse: Optional[bool] = False,
-        blockmask: Optional[torch.Tensor] = None,
-        block_window_size: Optional[int] = None,
     ) -> torch.Tensor:
         if k is not None:
             assert v is not None
@@ -1027,95 +1001,25 @@ class FlashAttentionBackend(AttentionBackend):
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
-                bsz = q.shape[0]
 
-                if is_sparse:
-                    import flash_attn_2_cuda as flash_attn_gpu
-
-                    # unsqueeze the batch dim
-                    k = k.unsqueeze(0)
-                    v = v.unsqueeze(0)
-                    key_cache = key_cache[
-                        forward_batch.out_cache_loc
-                        - forward_batch.seq_lens_sum
-                        + 1 : forward_batch.out_cache_loc,
-                        :,
-                    ].view(1, -1, layer.tp_k_head_num, layer.head_dim)
-                    value_cache = value_cache[
-                        forward_batch.out_cache_loc
-                        - forward_batch.seq_lens_sum
-                        + 1 : forward_batch.out_cache_loc,
-                        :,
-                    ].view(1, -1, layer.tp_k_head_num, layer.head_dim)
-
-                    # from sgl_kernel.flash_attn import flash_attn_varlen_func
-                    # topk_attn_output = flash_attn_varlen_func(
-                    #     q,
-                    #     k,
-                    #     v,
-                    #     cu_seqlens_q,
-                    #     cu_seqlens_k,
-                    #     max_seqlen_in_batch_q,
-                    #     max_seqlen_in_batch_k,
-                    #     # dropout_p=0.0,
-                    #     # deterministic=False,
-                    #     softmax_scale=None,
-                    #     causal=True,
-                    #     # return_attn_probs=False,
-                    #     # TODO: we dont have these two params in sgl-kernel
-                    #     # block_window_size=self.window_size // self.block_size,
-                    #     # topk_idx=topk_idx
-                    # )
-
-                    # TODO: handle the in-place update of key_cache & v_cache
-                    result, _softmax_lse = flash_attn_gpu.fwd_kvcache(
-                        q,
-                        # use the history key and value
-                        # k_cache,
-                        # v_cache,
-                        key_cache,
-                        value_cache,
-                        k,
-                        v,
-                        cache_seqlens - 1,
-                        None,  # rotary_cos
-                        None,
-                        torch.arange(
-                            bsz, device=q.device, dtype=torch.int32
-                        ),  # cache_batch_idx,
-                        None,  # cache_leftpad,
-                        None,
-                        None,  # alibi_slopes,
-                        None,
-                        layer.scaling,
-                        False,  # causal,
-                        window_size[0],
-                        window_size[1],
-                        layer.logit_cap,
-                        True,
-                        0,
-                        blockmask,
-                        block_window_size,
-                    )
-                else:
-                    # Default: single-token self-attention
-                    result = flash_attn_with_kvcache(
-                        q=q_reshaped,
-                        k_cache=key_cache,
-                        v_cache=value_cache,
-                        page_table=page_table,
-                        cache_seqlens=cache_seqlens,
-                        cu_seqlens_q=metadata.cu_seqlens_q,
-                        cu_seqlens_k_new=cu_seqlens_k,
-                        max_seqlen_q=max_seqlen_q,
-                        softmax_scale=layer.scaling,
-                        causal=False if use_cascade_attn else causal,
-                        window_size=window_size,
-                        softcap=layer.logit_cap,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                        return_softmax_lse=use_cascade_attn,
-                    )
+                # Default: single-token self-attention
+                result = flash_attn_with_kvcache(
+                    q=q_reshaped,
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=metadata.cu_seqlens_q,
+                    cu_seqlens_k_new=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=use_cascade_attn,
+                )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
