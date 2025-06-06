@@ -448,7 +448,7 @@ class VisionAttention(nn.Module):
             # [s, b, embed_dim] --> [s, b, head * 3 * head_size]
             qkv, _ = self.qkv_proj(x)
 
-            # [s, b, head * 3 * head_size] --> [s, b, head, 3 * head_size]
+            # [s, b, head, head_dim_sum]
             new_x_shape = qkv.size()[:-1] + (
                 head,
                 self.q_size + 2 * self.kv_size,
