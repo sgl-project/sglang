@@ -26,7 +26,10 @@ import os
 import threading
 import time
 from http import HTTPStatus
+from json import JSONDecodeError
 from typing import AsyncIterator, Callable, Dict, Optional
+
+from pydantic import ValidationError
 
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
@@ -72,6 +75,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.openai_api.adapter import (
+    create_error_response,
     v1_batches,
     v1_cancel_batch,
     v1_chat_completions,
@@ -147,6 +151,27 @@ app.add_middleware(
 )
 
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
+
+
+@app.exception_handler(ValidationError)
+@app.exception_handler(JSONDecodeError)
+async def validation_exception_handler(
+    request: Request, exc: ValidationError
+) -> Response:
+    return create_error_response(
+        message=str(exc),
+        err_type="BadRequestError",
+        status_code=HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.exception_handler(Exception)
+async def exception_handler(request: Request, exc: Exception) -> Response:
+    return create_error_response(
+        message=str(exc),
+        err_type="InternalServerError",
+        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+    )
 
 
 ##### Native API endpoints #####
