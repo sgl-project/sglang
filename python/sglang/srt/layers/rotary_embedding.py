@@ -120,16 +120,6 @@ class RotaryEmbedding(CustomOp):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
-    def forward(self, *args, **kwargs):
-        if torch.compiler.is_compiling():
-            return self.forward_native(*args, **kwargs)
-        if _is_cuda:
-            return self.forward_cuda(*args, **kwargs)
-        elif _is_cpu_amx:
-            return self.forward_cpu(*args, **kwargs)
-        else:
-            return self.forward_native(*args, **kwargs)
-
     def forward_native(
         self,
         positions: torch.Tensor,

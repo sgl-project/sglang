@@ -21,8 +21,9 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.utils import is_cuda, set_weight_attrs
 
 _is_cuda = is_cuda()
+_is_cpu_amx = cpu_has_amx_support()
 
-if not _is_cuda and not cpu_has_amx_support():
+if not _is_cuda and not _is_cpu_amx:
     from vllm import _custom_ops as vllm_ops
     from vllm._custom_ops import scaled_fp8_quant
 
