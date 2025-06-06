@@ -1233,7 +1233,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.q_lora_rank is not None and self.use_intel_amx_backend
         ), "forward_absorb_fused_mla_rope_cpu_prepare requires q_lora_rank is not None and use_intel_amx_backend"
 
-        q_input, k_input, v_input = torch.ops.sgl_kernel.qkv_proj_with_rope(
+        q_input, k_input, v_input = torch.ops.sgl_kernel.fused_qkv_proj_with_rope(
             hidden_states,
             self.fused_qkv_a_proj_with_mqa.weight,
             self.q_b_proj.weight,
