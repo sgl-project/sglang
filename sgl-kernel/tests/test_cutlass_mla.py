@@ -40,15 +40,21 @@ def ref_mla(
 @pytest.mark.parametrize("bs", [1, 2, 4])
 @pytest.mark.parametrize("varlen", [False, True])
 @pytest.mark.parametrize("block_size", [1, 16, 64, 128])
+@pytest.mark.parametrize("num_heads", [128])
 def test_cutlass_mla_decode(
-    dtype: torch.dtype, mean_seq_len: int, bs: int, varlen: bool, block_size: int
+    dtype: torch.dtype,
+    mean_seq_len: int,
+    bs: int,
+    varlen: bool,
+    block_size: int,
+    num_heads: int,
 ):
     torch.set_default_dtype(dtype)
     torch.set_default_device("cuda")
     torch.manual_seed(42)
 
     d = 576
-    h_q = 128
+    h_q = num_heads
     dv = 512
 
     q_nope_dim = 128

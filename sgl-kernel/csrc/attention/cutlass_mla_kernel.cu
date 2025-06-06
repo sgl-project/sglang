@@ -22,8 +22,9 @@ limitations under the License.
 #include <torch/all.h>
 
 #include <cute/tensor.hpp>
-#include <device/sm100_mla.hpp>
-#include <kernel/sm100_mla_tile_scheduler.hpp>
+
+#include "cultass_sm100_mla/device/sm100_mla.hpp"
+#include "cultass_sm100_mla/kernel/sm100_mla_tile_scheduler.hpp"
 
 // clang-format off
 #if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
@@ -55,13 +56,13 @@ struct IsPersistent {
   static const bool value = v;
 };
 
-template <typename T, typename PersistenceOption = IsPersistent<true>>
+template <typename T, typename NumHeads, typename PersistenceOption = IsPersistent<true>>
 struct MlaSm100 {
   using Element = T;
   using ElementAcc = float;
   using ElementOut = T;
 
-  using TileShape = Shape<_128, _128, Shape<_512, _64>>;
+  using TileShape = Shape<NumHeads, _128, Shape<_512, _64>>;
   using TileShapeH = cute::tuple_element_t<0, TileShape>;
   using TileShapeD = cute::tuple_element_t<2, TileShape>;
 
@@ -165,7 +166,7 @@ typename T::Fmha::Arguments args_from_options(
   return arguments;
 }
 
-template <typename Element>
+template <typename Element, typename NumHeads>
 void runMla(
     at::Tensor const& out,
     at::Tensor const& q_nope_and_q_pe,
@@ -174,7 +175,7 @@ void runMla(
     at::Tensor const& page_table,
     at::Tensor const& workspace,
     cudaStream_t stream) {
-  using MlaSm100Type = MlaSm100<Element>;
+  using MlaSm100Type = MlaSm100<Element, NumHeads>;
   typename MlaSm100Type::Fmha fmha;
   auto arguments = args_from_options<MlaSm100Type>(out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table);
 
@@ -195,21 +196,36 @@ void cutlass_mla_decode(
   auto in_dtype = q_nope_and_q_pe.dtype();
   at::cuda::CUDAGuard device_guard{(char)q_nope_and_q_pe.get_device()};
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q_nope_and_q_pe.get_device());
-  if (in_dtype == at::ScalarType::Half) {
-    runMla<cutlass::half_t>(out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, stream);
-  } else if (in_dtype == at::ScalarType::BFloat16) {
-    runMla<cutlass::bfloat16_t>(out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, stream);
-  } else if (in_dtype == at::ScalarType::Float8_e4m3fn) {
-    runMla<cutlass::float_e4m3_t>(out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, stream);
+  const int32_t num_heads = out.size(1);
+
+#define RUN_NUM_HEADS(NUM_HEADS) \
+  if (in_dtype == at::ScalarType::Half) { \
+    runMla<cutlass::half_t, NUM_HEADS>(out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, stream); \
+  } else if (in_dtype == at::ScalarType::BFloat16) { \
+    runMla<cutlass::bfloat16_t, NUM_HEADS>(out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, stream); \
+  } else if (in_dtype == at::ScalarType::Float8_e4m3fn) { \
+    runMla<cutlass::float_e4m3_t, NUM_HEADS>(out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, stream); \
+  } else { \
+    TORCH_CHECK(false, "Unsupported input data type of MLA"); \
+  }
+
+  if (num_heads == 128) {
+    RUN_NUM_HEADS(_128)
+  // } else if (num_heads == 64) {
+  //   RUN_NUM_HEADS(_64)
+  // } else if (num_heads == 32) {
+  //   RUN_NUM_HEADS(_32)
+  // } else if (num_heads == 16) {
+  //   RUN_NUM_HEADS(_16)
   } else {
-    TORCH_CHECK(false, "Unsupported input data type of MLA");
+    TORCH_CHECK(false, "Unsupported num_heads of MLA");
   }
 }
 
 int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count) {
   // Workspace size depends on ElementAcc and ElementLSE (same as ElementAcc)
   // which are float, so Element type here doesn't matter.
-  using MlaSm100Type = MlaSm100<cutlass::half_t>;
+  using MlaSm100Type = MlaSm100<cutlass::half_t, _128>;
 
   // Get split kv. Requires problem shape and sm_count only.
   typename MlaSm100Type::Fmha::Arguments arguments;

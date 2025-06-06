@@ -73,7 +73,7 @@ def cutlass_mla_decode(
         f"D_q must be equal to D_ckv and D_q must be equal to D_latent + D_rope, "
         f"but got D_q = {D_q}, D_ckv = {D_ckv}, D_latent = {D_latent}, D_rope = {D_rope}"
     )
-    assert H == 128, f"H must be 128, but got {H}"
+    assert H in [128, 64, 32, 16], f"H must be in [128, 64, 32, 16], but got {H}"
 
     assert len(page_table.shape) == 2
     B_block_table, block_num = page_table.shape
