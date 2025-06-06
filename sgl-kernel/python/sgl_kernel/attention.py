@@ -73,7 +73,7 @@ def cutlass_mla_decode(
         f"D_q must be equal to D_ckv and D_q must be equal to D_latent + D_rope, "
         f"but got D_q = {D_q}, D_ckv = {D_ckv}, D_latent = {D_latent}, D_rope = {D_rope}"
     )
-    assert H <= 128, f"H <= 128, but got {H}"
+    assert H <= 128, f"H must be <= 128, but got {H}"
     if H < 128:
         q_nope_and_q_pe_padded = q_nope_and_q_pe.new_empty((B_q, 128, D_q))
         q_nope_and_q_pe_padded[:, :H] = q_nope_and_q_pe
