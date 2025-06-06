@@ -106,7 +106,7 @@ class GenerateReqInput:
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
-    # For data parallel rank routing 
+    # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
     def contains_mm_input(self) -> bool:
@@ -420,7 +420,9 @@ class GenerateReqInput:
             bootstrap_room=(
                 self.bootstrap_room[i] if self.bootstrap_room is not None else None
             ),
-            data_parallel_rank=self.data_parallel_rank if self.data_parallel_rank is not None else None,
+            data_parallel_rank=(
+                self.data_parallel_rank if self.data_parallel_rank is not None else None
+            ),
         )
 
 
@@ -468,7 +470,7 @@ class TokenizedGenerateReqInput:
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
 
-    # For data parallel rank routing 
+    # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
 
