@@ -18,15 +18,10 @@
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
 import logging
-from dataclasses import dataclass
-from enum import Enum, auto
-from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
-from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_pp_group,
@@ -198,6 +193,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 top_k=self.top_k,
                 use_grouped_topk=False,
                 renormalize=self.renormalize,
+                num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -265,6 +261,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 top_k=self.top_k,
                 use_grouped_topk=False,
                 renormalize=self.renormalize,
+                num_token_non_padded=state.forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -811,10 +808,11 @@ class Qwen3MoeForCausalLM(nn.Module):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
+        # TODO mimic deepseek
         self.routed_experts_weights_of_layer = {
-            layer_id: layer.mlp.get_moe_weights()
-            for layer_id, layer in enumerate(self.model.layers)
-            if isinstance(layer.mlp, Qwen3MoeSparseMoeBlock)
+            layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+            for layer_id in range(self.start_layer, self.end_layer)
+            if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
         }
 
     @classmethod
