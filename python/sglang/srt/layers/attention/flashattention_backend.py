@@ -813,7 +813,7 @@ class FlashAttentionBackend(AttentionBackend):
 
                 elapsed = start_event.elapsed_time(end_event)
                 capture.report()
-                print(f'layer {layer.layer_id} took {elapsed:.2f} ms')
+                print(f'[fa3] layer {layer.layer_id} took {elapsed:.2f} ms')
         else:
             if (
                 not global_server_args_dict["disable_chunked_prefix_cache"]
