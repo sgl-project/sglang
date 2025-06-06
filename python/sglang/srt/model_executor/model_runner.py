@@ -145,7 +145,9 @@ class ModelRunner:
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
-        main_worker_avail_memory: Optional[float] = None,
+        main_worker_avail_memory: Optional[
+            float
+        ] = None,  # For draft worker: the available memory before main worker model loading
     ):
         # Parse args
         self.model_config = model_config
@@ -178,7 +180,7 @@ class ModelRunner:
         self.attention_chunk_size = model_config.attention_chunk_size
 
         self.forward_pass_id = 0
-
+        self.draft_mem_fraction = 0.15
         # Model-specific adjustment
         self.model_specific_adjustment()
 
@@ -223,11 +225,8 @@ class ModelRunner:
         # Get memory before model loading
         if not self.is_draft_worker:
             self.available_memory = self.init_torch_distributed()
-            if self.server_args.speculative_algorithm is not None:
-                self.available_memory = (
-                    self.available_memory * 0.85
-                )  # reserve 10% for draft worker model and KV pool
         else:
+            self.init_torch_distributed()
             assert main_worker_avail_memory is not None
             self.available_memory = main_worker_avail_memory
 
@@ -840,13 +839,22 @@ class ModelRunner:
                 * torch._utils._element_size(self.kv_cache_dtype)
             )
 
-        rest_memory = available_gpu_memory - total_gpu_memory * (
-            1 - self.mem_fraction_static
+        min_unoccupied_memory = total_gpu_memory * (
+            1
+            - self.mem_fraction_static
+            * (
+                (1 - self.draft_mem_fraction)
+                if (not self.is_draft_worker and not self.spec_algorithm.is_none())
+                else 1
+            )
         )
-        assert (
-            rest_memory > 0
-        ), "No remaining memory available for KV pool. Please try to increase --mem-fraction-static."
-        max_num_token = int(rest_memory * (1 << 30) // cell_size)
+        usable_memory = available_gpu_memory - min_unoccupied_memory
+        msg = "No memory available for KV pool after loading model. Please increase --mem-fraction-static"
+        if self.is_draft_worker:
+            msg += " or --draft-mem-fraction"
+        msg += "."
+        assert usable_memory > 0, msg
+        max_num_token = int(usable_memory * (1 << 30) // cell_size)
         return max_num_token
 
     def init_memory_pool(
