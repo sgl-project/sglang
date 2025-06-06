@@ -346,3 +346,7 @@ inline torch::Tensor pad_tensor(const torch::Tensor& tensor, int64_t alignment =
   }
   return tensor_padded;
 }
+
+__device__ __forceinline__ float silu(const float& val) {
+  return val / (1.0f + __expf(-val));
+}
