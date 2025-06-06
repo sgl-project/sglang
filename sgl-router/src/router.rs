@@ -528,6 +528,10 @@ impl Router {
             ..
         } = self
         {
+            if worker_urls.read().unwrap().is_empty() {
+                return Err("No workers available for CacheAware routing".to_string());
+            }
+            
             let text = self.get_text_from_request(&body, route);
 
             // TODO: delay scheduling if cache hit rate is high because it may cause imbalance. prioritize low hit rate ones
