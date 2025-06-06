@@ -232,8 +232,9 @@ class EagleVerifyInput:
     retrive_next_token: torch.Tensor
     retrive_next_sibling: torch.Tensor
     retrive_cum_len: torch.Tensor
-    draft_token_num: int
     spec_steps: int
+    topk: int
+    draft_token_num: int
     capture_hidden_mode: CaptureHiddenMode
     grammar: BaseGrammarObject = None
 
