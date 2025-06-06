@@ -499,20 +499,14 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        if any(item.precomputed_features is not None for item in items):
-            if not all(item.precomputed_features is not None for item in items):
-                raise NotImplementedError(
-                    "MM inputs where only some items are precomputed."
-                )
-            return torch.concat([item.precomputed_features for item in items])
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
             self.visual.dtype
         )
-        image_grid_thws = torch.concat([item.image_grid_thws for item in items], dim=0)
+        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
-        assert image_grid_thws.dim() == 2, image_grid_thws.dim()
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thws)
+        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
 
     def _process_video_input(self, video_input: Qwen2VLVideoInputs) -> torch.Tensor:

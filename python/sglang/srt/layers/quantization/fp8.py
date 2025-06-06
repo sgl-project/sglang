@@ -49,8 +49,8 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
-    apply_w8a8_block_fp8_linear,
     cutlass_fp8_supported,
+    dispatch_w8a8_block_fp8_linear,
     input_to_float8,
     is_sm100_supported,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -208,6 +208,8 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             # Marlin doesn't support block-wise fp8
             self.use_marlin = False
+
+        self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
     def create_weights(
         self,
@@ -417,7 +419,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.block_quant:
-            return apply_w8a8_block_fp8_linear(
+            return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
                 block_size=self.quant_config.weight_block_size,
@@ -571,7 +573,7 @@ class Fp8MoEMethod:
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
             if (
-                get_bool_env_var("CUTLASS_MOE")
+                get_bool_env_var("SGLANG_CUTLASS_MOE")
                 and self.cutlass_fp8_supported
                 and is_sm100_supported()
             ):
@@ -935,6 +937,7 @@ class Fp8MoEMethod:
         use_grouped_topk: bool,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
@@ -955,6 +958,7 @@ class Fp8MoEMethod:
             renormalize=renormalize,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
+            num_fused_shared_experts=num_fused_shared_experts,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
@@ -973,14 +977,14 @@ class Fp8MoEMethod:
                 return ret
 
         if (
-            get_bool_env_var("CUTLASS_MOE")
+            get_bool_env_var("SGLANG_CUTLASS_MOE")
             and self.cutlass_fp8_supported
             and self.block_quant
             and is_sm100_supported()
         ):
-            from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts
+            from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
-            return cutlass_fused_experts(
+            return cutlass_fused_experts_fp8(
                 x,
                 layer.w13_weight.transpose(1, 2),
                 layer.w2_weight.transpose(1, 2),

@@ -13,3 +13,5 @@ docker exec -w /human-eval ci_sglang pip install -e .
 docker exec -w / ci_sglang mkdir -p /dummy-grok
 mkdir -p dummy-grok && wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json -O dummy-grok/config.json
 docker cp ./dummy-grok ci_sglang:/
+
+docker exec ci_sglang pip install huggingface_hub[hf_xet]
