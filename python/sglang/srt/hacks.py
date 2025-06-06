@@ -2,10 +2,10 @@ from typing import Tuple
 
 import deep_gemm.utils.layout
 import torch
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
-from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from tqdm import trange
 
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 
 # def hack_requant_moe_weight(that, weights):
 #     print("hi hack_requant_moe_weight")
@@ -106,7 +106,9 @@ def hack_requant_moe_weight_at_post_load_weights(that):
                 ]:
                     _requant_grouped_moe_weight_inplace(that, w[0], w[1])
             else:
-                print("hack_requant_moe_weight_at_post_load_weights skip handling experts since not DeepEPMoE")
+                print(
+                    "hack_requant_moe_weight_at_post_load_weights skip handling experts since not DeepEPMoE"
+                )
         else:
             mlp = layer.mlp
             assert isinstance(mlp, DeepseekV2MLP)
