@@ -28,8 +28,9 @@ else:
 import logging
 
 _is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_hip:
+if _use_aiter:
     from aiter import ActivationType
     from aiter.fused_moe_bf16_asm import ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
@@ -104,7 +105,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_hip and get_bool_env_var("SGLANG_AITER_MOE"):
+        if _use_aiter:
             layer.w13_weight = torch.nn.Parameter(
                 shuffle_weight(layer.w13_weight.data, (16, 16)),
                 requires_grad=False,
@@ -188,7 +189,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        if _is_hip and get_bool_env_var("SGLANG_AITER_MOE"):
+        if _use_aiter:
             assert not no_combine, "unsupported"
             if apply_router_weight_on_input:
                 assert (
