@@ -13,8 +13,9 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
-    apply_fp8_linear,
+    FP8LinearFn,
     cutlass_fp8_supported,
+    dispatch_fp8_linear,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.utils import (
@@ -130,6 +131,10 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         super().__init__()
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
+        self.fp8_linear = dispatch_fp8_linear(
+            cutlass_fp8_supported=self.cutlass_fp8_supported,
+            compressed_tensor_quant=False,
+        )
 
     def create_weights(
         self,
@@ -202,13 +207,13 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Applies FP8 linear transformation."""
-        return apply_fp8_linear(
+
+        return self.fp8_linear(
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale,
             input_scale=layer.input_scale,
             bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
         )
 
 

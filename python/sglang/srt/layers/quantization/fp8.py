@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
+from pandas import cut
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
@@ -48,8 +49,8 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
-    apply_fp8_linear,
     cutlass_fp8_supported,
+    dispatch_fp8_linear,
     dispatch_w8a8_block_fp8_linear,
     input_to_float8,
     is_sm100_supported,
@@ -210,6 +211,11 @@ class Fp8LinearMethod(LinearMethodBase):
             self.use_marlin = False
 
         self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+
+        self.fp8_linear = dispatch_fp8_linear(
+            cutlass_fp8_supported=self.cutlass_fp8_supported,
+            compressed_tensor_quant=False,
+        )
 
     def create_weights(
         self,
@@ -428,13 +434,12 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        return apply_fp8_linear(
+        return self.fp8_linear(
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale,
             input_scale=layer.input_scale,
             bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=False,
         )
 

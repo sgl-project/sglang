@@ -1,6 +1,8 @@
 from typing import Any, Callable, Dict, List, Optional
 
+import compressed_tensors
 import torch
+from fastapi import FastAPI
 from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.linear import LinearMethodBase
@@ -15,8 +17,8 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
-    apply_fp8_linear,
     cutlass_fp8_supported,
+    dispatch_fp8_linear,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
 )
@@ -94,6 +96,10 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
     def __init__(self, quantization_config: W8A8Fp8Config):
         self.cutlass_fp8_supported = cutlass_fp8_supported()
         self.quantization_config = quantization_config
+        self.fp8_linear = dispatch_fp8_linear(
+            cutlass_fp8_supported=self.cutlass_fp8_supported,
+            compressed_tensor_quant=False,
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight
@@ -174,12 +180,11 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
-        return apply_fp8_linear(
+        return self.fp8_linear(
             x,
             layer.weight,
             layer.weight_scale,
             bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
         )
 
 
