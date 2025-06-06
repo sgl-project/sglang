@@ -1331,7 +1331,6 @@ class RowParallelLinear(LinearBase):
         if self.reduce_results and self.tp_size >1:            
             torch.cuda.current_stream().wait_event(comm_events[-1])
         output_bias = self.bias if self.skip_bias_add else None
-        output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
     def extra_repr(self) -> str:
