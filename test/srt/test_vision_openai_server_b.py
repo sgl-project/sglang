@@ -21,8 +21,6 @@ class TestPixtralServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.73",
             ],
         )
         cls.base_url += "/v1"
@@ -43,8 +41,6 @@ class TestMistral3_1Server(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.8",
             ],
         )
         cls.base_url += "/v1"
@@ -87,8 +83,6 @@ class TestJanusProServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.4",
             ],
         )
         cls.base_url += "/v1"
@@ -115,8 +109,6 @@ class TestJanusProServer(TestOpenAIVisionServer):
 #             other_args=[
 #                 "--chat-template",
 #                 "llama-4",
-#                 "--mem-fraction-static",
-#                 "0.8",
 #                 "--tp-size=8",
 #                 "--context-length=8192",
 #             ],
@@ -139,8 +131,6 @@ class TestGemma3itServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.70",
                 "--enable-multimodal",
             ],
         )
@@ -196,8 +186,6 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.75",
                 "--disable-radix-cache",
                 "--max-loras-per-batch",
                 "1",
