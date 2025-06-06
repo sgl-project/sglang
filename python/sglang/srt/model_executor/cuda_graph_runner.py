@@ -56,10 +56,29 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 
-logger = logging.getLogger(__name__)
+try:
+    import torch.distributed as dist
+    from sglang.srt.distributed import (
+        get_tensor_model_parallel_rank,
+        split_tensor_along_last_dim,
+        tensor_model_parallel_all_gather,
+        tensor_model_parallel_all_reduce,
+        get_tensor_model_parallel_world_size,
+    )
+    SGLANG_DIST_ACTIVATED = True
+except ImportError as ex:
+    SGLANG_DIST_ACTIVATED = False
+
+def get_local_rank() -> 0:
+    if SGLANG_DIST_ACTIVATED:
+        return get_tensor_model_parallel_rank()
+    else:
+        return 0
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+logger = logging.getLogger(__name__)
 
 # Detect whether the current forward pass is in capture mode
 is_capture_mode = False
@@ -820,8 +839,20 @@ class CudaGraphRunner:
         graph_handle = (self.bs,)
         if self.enable_hip_attention:
             graph_handle = (self.bs, forward_batch.hip_metadata_cached_stages)
+        run_bench = (
+            os.getenv('HIP_DEBUG_BENCH', '0') == '1'
+            and get_local_rank() == 0
+        )
+        if run_bench:
+            start = torch.cuda.Event(True)
+            end = torch.cuda.Event(True)
+            start.record()
         self.graphs[graph_handle].replay()
-
+        if run_bench:
+            end.record()
+            end.synchronize()
+            elapsed = start.elapsed_time(end)
+            print(f'graph {graph_handle} took {elapsed:.2f} ms')
         output = self.output_buffers[graph_handle]
 
         if isinstance(output, LogitsProcessorOutput):
