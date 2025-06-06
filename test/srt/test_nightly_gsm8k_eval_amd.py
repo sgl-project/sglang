@@ -171,7 +171,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                     os.environ["HF_HUB_DISABLE_XET"] = (
                         "1" if model in DISABLE_HF_XET_MODELS else "0"
                     )
-                    os.environ["SGLANG_AITER_MOE"] = (
+                    os.environ["SGLANG_USE_AITER"] = (
                         "0" if model in TRITON_MOE_MODELS else "1"
                     )
 
