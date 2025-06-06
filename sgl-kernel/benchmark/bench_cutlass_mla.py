@@ -40,14 +40,19 @@ def benchmark(batch_size, seq_len, provider, block_size):
     d = 576
     dv = 512
 
-    if "128" in provider:
-        h_q = 128
-    elif "64" in provider:
-        h_q = 64
-    elif "32" in provider:
-        h_q = 32
-    elif "16" in provider:
-        h_q = 16
+    h_q_map = {
+        "128": 128,
+        "64": 64,
+        "32": 32,
+        "16": 16,
+    }
+    parsed_h_q = next(
+        (value for key, value in h_q_map.items() if key in provider), None
+    )
+
+    if parsed_h_q is None:
+        raise ValueError(f"Unknown head configuration in provider: {provider}")
+    h_q = parsed_h_q
 
     seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
     max_seq_len = seq_lens.max().item()
