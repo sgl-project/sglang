@@ -156,7 +156,7 @@ class DecodePreallocQueue:
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
-            target_dp_rank=req.data_parallel_rank,
+            data_parallel_rank=req.data_parallel_rank,
         )
         self.queue.append(DecodeRequest(req=req, kv_receiver=kv_receiver))
 

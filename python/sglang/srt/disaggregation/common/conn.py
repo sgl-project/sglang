@@ -109,12 +109,12 @@ class CommonKVReceiver(BaseKVReceiver):
         mgr: BaseKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
-        target_dp_rank: Optional[int] = None,
+        data_parallel_rank: Optional[int] = None,
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
         self.kv_mgr = mgr
-        self.target_dp_rank = target_dp_rank
+        self.data_parallel_rank = data_parallel_rank
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
             self.prefill_tp_size, self.prefill_dp_size = (
@@ -182,9 +182,9 @@ class CommonKVReceiver(BaseKVReceiver):
             self.target_tp_rank = self.target_tp_ranks[0]
             self.required_dst_info_num = 1
 
-        if self.target_dp_rank is not None:
-            logger.debug(f"Targeting DP rank: {self.target_dp_rank}")
-            self.target_dp_group = self.target_dp_rank
+        if self.data_parallel_rank is not None:
+            logger.debug(f"Targeting DP rank: {self.data_parallel_rank}")
+            self.target_dp_group = self.data_parallel_rank
         else:
             self.target_dp_group = bootstrap_room % self.prefill_dp_size
 
