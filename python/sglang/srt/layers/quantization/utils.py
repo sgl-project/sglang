@@ -10,8 +10,9 @@ from sglang.srt.utils import cpu_has_amx_support, is_cuda, is_npu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_cpu_amx = cpu_has_amx_support()
 
-if not (_is_cuda or _is_npu or cpu_has_amx_support()):
+if not (_is_cuda or _is_npu or _is_cpu_amx):
     from vllm._custom_ops import scaled_fp8_quant
 
 

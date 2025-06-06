@@ -22,12 +22,9 @@ from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_cpu_amx = cpu_has_amx_support()
 
-<<<<<<< HEAD
-if not _is_cuda and not _is_npu:
-=======
-if not _is_cuda and not cpu_has_amx_support():
->>>>>>> a3f5e41b (remove vllm dependency)
+if not (_is_cuda or _is_npu or _is_cpu_amx):
     from vllm import _custom_ops as vllm_ops
     from vllm._custom_ops import scaled_fp8_quant
 

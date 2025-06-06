@@ -108,10 +108,11 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_cpu_amx = cpu_has_amx_support()
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8, merge_state_v2
-elif cpu_has_amx_support():
+elif _is_cpu_amx:
     pass
 else:
     from vllm._custom_ops import awq_dequantize
