@@ -208,6 +208,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             return_logprob=False,
             positions=positions,
             global_num_tokens_gpu=global_num_tokens,
+            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob,
             gathered_buffer=gathered_buffer,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
@@ -265,8 +266,16 @@ class EAGLEDraftExtendCudaGraphRunner:
         raw_bs = forward_batch.batch_size
         num_tokens = forward_batch.input_ids.shape[0]
         assert raw_bs * self.num_tokens_per_bs == num_tokens
+        if self.enable_dp_attention or self.enable_sp_layernorm:
+            total_batch_size = (
+                sum(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
+                if self.model_runner.spec_algorithm.is_eagle()
+                else sum(forward_batch.global_num_tokens_cpu)
+            )
+            index = bisect.bisect_left(self.capture_bs, total_batch_size)
+        else:
+            index = bisect.bisect_left(self.capture_bs, raw_bs)
 
-        index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
         if bs != raw_bs:
             self.seq_lens.fill_(1)
