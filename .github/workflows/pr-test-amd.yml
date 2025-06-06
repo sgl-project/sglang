@@ -55,7 +55,7 @@ jobs:
         github.event.pull_request.draft == false
     strategy:
       matrix:
-        runner: [linux-mi300-gpu-2-test-test]
+        runner: [linux-mi300-gpu-2-test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
