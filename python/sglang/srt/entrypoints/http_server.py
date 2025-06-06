@@ -47,7 +47,7 @@ from sglang.srt.disaggregation.utils import (
     register_disaggregation_server,
 )
 from sglang.srt.entrypoints.engine import _launch_subprocesses
-from sglang.srt.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -82,6 +82,7 @@ from sglang.srt.openai_api.adapter import (
     v1_retrieve_batch,
     v1_retrieve_file,
     v1_retrieve_file_content,
+    v1_score,
 )
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -229,6 +230,11 @@ async def get_server_info():
     }
 
 
+@app.get("/get_load")
+async def get_load():
+    return await _global_state.tokenizer_manager.get_load()
+
+
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
@@ -251,7 +257,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     ) + b"\n\n"
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
-                logger.error(f"Error: {e}")
+                logger.error(f"[http_server] Error: {e}")
                 yield b"data: " + orjson.dumps(
                     out, option=orjson.OPT_NON_STR_KEYS
                 ) + b"\n\n"
@@ -269,7 +275,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ).__anext__()
             return ret
         except ValueError as e:
-            logger.error(f"Error: {e}")
+            logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
 
 
@@ -345,6 +351,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         activities=obj.activities,
         with_stack=obj.with_stack,
         record_shapes=obj.record_shapes,
+        profile_by_stage=obj.profile_by_stage,
     )
     return Response(
         content="Start profiling.\n",
@@ -712,6 +719,12 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     if isinstance(ret, Response):
         return ret
     return ORJSONResponse({"predictions": ret})
+
+
+@app.post("/v1/score")
+async def v1_score_request(raw_request: Request):
+    """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
+    return await v1_score(_global_state.tokenizer_manager, raw_request)
 
 
 def _create_error_response(e):
