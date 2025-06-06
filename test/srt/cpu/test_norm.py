@@ -37,7 +37,8 @@ class TestNorm(CustomTestCase):
 
     def _norm_test(self, m, n, dtype):
 
-        x = torch.randn([m, n], dtype=dtype)
+        x = torch.randn([m, 2 * n], dtype=dtype)
+        x = x[..., :n]  # Make x non-contiguous
         hidden_size = x.size(-1)
         weight = torch.randn(hidden_size, dtype=dtype)
         variance_epsilon = 1e-6
