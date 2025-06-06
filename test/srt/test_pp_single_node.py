@@ -5,11 +5,13 @@ python3 -m unittest test_pp_single_node.TestQwenPPAccuracy.test_pp_consistency
 python3 -m unittest test_pp_single_node.TestFixedBugs.test_chunked_prefill_with_small_bs
 """
 
+import os
 import time
 import unittest
 from types import SimpleNamespace
 
 from sglang.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
+from sglang.srt.distributed import get_pp_indices
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
@@ -21,6 +23,61 @@ from sglang.test.test_utils import (
     popen_launch_server,
     run_bench_one_batch_server,
 )
+
+
+# Adapted from https://github.com/vllm-project/vllm/blob/v0.9.0/tests/distributed/test_pipeline_partition.py
+class TestCustomLayerPartition(unittest.TestCase):
+    def test_custom_layer_partition(self):
+        def _verify(partition_str, num_layers, pp_size, goldens):
+            bak = os.environ.get("SGLANG_PP_LAYER_PARTITION", None)
+            os.environ["SGLANG_PP_LAYER_PARTITION"] = partition_str
+            for pp_rank, golden in enumerate(goldens):
+                self.assertEqual(get_pp_indices(num_layers, pp_rank, pp_size), golden)
+            if bak is not None:
+                os.environ["VLLM_PP_LAYER_PARTITION"] = bak
+
+        # Even partition
+        _verify("5,5,5,5", 20, 4, [(0, 5), (5, 10), (10, 15), (15, 20)])
+        # Balanced partition
+        _verify("4,6,6,4", 20, 4, [(0, 4), (4, 10), (10, 16), (16, 20)])
+        # Put reminder somewhere
+        _verify("5,6,5,6", 22, 4, [(0, 5), (5, 11), (11, 16), (16, 22)])
+        # Invalid partition strings
+        with self.assertRaises(ValueError):
+            _verify("5,5,5,5,", 20, 4, [(0, 5), (5, 10), (10, 15), (15, 20)])
+        with self.assertRaises(ValueError):
+            _verify("5,5,5,a", 20, 4, [(0, 5), (5, 10), (10, 15), (15, 20)])
+        # Wrong number of partitions
+        with self.assertRaises(ValueError):
+            _verify("5,5,5", 20, 4, [(0, 5), (5, 10), (10, 15), (15, 20)])
+        # Wrong number of layers
+        with self.assertRaises(ValueError):
+            _verify("5,5,5,5", 21, 4, [(0, 5), (5, 10), (10, 15), (15, 20)])
+
+
+class TestUnevenAutoPartition(unittest.TestCase):
+    def test_uneven_auto_partition(self):
+        test_cases = [
+            # pp_size 2
+            (2, 2, 0, (0, 1)),
+            (2, 2, 1, (1, 2)),
+            (3, 2, 0, (0, 2)),
+            (3, 2, 1, (2, 3)),
+            # pp_size 3
+            (3, 3, 0, (0, 1)),
+            (3, 3, 1, (1, 2)),
+            (3, 3, 2, (2, 3)),
+            (4, 3, 0, (0, 1)),
+            (4, 3, 1, (1, 3)),
+            (4, 3, 2, (3, 4)),
+            (5, 3, 0, (0, 2)),
+            (5, 3, 1, (2, 4)),
+            (5, 3, 2, (4, 5)),
+        ]
+        for num_hidden_layers, pp_size, pp_rank, indices in test_cases:
+            self.assertEqual(
+                indices, get_pp_indices(num_hidden_layers, pp_rank, pp_size)
+            )
 
 
 class TestPPAccuracy(unittest.TestCase):
