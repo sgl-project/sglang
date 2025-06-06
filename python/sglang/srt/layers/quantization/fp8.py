@@ -77,8 +77,8 @@ _is_cuda = is_cuda()
 
 _is_fp8_fnuz = is_fp8_fnuz()
 
-use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT")
-use_aiter_moe = get_bool_env_var("SGLANG_AITER_MOE")
+_use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT")
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_hip:
     from aiter import ActivationType, QuantType
@@ -487,7 +487,7 @@ class Fp8MoEMethod:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         if self.quant_config.is_checkpoint_fp8_serialized:
-            params_dtype = torch.uint32 if use_hip_int4 else torch.float8_e4m3fn
+            params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
         tp_size = get_tensor_model_parallel_world_size()
         if self.block_quant:
             block_n, block_k = (
@@ -512,7 +512,7 @@ class Fp8MoEMethod:
                     )
 
         # WEIGHTS
-        if _is_hip and use_hip_int4:
+        if _is_hip and _use_hip_int4:
             # INT4 MoE weight - INT32 packed
             w13_weight = torch.nn.Parameter(
                 torch.empty(
@@ -641,7 +641,7 @@ class Fp8MoEMethod:
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-            if _is_hip:  # and use_aiter_moe: TODO: add check back after triton kernel
+            if _is_hip:  # _use_aiter: TODO: add check back after triton kernel
                 # ROCm - using column scaling, duplicate scaling numbers in case per tensor scaling
                 w13_weight_scale1 = torch.nn.Parameter(
                     torch.ones(num_experts, 2 * intermediate_size, dtype=torch.float32),
@@ -668,7 +668,7 @@ class Fp8MoEMethod:
             set_weight_attrs(w13_weight_scale, extra_weight_attrs)
             set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
-            if _is_hip and use_hip_int4:
+            if _is_hip and _use_hip_int4:
                 extra_weight_attrs.update(
                     {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
                 )
@@ -700,7 +700,7 @@ class Fp8MoEMethod:
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        if _is_hip and use_hip_int4:
+        if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
             return
 
@@ -731,7 +731,7 @@ class Fp8MoEMethod:
                 )
                 layer.w2_input_scale = None
 
-            if _is_hip and use_aiter_moe:
+            if _use_aiter:
                 # Pre-shuffle weights
                 layer.w13_weight.data = shuffle_weight(
                     layer.w13_weight.contiguous(), (16, 16)
@@ -853,7 +853,7 @@ class Fp8MoEMethod:
             return
 
     def process_weights_hip_int4(self, layer: Module):
-        # TODO: and use_aiter_moe: add after triton kernel added
+        # TODO: _use_aiter: add after triton kernel added
         # INT4-FP8 (INT4 MoE Weight, FP8 Compute)
         # Weight Permutation
         layer.w13_weight = torch.nn.Parameter(
@@ -900,7 +900,7 @@ class Fp8MoEMethod:
             padding_size,  # Avoid circular import
         )
 
-        if use_aiter_moe:
+        if _use_aiter:
             layer.w13_weight = torch.nn.Parameter(
                 shuffle_weight(layer.w13_weight.data, (16, 16)),
                 requires_grad=False,
@@ -911,7 +911,7 @@ class Fp8MoEMethod:
                 requires_grad=False,
             )
             torch.cuda.empty_cache()
-            # ROCm (use_aiter_moe): using column-wise scaling
+            # ROCm (_use_aiter): using column-wise scaling
             layer.w13_weight_scale1 *= layer.w13_weight_scale.unsqueeze(-1)
             layer.w2_weight_scale1 *= layer.w2_weight_scale.unsqueeze(-1)
         elif get_bool_env_var("SGLANG_MOE_PADDING"):
@@ -982,9 +982,9 @@ class Fp8MoEMethod:
             and self.block_quant
             and is_sm100_supported()
         ):
-            from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts
+            from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
-            return cutlass_fused_experts(
+            return cutlass_fused_experts_fp8(
                 x,
                 layer.w13_weight.transpose(1, 2),
                 layer.w2_weight.transpose(1, 2),
@@ -1041,8 +1041,8 @@ class Fp8MoEMethod:
         activation: str = "silu",
         no_combine: bool = False,
     ) -> Optional[torch.Tensor]:
-        if use_hip_int4:
-            # TODO: add triton kernel and add check use_aiter_moe
+        if _use_hip_int4:
+            # TODO: add triton kernel and add check _use_aiter
             assert not no_combine, f"{no_combine=} is not supported."
             return ck_moe_2stages(
                 x,
@@ -1058,13 +1058,13 @@ class Fp8MoEMethod:
                 ),
             )
 
-        if use_aiter_moe:
+        if _use_aiter:
             assert not no_combine, f"{no_combine=} is not supported."
             if self.block_quant:
-                # TODO(use_aiter_moe): FP8 block_quant only supports 'silu' for the time-being.
+                # TODO(_use_aiter): FP8 block_quant only supports 'silu' for the time-being.
                 assert (
                     activation == "silu"
-                ), f"use_aiter_moe: FP8 bloack_quant {activation=} will be supported later, unset use_aiter_moe"
+                ), f"_use_aiter: FP8 bloack_quant {activation=} will be supported later, unset _use_aiter"
                 return asm_moe(
                     x,
                     layer.w13_weight,
