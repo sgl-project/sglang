@@ -24,6 +24,7 @@ from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -571,7 +572,9 @@ class Scheduler(
 
     def init_kv_events(self, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
-            self.kv_event_publisher = EventPublisherFactory.create(kv_events_config)
+            self.kv_event_publisher = EventPublisherFactory.create(
+                kv_events_config, self.attn_dp_rank
+            )
 
     def init_disaggregation(self):
         self.transfer_backend = TransferBackend(
@@ -1988,7 +1991,7 @@ class Scheduler(
             self.cum_spec_accept_length = self.cum_spec_accept_count = 0
             for k, v in server_args_dict.items():
                 global_server_args_dict[k] = v
-            logger.info(f"Global server args updated! " f"{global_server_args_dict=}")
+            logger.info(f"Global server args updated! {global_server_args_dict=}")
         return SetInternalStateReqOutput(
             updated=True,
             server_args=global_server_args_dict,
@@ -2280,6 +2283,9 @@ class Scheduler(
                 success=False,
                 message="Profiling is not in progress. Call /start_profile first.",
             )
+
+        if not Path(self.torch_profiler_output_dir).exists():
+            Path(self.torch_profiler_output_dir).mkdir(parents=True, exist_ok=True)
 
         stage_suffix = f"-{stage.__str__()}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
