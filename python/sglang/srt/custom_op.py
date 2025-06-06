@@ -72,13 +72,11 @@ class CustomOp(nn.Module):
         return self.forward_native(*args, **kwargs)
 
     def dispatch_forward(self):
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
-
         if _is_cuda:
             return self.forward_cuda
         elif _is_hip:
             return self.forward_hip
-        elif global_server_args_dict["device"] == "cpu" and _is_cpu_amx:
+        elif _is_cpu_amx:
             return self.forward_cpu
         else:
             return self.forward_native

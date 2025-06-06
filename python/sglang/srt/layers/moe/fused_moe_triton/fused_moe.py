@@ -36,10 +36,11 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_cpu_amx = cpu_has_amx_support()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
-elif cpu_has_amx_support():
+elif _is_cpu_amx:
     pass
 else:
     from vllm import _custom_ops as vllm_ops
