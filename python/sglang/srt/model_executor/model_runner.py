@@ -486,12 +486,11 @@ class ModelRunner:
                     else 1.0
                 )
 
-                # everytime the complexity grows 100%, adjust final factor for 3%
+                # every time the complexity grows 100%, adjust final factor for 2%
                 sensitivity_scale = 0.02
                 dynamic_adjustment_factor = 1.0 - sensitivity_scale * (
                     complexity_ratio - 1.0
                 )
-                print(f"{dynamic_adjustment_factor=}")
                 dynamic_adjustment_factor = max(
                     0.8, min(1.05, dynamic_adjustment_factor)
                 )
@@ -502,9 +501,6 @@ class ModelRunner:
                 self.mem_fraction_static = (
                     original_server_arg_mem_fraction * final_overall_factor
                 )
-
-                print(f"{vit_hidden_size=}")
-                print(f"{vit_num_layers=}")
 
                 logger.info(
                     f"Multimodal model: Dynamically adjusted --mem-fraction-static "
