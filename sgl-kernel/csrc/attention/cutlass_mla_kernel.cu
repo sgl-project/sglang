@@ -22,9 +22,8 @@ limitations under the License.
 #include <torch/all.h>
 
 #include <cute/tensor.hpp>
-
-#include "device/sm100_mla.hpp"
-#include "kernel/sm100_mla_tile_scheduler.hpp"
+#include <device/sm100_mla.hpp>
+#include <kernel/sm100_mla_tile_scheduler.hpp>
 
 // clang-format off
 #if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
