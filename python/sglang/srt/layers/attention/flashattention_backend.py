@@ -860,7 +860,7 @@ class FlashAttentionBackend(AttentionBackend):
 
                 elapsed = start_event.elapsed_time(end_event)
                 capture.report()
-                print(f'layer {layer.layer_id} took {elapsed:.2f} ms')
+                print(f'[fa3] layer {layer.layer_id} took {elapsed:.2f} ms')
         else:
             if (
                 forward_batch.attn_attend_prefix_cache is not None
