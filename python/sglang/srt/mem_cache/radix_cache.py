@@ -277,6 +277,9 @@ class RadixCache(BasePrefixCache):
             node_value_len = len(node.value)
             self.token_to_kv_pool_allocator.free(node.value)
             node.value = None  # Mark node as evicted
+            # Update evictable size here since value is freed;
+            # do not update again in _delete_leaf()
+            self.evictable_size_ -= node_value_len
             num_evicted += node_value_len
             self._delete_leaf(node)
             self._record_remove_event(node)
@@ -447,7 +450,6 @@ class RadixCache(BasePrefixCache):
     def _delete_leaf(self, node):
         if node.child_key in node.parent.children:
             del node.parent.children[node.child_key]
-        self.evictable_size_ -= len(node.key)
 
     def _total_size_helper(self):
         total_size = 0
