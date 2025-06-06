@@ -125,7 +125,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        self.determine_n_share_experts_fusion("DeepseekV3ForCausalLMNextN")
+        self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
 
         self.model = DeepseekModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
