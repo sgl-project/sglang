@@ -1201,10 +1201,7 @@ class ModelRunner:
         debug_utils.dumper.forward_pass_id = self.forward_pass_id
 
         if get_bool_env_var("SGLANG_FORWARD_PASS_START_BARRIER"):
-            device = self.server_args.device
-            world_size = torch.distributed.get_world_size()
-            tensors = [torch.zeros((1,), device=device) for _ in range(world_size)]
-            torch.distributed.all_gather(tensors, torch.zeros((1,), device=device))
+            torch.distributed.barrier()
 
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
