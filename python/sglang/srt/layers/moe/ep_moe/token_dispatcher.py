@@ -498,9 +498,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_idx = topk_idx.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
-            + self.num_experts
-        ) // self.num_experts
+                         hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+                         + self.num_experts
+                     ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
@@ -527,8 +527,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hook,
     ):
         if _DEBUG_LL_INSERT_SLOWNESS:
-            mat_0 = torch.randn((8192, 8192), dtype=torch.float)
-            mat_1 = torch.randn((8192, 8192), dtype=torch.float)
+            mat_0 = torch.zeros((1024, 1024), dtype=torch.float)
+            mat_1 = torch.zeros((1024, 1024), dtype=torch.float)
             mat_0 @ mat_1
 
         hook() if self.return_recv_hook else event.current_stream_wait()
@@ -617,8 +617,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
     def combine_b(self, hidden_states, event, hook):
         if _DEBUG_LL_INSERT_SLOWNESS:
-            mat_0 = torch.randn((8192, 8192), dtype=torch.float)
-            mat_1 = torch.randn((8192, 8192), dtype=torch.float)
+            mat_0 = torch.zeros((1024, 1024), dtype=torch.float)
+            mat_1 = torch.zeros((1024, 1024), dtype=torch.float)
             mat_0 @ mat_1
 
         hook() if self.return_recv_hook else event.current_stream_wait()
