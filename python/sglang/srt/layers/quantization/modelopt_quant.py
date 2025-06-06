@@ -313,10 +313,6 @@ class ModelOptFp4Config(QuantizationConfig):
     ) -> Optional["QuantizeMethodBase"]:
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
-        # if self.exclude_modules and any(
-        #     module in prefix for module in self.exclude_modules
-        # ):
-        #     return None
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.exclude_modules) or self.is_layer_excluded(
                 prefix, self.exclude_modules
@@ -746,6 +742,7 @@ class ModelOptNvFp4FusedMoEMethod:
         use_grouped_topk: bool,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
@@ -768,6 +765,7 @@ class ModelOptNvFp4FusedMoEMethod:
             renormalize=renormalize,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
+            num_fused_shared_experts=num_fused_shared_experts,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
