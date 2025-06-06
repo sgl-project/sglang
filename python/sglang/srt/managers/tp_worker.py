@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAlloca
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 
 logger = logging.getLogger(__name__)
@@ -56,9 +57,7 @@ class TpModelWorker:
         dp_rank: Optional[int],
         nccl_port: int,
         is_draft_worker: bool = False,
-        req_to_token_pool: Optional[ReqToTokenPool] = None,
-        token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
-        main_worker_avail_memory: Optional[float] = None,
+        target_worker: Optional["TpModelWorker"] = None,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
@@ -87,9 +86,7 @@ class TpModelWorker:
             nccl_port=nccl_port,
             server_args=server_args,
             is_draft_worker=is_draft_worker,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            main_worker_avail_memory=main_worker_avail_memory,
+            target_worker=target_worker,
         )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -115,27 +112,16 @@ class TpModelWorker:
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
-        # Profile number of tokens
-        self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         self.max_prefill_tokens = server_args.max_prefill_tokens
-        self.max_running_requests = min(
-            (
-                self.max_total_num_tokens // 2
-                if server_args.max_running_requests is None
-                else server_args.max_running_requests
-                // (server_args.dp_size if server_args.enable_dp_attention else 1)
-            ),
-            self.model_runner.req_to_token_pool.size,
+        self.server_args = server_args
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
         )
-        assert self.max_running_requests > 0, "max_running_request is zero"
-        self.max_req_len = min(
-            self.model_config.context_len - 1,
-            self.max_total_num_tokens - 1,
-        )
-        self.max_req_input_len = self.max_req_len - 5
-        assert (
-            self.max_req_len > 0 and self.max_req_input_len > 0
-        ), "Memory pool size is too small"
+        # TODO: adjust for nextn
+        if self.spec_algorithm.is_none() or (
+            self.spec_algorithm.is_eagle() and is_draft_worker
+        ):
+            self.post_memory_pool_init()
 
         # Sync random seed across TP workers
         self.random_seed = broadcast_pyobj(
@@ -148,6 +134,32 @@ class TpModelWorker:
 
         # A reference make this class has the same member as TpModelWorkerClient
         self.worker = self
+
+    def post_memory_pool_init(self):
+        # Profile number of tokens
+        self.max_total_num_tokens = self.model_runner.max_total_num_tokens
+        self.max_running_requests = min(
+            (
+                self.max_total_num_tokens // 2
+                if self.server_args.max_running_requests is None
+                else self.server_args.max_running_requests
+                // (
+                    self.server_args.dp_size
+                    if self.server_args.enable_dp_attention
+                    else 1
+                )
+            ),
+            self.model_runner.req_to_token_pool.size,
+        )
+        assert self.max_running_requests > 0, "max_running_request is zero"
+        self.max_req_len = min(
+            self.model_config.context_len - 1,
+            self.max_total_num_tokens - 1,
+        )
+        self.max_req_input_len = self.max_req_len - 5
+        assert (
+            self.max_req_len > 0 and self.max_req_input_len > 0
+        ), "Memory pool size is too small"
 
     def get_worker_info(self):
         return (
