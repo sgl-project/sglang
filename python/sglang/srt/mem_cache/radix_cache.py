@@ -461,17 +461,14 @@ class RadixCache(BasePrefixCache):
         return ret_list
 
     def _record_store_event(self, node: TreeNode):
-        # Emit one BlockStored event per fixed-size "page" so that each
-        # event always represents exactly ``self.page_size`` contiguous tokens.
-        # This keeps the wire contract simple for downstream consumers like
-        # Dynamo that assume uniform block sizes.
+        # One BlockStored per ``page_size`` chunk.
         if self.enable_kv_cache_events:
-            # The first page inherits its parent from the radix tree; each
-            # subsequent page chains off the previous page we just emitted so
-            # that the receiver can reconstruct the original order.
-            parent_block_hash = (
-                hash(tuple(node.parent.key)) if node.parent else None
-            )
+            # First chunk links to the last page of the parent node (if any).
+            if node.parent is None:
+                parent_block_hash = None
+            else:
+                parent_parent_tokens = node.parent.key[-self.page_size :]
+                parent_block_hash = hash(tuple(parent_parent_tokens))
 
             for start in range(0, len(node.key), self.page_size):
                 page_tokens = node.key[start : start + self.page_size]
@@ -490,11 +487,11 @@ class RadixCache(BasePrefixCache):
                     )
                 )
 
-                # Next slice's parent is the block we just pushed.
+                # Chain next chunk to this one.
                 parent_block_hash = block_hash
 
     def _record_remove_event(self, node: TreeNode):
-        # Emit one BlockRemoved per page for symmetry with _record_store_event.
+        # One BlockRemoved per chunk.
         if self.enable_kv_cache_events:
             for start in range(0, len(node.key), self.page_size):
                 page_tokens = node.key[start : start + self.page_size]
