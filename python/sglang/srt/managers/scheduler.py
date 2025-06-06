@@ -97,6 +97,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    StopAllReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -452,6 +453,7 @@ class Scheduler(
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
                 (AbortReq, self.abort_request),
+                (StopAllReq, self.stop_all_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
@@ -2063,6 +2065,17 @@ class Scheduler(
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
                 req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
+
+    def stop_all_request(self, recv_req: StopAllReq):
+        num_requests_to_stop = len(self.waiting_queue) + len(self.running_batch.reqs)
+        for req in self.waiting_queue:
+            req.sampling_params.max_new_tokens = 0
+
+        for req in self.running_batch.reqs:
+            req.sampling_params.max_new_tokens = len(req.output_ids)
+
+        logger.info(f"Stop {num_requests_to_stop} requests.")
+        return
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()

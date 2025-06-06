@@ -422,6 +422,16 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
         )
 
 
+@app.api_route("/stop_all", methods=["GET", "POST"])
+async def stop_all_async():
+    """Stop all requests."""
+    _global_state.tokenizer_manager.stop_all()
+    return Response(
+        content="Start stopping all requests.\n",
+        status_code=200,
+    )
+
+
 @app.post("/init_weights_update_group")
 async def init_weights_update_group(
     obj: InitWeightsUpdateGroupReqInput, request: Request
