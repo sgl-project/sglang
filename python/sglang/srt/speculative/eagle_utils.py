@@ -271,16 +271,17 @@ class EagleVerifyInput:
         )
 
         return cls(
-            draft_tokens,
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            None,
-            num_verify_tokens,
-            spec_steps,
-            CaptureHiddenMode.FULL,
+            draft_token=draft_tokens,
+            custom_mask=tree_mask,
+            positions=position,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            retrive_cum_len=None,
+            spec_steps=spec_steps,
+            topk=topk,
+            draft_token_num=num_verify_tokens,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
