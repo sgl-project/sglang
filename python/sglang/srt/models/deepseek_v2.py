@@ -772,7 +772,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.rocm_fused_decode_mla
                     and forward_batch.forward_mode.is_decode()
                 ):
-
                     return AttnForwardMethod.MLA_FUSED_ROPE
                 else:
                     return AttnForwardMethod.MLA
@@ -1044,7 +1043,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_nope_out = bmm_fp8(
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
             )
-
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
@@ -1372,7 +1370,16 @@ class DeepseekV2AttentionMLA(nn.Module):
                 torch.bfloat16,
             )
         else:
-            # See [Note] Align shapes of bmm inputs.
+            # [Note] Align shapes of bmm inputs.
+            # Shapes of inputs:
+            #   q_nope: [M, B, K]
+            #   original self.w_kc: [B, K, N]
+            #   current self.w_kc (which has been converted in PackWeightMethod): [B, N, K]
+
+            # Shapes of inputs to sgl_kernel.cpu.bmm:
+            #   out: [B, M, N]
+            #   mat1: [B, M, K]
+            #   mat2: [B, N, K]
             B = self.w_vc.size(0)
             N = self.w_vc.size(1)
             M = attn_output.size(0)
