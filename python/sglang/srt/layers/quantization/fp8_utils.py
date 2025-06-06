@@ -166,11 +166,13 @@ def flashinfer_gemm_w8a8_block_fp8_linear(
         input_2d, block_size[1], column_major_scales=False
     )
 
-    x_scale_input = x_scale.T.contiguous()
-    weight_scale_input = weight_scale.T.contiguous()
-
     output = gemm_fp8_nt_groupwise(
-        q_input, weight, x_scale_input, weight_scale_input, out_dtype=input_2d.dtype
+        q_input,
+        weight,
+        x_scale,
+        weight_scale,
+        scale_major_mode="K",
+        out_dtype=input_2d.dtype,
     )
 
     if bias is not None:
@@ -225,8 +227,8 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     output_dtype = input.dtype
     dtype_supported = output_dtype == torch.bfloat16
 
-    # TODO: add more robust shape check here
-    shape_supported = weight.shape[0] % 128 == 0 and weight.shape[1] % 128 == 0
+    # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
+    shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
 
     if not (shape_supported and dtype_supported):
         # fall back to triton

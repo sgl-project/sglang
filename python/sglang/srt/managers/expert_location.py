@@ -33,9 +33,11 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ExpertLocationMetadata:
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
+    physical_to_logical_map_cpu: torch.Tensor
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
-    logical_to_rank_dispatch_physical_map: torch.Tensor  # (layers, num_logical_experts)
+    # (layers, num_logical_experts)
+    logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
 
     # -------------------------------- properties ------------------------------------
 
@@ -70,11 +72,8 @@ class ExpertLocationMetadata:
         num_layers_2, num_logical_experts_1 = (
             self.logical_to_all_physical_map_num_valid.shape
         )
-        num_layers_3, num_logical_experts_2 = (
-            self.logical_to_rank_dispatch_physical_map.shape
-        )
-        assert num_layers_0 == num_layers_1 == num_layers_2 == num_layers_3
-        assert num_logical_experts_0 == num_logical_experts_1 == num_logical_experts_2
+        assert num_layers_0 == num_layers_1 == num_layers_2
+        assert num_logical_experts_0 == num_logical_experts_1
         assert num_physical_experts_0 == num_physical_experts_1
 
     # -------------------------------- construction ------------------------------------
@@ -117,6 +116,7 @@ class ExpertLocationMetadata:
         )
 
         return ExpertLocationMetadata._init_raw(
+            server_args=server_args,
             ep_size=common["ep_size"],
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
@@ -154,6 +154,7 @@ class ExpertLocationMetadata:
         )
 
         return ExpertLocationMetadata._init_raw(
+            server_args=server_args,
             ep_size=common["ep_size"],
             physical_to_logical_map=physical_to_logical_map.to(server_args.device),
             logical_to_all_physical_map=logical_to_all_physical_map.to(
@@ -184,6 +185,7 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def _init_raw(
+        server_args: ServerArgs,
         ep_size: int,
         physical_to_logical_map: torch.Tensor,
         logical_to_all_physical_map: torch.Tensor,
@@ -202,14 +204,19 @@ class ExpertLocationMetadata:
 
         return ExpertLocationMetadata(
             physical_to_logical_map=physical_to_logical_map,
+            physical_to_logical_map_cpu=physical_to_logical_map.cpu(),
             logical_to_all_physical_map=logical_to_all_physical_map_padded,
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
-            logical_to_rank_dispatch_physical_map=compute_logical_to_rank_dispatch_physical_map(
-                logical_to_all_physical_map=logical_to_all_physical_map,
-                num_gpus=ep_size,
-                num_physical_experts=num_physical_experts,
-                # TODO improve when we have real EP rank
-                ep_rank=torch.distributed.get_rank() % ep_size,
+            logical_to_rank_dispatch_physical_map=(
+                compute_logical_to_rank_dispatch_physical_map(
+                    logical_to_all_physical_map=logical_to_all_physical_map,
+                    num_gpus=ep_size,
+                    num_physical_experts=num_physical_experts,
+                    # TODO improve when we have real EP rank
+                    ep_rank=torch.distributed.get_rank() % ep_size,
+                )
+                if server_args.ep_dispatch_algorithm == "static"
+                else None
             ),
         )
 
@@ -218,6 +225,7 @@ class ExpertLocationMetadata:
     def update(
         self,
         other: "ExpertLocationMetadata",
+        update_layer_ids: List[int],
     ):
         for field in [
             "ep_size",
@@ -226,12 +234,21 @@ class ExpertLocationMetadata:
 
         for field in [
             "physical_to_logical_map",
+            "physical_to_logical_map_cpu",
             "logical_to_all_physical_map",
             "logical_to_all_physical_map_num_valid",
             "logical_to_rank_dispatch_physical_map",
         ]:
-            dst = getattr(self, field)
-            dst[...] = getattr(other, field)
+            other_field = getattr(other, field)
+            self_field = getattr(self, field)
+            assert (other_field is not None) == (self_field is not None)
+            if self_field is not None:
+                mask_update = torch.tensor(
+                    [i in update_layer_ids for i in range(self.num_layers)]
+                )
+                mask_update = mask_update.view(*([-1] + [1] * (self_field.dim() - 1)))
+                mask_update = mask_update.to(self_field.device, non_blocking=True)
+                self_field[...] = torch.where(mask_update, other_field, self_field)
 
     # -------------------------------- usage ------------------------------------
 
@@ -401,7 +418,6 @@ def compute_initial_expert_location_metadata(
 ) -> ExpertLocationMetadata:
     data = server_args.init_expert_location
     if data == "trivial":
-        logger.info("init_expert_location from trivial")
         return ExpertLocationMetadata.init_trivial(server_args, model_config)
 
     # TODO unify with the utils function

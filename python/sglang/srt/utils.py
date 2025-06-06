@@ -2055,6 +2055,12 @@ is_ampere_with_cuda_12_3 = lambda: _check(8)
 is_hopper_with_cuda_12_3 = lambda: _check(9)
 
 
+def is_blackwell():
+    if not is_cuda():
+        return False
+    return torch.cuda.get_device_capability()[0] == 10
+
+
 def get_free_port():
     # try ipv4
     try:
@@ -2074,6 +2080,14 @@ def get_local_ip_by_remote() -> str:
     try:
         s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
+    except Exception:
+        pass
+
+    try:
+        hostname = socket.gethostname()
+        ip = socket.gethostbyname(hostname)
+        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+            return ip
     except Exception:
         pass
 
@@ -2282,3 +2296,16 @@ except:
 
 def cpu_has_amx_support():
     return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
+
+
+class LazyValue:
+    def __init__(self, creator: Callable):
+        self._creator = creator
+        self._value = None
+
+    @property
+    def value(self):
+        if self._creator is not None:
+            self._value = self._creator()
+            self._creator = None
+        return self._value
