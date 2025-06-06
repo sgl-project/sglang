@@ -472,109 +472,137 @@ impl Router {
         }
     }
 
-    // TODO: return Result<String, String> instead of panicking
-    fn select_generate_worker(&self, body: &Bytes, route: &str) -> String {
-        let text = self.get_text_from_request(&body, route);
+    fn select_generate_worker(&self, body: &Bytes, route: &str) -> Result<String, String> {
+        match self {
+            Self::RoundRobin { .. } => self.select_worker_round_robin(),
+            Self::Random { .. } => self.select_worker_random(),
+            Self::CacheAware { .. } => self.select_worker_cache_aware(body, route),
+        }
+    }
 
-        let worker_url = match self {
-            Router::RoundRobin {
-                worker_urls,
-                current_index,
-                ..
-            } => {
-                let idx = current_index
-                    .fetch_update(
-                        std::sync::atomic::Ordering::SeqCst,
-                        std::sync::atomic::Ordering::SeqCst,
-                        |x| Some((x + 1) % worker_urls.read().unwrap().len()),
-                    )
-                    .unwrap();
-                worker_urls.read().unwrap()[idx].clone()
+    fn select_worker_round_robin(&self) -> Result<String, String> {
+        if let Self::RoundRobin {
+            worker_urls,
+            current_index,
+            ..
+        } = self
+        {
+            let urls = worker_urls.read().unwrap();
+            if urls.is_empty() {
+                return Err("No workers available for RoundRobin routing".to_string());
             }
+            let idx = current_index
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |x| Some((x + 1) % urls.len()),
+                )
+                .unwrap(); // Safe due to the empty check
+            Ok(urls[idx].clone())
+        } else {
+            unreachable!("Called select_worker_round_robin on a non-RoundRobin router");
+        }
+    }
 
-            Router::Random { worker_urls, .. } => worker_urls.read().unwrap()
-                [rand::random::<usize>() % worker_urls.read().unwrap().len()]
-            .clone(),
+    fn select_worker_random(&self) -> Result<String, String> {
+        if let Self::Random { worker_urls, .. } = self {
+            let urls = worker_urls.read().unwrap();
+            if urls.is_empty() {
+                return Err("No workers available for Random routing".to_string());
+            }
+            Ok(urls[rand::random::<usize>() % urls.len()].clone())
+        } else {
+            unreachable!("Called select_worker_random on a non-Random router");
+        }
+    }
 
-            Router::CacheAware {
-                worker_urls,
-                tree,
-                running_queue,
-                processed_queue,
-                cache_threshold,
-                balance_abs_threshold,
-                balance_rel_threshold,
-                ..
-            } => {
-                // TODO: delay scheduling if cache hit rate is high because it may cause imbalance. prioritize low hit rate ones
+    fn select_worker_cache_aware(&self, body: &Bytes, route: &str) -> Result<String, String> {
+        if let Self::CacheAware {
+            worker_urls,
+            tree,
+            running_queue,
+            processed_queue,
+            cache_threshold,
+            balance_abs_threshold,
+            balance_rel_threshold,
+            ..
+        } = self
+        {
+            let text = self.get_text_from_request(&body, route);
 
-                let tree = tree.lock().unwrap();
-                let mut running_queue = running_queue.lock().unwrap();
+            // TODO: delay scheduling if cache hit rate is high because it may cause imbalance. prioritize low hit rate ones
+            let running_queue_snapshot = running_queue.lock().unwrap().clone();
 
-                // Get current load statistics
-                let max_load = *running_queue.values().max().unwrap_or(&0);
-                let min_load = *running_queue.values().min().unwrap_or(&0);
+            // Get current load statistics
+            let max_load = *running_queue_snapshot.values().max().unwrap_or(&0);
+            let min_load = *running_queue_snapshot.values().min().unwrap_or(&0);
 
-                // Load is considered imbalanced if:
-                // 1. (max - min) > abs_threshold AND
-                // 2. max > rel_threshold * min
-                let is_imbalanced = max_load.saturating_sub(min_load) > *balance_abs_threshold
-                    && (max_load as f32) > (min_load as f32 * balance_rel_threshold);
+            // Load is considered imbalanced if:
+            // 1. (max - min) > abs_threshold AND
+            // 2. max > rel_threshold * min
+            let is_imbalanced = max_load.saturating_sub(min_load) > *balance_abs_threshold
+                && (max_load as f32) > (min_load as f32 * balance_rel_threshold);
 
-                let selected_url = if is_imbalanced {
-                    // Log load balancing trigger and current queue state
-                    info!(
-                        "Load balancing triggered due to workload imbalance:\n\
+            let selected_url = if is_imbalanced {
+                // Log load balancing trigger and current queue state
+                info!(
+                    "Load balancing triggered due to workload imbalance:\n\
                         Max load: {}, Min load: {}\n\
                         Current running queue: {:?}",
-                        max_load, min_load, running_queue
-                    );
+                    max_load, min_load, running_queue_snapshot
+                );
 
-                    counter!("sgl_router_load_balancing_events_total").increment(1);
-                    gauge!("sgl_router_max_load").set(max_load as f64);
-                    gauge!("sgl_router_min_load").set(min_load as f64);
+                counter!("sgl_router_load_balancing_events_total").increment(1);
+                gauge!("sgl_router_max_load").set(max_load as f64);
+                gauge!("sgl_router_min_load").set(min_load as f64);
 
-                    // Use shortest queue routing when load is imbalanced
-                    running_queue
-                        .iter()
-                        .min_by_key(|(_url, &count)| count)
-                        .map(|(url, _)| url.clone())
-                        .unwrap_or_else(|| worker_urls.read().unwrap()[0].clone())
-                } else {
-                    // Use cache-aware routing when load is balanced
-                    let (matched_text, matched_worker) = tree.prefix_match(&text);
-                    let matched_rate =
-                        matched_text.chars().count() as f32 / text.chars().count() as f32;
-
-                    if matched_rate > *cache_threshold {
-                        counter!("sgl_router_cache_hits_total").increment(1);
-                        matched_worker.to_string()
-                    } else {
-                        counter!("sgl_router_cache_misses_total").increment(1);
-                        tree.get_smallest_tenant()
-                    }
+                // Use shortest queue routing when load is imbalanced
+                running_queue_snapshot
+                    .iter()
+                    .min_by_key(|(_url, &count)| count)
+                    .map(|(url, _)| url.clone())
+                    .unwrap_or_else(|| worker_urls.read().unwrap()[0].clone())
+            } else {
+                // Use cache-aware routing when load is balanced
+                let (matched_text, matched_worker) = {
+                    let tree = tree.lock().unwrap();
+                    tree.prefix_match(&text)
                 };
 
-                // Update queues and tree
+                let matched_rate =
+                    matched_text.chars().count() as f32 / text.chars().count() as f32;
+
+                if matched_rate > *cache_threshold {
+                    counter!("sgl_router_cache_hits_total").increment(1);
+                    matched_worker.to_string()
+                } else {
+                    counter!("sgl_router_cache_misses_total").increment(1);
+                    tree.lock().unwrap().get_smallest_tenant()
+                }
+            };
+
+            // Update queues and tree
+            {
+                let mut running_queue = running_queue.lock().unwrap();
                 *running_queue.get_mut(&selected_url).unwrap() += 1;
-
-                *processed_queue
-                    .lock()
-                    .unwrap()
-                    .get_mut(&selected_url)
-                    .unwrap() += 1;
-
-                gauge!("sgl_router_running_requests", "worker" => selected_url.to_string())
-                    .set(*running_queue.get(&selected_url).unwrap() as f64);
-                counter!("sgl_router_processed_requests_total", "worker" => selected_url.to_string()).increment(1);
-
-                tree.insert(&text, &selected_url);
-
-                selected_url
             }
-        };
 
-        worker_url
+            {
+                let mut processed_queue = processed_queue.lock().unwrap();
+                *processed_queue.get_mut(&selected_url).unwrap() += 1;
+            }
+
+            gauge!("sgl_router_running_requests", "worker" => selected_url.to_string())
+                .increment(1);
+            counter!("sgl_router_processed_requests_total", "worker" => selected_url.to_string())
+                .increment(1);
+
+            tree.lock().unwrap().insert(&text, &selected_url);
+
+            Ok(selected_url)
+        } else {
+            unreachable!("Called select_worker_cache_aware on a non-CacheAware router");
+        }
     }
 
     async fn send_generate_request(
@@ -673,7 +701,14 @@ impl Router {
         let mut total_retries = 0;
 
         while total_retries < MAX_TOTAL_RETRIES {
-            let worker_url = self.select_generate_worker(body, route);
+            let worker_url = match self.select_generate_worker(body, route) {
+                Ok(url) => url,
+                Err(e) => {
+                    // If there are no workers, we can't continue. Return 503 Service Unavailable.
+                    error!("Failed to select worker: {}", e);
+                    return HttpResponse::ServiceUnavailable().body(e);
+                }
+            };
             let mut request_retries = 0;
 
             // Try the same worker multiple times
