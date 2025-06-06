@@ -629,3 +629,69 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope(
 
   return std::make_tuple(q_input, k_input, v_input);
 }
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_qkv_proj_with_rope(
+    at::Tensor& hidden_states,
+    at::Tensor& qkv_a_proj_weight,
+    at::Tensor& q_b_proj_weight,
+    at::Tensor& w_kc,
+    at::Tensor& q_a_layernorm_weight,
+    at::Tensor& kv_a_layernorm_weight,
+    at::Tensor& positions,
+    at::Tensor& cos_sin_cache,
+    double eps,
+    bool use_int8_w8a8,
+    bool use_fp8_w8a16,
+    std::optional<at::Tensor> qkv_a_proj_scale,
+    std::optional<at::Tensor> q_b_proj_scale,
+    bool is_vnni,
+    std::optional<std::vector<int64_t>> block_size,
+    int64_t q_lora_rank,
+    int64_t kv_lora_rank,
+    int64_t qk_rope_head_dim) {
+  RECORD_FUNCTION(
+      "sgl-kernel::fused_qkv_proj_with_rope",
+      std::vector<c10::IValue>({hidden_states, qkv_a_proj_weight, q_b_proj_weight, w_kc}));
+
+  int64_t hidden_size = hidden_states.size(1);
+  CHECK_EQ(qkv_a_proj_weight.size(0), q_lora_rank + kv_lora_rank + qk_rope_head_dim);
+  CHECK_EQ(qkv_a_proj_weight.size(1), get_row_size(hidden_size, use_int8_w8a8));
+
+  at::Tensor q_a_proj_weight = qkv_a_proj_weight.narrow(0, 0, q_lora_rank).contiguous();
+  at::Tensor kv_a_proj_weight = qkv_a_proj_weight.narrow(0, q_lora_rank, kv_lora_rank + qk_rope_head_dim).contiguous();
+  at::Tensor q_a_proj_s;
+  at::Tensor kv_a_proj_s;
+
+  if (use_int8_w8a8) {
+    TORCH_CHECK(qkv_a_proj_scale.has_value(), "missing qkv_a_proj_scale for int8 w8a8.");
+    q_a_proj_s = qkv_a_proj_scale.value().narrow(0, 0, q_lora_rank).contiguous();
+    kv_a_proj_s = qkv_a_proj_scale.value().narrow(0, q_lora_rank, kv_lora_rank + qk_rope_head_dim).contiguous();
+  }
+  if (use_fp8_w8a16) {
+    TORCH_CHECK(qkv_a_proj_scale.has_value(), "missing qkv_a_proj_scale for fp8 w8a16.");
+    int64_t block_size_N = block_size.value()[0];
+    int64_t q_a_proj_s_dim0 = div_up(q_lora_rank, block_size_N);
+    int64_t kv_a_proj_s_dim0 = div_up(kv_lora_rank + qk_rope_head_dim, block_size_N);
+    q_a_proj_s = qkv_a_proj_scale.value().narrow(0, 0, q_a_proj_s_dim0).contiguous();
+    kv_a_proj_s = qkv_a_proj_scale.value().narrow(0, q_a_proj_s_dim0, kv_a_proj_s_dim0).contiguous();
+  }
+
+  return qkv_proj_with_rope(
+      hidden_states,
+      q_a_proj_weight,
+      q_b_proj_weight,
+      kv_a_proj_weight,
+      w_kc,
+      q_a_layernorm_weight,
+      kv_a_layernorm_weight,
+      positions,
+      cos_sin_cache,
+      eps,
+      use_int8_w8a8,
+      use_fp8_w8a16,
+      q_a_proj_s,
+      q_b_proj_scale,
+      kv_a_proj_s,
+      is_vnni,
+      block_size);
+}
