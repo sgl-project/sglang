@@ -40,7 +40,7 @@ def ref_mla(
 @pytest.mark.parametrize("bs", [1, 2, 4])
 @pytest.mark.parametrize("varlen", [False, True])
 @pytest.mark.parametrize("block_size", [1, 16, 64, 128])
-@pytest.mark.parametrize("num_heads", [128])
+@pytest.mark.parametrize("num_heads", [16, 32, 64, 128])
 def test_cutlass_mla_decode(
     dtype: torch.dtype,
     mean_seq_len: int,

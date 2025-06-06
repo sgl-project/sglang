@@ -7,7 +7,7 @@ import triton
 from sgl_kernel import cutlass_mla_decode, cutlass_mla_get_workspace_size
 
 bs_range = [1, 8, 32, 64, 128, 256]
-qlen_range = [1, 64, 128, 256, 512, 1024, 2048]
+qlen_range = [1, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
 
 configs = list(itertools.product(bs_range, qlen_range))
 
@@ -20,15 +20,15 @@ configs = list(itertools.product(bs_range, qlen_range))
         line_arg="provider",
         line_vals=[
             "128 heads",
-            # "64 heads",
-            # "32 heads",
-            # "16 heads",
+            "64 heads",
+            "32 heads",
+            "16 heads",
         ],
         line_names=[
             "128 heads",
-            # "64 heads",
-            # "32 heads",
-            # "16 heads",
+            "64 heads",
+            "32 heads",
+            "16 heads",
         ],
         styles=[("green", "-"), ("green", "--"), ("blue", "-"), ("blue", "--")],
         ylabel="GB/s",
