@@ -527,8 +527,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hook,
     ):
         if _DEBUG_LL_INSERT_SLOWNESS:
-            mat_0 = torch.zeros((1024, 1024), dtype=torch.float)
-            mat_1 = torch.zeros((1024, 1024), dtype=torch.float)
+            device = hidden_states.device
+            mat_0 = torch.zeros((2048, 2048), dtype=torch.float, device=device)
+            mat_1 = torch.zeros((2048, 2048), dtype=torch.float, device=device)
             mat_0 @ mat_1
 
         hook() if self.return_recv_hook else event.current_stream_wait()
@@ -617,8 +618,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
     def combine_b(self, hidden_states, event, hook):
         if _DEBUG_LL_INSERT_SLOWNESS:
-            mat_0 = torch.zeros((1024, 1024), dtype=torch.float)
-            mat_1 = torch.zeros((1024, 1024), dtype=torch.float)
+            device = hidden_states.device
+            mat_0 = torch.zeros((2048, 2048), dtype=torch.float, device=device)
+            mat_1 = torch.zeros((2048, 2048), dtype=torch.float, device=device)
             mat_0 @ mat_1
 
         hook() if self.return_recv_hook else event.current_stream_wait()
