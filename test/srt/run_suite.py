@@ -176,9 +176,9 @@ suites = {
         TestFile("test_deepep_intranode.py"),
         TestFile("test_deepep_low_latency.py"),
         TestFile("test_double_sparsity.py"),
-        TestFile('test_eplb.py'),
-        TestFile('test_expert_distribution.py'),
-        TestFile('test_expert_location_updater.py'),
+        TestFile("test_eplb.py"),
+        TestFile("test_expert_distribution.py"),
+        TestFile("test_expert_location_updater.py"),
         TestFile("test_eval_accuracy_large.py"),
         TestFile("test_fim_completion.py"),
         TestFile("test_fp8_kvcache.py"),
@@ -205,7 +205,7 @@ suites = {
         TestFile("test_torch_tp.py"),
         TestFile("test_triton_attention_rocm_mla.py"),
         TestFile("test_triton_moe_wna16.py"),
-        TestFile('test_two_batch_overlap.py'),
+        TestFile("test_two_batch_overlap.py"),
         TestFile("test_verl_engine.py"),
         TestFile("test_verl_engine_server.py"),
         TestFile("test_vision_openai_server.py"),
@@ -325,7 +325,7 @@ if __name__ == "__main__":
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
     else:
-        files = files[args.range_begin: args.range_end]
+        files = files[args.range_begin : args.range_end]
 
     print("The running tests are ", [f.name for f in files])
 
