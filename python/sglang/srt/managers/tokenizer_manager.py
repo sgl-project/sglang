@@ -186,8 +186,9 @@ class TokenizerManager:
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
         self.send_to_scheduler = get_zmq_socket(
-            context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+            context, zmq.PUSH, port_args.scheduler_input_ipc_name, False
         )
+        self.workder_id = os.getpid()
 
         # Read model args
         self.model_path = server_args.model_path
@@ -406,7 +407,16 @@ class TokenizerManager:
         request: Optional[fastapi.Request] = None,
     ):
         created_time = time.time()
-
+         # 获取当前 worker 的 ID
+        worker_id = os.getpid()
+        
+        # 修改 rid，添加 worker_id
+        if isinstance(obj.rid, list):
+            # 如果是数组，为每个元素添加 worker_id 前缀
+            obj.rid = [f"{worker_id}_{rid}" for rid in obj.rid]
+        else:
+            # 如果是单个值，在前面添加 worker_id
+            obj.rid = f"{worker_id}_{obj.rid}"
         self.auto_create_handle_loop()
 
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:

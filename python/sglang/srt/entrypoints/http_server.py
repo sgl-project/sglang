@@ -23,11 +23,14 @@ import json
 import logging
 import multiprocessing as multiprocessing
 import os
+import tempfile
 import threading
 import time
 from http import HTTPStatus
 from typing import AsyncIterator, Callable, Dict, Optional
-
+from multiprocessing import shared_memory, Lock, Value, Manager
+import ctypes
+import sys
 # Fix a bug of Python threading
 setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
@@ -86,7 +89,7 @@ from sglang.srt.openai_api.adapter import (
 )
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.reasoning_parser import ReasoningParser
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
     add_prometheus_middleware,
@@ -98,6 +101,8 @@ from sglang.srt.utils import (
 from sglang.srt.warmup import execute_warmups
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
+from sglang.srt.openai_api.adapter import load_chat_template_for_openai_api
+from sglang.srt.code_completion_parser import load_completion_template_for_openai_api
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -117,20 +122,220 @@ def set_global_state(global_state: _GlobalState):
     global _global_state
     _global_state = global_state
 
+def serialize_port_args(port_args: PortArgs) -> dict:
+    """将 PortArgs 序列化为可共享的字典"""
+    return {
+        "tokenizer_ipc_name": port_args.tokenizer_ipc_name,
+        "scheduler_input_ipc_name": port_args.scheduler_input_ipc_name,
+        "detokenizer_ipc_name": port_args.detokenizer_ipc_name,
+        "nccl_port": port_args.nccl_port,
+        "rpc_ipc_name": port_args.rpc_ipc_name,
+    }
+
+def deserialize_port_args(data: dict) -> PortArgs:
+    """从共享的字典反序列化为 PortArgs"""
+    return PortArgs(**data)
+
+def serialize_server_args(server_args: ServerArgs) -> dict:
+    """将 ServerArgs 序列化为可共享的字典"""
+    return dataclasses.asdict(server_args)
+
+def deserialize_server_args(data: dict) -> ServerArgs:
+    """从共享的字典反序列化为 ServerArgs"""
+    return ServerArgs(**data)
+
+def serialize_scheduler_info(scheduler_info: Dict) -> dict:
+    """将 scheduler_info 序列化为可共享的字典"""
+    return scheduler_info
+
+def deserialize_scheduler_info(data: dict) -> Dict:
+    """从共享的字典反序列化为 scheduler_info"""
+    return data
+
+def write_to_shared_memory(data: dict, name: str) -> shared_memory.SharedMemory:
+    """将数据写入共享内存"""
+    serialized = json.dumps(data).encode('utf-8')
+    size = len(serialized)
+    try:
+        # 尝试打开已存在的共享内存
+        shm = shared_memory.SharedMemory(name=name)
+        # 如果大小不够，关闭并重新创建
+        if shm.size < size:
+            shm.close()
+            shm.unlink()
+            shm = shared_memory.SharedMemory(create=True, size=size, name=name)
+    except FileNotFoundError:
+        # 如果不存在，创建新的共享内存
+        shm = shared_memory.SharedMemory(create=True, size=size, name=name)
+    
+    shm.buf[:size] = serialized
+    return shm
+
+def read_from_shared_memory(name: str) -> dict:
+    """从共享内存读取数据"""
+    try:
+        shm = shared_memory.SharedMemory(name=name)
+        data = json.loads(bytes(shm.buf).decode('utf-8'))
+        shm.close()
+        return data
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Shared memory {name} not found")
+
+def get_main_process_id() -> int:
+    """获取主进程的 ID"""
+    return multiprocessing.current_process()._parent_pid
+
+def serialize_tokenizer_mapping(mapping: Dict[int, str]) -> dict:
+    """将 tokenizer_ipc_name 映射序列化为可共享的字典"""
+    return mapping
+
+def deserialize_tokenizer_mapping(data: dict) -> Dict[int, str]:
+    """从共享的字典反序列化为 tokenizer_ipc_name 映射"""
+    return data
+
+def create_shared_lock() -> Lock:
+    """创建一个共享的锁"""
+    return Lock()
+
+def update_tokenizer_mapping(worker_id: int, ipc_name: str, shm_name: str, lock_value: Value) -> tuple[shared_memory.SharedMemory, int]:
+    """更新或创建 tokenizer_ipc_name 映射"""
+    with lock_value.get_lock():  # 使用共享锁确保进程间同步
+        try:
+            # 尝试读取现有的映射
+            existing_data = read_from_shared_memory(shm_name)
+            mapping = deserialize_tokenizer_mapping(existing_data)
+        except FileNotFoundError:
+            # 如果不存在，创建新的映射
+            mapping = {}
+        
+        # 更新映射
+        mapping[worker_id] = ipc_name
+        print(f"worker_id:{worker_id}, mapping:{mapping}")
+        
+        # 写入共享内存
+        shm = write_to_shared_memory(
+            serialize_tokenizer_mapping(mapping),
+            shm_name,
+        )
+        return shm, len(mapping)
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
-    server_args: ServerArgs = fast_api_app.server_args
-    if server_args.warmups is not None:
-        await execute_warmups(
-            server_args.warmups.split(","), _global_state.tokenizer_manager
-        )
-        logger.info("Warmup ended")
+    server_args = getattr(fast_api_app, "server_args", None)
+    if server_args is not None:
+        if server_args.warmups is not None:
+            await execute_warmups(
+                server_args.warmups.split(","), _global_state.tokenizer_manager
+            )
+            logger.info("Warmup ended")
 
-    warmup_thread = getattr(fast_api_app, "warmup_thread", None)
-    if warmup_thread is not None:
+        warmup_thread = getattr(fast_api_app, "warmup_thread", None)
+        if warmup_thread is not None:
+            warmup_thread.start()
+    else:
+        pid = os.getpid()
+        main_pid = get_main_process_id()
+        print(f"current worker_id: {pid}, main processID: {main_pid}")
+        
+        # 从共享内存读取 port_args、server_args 和 scheduler_info
+        max_retries = 5
+        retry_delay = 1  # 秒
+        
+        for retry in range(max_retries):
+            try:
+                port_args_data = read_from_shared_memory(f"port_args_{main_pid}")
+                server_args_data = read_from_shared_memory(f"server_args_{main_pid}")
+                scheduler_info_data = read_from_shared_memory(f"scheduler_info_{main_pid}")
+                lock_data = read_from_shared_memory(f"mapping_lock_{main_pid}")
+                break
+            except FileNotFoundError as e:
+                if retry < max_retries - 1:
+                    print(f"等待共享内存就绪，重试 {retry + 1}/{max_retries}")
+                    time.sleep(retry_delay)
+                else:
+                    raise Exception(f"无法访问共享内存: {e}")
+        
+        lock_value = Value(ctypes.c_int, lock_data["lock_value"])
+        
+        port_args = deserialize_port_args(port_args_data)
+        server_args = deserialize_server_args(server_args_data)
+        scheduler_info = deserialize_scheduler_info(scheduler_info_data)
+        
+        port_args.tokenizer_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        
+        # 使用共享锁更新 tokenizer_ipc_name 映射
+        tokenizer_mapping_shm, mapping_len = update_tokenizer_mapping(
+            pid,
+            port_args.tokenizer_ipc_name,
+            f"tokenizer_mapping_{main_pid}",
+            lock_value
+        )
+        
+        # Launch tokenizer process
+        tokenizer_manager = TokenizerManager(server_args, port_args)
+        if server_args.chat_template:
+            load_chat_template_for_openai_api(
+                tokenizer_manager, server_args.chat_template, server_args.model_path
+            )
+        if server_args.completion_template:
+            load_completion_template_for_openai_api(server_args.completion_template)
+        tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+        set_global_state(
+            _GlobalState(
+                tokenizer_manager=tokenizer_manager,
+                scheduler_info=scheduler_info,
+            )
+        )
+        
+        print(f"mapping_length={mapping_len},worker_num={server_args.worker_num}")
+        # 检查是否所有 worker 都已注册
+        
+        if server_args.warmups is not None:
+            logger.info("Warmup started")
+            await execute_warmups(
+                server_args.warmups.split(","), _global_state.tokenizer_manager
+            )
+            logger.info("Warmup ended")
+        # wait detokenizer manager register zmq
+        time.sleep(12)
+        logger.info("warmup_thread start")
+        print(f"warmup_thread start p")
+        
+        # 为每个 worker 创建自己的 warmup 线程
+        warmup_thread = threading.Thread(
+            target=_wait_and_warmup,
+            args=(
+                server_args,
+                None,  # pipe_finish_writer 在 worker 中不需要
+                _global_state.tokenizer_manager.image_token_id,
+                None,  # launch_callback 在 worker 中不需要
+            ),
+        )
+        print(f"warmup_thread start warmup_thread={warmup_thread}")
         warmup_thread.start()
-    yield
+        
+        print(f"worker {pid} started")
+    try:
+        yield
+    finally:
+        if server_args.worker_num > 1:
+            print(f"worker {pid} ending")
+            # 清理共享内存
+            try:
+                if "warmup_thread" in locals() and warmup_thread.is_alive():
+                    warmup_thread.join()
+                with lock_value.get_lock():  # 使用共享锁确保清理时的进程间同步
+                    tokenizer_mapping_shm.close()
+                    # 检查是否还有其他 worker 在使用这个映射
+                    try:
+                        mapping = deserialize_tokenizer_mapping(read_from_shared_memory(f"tokenizer_mapping_{main_pid}"))
+                        if len(mapping) <= 1:  # 如果只有当前 worker 在使用
+                            tokenizer_mapping_shm.unlink()
+                    except FileNotFoundError:
+                        pass
+            except Exception as e:
+                print(f"清理共享内存时出错: {e}")
+            print(f"worker {pid} ended")
 
 
 # Fast API
@@ -753,7 +958,54 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
+    port_args = PortArgs.init_new(server_args)
+    tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args, port_args=port_args)
+    if server_args.worker_num > 1 :
+        # get main process ID
+        main_pid = get_main_process_id()
+        current_pid = os.getpid()
+        logger.info(f"main process ID: {main_pid}, current process ID: {current_pid}")
+        
+        # 创建共享的锁值
+        lock_value = Value(ctypes.c_int, 0)
+        
+        # 将 port_args 和 server_args 写入共享内存
+        port_args_shm = write_to_shared_memory(
+            serialize_port_args(port_args), 
+            f"port_args_{os.getpid()}"
+        )
+        server_args_shm = write_to_shared_memory(
+            serialize_server_args(server_args), 
+            f"server_args_{os.getpid()}"
+        )
+        
+        # 将锁值的地址写入共享内存
+        lock_shm = write_to_shared_memory(
+            {"lock_value": lock_value.value},
+            f"mapping_lock_{os.getpid()}"
+        )
+        
+        
+        
+        # 将 scheduler_info 写入共享内存
+        scheduler_info_shm = write_to_shared_memory(
+            serialize_scheduler_info(scheduler_info),
+            f"scheduler_info_{os.getpid()}"
+        )
+        port_args_shm.close()
+        server_args_shm.close()
+        scheduler_info_shm.close()
+        lock_shm.close()
+    else:
+        warmup_thread = threading.Thread(
+        target=_wait_and_warmup,
+        args=(
+            server_args,
+            pipe_finish_writer,
+            _global_state.tokenizer_manager.image_token_id,
+            launch_callback,
+        ),
+    )
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
@@ -788,16 +1040,33 @@ def launch_server(
         set_uvicorn_logging_configs()
         app.server_args = server_args
         # Listen for HTTP requests
-        uvicorn.run(
-            app,
+        if server_args.worker_num > 1:
+            uvicorn.run(
+            "sglang.srt.entrypoints.http_server:app",
             host=server_args.host,
             port=server_args.port,
             log_level=server_args.log_level_http or server_args.log_level,
             timeout_keep_alive=5,
             loop="uvloop",
+            workers=server_args.worker_num,
         )
+        else:
+            uvicorn.run(
+                "app",
+                host=server_args.host,
+                port=server_args.port,
+                log_level=server_args.log_level_http or server_args.log_level,
+                timeout_keep_alive=5,
+                loop="uvloop",
+            )
     finally:
-        warmup_thread.join()
+        if server_args.worker_num > 1:
+            port_args_shm.unlink()
+            server_args_shm.unlink()
+            scheduler_info_shm.unlink()
+            lock_shm.unlink()
+        else:
+            warmup_thread.join()
 
 
 def _wait_and_warmup(
