@@ -1,0 +1,13 @@
+FROM sgl_noflash:cu124
+
+COPY flashinfer-0.0.2+cu121torch2.2-cp310-cp310-linux_x86_64.whl ./
+RUN pyhton3 -m pip install flashinfer-0.0.2+cu121torch2.2-cp310-cp310-linux_x86_64.whl
+RUN cd sglang \
+&& python3 -m pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.6/flashinfer-python
+
+RUN python3 -m pip cache purge
+
+ENV DEBIAN_FRONTEND=interactive
+
+LABEL version=cu124
+LABEL maintainer="base_model"

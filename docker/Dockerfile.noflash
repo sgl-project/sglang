@@ -1,0 +1,20 @@
+FROM sgl_base:cu124
+
+RUN pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+RUN pip3 install datamodel_code_generator
+
+WORKDIR /sgl-workspace
+
+RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six
+RUN git clone --depth=1 https://github.com/sgl-project/sglang.git 
+RUN python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu124
+RUN python3 -m pip install vllm
+# RUN cd sglang \
+# && python3 -m pip install -e "python[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.6/flashinfer-python
+
+RUN python3 -m pip cache purge
+
+ENV DEBIAN_FRONTEND=interactive
+
+LABEL version=cu124
+LABEL maintainer="sgl_noflash"
