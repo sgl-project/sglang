@@ -129,8 +129,7 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor k_rope,
     at::Tensor cos_sin_cache,
     at::Tensor pos_ids,
-    bool interleave,
-    int64_t cuda_stream);
+    bool interleave);
 
 /*
  * From csrc/gemm
@@ -190,8 +189,7 @@ void bmm_fp8(
     at::Tensor A_scale,
     at::Tensor B_scale,
     at::Tensor workspace_buffer,
-    int64_t cublas_handle,
-    int64_t cuda_stream);
+    int64_t cublas_handle);
 
 /*
  * From csrc/moe
