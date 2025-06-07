@@ -1719,7 +1719,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                     logger,
                     "Only Deepseek V3/R1 on NV-platform can use shared experts fusion optimization. Shared experts fusion optimization is disabled.",
                 )
-            elif (global_server_args_dict["enable_deepep_moe"] or global_server_args_dict["enable_ep_moe"]):
+            elif (
+                global_server_args_dict["enable_deepep_moe"]
+                or global_server_args_dict["enable_ep_moe"]
+            ):
                 self.num_fused_shared_experts = 0
                 global_server_args_dict["disable_shared_experts_fusion"] = True
                 log_info_on_rank0(
