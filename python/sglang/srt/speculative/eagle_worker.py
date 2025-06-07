@@ -293,6 +293,7 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
+
         if batch.forward_mode.is_decode():
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
@@ -319,6 +320,7 @@ class EAGLEWorker(TpModelWorker):
 
             return logits_output, next_token_ids, model_worker_batch.bid, 0, False
         else:
+
             logits_output, next_token_ids, bid = self.forward_target_extend(batch)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.forward_draft_extend(
@@ -427,10 +429,10 @@ class EAGLEWorker(TpModelWorker):
         batch.out_cache_loc = out_cache_loc
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
-
-        # Get forward batch
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
@@ -521,9 +523,11 @@ class EAGLEWorker(TpModelWorker):
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         spec_info.prepare_for_verify(batch, self.page_size)
+        batch.return_hidden_states = False
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = spec_info
         model_worker_batch = batch.get_model_worker_batch()
+        assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
         if batch.has_grammar:
             retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
@@ -658,13 +662,16 @@ class EAGLEWorker(TpModelWorker):
             hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # Sometimes we get hidden states produced by CaptureHiddenMode.FULL, so we have to select just the last
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids,
         )
+        batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch = batch.get_model_worker_batch()
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
@@ -691,7 +698,9 @@ class EAGLEWorker(TpModelWorker):
         )
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         batch.return_logprob = False
+        batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
