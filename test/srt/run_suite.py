@@ -1,6 +1,7 @@
 import argparse
 import glob
 from dataclasses import dataclass
+from pathlib import Path
 
 from sglang.test.test_utils import run_unittest_files
 
@@ -150,7 +151,80 @@ suites = {
         TestFile("test_gptqmodel_dynamic.py", 72),
         TestFile("test_vllm_dependency.py"),
     ],
+    "not_in_ci": [
+        "cpu/test_rope.py",
+        "cpu/test_topk.py",
+        "cpu/utils.py",
+        "experiment_runner.py",
+        "models/compare.py",
+        "models/lora/utils.py",
+        "models/test_clip_models.py",
+        "models/test_dummy_grok_models.py",
+        "models/test_encoder_embedding_models.py",
+        "models/test_gme_qwen_models.py",
+        "models/test_grok_models.py",
+        "models/test_llama4_models.py",
+        "models/test_mtp_models.py",
+        "models/test_unsloth_models.py",
+        "parse_results.py",
+        "run_suite.py",
+        "test_bench_one_batch.py",
+        "test_bench_serving.py",
+        "test_cache_report.py",
+        "test_custom_allreduce.py",
+        "test_deepep_internode.py",
+        "test_deepep_intranode.py",
+        "test_deepep_low_latency.py",
+        "test_double_sparsity.py",
+        "test_eval_accuracy_large.py",
+        "test_fim_completion.py",
+        "test_fp8_kvcache.py",
+        "test_function_calling.py",
+        "test_get_weights_by_name.py",
+        "test_health_check.py",
+        "test_hicache_page.py",
+        "test_io_struct.py",
+        "test_json_mode.py",
+        "test_kv_events.py",
+        "test_matched_stop.py",
+        "test_modelopt.py",
+        "test_modelopt_fp8kvcache.py",
+        "test_models_from_modelscope.py",
+        "test_moe_deepep.py",
+        "test_moe_deepep_eval_accuracy_large.py",
+        "test_moe_eval_accuracy_large.py",
+        "test_mscclpp.py",
+        "test_sagemaker_server.py",
+        "test_schedule_policy.py",
+        "test_score_api.py",
+        "test_session_control.py",
+        "test_srt_engine_with_quant_args.py",
+        "test_torch_tp.py",
+        "test_triton_attention_rocm_mla.py",
+        "test_triton_moe_wna16.py",
+        "test_verl_engine.py",
+        "test_verl_engine_server.py",
+        "test_vision_openai_server.py",
+        "test_vision_openai_server_common.py",
+        "test_vlm_accuracy.py",
+    ],
 }
+
+
+def _sanity_check_suites(suites):
+    dir_base = Path(__file__).parent
+    disk_files = set([str(x.relative_to(dir_base)) for x in dir_base.glob("**/*.py")])
+
+    suite_files = set(
+        [test_file.name for _, suite in suites.items() for test_file in suite]
+    )
+
+    missing_files = sorted(list(disk_files - suite_files))
+    assert len(missing_files) == 0, (
+        f"Some test files are not in test suite. "
+        f"If this is intentional, please add to `not_in_ci` section. "
+        f"{missing_files=}"
+    )
 
 
 def auto_partition(files, rank, size):
@@ -236,6 +310,8 @@ if __name__ == "__main__":
     )
     args = arg_parser.parse_args()
     print(f"{args=}")
+
+    _sanity_check_suites(suites)
 
     if args.suite == "all":
         files = glob.glob("**/test_*.py", recursive=True)
