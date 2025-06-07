@@ -46,7 +46,7 @@ template <typename T, int N>
 using Array = AlignedArray<T, N>;
 // QQ: NOTE expression must have a constant value, this has to be > params.VPT
 template <typename T>
-using AccessType = AlignedArray<T, (N > 128 ? 128 : N)>;
+using AccessType = AlignedArray<T, MAX_VPT>;
 // Process up to 32 elements at a time, with the excess handled via tiling.
 
 template <typename T, typename Params>
@@ -101,8 +101,9 @@ __device__ void moe_fused_gate_impl(
     // Read row_chunk and bias_chunk
     #pragma unroll
       for (int ii = 0; ii < tile_size; ++ii) {
-        row_chunk[tile_offset + ii] = vec_thread_read_ptr[tile][ii];
-        bias_chunk[tile_offset + ii] = vec_bias_thread_read_ptr[tile][ii];
+        int global_idx = tile_offset + ii;
+        row_chunk[global_idx] = vec_thread_read_ptr[0][global_idx];
+        bias_chunk[global_idx] = vec_bias_thread_read_ptr[0][global_idx];
       }
 
       __syncthreads();
