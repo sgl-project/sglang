@@ -467,7 +467,8 @@ class RadixCache(BasePrefixCache):
             if node.parent is None:
                 parent_block_hash = None
             else:
-                parent_parent_tokens = node.parent.key[-self.page_size :]
+                last_page_start = ((len(node.parent.key) - 1) // self.page_size) * self.page_size
+                parent_parent_tokens = node.parent.key[last_page_start:]
                 parent_block_hash = hash(tuple(parent_parent_tokens))
 
             for start in range(0, len(node.key), self.page_size):
