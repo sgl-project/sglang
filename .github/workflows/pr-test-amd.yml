@@ -222,6 +222,7 @@ jobs:
     strategy:
       matrix:
         runner: [linux-mi300-gpu-1, linux-mi325-gpu-1]
+    runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
