@@ -37,6 +37,12 @@ class BaseGrammarObject:
         """
         raise NotImplementedError()
 
+    def rollback(self, k: int):
+        raise NotImplementedError()
+
+    def is_terminated(self):
+        return False
+
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
@@ -54,7 +60,7 @@ class BaseGrammarObject:
         raise NotImplementedError()
 
     def copy(self) -> "BaseGrammarObject":
-        raise NotImplementedError()
+        return self
 
     @property
     def finished(self):
@@ -93,9 +99,12 @@ class BaseGrammarObject:
         raise NotImplementedError()
 
 
+INVALID_GRAMMAR_OBJ = BaseGrammarObject()
+
+
 @dataclass
 class CacheEntry:
-    value: Optional[BaseGrammarObject]
+    value: BaseGrammarObject
     event: Event
 
 

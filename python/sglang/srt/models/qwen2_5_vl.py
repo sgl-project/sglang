@@ -146,6 +146,8 @@ class Qwen2_5_VisionBlock(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
+            rotary_embed="normal",
+            proj_bias=True,
             qkv_backend=qkv_backend,
             softmax_in_single_precision=softmax_in_single_precision,
             flatten_batch=flatten_batch,
@@ -501,10 +503,10 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
             self.visual.dtype
         )
-        image_grid_thws = torch.concat([item.image_grid_thws for item in items], dim=0)
+        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
-        assert image_grid_thws.dim() == 2, image_grid_thws.dim()
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thws)
+        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
 
     def _process_video_input(self, video_input: Qwen2VLVideoInputs) -> torch.Tensor:
