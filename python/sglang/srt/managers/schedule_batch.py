@@ -37,6 +37,7 @@ import hashlib
 import logging
 import threading
 from enum import Enum, auto
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -51,6 +52,7 @@ from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -60,7 +62,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, get_compiler_backend, support_triton
+from sglang.srt.utils import flatten_nested_list, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -87,7 +89,7 @@ global_server_args_dict = {
     "max_micro_batch_size": ServerArgs.max_micro_batch_size,
     "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
     "ep_dispatch_algorithm": ServerArgs.ep_dispatch_algorithm,
-    "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
+    "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
     "sampling_backend": ServerArgs.sampling_backend,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
@@ -186,7 +188,7 @@ class MultimodalDataItem:
     # the real data, pixel_values or audio_features
     # data: Union[List[torch.Tensor], List[np.ndarray]]
     pixel_values: Union[torch.Tensor, np.ndarray] = None
-    image_grid_thws: Union[torch.Tensor, np.ndarray] = None
+    image_grid_thw: Union[torch.Tensor, np.ndarray] = None
     video_grid_thws: Union[torch.Tensor, np.ndarray] = None
 
     image_emb_mask: Optional[torch.Tensor] = None
@@ -195,6 +197,9 @@ class MultimodalDataItem:
 
     # [num_images, (n, w, h)]
     tgt_size: Tuple[int, int] = None
+
+    # kimi-vl related
+    image_grid_hws: Optional[List[torch.Tensor]] = None
 
     audio_features: Union[torch.Tensor, np.ndarray] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
@@ -771,6 +776,16 @@ class Req:
         logger.info(f"{prefix}: {self.time_stats}")
         self.has_log_time_stats = True
 
+    def set_finish_with_abort(self, error_msg: str):
+        if get_tensor_model_parallel_rank() == 0:
+            logger.error(f"{error_msg}, {self.rid=}")
+        self.multimodal_inputs = None
+        self.grammar = None
+        self.origin_input_ids = [0]  # set it to one token to skip the long prefill
+        self.finished_reason = FINISH_ABORT(
+            error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+        )
+
     def __repr__(self):
         return (
             f"Req(rid={self.rid}, "
@@ -1321,7 +1336,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         page_size = self.token_to_kv_pool_allocator.page_size
         if page_size == 1:
             return len(self.reqs)
-        return sum(1 for req in self.reqs if req.seqlen % page_size == 0)
+        # In the decoding phase, the length of a request's KV cache should be
+        # the total length of the request minus 1
+        return sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
 
     def check_decode_mem(self, buf_multiplier=1):
         tokens_required = (

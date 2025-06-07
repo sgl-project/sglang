@@ -35,6 +35,7 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
+    set_mscclpp_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
@@ -204,7 +205,7 @@ class ModelRunner:
                 "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
                 "moe_dense_tp_size": server_args.moe_dense_tp_size,
                 "ep_dispatch_algorithm": server_args.ep_dispatch_algorithm,
-                "n_share_experts_fusion": server_args.n_share_experts_fusion,
+                "disable_shared_experts_fusion": server_args.disable_shared_experts_fusion,
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
                 "torchao_config": server_args.torchao_config,
                 "sampling_backend": server_args.sampling_backend,
@@ -354,6 +355,15 @@ class ModelRunner:
                 # MLA architecture
                 if is_hopper_with_cuda_12_3():
                     server_args.attention_backend = "fa3"
+                elif _is_hip:
+                    head_num = self.model_config.get_num_kv_heads(self.tp_size)
+                    # TODO current aiter only support head number 16 or 128 head number
+                    if (
+                        head_num == 128 or head_num == 16
+                    ) and self.spec_algorithm.is_none():
+                        server_args.attention_backend = "aiter"
+                    else:
+                        server_args.attention_backend = "triton"
                 else:
                     server_args.attention_backend = "triton"
             logger.info(
@@ -362,6 +372,7 @@ class ModelRunner:
         elif self.use_mla_backend:
             if server_args.device != "cpu":
                 if server_args.attention_backend in [
+                    "aiter",
                     "flashinfer",
                     "fa3",
                     "triton",
@@ -460,6 +471,7 @@ class ModelRunner:
         else:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
+        set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
 
         if not self.is_draft_worker:
             # Only initialize the distributed environment on the target model worker.
@@ -609,11 +621,14 @@ class ModelRunner:
             ) from None
 
     def update_expert_location(
-        self, new_expert_location_metadata: ExpertLocationMetadata
+        self,
+        new_expert_location_metadata: ExpertLocationMetadata,
+        update_layer_ids: List[int],
     ):
         self.expert_location_updater.update(
             self.model.routed_experts_weights_of_layer,
             new_expert_location_metadata,
+            update_layer_ids=update_layer_ids,
             nnodes=self.server_args.nnodes,
             rank=self.tp_rank,
         )
@@ -918,7 +933,7 @@ class ModelRunner:
 
         if self.req_to_token_pool is None:
             self.req_to_token_pool = ReqToTokenPool(
-                size=max_num_reqs + 1,
+                size=max_num_reqs,
                 max_context_len=self.model_config.context_len + 4,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
@@ -1201,7 +1216,7 @@ class ModelRunner:
             )
 
         if self.eplb_manager is not None:
-            self.eplb_manager.on_forward_pass_end(self.forward_pass_id)
+            self.eplb_manager.on_forward_pass_end()
 
         return output
 

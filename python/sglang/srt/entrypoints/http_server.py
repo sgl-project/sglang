@@ -82,6 +82,7 @@ from sglang.srt.openai_api.adapter import (
     v1_retrieve_batch,
     v1_retrieve_file,
     v1_retrieve_file_content,
+    v1_score,
 )
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -256,7 +257,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     ) + b"\n\n"
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
-                logger.error(f"Error: {e}")
+                logger.error(f"[http_server] Error: {e}")
                 yield b"data: " + orjson.dumps(
                     out, option=orjson.OPT_NON_STR_KEYS
                 ) + b"\n\n"
@@ -274,7 +275,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ).__anext__()
             return ret
         except ValueError as e:
-            logger.error(f"Error: {e}")
+            logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
 
 
@@ -718,6 +719,12 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     if isinstance(ret, Response):
         return ret
     return ORJSONResponse({"predictions": ret})
+
+
+@app.post("/v1/score")
+async def v1_score_request(raw_request: Request):
+    """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
+    return await v1_score(_global_state.tokenizer_manager, raw_request)
 
 
 def _create_error_response(e):
