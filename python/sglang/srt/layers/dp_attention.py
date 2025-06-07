@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import functools
-import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List
 
@@ -15,8 +14,6 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -238,6 +235,10 @@ def _dp_gather(
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
+        if forward_batch.forward_mode.is_draft_extend():
+            shape_tensor = local_num_tokens.new_full((), local_tokens.shape[0])
+            local_num_tokens = torch.minimum(local_num_tokens, shape_tensor)
+
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
         )
@@ -261,7 +262,12 @@ def dp_gather_partial(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
 ):
-    _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=True)
+    _dp_gather(
+        global_tokens,
+        local_tokens,
+        forward_batch,
+        is_partial=True,
+    )
 
 
 def dp_gather_replicate(
@@ -288,9 +294,44 @@ def dp_scatter(
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
+        if forward_batch.forward_mode.is_draft_extend():
+            shape_tensor = local_num_tokens.new_full((), local_tokens.shape[0])
+            local_num_tokens = torch.minimum(local_num_tokens, shape_tensor)
+
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
+
+
+def dp_gather_weight(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    use_attn_tp_group: bool,
+):
+    global_tokens.fill_(0)
+    assert local_tokens.is_contiguous()
+    assert global_tokens.is_contiguous()
+
+    if use_attn_tp_group:
+        attn_tp_all_gather(
+            list(global_tokens.tensor_split(get_attention_tp_size())),
+            local_tokens,
+        )
+    else:
+        assert (
+            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
+        ), "aliasing between global_tokens and local_tokens not allowed"
+        local_num_tokens = torch.tensor(
+            local_tokens.shape[0], device=local_tokens.device, dtype=torch.int64
+        )
+        start_pos = (
+            get_attention_dp_rank() * get_attention_tp_size() + get_attention_tp_rank()
+        ) * local_num_tokens
+        memcpy_triton(
+            global_tokens, local_tokens, 0, start_pos, local_num_tokens, False
+        )
+
+        global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
 def attn_tp_reduce_scatter(
