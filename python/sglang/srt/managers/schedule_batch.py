@@ -446,6 +446,7 @@ class Req:
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        data_parallel_rank: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -599,6 +600,9 @@ class Req:
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
         self.disagg_kv_sender: Optional[BaseKVSender] = None
+
+        # For data parallel rank routing
+        self.data_parallel_rank: Optional[int] = data_parallel_rank
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
