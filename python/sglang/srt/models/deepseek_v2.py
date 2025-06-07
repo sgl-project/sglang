@@ -1735,6 +1735,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 and torch.cuda.get_device_capability("cuda") >= (9, 0)
                 and self.config.architectures[0] == architecture
                 and self.config.n_routed_experts == 256
+                and (not global_server_args_dict["disable_shared_experts_fusion"])
                 and (
                     not (
                         global_server_args_dict["enable_deepep_moe"]
