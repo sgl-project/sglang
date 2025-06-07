@@ -100,6 +100,7 @@ suites = {
         TestFile("models/lora/test_lora_tp.py", 116),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_dp_attention.py", 137),
+        TestFile("test_dp_attention_port_picking.py", 137),
         TestFile("test_mla_tp.py", 170),
         TestFile("test_moe_ep.py", 181),
         TestFile("test_patch_torch.py", 19),

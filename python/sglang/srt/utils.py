@@ -1037,9 +1037,7 @@ def pytorch_profile(name, func, *args, data_size=-1):
     return result
 
 
-def get_zmq_socket(
-    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
-):
+def config_socket(socket, socket_type: zmq.SocketType):
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
@@ -1047,10 +1045,6 @@ def get_zmq_socket(
         buf_size = int(0.5 * 1024**3)
     else:
         buf_size = -1
-
-    socket = context.socket(socket_type)
-    if endpoint.find("[") != -1:
-        socket.setsockopt(zmq.IPV6, 1)
 
     def set_send_opt():
         socket.setsockopt(zmq.SNDHWM, 0)
@@ -1064,11 +1058,30 @@ def get_zmq_socket(
         set_send_opt()
     elif socket_type == zmq.PULL:
         set_recv_opt()
-    elif socket_type == zmq.DEALER:
+    elif socket_type in [zmq.DEALER, zmq.REQ, zmq.REP]:
         set_send_opt()
         set_recv_opt()
     else:
         raise ValueError(f"Unsupported socket type: {socket_type}")
+
+
+def get_tcp_zmq_socket_binded_to_local_free_port(
+    context: zmq.Context, socket_type: zmq.SocketType
+) -> Tuple[int, zmq.Socket]:
+    socket = context.socket(socket_type)
+    config_socket(socket, socket_type)
+    port = socket.bind_to_random_port("tcp://*")
+    return port, socket
+
+
+def get_zmq_socket(
+    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
+):
+    socket = context.socket(socket_type)
+    if endpoint.find("[") != -1:
+        socket.setsockopt(zmq.IPV6, 1)
+
+    config_socket(socket, socket_type)
 
     if bind:
         socket.bind(endpoint)
