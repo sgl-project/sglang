@@ -370,9 +370,9 @@ class EPMoE(torch.nn.Module):
             )
 
         ones_tensor = torch.ones(
-                self.num_experts_per_partition,
-                dtype=torch.float32,
-                device=hidden_states_device,
+            self.num_experts_per_partition,
+            dtype=torch.float32,
+            device=hidden_states_device,
         )
 
         self.w2_input_scale = torch.nn.Parameter(
