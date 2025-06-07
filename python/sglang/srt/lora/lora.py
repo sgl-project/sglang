@@ -165,12 +165,17 @@ class LoRAAdapter(nn.Module):
                         self.base_hf_config.hidden_size
                         // self.base_hf_config.num_attention_heads
                     )
-                    weights[q_name], weights[kv_name] = torch.split(
+                    weights[q_name], k_proj_weight, v_proj_weight = torch.split(
                         weights[qkv_name],
                         [
                             head_size * self.base_hf_config.num_attention_heads,
-                            head_size * self.base_hf_config.num_key_value_heads * 2,
+                            head_size * self.base_hf_config.num_key_value_heads,
+                            head_size * self.base_hf_config.num_key_value_heads,
                         ],
+                        dim=0,
+                    )
+                    weights[kv_name] = torch.stack(
+                        [k_proj_weight, v_proj_weight],
                         dim=0,
                     )
 
