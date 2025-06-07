@@ -39,14 +39,15 @@ __device__ inline bool cmp_eq(const T& a, const T& b) {
 // Fixed constants common to both dynamic and static template versions:
 static constexpr int WARP_SIZE = 32;
 static constexpr int WARPS_PER_CTA = 6;
-static constexpr int MAX_VPT = 32;  // maximum VPT we support, > params.VPT = num_expert / num_expert_group
+static constexpr int MAX_VPT = 128;  // maximum VPT we support, > params.VPT = num_expert / num_expert_group
 
 // Create an alias for Array using AlignedArray
 template <typename T, int N>
 using Array = AlignedArray<T, N>;
 // QQ: NOTE expression must have a constant value, this has to be > params.VPT
 template <typename T>
-using AccessType = AlignedArray<T, MAX_VPT>;
+using AccessType = AlignedArray<T, (N > 128 ? 128 : N)>;
+// Process up to 32 elements at a time, with the excess handled via tiling.
 
 template <typename T, typename Params>
 __device__ void moe_fused_gate_impl(
@@ -93,24 +94,34 @@ __device__ void moe_fused_gate_impl(
 // AccessType<T>* row_chunk_vec_ptr = reinterpret_cast<AccessType<T>*>(&row_chunk);
 // row_chunk_vec_ptr[0] = vec_thread_read_ptr[0];
 #pragma unroll
-  for (int ii = 0; ii < params.VPT; ++ii) {
-    row_chunk[ii] = vec_thread_read_ptr[0][ii];
-    bias_chunk[ii] = vec_bias_thread_read_ptr[0][ii];
-  }
+  for (int tile = 0; tile < (params.VPT + 31) / 32; ++tile) {
+    int tile_offset = tile * 32;
+    int tile_size = min(32, params.VPT - tile_offset);
 
-  __syncthreads();
+    // Read row_chunk and bias_chunk
+    #pragma unroll
+      for (int ii = 0; ii < tile_size; ++ii) {
+        row_chunk[tile_offset + ii] = vec_thread_read_ptr[tile][ii];
+        bias_chunk[tile_offset + ii] = vec_bias_thread_read_ptr[tile][ii];
+      }
 
-////////////////////// Sigmoid //////////////////////
-#pragma unroll
-  for (int ii = 0; ii < params.VPT; ++ii) {
-    row_chunk[ii] = static_cast<T>(1.0f / (1.0f + expf(-float(row_chunk[ii]))));
-  }
-  __syncthreads();
+      __syncthreads();
 
-////////////////////// Add Bias //////////////////////
-#pragma unroll
-  for (int ii = 0; ii < params.VPT; ++ii) {
-    bias_chunk[ii] = row_chunk[ii] + bias_chunk[ii];
+    ////////////////////// Sigmoid //////////////////////
+    #pragma unroll
+      for (int ii = 0; ii < tile_size; ++ii) {
+        row_chunk[tile_offset + ii] = static_cast<T>(1.0f / (1.0f + expf(-float(row_chunk[tile_offset + ii]))));
+      }
+
+      __syncthreads();
+
+    ////////////////////// Add Bias //////////////////////
+    #pragma unroll
+      for (int ii = 0; ii < tile_size; ++ii) {
+        bias_chunk[tile_offset + ii] = row_chunk[tile_offset + ii] + bias_chunk[tile_offset + ii];
+      }
+
+      __syncthreads();
   }
 
 ////////////////////// Exclude Groups //////////////////////
