@@ -286,7 +286,7 @@ jobs:
       - name: Run test
         timeout-minutes: 40
         run: |
-          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd
+          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --timeout-per-file 2700
 
   finish:
     if: always()
