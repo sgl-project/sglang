@@ -197,7 +197,7 @@ class MooncakeKVManager(BaseKVManager):
             self.heartbeat_failures = {}
             self.session_pool = defaultdict(requests.Session)
             self.session_pool_lock = threading.Lock()
-            self.addr_to_rooms_tracker = defaultdict(list)
+            self.addr_to_rooms_tracker = defaultdict(set)
             self.connection_lock = threading.Lock()
             self.required_prefill_info_num_map: Dict[int, int] = {}
             self.decode_kv_arrive_state: Dict[int, Set[int]] = defaultdict(set)
@@ -680,12 +680,14 @@ class MooncakeKVManager(BaseKVManager):
                         if response.status_code == 200:
                             self.heartbeat_failures[bootstrap_addr] = 0
 
-                            for bootstrap_room in self.addr_to_rooms_tracker[
+                            current_rooms = self.addr_to_rooms_tracker[
                                 bootstrap_addr
-                            ]:
-                                # Remove KVPoll.Success requests from the map
+                            ].copy()
+
+                            for bootstrap_room in current_rooms:
+                                # Remove KVPoll.Success requests from the tracker
                                 if bootstrap_room not in self.request_status:
-                                    self.addr_to_rooms_tracker[bootstrap_addr].remove(
+                                    self.addr_to_rooms_tracker[bootstrap_addr].discard(
                                         bootstrap_room
                                     )
                         else:
@@ -736,6 +738,12 @@ class MooncakeKVManager(BaseKVManager):
             )
             return
 
+        if bootstrap_room not in self.transfer_infos:
+            # This means that the current rank is a dummy rank for this request,
+            # and it has already been marked as success, so there is no need to
+            # add further chunks into the transfer queue.
+            return
+
         # NOTE(shangming): sharding according to the dst_infos to make sure
         # requests with the same dst_sessions will be added into the same
         # queue, which enables early abort with failed sessions.
@@ -752,7 +760,6 @@ class MooncakeKVManager(BaseKVManager):
                 prefill_aux_index=aux_index,
             )
         )
-        self.update_status(bootstrap_room, KVPoll.WaitingForInput)
 
     def check_status(self, bootstrap_room: int):
         return self.request_status[bootstrap_room]
@@ -1067,9 +1074,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
         assert len(self.bootstrap_infos) > 0
-        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].append(
-            self.bootstrap_room
-        )
+        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def _get_bootstrap_info_from_server(self, engine_rank, target_dp_group):

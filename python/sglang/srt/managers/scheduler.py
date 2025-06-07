@@ -24,6 +24,7 @@ from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -429,7 +430,7 @@ class Scheduler(
         self.torch_profiler = None
         self.torch_profiler_output_dir: Optional[str] = None
         self.profiler_activities: Optional[List[str]] = None
-        self.profiler_id: Optional[str] = None
+        self.profile_id: Optional[str] = None
         self.profiler_target_forward_ct: Optional[int] = None
         self.profiler_target_prefill_ct: Optional[int] = None
         self.profiler_target_decode_ct: Optional[int] = None
@@ -571,7 +572,9 @@ class Scheduler(
 
     def init_kv_events(self, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
-            self.kv_event_publisher = EventPublisherFactory.create(kv_events_config)
+            self.kv_event_publisher = EventPublisherFactory.create(
+                kv_events_config, self.attn_dp_rank
+            )
 
     def init_disaggregation(self):
         self.transfer_backend = TransferBackend(
@@ -1158,7 +1161,8 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
-            f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)} "
+            f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)}, "
+            f += f"time: {gap_latency:.2f} "
         else:
             f += f"#queue-req: {len(self.waiting_queue)}"
 
@@ -1987,7 +1991,7 @@ class Scheduler(
             self.cum_spec_accept_length = self.cum_spec_accept_count = 0
             for k, v in server_args_dict.items():
                 global_server_args_dict[k] = v
-            logger.info(f"Global server args updated! " f"{global_server_args_dict=}")
+            logger.info(f"Global server args updated! {global_server_args_dict=}")
         return SetInternalStateReqOutput(
             updated=True,
             server_args=global_server_args_dict,
@@ -2037,9 +2041,22 @@ class Scheduler(
 
         # Sort in reverse order to avoid index issues when deleting
         for i in reversed(to_del):
+            # Abort method 1: directly pop from the queue
+            # This only works for requests that have not started anything.
+            # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
             self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
             logger.debug(f"Abort queued request. {req.rid=}")
+
+        # Delete the requests in the grammar queue
+        for req in self.grammar_queue:
+            # Abort method 2: call `set_finish_with_abort`
+            # The request will still run one prefill forward pass.
+            # In this case, we change the input_ids to be only one token to make this prefill cheap.
+            if req.rid.startswith(recv_req.rid):
+                logger.debug(f"Abort grammar queue request. {req.rid=}")
+                req.grammar.cancel()
+                req.set_finish_with_abort("Aborted by AbortReq.")
 
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:
@@ -2049,16 +2066,11 @@ class Scheduler(
 
         for req in reqs:
             if req.rid.startswith(recv_req.rid) and not req.finished():
+                # Abort method 3: set `to_abort=True`
+                # The request will still run one decode forward pass.
+                # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                # We must use to_abort because it is in a running batch
                 req.to_abort = True
-
-        # Delete the requests in the grammar queue
-        for req in self.grammar_queue:
-            if req.rid.startswith(recv_req.rid):
-                logger.debug(f"Abort grammar queue request. {req.rid=}")
-                req.grammar.cancel()
-                req.set_finish_with_abort("Aborted by AbortReq.")
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -2144,6 +2156,7 @@ class Scheduler(
                     recv_req.with_stack,
                     recv_req.record_shapes,
                     recv_req.profile_by_stage,
+                    recv_req.profile_id,
                 )
             else:
                 self.init_profile(
@@ -2153,6 +2166,7 @@ class Scheduler(
                     recv_req.with_stack,
                     recv_req.record_shapes,
                     recv_req.profile_by_stage,
+                    recv_req.profile_id,
                 )
                 return self.start_profile(True)
         else:
@@ -2166,6 +2180,7 @@ class Scheduler(
         with_stack: Optional[bool],
         record_shapes: Optional[bool],
         profile_by_stage: bool,
+        profile_id: str,
     ) -> ProfileReqOutput:
         if self.profile_in_progress:
             return ProfileReqOutput(
@@ -2184,6 +2199,7 @@ class Scheduler(
         self.torch_profiler_with_stack = with_stack
         self.torch_profiler_record_shapes = record_shapes
         self.profiler_activities = activities
+        self.profile_id = profile_id
 
         if num_steps:
             self.profile_steps = num_steps
@@ -2276,6 +2292,9 @@ class Scheduler(
                 message="Profiling is not in progress. Call /start_profile first.",
             )
 
+        if not Path(self.torch_profiler_output_dir).exists():
+            Path(self.torch_profiler_output_dir).mkdir(parents=True, exist_ok=True)
+
         stage_suffix = f"-{stage.__str__()}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
@@ -2283,7 +2302,7 @@ class Scheduler(
             self.torch_profiler.export_chrome_trace(
                 os.path.join(
                     self.torch_profiler_output_dir,
-                    str(time.time())
+                    self.profile_id
                     + f"-TP-{self.tp_rank}"
                     + stage_suffix
                     + ".trace.json.gz",
