@@ -498,9 +498,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_idx = topk_idx.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
-            + self.num_experts
-        ) // self.num_experts
+                         hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+                         + self.num_experts
+                     ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
@@ -590,6 +590,14 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
         """
         buffer = self._get_buffer()
+
+        extra_kwargs = {}
+        if get_bool_env_var("SGLANG_HACK_DEEPEP_LOW_LATENCY_DISPATCH_EXTRA_KWARGS"):
+            extra_kwargs = dict(
+                round_scale=True,
+                use_ue8m0=True,
+            )
+
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
@@ -597,11 +605,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=use_fp8,
-                # NOTE MODIFIED
-                round_scale=True,
-                use_ue8m0=True,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
+                **extra_kwargs,
             )
         )
         return packed_recv_hidden, packed_recv_count, event, hook
