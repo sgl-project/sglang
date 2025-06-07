@@ -165,6 +165,7 @@ class ServerArgs:
     enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
+    disable_quick_all_reduce: bool = False
     enable_mscclpp: bool = False
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
@@ -1169,6 +1170,11 @@ class ServerArgs:
             "--disable-custom-all-reduce",
             action="store_true",
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
+        )
+        parser.add_argument(
+            "--disable-quick-all-reduce",
+            action="store_true",
+            help="Disable the quick all-reduce kernel and fall back to custom all-reduce or NCCL.",
         )
         parser.add_argument(
             "--enable-mscclpp",

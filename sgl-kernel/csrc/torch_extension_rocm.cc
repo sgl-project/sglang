@@ -54,6 +54,18 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("get_meta_buffer_ipc_handle", &get_meta_buffer_ipc_handle);
   m.impl("get_meta_buffer_ipc_handle", torch::kCPU, &get_meta_buffer_ipc_handle);
 
+  m.def("init_quick_ar(int world_size, int rank) -> int");
+  m.def("qr_get_comm_handle(int _fa) -> Tensor");
+  m.def("qr_set_comm_handles(int _fa, Tensor[] handles) -> ()");
+  m.def("qr_all_reduce(int _fa, int profile, Tensor inp, Tensor out) -> ()");
+  m.def("qr_destroy(int _fa) -> ()");
+  m.def("is_quickreduce_available() -> ()");
+  m.impl("init_quick_ar", &init_quick_ar);
+  m.impl("qr_get_comm_handle", &qr_get_comm_handle);
+  m.impl("qr_set_comm_handles", &qr_set_comm_handles);
+  m.impl("qr_all_reduce", torch::kCUDA, &qr_all_reduce);
+  m.impl("qr_destroy", &qr_destroy);
+  m.impl("is_quickreduce_available", &is_quickreduce_available);
   /*
    * From csrc/moe
    */

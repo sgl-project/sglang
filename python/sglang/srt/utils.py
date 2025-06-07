@@ -750,7 +750,7 @@ def monkey_patch_p2p_access_check():
     NOTE: We assume the p2p access is always allowed, which can be wrong for some setups.
     """
 
-    import sglang.srt.distributed.device_communicators.custom_all_reduce_utils as tgt
+    import sglang.srt.distributed.device_communicators.all_reduce_utils as tgt
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 

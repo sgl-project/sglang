@@ -101,6 +101,7 @@ def initialize_dp_attention(
         use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
         use_pymscclpp=False,
         use_custom_allreduce=False,
+        use_quick_allreduce=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,

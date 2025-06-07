@@ -63,6 +63,15 @@ void register_graph_buffers(
     fptr_t _fa, const std::vector<std::string>& handles, const std::vector<std::vector<int64_t>>& offsets);
 torch::Tensor allocate_meta_buffer(int64_t size);
 torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor& inp);
+
+// ROCM quick allreduce
+fptr_t init_quick_ar(int64_t world_size, int64_t rank);
+torch::Tensor qr_get_comm_handle(fptr_t _fa);
+void qr_set_comm_handles(fptr_t _fa, std::vector<torch::Tensor> const& comm_handles);
+void qr_all_reduce(fptr_t _fa, int64_t profile, torch::Tensor const& inp, torch::Tensor& out);
+void qr_destroy(fptr_t _fa);
+void is_quickreduce_available();
+
 #else
 // custom allreduce
 fptr_t
@@ -74,6 +83,15 @@ std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta
 void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs);
 void register_graph_buffers(
     fptr_t _fa, const std::vector<std::vector<int64_t>>& handles, const std::vector<std::vector<int64_t>>& offsets);
+
+// quick allreduce
+fptr_t init_quick_ar(int64_t world_size, int64_t rank);
+torch::Tensor qr_get_comm_handle(fptr_t _fa);
+void qr_set_comm_handles(fptr_t _fa, std::vector<torch::Tensor> const& comm_handles);
+void qr_all_reduce(fptr_t _fa, int64_t profile, torch::Tensor const& inp, torch::Tensor& out);
+void qr_destroy(fptr_t _fa);
+void is_quickreduce_available();
+
 torch::Tensor mscclpp_generate_unique_id();
 fptr_t mscclpp_init_context(
     const torch::Tensor& unique_id,
@@ -86,6 +104,7 @@ fptr_t mscclpp_init_context(
     const std::vector<int64_t>& rank_to_ib,
     const int64_t context_selection);
 void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out, int64_t nthreads, int64_t nblocks);
+
 #endif
 
 /*

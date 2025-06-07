@@ -346,7 +346,7 @@ class CudaGraphRunner:
                 if get_tensor_model_parallel_rank() == 0
                 else reversed(self.capture_bs)
             )
-            for bs in capture_range:
+            for bs in capture_range:  # 256 - > 1
                 if get_tensor_model_parallel_rank() == 0:
                     avail_mem = get_available_gpu_memory(
                         self.model_runner.device,
