@@ -23,8 +23,8 @@ If you frequently see `token usage < 0.9` and `#queue-req > 0`, it means the ser
 The case of server being too conservative can happen when users send many requests with a large `max_new_tokens` but the requests stop very early due to EOS or stop strings.
 
 On the other hand, if you see `token usage` very high and you frequently see warnings like
-`decode out of memory happened, #retracted_reqs: 1, #new_token_ratio: 0.9998 -> 1.0000`, you can increase `--schedule-conservativeness` to a value like 1.3.
-If you see `decode out of memory happened` occasionally but not frequently, it is okay.
+`KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_token_ratio: 0.9998 -> 1.0000`, you can increase `--schedule-conservativeness` to a value like 1.3.
+If you see `KV cache pool is full. Retract requests.` occasionally but not frequently, it is okay.
 
 ### Tune `--dp-size` and `--tp-size`
 

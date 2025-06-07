@@ -9,6 +9,17 @@ jobs:
   build-dev:
     if: ${{ github.repository == 'sgl-project/sglang' }}
     runs-on: ubuntu-22.04
+
+    strategy:
+      matrix:
+        variant:
+          - base: lmsysorg/sglang:latest
+            tag: deepep
+          - base: lmsysorg/sglang:dev
+            tag: dev-deepep
+          - base: lmsysorg/sglang:blackwell
+            tag: blackwell-deepep
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -30,7 +41,7 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and Push DeepEP Image
+      - name: Build and Push Docker Image
         run: |
-          docker build . -f docker/Dockerfile.deepep -t lmsysorg/sglang:deepep --no-cache
-          docker push lmsysorg/sglang:deepep
+          docker build . -f docker/Dockerfile.deepep --build-arg BASE_IMAGE=${{ matrix.variant.base }} -t lmsysorg/sglang:${{ matrix.variant.tag }} --no-cache
+          docker push lmsysorg/sglang:${{ matrix.variant.tag }}

@@ -165,12 +165,17 @@ class LoRAAdapter(nn.Module):
                         self.base_hf_config.hidden_size
                         // self.base_hf_config.num_attention_heads
                     )
-                    weights[q_name], weights[kv_name] = torch.split(
+                    weights[q_name], k_proj_weight, v_proj_weight = torch.split(
                         weights[qkv_name],
                         [
                             head_size * self.base_hf_config.num_attention_heads,
-                            head_size * self.base_hf_config.num_key_value_heads * 2,
+                            head_size * self.base_hf_config.num_key_value_heads,
+                            head_size * self.base_hf_config.num_key_value_heads,
                         ],
+                        dim=0,
+                    )
+                    weights[kv_name] = torch.stack(
+                        [k_proj_weight, v_proj_weight],
                         dim=0,
                     )
 
@@ -209,4 +214,12 @@ class LoRAAdapter(nn.Module):
                 gate_up_name = weight_name
                 if "lora_A" in weight_name:
                     weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
-                # else: "lora_B" is already stacked, no operations is needed.
+                else:
+                    output_dim = weights[gate_up_name].shape[0] // 2
+                    weights[gate_up_name] = torch.stack(
+                        [
+                            weights[gate_up_name][:output_dim, :],
+                            weights[gate_up_name][output_dim:, :],
+                        ],
+                        dim=0,
+                    )

@@ -1,15 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-# Default working directory
 WORKDIR="/sglang-checkout/test/srt"
-ENV_ARGS=(
-  -e SGLANG_AMD_CI=1
-  -e SGLANG_IS_IN_CI=1
-  -e SGLANG_AITER_MOE=1
+declare -A ENV_MAP=(
+  [SGLANG_AMD_CI]=1
+  [SGLANG_IS_IN_CI]=1
+  [SGLANG_USE_AITER]=1
 )
 
-# Parse optional -w/--workdir and -e ENV=VAL flags
+# Parse -w/--workdir and -e ENV=VAL
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -w|--workdir)
@@ -17,7 +16,8 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     -e)
-      ENV_ARGS+=("-e" "$2")
+      IFS="=" read -r key val <<< "$2"
+      ENV_MAP["$key"]="$val"
       shift 2
       ;;
     --)
@@ -28,6 +28,12 @@ while [[ $# -gt 0 ]]; do
       break
       ;;
   esac
+done
+
+# Build final ENV_ARGS
+ENV_ARGS=()
+for key in "${!ENV_MAP[@]}"; do
+  ENV_ARGS+=("-e" "$key=${ENV_MAP[$key]}")
 done
 
 # Run docker exec

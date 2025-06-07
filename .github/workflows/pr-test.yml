@@ -103,7 +103,7 @@ jobs:
           bash scripts/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 20
+        timeout-minutes: 30
         run: |
           cd test/srt
           python3 run_suite.py --suite per-commit-4-gpu

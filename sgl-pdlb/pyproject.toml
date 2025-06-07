@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.8.0"]
+build-backend = "maturin"
+
+[project]
+name = "sgl_pdlb"
+version = "0.0.1"
+
+[tool.maturin]
+python-source = "py_src"
+module-name = "sgl_pdlb._rust"
+
+[tool.maturin.build-backend]
+features = ["pyo3/extension-module"]

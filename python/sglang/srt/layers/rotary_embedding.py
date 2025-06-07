@@ -8,9 +8,10 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 
 if _is_cuda:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
@@ -609,6 +610,10 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
+        # Re-dispatch
+        if _is_hip:
+            self._forward_method = self.forward_native
+
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
         pos_freqs = self.base ** (
             torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device=self.device)
@@ -649,17 +654,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         sin = freqs.sin() * self.mscale
         cache = torch.cat((cos, sin), dim=-1)
         return cache
-
-    def forward_hip(self, *args, **kwargs):
-        return self.forward_native(*args, **kwargs)
-
-    def forward(self, *args, **kwargs):
-        if torch.compiler.is_compiling():
-            return self.forward_native(*args, **kwargs)
-        if _is_cuda:
-            return self.forward_cuda(*args, **kwargs)
-        else:
-            return self.forward_native(*args, **kwargs)
 
     def forward_native(
         self,

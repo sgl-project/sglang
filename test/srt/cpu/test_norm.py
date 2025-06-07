@@ -63,10 +63,24 @@ class TestNorm(CustomTestCase):
         self.assertTrue(torch.allclose(x, ref_x, atol=atol, rtol=rtol))
         self.assertTrue(torch.allclose(residual, ref_residual, atol=atol, rtol=rtol))
 
+    def _l2norm_test(self, m, n, dtype):
+
+        x = torch.randn([m, n], dtype=dtype)
+        hidden_size = x.size(-1)
+        fake_ones_weight = torch.ones(hidden_size, dtype=dtype)
+        variance_epsilon = 1e-6
+
+        out = torch.ops.sgl_kernel.l2norm_cpu(x, variance_epsilon)
+        ref_out = self._forward_native(x, fake_ones_weight, variance_epsilon)
+
+        atol = rtol = precision[ref_out.dtype]
+        self.assertTrue(torch.allclose(ref_out, out, atol=atol, rtol=rtol))
+
     def test_norm(self):
         for params in itertools.product(self.M, self.N, self.dtype):
             with self.subTest(m=params[0], n=params[1], dtype=params[2]):
                 self._norm_test(*params)
+                self._l2norm_test(*params)
 
 
 if __name__ == "__main__":

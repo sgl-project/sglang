@@ -5,7 +5,8 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import Any, List, Optional, Tuple, Union
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -16,16 +17,24 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import encode_video, load_audio, load_image
 
 
+class MultimodalInputFormat(Enum):
+    """Enum for different multimodal input formats."""
+
+    RAW_IMAGES = "raw_images"
+    PRECOMPUTED_FEATURES = "precomputed_features"
+    PIXEL_VALUES = "pixel_values"
+
+
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
     # input_text, with each frame of video/image represented with a image_token
     input_text: str
 
     # frames loaded from image and video, in given order
-    images: Optional[list[Union[Image.Image, MultimodalDataItem]]] = None
+    images: Optional[list[Union[Image.Image, dict]]] = None
 
     # audios
-    audios: Optional[list[Union[np.ndarray, MultimodalDataItem]]] = None
+    audios: Optional[list[Union[np.ndarray, dict]]] = None
 
     def normalize(self):
         for field_name in ["images", "audios"]:
@@ -170,8 +179,6 @@ class BaseMultimodalProcessor(ABC):
     ):
         """Static method that can be pickled for multiprocessing"""
         if isinstance(data, dict):
-            return MultimodalDataItem.from_dict(data)
-        if isinstance(data, MultimodalDataItem):
             return data
         try:
             if is_audio:
@@ -370,29 +377,180 @@ class BaseMultimodalProcessor(ABC):
 
         return list(zip(indices_start.tolist(), indices_end.tolist()))
 
-    def mm_inputs_are_preprocessed(self, mm_inputs: Optional[list]):
-        """Returns true if all images are preprocessed, false if all are not, and error otherwise."""
-        if not mm_inputs:
-            return True
-        ret = any(isinstance(mm_input, MultimodalDataItem) for mm_input in mm_inputs)
-        if ret and not all(
-            isinstance(mm_input, MultimodalDataItem) for mm_input in mm_inputs
-        ):
-            raise ValueError(
-                "Unsupported: mixture of multimodal inputs where some but not all are preprocessed."
-            )
-        return ret
-
     @staticmethod
     def _extract_processor_features(
-        items: List[Any], attr_name: str
+        items: List[dict], attr_name: str
     ) -> Optional[torch.Tensor]:
         """
         Helper function to concat extracted attributes from processor output.
         """
-        values = [
-            getattr(item, attr_name)
-            for item in items
-            if getattr(item, attr_name) is not None
-        ]
-        return torch.concat(values) if values else None
+        values = [value for item in items if (value := item.get(attr_name)) is not None]
+        return torch.cat(values) if values else None
+
+    # When we assume that all the items have the same attributes
+    def _extract_processor_features_from_all_attributes(
+        self, items: List[dict]
+    ) -> dict:
+        values = {}
+        # Verify all items have the same keys
+        first_keys = set(items[0].keys())
+        for item in items[1:]:
+            if set(item.keys()) != first_keys:
+                raise ValueError(
+                    f"All items must have the same attributes. "
+                    f"First item has {first_keys}, but found {set(item.keys())}"
+                )
+
+        # Process each attribute
+        for k, v in items[0].items():
+            if isinstance(v, list):
+                values[k] = self._extract_processor_features(items, k)
+            else:
+                # Verify all items have the same value for non-list attributes
+                for item in items[1:]:
+                    if item[k] != v:
+                        raise ValueError(
+                            f"All items must have the same value for attribute {k}. "
+                            f"First item has {v}, but found {item[k]}"
+                        )
+                values[k] = v
+        return values
+
+    def process_and_combine_mm_data(
+        self, base_output: BaseMultiModalProcessorOutput
+    ) -> Tuple[Optional[MultimodalDataItem], torch.Tensor]:
+        """
+        Process multimodal data and return the combined multimodal item and input_ids.
+        Handles all three input formats at the same abstraction level.
+
+        Returns:
+            Tuple of (combined_mm_item, input_ids)
+        """
+
+        def tokenize_text(input_text: str) -> torch.Tensor:
+            """Tokenize input text."""
+            return self._processor.tokenizer(
+                input_text,
+                return_tensors="pt",
+                add_special_tokens=True,
+            ).input_ids.flatten()
+
+        def categorize_mm_inputs(mm_inputs: List) -> MultimodalInputFormat:
+            """Categorize multimodal inputs and validate consistency."""
+            try:
+                has_image = False
+                has_pixel_values = False
+                has_precomputed_features = False
+
+                for mm_input in mm_inputs:
+                    if isinstance(mm_input, Image.Image):
+                        has_image = True
+                    elif isinstance(mm_input, dict):
+                        if mm_input.get("precomputed_features", None) is not None:
+                            has_precomputed_features = True
+                        elif mm_input.get("pixel_values", None) is not None:
+                            has_pixel_values = True
+                        else:
+                            raise ValueError(
+                                f"Invalid multimodal input: {mm_input}, expected dict with pixel_values or precomputed_features"
+                            )
+                    else:
+                        raise ValueError(
+                            f"Invalid multimodal input: {mm_input}, expected Image.Image or dict"
+                        )
+
+                # Validate format consistency
+                format_count = sum(
+                    [has_image, has_pixel_values, has_precomputed_features]
+                )
+                if format_count > 1:
+                    raise ValueError(
+                        "Unsupported: mixture of multimodal input formats. "
+                        f"Found formats: image={has_image}, pixel_values={has_pixel_values}, "
+                        f"precomputed_features={has_precomputed_features}"
+                    )
+
+                if has_image:
+                    return MultimodalInputFormat.RAW_IMAGES
+                elif has_precomputed_features:
+                    return MultimodalInputFormat.PRECOMPUTED_FEATURES
+                elif has_pixel_values:
+                    return MultimodalInputFormat.PIXEL_VALUES
+                else:
+                    raise ValueError("No valid multimodal input format found")
+            except Exception as e:
+                raise ValueError(f"Failed to categorize inputs: {e}")
+
+        def process_raw_images(
+            base_output: BaseMultiModalProcessorOutput,
+        ) -> Tuple[MultimodalDataItem, torch.Tensor]:
+            """Process raw Image.Image objects using transformers processor."""
+            ret = self.process_mm_data(
+                input_text=base_output.input_text,
+                images=base_output.images,
+            )
+            combined_mm_item = MultimodalDataItem(modality=Modality.IMAGE)
+
+            # Copy all fields from processor output except input_ids
+            for key, value in ret.items():
+                if key != "input_ids" and hasattr(combined_mm_item, key):
+                    setattr(combined_mm_item, key, value)
+
+            input_ids = ret["input_ids"].flatten()
+            return combined_mm_item, input_ids
+
+        def process_precomputed_features(
+            base_output: BaseMultiModalProcessorOutput,
+        ) -> Tuple[MultimodalDataItem, torch.Tensor]:
+            """Process inputs with precomputed features."""
+            combined_mm_item = MultimodalDataItem(modality=Modality.IMAGE)
+            combined_mm_item.precomputed_features = self._extract_processor_features(
+                base_output.images, "precomputed_features"
+            )
+            input_ids = tokenize_text(base_output.input_text)
+            return combined_mm_item, input_ids
+
+        def process_pixel_values(
+            base_output: BaseMultiModalProcessorOutput,
+        ) -> Tuple[MultimodalDataItem, torch.Tensor]:
+            """Process inputs with pixel values."""
+            values = self._extract_processor_features_from_all_attributes(
+                base_output.images
+            )
+            combined_mm_item = MultimodalDataItem.from_dict(values)
+            input_ids = tokenize_text(base_output.input_text)
+            return combined_mm_item, input_ids
+
+        def finalize_mm_item(
+            combined_mm_item: MultimodalDataItem, input_ids: torch.Tensor
+        ) -> MultimodalDataItem:
+            """Apply common post-processing to the multimodal item."""
+            combined_mm_item.image_offsets = self.get_mm_items_offset(
+                input_ids=input_ids,
+                mm_token_id=self.IM_TOKEN_ID,
+            )
+            return combined_mm_item
+
+        # Main logic
+        mm_inputs = base_output.images
+        if not mm_inputs:
+            # Return text-only case
+            input_ids = tokenize_text(base_output.input_text)
+            return None, input_ids
+
+        # Categorize input formats
+        input_format = categorize_mm_inputs(mm_inputs)
+
+        # Process based on format
+        if input_format == MultimodalInputFormat.RAW_IMAGES:
+            combined_mm_item, input_ids = process_raw_images(base_output)
+        elif input_format == MultimodalInputFormat.PRECOMPUTED_FEATURES:
+            combined_mm_item, input_ids = process_precomputed_features(base_output)
+        elif input_format == MultimodalInputFormat.PIXEL_VALUES:
+            combined_mm_item, input_ids = process_pixel_values(base_output)
+        else:
+            raise ValueError(f"Unknown input format: {input_format}")
+
+        # Finalize with common processing
+        combined_mm_item = finalize_mm_item(combined_mm_item, input_ids)
+        return combined_mm_item, input_ids

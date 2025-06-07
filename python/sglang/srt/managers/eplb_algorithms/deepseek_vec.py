@@ -1,6 +1,5 @@
 # This file is copied from https://github.com/deepseek-ai/EPLB/blob/main/eplb.py since that one is not a pypi package
-
-from typing import Literal, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -259,13 +258,9 @@ def rebalance_experts(
     num_local_physical_experts: int,
     num_groups: Optional[int],
     num_nodes: int,
-    phase: Literal["prefill", "decode", "null"],
+    enable_hierarchical: bool,
 ):
-    if (
-        (phase == "prefill")
-        and (num_groups is not None)
-        and (num_groups % num_nodes == 0)
-    ):
+    if enable_hierarchical:
         return prefill_rebalance_experts(
             tokens_per_expert=tokens_per_expert,
             num_physical_experts=num_physical_experts,
@@ -273,8 +268,9 @@ def rebalance_experts(
             num_groups=num_groups,
             num_nodes=num_nodes,
         )
-    return decode_rebalance_experts(
-        tokens_per_expert=tokens_per_expert,
-        num_physical_experts=num_physical_experts,
-        num_local_physical_experts=num_local_physical_experts,
-    )
+    else:
+        return decode_rebalance_experts(
+            tokens_per_expert=tokens_per_expert,
+            num_physical_experts=num_physical_experts,
+            num_local_physical_experts=num_local_physical_experts,
+        )

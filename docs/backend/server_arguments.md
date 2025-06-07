@@ -63,6 +63,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `kv_cache_dtype` | Dtype of the kv cache. | `auto` |
 | `context_length` | The model's maximum context length. Defaults to None (will use the value from the model's config.json instead). Note that extending the default might lead to strange behavior. | None |
 | `device` | The device we put the model. | None |
+| `impl` | The implementation of the model to use. Defaults to SGlang implementation and fall back to transformers if needed | `auto` |
 | `served_model_name` | Override the model name returned by the v1/models endpoint in OpenAI API server.| None |
 | `is_embedding` | Set to `true` to perform [embedding](./openai_api_embeddings.ipynb) / [encode](https://docs.sglang.ai/backend/native_api#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api#Classify-(reward-model)) tasks. | `False` |
 | `revision` | Adjust if a specific version of the model should be used. | None |
@@ -200,6 +201,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `disable_cuda_graph_padding` | Disable CUDA Graph when padding is needed; otherwise, still use CUDA Graph. | `False` |
 | `disable_outlines_disk_cache` | Disable disk cache for outlines grammar backend. | `False` |
 | `disable_custom_all_reduce` | Disable usage of custom all-reduce kernel. | `False` |
+| `enable_mscclpp` | Enable usage of mscclpp kernel for small message all-reduce. | `False` |
 | `disable_overlap_schedule` | Disable the [Overhead-Scheduler](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#zero-overhead-batch-scheduler). | `False` |
 | `enable_nan_detection` | Enable warning if the logits contain `NaN`. | `False` |
 | `enable_p2p_check` | Turns off the default of always allowing P2P checks when accessing GPU. | `False` |

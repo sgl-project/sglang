@@ -1,6 +1,3 @@
-from typing import Optional
-
-import torch
 from torch import nn
 
 from sglang.srt.utils import is_cuda, is_hip
@@ -14,6 +11,44 @@ class CustomOp(nn.Module):
         super().__init__()
         self._forward_method = self.dispatch_forward()
 
+        # States for torch.compile
+        self._original_forward_method = None
+        self.is_torch_compile = False
+
+    def enter_torch_compile(self, num_tokens: int):
+        # Skip if Op is already entered compile mode.
+        # NOTE(alcanderian): Some Ops(for example RotaryEmbedding) will be reused
+        # among layers and `enter_torch_compile` will be called many times.
+        # We should prevent `self._original_forward_method` from being overridden when
+        # it is not the first time `enter_torch_compile` called.
+        if self.is_torch_compile:
+            return
+
+        self._original_forward_method = self._forward_method
+        # NOTE: Temporarily workaround MoE
+        if "FusedMoE" in self.__class__.__name__:
+            if num_tokens == 1:
+                from sglang.srt.layers.moe.fused_moe_native import (
+                    fused_moe_forward_native,
+                )
+
+                # The performance of torch.compile on this layer is not always good when bs > 1,
+                # so we decide to only use torch.compile when bs =1
+                self._forward_method = fused_moe_forward_native
+        else:
+            self._forward_method = self.forward_native
+        self.is_torch_compile = True
+
+    def leave_torch_compile(self):
+        # Skip if Op is already exited compile mode.
+        if not self.is_torch_compile:
+            return
+
+        self._forward_method = self._original_forward_method
+        self._original_forward_method = None
+        self.is_torch_compile = False
+
+    # Please do not override this method, because `self._forward_method` can change when in torch compile mode
     def forward(self, *args, **kwargs):
         return self._forward_method(*args, **kwargs)
 
