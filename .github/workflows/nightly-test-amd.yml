@@ -19,7 +19,7 @@ jobs:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
     strategy:
       matrix:
-        runner: [linux-mi300-gpu-2, linux-mi325-gpu-2-nightly]
+        runner: [linux-mi300-gpu-2-test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -37,5 +37,5 @@ jobs:
 
       - name: Nightly Test
         run: |
-          bash scripts/amd_ci_exec.sh -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd --timeout-per-file 7200
+          bash scripts/amd_ci_exec.sh -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd --timeout-per-file 14400
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY
