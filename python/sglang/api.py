@@ -46,6 +46,8 @@ def Engine(*args, **kwargs):
 
 
 def set_default_backend(backend: BaseBackend):
+    if hasattr(backend, "endpoint"):
+        backend = backend.endpoint
     global_config.default_backend = backend
 
 

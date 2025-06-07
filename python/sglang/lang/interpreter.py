@@ -63,8 +63,6 @@ def run_program(
     sync=False,
     use_thread=True,
 ):
-    if hasattr(backend, "endpoint"):
-        backend = backend.endpoint
     assert backend is not None, "Please specify a backend"
     func_kwargs.update(program.bind_arguments)
     stream_executor = StreamExecutor(
@@ -98,8 +96,6 @@ def run_program_batch(
     progress_bar,
     generator_style=False,
 ):
-    if hasattr(backend, "endpoint"):
-        backend = backend.endpoint
 
     # Pre-cache the common prefix for a batch. The prefix is extracted by tracing the program.
     if global_config.enable_precache_with_tracing and len(batch_arguments) > 1:
