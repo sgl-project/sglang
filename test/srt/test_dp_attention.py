@@ -13,7 +13,6 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_amd_ci,
     popen_launch_server,
 )
 
@@ -78,6 +77,8 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
+            "--cuda-graph-max-bs",
+            "4",
             "--disable-radix",
             "--speculative-algorithm",
             "EAGLE",
@@ -95,8 +96,6 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(CustomTestCase):
             "--dp-size",
             "2",
         ]
-        if not is_in_amd_ci():
-            other_args += ["--mem-frac", "0.7"]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
