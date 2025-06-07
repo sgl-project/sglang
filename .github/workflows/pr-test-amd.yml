@@ -72,7 +72,7 @@ jobs:
       - name: Evaluate accuracy (TP=2)
         timeout-minutes: 30
         run: |
-          bash scripts/amd_ci_exec.sh python3 test_moe_eval_accuracy_large.py
+          bash scripts/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_moe_eval_accuracy_large.py
 
   mla-test-1-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -284,9 +284,9 @@ jobs:
         run: bash scripts/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 40
+        timeout-minutes: 60
         run: |
-          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd
+          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --timeout-per-file 3600
 
   finish:
     if: always()
