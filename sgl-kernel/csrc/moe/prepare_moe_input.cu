@@ -255,16 +255,15 @@ void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2sr
 
 template <typename scalar_t>
 __global__ void apply_shuffle_mul_sum_kernel(
-    const scalar_t* __restrict__ input_tensor,  // [num_in_rows, row_stride]
+    const scalar_t* __restrict__ input_tensor,  // [m * topk, row_stride]
     scalar_t* __restrict__ output_tensor,       // [m, row_stride]
     const int32_t* __restrict__ permutation,    // [m * topk]
-    int num_in_rows,
     int m,
     int topk,
     int row_stride,
     const scalar_t* __restrict__ factors)  // [m * topk] or nullptr
 {
-  int i = blockIdx.x;   // [0, m)
+  int i = blockIdx.x;   // [0, m * topk)
   int d = threadIdx.x;  // [0, row_stride)
 
   if (i >= m || d >= row_stride) return;
@@ -290,19 +289,18 @@ __global__ void apply_shuffle_mul_sum_kernel(
 }
 
 void get_apply_shuffle_mul_sum_caller(
-    const torch::Tensor& input_tensor,                // [num_in_rows, row_stride], float8 as uint8
+    const torch::Tensor& input_tensor,                // [m * topk, row_stride], bf16/f16
     torch::Tensor& output_tensor,                     // [m, row_stride], bf16/f16
     const torch::Tensor& permutation,                 // [m * topk], int32
     const std::optional<torch::Tensor>& factors_opt)  // optional [m * topk], bf16/f16
 {
-  TORCH_CHECK(input_tensor.dim() == 2, "input_tensor must be 2D [num_in_rows, row_stride]");
+  TORCH_CHECK(input_tensor.dim() == 2, "input_tensor must be 2D [m * topk, row_stride]");
   TORCH_CHECK(output_tensor.dim() == 2, "output_tensor must be 2D [m, row_stride]");
   TORCH_CHECK(permutation.dim() == 1, "permutation must be 1D [m * topk]");
 
   int m = output_tensor.size(0);
   int topk = int(permutation.size(0) / m);
   int row_stride = output_tensor.size(1);
-  int num_in_rows = input_tensor.size(0);
 
   TORCH_CHECK(permutation.size(0) == m * topk, "permutation size must match m * topk");
 
@@ -325,7 +323,6 @@ void get_apply_shuffle_mul_sum_caller(
         input_tensor.data_ptr<at::Half>(),
         output_tensor.data_ptr<at::Half>(),
         perm_ptr,
-        num_in_rows,
         m,
         topk,
         row_stride,
@@ -336,7 +333,6 @@ void get_apply_shuffle_mul_sum_caller(
         input_tensor.data_ptr<c10::BFloat16>(),
         output_tensor.data_ptr<c10::BFloat16>(),
         perm_ptr,
-        num_in_rows,
         m,
         topk,
         row_stride,
