@@ -95,7 +95,8 @@ def main(args):
 
     preds = []
     for i in range(len(states)):
-        print(f"hi {i=} {states[i]=}")
+        if i < 20:
+            print(f"hi {i=} {states[i]=}")
         preds.append(get_answer_value(states[i]["answer"]))
 
     # Compute accuracy
