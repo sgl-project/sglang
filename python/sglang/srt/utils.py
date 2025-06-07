@@ -705,6 +705,14 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
         )
 
 
+def pkg_version_not_less_than(pkg: str, target_version: str):
+    try:
+        installed_version = version(pkg)
+        return pkg_version.parse(installed_version) >= pkg_version.parse(target_version)
+    except PackageNotFoundError:
+        return False
+
+
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
     # Remove sigchld handler to avoid spammy logs.
