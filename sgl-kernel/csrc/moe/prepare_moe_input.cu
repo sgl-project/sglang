@@ -342,6 +342,23 @@ void get_apply_shuffle_mul_sum_caller(
   }
 }
 
+/**
+ * @brief Applies a permutation-based shuffle, element-wise multiplication, and reduction over the second dimension.
+ *
+ * This function performs the equivalent of the following PyTorch expression:
+ *
+ *     (c2[c_map].view(m, topk, k) * topk_weights.view(m, topk, 1).to(out_dtype)).sum(dim=1)
+ *
+ * Specifically:
+ * - `input` is shuffled using the `permutation` tensor.
+ * - The shuffled tensor is reshaped and multiplied element-wise with `factors` (e.g., top-k weights).
+ * - The result is summed along dimension 1 (the top-k dimension), and stored in `output`.
+ *
+ * @param input        Input tensor of shape (m * topk, k), representing c2.
+ * @param output       Output tensor of shape (m, k), where the final reduced results are stored.
+ * @param permutation  Index tensor (e.g., c_map) that maps positions in `input` to shuffled layout.
+ * @param factors      Optional scaling factors (e.g., top-k weights), shape (m * topk) or (m, topk).
+ */
 void apply_shuffle_mul_sum(
     const torch::Tensor& input,
     torch::Tensor& output,
