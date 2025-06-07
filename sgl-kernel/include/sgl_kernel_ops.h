@@ -74,6 +74,18 @@ std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta
 void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs);
 void register_graph_buffers(
     fptr_t _fa, const std::vector<std::vector<int64_t>>& handles, const std::vector<std::vector<int64_t>>& offsets);
+torch::Tensor mscclpp_generate_unique_id();
+fptr_t mscclpp_init_context(
+    const torch::Tensor& unique_id,
+    const int64_t rank,
+    const int64_t world_size,
+    torch::Tensor& scratch,
+    torch::Tensor& put_buffer,
+    const int64_t nranks_per_node,
+    const std::vector<int64_t>& rank_to_node,
+    const std::vector<int64_t>& rank_to_ib,
+    const int64_t context_selection);
+void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out, int64_t nthreads, int64_t nblocks);
 #endif
 
 /*
@@ -206,11 +218,16 @@ std::vector<at::Tensor> moe_fused_gate(
     int64_t num_expert_group,
     int64_t topk_group,
     int64_t topk,
-    int64_t n_share_experts_fusion,
+    int64_t num_fused_shared_experts,
     double routed_scaling_factor);
 
 void fp8_blockwise_scaled_grouped_mm(
     torch::Tensor& output,
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& a_scales_ptrs,
+    torch::Tensor& b_scales_ptrs,
     const torch::Tensor& a,
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
@@ -221,7 +238,64 @@ void fp8_blockwise_scaled_grouped_mm(
     const torch::Tensor& layout_sfa,
     const torch::Tensor& layout_sfb,
     const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets);
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace);
+
+void prepare_moe_input(
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_offsets,
+    const std::optional<torch::Tensor>& blockscale_offsets,
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& problem_sizes2,
+    torch::Tensor& input_permutation,
+    torch::Tensor& output_permutation,
+    const int64_t num_experts,
+    const int64_t n,
+    const int64_t k);
+
+void ep_moe_pre_reorder(
+    torch::Tensor input,
+    torch::Tensor gateup_input,
+    torch::Tensor src2dst,
+    torch::Tensor topk_ids,
+    torch::Tensor a1_scales,
+    int64_t start_expert_id,
+    int64_t end_expert_id,
+    int64_t topk,
+    bool use_per_token_if_dynamic);
+
+void ep_moe_post_reorder(
+    torch::Tensor down_output,
+    torch::Tensor output,
+    torch::Tensor src2dst,
+    torch::Tensor topk_ids,
+    torch::Tensor topk_weights,
+    int64_t start_expert_id,
+    int64_t end_expert_id,
+    int64_t topk);
+
+void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor);
+
+void cutlass_fp4_group_mm(
+    torch::Tensor& output,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& a_blockscale,
+    const torch::Tensor& b_blockscales,
+    const torch::Tensor& alphas,
+    const torch::Tensor& ab_strides,
+    const torch::Tensor& c_strides,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& sf_offsets);
+
+void scaled_fp4_experts_quant(
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    torch::Tensor const& input,
+    torch::Tensor const& input_global_scale,
+    torch::Tensor const& input_offset_by_experts,
+    torch::Tensor const& output_scale_offset_by_experts);
 
 /*
  * From csrc/speculative
@@ -387,3 +461,24 @@ void convert_vertical_slash_indexes_mergehead(
  * From XGrammar
  */
 void ApplyTokenBitmaskInplace(at::Tensor logits, at::Tensor bitmask, at::optional<at::Tensor> indices = at::nullopt);
+
+/*
+ * From QServe
+ */
+void qserve_w4a8_per_chn_gemm(
+    const torch::Tensor& _in_feats,
+    const torch::Tensor& _kernel,
+    const torch::Tensor& _wscales,
+    const torch::Tensor& _ascales,
+    const torch::Tensor& _w_szs,
+    const torch::Tensor& _a_ssums,
+    torch::Tensor& _out_feats);
+
+void qserve_w4a8_per_group_gemm(
+    const torch::Tensor& _in_feats,
+    const torch::Tensor& _kernel,
+    const torch::Tensor& _zeros,
+    const torch::Tensor& _scales_i8,
+    const torch::Tensor& _wscales,
+    const torch::Tensor& _ascales,
+    torch::Tensor& _out_feats);

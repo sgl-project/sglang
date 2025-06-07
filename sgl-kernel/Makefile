@@ -19,14 +19,14 @@ submodule: ## Initialize and update git submodules
 	@git submodule update --init --recursive
 
 ln: submodule ## Create compilation database
-	@rm -rf build && mkdir build && cd build && cmake .. -DCMAKE_EXPORT_COMPILE_COMMANDS=YES
+	@rm -rf build && mkdir build && cd build && cmake .. -DCMAKE_EXPORT_COMPILE_COMMANDS=YES -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 
 
 install: submodule ## Install package in development mode
 	@pip install -e . --no-build-isolation
 
 build: install-deps submodule ## Build and install wheel package
-	@rm -rf dist/* || true && export MAX_JOBS=$(nproc) && CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) uv build --wheel -Cbuild-dir=build . --verbose --color=always --no-build-isolation && pip3 install dist/*whl --force-reinstall --no-deps
+	@rm -rf dist/* || true && export MAX_JOBS=$(nproc) && CMAKE_POLICY_VERSION_MINIMUM=3.5 CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) uv build --wheel -Cbuild-dir=build . --verbose --color=always --no-build-isolation && pip3 install dist/*whl --force-reinstall --no-deps
 
 clean: ## Remove build artifacts
 	@rm -rf build dist *.egg-info
@@ -47,6 +47,7 @@ format: check-deps ## Format all source files
 FILES_TO_UPDATE = python/sgl_kernel/version.py \
                  pyproject.toml \
                  pyproject_rocm.toml \
+                 pyproject_cpu.toml \
                  ../docker/Dockerfile.blackwell
 
 update: ## Update version numbers across project files. Usage: make update <new_version>

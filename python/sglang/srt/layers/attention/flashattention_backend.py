@@ -918,8 +918,11 @@ class FlashAttentionBackend(AttentionBackend):
             and local_attn_metadata is not None
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
-        # We do cascade attention for Draft Decode with topk > 1
-        use_cascade_attn = self.topk > 1
+
+        # When Spec Decode enabled, forward_decode would be called with two mode:
+        # 1. DRAFT_DECODE: we enable cascade attention when top_k > 1
+        # 2. IDLE: we don’t need cascade attention, spec_info will be none in this case
+        use_cascade_attn = forward_batch.spec_info is not None and self.topk > 1
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
@@ -1265,6 +1268,29 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             }
 
+            self.draft_extend_metadata = {
+                "cache_seqlens": torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                ),
+                "cu_seqlens_q": torch.zeros(
+                    max_bs + 1,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "cu_seqlens_k": torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
+                ),
+                "page_table": torch.zeros(
+                    max_bs,
+                    (self.max_context_len + self.page_size - 1) // self.page_size,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "strided_indices": torch.arange(
+                    0, self.max_context_len, self.page_size, device=self.device
+                ),
+            }
+
         if self.topk > 1:
             self.target_verify_metadata_topk_normal = {
                 "cache_seqlens": torch.zeros(
@@ -1434,19 +1460,7 @@ class FlashAttentionBackend(AttentionBackend):
                 self.decode_cuda_graph_metadata[bs] = metadata
 
                 if self.attention_chunk_size is not None:
-                    metadata.local_attn_metadata = FlashAttentionMetadata.LocalAttentionMetadata(
-                        local_query_start_loc=self.decode_cuda_graph_local_attn_metadata[
-                            "local_query_start_loc"
-                        ],
-                        local_seqused_k=self.decode_cuda_graph_local_attn_metadata[
-                            "local_seqused_k"
-                        ],
-                        local_block_table=self.decode_cuda_graph_local_attn_metadata[
-                            "local_block_table"
-                        ],
-                        local_max_query_len=1,
-                        local_max_seq_len=1,
-                    )
+                    self._update_local_attn_metadata_for_capture(metadata, batch_size)
 
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
@@ -1517,6 +1531,32 @@ class FlashAttentionBackend(AttentionBackend):
 
                 self.target_verify_metadata_topk_normal[bs] = metadata
                 self.target_verify_metadata_topk_expand[bs] = metadata_expand
+        elif forward_mode.is_draft_extend():
+            metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
+                :bs
+            ]
+            metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+
+            num_tokens_per_bs = num_tokens // bs
+            metadata.max_seq_len_q = num_tokens_per_bs
+            metadata.max_seq_len_k = seq_lens.max().item()
+
+            metadata.cu_seqlens_q = torch.arange(
+                0,
+                bs * num_tokens_per_bs + 1,
+                num_tokens_per_bs,
+                dtype=torch.int32,
+                device=device,
+            )
+
+            metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][
+                : (bs + 1)
+            ]
+            metadata.page_table = self.draft_extend_metadata["page_table"][
+                req_pool_indices, :
+            ]
+
+            self.draft_extend_metadata[bs] = metadata
 
         if encoder_lens is not None:
             encoder_bs = encoder_lens.numel()
@@ -1741,6 +1781,29 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata_expand.max_seq_len_k = (
                     metadata_expand.cache_seqlens_int32.max().item()
                 )
+        elif forward_mode.is_draft_extend():
+            metadata = self.draft_extend_metadata[bs]
+            metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+
+            metadata.max_seq_len_k = seq_lens_cpu.max().item()
+            metadata.cu_seqlens_k[1:].copy_(
+                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+            )
+            accept_length = spec_info.accept_length[:bs]
+            metadata.max_seq_len_q = accept_length.max().item()
+            metadata.cu_seqlens_q[1:].copy_(
+                torch.cumsum(accept_length, dim=0, dtype=torch.int32)
+            )
+
+            max_seq_pages = (
+                metadata.max_seq_len_k + self.page_size - 1
+            ) // self.page_size
+            page_indices = self.req_to_token[
+                req_pool_indices[:, None],
+                self.draft_extend_metadata["strided_indices"][:max_seq_pages],
+            ]
+            page_indices //= self.page_size
+            metadata.page_table[:, :max_seq_pages].copy_(page_indices)
 
         if encoder_lens is not None:
             # Only support encoder size 1 for now
@@ -1806,6 +1869,62 @@ class FlashAttentionBackend(AttentionBackend):
             local_max_seq_len=int(seqlens_k_local_np.max()),
         )
         metadata.local_attn_metadata = local_metadata
+
+    def _update_local_attn_metadata_for_capture(
+        self, metadata: FlashAttentionMetadata, bs: int
+    ):
+        """Update local attention metadata during CUDA graph capture phase.
+
+        This method calculates the exact buffer sizes needed for local attention metadata
+        during the CUDA graph capture phase, optimizing memory usage by creating views of
+        pre-allocated buffers with exactly the sizes needed.
+        """
+        seq_lens_capture = metadata.cache_seqlens_int32
+        max_seq_len = int(seq_lens_capture.max().item())
+        page_table_capture = metadata.page_table
+
+        cu_seqlens_q_np = metadata.cu_seqlens_q.cpu().numpy()
+        seqlens_np = seq_lens_capture.cpu().numpy()
+        (
+            seqlens_q_local_np,
+            cu_seqlens_q_local_np,
+            seqlens_k_local_np,
+            block_table_local_np,
+        ) = make_local_attention_virtual_batches(
+            self.attention_chunk_size,
+            cu_seqlens_q_np,
+            seqlens_np,
+            page_table_capture,
+            self.page_size,
+        )
+
+        # Get exact dimensions from the calculation
+        q_len = len(cu_seqlens_q_local_np)
+        k_len = len(seqlens_k_local_np)
+        b0 = block_table_local_np.shape[0] if block_table_local_np.shape[0] > 0 else bs
+        b1 = block_table_local_np.shape[1] if block_table_local_np.shape[1] > 0 else 1
+
+        # Create views of the pre-allocated buffers with exactly these sizes
+        # This is the key optimization - we only use the memory we actually need
+        local_query_start_loc = self.decode_cuda_graph_local_attn_metadata[
+            "local_query_start_loc"
+        ][:q_len]
+
+        local_seqused_k = self.decode_cuda_graph_local_attn_metadata["local_seqused_k"][
+            :k_len
+        ]
+
+        local_block_table = self.decode_cuda_graph_local_attn_metadata[
+            "local_block_table"
+        ][:b0, :b1]
+
+        metadata.local_attn_metadata = FlashAttentionMetadata.LocalAttentionMetadata(
+            local_query_start_loc=local_query_start_loc,
+            local_seqused_k=local_seqused_k,
+            local_block_table=local_block_table,
+            local_max_query_len=1,
+            local_max_seq_len=max_seq_len,
+        )
 
     def _update_local_attn_metadata_for_replay(
         self, metadata: FlashAttentionMetadata, bs: int
