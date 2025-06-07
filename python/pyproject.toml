@@ -50,7 +50,7 @@ runtime_common = [
 srt = [
     "sglang[runtime_common]",
     "sgl-kernel==0.1.5",
-    "flashinfer_python==0.2.6",
+    "flashinfer_python==0.2.6.post1",
     "torch==2.6.0",
     "torchvision==0.21.0",
     "cuda-python",
@@ -66,7 +66,7 @@ blackwell = [
     "cuda-python",
     "outlines>=0.0.44,<=0.1.11",
     "einops",
-    "flashinfer_python==0.2.6",
+    "flashinfer_python==0.2.6.post1",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
