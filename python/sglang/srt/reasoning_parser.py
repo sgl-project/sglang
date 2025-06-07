@@ -32,7 +32,7 @@ class BaseReasoningFormatDetector:
         One-time parsing: Detects and parses reasoning sections in the provided text.
         Returns both reasoning content and normal text separately.
         """
-        text = text.replace(self.think_start_token, "").strip()
+        text = text.replace(self.think_start_token, "")
         if self.think_end_token not in text:
             # Assume reasoning was truncated before `</think>` token
             return StreamingParseResult(reasoning_text=text)
@@ -73,7 +73,7 @@ class BaseReasoningFormatDetector:
             normal_text = current_text[end_idx + len(self.think_end_token) :]
 
             return StreamingParseResult(
-                normal_text=normal_text, reasoning_text=reasoning_text.rstrip()
+                normal_text=normal_text, reasoning_text=reasoning_text
             )
 
         # Continue with reasoning content
