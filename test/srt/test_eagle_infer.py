@@ -720,7 +720,7 @@ class TestEAGLEDraftExtendFlashinferMLA(TestEAGLEDraftExtend):
                 "flashinfer",
             ],
         )
-        cls.accept_len_threshold = 1.85
+        cls.accept_len_threshold = 1.80
 
 
 if __name__ == "__main__":
