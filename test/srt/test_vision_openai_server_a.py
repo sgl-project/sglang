@@ -164,6 +164,8 @@ class TestMinicpmoServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.7",
             ],
         )
         cls.base_url += "/v1"

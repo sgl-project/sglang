@@ -131,6 +131,8 @@ class TestGemma3itServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.75",
                 "--enable-multimodal",
             ],
         )
