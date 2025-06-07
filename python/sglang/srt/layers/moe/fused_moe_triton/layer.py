@@ -225,6 +225,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 activation=activation,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 no_combine=no_combine,
+                routed_scaling_factor=routed_scaling_factor,
             )
 
     def forward_cpu(

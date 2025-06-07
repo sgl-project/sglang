@@ -276,6 +276,12 @@ void ep_moe_post_reorder(
 
 void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor);
 
+void apply_shuffle_mul_sum(
+    const torch::Tensor& input,
+    torch::Tensor& output,
+    const torch::Tensor& permutation,
+    const std::optional<torch::Tensor>& factors);
+
 void cutlass_fp4_group_mm(
     torch::Tensor& output,
     const torch::Tensor& a,
