@@ -36,7 +36,7 @@ configs = list(itertools.product(bs_range, qlen_range))
         args={},
     )
 )
-def benchmark(batch_size, seq_len, provider, block_size):
+def benchmark(batch_size, seq_len, provider, block_size, num_kv_splits):
     d = 576
     dv = 512
 
@@ -76,12 +76,16 @@ def benchmark(batch_size, seq_len, provider, block_size):
         block_table.numel(), block_size, d, dtype=torch.bfloat16, device="cuda"
     )
 
-    workspace_size = cutlass_mla_get_workspace_size(block_num * block_size, batch_size)
+    workspace_size = cutlass_mla_get_workspace_size(
+        block_num * block_size, batch_size, num_kv_splits=num_kv_splits
+    )
     workspace = torch.empty(workspace_size, device="cuda", dtype=torch.uint8)
 
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench(
-        lambda: cutlass_mla_decode(q, kv_cache, seq_lens, block_table, workspace),
+        lambda: cutlass_mla_decode(
+            q, kv_cache, seq_lens, block_table, workspace, num_kv_splits
+        ),
         quantiles=quantiles,
     )
 
@@ -106,15 +110,24 @@ if __name__ == "__main__":
         default=[1, 32, 64, 128],
         help="List of batch sizes",
     )
+    parser.add_argument(
+        "--num-kv-splits",
+        nargs="+",
+        type=int,
+        default=[-1],
+        help="List of batch sizes",
+    )
     args = parser.parse_args()
 
     for block_size in args.block_sizes:
-        print(f"block_size={block_size}: ")
-        benchmark.run(
-            print_data=True,
-            show_plots=True,
-            save_path="bench_blackwell_mla_res",
-            block_size=block_size,
-        )
+        for kv_split in args.num_kv_splits:
+            print(f"block_size={block_size}, num_kv_splits={kv_split}: ")
+            benchmark.run(
+                print_data=True,
+                show_plots=True,
+                save_path="bench_blackwell_mla_res",
+                block_size=block_size,
+                num_kv_splits=kv_split,
+            )
 
     print("Benchmark finished!")
