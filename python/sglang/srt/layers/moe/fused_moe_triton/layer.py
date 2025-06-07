@@ -242,19 +242,59 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         correction_bias: Optional[torch.Tensor] = None,
         inplace: bool = True,
     ) -> torch.Tensor:
-        return moe_forward_native(
-            layer,
-            x,
-            use_grouped_topk,
-            top_k,
-            router_logits,
-            renormalize,
-            topk_group,
-            num_expert_group,
-            num_fused_shared_experts,
-            custom_routing_function,
-            correction_bias,
-        )
+        assert activation == "silu", f"activation = {activation} is not supported."
+
+        # TODO: rebase when #6641 lands
+        if layer.use_intel_amx_backend:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                num_fused_shared_experts=num_fused_shared_experts,
+                custom_routing_function=custom_routing_function,
+                correction_bias=correction_bias,
+                routed_scaling_factor=routed_scaling_factor,
+            )
+
+            return torch.ops.sgl_kernel.fused_experts_cpu(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                False,  # inplace # See [Note] inplace should be False in fused_experts.
+                False,  # use_int8_w8a8
+                False,  # use_fp8_w8a16
+                None,  # w1_scale
+                None,  # w2_scale
+                None,  # block_size
+                None,  # a1_scale
+                None,  # a2_scale
+                True,  # is_vnni
+            )
+        else:
+            return moe_forward_native(
+                layer,
+                x,
+                use_grouped_topk,
+                top_k,
+                router_logits,
+                renormalize,
+                topk_group,
+                num_expert_group,
+                num_fused_shared_experts,
+                custom_routing_function,
+                correction_bias,
+                activation,
+                apply_router_weight_on_input,
+                inplace,
+                no_combine,
+                routed_scaling_factor,
+            )
 
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
