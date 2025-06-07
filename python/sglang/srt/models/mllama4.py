@@ -16,6 +16,7 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.llama_common import LLAMA4_STACKED_PARAMS_MAPPING
 from sglang.srt.utils import add_prefix
 
 
@@ -120,18 +121,72 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         return name, loaded_weight
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    def _load_stacked_weight(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        mapping: dict[str, Tuple[torch.Tensor, str]],
+    ) -> bool:
 
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
-            (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
-            (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
-            (".shared_expert.gate_up_proj", ".shared_expert.gate_proj", 0),
-            (".shared_expert.gate_up_proj", ".shared_expert.up_proj", 1),
-            (".feed_forward.gate_up_proj", ".feed_forward.gate_proj", 0),
-            (".feed_forward.gate_up_proj", ".feed_forward.up_proj", 1),
-        ]
+        if name in mapping and "vision" not in name:
+            param, shard_id = mapping[name]
+            weight_loader = param.weight_loader
+            weight_loader(param, loaded_weight, shard_id)
+            return True
+        return False
+
+    def _load_expert_weight(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict[str, torch.tensor],
+        num_experts: int,
+        expert_mapping: dict[str, Tuple[torch.Tensor, int, str]],
+    ) -> bool:
+        if ".experts." not in name:
+            return False
+        if "experts.gate_up_proj" not in name or "experts.down_proj" not in name:
+            if name in expert_mapping:
+                param, expert_id, shard_id = expert_mapping[name]
+                weight_loader = param.weight_loader
+                weight_loader(
+                    param,
+                    loaded_weight,
+                    name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+                return True
+            return False
+        if ".gate_up_proj" in name:
+            name_list = [
+                name.replace(".experts.gate_up_proj", ".experts.w13_weight")
+            ] * 2
+            loaded_weight_list = loaded_weight.chunk(2, dim=-1)
+            shard_id_list = ["w1", "w3"]
+        else:
+            name_list = [name.replace(".experts.down_proj", ".experts.w2_weight")]
+            shard_id_list = ["w2"]
+            loaded_weight_list = [loaded_weight]
+
+        for name, loaded_weight, shard_id in zip(
+            name_list, loaded_weight_list, shard_id_list
+        ):
+            param = params_dict[name]
+            weight_loader = param.weight_loader
+            for expert_id in range(num_experts):
+                weight_loader(
+                    param,
+                    loaded_weight[expert_id].T,
+                    name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+        return True
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+
+        stacked_params_mapping = LLAMA4_STACKED_PARAMS_MAPPING
 
         params_dict = dict(self.named_parameters())
 
@@ -146,82 +201,49 @@ class Llama4ForConditionalGeneration(nn.Module):
             num_experts=num_experts,
         )
 
+        # Create a mapping for stacked parameters
+        # For a p_name example in params_dict.items():
+        #   language_model.model.layers.0.self_attn.qkv_proj.weight
+        # it will generate three different checkpoint keys in stacked_mapping:
+        #   language_model.layers.0.self_attn.q_proj.weight,
+        #   language_model.layers.0.self_attn.k_proj.weight,
+        #   language_model.layers.0.self_attn.v_proj.weight
+        stacked_mapping: dict[str, Tuple[torch.Tensor, str]] = {}
+        for param_name, weight_name, shard_id in stacked_params_mapping:
+            for p_name, param in params_dict.items():
+                if p_name.endswith(".weight") and param_name in p_name:
+                    ckpt_name = p_name.replace(param_name, weight_name)
+                    stacked_mapping[ckpt_name] = (param, shard_id)
+
+        expert_mapping: dict[str, Tuple[torch.Tensor, int, str]] = {}
+        for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+            for p_name, param in params_dict.items():
+                if p_name.endswith(".weight") and param_name in p_name:
+                    ckpt_name = p_name.replace(param_name, weight_name)
+                    expert_mapping[ckpt_name] = (param, expert_id, shard_id)
+
         for name, loaded_weight in weights:
-            if not "vision" in name:
+            if "vision" not in name:
                 name, loaded_weight = self.permute_qk_weight_for_rotary(
                     name, loaded_weight
                 )
+            if self._load_stacked_weight(name, loaded_weight, stacked_mapping):
+                continue
 
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-
-                if "vision" in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if ".experts" in name:
-                    # NOTE: llama4 fp8 has different weight format for experts
-                    if (
-                        "experts.gate_up_proj" not in name
-                        and "experts.down_proj" not in name
-                    ):
-                        for mapping in expert_params_mapping:
-                            param_name, weight_name, expert_id, shard_id = mapping
-                            if weight_name not in name:
-                                continue
-                            name = name.replace(weight_name, param_name)
-                            param = params_dict[name]
-                            weight_loader = param.weight_loader
-                            weight_loader(
-                                param,
-                                loaded_weight,
-                                name,
-                                shard_id=shard_id,
-                                expert_id=expert_id,
-                            )
-                            break
-                    else:
-                        if ".gate_up_proj" in name:
-                            name_list = [
-                                name.replace(
-                                    ".experts.gate_up_proj", ".experts.w13_weight"
-                                )
-                            ] * 2
-                            loaded_weight_list = loaded_weight.chunk(2, dim=-1)
-                            shard_id_list = ["w1", "w3"]
-                        else:
-                            name_list = [
-                                name.replace(".experts.down_proj", ".experts.w2_weight")
-                            ]
-                            shard_id_list = ["w2"]
-                            loaded_weight_list = [loaded_weight]
-                        for name, loaded_weight, shard_id in zip(
-                            name_list, loaded_weight_list, shard_id_list
-                        ):
-                            param = params_dict[name]
-                            weight_loader = param.weight_loader
-                            for expert_id in range(num_experts):
-                                weight_loader(
-                                    param,
-                                    loaded_weight[expert_id].T,
-                                    name,
-                                    shard_id=shard_id,
-                                    expert_id=expert_id,
-                                )
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+            if self._load_expert_weight(
+                name,
+                loaded_weight,
+                params_dict,
+                num_experts,
+                expert_mapping,
+            ):
+                continue
+            # Skip loading extra bias for GPTQ models.
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
 
 
 EntryClass = Llama4ForConditionalGeneration

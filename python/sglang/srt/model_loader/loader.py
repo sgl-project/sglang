@@ -17,6 +17,7 @@ from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
 import huggingface_hub
 import numpy as np
 import torch
+import torch.distributed as dist
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
 from transformers import AutoModelForCausalLM
