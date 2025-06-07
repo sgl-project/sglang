@@ -29,16 +29,17 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import flatten_nested_list, get_compiler_backend
+from sglang.srt.utils import flatten_nested_list, get_compiler_backend, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -239,6 +240,7 @@ class ForwardBatch:
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
+    global_forward_mode: Optional[ForwardMode] = None
 
     # Speculative decoding
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
@@ -247,9 +249,14 @@ class ForwardBatch:
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded
+    num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
+
+    tbo_split_seq_index: Optional[int] = None
+    tbo_parent_token_range: Optional[Tuple[int, int]] = None
+    tbo_children: Optional[List["ForwardBatch"]] = None
 
     @classmethod
     def init_new(
@@ -257,6 +264,8 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
+        from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
+
         device = model_runner.device
         extend_input_logprob_token_ids_gpu = None
         if batch.extend_input_logprob_token_ids is not None:
@@ -280,6 +289,7 @@ class ForwardBatch:
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
+            global_forward_mode=batch.global_forward_mode,
             lora_paths=batch.lora_paths,
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
@@ -290,6 +300,10 @@ class ForwardBatch:
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
             extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
+            num_token_non_padded=torch.tensor(
+                len(batch.input_ids), dtype=torch.int32
+            ).to(device, non_blocking=True),
+            tbo_split_seq_index=batch.tbo_split_seq_index,
         )
 
         # For DP attention
@@ -312,6 +326,7 @@ class ForwardBatch:
             )
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
+            TboForwardBatchPreparer.prepare(ret)
             return ret
 
         # Override the positions with spec_info
@@ -336,7 +351,7 @@ class ForwardBatch:
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
-            if model_runner.server_args.attention_backend != "torch_native":
+            if support_triton(model_runner.server_args.attention_backend):
                 ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
                     ret.extend_prefix_lens,
@@ -359,6 +374,8 @@ class ForwardBatch:
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
+
+        TboForwardBatchPreparer.prepare(ret)
 
         return ret
 
@@ -583,6 +600,10 @@ class ForwardBatch:
 
         # Precompute the kv indices for each chunk
         self.prepare_chunked_kv_indices(device)
+
+    @property
+    def can_run_tbo(self):
+        return self.tbo_split_seq_index is not None
 
 
 class PPProxyTensors:

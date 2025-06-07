@@ -1436,7 +1436,7 @@ def fused_experts_impl(
     if (
         not (use_fp8_w8a8 or use_int8_w8a8)
         or block_shape is not None
-        or (_is_hip and get_bool_env_var("SGLANG_AITER_MOE"))
+        or (_is_hip and get_bool_env_var("SGLANG_USE_AITER"))
     ):
         padded_size = 0
 
@@ -1649,6 +1649,7 @@ def fused_moe(
     activation: str = "silu",
     use_grouped_topk: bool = False,
     num_expert_group: Optional[int] = None,
+    num_fused_shared_experts: int = 0,
     topk_group: Optional[int] = None,
     custom_routing_function: Optional[Callable] = None,
     use_fp8_w8a8: bool = False,
@@ -1718,6 +1719,7 @@ def fused_moe(
         renormalize=renormalize,
         topk_group=topk_group,
         num_expert_group=num_expert_group,
+        num_fused_shared_experts=num_fused_shared_experts,
         custom_routing_function=custom_routing_function,
         routed_scaling_factor=routed_scaling_factor,
     )

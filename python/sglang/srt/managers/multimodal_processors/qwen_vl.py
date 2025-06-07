@@ -1,6 +1,7 @@
 import asyncio
 import math
-from typing import List, Union
+import re
+from typing import Dict, List, Union
 
 import torch
 from PIL import Image
@@ -23,11 +24,16 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
+        # The single, pre-expanded image token.
         self.IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
+        # The regex that matches expanded image tokens.
+        self.IMAGE_TOKEN_REGEX = re.compile(
+            r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
+        )
         self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
         self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
-        self.image_token_id = hf_config.image_token_id
-        self.video_token_id = hf_config.video_token_id
+        self.IM_TOKEN_ID = hf_config.image_token_id
+        self.VIDEO_TOKEN_ID = hf_config.video_token_id
         self.vision_start_token_id = hf_config.vision_start_token_id
         self.vision_end_token_id = hf_config.vision_end_token_id
         self.NUM_TOKEN_PER_FRAME = 770
@@ -38,7 +44,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
     async def process_mm_data_async(
         self,
-        image_data: List[Union[str, bytes]],
+        image_data: List[Union[str, bytes, Dict]],
         input_text,
         request_obj,
         max_req_input_len,
@@ -48,11 +54,13 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         if isinstance(image_data, str):
             image_data = [image_data]
 
-        image_token = self.IMAGE_TOKEN
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
+            multimodal_tokens=MultimodalSpecialTokens(
+                image_token=self.IMAGE_TOKEN,
+                image_token_regex=self.IMAGE_TOKEN_REGEX,
+            ),
             max_req_input_len=max_req_input_len,
         )
 
@@ -117,53 +125,45 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         async def resize_image_async(image):
             return resize_image(image)
 
-        if base_output.images:
+        # Qwen-specific: resize images if they are raw Image objects
+        if base_output.images and isinstance(base_output.images[0], Image.Image):
             resize_tasks = [resize_image_async(image) for image in base_output.images]
             base_output.images = await asyncio.gather(*resize_tasks)
 
-        ret = self.process_mm_data(
-            input_text=base_output.input_text,
-            images=base_output.images,
-        )
+        video_grid_thw = None  # TODO
 
-        items = []
+        combined_mm_item, input_ids = self.process_and_combine_mm_data(base_output)
 
-        input_ids = ret["input_ids"].flatten().tolist()
-        if "pixel_values" in ret:
-            items += [
-                MultimodalDataItem(
-                    pixel_values=ret["pixel_values"],
-                    image_grid_thws=torch.concat([ret["image_grid_thw"]]),
-                    # TODO
-                    video_grid_thws=None,
-                    second_per_grid_ts=ret.get("second_per_grid_ts", None),
-                    modality=Modality.IMAGE,
-                )
-            ]
+        if combined_mm_item is None:
+            # Note(Xinyuan): This is the case where image loading fails.
+            return None
+
+        video_grid_thw = None  # TODO
+        second_per_grid_ts = getattr(combined_mm_item, "second_per_grid_ts", None)
 
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
-            image_token_id=self.image_token_id,
-            video_token_id=self.video_token_id,
+            image_token_id=self.IM_TOKEN_ID,
+            video_token_id=self.VIDEO_TOKEN_ID,
             vision_start_token_id=self.vision_start_token_id,
             model_type=self.hf_config.model_type,
             tokens_per_second=getattr(
                 self.hf_config.vision_config, "tokens_per_second", None
             ),
-            input_ids=torch.tensor(input_ids).unsqueeze(0),
-            image_grid_thw=ret.get("image_grid_thw", None),
-            video_grid_thw=ret.get("video_grid_thw", None),
-            second_per_grid_ts=ret.get("second_per_grid_ts", None),
+            input_ids=input_ids.unsqueeze(0),
+            image_grid_thw=combined_mm_item.image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
         )
         mrope_positions = mrope_positions.squeeze(1)
 
         return {
-            "input_ids": input_ids,
-            "mm_items": items,
+            "input_ids": input_ids.tolist(),
+            "mm_items": [combined_mm_item],
             "im_start_id": self.IM_START_TOKEN_ID,
             "im_end_id": self.IM_END_TOKEN_ID,
-            "im_token_id": self.image_token_id,
-            "video_token_id": self.video_token_id,
+            "im_token_id": self.IM_TOKEN_ID,
+            "video_token_id": self.VIDEO_TOKEN_ID,
             "mrope_positions": mrope_positions,
             "mrope_position_delta": mrope_position_delta,
         }

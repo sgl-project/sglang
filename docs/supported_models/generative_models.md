@@ -11,8 +11,17 @@ python3 -m sglang.launch_server \
   --port 30000 \
 ```
 
-## Supporting Matrixs
+## Supported models
 
+Below the supported models are summarized in a table.
+
+If you are unsure if a specific architecture is implemented, you can search for it via GitHub. For example, to search for `Qwen3ForCausalLM`, use the expression:
+
+```
+repo:sgl-project/sglang path:/^python\/sglang\/srt\/models\// Qwen3ForCausalLM
+```
+
+in the GitHub search bar.
 
 | Model Family (Variants)             | Example HuggingFace Identifier                     | Description                                                                            |
 |-------------------------------------|--------------------------------------------------|----------------------------------------------------------------------------------------|
@@ -35,3 +44,4 @@ python3 -m sglang.launch_server \
 | **XVERSE** (MoE)                   | `xverse/XVERSE-MoE-A36B`                         | Yuanxiang’s open MoE LLM (XVERSE-MoE-A36B: 255B total, 36B active) supporting ~40 languages; delivers 100B+ dense-level performance via expert routing. |
 | **SmolLM** (135M–1.7B)            | `HuggingFaceTB/SmolLM-1.7B`                      | Hugging Face’s ultra-small LLM series (135M–1.7B params) offering surprisingly strong results, enabling advanced AI on mobile/edge devices. |
 | **GLM-4** (Multilingual 9B)        | `ZhipuAI/glm-4-9b-chat`                          | Zhipu’s GLM-4 series (up to 9B parameters) – open multilingual models with support for 1M-token context and even a 5.6B multimodal variant (Phi-4V). |
+| **MiMo** (7B series)               | `XiaomiMiMo/MiMo-7B-RL`                         | Xiaomi's reasoning-optimized model series, leverages Multiple-Token Prediction for faster inference. |

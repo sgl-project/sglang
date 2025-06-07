@@ -37,6 +37,7 @@ import hashlib
 import logging
 import threading
 from enum import Enum, auto
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -48,7 +49,11 @@ from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
-from sglang.srt.disaggregation.decode import ScheduleBatchDisaggregationDecodeMixin
+from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
+    ScheduleBatchDisaggregationDecodeMixin,
+)
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
@@ -57,7 +62,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, get_compiler_backend
+from sglang.srt.utils import flatten_nested_list, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -75,18 +80,22 @@ global_server_args_dict = {
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "enable_deepep_moe": ServerArgs.enable_deepep_moe,
     "enable_dp_attention": ServerArgs.enable_dp_attention,
+    "enable_two_batch_overlap": ServerArgs.enable_two_batch_overlap,
     "enable_dp_lm_head": ServerArgs.enable_dp_lm_head,
     "enable_ep_moe": ServerArgs.enable_ep_moe,
+    "deepep_config": ServerArgs.deepep_config,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
     "max_micro_batch_size": ServerArgs.max_micro_batch_size,
     "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
-    "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
+    "ep_dispatch_algorithm": ServerArgs.ep_dispatch_algorithm,
+    "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
     "sampling_backend": ServerArgs.sampling_backend,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "torchao_config": ServerArgs.torchao_config,
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
+    "ep_num_redundant_experts": ServerArgs.ep_num_redundant_experts,
 }
 
 logger = logging.getLogger(__name__)
@@ -177,10 +186,10 @@ class MultimodalDataItem:
     image_offsets: Optional[list] = None
 
     # the real data, pixel_values or audio_features
-    # data: Union[List[torch.Tensor], List[np.array]]
-    pixel_values: Union[torch.Tensor, np.array] = None
-    image_grid_thws: Union[torch.Tensor, np.array] = None
-    video_grid_thws: Union[torch.Tensor, np.array] = None
+    # data: Union[List[torch.Tensor], List[np.ndarray]]
+    pixel_values: Union[torch.Tensor, np.ndarray] = None
+    image_grid_thw: Union[torch.Tensor, np.ndarray] = None
+    video_grid_thws: Union[torch.Tensor, np.ndarray] = None
 
     image_emb_mask: Optional[torch.Tensor] = None
     image_spatial_crop: Optional[torch.Tensor] = None
@@ -189,8 +198,14 @@ class MultimodalDataItem:
     # [num_images, (n, w, h)]
     tgt_size: Tuple[int, int] = None
 
-    audio_features: Union[torch.Tensor, np.array] = None
+    # kimi-vl related
+    image_grid_hws: Optional[List[torch.Tensor]] = None
+
+    audio_features: Union[torch.Tensor, np.ndarray] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
+    audio_offsets: Optional[List[Tuple[int, int]]] = None
+
+    precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     @staticmethod
     def is_empty_list(l):
@@ -219,7 +234,8 @@ class MultimodalDataItem:
                     for x in tensor_list
                 ]
                 tensor = torch.concat(tensor_list)
-
+            if tensor.is_cuda:
+                return gpu_tensor_hash(tensor)
             tensor = tensor.detach().contiguous()
 
             if tensor.dtype == torch.bfloat16:
@@ -249,7 +265,9 @@ class MultimodalDataItem:
                 return tensor_hash([f])
             return data_hash(f)
 
-        if self.is_audio():
+        if self.precomputed_features is not None:
+            self.hash = hash_feature(self.precomputed_features)
+        elif self.is_audio():
             self.hash = hash_feature(self.audio_features)
         else:
             self.hash = hash_feature(self.pixel_values)
@@ -258,19 +276,24 @@ class MultimodalDataItem:
         self.pad_value = self.hash % (1 << 30)
 
     def is_audio(self):
-        return (
-            self.modality == Modality.AUDIO
-        ) and not MultimodalDataItem.is_empty_list(self.audio_features)
+        return (self.modality == Modality.AUDIO) and (
+            self.precomputed_features is not None
+            or not MultimodalDataItem.is_empty_list(self.audio_features)
+        )
 
     def is_image(self):
         return (
             self.modality == Modality.IMAGE or self.modality == Modality.MULTI_IMAGES
-        ) and not MultimodalDataItem.is_empty_list(self.pixel_values)
+        ) and (
+            self.precomputed_features is not None
+            or not MultimodalDataItem.is_empty_list(self.pixel_values)
+        )
 
     def is_video(self):
-        return (
-            self.modality == Modality.VIDEO
-        ) and not MultimodalDataItem.is_empty_list(self.pixel_values)
+        return (self.modality == Modality.VIDEO) and (
+            self.precomputed_features is not None
+            or not MultimodalDataItem.is_empty_list(self.pixel_values)
+        )
 
     def is_valid(self) -> bool:
         return self.is_image() or self.is_video() or self.is_audio()
@@ -278,6 +301,16 @@ class MultimodalDataItem:
     def validate(self):
         ...
         # TODO
+
+    @staticmethod
+    def from_dict(obj: dict):
+        kwargs = dict(obj)
+        modality = kwargs.pop("modality")
+        if isinstance(modality, str):
+            modality = Modality[modality]
+        ret = MultimodalDataItem(modality=modality, **kwargs)
+        ret.validate()
+        return ret
 
 
 @dataclasses.dataclass
@@ -304,8 +337,9 @@ class MultimodalInputs:
     video_token_id: Optional[int] = None
 
     # audio
-    audio_start_id: Optional[torch.Tensor] = None
-    audio_end_id: Optional[torch.Tensor] = None
+    audio_token_id: Optional[int] = None
+    audio_start_id: Optional[int] = None
+    audio_end_id: Optional[int] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -329,6 +363,7 @@ class MultimodalInputs:
             "slice_end_id",
             "audio_start_id",
             "audio_end_id",
+            "audio_token_id",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -578,9 +613,6 @@ class Req:
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
 
-        # The first output_id transferred from prefill instance.
-        self.transferred_output_id: Optional[int] = None
-
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
@@ -744,6 +776,16 @@ class Req:
         logger.info(f"{prefix}: {self.time_stats}")
         self.has_log_time_stats = True
 
+    def set_finish_with_abort(self, error_msg: str):
+        if get_tensor_model_parallel_rank() == 0:
+            logger.error(f"{error_msg}, {self.rid=}")
+        self.multimodal_inputs = None
+        self.grammar = None
+        self.origin_input_ids = [0]  # set it to one token to skip the long prefill
+        self.finished_reason = FINISH_ABORT(
+            error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+        )
+
     def __repr__(self):
         return (
             f"Req(rid={self.rid}, "
@@ -805,6 +847,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     can_run_dp_cuda_graph: bool = False
+    tbo_split_seq_index: Optional[int] = None
+    global_forward_mode: Optional[ForwardMode] = None
 
     # For processing logprobs
     return_logprob: bool = False
@@ -1069,7 +1113,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert len(self.out_cache_loc) == self.extend_num_tokens
+        assert (
+            len(self.out_cache_loc) == self.extend_num_tokens
+        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
@@ -1226,7 +1272,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         # Write to req_to_token_pool
-        if global_server_args_dict["attention_backend"] != "torch_native":
+        if support_triton(global_server_args_dict.get("attention_backend")):
             # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
 
             write_req_to_token_pool_triton[(bs,)](
@@ -1290,7 +1336,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         page_size = self.token_to_kv_pool_allocator.page_size
         if page_size == 1:
             return len(self.reqs)
-        return sum(1 for req in self.reqs if req.seqlen % page_size == 0)
+        # In the decoding phase, the length of a request's KV cache should be
+        # the total length of the request minus 1
+        return sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
 
     def check_decode_mem(self, buf_multiplier=1):
         tokens_required = (
@@ -1596,6 +1644,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             or global_server_args_dict["attention_backend"] == "flashmla"
             or global_server_args_dict["attention_backend"] == "fa3"
             or global_server_args_dict["attention_backend"] == "cutlass_mla"
+            or global_server_args_dict["enable_two_batch_overlap"]
         ):
             seq_lens_cpu = self.seq_lens.cpu()
         else:
@@ -1623,6 +1672,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            tbo_split_seq_index=self.tbo_split_seq_index,
+            global_forward_mode=self.global_forward_mode,
             seq_lens_cpu=seq_lens_cpu,
             extend_num_tokens=self.extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
@@ -1701,6 +1752,8 @@ class ModelWorkerBatch:
     global_num_tokens: Optional[List[int]]
     global_num_tokens_for_logprob: Optional[List[int]]
     can_run_dp_cuda_graph: bool
+    tbo_split_seq_index: Optional[int]
+    global_forward_mode: Optional[ForwardMode]
 
     # For extend
     extend_num_tokens: Optional[int]
@@ -1774,10 +1827,72 @@ def write_req_to_token_pool_triton(
         )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def get_last_loc(req_to_token, req_pool_indices_tensor, prefix_lens_tensor):
+def get_last_loc(
+    req_to_token: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+) -> torch.Tensor:
+    if global_server_args_dict["attention_backend"] != "torch_native":
+        impl = get_last_loc_triton
+    else:
+        impl = get_last_loc_torch
+
+    return impl(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
+
+
+def get_last_loc_torch(
+    req_to_token: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+) -> torch.Tensor:
     return torch.where(
         prefix_lens_tensor > 0,
         req_to_token[req_pool_indices_tensor, prefix_lens_tensor - 1],
         torch.full_like(prefix_lens_tensor, -1),
     )
+
+
+@triton.jit
+def get_last_loc_kernel(
+    req_to_token,
+    req_pool_indices_tensor,
+    prefix_lens_tensor,
+    result,
+    num_tokens,
+    req_to_token_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offset = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
+    mask = offset < num_tokens
+
+    prefix_lens = tl.load(prefix_lens_tensor + offset, mask=mask, other=0)
+    req_pool_indices = tl.load(req_pool_indices_tensor + offset, mask=mask, other=0)
+
+    token_mask = prefix_lens > 0
+    token_index = req_pool_indices * req_to_token_stride + (prefix_lens - 1)
+    tokens = tl.load(req_to_token + token_index, mask=token_mask, other=-1)
+
+    tl.store(result + offset, tokens, mask=mask)
+
+
+def get_last_loc_triton(
+    req_to_token: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+) -> torch.Tensor:
+    BLOCK_SIZE = 256
+    num_tokens = prefix_lens_tensor.shape[0]
+    result = torch.empty_like(prefix_lens_tensor)
+    grid = (triton.cdiv(num_tokens, BLOCK_SIZE),)
+
+    get_last_loc_kernel[grid](
+        req_to_token,
+        req_pool_indices_tensor,
+        prefix_lens_tensor,
+        result,
+        num_tokens,
+        req_to_token.stride(0),
+        BLOCK_SIZE,
+    )
+    return result
