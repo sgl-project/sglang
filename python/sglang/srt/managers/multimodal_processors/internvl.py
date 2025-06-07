@@ -175,6 +175,10 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
         if not image_data:
             return None
 
+        # Ensure image_data is a list
+        if isinstance(image_data, str):
+            image_data = [image_data]
+
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
