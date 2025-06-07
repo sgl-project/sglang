@@ -139,7 +139,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         if gpu_mem is not None and gpu_mem > 96 * 1024:
             capture_bs += list(range(160, 257, 8))
         if gpu_mem is not None and gpu_mem > 180 * 1000:
-            capture_bs += list(range(256, 321, 16))
+            capture_bs += list(range(256, 513, 16))
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
