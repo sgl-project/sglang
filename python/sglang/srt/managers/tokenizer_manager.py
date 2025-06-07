@@ -1419,7 +1419,7 @@ class TokenizerManager:
             asyncio.create_task(asyncio.to_thread(background_task))
 
     def _handle_abort_req(self, recv_obj):
-        self.rid_to_state.pop(recv_obj.rid)
+        self.rid_to_state.pop(recv_obj.rid, None)
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(

@@ -5,6 +5,7 @@ from typing import Callable, List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.utils import is_sm100_supported
 
 try:
     from vllm import _custom_ops as ops
@@ -81,12 +82,6 @@ def cutlass_fp8_supported():
     elif major == 8 and minor == 9:
         return cuda_version >= (12, 4)
     return False
-
-
-def is_sm100_supported(device=None) -> bool:
-    return (torch.cuda.get_device_capability(device)[0] == 10) and (
-        torch.version.cuda >= "12.8"
-    )
 
 
 def normalize_e4m3fn_to_e4m3fnuz(

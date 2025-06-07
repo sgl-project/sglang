@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.srt.model_executor.cuda_graph_runner import (
+    CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
     LogitsProcessorOutput,
     get_batch_sizes_to_capture,
@@ -89,13 +90,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.capture()
         except RuntimeError as e:
             raise Exception(
-                f"Capture CUDA graph failed: {e}\n"
-                "Possible solutions:\n"
-                "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
-                "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
-                "3. disable torch compile by not using --enable-torch-compile\n"
-                "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
-                "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
+                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
     def can_run(self, forward_batch: ForwardBatch):
@@ -200,7 +195,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         # in the batch, which will not be counted as num_seqs
         raw_bs = forward_batch.batch_size
         num_tokens = forward_batch.input_ids.shape[0]
-        assert raw_bs * self.num_tokens_per_bs == num_tokens
 
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
@@ -224,9 +218,9 @@ class EAGLEDraftExtendCudaGraphRunner:
                 self.seq_lens_cpu.fill_(1)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
 
-        forward_batch.spec_info.positions = None
         if bs != raw_bs:
             forward_batch.spec_info.accept_length = self.accept_length[:bs]
+        forward_batch.spec_info.positions = None
 
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
