@@ -145,7 +145,7 @@ class Llama4ForConditionalGeneration(nn.Module):
     ) -> bool:
         if ".experts." not in name:
             return False
-        if "experts.gate_up_proj" not in name or "experts.down_proj" not in name:
+        if "experts.gate_up_proj" not in name and "experts.down_proj" not in name:
             if name in expert_mapping:
                 param, expert_id, shard_id = expert_mapping[name]
                 weight_loader = param.weight_loader

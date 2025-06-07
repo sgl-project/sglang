@@ -1,4 +1,5 @@
 """Shared utilities for Llama-based models."""
+
 # Mapping of checkpoint weight names to stacked parameter names for Llama models.
 # Each tuple is (param_name, shard_name, shard_id).
 LLAMA_STACKED_PARAMS_MAPPING = [
