@@ -218,6 +218,8 @@ class EAGLEDraftExtendCudaGraphRunner:
                 self.seq_lens_cpu.fill_(1)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
 
+        if bs != raw_bs:
+            forward_batch.spec_info.accept_length = self.accept_length[:bs]
         forward_batch.spec_info.positions = None
 
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
@@ -235,6 +237,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.graphs[bs].replay()
         out = self.output_buffers[bs]
         if bs != raw_bs:
+            forward_batch.spec_info.accept_length = self.accept_length[:raw_bs]
             out = LogitsProcessorOutput(
                 next_token_logits=out.next_token_logits[:raw_bs],
                 hidden_states=out.hidden_states[:raw_bs],
