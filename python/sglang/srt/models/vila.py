@@ -131,25 +131,24 @@ class MultimodalProjector(nn.Module):
     ):
         super().__init__(*args, **kwargs)
 
-        match config.mm_projector_type:
-            case "mlp_downsample_3x3_fix":
-                self.layers = nn.Sequential(
-                    DownSample3x3BlockFix(),
-                    nn.LayerNorm(config.mm_hidden_size * 9),
-                    nn.Linear(
-                        config.mm_hidden_size * 9,
-                        config.mm_hidden_size * 3,
-                    ),
-                    nn.GELU(),
-                    nn.LayerNorm(config.vision_config.hidden_size * 3),
-                    nn.Linear(config.vision_config.hidden_size * 3, config.hidden_size),
-                    nn.GELU(),
-                    nn.Linear(config.hidden_size, config.hidden_size),
-                )
-            case _:
-                raise NotImplementedError(
-                    f"Unsupported mm_projector_type: {config.mm_projector_type}"
-                )
+        if config.mm_projector_type == "mlp_downsample_3x3_fix":
+            self.layers = nn.Sequential(
+                DownSample3x3BlockFix(),
+                nn.LayerNorm(config.mm_hidden_size * 9),
+                nn.Linear(
+                    config.mm_hidden_size * 9,
+                    config.mm_hidden_size * 3,
+                ),
+                nn.GELU(),
+                nn.LayerNorm(config.vision_config.hidden_size * 3),
+                nn.Linear(config.vision_config.hidden_size * 3, config.hidden_size),
+                nn.GELU(),
+                nn.Linear(config.hidden_size, config.hidden_size),
+            )
+        else:
+            raise NotImplementedError(
+                f"Unsupported mm_projector_type: {config.mm_projector_type}"
+            )
 
         self.layers.type(config.torch_dtype)
 
@@ -293,13 +292,12 @@ class VILAForConditionalGeneration(nn.Module):
             self.config.mm_vision_select_layer
         ]
 
-        match self.config.mm_vision_select_feature:
-            case "cls_patch":
-                return selected_layer_hidden_states
-            case _:
-                raise NotImplementedError(
-                    f"Unsupported mm_vision_select_feature: {self.config.mm_vision_select_feature}"
-                )
+        if self.config.mm_vision_select_feature == "cls_patch":
+            return selected_layer_hidden_states
+        else:
+            raise NotImplementedError(
+                f"Unsupported mm_vision_select_feature: {self.config.mm_vision_select_feature}"
+            )
 
     ##### END COPY modeling_vila.py #####
 

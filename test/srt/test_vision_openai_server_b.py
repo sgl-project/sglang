@@ -221,6 +221,7 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
     def test_video_chat_completion(self):
         pass
 
+
 class TestVILAServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
@@ -238,6 +239,7 @@ class TestVILAServer(TestOpenAIVisionServer):
             ],
         )
         cls.base_url += "/v1"
+
 
 if __name__ == "__main__":
     unittest.main()
