@@ -213,6 +213,7 @@ class ServerArgs:
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     mm_attention_backend: Optional[str] = None
+    pick_free_dp_port: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -1486,6 +1487,12 @@ class ServerArgs:
             help="Set multimodal attention backend.",
         )
 
+        parser.add_argument(
+            "--pick-free-dp-port",
+            action="store_true",
+            help="Whether to picks dp ports from free ports, or use fixed dp port as default. Useful when get frequent port conflict under huge DP cases",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
@@ -1621,7 +1628,10 @@ class PortArgs:
                     port_base + 3
                 )  # TokenizerManager to DataParallelController
             else:
-                scheduler_input_port = dp_controller_zmq_ports[dp_rank]
+                if server_args.pick_free_dp_port:
+                    scheduler_input_port = dp_controller_zmq_ports[dp_rank]
+                else:
+                    scheduler_input_port = port_base + 3 + 1 + dp_rank
 
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",

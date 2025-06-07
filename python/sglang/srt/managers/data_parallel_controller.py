@@ -90,7 +90,8 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers = [None] * server_args.dp_size
-        if server_args.node_rank == 0:
+
+        if server_args.node_rank == 0 and server_args.pick_free_dp_port:
             self.workers_port = {}
             for dp_rank in range(server_args.dp_size):
                 port_and_socket = get_tcp_zmq_socket_binded_to_local_free_port(
@@ -106,6 +107,15 @@ class DataParallelController:
         else:
             dp_port_args = self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
+
+        if server_args.node_rank == 0 and not server_args.pick_free_dp_port:
+            for dp_rank in range(server_args.dp_size):
+                self.workers[dp_rank] = get_zmq_socket(
+                    self.context,
+                    zmq.PUSH,
+                    dp_port_args[dp_rank].scheduler_input_ipc_name,
+                    True,
+                )
 
         self.max_req_input_len = None
 
@@ -166,14 +176,18 @@ class DataParallelController:
             time.sleep(30 * 24 * 3600)
 
     def _dispatch_dp_attn_ctrl_zmq_port(self, server_args: ServerArgs):
+        ex_endpoint = None
+        if server_args.dist_init_addr is None:
+            ex_endpoint = f"tcp://127.0.0.1:{server_args.port + 5}"
+        else:
+            ex_endpoint = f"tcp://{server_args.dist_init_addr}"
+
         if server_args.node_rank == 0:
             free_ports = {i: port for i, port in self.workers_port.items()}
             logger.debug(f"Free ports: {free_ports}")
 
             # broadcast dp_port_args to all dp ranks
-            rep_socket = get_zmq_socket(
-                self.context, zmq.REP, f"tcp://{server_args.dist_init_addr}", True
-            )
+            rep_socket = get_zmq_socket(self.context, zmq.REP, ex_endpoint, True)
 
             connected_nodes = 0
             expected_nodes = server_args.nnodes - 1
@@ -194,9 +208,7 @@ class DataParallelController:
 
             rep_socket.close()
         else:
-            req_socket = get_zmq_socket(
-                self.context, zmq.REQ, f"tcp://{server_args.dist_init_addr}", False
-            )
+            req_socket = get_zmq_socket(self.context, zmq.REQ, ex_endpoint, False)
 
             req_socket.setsockopt(zmq.RCVTIMEO, 60 * 1000)  # 1 min timeout
             req_socket.setsockopt(zmq.SNDTIMEO, 60 * 1000)
@@ -213,7 +225,8 @@ class DataParallelController:
         PortArgs.register_dp_controller_to_attn_tp_rk0_port(free_ports)
 
     def launch_dp_attention_schedulers(self, server_args, port_args):
-        self._dispatch_dp_attn_ctrl_zmq_port(server_args)
+        if server_args.pick_free_dp_port:
+            self._dispatch_dp_attn_ctrl_zmq_port(server_args)
         dp_port_args = []
         for dp_rank in range(server_args.dp_size):
             dp_port_args.append(PortArgs.init_new(server_args, dp_rank))
