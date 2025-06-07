@@ -369,6 +369,16 @@ class EPMoE(torch.nn.Module):
                 ),
             )
 
+        self.w2_input_scale = torch.nn.Parameter(
+            ones_tensor,
+            requires_grad=False,
+        )
+
+        self.w2_weight_scale = torch.nn.Parameter(
+            ones_tensor,
+            requires_grad=False,
+        )
+
         if self.activation == "silu":
             silu_and_mul_triton_kernel[(gateup_output.shape[0],)](
                 gateup_output,
