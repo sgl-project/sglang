@@ -597,6 +597,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=use_fp8,
+                # NOTE MODIFIED
+                round_scale=True,
+                use_ue8m0=True,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
             )
