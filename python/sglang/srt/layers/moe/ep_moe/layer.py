@@ -31,10 +31,12 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.moe.ep_moe.kernels import (
+    deepgemm_post_reorder_triton_kernel,
     ep_gather,
     ep_scatter,
     gelu_and_mul_triton_kernel,
     grouped_gemm_triton,
+    moe_ep_deepgemm_preprocess,
     post_reorder_triton_kernel,
     pre_reorder_triton_kernel,
     run_moe_ep_preproess,
@@ -49,13 +51,21 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
     sglang_per_token_quant_fp8,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import DeepEPMode, dispose_tensor, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    DeepEPMode,
+    dispose_tensor,
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    set_weight_attrs,
+)
 
 _is_hip = is_hip()
 
@@ -232,13 +242,144 @@ class EPMoE(torch.nn.Module):
 
         self.grouped_gemm_runner = None
 
+        self.w13_weight_fp8 = (
+            self.w13_weight,
+            (
+                self.w13_weight_scale_inv
+                if self.use_block_quant
+                else self.w13_weight_scale
+            ),
+        )
+        self.w2_weight_fp8 = (
+            self.w2_weight,
+            self.w2_weight_scale_inv if self.use_block_quant else self.w2_weight_scale,
+        )
+
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        if use_deep_gemm and _ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
+            return self.forward_deepgemm(hidden_states, router_logits)
+        else:
+            return self.forward_normal(hidden_states, router_logits)
+
+    def forward_deepgemm(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ):
+        assert self.quant_method is not None
         hidden_states_shape = hidden_states.shape
         hidden_states_dtype = hidden_states.dtype
         hidden_states_device = hidden_states.device
+        topk_weights, topk_ids = select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=self.top_k,
+            use_grouped_topk=self.use_grouped_topk,
+            renormalize=self.renormalize,
+            topk_group=self.topk_group,
+            num_expert_group=self.num_expert_group,
+            correction_bias=self.correction_bias,
+            custom_routing_function=self.custom_routing_function,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
 
+        # PreReorder
+        m_max, masked_m, expected_m, src2dst, gateup_input, gateup_input_scale = (
+            moe_ep_deepgemm_preprocess(
+                topk_ids,
+                self.num_experts,
+                hidden_states,
+                self.top_k,
+                self.start_expert_id,
+                self.end_expert_id,
+                self.block_shape,
+            )
+        )
+        gateup_input_fp8 = (
+            gateup_input,
+            get_col_major_tma_aligned_tensor(gateup_input_scale),
+        )
+
+        # GroupGemm-0
+        num_groups, m, k = gateup_input_fp8[0].size()
+        n = self.w13_weight.size(1)
+        gateup_output = torch.empty(
+            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+        )
+
+        m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+            gateup_input_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
+        )
+        del gateup_input
+        del gateup_input_scale
+        del gateup_input_fp8
+
+        # Act
+        down_input = torch.empty(
+            (
+                gateup_output.shape[0],
+                gateup_output.shape[1],
+                gateup_output.shape[2] // 2,
+            ),
+            device=hidden_states_device,
+            dtype=self.fp8_dtype,
+        )
+        scale_block_size = 128
+        down_input_scale = torch.empty(
+            (
+                gateup_output.shape[0],
+                gateup_output.shape[1],
+                gateup_output.shape[2] // 2 // scale_block_size,
+            ),
+            device=hidden_states_device,
+            dtype=torch.float32,
+        )
+        silu_and_mul_masked_post_quant_fwd(
+            gateup_output,
+            down_input,
+            down_input_scale,
+            scale_block_size,
+            masked_m,
+        )
+        dispose_tensor(gateup_output)
+
+        # GroupGemm-1
+        n = self.w2_weight.size(1)
+        down_input_fp8 = (
+            down_input,
+            get_col_major_tma_aligned_tensor(down_input_scale),
+        )
+        down_output = torch.empty(
+            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+        )
+        m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+            down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
+        )
+        del down_input
+        del down_input_scale
+        del down_input_fp8
+        # PostReorder
+        output = torch.empty(
+            hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
+        )
+        deepgemm_post_reorder_triton_kernel[(hidden_states_shape[0],)](
+            down_output,
+            output,
+            src2dst,
+            topk_ids,
+            topk_weights,
+            self.start_expert_id,
+            self.end_expert_id,
+            self.top_k,
+            hidden_states_shape[1],
+            m_max,
+            BLOCK_SIZE=512,
+        )
+        return output
+
+    def forward_normal(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
-
+        hidden_states_shape = hidden_states.shape
+        hidden_states_dtype = hidden_states.dtype
+        hidden_states_device = hidden_states.device
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device,
