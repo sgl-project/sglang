@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import pickle
+import platform
 import random
 import re
 import resource
@@ -156,6 +157,15 @@ def is_xpu() -> bool:
 
 def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
+
+
+def is_cpu() -> bool:
+    machine = platform.machine().lower()
+    return (
+        machine in ("x86_64", "amd64", "i386", "i686")
+        and hasattr(torch, "cpu")
+        and torch.cpu.is_available()
+    )
 
 
 def is_flashinfer_available():
