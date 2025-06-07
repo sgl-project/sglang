@@ -195,7 +195,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("shuffle_rows(Tensor input, Tensor dst2src_map, Tensor output) -> ()");
   m.impl("shuffle_rows", torch::kCUDA, &shuffle_rows);
-
+  m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
+  m.impl("apply_shuffle_mul_sum", torch::kCUDA, &apply_shuffle_mul_sum);
   /*
    * From csrc/speculative
    */
