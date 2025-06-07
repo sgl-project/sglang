@@ -1139,8 +1139,8 @@ def _execute_server_warmup(
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
     max_new_tokens = 128 if model_info["is_generation"] else 1
-    if os.getenv('SGLANG_DEBUG_EXIT_WARMUP', '0') == '1':
-        max_new_tokens = 10
+    # if os.getenv('SGLANG_DEBUG_EXIT_WARMUP', '0') == '1':
+    #     max_new_tokens = 10
     json_data = {
         "sampling_params": {
             "temperature": 0,
@@ -1149,6 +1149,7 @@ def _execute_server_warmup(
             "no_stop_trim": False,
         },
     }
+    print(json_data)
     if server_args.skip_tokenizer_init:
         json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
         # TODO Workaround the bug that embedding errors for list of size 1
