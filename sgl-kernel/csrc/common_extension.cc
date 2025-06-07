@@ -178,6 +178,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "a1_scales, int start_expert_id, int end_expert_id, int topk, bool use_per_token_if_dynamic) -> ()");
   m.impl("ep_moe_pre_reorder", torch::kCUDA, &ep_moe_pre_reorder);
   m.def(
+      "ep_moe_silu_and_mul(Tensor gateup_output, Tensor down_input, Tensor reorder_topk_ids, Tensor scales, int "
+      "start_expert_id, int end_expert_id) -> ()");
+  m.impl("ep_moe_silu_and_mul", torch::kCUDA, &ep_moe_silu_and_mul);
+  m.def(
       "ep_moe_post_reorder(Tensor down_output, Tensor output, Tensor src2dst, Tensor topk_ids, Tensor "
       "topk_weights, int start_expert_id, int end_expert_id, int topk) -> ()");
   m.impl("ep_moe_post_reorder", torch::kCUDA, &ep_moe_post_reorder);
