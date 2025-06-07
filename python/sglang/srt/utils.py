@@ -2259,6 +2259,54 @@ def cpu_has_amx_support():
     return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
 
 
+def prepack_weight_if_needed(weight):
+    if weight.device != torch.device("cpu"):
+        return weight
+    if not cpu_has_amx_support():
+        return weight
+
+    return torch.ops.sgl_kernel.convert_weight_packed(weight)
+
+
+def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
+    # Pack weight for get better performance on CPU
+    devices = {getattr(module, weight_name).device for weight_name in weight_names}
+    assert len(devices) == 1, f"Expects all weights to be on the same device"
+    device = devices.pop()
+
+    if transpose_dims:
+        assert len(weight_names) == len(
+            transpose_dims
+        ), "len(weight_names) should be equal to len(transpose_dims)"
+
+    for i, weight_name in enumerate(weight_names):
+        weight_tensor = getattr(module, weight_name)
+        if transpose_dims and transpose_dims[i]:
+            weight_tensor = weight_tensor.transpose(*transpose_dims[i])
+
+        setattr(
+            module,
+            weight_name,
+            torch.nn.Parameter(
+                prepack_weight_if_needed(weight_tensor),
+                requires_grad=False,
+            ),
+        )
+
+    module.use_intel_amx_backend = (
+        device == torch.device("cpu") and cpu_has_amx_support()
+    )
+
+
+class PackWeightMethod:
+    def __init__(self, weight_names, transpose_dims=None):
+        self.weight_names = weight_names
+        self.transpose_dims = transpose_dims
+
+    def process_weights_after_loading(self, module) -> None:
+        _process_weight_after_loading(module, self.weight_names, self.transpose_dims)
+
+
 class LazyValue:
     def __init__(self, creator: Callable):
         self._creator = creator

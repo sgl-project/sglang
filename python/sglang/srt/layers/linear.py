@@ -30,7 +30,12 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import (
+    _process_weight_after_loading,
+    cpu_has_amx_support,
+    prepack_weight_if_needed,
+    set_weight_attrs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -165,12 +170,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        _process_weight_after_loading(layer, ["weight"])
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+
+        if layer.use_intel_amx_backend:
+            return torch.ops.sgl_kernel.weight_packed_linear(
+                x, layer.weight, bias, True  # is_vnni
+            )
 
         return F.linear(x, layer.weight, bias)
 
