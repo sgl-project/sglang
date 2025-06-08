@@ -434,16 +434,6 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
     def reset(self):
         self._data[...] = 0
 
-    def collect(self) -> Dict:
-        # Can optimize if bottleneck
-        global_physical_count = _convert_local_to_global_physical_count(
-            self._data,
-            rank=self._rank,
-            num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
-            num_physical_experts=self._expert_location_metadata.num_physical_experts,
-        )
-        return dict(global_physical_count=global_physical_count)
-
 
 class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     # can optimize (e.g. fuse / compile)
@@ -453,6 +443,16 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         self._data[layer_idx, :].scatter_add_(
             dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
         )
+
+    def collect(self) -> Dict:
+        # Can optimize if bottleneck
+        global_physical_count = _convert_local_to_global_physical_count(
+            self._data,
+            rank=self._rank,
+            num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
+            num_physical_experts=self._expert_location_metadata.num_physical_experts,
+        )
+        return dict(global_physical_count=global_physical_count)
 
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
@@ -494,6 +494,16 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     ):
         # Most naive implementation, can optimize later
         self._data[layer_idx, :] += local_physical_count_of_layer
+
+    def collect(self) -> Dict:
+        # Can optimize if bottleneck
+        global_physical_count = _convert_local_to_global_physical_count(
+            self._data,
+            rank=self._rank,
+            num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
+            num_physical_experts=self._expert_location_metadata.num_physical_experts,
+        )
+        return dict(global_physical_count=global_physical_count)
 
 
 def _convert_local_to_global_physical_count(
