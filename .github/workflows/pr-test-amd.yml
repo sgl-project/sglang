@@ -220,8 +220,10 @@ jobs:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
     strategy:
+      fail-fast: false
       matrix:
         runner: [linux-mi300-gpu-1, linux-mi325-gpu-1]
+        part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -238,7 +240,7 @@ jobs:
       - name: Run test
         timeout-minutes: 40
         run: |
-          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-amd
+          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
 
   unit-test-backend-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -284,9 +286,9 @@ jobs:
         run: bash scripts/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 40
+        timeout-minutes: 60
         run: |
-          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd
+          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-8-gpu-amd --timeout-per-file 3600
 
   finish:
     if: always()

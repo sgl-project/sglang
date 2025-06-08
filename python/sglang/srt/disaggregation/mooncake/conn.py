@@ -562,6 +562,12 @@ class MooncakeKVManager(BaseKVManager):
             )
             return
 
+        if bootstrap_room not in self.transfer_infos:
+            # This means that the current rank is a dummy rank for this request,
+            # and it has already been marked as success, so there is no need to
+            # add further chunks into the transfer queue.
+            return
+
         # NOTE(shangming): sharding according to the dst_infos to make sure
         # requests with the same dst_sessions will be added into the same
         # queue, which enables early abort with failed sessions.
@@ -578,7 +584,6 @@ class MooncakeKVManager(BaseKVManager):
                 prefill_aux_index=aux_index,
             )
         )
-        self.update_status(bootstrap_room, KVPoll.WaitingForInput)
 
     def check_status(self, bootstrap_room: int):
         return self.request_status[bootstrap_room]
