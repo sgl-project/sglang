@@ -444,6 +444,14 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
 
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if torch.distributed.get_rank() == 0:
+            logger.info(
+                "DeepepNormalSinglePassGatherer gathers approximate statistics. "
+                "If used with small batch size, consider using expert_distribution_recorder_mode=stat."
+            )
+
     def on_deepep_dispatch_normal(
         self,
         layer_idx: int,
