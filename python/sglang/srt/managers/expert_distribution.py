@@ -438,17 +438,9 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
 class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     # can optimize (e.g. fuse)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
-        topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
-        torch.cuda.synchronize()
-
-        global_physical_count = [
-            0
-        ] * self._expert_location_metadata.num_physical_experts
-        for token_record in topk_ids_list:
-            for global_physical_expert_idx in token_record:
-                global_physical_count[global_physical_expert_idx] += 1
-
-        self._data[layer_idx, :] += TODO
+        topk_ids = topk_ids.flatten()
+        mask = topk_ids != -1
+        self._data[layer_idx, :].scatter_add_(dim=0, index=topk_ids.masked_fill(~mask, 0), src=mask.int())
 
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
