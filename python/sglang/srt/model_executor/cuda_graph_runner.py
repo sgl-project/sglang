@@ -34,7 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
-    PPProxyTensors,
+    PPProxyTensors, enable_num_token_non_padded,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
@@ -550,7 +550,8 @@ class CudaGraphRunner:
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
         num_token_non_padded = len(forward_batch.input_ids)
-        self.num_token_non_padded[...] = num_token_non_padded
+        if enable_num_token_non_padded(self.model_runner.server_args):
+            self.num_token_non_padded[...] = num_token_non_padded
         self.tbo_plugin.replay_prepare(
             forward_mode=forward_batch.forward_mode,
             bs=bs,
