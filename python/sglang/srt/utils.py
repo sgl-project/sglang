@@ -1920,7 +1920,7 @@ setattr(triton, "next_power_of_2", next_power_of_2)
 
 def empty_context():
     class EmptyContextManager:
-        def __enter__(self):
+        def __enter__(self, *args, **kwargs):
             return self
 
         def __exit__(self, exc_type, exc_value, traceback):
