@@ -112,20 +112,8 @@ class Sampler(nn.Module):
                     )
 
             if return_logprob:
-                # NOTE: the top_p_renorm_prob from flashinfer has numerical problems,
-                # https://github.com/flashinfer-ai/flashinfer/issues/708
-                # so we use the torch implementation.
-                if sampling_info.need_top_p_sampling:
-                    normalized_probs = top_p_normalize_probs_torch(
-                        probs, sampling_info.top_ps
-                    )
-                else:
-                    normalized_probs = probs
-
                 # clamp to avoid -inf
-                logprobs = torch.log(normalized_probs).clamp(
-                    min=torch.finfo(probs.dtype).min
-                )
+                logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
