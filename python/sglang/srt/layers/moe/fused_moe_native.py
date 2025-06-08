@@ -61,7 +61,7 @@ def fused_moe_forward_native(
         raise ValueError(f"Unsupported activation: {activation=}")
     x3 = torch.einsum("ti, taoi -> tao", x, w3_weights)
     expert_outs = torch.einsum("tao, taio -> tai", (x1 * x3), w2_weights)
-    return torch.einsum("tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype))
+    return torch.einsum("tai,ta -> ti", expert_outs, topk_weights.to(expert_outs.dtype)).mul_(routed_scaling_factor)
 
 
 def moe_forward_native(
@@ -138,6 +138,7 @@ def moe_forward_native(
         .type(topk_weights.dtype)
         .mul_(topk_weights.unsqueeze(dim=-1))
         .sum(dim=1)
+        .mul_(routed_scaling_factor)
         .type(new_x.dtype)
     )
     return final_out
