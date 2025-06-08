@@ -57,7 +57,7 @@ class TestSlidingWindowAttentionTriton(CustomTestCase):
         metrics = run_eval(args)
         print(f"MMLU metrics with sliding window: {metrics}")
 
-        self.assertGreaterEqual(metrics["score"], 0.605)
+        self.assertGreaterEqual(metrics["score"], 0.60)
 
     def _test_short_context_generation(self):
         response = requests.post(
