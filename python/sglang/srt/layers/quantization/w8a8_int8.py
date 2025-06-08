@@ -268,5 +268,4 @@ class W8A8Int8MoEMethod:
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
         )

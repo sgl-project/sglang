@@ -411,5 +411,4 @@ class BlockInt8MoEMethod:
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
             no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
         )
