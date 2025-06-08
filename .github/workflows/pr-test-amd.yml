@@ -265,7 +265,7 @@ jobs:
         timeout-minutes: 40
         run: |
           bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-2-gpu-amd
-  
+
   unit-test-backend-4-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
       github.event.pull_request.draft == false
