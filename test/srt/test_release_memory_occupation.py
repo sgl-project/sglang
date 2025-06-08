@@ -7,35 +7,33 @@ from transformers import AutoModelForCausalLM
 import sglang as sgl
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
-# Change to local path to bypass internet access
-DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "/shared/public/elr-models/meta-llama/Llama-3.2-1B-Instruct/e9f8effbab1cbdc515c11ee6e098e3d5a9f51e14"
+# TODO: Remove this line when PR is ready, we need this to bypass internet issue during development
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "/shared/public/elr-models/Qwen/Qwen2.5-7B-Instruct/52e20a6f5f475e5c8f6a8ebda4ae5fa6b1ea22ac"
 
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly
 _DEBUG_EXTRA = True
 
 
 class TestReleaseMemoryOccupation(CustomTestCase):
-    def _setup_engine_and_model(self):
+    def _setup_engine(self, model_name, mem_fraction_static=0.8):
         """Common setup for engine and HF model."""
-        model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         engine = sgl.Engine(
             model_path=model_name,
             random_seed=42,
             enable_memory_saver=True,
-            mem_fraction_static=0.9,
+            mem_fraction_static=mem_fraction_static,
             # disable_cuda_graph=True,  # for debugging only
         )
-        hf_model_new = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype="bfloat16"
-        )
-        return engine, hf_model_new, model_name
+
+        return engine, model_name
 
     def _common_test_params(self):
         """Common test parameters."""
         return {
             "prompt": "Today is a sunny day and I like",
             "sampling_params": {"temperature": 0, "max_new_tokens": 8},
-            "expect_output": " to spend it outdoors. I decided to",
+            "expect_output": " to go for a walk. I walk",
+            # "expect_output": " to spend it outdoors. I decided to",
         }
 
     def _test_initial_generation(self, engine, prompt, sampling_params, expect_output):
@@ -46,6 +44,9 @@ class TestReleaseMemoryOccupation(CustomTestCase):
 
         if _DEBUG_EXTRA:
             time.sleep(3)
+            print(
+                f"gpu_memory_usage_after_initial_generation: {get_gpu_memory_gb()} GB"
+            )
 
         self.assertEqual(
             _try_allocate_big_tensor(),
@@ -53,31 +54,46 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             "Should not be able to allocate big tensors before releasing",
         )
 
-    def _test_final_generation_and_cleanup(
-        self, engine, hf_model_new, prompt, sampling_params, expect_output
+    def _test_update_weights(
+        self, engine, model_name, is_multi_stage, prompt, sampling_params, expect_output
     ):
         """Test final generation, weight update, and cleanup."""
-        self.assertEqual(
-            _try_allocate_big_tensor(),
-            False,
-            "Should not be able to allocate big tensors after resuming",
+        hf_model_new = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype="bfloat16"
         )
+
+        if is_multi_stage:
+            # Even though we have two copies of weights, we can still allocate big tensors since we haven't resumed kv cache
+            self.assertEqual(
+                _try_allocate_big_tensor(),
+                True,
+                "Should be able to allocate big tensors for multi-stage release and resume",
+            )
+        else:
+            # With two copies of weights plus the kv cache, we cannot allocate big tensors
+            self.assertEqual(
+                _try_allocate_big_tensor(),
+                False,
+                "Should not be able to allocate big tensors for naive release and resume",
+            )
 
         print("update_weights_from_tensor")
         # As if: PPO/RL Engine has updated hf model's weights, and now we sync it to SGLang
         engine.update_weights_from_tensor(list(hf_model_new.named_parameters()))
 
-        print("generate (#2)")
-        outputs = engine.generate(prompt, sampling_params)["text"]
-        self.assertEqual(outputs, expect_output)
+        # destroy the hf model
+        del hf_model_new
+        torch.cuda.empty_cache()
 
         if _DEBUG_EXTRA:
             time.sleep(4)
 
-        engine.shutdown()
-
     def test_release_and_resume_occupation(self):
-        engine, hf_model_new, model_name = self._setup_engine_and_model()
+        # Without multi-stage release and resume, we need to carefully control the memory fraction to avoid OOM
+        model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        engine, model_name = self._setup_engine(
+            model_name=model_name, mem_fraction_static=0.8
+        )
         params = self._common_test_params()
 
         self._test_initial_generation(engine, **params)
@@ -87,6 +103,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         engine.release_memory_occupation()
         if _DEBUG_EXTRA:
             print("release_memory_occupation", time.perf_counter() - t)
+            print(f"gpu_memory_usage_after_release: {get_gpu_memory_gb()} GB")
 
         if _DEBUG_EXTRA:
             time.sleep(5)
@@ -105,11 +122,20 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         engine.resume_memory_occupation()
         if _DEBUG_EXTRA:
             print("resume_memory_occupation", time.perf_counter() - t)
+            print(f"gpu_memory_usage_after_resume: {get_gpu_memory_gb()} GB")
+        self._test_update_weights(engine, model_name, is_multi_stage=False, **params)
 
-        self._test_final_generation_and_cleanup(engine, hf_model_new, **params)
+        print("generate (#2)")
+        outputs = engine.generate(params["prompt"], params["sampling_params"])["text"]
+        self.assertEqual(outputs, params["expect_output"])
+        engine.shutdown()
 
     def test_multi_stage_release_and_resume(self):
-        engine, hf_model_new, model_name = self._setup_engine_and_model()
+        # With multi-stage release and resume, we can set the memory fraction to 0.9 without concern of OOM
+        model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        engine, model_name = self._setup_engine(
+            model_name=model_name, mem_fraction_static=0.9
+        )
         params = self._common_test_params()
 
         self._test_initial_generation(engine, **params)
@@ -163,6 +189,9 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         gpu_memory_usage_before_resume_kv_cache = get_gpu_memory_gb()
         engine.resume_memory_occupation(tags=["weights"])
 
+        # Update weights from a trained model to serving engine, and then destroy the trained model
+        self._test_update_weights(engine, model_name, is_multi_stage=True, **params)
+
         gpu_memory_usage_after_resume_weights = get_gpu_memory_gb()
         self.assertGreater(
             gpu_memory_usage_after_resume_weights,
@@ -177,7 +206,9 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         )
 
         if _DEBUG_EXTRA:
-            print("resume_memory_occupation", time.perf_counter() - t)
+            print(
+                "resume_memory_occupation and update weights", time.perf_counter() - t
+            )
             print(
                 f"gpu_memory_usage_before_resume_kv_cache: {gpu_memory_usage_before_resume_kv_cache} GB"
             )
@@ -188,10 +219,17 @@ class TestReleaseMemoryOccupation(CustomTestCase):
                 f"gpu_memory_usage_after_resume_kv_cache: {gpu_memory_usage_after_resume_kv_cache} GB"
             )
 
-        self._test_final_generation_and_cleanup(engine, hf_model_new, **params)
+        print("generate (#2)")
+        outputs = engine.generate(params["prompt"], params["sampling_params"])["text"]
+        self.assertEqual(outputs, params["expect_output"])
+
+        engine.shutdown()
 
 
 def _try_allocate_big_tensor(size: int = 20_000_000_000):
+    if torch.cuda.get_device_properties(0).total_memory / (1024**3) > 100:
+        size = 30_000_000_000
+
     try:
         torch.empty((size,), dtype=torch.uint8, device="cuda")
         torch.cuda.empty_cache()
