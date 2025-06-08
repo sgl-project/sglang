@@ -548,6 +548,7 @@ class _Accumulator(ABC):
     def get_class(server_args: ServerArgs) -> Type["_Accumulator"]:
         return {
             "stat": _StatAccumulator,
+            "stat_approx": _StatAccumulator,
             "per_pass": _DetailAccumulator,
             "per_token": _DetailAccumulator,
         }[server_args.expert_distribution_recorder_mode]
