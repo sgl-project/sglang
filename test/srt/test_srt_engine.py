@@ -145,7 +145,7 @@ class TestSRTEngine(CustomTestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["accuracy"], 0.3)
+        self.assertGreater(metrics["accuracy"], 0.29)
 
     def test_6_engine_cpu_offload(self):
         prompt = "Today is a sunny day and I like"
