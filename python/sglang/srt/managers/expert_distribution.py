@@ -409,6 +409,32 @@ def _list_sum(a: List, b: List) -> List:
     return [x + y for x, y in zip(a, b, strict=True)]
 
 
+class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._data = torch.zeros(
+            (
+                self._expert_location_metadata.num_layers,
+                self._expert_location_metadata.num_local_physical_experts,
+            ),
+            dtype=torch.int,
+            device="cuda",
+        )
+
+    def reset(self):
+        self._data[...] = 0
+
+    def collect(self) -> Dict:
+        # Can optimize if bottleneck
+        global_physical_count = _convert_local_to_global_physical_count(
+            self._data,
+            rank=self._rank,
+            num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
+            num_physical_experts=self._expert_location_metadata.num_physical_experts,
+        )
+        return dict(global_physical_count=global_physical_count)
+
+
 class _SelectExpertsSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
     # pretty slow, but we will use the DeepEP Gatherer in production
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
@@ -455,37 +481,12 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
         )
         return dict(global_physical_count=global_physical_count)
 
-
-class _DeepepLowLatencySinglePassGatherer(_SinglePassGatherer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._data = torch.zeros(
-            (
-                self._expert_location_metadata.num_layers,
-                self._expert_location_metadata.num_local_physical_experts,
-            ),
-            dtype=torch.int,
-            device="cuda",
-        )
-
+class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     def on_deepep_dispatch_low_latency(
         self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
     ):
         # Most naive implementation, can optimize later
         self._data[layer_idx, :] += local_physical_count_of_layer
-
-    def reset(self):
-        self._data[...] = 0
-
-    def collect(self) -> Dict:
-        # Can optimize if bottleneck
-        global_physical_count = _convert_local_to_global_physical_count(
-            self._data,
-            rank=self._rank,
-            num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
-            num_physical_experts=self._expert_location_metadata.num_physical_experts,
-        )
-        return dict(global_physical_count=global_physical_count)
 
 
 def _convert_local_to_global_physical_count(
