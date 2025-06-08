@@ -23,6 +23,7 @@ class TestExpertDistribution(CustomTestCase):
             dict(model_path="deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"),
             dict(model_path="Qwen/Qwen1.5-MoE-A2.7B"),
             dict(model_path="Qwen/Qwen1.5-MoE-A2.7B", tp_size=2),
+            dict(model_path="Qwen/Qwen1.5-MoE-A2.7B", mode="stat_approx"),
             dict(model_path="Qwen/Qwen1.5-MoE-A2.7B", mode="per_pass"),
             dict(model_path="Qwen/Qwen1.5-MoE-A2.7B", mode="per_token"),
         ]:
