@@ -90,38 +90,26 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     def __init__(self, is_primary: bool = True):
         self.is_primary = is_primary
 
+    def _get_memory_saver(self):
+        """Get the appropriate memory saver instance based on is_primary flag."""
+        return _primary_memory_saver if self.is_primary else _secondary_memory_saver
+
     def region(self):
-        return (
-            _primary_memory_saver.region()
-            if self.is_primary
-            else _secondary_memory_saver.region()
-        )
+        return self._get_memory_saver().region()
 
     def pause(self):
         if self.is_primary:
             print("pause primary memory saver")
         else:
             print("pause secondary memory saver")
-        return (
-            _primary_memory_saver.pause()
-            if self.is_primary
-            else _secondary_memory_saver.pause()
-        )
+        return self._get_memory_saver().pause()
 
     def resume(self):
-        return (
-            _primary_memory_saver.resume()
-            if self.is_primary
-            else _secondary_memory_saver.resume()
-        )
+        return self._get_memory_saver().resume()
 
     @property
     def enabled(self):
-        return (
-            _primary_memory_saver.enabled
-            if self.is_primary
-            else _secondary_memory_saver.enabled
-        )
+        return self._get_memory_saver().enabled
 
 
 class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):

@@ -441,17 +441,17 @@ class Engine(EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
-    def release_memory_occupation(self):
-        """Release GPU occupation temporarily."""
-        obj = ReleaseMemoryOccupationReqInput()
+    def release_memory_occupation(self, tags: Optional[List[str]] = None):
+        """Pause GPU Memory occupation temporarily for Model Weights and KV Cache."""
+        obj = ReleaseMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.release_memory_occupation(obj, None)
         )
 
-    def resume_memory_occupation(self):
-        """Resume GPU occupation."""
-        obj = ResumeMemoryOccupationReqInput()
+    def resume_memory_occupation(self, tags: Optional[List[str]] = None):
+        """Resume GPU Memory occupation for Model Weights and KV Cache."""
+        obj = ResumeMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.resume_memory_occupation(obj, None)
