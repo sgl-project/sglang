@@ -610,6 +610,9 @@ class TestEAGLEDraftExtend(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_one_batch_accept_length(self):
+        resp = requests.get(self.base_url + "/flush_cache")
+        self.assertEqual(resp.status_code, 200)
+
         prompts = [
             "Hello, my name is",
             "The president of the United States is",
