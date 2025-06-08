@@ -1918,9 +1918,9 @@ def next_power_of_2(n: int):
 setattr(triton, "next_power_of_2", next_power_of_2)
 
 
-def empty_context():
+def empty_context(*args, **kwargs):
     class EmptyContextManager:
-        def __enter__(self, *args, **kwargs):
+        def __enter__(self):
             return self
 
         def __exit__(self, exc_type, exc_value, traceback):
