@@ -342,21 +342,17 @@ class ModelOptFp8MoEMethod:
 
         if self.quant_config.is_checkpoint_fp8_serialized:
             # WEIGHT SCALES - Per-tensor scaling for ModelOpt
-            w13_weight_scale = torch.nn.Parameter(
-                torch.full(
-                    (num_experts,),
-                    torch.finfo(torch.float32).min,
-                    dtype=torch.float32,
+            w13_weight_scale = PerTensorScaleParameter(
+                data=torch.full(
+                    (num_experts,), torch.finfo(torch.float32).min, dtype=torch.float32
                 ),
-                requires_grad=False,
+                weight_loader=weight_loader,
             )
-            w2_weight_scale = torch.nn.Parameter(
-                torch.full(
-                    (num_experts,),
-                    torch.finfo(torch.float32).min,
-                    dtype=torch.float32,
+            w2_weight_scale = PerTensorScaleParameter(
+                data=torch.full(
+                    (num_experts,), torch.finfo(torch.float32).min, dtype=torch.float32
                 ),
-                requires_grad=False,
+                weight_loader=weight_loader,
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
@@ -365,36 +361,30 @@ class ModelOptFp8MoEMethod:
             extra_weight_attrs.update(
                 {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
             )
-            set_weight_attrs(w13_weight_scale, extra_weight_attrs)
-            set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+            # set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+            # set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
             # INPUT SCALES - Per-tensor scaling for ModelOpt
-            w13_input_scale = torch.nn.Parameter(
-                torch.full(
-                    (num_experts,),
-                    torch.finfo(torch.float32).min,
-                    dtype=torch.float32,
+            w13_input_scale = PerTensorScaleParameter(
+                data=torch.full(
+                    (num_experts,), torch.finfo(torch.float32).min, dtype=torch.float32
                 ),
-                requires_grad=False,
+                weight_loader=weight_loader,
             )
-            w2_input_scale = torch.nn.Parameter(
-                torch.full(
-                    (num_experts,),
-                    torch.finfo(torch.float32).min,
-                    dtype=torch.float32,
+            w2_input_scale = PerTensorScaleParameter(
+                data=torch.full(
+                    (num_experts,), torch.finfo(torch.float32).min, dtype=torch.float32
                 ),
-                requires_grad=False,
+                weight_loader=weight_loader,
             )
             layer.register_parameter("w13_input_scale", w13_input_scale)
             layer.register_parameter("w2_input_scale", w2_input_scale)
-            set_weight_attrs(w13_input_scale, extra_weight_attrs)
-            set_weight_attrs(w2_input_scale, extra_weight_attrs)
+            # set_weight_attrs(w13_input_scale, extra_weight_attrs)
+            # set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
             # ADDITIONAL SCALES for Llama4 checkpoint format
             # These are per-layer scales (scalar) that match the checkpoint naming
             # Use PerTensorScaleParameter for consistency with linear method
-            from sglang.srt.layers.parameter import PerTensorScaleParameter
-
             gate_up_proj_weight_scale = PerTensorScaleParameter(
                 data=torch.full(
                     (
