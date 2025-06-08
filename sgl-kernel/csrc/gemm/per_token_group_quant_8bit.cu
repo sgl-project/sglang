@@ -52,14 +52,15 @@ __global__ void per_token_group_quant_8bit_kernel(
   scale_element_t* scale_output;
 
   if constexpr (IS_COLUMN_MAJOR) {
+    const int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
     const int row_idx = global_group_id / scale_num_rows;
-    const int col_idx = global_group_id % scale_num_rows;
-    if constexpr (SCALE_UE8M0) {
-      scale_output = output_s + TODO;
-    } else {
-      scale_output = output_s + (col_idx * scale_stride + row_idx);
-    }
+    const int col_idx_raw = global_group_id % scale_num_rows;
+    const int col_idx = row_idx_raw / num_elems_per_pack;
+    const int pack_idx = row_idx_raw % num_elems_per_pack;
+    scale_output = static_cast<scale_element_t>(output_s) +
+                   (col_idx * scale_stride * num_elems_per_pack + row_idx * num_elems_per_pack + pack_idx);
   } else {
+    static_assert(!SCALE_UE8M0);
     scale_output = output_s + global_group_id;
   }
 
