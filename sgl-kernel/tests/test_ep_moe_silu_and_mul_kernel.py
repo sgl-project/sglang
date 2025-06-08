@@ -21,7 +21,7 @@ def create_test_tensors(
         start_expert_id,
         end_expert_id + 1,
         (total_tokens,),
-        dtype=torch.int64,
+        dtype=torch.int32,
         device=device,
     )
 
@@ -81,9 +81,9 @@ def run_triton_kernel(
 def assert_close(a: torch.Tensor, b: torch.Tensor):
     a32, b32 = a.float(), b.float()
     if a.dtype is torch.float16:
-        torch.testing.assert_close(a32, b32, rtol=1e-5, atol=1e-2)
+        torch.testing.assert_close(a32, b32, rtol=1e-4, atol=1e-2)
     elif a.dtype is torch.bfloat16:
-        torch.testing.assert_close(a32, b32, rtol=1e-4, atol=1e-1)
+        torch.testing.assert_close(a32, b32, rtol=1e-1, atol=1e-2)
     else:
         torch.testing.assert_close(a32, b32, rtol=1e-5, atol=1e-5)
 

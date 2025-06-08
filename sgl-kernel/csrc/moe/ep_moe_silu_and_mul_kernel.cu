@@ -13,7 +13,7 @@ template <typename scalar_t, float (*Activation)(const float&)>
 __global__ void ep_moe_act_and_mul_cuda_kernel(
     const scalar_t* __restrict__ gateup_output,
     scalar_t* __restrict__ down_input,
-    const int64_t* __restrict__ reorder_topk_ids,
+    const int* __restrict__ reorder_topk_ids,
     const float* __restrict__ scales,
     int start_expert_id,
     int end_expert_id,
@@ -73,10 +73,10 @@ void ep_moe_silu_and_mul(
     ep_moe_act_and_mul_cuda_kernel<scalar_t, silu><<<grid, block>>>(
         static_cast<scalar_t*>(gateup_output.data_ptr()),
         static_cast<scalar_t*>(down_input.data_ptr()),
-        reorder_topk_ids.data_ptr<int64_t>(),
+        reorder_topk_ids.data_ptr<int>(),
         scales.defined() ? scales.data_ptr<float>() : nullptr,
-        start_expert_id,
-        end_expert_id,
+        static_cast<int>(start_expert_id),
+        static_cast<int>(end_expert_id),
         hidden_size);
     return true;
   });
