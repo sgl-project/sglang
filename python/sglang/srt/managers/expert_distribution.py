@@ -435,8 +435,8 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
         return dict(global_physical_count=global_physical_count)
 
 
-class _SelectExpertsSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
-    # pretty slow, but we will use the DeepEP Gatherer in production
+class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
+    # can optimize (e.g. fuse)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
         torch.cuda.synchronize()
@@ -448,13 +448,7 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
             for global_physical_expert_idx in token_record:
                 global_physical_count[global_physical_expert_idx] += 1
 
-        self._on_layer_data(layer_idx, global_physical_count)
-
-    def collect(self) -> Dict:
-        global_physical_count = super()._collect_objects(
-            pad_len=self._expert_location_metadata.num_physical_experts
-        )
-        return dict(global_physical_count=global_physical_count)
+        self._data[layer_idx, :] += TODO
 
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
