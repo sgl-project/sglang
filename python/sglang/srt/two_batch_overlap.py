@@ -131,9 +131,6 @@ class TboCudaGraphRunnerPlugin:
     def replay_prepare(
         self, forward_mode: ForwardMode, bs: int, num_token_non_padded: int
     ):
-        if not global_server_args_dict["enable_two_batch_overlap"]:
-            return
-
         tbo_split_seq_index, tbo_split_token_index = (
             compute_split_indices_for_cuda_graph_replay(
                 forward_mode=forward_mode,
