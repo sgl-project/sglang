@@ -446,7 +446,7 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
 class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     # can optimize (e.g. fuse)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
-        self._on_select_experts_impl(self.data, layer_idx, topk_ids)
+        self._on_select_experts_impl(self._data, layer_idx, topk_ids)
 
     @staticmethod
     @torch.compile(dynamic=True, backend=get_compiler_backend())
