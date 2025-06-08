@@ -1,7 +1,7 @@
 from typing import Optional
 
 import torch
-from sgl_kernel.utils import get_cuda_stream, is_hopper_arch
+from sgl_kernel.utils import get_cuda_stream, is_hopper_or_later_arch
 
 
 # These implementations extensively draw from and build upon the FlashInfer project https://github.com/flashinfer-ai/flashinfer
@@ -11,7 +11,7 @@ def rmsnorm(
     weight: torch.Tensor,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
-    enable_pdl: Optional[bool] = is_hopper_arch(),
+    enable_pdl: Optional[bool] = is_hopper_or_later_arch(),
 ) -> torch.Tensor:
     r"""Root mean square normalization.
 
@@ -48,7 +48,7 @@ def fused_add_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    enable_pdl: Optional[bool] = is_hopper_arch(),
+    enable_pdl: Optional[bool] = is_hopper_or_later_arch(),
 ) -> None:
     r"""Fused add root mean square normalization.
 
@@ -83,7 +83,7 @@ def gemma_rmsnorm(
     weight: torch.Tensor,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
-    enable_pdl: Optional[bool] = is_hopper_arch(),
+    enable_pdl: Optional[bool] = is_hopper_or_later_arch(),
 ) -> torch.Tensor:
     r"""Gemma-style root mean square normalization.
 
@@ -120,7 +120,7 @@ def gemma_fused_add_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    enable_pdl: Optional[bool] = is_hopper_arch(),
+    enable_pdl: Optional[bool] = is_hopper_or_later_arch(),
 ) -> None:
     r"""Gemma-style fused add root mean square normalization.
 
@@ -161,7 +161,9 @@ def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
 
 
 def silu_and_mul(
-    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = is_hopper_arch()
+    input: torch.Tensor,
+    out: torch.Tensor = None,
+    enable_pdl: bool = is_hopper_or_later_arch(),
 ) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
@@ -178,7 +180,9 @@ def silu_and_mul(
 
 
 def gelu_tanh_and_mul(
-    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = is_hopper_arch()
+    input: torch.Tensor,
+    out: torch.Tensor = None,
+    enable_pdl: bool = is_hopper_or_later_arch(),
 ) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
@@ -195,7 +199,9 @@ def gelu_tanh_and_mul(
 
 
 def gelu_and_mul(
-    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = is_hopper_arch()
+    input: torch.Tensor,
+    out: torch.Tensor = None,
+    enable_pdl: bool = is_hopper_or_later_arch(),
 ) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")
