@@ -55,7 +55,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int row_idx = global_group_id / scale_num_rows;
     const int col_idx = global_group_id % scale_num_rows;
     if constexpr (SCALE_UE8M0) {
-      scale_output = TODO;
+      scale_output = output_s + TODO;
     } else {
       scale_output = output_s + (col_idx * scale_stride + row_idx);
     }
