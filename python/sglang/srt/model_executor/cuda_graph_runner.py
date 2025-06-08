@@ -552,7 +552,7 @@ class CudaGraphRunner:
         self.positions[:raw_num_token].copy_(forward_batch.positions)
         num_token_non_padded = len(forward_batch.input_ids)
         if enable_num_token_non_padded(self.model_runner.server_args):
-            self.num_token_non_padded[...] = num_token_non_padded
+            self.num_token_non_padded[...] = forward_batch.num_token_non_padded
         self.tbo_plugin.replay_prepare(
             forward_mode=forward_batch.forward_mode,
             bs=bs,
