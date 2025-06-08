@@ -274,7 +274,7 @@ class ForwardBatch:
             )
 
         num_token_non_padded = None
-        if TODO:
+        if enable_num_token_non_padded(model_runner.server_args):
             num_token_non_padded=torch.tensor(
                 len(batch.input_ids), dtype=torch.int32
             ).to(device, non_blocking=True)
@@ -609,6 +609,9 @@ class ForwardBatch:
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
+
+def enable_num_token_non_padded(server_args):
+    return server_args.enable_ep_moe or server_args.enable_deepep_moe
 
 
 class PPProxyTensors:
