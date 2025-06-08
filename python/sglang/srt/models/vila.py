@@ -223,38 +223,14 @@ class VILAForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.llm,
-            image_data_embedding_func=self._embed_image_data,
+            image_data_embedding_func=self.get_image_feature,
             get_embedding=get_embedding,
             positions=positions,
         )
 
         return cast(LogitsProcessorOutput, output)
 
-    def load_weights(self, weights: Iterable[Tuple[str, Tensor]]) -> None:
-        params_dict = dict(self.named_parameters())
-
-        for name, loaded_weight in weights:
-            if name.startswith("llm."):
-                self.llm.load_weights([(name[len("llm.") :], loaded_weight)])
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(
-                    param, "weight_loader", weight_utils.default_weight_loader
-                )
-                weight_loader(param, loaded_weight)
-
-    def pad_input_ids(
-        self,
-        input_ids: List[int],
-        image_inputs: MultimodalInputs,
-    ) -> List[int]:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens(
-            token_ids=[self.config.image_token_id],
-        )
-
-        return pattern.pad_input_tokens(input_ids, image_inputs)
-
-    def _embed_image_data(self, mm_input: List[MultimodalDataItem]) -> Tensor:
+    def get_image_feature(self, mm_input: List[MultimodalDataItem]) -> Tensor:
         pixel_values = cast(Tensor, mm_input[0].pixel_values)
 
         ##### BEGIN COPY modeling_vila.py #####
@@ -279,6 +255,30 @@ class VILAForConditionalGeneration(nn.Module):
         ##### END COPY modeling_vila.py #####
 
         return image_embedding
+
+    def load_weights(self, weights: Iterable[Tuple[str, Tensor]]) -> None:
+        params_dict = dict(self.named_parameters())
+
+        for name, loaded_weight in weights:
+            if name.startswith("llm."):
+                self.llm.load_weights([(name[len("llm.") :], loaded_weight)])
+            else:
+                param = params_dict[name]
+                weight_loader = getattr(
+                    param, "weight_loader", weight_utils.default_weight_loader
+                )
+                weight_loader(param, loaded_weight)
+
+    def pad_input_ids(
+        self,
+        input_ids: List[int],
+        image_inputs: MultimodalInputs,
+    ) -> List[int]:
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens(
+            token_ids=[self.config.image_token_id],
+        )
+
+        return pattern.pad_input_tokens(input_ids, image_inputs)
 
     ##### BEGIN COPY modeling_vila.py #####
 
