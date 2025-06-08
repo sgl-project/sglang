@@ -118,6 +118,7 @@ class ForwardMode(IntEnum):
 
 
 class CaptureHiddenMode(IntEnum):
+    # Do not capture anything.
     NULL = auto()
     # Capture hidden states of all tokens.
     FULL = auto()
