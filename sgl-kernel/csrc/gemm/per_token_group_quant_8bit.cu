@@ -16,7 +16,8 @@ __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   return val;
 }
 
-template <typename T, typename DST_DTYPE, bool IS_COLUMN_MAJOR = false, bool SCALE_UE8M0 = false>
+template <typename T, typename DST_DTYPE, bool IS_COLUMN_MAJOR = false, bool SCALE_UE8M0 = false,
+    typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>>
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
     void* __restrict__ output_q,
@@ -40,8 +41,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   float local_absmax = eps;
 
   using scale_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
-  using packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>;
-  static_assert(sizeof(packed_t) % sizeof(scale_t) == 0);
+  static_assert(sizeof(scale_packed_t) % sizeof(scale_t) == 0);
 
   const T* group_input = input + block_group_offset;
   DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + block_group_offset;
