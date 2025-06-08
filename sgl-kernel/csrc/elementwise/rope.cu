@@ -64,7 +64,7 @@ void apply_rope_pos_ids_cos_sin_cache(
         static_cast<c_type*>(q_rope.data_ptr()),
         static_cast<c_type*>(k_rope.data_ptr()),
         static_cast<float*>(cos_sin_cache.data_ptr()),
-        static_cast<int32_t*>(pos_ids.data_ptr()),
+        static_cast<int64_t*>(pos_ids.data_ptr()),
         nnz,
         num_qo_heads,
         num_kv_heads,
