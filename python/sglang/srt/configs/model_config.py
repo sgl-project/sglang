@@ -336,16 +336,24 @@ class ModelConfig:
             # check if is modelopt model -- modelopt doesn't have corresponding field
             # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
-            is_local = os.path.exists(self.model_path)
-            modelopt_quant_config = {"quant_method": "modelopt"}
-            if not is_local:
-                from huggingface_hub import HfApi
+            from huggingface_hub import HfApi, try_to_load_from_cache
 
+            modelopt_quant_config = {"quant_method": "modelopt"}
+
+            if os.path.exists(self.model_path):
+                if os.path.exists(
+                    os.path.join(self.model_path, "hf_quant_config.json")
+                ):
+                    quant_cfg = modelopt_quant_config
+            elif try_to_load_from_cache(
+                self.model_path,
+                filename="hf_quant_config.json",
+            ):
+                quant_cfg = modelopt_quant_config
+            else:
                 hf_api = HfApi()
                 if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
                     quant_cfg = modelopt_quant_config
-            elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
-                quant_cfg = modelopt_quant_config
         return quant_cfg
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
