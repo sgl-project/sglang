@@ -1918,14 +1918,15 @@ def next_power_of_2(n: int):
 setattr(triton, "next_power_of_2", next_power_of_2)
 
 
-@contextmanager
-def empty_context(*args, **kwargs):
-    try:
-        # Setup code goes here
-        yield
-    finally:
-        # Cleanup code goes here
-        pass
+def empty_context():
+    class EmptyContextManager:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            pass
+
+    return EmptyContextManager()
 
 
 def add_prefix(name: str, prefix: str) -> str:
