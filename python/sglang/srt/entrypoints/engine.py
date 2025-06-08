@@ -179,7 +179,9 @@ class Engine(EngineBase):
             elif data_parallel_rank < 0:
                 raise ValueError("data_parallel_rank must be non-negative")
             elif data_parallel_rank >= self.server_args.dp_size:
-                raise ValueError(f"data_parallel_rank must be less than dp_size: {self.server_args.dp_size}")
+                raise ValueError(
+                    f"data_parallel_rank must be less than dp_size: {self.server_args.dp_size}"
+                )
 
         obj = GenerateReqInput(
             text=prompt,
@@ -260,7 +262,9 @@ class Engine(EngineBase):
             elif data_parallel_rank < 0:
                 raise ValueError("data_parallel_rank must be non-negative")
             elif data_parallel_rank >= self.server_args.dp_size:
-                raise ValueError(f"data_parallel_rank must be in range [0, {self.server_args.dp_size-1}]")
+                raise ValueError(
+                    f"data_parallel_rank must be in range [0, {self.server_args.dp_size-1}]"
+                )
 
         logger.info(f"data_parallel_rank: {data_parallel_rank}")
         obj = GenerateReqInput(
