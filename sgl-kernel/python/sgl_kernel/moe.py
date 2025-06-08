@@ -178,6 +178,17 @@ def prepare_moe_input(
     )
 
 
+def apply_shuffle_mul_sum(
+    input,
+    output,
+    permutation,
+    factors,
+):
+    torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(
+        input, output, permutation, factors
+    )
+
+
 def cutlass_fp4_group_mm(
     a_fp4,
     b_fp4,
