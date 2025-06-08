@@ -306,7 +306,7 @@ class ForwardBatch:
             ret.num_token_non_padded = torch.tensor(
                 len(batch.input_ids), dtype=torch.int32
             ).to(device, non_blocking=True)
-        
+
         # For DP attention
         if batch.global_num_tokens is not None:
             ret.global_num_tokens_cpu = batch.global_num_tokens
