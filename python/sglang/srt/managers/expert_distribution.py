@@ -264,6 +264,11 @@ class _SinglePassGatherer(ABC):
             return _DetailSinglePassGatherer(
                 server_args, expert_location_metadata, rank
             )
+
+        if server_args.expert_distribution_recorder_mode == "stat_approx":
+            assert server_args.enable_deepep_moe and (server_args.deepep_mode == "normal")
+            return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
+
         if server_args.enable_deepep_moe:
             if server_args.deepep_mode == "normal":
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
@@ -273,6 +278,7 @@ class _SinglePassGatherer(ABC):
                 )
             else:
                 raise NotImplementedError
+
         return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
 
     def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
