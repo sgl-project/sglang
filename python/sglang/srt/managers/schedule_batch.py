@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-from enum import Enum, auto
-
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,12 +27,17 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
   It will be transformed from CPU scheduler to GPU model runner.
 - ForwardBatch is managed by `model_runner.py::ModelRunner`.
   It contains low-level tensor data. Most of the data consists of GPU tensors.
+
+TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing it in the future.
 """
 
 import copy
 import dataclasses
+import hashlib
 import logging
 import threading
+from enum import Enum, auto
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -47,15 +49,20 @@ from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
-from sglang.srt.disaggregation.decode import ScheduleBatchDisaggregationDecodeMixin
+from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
+    ScheduleBatchDisaggregationDecodeMixin,
+)
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
+from sglang.srt.metrics.collector import TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, get_compiler_backend
+from sglang.srt.utils import flatten_nested_list, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -63,28 +70,38 @@ if TYPE_CHECKING:
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
+GLOBAL_SERVER_ARGS_KEYS = [
+    "attention_backend",
+    "debug_tensor_dump_inject",
+    "debug_tensor_dump_output_folder",
+    "chunked_prefill_size",
+    "deepep_mode",
+    "device",
+    "disable_chunked_prefix_cache",
+    "disable_radix_cache",
+    "enable_deepep_moe",
+    "enable_dp_attention",
+    "enable_two_batch_overlap",
+    "enable_dp_lm_head",
+    "enable_ep_moe",
+    "deepep_config",
+    "enable_nan_detection",
+    "flashinfer_mla_disable_ragged",
+    "max_micro_batch_size",
+    "moe_dense_tp_size",
+    "ep_dispatch_algorithm",
+    "disable_shared_experts_fusion",
+    "sampling_backend",
+    "speculative_accept_threshold_acc",
+    "speculative_accept_threshold_single",
+    "torchao_config",
+    "triton_attention_reduce_in_fp32",
+    "ep_num_redundant_experts",
+    "mm_attention_backend",
+]
+
 # Put some global args for easy access
-global_server_args_dict = {
-    "attention_backend": ServerArgs.attention_backend,
-    "chunked_prefill_size": ServerArgs.chunked_prefill_size,
-    "deepep_mode": ServerArgs.deepep_mode,
-    "device": ServerArgs.device,
-    "disable_chunked_prefix_cache": ServerArgs.disable_chunked_prefix_cache,
-    "disable_radix_cache": ServerArgs.disable_radix_cache,
-    "enable_deepep_moe": ServerArgs.enable_deepep_moe,
-    "enable_dp_attention": ServerArgs.enable_dp_attention,
-    "enable_ep_moe": ServerArgs.enable_ep_moe,
-    "enable_nan_detection": ServerArgs.enable_nan_detection,
-    "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
-    "max_micro_batch_size": ServerArgs.max_micro_batch_size,
-    "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
-    "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
-    "sampling_backend": ServerArgs.sampling_backend,
-    "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
-    "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
-    "torchao_config": ServerArgs.torchao_config,
-    "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
-}
+global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
 
 logger = logging.getLogger(__name__)
 
@@ -134,9 +151,9 @@ class FINISH_LENGTH(BaseFinishReason):
 
 
 class FINISH_ABORT(BaseFinishReason):
-    def __init__(self, message="Unknown error", status_code=None, err_type=None):
+    def __init__(self, message=None, status_code=None, err_type=None):
         super().__init__(is_error=True)
-        self.message = message
+        self.message = message or "Aborted"
         self.status_code = status_code
         self.err_type = err_type
 
@@ -174,10 +191,10 @@ class MultimodalDataItem:
     image_offsets: Optional[list] = None
 
     # the real data, pixel_values or audio_features
-    # data: Union[List[torch.Tensor], List[np.array]]
-    pixel_values: Union[torch.Tensor, np.array] = None
-    image_grid_thws: Union[torch.Tensor, np.array] = None
-    video_grid_thws: Union[torch.Tensor, np.array] = None
+    # data: Union[List[torch.Tensor], List[np.ndarray]]
+    pixel_values: Union[torch.Tensor, np.ndarray] = None
+    image_grid_thw: Union[torch.Tensor, np.ndarray] = None
+    video_grid_thws: Union[torch.Tensor, np.ndarray] = None
 
     image_emb_mask: Optional[torch.Tensor] = None
     image_spatial_crop: Optional[torch.Tensor] = None
@@ -186,8 +203,14 @@ class MultimodalDataItem:
     # [num_images, (n, w, h)]
     tgt_size: Tuple[int, int] = None
 
-    audio_features: Union[torch.Tensor, np.array] = None
+    # kimi-vl related
+    image_grid_hws: Optional[List[torch.Tensor]] = None
+
+    audio_features: Union[torch.Tensor, np.ndarray] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
+    audio_offsets: Optional[List[Tuple[int, int]]] = None
+
+    precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     @staticmethod
     def is_empty_list(l):
@@ -216,7 +239,8 @@ class MultimodalDataItem:
                     for x in tensor_list
                 ]
                 tensor = torch.concat(tensor_list)
-
+            if tensor.is_cuda:
+                return gpu_tensor_hash(tensor)
             tensor = tensor.detach().contiguous()
 
             if tensor.dtype == torch.bfloat16:
@@ -246,7 +270,9 @@ class MultimodalDataItem:
                 return tensor_hash([f])
             return data_hash(f)
 
-        if self.is_audio():
+        if self.precomputed_features is not None:
+            self.hash = hash_feature(self.precomputed_features)
+        elif self.is_audio():
             self.hash = hash_feature(self.audio_features)
         else:
             self.hash = hash_feature(self.pixel_values)
@@ -255,19 +281,24 @@ class MultimodalDataItem:
         self.pad_value = self.hash % (1 << 30)
 
     def is_audio(self):
-        return (
-            self.modality == Modality.AUDIO
-        ) and not MultimodalDataItem.is_empty_list(self.audio_features)
+        return (self.modality == Modality.AUDIO) and (
+            self.precomputed_features is not None
+            or not MultimodalDataItem.is_empty_list(self.audio_features)
+        )
 
     def is_image(self):
         return (
             self.modality == Modality.IMAGE or self.modality == Modality.MULTI_IMAGES
-        ) and not MultimodalDataItem.is_empty_list(self.pixel_values)
+        ) and (
+            self.precomputed_features is not None
+            or not MultimodalDataItem.is_empty_list(self.pixel_values)
+        )
 
     def is_video(self):
-        return (
-            self.modality == Modality.VIDEO
-        ) and not MultimodalDataItem.is_empty_list(self.pixel_values)
+        return (self.modality == Modality.VIDEO) and (
+            self.precomputed_features is not None
+            or not MultimodalDataItem.is_empty_list(self.pixel_values)
+        )
 
     def is_valid(self) -> bool:
         return self.is_image() or self.is_video() or self.is_audio()
@@ -275,6 +306,16 @@ class MultimodalDataItem:
     def validate(self):
         ...
         # TODO
+
+    @staticmethod
+    def from_dict(obj: dict):
+        kwargs = dict(obj)
+        modality = kwargs.pop("modality")
+        if isinstance(modality, str):
+            modality = Modality[modality]
+        ret = MultimodalDataItem(modality=modality, **kwargs)
+        ret.validate()
+        return ret
 
 
 @dataclasses.dataclass
@@ -301,8 +342,9 @@ class MultimodalInputs:
     video_token_id: Optional[int] = None
 
     # audio
-    audio_start_id: Optional[torch.Tensor] = None
-    audio_end_id: Optional[torch.Tensor] = None
+    audio_token_id: Optional[int] = None
+    audio_start_id: Optional[int] = None
+    audio_end_id: Optional[int] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -326,6 +368,7 @@ class MultimodalInputs:
             "slice_end_id",
             "audio_start_id",
             "audio_end_id",
+            "audio_token_id",
         ]
         for arg in optional_args:
             if arg in obj:
@@ -434,6 +477,7 @@ class Req:
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
+        self.lora_path = lora_path
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -441,11 +485,13 @@ class Req:
         # Check finish
         self.tokenizer = None
         self.finished_reason = None
+        # Whether this request has finished output
+        self.finished_output = None
         # If we want to abort the request in the middle of the event loop, set this to true
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_abort = False
         # This carries the error message for `.to_abort` and will be attached to the finished_reason at the end of the event loop
-        self.to_abort_message: str = "Unknown error"
+        self.to_abort_message: str = None
         self.stream = stream
         self.eos_token_ids = eos_token_ids
 
@@ -483,6 +529,13 @@ class Req:
         # For retraction
         self.is_retracted = False
 
+        # Incremental streamining
+        self.send_token_offset: int = 0
+        self.send_decode_id_offset: int = 0
+        # TODO (Byron): send_output_token_logprobs_offset and send_decode_id_offset can be different in disaggregation mode
+        # because the decode server does not have the first output token logprobs
+        self.send_output_token_logprobs_offset: int = 0
+
         # Logprobs (arguments)
         self.return_logprob = return_logprob
         # Start index to compute logprob from.
@@ -492,11 +545,9 @@ class Req:
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
 
-        # Latency Breakdown
-        self.queue_time_start = None
-        self.queue_time_end = None
-
         # Logprobs (return values)
+        # True means the input logprob has been already sent to detokenizer.
+        self.input_logprob_sent: bool = False
         self.input_token_logprobs_val: Optional[List[float]] = None
         self.input_token_logprobs_idx: Optional[List[int]] = None
         self.input_top_logprobs_val: Optional[List[float]] = None
@@ -511,8 +562,10 @@ class Req:
         self.temp_input_token_ids_logprobs_idx: Optional[List[int]] = None
 
         if return_logprob:
+            # shape: (bs, 1)
             self.output_token_logprobs_val = []
             self.output_token_logprobs_idx = []
+            # shape: (bs, k)
             self.output_top_logprobs_val = []
             self.output_top_logprobs_idx = []
             self.output_token_ids_logprobs_val = []
@@ -530,6 +583,7 @@ class Req:
 
         # Constrained decoding
         self.grammar: Optional[BaseGrammarObject] = None
+        self.grammar_wait_ct = 0
 
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
@@ -538,7 +592,12 @@ class Req:
         # The number of verification forward passes in the speculative decoding.
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0
-        self.lora_path = lora_path
+
+        # For metrics
+        self.time_stats: TimeStats = TimeStats()
+        self.has_log_time_stats: bool = False
+        self.queue_time_start = None
+        self.queue_time_end = None
 
         # For disaggregation
         self.bootstrap_host: str = bootstrap_host
@@ -546,8 +605,6 @@ class Req:
         self.bootstrap_room: Optional[int] = bootstrap_room
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
-        # used for warmup because we don't have a pair yet when init
-        self.skip_kv_transfer: bool = False
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
         # After every chunk forward, we do the following:
@@ -555,14 +612,11 @@ class Req:
         # start_send_idx = len(req.fill_ids)
         self.start_send_idx: int = 0
 
-        self.metadata_buffer_index: int = -1
-        # The first output_id transferred from prefill instance.
-        self.transferred_output_id: Optional[int] = None
-
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
+        self.metadata_buffer_index: int = -1
 
     @property
     def seqlen(self):
@@ -653,6 +707,11 @@ class Req:
             )
             return
 
+        if self.grammar is not None:
+            if self.grammar.is_terminated():
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
+                return
+
         last_token_id = self.output_ids[-1]
 
         if not self.sampling_params.ignore_eos:
@@ -697,13 +756,51 @@ class Req:
         self.req_pool_idx = None
         self.already_computed = 0
 
+    def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+        token_indices = req_to_token_pool.req_to_token[
+            self.req_pool_idx, : self.seqlen - 1
+        ]
+        self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(token_indices)
+
+    def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+        token_indices = req_to_token_pool.req_to_token[
+            self.req_pool_idx, : self.seqlen - 1
+        ]
+        token_to_kv_pool_allocator.load_cpu_copy(self.kv_cache_cpu, token_indices)
+        del self.kv_cache_cpu
+
+    def log_time_stats(self):
+        # If overlap schedule, we schedule one decode batch ahead so this gets called twice.
+        if self.has_log_time_stats is True:
+            return
+
+        if self.bootstrap_room is not None:
+            prefix = f"Req Time Stats(rid={self.rid}, bootstrap_room={self.bootstrap_room}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.get_type().value})"
+        else:
+            prefix = f"Req Time Stats(rid={self.rid}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.get_type().value})"
+        logger.info(f"{prefix}: {self.time_stats}")
+        self.has_log_time_stats = True
+
+    def set_finish_with_abort(self, error_msg: str):
+        if get_tensor_model_parallel_rank() == 0:
+            logger.error(f"{error_msg}, {self.rid=}")
+        self.multimodal_inputs = None
+        self.grammar = None
+        self.origin_input_ids = [0]  # set it to one token to skip the long prefill
+        self.finished_reason = FINISH_ABORT(
+            error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+        )
+
     def __repr__(self):
         return (
             f"Req(rid={self.rid}, "
-            f"input_ids={self.origin_input_ids}, output_ids={self.output_ids})"
+            f"input_ids={self.origin_input_ids}, output_ids={self.output_ids}, "
+            f"{self.grammar=}, "
+            f"{self.sampling_params=})"
         )
 
 
+# Batch id
 bid = 0
 
 
@@ -755,6 +852,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     can_run_dp_cuda_graph: bool = False
+    tbo_split_seq_index: Optional[int] = None
+    global_forward_mode: Optional[ForwardMode] = None
 
     # For processing logprobs
     return_logprob: bool = False
@@ -862,7 +961,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             error_msg = (
                 f"{phase_str} out of memory. Try to lower your batch size.\n"
                 f"Try to allocate {num_tokens} tokens.\n"
-                f"Avaliable tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
+                f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
             )
             logger.error(error_msg)
             if self.tree_cache is not None:
@@ -903,7 +1002,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             error_msg = (
                 f"Prefill out of memory. Try to lower your batch size.\n"
                 f"Try to allocate {extend_num_tokens} tokens.\n"
-                f"Avaliable tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
+                f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
@@ -938,7 +1037,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             error_msg = (
                 f"Decode out of memory. Try to lower your batch size.\n"
                 f"Try to allocate {len(seq_lens)} tokens.\n"
-                f"Avaliable tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
+                f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
@@ -1019,7 +1118,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert len(self.out_cache_loc) == self.extend_num_tokens
+        assert (
+            len(self.out_cache_loc) == self.extend_num_tokens
+        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
@@ -1176,7 +1277,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         # Write to req_to_token_pool
-        if global_server_args_dict["attention_backend"] != "torch_native":
+        if support_triton(global_server_args_dict.get("attention_backend")):
             # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
 
             write_req_to_token_pool_triton[(bs,)](
@@ -1240,7 +1341,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         page_size = self.token_to_kv_pool_allocator.page_size
         if page_size == 1:
             return len(self.reqs)
-        return sum(1 for req in self.reqs if req.seqlen % page_size == 0)
+        # In the decoding phase, the length of a request's KV cache should be
+        # the total length of the request minus 1
+        return sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
 
     def check_decode_mem(self, buf_multiplier=1):
         tokens_required = (
@@ -1447,7 +1550,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and not self.reqs[i] in chunked_req_to_exclude
+                and self.reqs[i] not in chunked_req_to_exclude
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -1468,7 +1571,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
         self.reqs = [self.reqs[i] for i in keep_indices]
-        self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
+        if self.multimodal_inputs is not None:
+            self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.out_cache_loc = None
@@ -1517,7 +1621,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
         self.reqs.extend(other.reqs)
-        self.multimodal_inputs.extend(other.multimodal_inputs)
+        if self.multimodal_inputs is not None:
+            self.multimodal_inputs.extend(other.multimodal_inputs)
 
         self.return_logprob |= other.return_logprob
         self.has_stream |= other.has_stream
@@ -1544,6 +1649,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             or global_server_args_dict["attention_backend"] == "flashmla"
             or global_server_args_dict["attention_backend"] == "fa3"
             or global_server_args_dict["attention_backend"] == "cutlass_mla"
+            or global_server_args_dict["enable_two_batch_overlap"]
         ):
             seq_lens_cpu = self.seq_lens.cpu()
         else:
@@ -1564,6 +1670,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
             out_cache_loc=self.out_cache_loc,
+            seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=self.seq_lens_sum,
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
@@ -1571,7 +1678,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
-            seq_lens_cpu=seq_lens_cpu,
+            tbo_split_seq_index=self.tbo_split_seq_index,
+            global_forward_mode=self.global_forward_mode,
             extend_num_tokens=self.extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -1633,11 +1741,11 @@ class ModelWorkerBatch:
     req_pool_indices: torch.Tensor
     # The sequence length
     seq_lens: torch.Tensor
-    seq_lens_cpu: Optional[torch.Tensor]
     # The indices of output tokens in the token_to_kv_pool_allocator
     out_cache_loc: torch.Tensor
 
-    # The sum of all sequence lengths
+    # The sequence length tensor on CPU
+    seq_lens_cpu: Optional[torch.Tensor]
     seq_lens_sum: int
 
     # For logprob
@@ -1649,6 +1757,8 @@ class ModelWorkerBatch:
     global_num_tokens: Optional[List[int]]
     global_num_tokens_for_logprob: Optional[List[int]]
     can_run_dp_cuda_graph: bool
+    tbo_split_seq_index: Optional[int]
+    global_forward_mode: Optional[ForwardMode]
 
     # For extend
     extend_num_tokens: Optional[int]
@@ -1722,10 +1832,72 @@ def write_req_to_token_pool_triton(
         )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def get_last_loc(req_to_token, req_pool_indices_tensor, prefix_lens_tensor):
+def get_last_loc(
+    req_to_token: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+) -> torch.Tensor:
+    if global_server_args_dict["attention_backend"] != "torch_native":
+        impl = get_last_loc_triton
+    else:
+        impl = get_last_loc_torch
+
+    return impl(req_to_token, req_pool_indices_tensor, prefix_lens_tensor)
+
+
+def get_last_loc_torch(
+    req_to_token: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+) -> torch.Tensor:
     return torch.where(
         prefix_lens_tensor > 0,
         req_to_token[req_pool_indices_tensor, prefix_lens_tensor - 1],
         torch.full_like(prefix_lens_tensor, -1),
     )
+
+
+@triton.jit
+def get_last_loc_kernel(
+    req_to_token,
+    req_pool_indices_tensor,
+    prefix_lens_tensor,
+    result,
+    num_tokens,
+    req_to_token_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offset = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
+    mask = offset < num_tokens
+
+    prefix_lens = tl.load(prefix_lens_tensor + offset, mask=mask, other=0)
+    req_pool_indices = tl.load(req_pool_indices_tensor + offset, mask=mask, other=0)
+
+    token_mask = prefix_lens > 0
+    token_index = req_pool_indices * req_to_token_stride + (prefix_lens - 1)
+    tokens = tl.load(req_to_token + token_index, mask=token_mask, other=-1)
+
+    tl.store(result + offset, tokens, mask=mask)
+
+
+def get_last_loc_triton(
+    req_to_token: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+) -> torch.Tensor:
+    BLOCK_SIZE = 256
+    num_tokens = prefix_lens_tensor.shape[0]
+    result = torch.empty_like(prefix_lens_tensor)
+    grid = (triton.cdiv(num_tokens, BLOCK_SIZE),)
+
+    get_last_loc_kernel[grid](
+        req_to_token,
+        req_pool_indices_tensor,
+        prefix_lens_tensor,
+        result,
+        num_tokens,
+        req_to_token.stride(0),
+        BLOCK_SIZE,
+    )
+    return result

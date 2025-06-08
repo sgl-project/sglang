@@ -47,6 +47,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+    ImageDataItem,
     InitWeightsUpdateGroupReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -150,9 +151,9 @@ class Engine(EngineBase):
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[
             Union[
-                List[List[Union[Image, str]]],
-                List[Union[Image, str]],
-                Union[Image, str],
+                List[List[ImageDataItem]],
+                List[ImageDataItem],
+                ImageDataItem,
             ]
         ] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
@@ -221,9 +222,9 @@ class Engine(EngineBase):
         # See also python/sglang/srt/utils.py:load_image for more details.
         image_data: Optional[
             Union[
-                List[List[Union[Image, str]]],
-                List[Union[Image, str]],
-                Union[Image, str],
+                List[List[ImageDataItem]],
+                List[ImageDataItem],
+                ImageDataItem,
             ]
         ] = None,
         return_logprob: Optional[Union[List[bool], bool]] = False,
@@ -285,6 +286,21 @@ class Engine(EngineBase):
         ret = loop.run_until_complete(generator.__anext__())
         return ret
 
+    async def async_encode(
+        self,
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+        image_data: Optional[Union[List[str], str]] = None,
+    ) -> Dict:
+        """
+        Asynchronous version of encode method.
+
+        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
+        Please refer to `EmbeddingReqInput` for the documentation.
+        """
+        obj = EmbeddingReqInput(text=prompt, image_data=image_data)
+        generator = self.tokenizer_manager.generate_request(obj, None)
+        return await generator.__anext__()
+
     def shutdown(self):
         """Shutdown the engine"""
         kill_process_tree(os.getpid(), include_parent=False)
@@ -305,7 +321,26 @@ class Engine(EngineBase):
         loop.run_until_complete(self.tokenizer_manager.start_profile())
 
     def stop_profile(self):
-        self.tokenizer_manager.stop_profile()
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.tokenizer_manager.stop_profile())
+
+    def start_expert_distribution_record(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            self.tokenizer_manager.start_expert_distribution_record()
+        )
+
+    def stop_expert_distribution_record(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            self.tokenizer_manager.stop_expert_distribution_record()
+        )
+
+    def dump_expert_distribution_record(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(
+            self.tokenizer_manager.dump_expert_distribution_record()
+        )
 
     def get_server_info(self):
         loop = asyncio.get_event_loop()
@@ -315,7 +350,7 @@ class Engine(EngineBase):
         return {
             **dataclasses.asdict(self.tokenizer_manager.server_args),
             **self.scheduler_info,
-            **internal_states,
+            "internal_states": internal_states,
             "version": __version__,
         }
 
@@ -437,6 +472,79 @@ class Engine(EngineBase):
     def save_sharded_model(self, **kwargs):
         self.collective_rpc("save_sharded_model", **kwargs)
 
+    def score(
+        self,
+        query: Optional[Union[str, List[int]]] = None,
+        items: Optional[Union[str, List[str], List[List[int]]]] = None,
+        label_token_ids: Optional[List[int]] = None,
+        apply_softmax: bool = False,
+        item_first: bool = False,
+    ) -> List[List[float]]:
+        """
+        Score the probability of specified token IDs appearing after the given (query + item) pair. For example:
+        query = "<|user|>Is the following city the capital of France? "
+        items = ["Paris <|assistant|>", "London <|assistant|>", "Berlin <|assistant|>"]
+        label_token_ids = [2332, 1223] # Token IDs for "Yes" and "No"
+        item_first = False
+
+        This would pass the following prompts to the model:
+        "<|user|>Is the following city the capital of France? Paris <|assistant|>"
+        "<|user|>Is the following city the capital of France? London <|assistant|>"
+        "<|user|>Is the following city the capital of France? Berlin <|assistant|>"
+        The api would then return the probabilities of the model producing "Yes" and "No" as the next token.
+        The output would look like:
+        [[0.9, 0.1], [0.2, 0.8], [0.1, 0.9]]
+
+
+        Args:
+            query: The query text or pre-tokenized query token IDs. Must be provided.
+            items: The item text(s) or pre-tokenized item token IDs. Must be provided.
+            label_token_ids: List of token IDs to compute probabilities for. If None, no token probabilities will be computed.
+            apply_softmax: Whether to normalize probabilities using softmax.
+            item_first: If True, prepend items to query. Otherwise append items to query.
+
+        Returns:
+            List of dictionaries mapping token IDs to their probabilities for each item.
+            Each dictionary in the list corresponds to one item input.
+
+        Raises:
+            ValueError: If query is not provided, or if items is not provided,
+                      or if token IDs are out of vocabulary, or if logprobs are not available for the specified tokens.
+        """
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.score_request(
+                query=query,
+                items=items,
+                label_token_ids=label_token_ids,
+                apply_softmax=apply_softmax,
+                item_first=item_first,
+                request=None,
+            )
+        )
+
+    async def async_score(
+        self,
+        query: Optional[Union[str, List[int]]] = None,
+        items: Optional[Union[str, List[str], List[List[int]]]] = None,
+        label_token_ids: Optional[List[int]] = None,
+        apply_softmax: bool = False,
+        item_first: bool = False,
+    ) -> List[List[float]]:
+        """
+        Asynchronous version of score method.
+
+        See score() for detailed documentation.
+        """
+        return await self.tokenizer_manager.score_request(
+            query=query,
+            items=items,
+            label_token_ids=label_token_ids,
+            apply_softmax=apply_softmax,
+            item_first=item_first,
+            request=None,
+        )
+
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
@@ -471,7 +579,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda:
         assert_pkg_version(
             "sgl-kernel",
-            "0.1.1",
+            "0.1.6.post1",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
@@ -479,9 +587,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         pid, exitcode = os.waitpid(0, os.WNOHANG)
         if exitcode != 0:
             logger.warning(
-                "Child process unexpectedly failed with an exit code %d. pid=%d",
-                exitcode,
-                pid,
+                f"Child process unexpectedly failed with {exitcode=}. {pid=}"
             )
 
     signal.signal(signal.SIGCHLD, sigchld_handler)

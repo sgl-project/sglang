@@ -18,7 +18,6 @@ import logging
 from typing import List, Optional, Tuple, Union
 
 import torch
-import xgrammar
 from xgrammar import (
     CompiledGrammar,
     GrammarCompiler,
@@ -29,13 +28,13 @@ from xgrammar import (
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
+    INVALID_GRAMMAR_OBJ,
     BaseGrammarBackend,
     BaseGrammarObject,
 )
 from sglang.srt.constrained.triton_ops.bitmask_ops import (
     apply_token_bitmask_inplace_triton,
 )
-from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -51,49 +50,35 @@ class XGrammarGrammar(BaseGrammarObject):
         vocab_size: int,
         ctx: CompiledGrammar,
         override_stop_tokens: Optional[Union[List[int], int]],
+        key_string: Optional[str] = None,  # TODO (sk): for debugging, remove later
     ) -> None:
-        super().__init__()
         self.matcher = matcher
         self.vocab_size = vocab_size
         self.ctx = ctx
         self.override_stop_tokens = override_stop_tokens
         self.finished = False
-
-        from xgrammar.kernels.apply_token_bitmask_inplace_cpu import (
-            apply_token_bitmask_inplace_cpu,
-        )
-
-        self.apply_vocab_mask_cpu = apply_token_bitmask_inplace_cpu
+        self.accepted_tokens = []
+        self.key_string = key_string
 
     def accept_token(self, token: int):
-        assert self.matcher.accept_token(token)
-
-    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
-        s = self.matcher.find_jump_forward_string()
-        if s:
-            return [], s
-        return None
-
-    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
-        _, data = helper
-        return data, -1
-
-    def jump_and_retokenize(
-        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
-    ):
-        k = 0
-        for i, old_id in enumerate(old_output_ids):
-            if old_id == new_output_ids[i]:
-                k = i + 1
+        if not self.is_terminated():
+            accepted = self.matcher.accept_token(token)
+            if not accepted:
+                # log for debugging
+                raise ValueError(
+                    f"Tokens not accepted: {token}\n"
+                    f"Accepted tokens: {self.accepted_tokens}\n"
+                    f"Key string: {self.key_string}"
+                )
             else:
-                break
+                self.accepted_tokens.append(token)
 
-        # rollback to the last token that is the same
-        if k < len(old_output_ids):
-            self.matcher.rollback(len(old_output_ids) - k)
+    def rollback(self, k: int):
+        self.matcher.rollback(k)
+        self.accepted_tokens = self.accepted_tokens[:-k]
 
-        for i in range(k, len(new_output_ids)):
-            assert self.matcher.accept_token(new_output_ids[i])
+    def is_terminated(self):
+        return self.matcher.is_terminated()
 
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
@@ -122,8 +107,42 @@ class XGrammarGrammar(BaseGrammarObject):
             override_stop_tokens=self.override_stop_tokens,
         )
         return XGrammarGrammar(
-            matcher, self.vocab_size, self.ctx, self.override_stop_tokens
+            matcher,
+            self.vocab_size,
+            self.ctx,
+            self.override_stop_tokens,
+            self.key_string,
         )
+
+    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
+        s = self.matcher.find_jump_forward_string()
+        if s:
+            return [], s
+        return None
+
+    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
+        _, data = helper
+        return data, -1
+
+    def jump_and_retokenize(
+        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
+    ):
+        k = 0
+        for i, old_id in enumerate(old_output_ids):
+            if old_id == new_output_ids[i]:
+                k = i + 1
+            else:
+                break
+
+        # rollback to the last token that is the same
+        if k < len(old_output_ids):
+            self.matcher.rollback(len(old_output_ids) - k)
+
+        for i in range(k, len(new_output_ids)):
+            assert self.matcher.accept_token(new_output_ids[i])
+
+    def __repr__(self):
+        return f"XGrammarGrammar({self.key_string=}, {self.accepted_tokens=})"
 
 
 class XGrammarGrammarBackend(BaseGrammarBackend):
@@ -134,18 +153,25 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     ):
         super().__init__()
 
-        tokenizer_info = TokenizerInfo.from_huggingface(
-            tokenizer, vocab_size=vocab_size
-        )
-        override_stop_tokens = None
+        if True:
+            tokenizer_info = TokenizerInfo.from_huggingface(
+                tokenizer, vocab_size=vocab_size
+            )
+            override_stop_tokens = None
 
         self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
 
-    def _from_context(self, ctx: CompiledGrammar) -> XGrammarGrammar:
-        matcher = GrammarMatcher(ctx, max_rollback_tokens=MAX_ROLLBACK_TOKENS)
-        return XGrammarGrammar(matcher, self.vocab_size, ctx, self.override_stop_tokens)
+    def _from_context(self, ctx: CompiledGrammar, key_string: str) -> XGrammarGrammar:
+        matcher = GrammarMatcher(
+            ctx,
+            max_rollback_tokens=MAX_ROLLBACK_TOKENS,
+            override_stop_tokens=self.override_stop_tokens,
+        )
+        return XGrammarGrammar(
+            matcher, self.vocab_size, ctx, self.override_stop_tokens, key_string
+        )
 
     def dispatch_json(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
@@ -154,26 +180,27 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
                 ctx = self.grammar_compiler.compile_json_schema(schema=key_string)
-        except RuntimeError as e:
-            logging.warning(f"Skip invalid json_schema: json_schema={key_string}, {e=}")
-            return None
-        return self._from_context(ctx)
+
+        except (RuntimeError, json.decoder.JSONDecodeError) as e:
+            logging.error(f"Hit invalid json_schema: {key_string=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
+        return self._from_context(ctx, key_string)
 
     def dispatch_ebnf(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
             ctx = self.grammar_compiler.compile_grammar(key_string)
         except RuntimeError as e:
-            logging.warning(f"Skip invalid ebnf: ebnf={key_string}, {e=}")
-            return None
-        return self._from_context(ctx)
+            logging.error(f"Hit invalid ebnf: {key_string=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
+        return self._from_context(ctx, key_string)
 
     def dispatch_regex(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
             ctx = self.grammar_compiler.compile_regex(key_string)
         except RuntimeError as e:
-            logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
-            return None
-        return self._from_context(ctx)
+            logging.error(f"Hit invalid regex: {key_string=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
+        return self._from_context(ctx, key_string)
 
     def dispatch_structural_tag(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
@@ -189,11 +216,10 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             ctx = self.grammar_compiler.compile_structural_tag(
                 tags, structural_tag["triggers"]
             )
-        except RuntimeError as e:
-            logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
-            return None
-        return self._from_context(ctx)
+        except (RuntimeError, json.decoder.JSONDecodeError) as e:
+            logging.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
+        return self._from_context(ctx, key_string)
 
     def reset(self):
-        if self.grammar_compiler:
-            self.grammar_compiler.clear_cache()
+        self.grammar_compiler.clear_cache()

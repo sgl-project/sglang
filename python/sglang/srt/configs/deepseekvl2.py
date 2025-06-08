@@ -416,9 +416,9 @@ class DeepseekVLV2Processor(ProcessorMixin):
             h = w = math.ceil(
                 (self.image_size // self.patch_size) / self.downsample_ratio
             )
-            # global views tokens h * (w + 1), 1 is for line seperator
+            # global views tokens h * (w + 1), 1 is for line separator
             tokenized_image = [self.image_token_id] * h * (w + 1)
-            # add a seperator between global and local views
+            # add a separator between global and local views
             tokenized_image += [self.image_token_id]
             # local views tokens, (num_height_tiles * h) * (num_width_tiles * w + 1)
             tokenized_image += (

@@ -26,6 +26,7 @@ from sglang.lang.backend.openai import OpenAI
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.utils import (
     get_bool_env_var,
+    get_device,
     is_port_available,
     kill_process_tree,
     retry,
@@ -93,6 +94,11 @@ def is_in_ci():
     return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
+def is_in_amd_ci():
+    """Return whether it is in an AMD CI runner."""
+    return get_bool_env_var("SGLANG_AMD_CI")
+
+
 if is_in_ci():
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
         5000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
@@ -102,6 +108,9 @@ else:
         7000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
     )
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
+
+if is_in_amd_ci():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -300,13 +309,33 @@ def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
     return args
 
 
+def auto_config_device() -> str:
+    """Auto-config available device platform"""
+
+    try:
+        device = get_device()
+    except (RuntimeError, ImportError) as e:
+        print(f"Warning: {e} - Falling back to CPU")
+        device = "cpu"
+
+    return device
+
+
 def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
     parser.add_argument("--parallel", type=int, default=64)
     parser.add_argument("--host", type=str, default="http://127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--backend", type=str, default="srt")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "rocm", "cpu"],
+        help="Device type (auto/cuda/rocm/cpu). Auto will detect available platforms",
+    )
     parser.add_argument("--result-file", type=str, default="result.jsonl")
     args = parser.parse_args()
+
     return args
 
 
@@ -392,15 +421,29 @@ def popen_launch_server(
     base_url: str,
     timeout: float,
     api_key: Optional[str] = None,
-    other_args: list[str] = (),
+    other_args: list[str] = [],
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
-    pd_seperated: bool = False,
+    device: str = "auto",
+    pd_separated: bool = False,
 ):
+    """Launch a server process with automatic device detection.
+
+    Args:
+        device: Device type ("auto", "cuda", "rocm" or "cpu").
+                If "auto", will detect available platforms automatically.
+    """
+    # Auto-detect device if needed
+    if device == "auto":
+        device = auto_config_device()
+        print(f"Auto-configed device: {device}", flush=True)
+        other_args = list(other_args)
+        other_args += ["--device", str(device)]
+
     _, host, port = base_url.split(":")
     host = host[2:]
 
-    if pd_seperated:
+    if pd_separated:
         command = "sglang.launch_pd_server"
     else:
         command = "sglang.launch_server"
@@ -414,7 +457,7 @@ def popen_launch_server(
         *[str(x) for x in other_args],
     ]
 
-    if pd_seperated:
+    if pd_separated:
         command.extend(
             [
                 "--lb-host",
@@ -449,9 +492,18 @@ def popen_launch_server(
     else:
         process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
-    start_time = time.time()
+    start_time = time.perf_counter()
     with requests.Session() as session:
-        while time.time() - start_time < timeout:
+        while time.perf_counter() - start_time < timeout:
+
+            return_code = process.poll()
+            if return_code is not None:
+                # Server failed to start (non-zero exit code) or crashed
+                raise Exception(
+                    f"Server process exited with code {return_code}. "
+                    "Check server logs for errors."
+                )
+
             try:
                 headers = {
                     "Content-Type": "application/json; charset=utf-8",
@@ -476,6 +528,47 @@ def popen_launch_server(
 
     kill_process_tree(process.pid)
     raise TimeoutError("Server failed to start within the timeout period.")
+
+
+def popen_launch_pd_server(
+    model: str,
+    base_url: str,
+    timeout: float,
+    api_key: Optional[str] = None,
+    other_args: list[str] = (),
+    env: Optional[dict] = None,
+):
+    _, host, port = base_url.split(":")
+    host = host[2:]
+
+    command = "sglang.launch_server"
+
+    command = [
+        "python3",
+        "-m",
+        command,
+        "--model-path",
+        model,
+        *[str(x) for x in other_args],
+    ]
+
+    command.extend(
+        [
+            "--host",
+            host,
+            "--port",
+            port,
+        ]
+    )
+
+    if api_key:
+        command += ["--api-key", api_key]
+
+    print(f"command={' '.join(command)}")
+
+    process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
+
+    return process
 
 
 def run_with_timeout(
@@ -509,7 +602,7 @@ class TestFile:
 
 
 def run_unittest_files(files: List[TestFile], timeout_per_file: float):
-    tic = time.time()
+    tic = time.perf_counter()
     success = True
 
     for i, file in enumerate(files):
@@ -524,13 +617,13 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
                 f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {filename}\n.\n.\n",
                 flush=True,
             )
-            tic = time.time()
+            tic = time.perf_counter()
 
             process = subprocess.Popen(
                 ["python3", filename], stdout=None, stderr=None, env=os.environ
             )
             process.wait()
-            elapsed = time.time() - tic
+            elapsed = time.perf_counter() - tic
 
             print(
                 f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
@@ -556,9 +649,9 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
             break
 
     if success:
-        print(f"Success. Time elapsed: {time.time() - tic:.2f}s", flush=True)
+        print(f"Success. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
     else:
-        print(f"Fail. Time elapsed: {time.time() - tic:.2f}s", flush=True)
+        print(f"Fail. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
 
     return 0 if success else -1
 
@@ -581,7 +674,8 @@ def get_benchmark_args(
     disable_stream=False,
     disable_ignore_eos=False,
     seed: int = 0,
-    pd_seperated: bool = False,
+    device="auto",
+    pd_separated: bool = False,
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -611,7 +705,8 @@ def get_benchmark_args(
         profile=None,
         lora_name=None,
         prompt_suffix="",
-        pd_seperated=pd_seperated,
+        device=device,
+        pd_separated=pd_separated,
     )
 
 
@@ -630,7 +725,10 @@ def run_bench_serving(
     disable_ignore_eos=False,
     need_warmup=False,
     seed: int = 0,
+    device="auto",
 ):
+    if device == "auto":
+        device = auto_config_device()
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
     process = popen_launch_server(
@@ -654,6 +752,7 @@ def run_bench_serving(
         disable_stream=disable_stream,
         disable_ignore_eos=disable_ignore_eos,
         seed=seed,
+        device=device,
     )
 
     try:
@@ -675,7 +774,7 @@ def run_bench_serving_multi(
     other_server_args,
     benchmark_args,
     need_warmup=False,
-    pd_seperated=False,
+    pd_separated=False,
 ):
     # Launch the server
     process = popen_launch_server(
@@ -683,7 +782,7 @@ def run_bench_serving_multi(
         base_url,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=other_server_args,
-        pd_seperated=pd_seperated,
+        pd_separated=pd_separated,
     )
 
     # run benchmark for all
@@ -704,6 +803,18 @@ def run_bench_serving_multi(
 
 
 def run_bench_one_batch(model, other_args):
+    """Launch a offline process with automatic device detection.
+
+    Args:
+        device: Device type ("auto", "cuda", "rocm" or "cpu").
+                If "auto", will detect available platforms automatically.
+    """
+    # Auto-detect device if needed
+
+    device = auto_config_device()
+    print(f"Auto-configed device: {device}", flush=True)
+    other_args += ["--device", str(device)]
+
     command = [
         "python3",
         "-m",
@@ -835,20 +946,24 @@ def calculate_rouge_l(output_strs_list1, output_strs_list2):
     return rouge_l_scores
 
 
-STDERR_FILENAME = "stderr.txt"
-STDOUT_FILENAME = "stdout.txt"
+STDERR_FILENAME = "/tmp/stderr.txt"
+STDOUT_FILENAME = "/tmp/stdout.txt"
 
 
 def read_output(output_lines: List[str], filename: str = STDERR_FILENAME):
     """Print the output in real time with another thread."""
     while not os.path.exists(filename):
-        time.sleep(1)
+        time.sleep(0.01)
 
     pt = 0
     while pt >= 0:
         if pt > 0 and not os.path.exists(filename):
             break
-        lines = open(filename).readlines()
+        try:
+            lines = open(filename).readlines()
+        except FileNotFoundError:
+            print(f"{pt=}, {os.path.exists(filename)=}")
+            raise
         for line in lines[pt:]:
             print(line, end="", flush=True)
             output_lines.append(line)

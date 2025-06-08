@@ -68,7 +68,7 @@ def main(args):
     #####################################
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     rets = few_shot_hellaswag.run_batch(
         arguments,
         temperature=0,
@@ -76,7 +76,7 @@ def main(args):
         progress_bar=True,
     )
     preds = [choices[i].index(rets[i]["answer"]) for i in range(len(rets))]
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
 
     # Compute accuracy
     acc = np.mean(np.array(preds) == np.array(labels))

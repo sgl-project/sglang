@@ -399,14 +399,20 @@ def main(args: argparse.Namespace):
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
     elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
-        n_share_fusion_experts = args.n_share_experts_fusion
         E = (
-            config.n_routed_experts + n_share_fusion_experts
+            config.n_routed_experts + (0 if args.disable_shared_experts_fusion else 1)
             if config.architectures[0] in ["DeepseekV3ForCausalLM"]
             else config.n_routed_experts
         )
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // args.tp_size
+    elif config.architectures[0] == "Llama4ForConditionalGeneration":
+        E = config.text_config.num_local_experts + (
+            0 if args.disable_shared_experts_fusion else 1
+        )
+        topk = config.text_config.num_experts_per_tok
+        intermediate_size = config.text_config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
     elif config.architectures[0] in [
         "Grok1ForCausalLM",
@@ -424,7 +430,7 @@ def main(args: argparse.Namespace):
         intermediate_size = config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
 
-    hidden_size = config.hidden_size
+    hidden_size = getattr(config, "hidden_size", None) or config.text_config.hidden_size
     dtype = config.torch_dtype
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
@@ -487,7 +493,7 @@ def main(args: argparse.Namespace):
             ]
         print(f"Start tuning over {len(search_space)} configurations...")
 
-        start = time.time()
+        start = time.perf_counter()
         configs = _distribute(
             "tune",
             [
@@ -522,7 +528,7 @@ def main(args: argparse.Namespace):
             use_int8_w8a16,
             block_shape,
         )
-        end = time.time()
+        end = time.perf_counter()
         print(f"Tuning took {end - start:.2f} seconds")
     else:
         outputs = _distribute(
@@ -554,7 +560,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1"
     )
-    parser.add_argument("--tp-size", "-tp", type=int, default=2)
+    parser.add_argument("--tp-size", "--tp", type=int, default=2)
     parser.add_argument(
         "--dtype",
         type=str,
@@ -564,12 +570,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, required=False)
     parser.add_argument("--tune", action="store_true")
-    parser.add_argument(
-        "--n-share-experts-fusion",
-        type=int,
-        default=0,
-        help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1",
-    )
+    parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     args = parser.parse_args()
 
     main(args)
