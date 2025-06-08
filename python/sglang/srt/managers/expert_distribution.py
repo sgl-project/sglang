@@ -28,7 +28,7 @@ from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import Withable, get_bool_env_var, get_compiler_backend
+from sglang.srt.utils import Withable, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -446,16 +446,9 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
 class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     # can optimize (e.g. fuse)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
-        self._on_select_experts_impl(self.data, layer_idx, topk_ids)
-
-    @staticmethod
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
-    def _on_select_experts_impl(
-        self_data: torch.Tensor, layer_idx: int, topk_ids: torch.Tensor
-    ):
         topk_ids = topk_ids.flatten()
         mask = topk_ids != -1
-        self_data[layer_idx, :].scatter_add_(
+        self._data[layer_idx, :].scatter_add_(
             dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
         )
 
