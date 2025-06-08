@@ -53,8 +53,9 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   if constexpr (IS_COLUMN_MAJOR) {
     const int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
-    const int row_idx = global_group_id / scale_num_rows;
-    const int col_idx_raw = global_group_id % scale_num_rows;
+    const int scale_num_rows_element = scale_num_rows * num_elems_per_pack;
+    const int row_idx = global_group_id / scale_num_rows_element;
+    const int col_idx_raw = global_group_id % scale_num_rows_element;
     const int col_idx = col_idx_raw / num_elems_per_pack;
     const int pack_idx = col_idx_raw % num_elems_per_pack;
     scale_output = reinterpret_cast<scale_element_t*>(output_s) +
