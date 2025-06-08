@@ -336,7 +336,12 @@ class ModelConfig:
             # check if is modelopt model -- modelopt doesn't have corresponding field
             # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
             # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
-            from huggingface_hub import HfApi, constants, try_to_load_from_cache
+            from huggingface_hub import (
+                _CACHED_NO_EXIST,
+                HfApi,
+                constants,
+                try_to_load_from_cache,
+            )
 
             modelopt_quant_config = {"quant_method": "modelopt"}
 
@@ -354,7 +359,7 @@ class ModelConfig:
                 if try_to_load_from_cache(
                     self.model_path,
                     filename="hf_quant_config.json",
-                ):
+                ) not in (None, _CACHED_NO_EXIST):
                     quant_cfg = modelopt_quant_config
             else:
                 hf_api = HfApi()
