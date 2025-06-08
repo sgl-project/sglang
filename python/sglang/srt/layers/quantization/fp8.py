@@ -52,7 +52,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
     input_to_float8,
-    is_sm100_supported,
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -63,6 +62,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     requantize_with_max_scale,
 )
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
