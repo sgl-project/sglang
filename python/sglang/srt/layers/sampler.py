@@ -81,17 +81,7 @@ class Sampler(nn.Module):
             probs = logits
             del logits
 
-            can_sample_directly_from_probs = (
-                not sampling_info.need_top_p_sampling
-                and not sampling_info.need_top_k_sampling
-                and not sampling_info.need_min_p_sampling
-            )
-
-            if False and can_sample_directly_from_probs:
-                # when we don't need top-k, top-p, or min-p sampling, we can directly sample from the probs
-                batch_next_token_ids = sampling_from_probs_torch(probs)
-
-            else:
+            if True:  # Keep this redundant check to simplify some internal code sync
                 if global_server_args_dict["sampling_backend"] == "flashinfer":
                     if sampling_info.need_min_p_sampling:
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
@@ -107,7 +97,6 @@ class Sampler(nn.Module):
                             filter_apply_order="joint",
                             check_nan=self.use_nan_detection,
                         )
-
                 elif global_server_args_dict["sampling_backend"] == "pytorch":
                     # A slower fallback implementation with torch native operations.
                     batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
