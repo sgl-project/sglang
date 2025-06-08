@@ -852,7 +852,7 @@ class TokenizerManager:
             obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
-        if True:
+        if True:  # Keep this redundant check to simplify some internal code sync
             # Hold the lock if it is not async. This means that weight sync
             # cannot run while requests are in progress.
             async with self.model_update_lock.writer_lock:
