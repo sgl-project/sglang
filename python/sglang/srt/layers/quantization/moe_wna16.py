@@ -388,7 +388,6 @@ class MoeWNA16Method:
             w2_zp=layer.w2_qzeros if has_zp else None,
             block_shape=[0, layer.group_size],
             no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
         )
 
     @staticmethod
