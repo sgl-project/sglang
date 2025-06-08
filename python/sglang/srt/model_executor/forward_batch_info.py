@@ -293,7 +293,6 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
-            num_token_non_padded=num_token_non_padded,
             tbo_split_seq_index=batch.tbo_split_seq_index,
         )
         device = model_runner.device
@@ -304,7 +303,7 @@ class ForwardBatch:
             )
 
         if enable_num_token_non_padded(model_runner.server_args):
-            num_token_non_padded = torch.tensor(
+            ret.num_token_non_padded = torch.tensor(
                 len(batch.input_ids), dtype=torch.int32
             ).to(device, non_blocking=True)
         
