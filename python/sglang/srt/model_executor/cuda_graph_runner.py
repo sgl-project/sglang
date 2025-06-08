@@ -591,7 +591,9 @@ class CudaGraphRunner:
             self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
 
         if hasattr(forward_batch.spec_info, "hidden_states"):
-            self.hidden_states[:raw_num_token] = forward_batch.spec_info.hidden_states
+            self.hidden_states[:raw_num_token].copy_(
+                forward_batch.spec_info.hidden_states
+            )
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
