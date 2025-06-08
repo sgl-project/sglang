@@ -21,7 +21,7 @@ template <typename T, typename DST_DTYPE, bool IS_COLUMN_MAJOR = false, bool SCA
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
     void* __restrict__ output_q,
-    void* __restrict__ output_s,
+    scale_packed_t* __restrict__ output_s,
     const int group_size,
     const int num_groups,
     const int groups_per_block,
@@ -156,7 +156,7 @@ void sgl_per_token_group_quant_8bit(
         per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, true><<<grid, block, 0, stream>>>( \
             static_cast<T*>(input.data_ptr()),                                                            \
             output_q.data_ptr(),                                                                          \
-            static_cast<int32_t*>(output_s.data_ptr()),                                                   \
+            static_cast<uint32_t*>(output_s.data_ptr()),                                                   \
             group_size,                                                                                   \
             num_groups,                                                                                   \
             groups_per_block,                                                                             \
