@@ -449,7 +449,7 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         topk_ids = topk_ids.flatten()
         mask = topk_ids != -1
         self._data[layer_idx, :].scatter_add_(
-            dim=0, index=topk_ids.masked_fill(~mask, 0), src=mask.int()
+            dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
         )
 
 
