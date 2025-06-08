@@ -266,19 +266,6 @@ class ForwardBatch:
     ):
         from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
 
-        device = model_runner.device
-        extend_input_logprob_token_ids_gpu = None
-        if batch.extend_input_logprob_token_ids is not None:
-            extend_input_logprob_token_ids_gpu = (
-                batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
-            )
-
-        num_token_non_padded = None
-        if enable_num_token_non_padded(model_runner.server_args):
-            num_token_non_padded = torch.tensor(
-                len(batch.input_ids), dtype=torch.int32
-            ).to(device, non_blocking=True)
-
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -306,11 +293,21 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
-            extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
             num_token_non_padded=num_token_non_padded,
             tbo_split_seq_index=batch.tbo_split_seq_index,
         )
+        device = model_runner.device
 
+        if batch.extend_input_logprob_token_ids is not None:
+            ret.extend_input_logprob_token_ids_gpu = (
+                batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
+            )
+
+        if enable_num_token_non_padded(model_runner.server_args):
+            num_token_non_padded = torch.tensor(
+                len(batch.input_ids), dtype=torch.int32
+            ).to(device, non_blocking=True)
+        
         # For DP attention
         if batch.global_num_tokens is not None:
             ret.global_num_tokens_cpu = batch.global_num_tokens
@@ -329,6 +326,7 @@ class ForwardBatch:
                 dtype=model_runner.dtype,
                 device=device,
             )
+
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
             TboForwardBatchPreparer.prepare(ret)
