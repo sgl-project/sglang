@@ -10,8 +10,8 @@ bash "${SCRIPT_DIR}/killall_sglang.sh"
 pip install --upgrade pip
 
 # Clean up existing installations
-pip uninstall -y flashinfer flashinfer_python sgl-kernel sglang vllm
-pip cache purge
+pip uninstall -y flashinfer flashinfer_python sgl-kernel sglang vllm || true
+pip cache purge || true
 rm -rf /root/.cache/flashinfer
 rm -rf /usr/local/lib/python3.10/dist-packages/flashinfer*
 rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
