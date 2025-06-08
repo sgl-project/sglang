@@ -17,19 +17,15 @@ if [ ${ARCH} = "aarch64" ]; then
    BUILDER_NAME="pytorch/manylinuxaarch64-builder"
 else
    LIBCUDA_ARCH=${ARCH}
-   if [ ${CUDA_VERSION} = "12.8" ]; then
-      BUILDER_NAME="pytorch/manylinux2_28-builder"
-   else
-      BUILDER_NAME="pytorch/manylinux-builder"
-   fi
+   BUILDER_NAME="pytorch/manylinux2_28-builder"
 fi
 
 if [ ${CUDA_VERSION} = "12.8" ]; then
    DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
-   TORCH_INSTALL="pip install --no-cache-dir torch==2.7.0 --index-url https://download.pytorch.org/whl/cu${CUDA_VERSION//.}"
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.7.1 --index-url https://download.pytorch.org/whl/cu${CUDA_VERSION//.}"
 else
    DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
-   TORCH_INSTALL="pip install --no-cache-dir torch==2.6.0 --index-url https://download.pytorch.org/whl/cu${CUDA_VERSION//.}"
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.7.1"
 fi
 
 docker run --rm \
