@@ -191,7 +191,9 @@ class CudaGraphRunner:
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.enable_dp_attention = model_runner.server_args.enable_dp_attention
         self.enable_sp_layernorm = model_runner.server_args.enable_sp_layernorm
-        self.enable_two_batch_overlap = model_runner.server_args.enable_two_batch_overlap
+        self.enable_two_batch_overlap = (
+            model_runner.server_args.enable_two_batch_overlap
+        )
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
@@ -329,9 +331,7 @@ class CudaGraphRunner:
         )
 
         is_tbo_supported = (
-            forward_batch.can_run_tbo
-            if self.enable_two_batch_overlap
-            else True
+            forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
 
         return is_bs_supported and is_encoder_lens_supported and is_tbo_supported
@@ -567,7 +567,7 @@ class CudaGraphRunner:
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
         if self.enable_dp_attention or self.enable_sp_layernorm:
-            self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)        
+            self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
         if enable_num_token_non_padded(self.model_runner.server_args):
             self.num_token_non_padded.copy_(forward_batch.num_token_non_padded)
         if self.enable_two_batch_overlap:
@@ -576,7 +576,7 @@ class CudaGraphRunner:
                 bs=bs,
                 num_token_non_padded=len(forward_batch.input_ids),
             )
-        
+
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
