@@ -380,7 +380,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         )
 
 
-class _LayerBasedSinglePassGatherer(_SinglePassGatherer):
+class _LayerBasedCpuSinglePassGatherer(_SinglePassGatherer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._objects_of_layer = {}
@@ -409,7 +409,7 @@ def _list_sum(a: List, b: List) -> List:
     return [x + y for x, y in zip(a, b, strict=True)]
 
 
-class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
+class _SelectExpertsSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
     # pretty slow, but we will use the DeepEP Gatherer in production
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         topk_ids_list = topk_ids.to("cpu", non_blocking=True).numpy().tolist()
@@ -431,7 +431,7 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedSinglePassGatherer):
         return dict(global_physical_count=global_physical_count)
 
 
-class _DeepepNormalSinglePassGatherer(_LayerBasedSinglePassGatherer):
+class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
     def on_deepep_dispatch_normal(
         self,
         layer_idx: int,
