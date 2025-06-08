@@ -20,17 +20,16 @@ class TestExpertDistribution(CustomTestCase):
     def test_expert_distribution_record(self):
         # TODO: Add tests for DeepEP gatherer (currently our CI cannot run that)
         for info in [
-            # dict(model_path="deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"),
-            # dict(model_path="Qwen/Qwen1.5-MoE-A2.7B"),
-            # dict(model_path="Qwen/Qwen1.5-MoE-A2.7B", tp_size=2),
-            # dict(model_path="Qwen/Qwen1.5-MoE-A2.7B", mode="per_pass"),
-            # dict(model_path="Qwen/Qwen1.5-MoE-A2.7B", mode="per_token"),
-            dict(model_path="lmsys/sglang-ci-dsv3-test", mode="stat_approx", tp_size=2, extra_args=["--enable-deepep-moe", "--deepep-mode", "normal"]),
+            dict(model_path="deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"),
+            dict(model_path="Qwen/Qwen1.5-MoE-A2.7B"),
+            dict(model_path="Qwen/Qwen1.5-MoE-A2.7B", tp_size=2),
+            dict(model_path="Qwen/Qwen1.5-MoE-A2.7B", mode="per_pass"),
+            dict(model_path="Qwen/Qwen1.5-MoE-A2.7B", mode="per_token"),
         ]:
             with self.subTest(info=info):
                 self._execute_core(**info)
 
-    def _execute_core(self, model_path: str, mode: str = "stat", tp_size: int = 1, extra_args = []):
+    def _execute_core(self, model_path: str, mode: str = "stat", tp_size: int = 1):
         """Test expert distribution record endpoints"""
         with tempfile.TemporaryDirectory() as tmp_dir:
             os.environ["SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR"] = tmp_dir
@@ -47,7 +46,6 @@ class TestExpertDistribution(CustomTestCase):
                     mode,
                     "--disable-cuda-graph",
                     "--disable-overlap-schedule",
-                    *extra_args,
                 ],
             )
 
