@@ -55,8 +55,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
     const int row_idx = global_group_id / scale_num_rows;
     const int col_idx_raw = global_group_id % scale_num_rows;
-    const int col_idx = row_idx_raw / num_elems_per_pack;
-    const int pack_idx = row_idx_raw % num_elems_per_pack;
+    const int col_idx = col_idx_raw / num_elems_per_pack;
+    const int pack_idx = col_idx_raw % num_elems_per_pack;
     scale_output = static_cast<scale_element_t>(output_s) +
                    (col_idx * scale_stride * num_elems_per_pack + row_idx * num_elems_per_pack + pack_idx);
   } else {
