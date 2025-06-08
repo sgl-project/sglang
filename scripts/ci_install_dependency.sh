@@ -19,6 +19,9 @@ rm -rf /usr/local/lib/python3.10/dist-packages/sgl_kernel*
 # Install the main package
 pip install -e "python[dev]"
 
+# Show current packages
+pip list
+
 # Install additional dependencies
 pip install mooncake-transfer-engine==0.3.2.post1 nvidia-cuda-nvrtc-cu12
 
@@ -31,3 +34,6 @@ pip install git+https://github.com/deepseek-ai/FlashMLA.git
 
 # Install hf_xet
 pip install huggingface_hub[hf_xet]
+
+# Show current packages
+pip list
