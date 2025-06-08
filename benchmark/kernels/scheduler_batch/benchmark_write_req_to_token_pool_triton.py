@@ -366,12 +366,12 @@ def get_benchmark():
                 run_optimized, quantiles=quantiles
             )
         elif provider == "triton_cumsum":
-            extend_lens_cumsum = F.pad(
-                torch.cumsum(extend_lens, dim=0), pad=(1, 0), value=0
-            )
 
-            ms, min_ms, max_ms = triton.testing.do_bench(
-                lambda: write_req_to_token_pool_triton_cumsum[(batch_size,)](
+            def run_triton_cumsum():
+                extend_lens_cumsum = F.pad(
+                    torch.cumsum(extend_lens, dim=0), pad=(1, 0), value=0
+                )
+                write_req_to_token_pool_triton_cumsum[(batch_size,)](
                     req_to_token.clone(),
                     req_pool_indices,
                     pre_lens,
@@ -380,7 +380,9 @@ def get_benchmark():
                     out_cache_loc,
                     max_context_len,
                 ),
-                quantiles=quantiles,
+
+            ms, min_ms, max_ms = triton.testing.do_bench(
+                run_triton_cumsum, quantiles=quantiles
             )
 
         return 1000 * ms, 1000 * max_ms, 1000 * min_ms
