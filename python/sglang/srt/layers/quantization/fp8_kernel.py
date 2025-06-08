@@ -287,8 +287,20 @@ def sglang_per_token_group_quant_fp8(
     assert x.is_contiguous(), "`x` is not contiguous"
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
-    if column_major_scales:
+    if scale_ue8m0:
+        assert column_major_scales and scale_tma_aligned
+        x_q_mn, x_q_k = x.shape
+        x_s_mn, x_s_k = x_q_mn, x_q_k // 128
+        aligned_mn = align(x_s_mn, 4)
+        aligned_k = align(x_s_k, 4)
+        x_s = torch.empty(
+            (aligned_k // 4, aligned_mn),
+            device=x.device,
+            dtype=torch.int,
+        ).permute(-1, -2)[:x_s_mn, :]
+    elif column_major_scales:
         if scale_tma_aligned:
+            # TODO extract "align" function
             # aligned to 4 * sizeof(float)
             aligned_size = (x.shape[-2] + 3) // 4 * 4
             x_s = torch.empty(
@@ -314,6 +326,16 @@ def sglang_per_token_group_quant_fp8(
         )
 
     return x_q, x_s
+
+
+# TODO move
+def align(x: int, y: int) -> int:
+    return ceil_div(x, y) * y
+
+
+# TODO move
+def ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
 
 
 def sglang_per_token_quant_fp8(
@@ -756,7 +778,15 @@ def prepare_block_fp8_matmul_inputs(
     assert A.shape[-1] == B.shape[-1]
     assert A.shape[:-1] == As.shape[:-1]
     assert A.is_contiguous()
-    assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+
+    if As.dtype == torch.float:
+        assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
+    elif Bs.dtype == torch.int:
+        assert (
+            triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1]
+        ), f"{A.shape=} {As.shape=} {block_size=}"
+    else:
+        raise NotImplementedError
 
     M = A.numel() // A.shape[-1]
 
