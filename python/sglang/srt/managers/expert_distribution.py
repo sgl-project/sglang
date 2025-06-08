@@ -355,7 +355,9 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         )
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
-        self._topk_ids_of_layer[layer_idx, : topk_ids.shape[0], :] = topk_ids
+        self._topk_ids_of_layer[layer_idx, : topk_ids.shape[0], : topk_ids.shape[1]] = (
+            topk_ids
+        )
 
     def on_deepep_dispatch_normal(
         self,
