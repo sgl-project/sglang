@@ -444,7 +444,7 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
 
 
 class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
-    # can optimize (e.g. fuse)
+    # can optimize (e.g. fuse / compile)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         topk_ids = topk_ids.flatten()
         mask = topk_ids != -1
