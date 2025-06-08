@@ -34,7 +34,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
-    PPProxyTensors, enable_num_token_non_padded,
+    PPProxyTensors,
+    enable_num_token_non_padded,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
