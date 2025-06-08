@@ -9,8 +9,8 @@ import torch
 
 import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
-from sglang.srt.utils import merge_bias_tensor
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.utils import merge_bias_tensor
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
