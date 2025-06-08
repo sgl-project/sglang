@@ -422,8 +422,13 @@ class Scheduler(
         self.parent_process = psutil.Process().parent()
 
         # Init memory saver
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
+        self.primary_memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.enable_memory_saver,
+            is_primary=True,  # for model weight, we use primary memory saver
+        )
+        self.secondary_memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.enable_memory_saver,
+            is_primary=False,  # for kv cache, we use secondary memory saver
         )
 
         # Init profiler
@@ -2120,19 +2125,30 @@ class Scheduler(
         return GetWeightsByNameReqOutput(parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
-        self.memory_saver_adapter.check_validity(
+        # TODO: Multi Stage Memory Pause and Resume
+        self.primary_memory_saver_adapter.check_validity(
+            caller_name="release_memory_occupation"
+        )
+        self.secondary_memory_saver_adapter.check_validity(
             caller_name="release_memory_occupation"
         )
         self.stashed_model_static_state = _export_static_state(
             self.tp_worker.worker.model_runner.model
         )
-        self.memory_saver_adapter.pause()
+        self.primary_memory_saver_adapter.pause()
+        self.secondary_memory_saver_adapter.pause()
         self.flush_cache()
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
-        self.memory_saver_adapter.check_validity(caller_name="resume_memory_occupation")
-        self.memory_saver_adapter.resume()
+        self.primary_memory_saver_adapter.check_validity(
+            caller_name="resume_memory_occupation"
+        )
+        self.secondary_memory_saver_adapter.check_validity(
+            caller_name="resume_memory_occupation"
+        )
+        self.primary_memory_saver_adapter.resume()
+        self.secondary_memory_saver_adapter.resume()
         _import_static_state(
             self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
         )

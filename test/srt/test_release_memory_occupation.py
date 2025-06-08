@@ -7,6 +7,9 @@ from transformers import AutoModelForCausalLM
 import sglang as sgl
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
+# Change to local path to bypass internet access
+DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "/shared/public/elr-models/meta-llama/Llama-3.2-1B-Instruct/e9f8effbab1cbdc515c11ee6e098e3d5a9f51e14"
+
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly
 _DEBUG_EXTRA = True
 
@@ -22,7 +25,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             model_path=model_name,
             random_seed=42,
             enable_memory_saver=True,
-            # disable_cuda_graph=True,  # for debugging only
+            disable_cuda_graph=True,  # for debugging only
         )
         hf_model_new = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype="bfloat16"

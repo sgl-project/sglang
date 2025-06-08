@@ -62,7 +62,8 @@ class ReqToTokenPool:
         enable_memory_saver: bool,
     ):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
+            enable=enable_memory_saver,
+            is_primary=False,  # for req_to_token, we use secondary memory saver
         )
 
         self.size = size
@@ -125,7 +126,8 @@ class KVCache(abc.ABC):
         self.start_layer = start_layer or 0
         self.end_layer = end_layer or layer_num - 1
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
+            enable=enable_memory_saver,
+            is_primary=False,  # for kv cache, we use secondary memory saver
         )
 
     @abc.abstractmethod
