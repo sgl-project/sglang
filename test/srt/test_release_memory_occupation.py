@@ -22,7 +22,8 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             model_path=model_name,
             random_seed=42,
             enable_memory_saver=True,
-            disable_cuda_graph=True,  # for debugging only
+            mem_fraction_static=0.9,
+            # disable_cuda_graph=True,  # for debugging only
         )
         hf_model_new = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype="bfloat16"
