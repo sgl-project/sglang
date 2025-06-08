@@ -420,11 +420,13 @@ def _list_sum(a: List, b: List) -> List:
 
 
 class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, enable_global_physical_experts: bool, **kwargs):
         super().__init__(*args, **kwargs)
         self._data = torch.zeros(
             (
                 self._expert_location_metadata.num_layers,
+                self._expert_location_metadata.num_physical_experts
+                if enable_global_physical_experts else
                 self._expert_location_metadata.num_local_physical_experts,
             ),
             dtype=torch.int,
@@ -436,6 +438,9 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
 
 
 class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs, enable_global_physical_experts=True)
+
     # can optimize (e.g. fuse / compile)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         topk_ids = topk_ids.flatten()
@@ -445,14 +450,7 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         )
 
     def collect(self) -> Dict:
-        # Can optimize if bottleneck
-        global_physical_count = _convert_local_to_global_physical_count(
-            self._data,
-            rank=self._rank,
-            num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
-            num_physical_experts=self._expert_location_metadata.num_physical_experts,
-        )
-        return dict(global_physical_count=global_physical_count)
+        return dict(global_physical_count=self._data)
 
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
@@ -489,6 +487,9 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
 
 
 class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs, enable_global_physical_experts=False)
+
     def on_deepep_dispatch_low_latency(
         self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
     ):
