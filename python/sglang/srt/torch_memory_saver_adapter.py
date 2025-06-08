@@ -24,18 +24,28 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 
 
+@contextmanager
 def configure_subprocess(enable: bool):
     """Configure subprocess for torch memory saver. Call this once per process."""
+    print("configure_subprocess 222!")
+
     if not enable:
+        print("configure_subprocess 333!")
         logger.debug("torch memory saver is disabled, skipping configure_subprocess")
+        yield
         return
 
     if import_error is not None:
+        print("configure_subprocess 444!")
         logger.warning(
             "torch-memory-saver is not installed. configure_subprocess will do nothing."
         )
+        yield
         return
-    return torch_memory_saver.configure_subprocess()
+
+    # Use the real torch_memory_saver configure_subprocess context manager
+    with torch_memory_saver.configure_subprocess():
+        yield
 
 
 class TorchMemorySaverAdapter(ABC):
