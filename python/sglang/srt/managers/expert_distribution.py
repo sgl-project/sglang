@@ -448,7 +448,9 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         topk_ids = topk_ids.flatten()
         mask = topk_ids != -1
-        self._data[layer_idx, :].scatter_add_(dim=0, index=topk_ids.masked_fill(~mask, 0), src=mask.int())
+        self._data[layer_idx, :].scatter_add_(
+            dim=0, index=topk_ids.masked_fill(~mask, 0), src=mask.int()
+        )
 
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
@@ -482,6 +484,7 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
             num_physical_experts=self._expert_location_metadata.num_physical_experts,
         )
         return dict(global_physical_count=global_physical_count)
+
 
 class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     def on_deepep_dispatch_low_latency(
