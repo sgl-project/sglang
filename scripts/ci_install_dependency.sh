@@ -31,10 +31,13 @@ pip install -e lmms-eval/
 
 # Install FlashMLA for attention backend tests
 pip install git+https://github.com/deepseek-ai/FlashMLA.git
-python -c "from flash_mla import flash_mla_with_kvcache, get_mla_metadata"
+# python -c "from flash_mla import flash_mla_with_kvcache, get_mla_metadata"
 
 # Install hf_xet
 pip install huggingface_hub[hf_xet]
+
+# Install xformers
+pip install -U xformers --index-url https://download.pytorch.org/whl/cu126 --no-deps --force-reinstall
 
 # Show current packages
 pip list
