@@ -32,7 +32,7 @@ def hash_kernel(
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    data = tl.load(input_ptr + offsets, mask=mask, other=0)
+    data = tl.load(input_ptr + offsets, mask=mask, other=0).to(tl.int64)
     mixed = data ^ (offsets.to(tl.int64) + XCONST)
     hash_val = mixed * PRIME
     hash_val = hash_val ^ (hash_val >> 16)
@@ -48,7 +48,7 @@ PRIME_2 = -(14029467366897019727 ^ 0xFFFFFFFFFFFFFFFF) - 1
 
 def gpu_tensor_hash(tensor: torch.Tensor) -> int:
     assert tensor.is_cuda
-    tensor = tensor.contiguous().view(torch.int64)
+    tensor = tensor.contiguous().view(torch.int32)
     n = tensor.numel()
     BLOCK_SIZE = 1024
     grid = (triton.cdiv(n, BLOCK_SIZE),)
