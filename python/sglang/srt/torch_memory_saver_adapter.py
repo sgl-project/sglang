@@ -27,16 +27,12 @@ logger = logging.getLogger(__name__)
 @contextmanager
 def configure_subprocess(enable: bool):
     """Configure subprocess for torch memory saver. Call this once per process."""
-    print("configure_subprocess 222!")
-
     if not enable:
-        print("configure_subprocess 333!")
         logger.debug("torch memory saver is disabled, skipping configure_subprocess")
         yield
         return
 
     if import_error is not None:
-        print("configure_subprocess 444!")
         logger.warning(
             "torch-memory-saver is not installed. configure_subprocess will do nothing."
         )
