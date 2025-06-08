@@ -37,8 +37,6 @@ jobs:
       matrix:
         include:
           - python-version: '3.9'
-            cuda-version: '11.8'
-          - python-version: '3.9'
             cuda-version: '12.4'
           - python-version: '3.9'
             cuda-version: '12.8'
