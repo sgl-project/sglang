@@ -23,7 +23,8 @@ RUN pip3 install datamodel_code_generator
 WORKDIR /sgl-workspace
 
 ARG CUDA_VERSION
-RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && git clone --depth=1 https://github.com/sgl-project/sglang.git \
     && if [ "$CUDA_VERSION" = "12.1.1" ]; then \
          export CUINDEX=121; \
@@ -33,13 +34,13 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six \
          export CUINDEX=124; \
        elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
          export CUINDEX=118; \
-         python3 -m pip install --no-cache-dir sgl-kernel -i https://docs.sglang.ai/whl/cu118; \
+         python3 -m pip install sgl-kernel -i https://docs.sglang.ai/whl/cu118; \
        else \
          echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1; \
        fi \
-    && python3 -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+    && python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
     && cd sglang \
-    && python3 -m pip --no-cache-dir install -e "python[${BUILD_TYPE}]" --find-links https://flashinfer.ai/whl/cu${CUINDEX}/torch2.6/flashinfer-python \
+    && python3 -m pip install -e "python[${BUILD_TYPE}]" --find-links https://flashinfer.ai/whl/cu${CUINDEX}/torch2.6/flashinfer-python \
     && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
          python3 -m pip install nvidia-nccl-cu12==2.26.2.post1 --force-reinstall --no-deps; \
        fi
