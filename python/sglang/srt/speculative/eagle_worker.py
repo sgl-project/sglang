@@ -132,7 +132,7 @@ class EAGLEWorker(TpModelWorker):
                 self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
                     embed.device
                 )
-            
+
         else:
             if self.hot_token_id is not None:
                 head = head.clone()
@@ -738,6 +738,7 @@ class EAGLEWorker(TpModelWorker):
             if torch.any(torch.isnan(logits)):
                 logger.error("Detected errors during sampling! NaN in the logits.")
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
+
 
 def load_token_map(token_map_path: str) -> List[int]:
     if not os.path.exists(token_map_path):

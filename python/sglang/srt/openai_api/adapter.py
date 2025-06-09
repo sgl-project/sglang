@@ -1275,7 +1275,7 @@ def v1_chat_generate_response(
     reasoning_parser=None,
 ):
     choices = []
-    
+
     for idx, ret_item in enumerate(ret):
         logprobs = False
         if isinstance(request, list) and request[idx].logprobs:
@@ -1413,7 +1413,9 @@ def v1_chat_generate_response(
         choices.append(choice_data)
 
     meta_info = {
-        "spec_verify_ct": [ret_item["meta_info"].get("spec_verify_ct", 0) for ret_item in ret]
+        "spec_verify_ct": [
+            ret_item["meta_info"].get("spec_verify_ct", 0) for ret_item in ret
+        ]
     }
 
     if to_file:

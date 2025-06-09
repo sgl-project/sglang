@@ -223,24 +223,24 @@ class Llama4ForConditionalGeneration(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-    def set_eagle3_layers_to_capture(self):  
-        if hasattr(self.language_model, 'set_eagle3_layers_to_capture'):  
+    def set_eagle3_layers_to_capture(self):
+        if hasattr(self.language_model, "set_eagle3_layers_to_capture"):
             self.language_model.set_eagle3_layers_to_capture()
 
     def get_embed_and_head(self):
         # For EAGLE3, we delegate to the language model which should have this method
         # If the language model doesn't have lm_head (like EAGLE3), we return None for head
         embed = self.language_model.get_embed()
-        if hasattr(self.language_model, 'get_embed_and_head'):
+        if hasattr(self.language_model, "get_embed_and_head"):
             return self.language_model.get_embed_and_head()
-        elif hasattr(self.language_model, 'lm_head'):
+        elif hasattr(self.language_model, "lm_head"):
             return embed, self.language_model.lm_head.weight
         else:
             # For EAGLE3, head might not be needed
             return embed, None
 
     def set_embed_and_head(self, embed, head):
-        if hasattr(self.language_model, 'set_embed_and_head'):
+        if hasattr(self.language_model, "set_embed_and_head"):
             return self.language_model.set_embed_and_head(embed, head)
         else:
             # For EAGLE3, only set embed

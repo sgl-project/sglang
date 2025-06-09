@@ -536,4 +536,5 @@ class Llama4ForCausalLM(LlamaForCausalLM):
     ):
         return Llama4Model(config, quant_config=quant_config, prefix=prefix)
 
+
 EntryClass = [Llama4ForCausalLM]
