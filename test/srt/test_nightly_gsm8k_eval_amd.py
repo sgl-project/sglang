@@ -188,11 +188,14 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                     )
                     # Allow retries, so flaky errors are avoided.
                     threshold = MODEL_SCORE_THRESHOLDS.get(model)
-                    for _ in range(3):
-                        metrics = run_eval(args)
-                        score = metrics["score"]
-                        if score >= threshold:
-                            break
+                    for attempt in range(3):
+                        try:
+                            metrics = run_eval(args)
+                            score = metrics["score"]
+                            if score >= threshold:
+                                break
+                        except Exception as e:
+                            print(f"Attempt {attempt + 1} failed with error: {e}")
                     print(
                         f"{'=' * 42}\n{model} - metrics={metrics} score={metrics['score']}\n{'=' * 42}\n"
                     )
