@@ -200,8 +200,6 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
             assert seq_lens_cpu is not None
             seq_lens = seq_lens[:bs]
 
-            self.cuda_graph_kv_indices[...] = -1
-
             create_flashmla_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices[:bs],
