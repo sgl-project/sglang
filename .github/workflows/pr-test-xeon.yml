@@ -12,8 +12,7 @@ concurrency:
 jobs:
   build-test:
     if: github.event_name == 'pull_request'
-    runs-on: sgl-kernel-build-node
-    environment: 'prod'
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         build_type: ['all']
@@ -30,7 +29,7 @@ jobs:
   unit-test:
     if: github.event_name == 'pull_request'
     needs: [build-test]
-    runs-on: sgl-kernel-build-node
+    runs-on: ubuntu-24.04
     steps:
       - name: Run container
         run: |
