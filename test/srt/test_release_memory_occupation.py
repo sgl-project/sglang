@@ -60,14 +60,10 @@ class TestReleaseMemoryOccupation(CustomTestCase):
     def _test_update_weights(
         self,
         engine,
-        model_name,
+        hf_model_new,
         is_multi_stage,
     ):
         """Test final generation, weight update, and cleanup."""
-        hf_model_new = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype="bfloat16", device_map="cuda"
-        )
-
         if is_multi_stage:
             # Even though we have two copies of weights, we can still allocate big tensors since we haven't resumed kv cache
             self.assertEqual(
@@ -86,12 +82,6 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         print("update_weights_from_tensor")
         # As if: PPO/RL Engine has updated hf model's weights, and now we sync it to SGLang
         engine.update_weights_from_tensor(list(hf_model_new.named_parameters()))
-
-        print("gpu_memory_usage_during_update_weights", get_gpu_memory_gb())
-
-        # destroy the hf model
-        del hf_model_new
-        torch.cuda.empty_cache()
 
         if _DEBUG_EXTRA:
             time.sleep(4)
@@ -134,8 +124,18 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         if _DEBUG_EXTRA:
             print("resume_memory_occupation", time.perf_counter() - t)
             print(f"gpu_memory_usage_after_resume: {get_gpu_memory_gb()} GB")
-        self._test_update_weights(
-            engine, MOCK_UPDATED_MODEL_NAME_FOR_TEST, is_multi_stage=False
+
+        hf_model_new = AutoModelForCausalLM.from_pretrained(
+            MOCK_UPDATED_MODEL_NAME_FOR_TEST, torch_dtype="bfloat16", device_map="cuda"
+        )
+        self._test_update_weights(engine, hf_model_new, is_multi_stage=False)
+
+        # destroy the hf model
+        del hf_model_new
+        torch.cuda.empty_cache()
+        print(
+            "gpu_memory_usage_after_update_weights_and_destroy_hf_model",
+            get_gpu_memory_gb(),
         )
 
         print("generate (#2)")
@@ -213,8 +213,17 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         engine.resume_memory_occupation(tags=["weights"])
 
         # Update weights from a trained model to serving engine, and then destroy the trained model
-        self._test_update_weights(
-            engine, MOCK_UPDATED_MODEL_NAME_FOR_TEST, is_multi_stage=True
+        hf_model_new = AutoModelForCausalLM.from_pretrained(
+            MOCK_UPDATED_MODEL_NAME_FOR_TEST, torch_dtype="bfloat16", device_map="cuda"
+        )
+        self._test_update_weights(engine, hf_model_new, is_multi_stage=True)
+
+        # destroy the hf model
+        del hf_model_new
+        torch.cuda.empty_cache()
+        print(
+            "gpu_memory_usage_after_update_weights_and_destroy_hf_model",
+            get_gpu_memory_gb(),
         )
 
         gpu_memory_usage_after_resume_weights = get_gpu_memory_gb()
