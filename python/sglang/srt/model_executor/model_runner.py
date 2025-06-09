@@ -406,8 +406,9 @@ class ModelRunner:
                     f"Automatically turn of --chunked-prefill-size as it is not supported for "
                     f"{self.model_config.hf_config.model_type}"
                 )
-
-        if not self.use_mla_backend:
+        if server_args.disable_radix_cache:
+            server_args.disable_chunked_prefix_cache = True
+        elif not self.use_mla_backend:
             server_args.disable_chunked_prefix_cache = True
         elif self.page_size > 1:
             logger.info("Disable chunked prefix cache when page size > 1.")

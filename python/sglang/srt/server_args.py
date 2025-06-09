@@ -1411,7 +1411,7 @@ class ServerArgs:
         parser.add_argument(
             "--disable-chunked-prefix-cache",
             action="store_true",
-            help="Disable chunked prefix cache feature for deepseek, which should save overhead for short sequences.",
+            help="For Deepseek, Disable chunked-prefix-cache to save overhead for short sequences.",
         )
         parser.add_argument(
             "--disable-fast-image-processor",
