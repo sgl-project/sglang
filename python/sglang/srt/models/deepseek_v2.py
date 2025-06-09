@@ -1929,22 +1929,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
-        # TODO support nextn later
-        if not is_nextn:
-            self.routed_experts_weights_of_layer = {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, DeepseekV2MoE)
-            }
-
     def compute_shared_experts_fusion_weights(
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
         moe_layers: Iterable[int],
     ):
-        if self.n_share_experts_fusion == 0:
+        if self.num_fused_shared_experts == 0:
             return weights
-        assert self.num_fused_shared_experts == 1
+
         weights_list = list(weights)
         weights_dict = dict(weights_list)
         if self.quant_config is not None:
@@ -2009,7 +2001,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         names_to_remove = []
         for moe_layer in tqdm(
             moe_layers,
-            desc=f"Cloning {self.n_share_experts_fusion} "
+            desc=f"Cloning {self.num_fused_shared_experts} "
             f"shared expert into MoE for {self.config.architectures[0]}",
         ):
             for suffix in suffix_list:
@@ -2050,7 +2042,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        if self.n_share_experts_fusion > 0:
+        if self.num_fused_shared_experts > 0:
+            assert self.num_fused_shared_experts == 1
             moe_layers = (
                 range(
                     self.config.first_k_dense_replace,
