@@ -121,7 +121,7 @@ class TestFlashinferMLAMTP(CustomTestCase):
         self.assertGreater(avg_spec_accept_length, 2.5)
 
 
-class TestFlashinferMLAMTPWithSharedExpertsFusion(CustomTestCase):
+class TestFlashinferMLAMTPWithDisableSharedExpertsFusion(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
@@ -148,8 +148,7 @@ class TestFlashinferMLAMTPWithSharedExpertsFusion(CustomTestCase):
                     "4",
                     "--attention-backend",
                     "flashinfer",
-                    "--n-share-experts-fusion",
-                    "8",
+                    "--disable-shared-experts-fusion",
                 ]
             )
         cls.process = popen_launch_server(

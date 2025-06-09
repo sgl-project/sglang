@@ -168,7 +168,7 @@ class TestDeepseekV3MTPWithDraft(CustomTestCase):
         self.assertGreater(avg_spec_accept_length, 2.5)
 
 
-class TestDeepseekV3MTPWithSharedExpertsFusion(CustomTestCase):
+class TestDeepseekV3MTPWithDisableSharedExpertsFusion(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
@@ -191,8 +191,7 @@ class TestDeepseekV3MTPWithSharedExpertsFusion(CustomTestCase):
             "4",
             "--speculative-num-draft-tokens",
             "4",
-            "--n-share-experts-fusion",
-            "8",
+            "--disable-shared-experts-fusion",
         ]
         cls.process = popen_launch_server(
             cls.model,

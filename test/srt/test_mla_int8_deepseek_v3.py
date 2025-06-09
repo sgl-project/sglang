@@ -112,7 +112,7 @@ class TestDeepseekV3MTPChannelInt8(CustomTestCase):
         self.assertGreater(avg_spec_accept_length, 2.5)
 
 
-class TestDeepseekV3MTPChannelInt8WithSharedExpertsFusion(CustomTestCase):
+class TestDeepseekV3MTPChannelInt8WithDisableSharedExpertsFusion(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "sgl-project/sglang-ci-dsv3-channel-int8-test"
@@ -137,8 +137,7 @@ class TestDeepseekV3MTPChannelInt8WithSharedExpertsFusion(CustomTestCase):
                     "4",
                     "--speculative-num-draft-tokens",
                     "4",
-                    "--n-share-experts-fusion",
-                    "8",
+                    "--disable-shared-experts-fusion",
                 ]
             )
         cls.process = popen_launch_server(
