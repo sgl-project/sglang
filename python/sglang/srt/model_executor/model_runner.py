@@ -177,6 +177,8 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.is_hybrid = model_config.is_hybrid
+        self.token_to_kv_pool_allocator_local = None
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
 
@@ -419,6 +421,10 @@ class ModelRunner:
         if server_args.attention_backend == "aiter":
             if self.model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
+
+        if self.is_hybrid is not None and not server_args.disable_radix_cache:
+            logger.info("Automatically disable radix cache for hybrid cache.")
+            server_args.disable_radix_cache = True
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -829,7 +835,30 @@ class ModelRunner:
             1 - self.mem_fraction_static
         )
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
-        return max_num_token
+        return max_num_token, cell_size
+
+    def get_num_token_hybrid(self):
+        temp_ratio = (
+            (1 - self.is_hybrid)
+            + self.is_hybrid * self.attention_chunk_size / self.model_config.context_len
+        )
+        self.local_max_total_num_tokens = (
+            4 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
+        )
+        self.max_total_num_tokens = (
+            4 * self.max_total_num_tokens
+            - 12 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
+        )
+        self.local_max_total_num_tokens = int(
+            self.local_max_total_num_tokens
+            // self.server_args.page_size
+            * self.server_args.page_size
+        )
+        self.max_total_num_tokens = int(
+            self.max_total_num_tokens
+            // self.server_args.page_size
+            * self.server_args.page_size
+        )
 
     def init_memory_pool(
         self,
@@ -852,7 +881,9 @@ class ModelRunner:
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
 
-        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+        self.max_total_num_tokens, cell_size = self.profile_max_num_token(
+            total_gpu_memory
+        )
 
         if max_num_reqs is None:
             max_num_reqs = min(
@@ -900,11 +931,25 @@ class ModelRunner:
                 )
             self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
 
+        # modify max_total_num_tokens due to ReqToTokenPool
+
+        self.max_total_num_tokens -= (
+            (max_num_reqs + 1)
+            * (self.model_config.context_len + 4)
+            * torch._utils._element_size(torch.int32)
+            // cell_size
+        )
         self.max_total_num_tokens = (
             self.max_total_num_tokens
             // self.server_args.page_size
             * self.server_args.page_size
         )
+
+        # create token size for hybrid cache
+        if self.is_hybrid is not None:
+            self.get_num_token_hybrid()
+        else:
+            self.local_max_total_num_tokens = None
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
@@ -917,6 +962,7 @@ class ModelRunner:
                 max_context_len=self.model_config.context_len + 4,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
+                is_hybrid=self.is_hybrid,
             )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
@@ -965,6 +1011,7 @@ class ModelRunner:
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
+                local_size=self.local_max_total_num_tokens,
             )
 
         if self.token_to_kv_pool_allocator is None:
@@ -975,6 +1022,14 @@ class ModelRunner:
                     device=self.device,
                     kvcache=self.token_to_kv_pool,
                 )
+                if self.is_hybrid is not None:
+                    self.token_to_kv_pool_allocator_local = TokenToKVPoolAllocator(
+                        self.local_max_total_num_tokens,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                    )
+
             else:
                 self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                     self.max_total_num_tokens,
