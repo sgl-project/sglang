@@ -421,10 +421,13 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights=topk_weights,
                 forward_mode=forward_mode,
             )
-        final_hidden_states *= self.routed_scaling_factor
 
         if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+            x = shared_output
+            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = x
+        else:
+            final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
 
