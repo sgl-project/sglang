@@ -26,7 +26,7 @@ def create_test_tensors(
     )
 
     num_experts = end_expert_id - start_expert_id + 1
-    scales = torch.rand(num_experts, dtype=torch.float32, device=device) + 0.5
+    scales = torch.rand(num_experts, dtype=torch.float32, device=device) * 0.8 + 0.5
 
     half_hidden = hidden_size // 2
     down_input = torch.empty(total_tokens, half_hidden, dtype=dtype, device=device)
@@ -81,9 +81,9 @@ def run_triton_kernel(
 def assert_close(a: torch.Tensor, b: torch.Tensor):
     a32, b32 = a.float(), b.float()
     if a.dtype is torch.float16:
-        torch.testing.assert_close(a32, b32, rtol=1e-4, atol=1e-2)
+        torch.testing.assert_close(a32, b32, rtol=1e-5, atol=1e-5)
     elif a.dtype is torch.bfloat16:
-        torch.testing.assert_close(a32, b32, rtol=1e-1, atol=1e-2)
+        torch.testing.assert_close(a32, b32, rtol=1e-5, atol=1e-5)
     else:
         torch.testing.assert_close(a32, b32, rtol=1e-5, atol=1e-5)
 
