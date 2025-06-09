@@ -318,12 +318,38 @@ class EAGLEWorker(TpModelWorker):
             )
 
             return logits_output, next_token_ids, model_worker_batch.bid, 0, False
+        elif (
+            batch.forward_mode.is_extend()
+            and batch.extend_data_for_draft_model_ready
+            and not batch.extend_draft_model
+        ):
+            if hasattr(batch, "extend_logits_output") and hasattr(
+                batch, "extend_next_token_ids"
+            ):
+                with self.draft_tp_context(self.draft_model_runner.tp_group):
+                    self.forward_draft_extend(
+                        batch,
+                        batch.extend_logits_output.hidden_states,
+                        batch.extend_next_token_ids,
+                    )
+                batch.extend_draft_model = True
+            else:
+                raise RuntimeError(
+                    "extend data not found for draft model initialization"
+                )
+            return (
+                batch.extend_logits_output,
+                batch.extend_next_token_ids,
+                batch.bid,
+                0,
+                False,
+            )
         else:
             logits_output, next_token_ids, bid = self.forward_target_extend(batch)
-            with self.draft_tp_context(self.draft_model_runner.tp_group):
-                self.forward_draft_extend(
-                    batch, logits_output.hidden_states, next_token_ids
-                )
+            batch.extend_logits_output = logits_output
+            batch.extend_next_token_ids = next_token_ids
+            batch.bid = bid
+            batch.extend_data_for_draft_model_ready = True
             return logits_output, next_token_ids, bid, 0, False
 
     def forward_target_extend(

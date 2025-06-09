@@ -898,6 +898,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # For draft model extend
+    extend_draft_model = False
+    extend_data_for_draft_model_ready = False
+    extend_logits_output = None
+    extend_next_token_ids = None
+    bid = None
+
     @classmethod
     def init_new(
         cls,
