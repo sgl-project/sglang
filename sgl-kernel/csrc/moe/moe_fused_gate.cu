@@ -106,70 +106,51 @@ __device__ void moe_fused_gate_impl(
     int tile_size = min(32, params.VPT - tile_offset);
     if (tile_size <= 0) break;
 
+    // Prefetch the data of the next tile before processing the current one
+    if (tile + 1 < (params.VPT + 31) / 32) {
+      __prefetch_global(vec_thread_read_ptr[0] + (tile+1)*32);
+      __prefetch_global(vec_bias_thread_read_ptr[0] + (tile+1)*32);
+    }
+
     // Read row_chunk and bias_chunk
     #pragma unroll
-      for (int ii = 0; ii < tile_size; ++ii) {
-        int global_idx = tile_offset + ii;
-        row_chunk[ii] = vec_thread_read_ptr[0][global_idx];
-        bias_chunk[ii] = vec_bias_thread_read_ptr[0][global_idx];
-      }
-
-      __syncthreads();
-
-    ////////////////////// Sigmoid //////////////////////
-    #pragma unroll
-      for (int ii = 0; ii < tile_size; ++ii) {
-        row_chunk[ii] = static_cast<T>(1.0f / (1.0f + expf(-float(row_chunk[ii]))));
-      }
-
-      __syncthreads();
-
-    ////////////////////// Add Bias //////////////////////
-    #pragma unroll
-      for (int ii = 0; ii < tile_size; ++ii) {
-        bias_chunk[ii] = row_chunk[ii] + bias_chunk[ii];
-      }
-
-      __syncthreads();
-
-      // 
-      if (tile == 0) {
-        // The first tile directly initializes the global maximum value
-        for (int ii = 0; ii < tile_size; ++ii) {
-          T val = bias_chunk[ii];
-          int global_idx = tile_offset + ii;
-          
-          if (cmp_gt(val, global_max_val)) {
-            global_max_val_second = global_max_val;
-            global_max_second_idx = global_max_idx;
-            global_max_val = val;
-            global_max_idx = global_idx;
-          } else if (cmp_gt(val, global_max_val_second)) {
-            global_max_val_second = val;
-            global_max_second_idx = global_idx;
-          }
-        }
-      } else {
-        // Subsequent tile, compare with the existing maximum value
-        for (int ii = 0; ii < tile_size; ++ii) {
-          T val = bias_chunk[ii];
-          int global_idx = tile_offset + ii;
-          
-          if (cmp_gt(val, global_max_val)) {
-            global_max_val_second = global_max_val;
-            global_max_second_idx = global_max_idx;
-            global_max_val = val;
-            global_max_idx = global_idx;
-          } else if (cmp_gt(val, global_max_val_second)) {
-            global_max_val_second = val;
-            global_max_second_idx = global_idx;
-          }
-        }
-      }
-    // Write the processing results back to the corresponding location in global memory so that subsequent operations can access them correctly.
     for (int ii = 0; ii < tile_size; ++ii) {
       int global_idx = tile_offset + ii;
-      // Write back via bias_thread_read_ptr and thread_read_ptr
+      row_chunk[ii] = vec_thread_read_ptr[0][global_idx];
+      bias_chunk[ii] = vec_bias_thread_read_ptr[0][global_idx];
+    }
+
+    // Merge Sigmoid, Add Bias, and find maximum operations to reduce __syncthreads() calls
+    #pragma unroll
+    for (int ii = 0; ii < tile_size; ++ii) {
+      // Calculate Sigmoid
+      T sigmoid_val = static_cast<T>(1.0f / (1.0f + expf(-float(row_chunk[ii]))));
+      // Add bias
+      T val_with_bias = sigmoid_val + bias_chunk[ii];
+      
+      // Save result
+      row_chunk[ii] = sigmoid_val;
+      bias_chunk[ii] = val_with_bias;
+      
+      // Find the maximum value immediately
+      int global_idx = tile_offset + ii;
+      if (cmp_gt(val_with_bias, global_max_val)) {
+        global_max_val_second = global_max_val;
+        global_max_second_idx = global_max_idx;
+        global_max_val = val_with_bias;
+        global_max_idx = global_idx;
+      } else if (cmp_gt(val_with_bias, global_max_val_second)) {
+        global_max_val_second = val_with_bias;
+        global_max_second_idx = global_idx;
+      }
+    }
+
+    __syncthreads();
+
+    // Write the processing results back to the corresponding location in global memory
+    #pragma unroll
+    for (int ii = 0; ii < tile_size; ++ii) {
+      int global_idx = tile_offset + ii;
       thread_read_ptr[global_idx] = row_chunk[ii];
       bias_thread_read_ptr[global_idx] = bias_chunk[ii];
     }
@@ -220,27 +201,29 @@ __device__ void moe_fused_gate_impl(
           global_max_second_idx = -1;
           
           // Rescan all data to find the maximum value
-          for (int tile = 0; tile < (params.VPT + 31) / 32; ++tile) {
-            int tile_offset = tile * 32;
-            int tile_size = min(32, params.VPT - tile_offset);
-            if (tile_size <= 0) break;
-            
-            for (int ii = 0; ii < tile_size; ++ii) {
-              int idx = tile_offset + ii;
-              T val = bias_thread_read_ptr[idx];
+          #pragma unroll
+            for (int tile = 0; tile < (params.VPT + 31) / 32; ++tile) {
+              int tile_offset = tile * 32;
+              int tile_size = min(32, params.VPT - tile_offset);
+              if (tile_size <= 0) break;
               
-              if (cmp_gt(val, global_max_val) && !cmp_eq(val, static_cast<T>(FLT_MAX))) {
-                global_max_val_second = global_max_val;
-                global_max_second_idx = global_max_idx;
-                global_max_val = val;
-                global_max_idx = idx;
-              } else if (cmp_gt(val, global_max_val_second) && !cmp_eq(val, static_cast<T>(FLT_MAX))) {
-                global_max_val_second = val;
-                global_max_second_idx = idx;
+              #pragma unroll
+              for (int ii = 0; ii < tile_size; ++ii) {
+                int idx = tile_offset + ii;
+                T val = bias_thread_read_ptr[idx];
+                
+                if (cmp_gt(val, global_max_val) && !cmp_eq(val, static_cast<T>(FLT_MAX))) {
+                  global_max_val_second = global_max_val;
+                  global_max_second_idx = global_max_idx;
+                  global_max_val = val;
+                  global_max_idx = idx;
+                } else if (cmp_gt(val, global_max_val_second) && !cmp_eq(val, static_cast<T>(FLT_MAX))) {
+                  global_max_val_second = val;
+                  global_max_second_idx = idx;
+                }
               }
             }
           }
-        }
       }
     }
   }
@@ -256,23 +239,25 @@ __device__ void moe_fused_gate_impl(
     int expert = first_elt_read_by_thread;
 
     // Scan all tiles
-    for (int tile = 0; tile < (params.VPT + 31) / 32; ++tile) {
-      int tile_offset = tile * 32;
-      int tile_size = min(32, params.VPT - tile_offset);
-      if (tile_size <= 0) break;
-      
-      // Read the data of the current tile
-      for (int ii = 0; ii < tile_size; ++ii) {
-        int global_idx = tile_offset + ii;
-        T val = bias_thread_read_ptr[global_idx];
+    #pragma unroll
+      for (int tile = 0; tile < (params.VPT + 31) / 32; ++tile) {
+        int tile_offset = tile * 32;
+        int tile_size = min(32, params.VPT - tile_offset);
+        if (tile_size <= 0) break;
         
-        if (cmp_gt(val, local_max_val) && !cmp_eq(val, static_cast<T>(FLT_MAX)) && 
-            !cmp_eq(val, static_cast<T>(-FLT_MAX))) {
-          local_max_val = val;
-          local_max_idx = global_idx;
+        // Read the data of the current tile
+        #pragma unroll
+        for (int ii = 0; ii < tile_size; ++ii) {
+          int global_idx = tile_offset + ii;
+          T val = bias_thread_read_ptr[global_idx];
+          
+          if (cmp_gt(val, local_max_val) && !cmp_eq(val, static_cast<T>(FLT_MAX)) && 
+              !cmp_eq(val, static_cast<T>(-FLT_MAX))) {
+            local_max_val = val;
+            local_max_idx = global_idx;
+          }
         }
       }
-    }
     
     // If no valid value is found
     if (local_max_idx == -1) {
@@ -495,7 +480,7 @@ std::vector<at::Tensor> moe_fused_gate(
       num_expert_group);
 
   int computed_vpt = num_experts / num_expert_group;
-  // Check 3: Ensure that num_experts/num_expert_group does not exceed MAX_VPT=32. Maximum VPT indicate max value per
+  // Check 3: Ensure that num_experts/num_expert_group does not exceed MAX_VPT=128. Maximum VPT indicate max value per
   // threads we can process.
   TORCH_CHECK(
       computed_vpt <= MAX_VPT,
@@ -509,7 +494,8 @@ std::vector<at::Tensor> moe_fused_gate(
   // We currently only support for:
   //   Case 1: 256 experts, with 8 or 16 groups.
   //   Case 2: 128 experts, with 4 or 8 groups.
-  //   Case 3: other cases, require 8 <= num_experts / num_expert_group <= 32
+  //   Case 3: 64 experts, with 1 groups.
+  //   Case 4: other cases, require 8 <= num_experts / num_expert_group <= 128.
   bool dispatched = false;
   switch (num_experts) {
     case 256:
@@ -555,7 +541,7 @@ std::vector<at::Tensor> moe_fused_gate(
   }
   if (!dispatched) {
     // Fallback to the dynamic kernel if none of the supported combinations match.
-    // currently only support num_experts / num_expert_group <= 32 for dynamic kernels
+    // currently only support num_experts / num_expert_group <= 128 for dynamic kernels
     if (input.scalar_type() == at::kBFloat16) {
       moe_fused_gate_kernel_dynamic<bfloat16_t><<<num_blocks, block_dim, 0, stream>>>(
           input.data_ptr(),
