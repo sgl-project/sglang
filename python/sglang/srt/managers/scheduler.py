@@ -2134,14 +2134,8 @@ class Scheduler(
                 self.tp_worker.worker.model_runner.model
             )
 
-            self.weights_memory_saver_adapter.check_validity(
-                caller_name="release_memory_occupation"
-            )
             self.weights_memory_saver_adapter.pause()
         if "kv_cache" in tags:
-            self.kv_cache_memory_saver_adapter.check_validity(
-                caller_name="release_memory_occupation"
-            )
             self.kv_cache_memory_saver_adapter.pause()
 
         self.flush_cache()
@@ -2155,22 +2149,14 @@ class Scheduler(
             logger.info(f"resume_memory_occupation: after adjust {tags=}")
 
         if "weights" in tags:
-            self.weights_memory_saver_adapter.check_validity(
-                caller_name="resume_memory_occupation"
-            )
-            logger.info(f"resume_memory_occupation: before weights resume {tags=}")
             self.weights_memory_saver_adapter.resume()
-            logger.info(f"resume_memory_occupation: after weights resume {tags=}")
+            print(f"resume_memory_occupation: before weights resume {tags=}")
             _import_static_state(
                 self.tp_worker.worker.model_runner.model,
                 self.stashed_model_static_state,
             )
             del self.stashed_model_static_state
         if "kv_cache" in tags:
-            self.kv_cache_memory_saver_adapter.check_validity(
-                caller_name="resume_memory_occupation"
-            )
-            logger.info(f"resume_memory_occupation: before kv_cache resume {tags=}")
             self.kv_cache_memory_saver_adapter.resume()
             logger.info(f"resume_memory_occupation: after kv_cache resume {tags=}")
         return ResumeMemoryOccupationReqOutput()
