@@ -348,7 +348,8 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-        final_hidden_states *= self.routed_scaling_factor
+        if not _is_cuda:
+            final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
@@ -452,13 +453,15 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states,
             layer_id=self.layer_id,
         )
-        final_hidden_states *= self.routed_scaling_factor
-
         debug_utils.dumper.dump(
             "moe_shared_output", shared_output, layer_id=self.layer_id
         )
         if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+            x = shared_output
+            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = x
+        else:
+            final_hidden_states *= self.routed_scaling_factor
 
         debug_utils.dumper.dump(
             "moe_output_final_hidden_states",
