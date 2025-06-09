@@ -924,6 +924,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
         ret = await tokenizer_manager.generate_request(
             adapted_request, raw_request
         ).__anext__()
+        print(ret)
     except ValueError as e:
         return create_error_response(str(e))
 
@@ -1274,7 +1275,7 @@ def v1_chat_generate_response(
     reasoning_parser=None,
 ):
     choices = []
-
+    
     for idx, ret_item in enumerate(ret):
         logprobs = False
         if isinstance(request, list) and request[idx].logprobs:
@@ -1411,6 +1412,10 @@ def v1_chat_generate_response(
 
         choices.append(choice_data)
 
+    meta_info = {
+        "spec_verify_ct": [ret_item["meta_info"].get("spec_verify_ct", 0) for ret_item in ret]
+    }
+
     if to_file:
         responses = []
 
@@ -1434,6 +1439,7 @@ def v1_chat_generate_response(
                         + ret[i]["meta_info"]["completion_tokens"],
                     },
                     "system_fingerprint": None,
+                    "meta_info": meta_info,
                 },
             }
             responses.append(response)
@@ -1457,6 +1463,7 @@ def v1_chat_generate_response(
                     {"cached_tokens": cached_tokens} if cache_report else None
                 ),
             ),
+            meta_info=meta_info,
         )
         return response
 

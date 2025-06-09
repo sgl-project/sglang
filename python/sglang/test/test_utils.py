@@ -334,6 +334,7 @@ def add_common_sglang_args_and_parse(parser: argparse.ArgumentParser):
         help="Device type (auto/cuda/rocm/cpu). Auto will detect available platforms",
     )
     parser.add_argument("--result-file", type=str, default="result.jsonl")
+    parser.add_argument("--is-chat-model", action="store_true", help="Whether the model is a chat model")
     args = parser.parse_args()
 
     return args
@@ -343,9 +344,9 @@ def select_sglang_backend(args: argparse.Namespace):
     if args.backend.startswith("srt"):
         if args.backend == "srt-no-parallel":
             global_config.enable_parallel_encoding = False
-        backend = RuntimeEndpoint(f"{args.host}:{args.port}")
+        backend = RuntimeEndpoint(f"{args.host}:{args.port}", is_chat_model=args.is_chat_model)
     elif args.backend.startswith("gpt-"):
-        backend = OpenAI(args.backend)
+        backend = OpenAI(args.backend, is_chat_model=args.is_chat_model)
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
     return backend

@@ -29,6 +29,7 @@ class RuntimeEndpoint(BaseBackend):
         api_key: Optional[str] = None,
         verify: Optional[str] = None,
         chat_template_name: Optional[str] = None,
+        is_chat_model: Optional[bool] = False
     ):
         super().__init__()
         self.support_concate_and_append = True
@@ -36,6 +37,8 @@ class RuntimeEndpoint(BaseBackend):
         self.base_url = base_url
         self.api_key = api_key
         self.verify = verify
+        self.is_chat_model = is_chat_model
+        self.api_endpoint = "/generate" if not self.is_chat_model else "/v1/chat/completions"
 
         res = http_request(
             self.base_url + "/get_model_info",
@@ -77,9 +80,27 @@ class RuntimeEndpoint(BaseBackend):
         return self.chat_template
 
     def cache_prefix(self, prefix_str: str):
+        from sglang.srt.openai_api.protocol import ChatCompletionRequest, ChatCompletionMessageGenericParam
+
+        if self.is_chat_model:
+            data = {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": prefix_str
+                    }
+                    
+                ],
+                "model": "",
+            }
+        else:
+            data = {
+                "text": prefix_str,
+            }
+
         res = http_request(
-            self.base_url + "/generate",
-            json={"text": prefix_str, "sampling_params": {"max_new_tokens": 0}},
+            self.base_url + self.api_endpoint,
+            json=data,
             api_key=self.api_key,
             verify=self.verify,
         )
@@ -89,7 +110,7 @@ class RuntimeEndpoint(BaseBackend):
         data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
         self._add_images(s, data)
         res = http_request(
-            self.base_url + "/generate",
+            self.base_url + self.api_endpoint,
             json=data,
             api_key=self.api_key,
             verify=self.verify,
@@ -100,7 +121,7 @@ class RuntimeEndpoint(BaseBackend):
         data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
         self._add_images(s, data)
         res = http_request(
-            self.base_url + "/generate",
+            self.base_url + self.api_endpoint,
             json=data,
             api_key=self.api_key,
             verify=self.verify,
@@ -145,13 +166,23 @@ class RuntimeEndpoint(BaseBackend):
         sampling_params: SglSamplingParams,
     ):
         self._handle_dtype_to_regex(sampling_params)
-        data = {
-            "text": s.text_,
-            "sampling_params": {
-                "skip_special_tokens": global_config.skip_special_tokens_in_output,
-                "spaces_between_special_tokens": global_config.spaces_between_special_tokens_in_out,
-                **sampling_params.to_srt_kwargs(),
-            },
+        
+        if self.is_chat_model:
+            data = {
+                "messages": [
+                    {"role": "user", "content": s.text_}
+                ],
+                "model": "",
+            }
+        else:
+            data = {
+                "text": s.text_,
+            }
+
+        data["sampling_params"] = {
+            "skip_special_tokens": global_config.skip_special_tokens_in_output,
+            "spaces_between_special_tokens": global_config.spaces_between_special_tokens_in_out,
+            **sampling_params.to_srt_kwargs(),
         }
 
         for item in [
@@ -167,16 +198,25 @@ class RuntimeEndpoint(BaseBackend):
         self._add_images(s, data)
 
         res = http_request(
-            self.base_url + "/generate",
+            self.base_url + self.api_endpoint,
             json=data,
             api_key=self.api_key,
             verify=self.verify,
         )
         self._assert_success(res)
 
-        obj = res.json()
-        comp = obj["text"]
-        return comp, obj["meta_info"]
+        if self.is_chat_model:
+            obj = res.json()
+            comp = obj['choices'][0]['message']['content']
+            meta_info = obj['meta_info']
+            meta_info['spec_verify_ct'] = obj['meta_info']['spec_verify_ct'][0]
+            meta_info['completion_tokens'] = obj['usage']['completion_tokens']
+        else:
+            obj = res.json()
+            comp = obj["text"]
+            meta_info = obj['meta_info']
+
+        return comp, meta_info
 
     def generate_stream(
         self,
@@ -208,7 +248,7 @@ class RuntimeEndpoint(BaseBackend):
         self._add_images(s, data)
 
         res = http_request(
-            self.base_url + "/generate",
+            self.base_url + self.endpoint,
             json=data,
             stream=True,
             api_key=self.api_key,
@@ -309,7 +349,7 @@ class RuntimeEndpoint(BaseBackend):
     def _generate_http_request(self, s: StreamExecutor, data):
         self._add_images(s, data)
         res = http_request(
-            self.base_url + "/generate",
+            self.base_url + self.api_endpoint,
             json=data,
             api_key=self.api_key,
             verify=self.verify,
