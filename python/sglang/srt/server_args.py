@@ -2609,13 +2609,14 @@ class PortArgs:
             dist_init_host, dist_init_port = dist_init_addr
             port_base = int(dist_init_port) + 1
             detokenizer_port = port_base + 1
-            rpc_port = port_base + 2
             metrics_ipc_name = port_base + 3
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
+                rpc_port = port_base + 2
             else:
                 scheduler_input_port = port_base + 4 + 1 + dp_rank
+                rpc_port = port_base + 100 + dp_rank
 
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
