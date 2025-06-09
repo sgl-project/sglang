@@ -132,9 +132,9 @@ class AttnForwardMethod(IntEnum):
     # Use multi-head attention, but with KV cache chunked.
     # This method can avoid OOM when prefix lengths are long.
     MHA_CHUNKED_KV = auto()
-    
+
     # Use multi-head attention, but with paged KV cache.
-    # This method only support MHA without prefix-cache for now. 
+    # This method only support MHA without prefix-cache for now.
     MHA_PAGED_PREFILL = auto()
 
     # Use MLA but with fused RoPE
@@ -762,7 +762,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             ):
                 return AttnForwardMethod.MHA_CHUNKED_KV
             elif (
-                forward_batch.forward_mode.is_prefill() 
+                forward_batch.forward_mode.is_prefill()
                 # because the chunked_prefix_cache is not supported for paged KV cache
                 # so we just enable it for prefill without prefix only
                 # [TODO] we need to fix it when allocator support chunked_prefix_cache
@@ -1378,7 +1378,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         return self.forward_normal_chunked_kv_prepare(
             positions, hidden_states, forward_batch, zero_allocator
         )
-    
+
     def forward_normal_paged_prefill_core(self, q, k, v, forward_batch):
         # we enable the chunked_prefix_cache temporarily
         temp_disable_flag = global_server_args_dict["disable_chunked_prefix_cache"]
