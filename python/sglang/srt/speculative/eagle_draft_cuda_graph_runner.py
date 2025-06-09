@@ -127,7 +127,7 @@ class EAGLEDraftCudaGraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum(),
+            seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
             positions=positions,
             spec_algorithm=self.model_runner.spec_algorithm,
@@ -209,7 +209,7 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.positions = self.positions[:num_tokens]
 
         # Special handle for seq_len_cpu used when flashinfer mla is used
-        if (forward_batch.seq_lens_cpu is not None) and (bs != raw_bs):
+        if forward_batch.seq_lens_cpu is not None and bs != raw_bs:
             self.seq_lens_cpu.fill_(1)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
             forward_batch.seq_lens_cpu = self.seq_lens_cpu[:bs]
