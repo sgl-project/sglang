@@ -425,7 +425,7 @@ class EAGLEWorker(TpModelWorker):
             self.page_size,
         )
         batch.out_cache_loc = out_cache_loc
-        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+        batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
 
         # Get forward batch
