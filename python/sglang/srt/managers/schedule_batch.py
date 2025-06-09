@@ -70,33 +70,38 @@ if TYPE_CHECKING:
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
+GLOBAL_SERVER_ARGS_KEYS = [
+    "attention_backend",
+    "debug_tensor_dump_inject",
+    "debug_tensor_dump_output_folder",
+    "chunked_prefill_size",
+    "deepep_mode",
+    "device",
+    "disable_chunked_prefix_cache",
+    "disable_radix_cache",
+    "enable_deepep_moe",
+    "enable_dp_attention",
+    "enable_two_batch_overlap",
+    "enable_dp_lm_head",
+    "enable_ep_moe",
+    "deepep_config",
+    "enable_nan_detection",
+    "flashinfer_mla_disable_ragged",
+    "max_micro_batch_size",
+    "moe_dense_tp_size",
+    "ep_dispatch_algorithm",
+    "disable_shared_experts_fusion",
+    "sampling_backend",
+    "speculative_accept_threshold_acc",
+    "speculative_accept_threshold_single",
+    "torchao_config",
+    "triton_attention_reduce_in_fp32",
+    "ep_num_redundant_experts",
+    "mm_attention_backend",
+]
+
 # Put some global args for easy access
-global_server_args_dict = {
-    "attention_backend": ServerArgs.attention_backend,
-    "chunked_prefill_size": ServerArgs.chunked_prefill_size,
-    "deepep_mode": ServerArgs.deepep_mode,
-    "device": ServerArgs.device,
-    "disable_chunked_prefix_cache": ServerArgs.disable_chunked_prefix_cache,
-    "disable_radix_cache": ServerArgs.disable_radix_cache,
-    "enable_deepep_moe": ServerArgs.enable_deepep_moe,
-    "enable_dp_attention": ServerArgs.enable_dp_attention,
-    "enable_two_batch_overlap": ServerArgs.enable_two_batch_overlap,
-    "enable_dp_lm_head": ServerArgs.enable_dp_lm_head,
-    "enable_ep_moe": ServerArgs.enable_ep_moe,
-    "deepep_config": ServerArgs.deepep_config,
-    "enable_nan_detection": ServerArgs.enable_nan_detection,
-    "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
-    "max_micro_batch_size": ServerArgs.max_micro_batch_size,
-    "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
-    "ep_dispatch_algorithm": ServerArgs.ep_dispatch_algorithm,
-    "num_fused_shared_experts": ServerArgs.num_fused_shared_experts,
-    "sampling_backend": ServerArgs.sampling_backend,
-    "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
-    "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
-    "torchao_config": ServerArgs.torchao_config,
-    "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
-    "ep_num_redundant_experts": ServerArgs.ep_num_redundant_experts,
-}
+global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
 
 logger = logging.getLogger(__name__)
 
@@ -1665,6 +1670,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
             out_cache_loc=self.out_cache_loc,
+            seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=self.seq_lens_sum,
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
@@ -1674,7 +1680,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             tbo_split_seq_index=self.tbo_split_seq_index,
             global_forward_mode=self.global_forward_mode,
-            seq_lens_cpu=seq_lens_cpu,
             extend_num_tokens=self.extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -1736,11 +1741,11 @@ class ModelWorkerBatch:
     req_pool_indices: torch.Tensor
     # The sequence length
     seq_lens: torch.Tensor
-    seq_lens_cpu: Optional[torch.Tensor]
     # The indices of output tokens in the token_to_kv_pool_allocator
     out_cache_loc: torch.Tensor
 
-    # The sum of all sequence lengths
+    # The sequence length tensor on CPU
+    seq_lens_cpu: Optional[torch.Tensor]
     seq_lens_sum: int
 
     # For logprob

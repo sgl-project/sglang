@@ -20,7 +20,7 @@ import copy
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from sglang.srt.mm_utils import has_valid_data
 
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 else:
     Image = Any
 
-from sglang.srt.managers.schedule_batch import BaseFinishReason, flatten_nested_list
+from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 
