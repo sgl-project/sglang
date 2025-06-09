@@ -318,27 +318,28 @@ class ModelOptFp8MoEMethod:
             if self.quant_config.is_checkpoint_fp8_serialized
             else params_dtype
         )
-
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        # WEIGHTS
-        w13_weight = torch.nn.Parameter(
-            torch.empty(
+        # Use ModelWeightParameter for consistency
+        w13_weight = ModelWeightParameter(
+            data=torch.empty(
                 num_experts, 2 * intermediate_size, hidden_size, dtype=weight_dtype
             ),
-            requires_grad=False,
+            input_dim=2,  # hidden_size is input dimension
+            output_dim=1,  # intermediate_size is output dimension
+            weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
 
-        w2_weight = torch.nn.Parameter(
-            torch.empty(
+        w2_weight = ModelWeightParameter(
+            data=torch.empty(
                 num_experts, hidden_size, intermediate_size, dtype=weight_dtype
             ),
-            requires_grad=False,
+            input_dim=2,  # intermediate_size is input dimension
+            output_dim=1,  # hidden_size is output dimension
+            weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
 
         if self.quant_config.is_checkpoint_fp8_serialized:
             # WEIGHT SCALES - Per-tensor scaling for ModelOpt
