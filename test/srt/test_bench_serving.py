@@ -175,7 +175,7 @@ class TestBenchServing(CustomTestCase):
     def test_vlm_online_latency(self):
         res = run_bench_serving(
             model=DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
-            num_prompts=50,
+            num_prompts=200,
             request_rate=1,
             other_server_args=[
                 "--mem-fraction-static",
