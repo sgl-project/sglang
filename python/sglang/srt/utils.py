@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import pickle
+import platform
 import random
 import re
 import resource
@@ -156,6 +157,15 @@ def is_xpu() -> bool:
 
 def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
+
+
+def is_cpu() -> bool:
+    machine = platform.machine().lower()
+    return (
+        machine in ("x86_64", "amd64", "i386", "i686")
+        and hasattr(torch, "cpu")
+        and torch.cpu.is_available()
+    )
 
 
 def is_flashinfer_available():
@@ -1918,14 +1928,16 @@ def next_power_of_2(n: int):
 setattr(triton, "next_power_of_2", next_power_of_2)
 
 
-@contextmanager
-def empty_context(*args, **kwargs):
-    try:
-        # Setup code goes here
-        yield
-    finally:
-        # Cleanup code goes here
+class EmptyContextManager:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
         pass
+
+
+def empty_context(*args, **kwargs):
+    return EmptyContextManager()
 
 
 def add_prefix(name: str, prefix: str) -> str:

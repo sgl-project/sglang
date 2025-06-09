@@ -165,6 +165,7 @@ class ServerArgs:
     enable_tokenizer_batch_encode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
+    enable_mscclpp: bool = False
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -179,6 +180,7 @@ class ServerArgs:
     enable_eplb: bool = False
     eplb_algorithm: str = "auto"
     eplb_rebalance_num_iterations: int = 1000
+    eplb_rebalance_layers_per_chunk: Optional[int] = None
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "per_pass", "per_token"]
     ] = None
@@ -423,6 +425,12 @@ class ServerArgs:
                 "Overlap scheduler is disabled because of using "
                 "eagle speculative decoding."
             )
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using "
+                    "eagle speculative decoding."
+                )
 
             model_arch = get_model_arch(self)
 
@@ -445,7 +453,7 @@ class ServerArgs:
                     self.speculative_num_steps,
                     self.speculative_eagle_topk,
                     self.speculative_num_draft_tokens,
-                ) = auto_choose_speculative_params(model_arch)
+                ) = auto_choose_speculative_params(self)
 
             if self.page_size > 1 and self.speculative_eagle_topk > 1:
                 self.speculative_eagle_topk = 1
@@ -1169,6 +1177,11 @@ class ServerArgs:
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
+            "--enable-mscclpp",
+            action="store_true",
+            help="Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
+        )
+        parser.add_argument(
             "--disable-overlap-schedule",
             action="store_true",
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
@@ -1360,6 +1373,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.eplb_rebalance_num_iterations,
             help="Number of iterations to automatically trigger a EPLB re-balance.",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-layers-per-chunk",
+            type=int,
+            default=ServerArgs.eplb_rebalance_layers_per_chunk,
+            help="Number of layers to rebalance per forward pass.",
         )
         parser.add_argument(
             "--expert-distribution-recorder-mode",
@@ -1642,12 +1661,23 @@ def get_model_arch(args: ServerArgs):
     return hf_config.architectures[0]
 
 
-def auto_choose_speculative_params(arch: str):
+def auto_choose_speculative_params(self: ServerArgs):
     """
     Automatically choose the parameters for speculative decoding.
 
     You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
     """
+    kwargs = {}
+
+    hf_config = get_config(
+        self.model_path,
+        trust_remote_code=self.trust_remote_code,
+        revision=self.revision,
+        model_override_args=json.loads(self.json_model_override_args),
+        **kwargs,
+    )
+    arch = hf_config.architectures[0]
+
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama
         return (5, 4, 8)
