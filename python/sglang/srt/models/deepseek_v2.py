@@ -1944,7 +1944,7 @@ class DeepseekV2ForCausalLM(nn.Module):
     ):
         if self.n_share_experts_fusion == 0:
             return weights
-
+        assert self.num_fused_shared_experts == 1
         weights_list = list(weights)
         weights_dict = dict(weights_list)
         if self.quant_config is not None:
@@ -2010,22 +2010,21 @@ class DeepseekV2ForCausalLM(nn.Module):
         for moe_layer in tqdm(
             moe_layers,
             desc=f"Cloning {self.n_share_experts_fusion} "
-            f"replicas of the shared expert into MoE for {self.config.architectures[0]}",
+            f"shared expert into MoE for {self.config.architectures[0]}",
         ):
             for suffix in suffix_list:
                 shared_expert_weight_name = (
                     f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
                 )
-                for num_repeat in range(self.n_share_experts_fusion):
-                    weights_list.append(
-                        (
-                            f"model.layers.{moe_layer}."
-                            f"mlp.experts."
-                            f"{self.config.n_routed_experts + num_repeat}"
-                            f".{suffix}",
-                            weights_dict[shared_expert_weight_name],
-                        )
+                weights_list.append(
+                    (
+                        f"model.layers.{moe_layer}."
+                        f"mlp.experts."
+                        f"{self.config.n_routed_experts + 0}"
+                        f".{suffix}",
+                        weights_dict[shared_expert_weight_name],
                     )
+                )
                 names_to_remove += [shared_expert_weight_name]
         return [w for w in weights_list if w[0] not in names_to_remove]
 
