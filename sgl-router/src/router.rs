@@ -531,7 +531,7 @@ impl Router {
             if worker_urls.read().unwrap().is_empty() {
                 return Err("No workers available for CacheAware routing".to_string());
             }
-            
+
             let text = self.get_text_from_request(&body, route);
 
             // TODO: delay scheduling if cache hit rate is high because it may cause imbalance. prioritize low hit rate ones
@@ -581,27 +581,48 @@ impl Router {
                     matched_worker.to_string()
                 } else {
                     counter!("sgl_router_cache_misses_total").increment(1);
-                    tree.lock().unwrap().get_smallest_tenant()
+                    tree.lock()
+                        .expect("Failed to lock tree, tree Mutex is poisoned")
+                        .get_smallest_tenant()
                 }
             };
 
             // Update queues and tree
             {
-                let mut running_queue = running_queue.lock().unwrap();
-                *running_queue.get_mut(&selected_url).unwrap() += 1;
-            }
+                let mut running_queue_locked = running_queue
+                    .lock()
+                    .expect("Failed to lock running queue, running queue Mutex is poisoned");
+                if let Some(count) = running_queue_locked.get_mut(&selected_url) {
+                    *count += 1;
+                    gauge!("sgl_router_running_requests", "worker" => selected_url.to_string())
+                        .set(*count as f64);
+                } else {
+                    error!(
+                        "Selected worker URL not found in running queue: {}",
+                        selected_url
+                    );
+                }
+            };
 
             {
-                let mut processed_queue = processed_queue.lock().unwrap();
-                *processed_queue.get_mut(&selected_url).unwrap() += 1;
-            }
+                let mut processed_queue_locked = processed_queue
+                    .lock()
+                    .expect("Failed to lock processed queue, processed queue Mutex is poisoned");
+                if let Some(count) = processed_queue_locked.get_mut(&selected_url) {
+                    *count += 1;
+                    gauge!("sgl_router_processed_requests", "worker" => selected_url.to_string())
+                        .set(*count as f64);
+                } else {
+                    error!(
+                        "Selected worker URL not found in processed queue: {}",
+                        selected_url
+                    );
+                }
+            };
 
-            gauge!("sgl_router_running_requests", "worker" => selected_url.to_string())
-                .increment(1);
-            counter!("sgl_router_processed_requests_total", "worker" => selected_url.to_string())
-                .increment(1);
-
-            tree.lock().unwrap().insert(&text, &selected_url);
+            tree.lock()
+                .expect("Failed to lock tree, tree Mutex is poisoned")
+                .insert(&text, &selected_url);
 
             Ok(selected_url)
         } else {
