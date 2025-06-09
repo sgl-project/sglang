@@ -24,12 +24,10 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 import torch
 import tqdm
 
-from sglang.srt import two_batch_overlap
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.fused_moe_native import fused_moe_forward_native
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import (
@@ -37,12 +35,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+    enable_num_token_non_padded,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
-from sglang.srt.two_batch_overlap import (
-    TboCudaGraphRunnerPlugin,
-    TboForwardBatchPreparer,
-)
+from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
     get_available_gpu_memory,
     get_device_memory_capacity,
@@ -64,18 +60,9 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
         if isinstance(sub, CustomOp):
             if reverse:
-                sub._forward_method = sub.forward_cuda
-                setattr(sub, "is_torch_compile", False)
+                sub.leave_torch_compile()
             else:
-                # NOTE: Temporarily workaround MoE
-                if "FusedMoE" in sub.__class__.__name__:
-                    if num_tokens == 1:
-                        # The performance of torch.compile on this layer is not always good when bs > 1,
-                        # so we decide to only use torch.compile when bs =1
-                        sub._forward_method = fused_moe_forward_native
-                else:
-                    sub._forward_method = sub.forward_native
-                setattr(sub, "is_torch_compile", True)
+                sub.enter_torch_compile(num_tokens=num_tokens)
         if isinstance(sub, torch.nn.Module):
             _to_torch(sub, reverse, num_tokens)
 
@@ -136,28 +123,29 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     if capture_bs is None:
         if server_args.speculative_algorithm is None:
             if server_args.disable_cuda_graph_padding:
-                capture_bs = list(range(1, 33)) + list(range(40, 161, 16))
+                capture_bs = list(range(1, 33)) + list(range(48, 161, 16))
             else:
                 capture_bs = [1, 2, 4, 8] + list(range(16, 161, 8))
         else:
             # Since speculative decoding requires more cuda graph memory, we
             # capture less.
             capture_bs = (
-                list(range(1, 9)) + list(range(10, 33, 2)) + list(range(40, 161, 16))
+                list(range(1, 9))
+                + list(range(10, 33, 2))
+                + list(range(40, 64, 8))
+                + list(range(80, 161, 16))
             )
 
         gpu_mem = get_device_memory_capacity()
         if gpu_mem is not None and gpu_mem > 96 * 1024:
             capture_bs += list(range(160, 257, 8))
         if gpu_mem is not None and gpu_mem > 180 * 1000:
-            capture_bs += list(range(256, 528, 16))
+            capture_bs += list(range(256, 513, 16))
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
-        # In some case (e.g., with a small GPU or --max-running-requests), the #max-running-requests
+        # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.
-        capture_bs += [model_runner.req_to_token_pool.size - 1] + [
-            model_runner.req_to_token_pool.size
-        ]
+        capture_bs += [model_runner.req_to_token_pool.size]
 
     if server_args.enable_two_batch_overlap:
         capture_bs = [bs for bs in capture_bs if bs >= 2]
@@ -170,7 +158,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
             )
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
-    assert len(capture_bs) > 0 and capture_bs[0] > 0
+    assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
         if server_args.enable_torch_compile
@@ -205,6 +193,9 @@ class CudaGraphRunner:
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.enable_dp_attention = model_runner.server_args.enable_dp_attention
         self.enable_sp_layernorm = model_runner.server_args.enable_sp_layernorm
+        self.enable_two_batch_overlap = (
+            model_runner.server_args.enable_two_batch_overlap
+        )
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
@@ -274,23 +265,8 @@ class CudaGraphRunner:
                 }
 
             # Speculative_inference
-            if (
-                model_runner.spec_algorithm.is_eagle3()
-                and not model_runner.is_draft_worker
-            ):
-                self.hidden_states = torch.zeros(
-                    (
-                        self.max_num_token,
-                        3 * self.model_runner.model_config.hidden_size,
-                    ),
-                    dtype=self.model_runner.dtype,
-                )
+            if model_runner.spec_algorithm.is_eagle3():
                 self.model_runner.model.set_eagle3_layers_to_capture()
-            elif model_runner.spec_algorithm.is_eagle():
-                self.hidden_states = torch.zeros(
-                    (self.max_num_token, self.model_runner.model_config.hidden_size),
-                    dtype=self.model_runner.dtype,
-                )
 
             if self.is_encoder_decoder:
                 # NOTE: encoder_lens can influence the full_text_row_masked_out_mask tensor when doing mixed batch
@@ -299,6 +275,7 @@ class CudaGraphRunner:
                 )
             else:
                 self.encoder_lens = None
+
             if self.enable_dp_attention or self.enable_sp_layernorm:
                 # TODO(ch-wan): SP layernorm should use a different logic to manage gathered_buffer
                 self.gathered_buffer = torch.zeros(
@@ -318,13 +295,7 @@ class CudaGraphRunner:
                 self.capture()
         except RuntimeError as e:
             raise Exception(
-                f"Capture CUDA graph failed: {e}\n"
-                "Possible solutions:\n"
-                "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
-                "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
-                "3. disable torch compile by not using --enable-torch-compile\n"
-                "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
-                "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
+                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
     @contextmanager
@@ -362,9 +333,7 @@ class CudaGraphRunner:
         )
 
         is_tbo_supported = (
-            forward_batch.can_run_tbo
-            if self.model_runner.server_args.enable_two_batch_overlap
-            else True
+            forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
 
         return is_bs_supported and is_encoder_lens_supported and is_tbo_supported
@@ -454,6 +423,7 @@ class CudaGraphRunner:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
+
         if self.model_runner.server_args.lora_paths is not None:
             # Currently, if the lora_path in `lora_paths` is None, the lora backend will use a
             # different logic to handle lora, so we need to set `lora_paths` to a list of non-None
@@ -482,9 +452,9 @@ class CudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
-            lora_paths=lora_paths,
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
+            lora_paths=lora_paths,
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -512,7 +482,9 @@ class CudaGraphRunner:
                 self.pp_size > 1
                 and "pp_proxy_tensors" in inspect.signature(forward).parameters
             ):
-                kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+                kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+                )
 
             logits_output_or_pp_proxy_tensors = forward(
                 input_ids,
@@ -581,13 +553,7 @@ class CudaGraphRunner:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
-        num_token_non_padded = len(forward_batch.input_ids)
-        self.num_token_non_padded[...] = num_token_non_padded
-        self.tbo_plugin.replay_prepare(
-            forward_mode=forward_batch.forward_mode,
-            bs=bs,
-            num_token_non_padded=num_token_non_padded,
-        )
+
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(1)
@@ -604,9 +570,14 @@ class CudaGraphRunner:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
         if self.enable_dp_attention or self.enable_sp_layernorm:
             self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
-
-        if hasattr(forward_batch.spec_info, "hidden_states"):
-            self.hidden_states[:raw_num_token] = forward_batch.spec_info.hidden_states
+        if enable_num_token_non_padded(self.model_runner.server_args):
+            self.num_token_non_padded.copy_(forward_batch.num_token_non_padded)
+        if self.enable_two_batch_overlap:
+            self.tbo_plugin.replay_prepare(
+                forward_mode=forward_batch.forward_mode,
+                bs=bs,
+                num_token_non_padded=len(forward_batch.input_ids),
+            )
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
@@ -665,7 +636,7 @@ class CudaGraphRunner:
             else:
                 spec_info = EagleVerifyInput(
                     draft_token=None,
-                    custom_mask=torch.zeros(
+                    custom_mask=torch.ones(
                         (num_tokens * self.model_runner.model_config.context_len),
                         dtype=torch.bool,
                         device="cuda",
@@ -675,9 +646,20 @@ class CudaGraphRunner:
                     retrive_next_token=None,
                     retrive_next_sibling=None,
                     retrive_cum_len=None,
-                    draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
                     spec_steps=self.model_runner.server_args.speculative_num_steps,
+                    topk=self.model_runner.server_args.speculative_eagle_topk,
+                    draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
 
         return spec_info
+
+
+CUDA_GRAPH_CAPTURE_FAILED_MSG = (
+    "Possible solutions:\n"
+    "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
+    "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
+    "3. disable torch compile by not using --enable-torch-compile\n"
+    "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
+    "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
+)
