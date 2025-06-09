@@ -1343,7 +1343,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return len(self.reqs)
         # In the decoding phase, the length of a request's KV cache should be
         # the total length of the request minus 1
-        return sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
+        return (
+            sum(1 for req in self.reqs if req.seqlen % page_size == 0)
+            if self.enable_overlap
+            else sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
+        )
 
     def check_decode_mem(self, buf_multiplier=1):
         tokens_required = (
