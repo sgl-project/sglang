@@ -4,7 +4,7 @@ Multi-modality utils
 
 import hashlib
 from abc import abstractmethod
-from typing import Callable, Dict, List, Optional, Tuple, Literal, Any, Dict
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
@@ -48,7 +48,6 @@ def serialize_tensors(
 
     def _serialize_tensor_recursive(data: Any, mode: TensorTransportMode) -> Any:
         """Recursively processes data to serialize tensors based on mode."""
-        # print(f"serialize {data=}")
         if isinstance(data, dict):
             if "mm_items" in data:
                 data["mm_items"] = _serialize_tensor_recursive(data["mm_items"], mode)
@@ -64,9 +63,7 @@ def serialize_tensors(
             if mode == "cuda_ipc":
                 try:
                     storage = data.untyped_storage()
-                    handle = (
-                        storage._share_cuda_()
-                    )
+                    handle = storage._share_cuda_()
                     return (
                         "cuda_ipc",
                         handle,
@@ -82,7 +79,8 @@ def serialize_tensors(
                     )
                     # Fallback to CPU copy if IPC fails
                     return data.cpu()
-            else:  # mode == 'copy' or fallback
+            else:
+                # mode == 'copy' or fallback
                 # Default: move to CPU for standard pickling
                 return data.cpu()
         else:
@@ -135,9 +133,9 @@ def deserialize_tensors(
                     current_device = torch.device(f"cuda:{device_index}")
                     with torch.cuda.device(current_device):
                         storage = torch.UntypedStorage._new_shared_cuda(*handle)
-                        tensor = torch.empty(0, dtype=dtype, device=current_device).set_(
-                            storage, offset=0, size=shape, stride=stride
-                        )
+                        tensor = torch.empty(
+                            0, dtype=dtype, device=current_device
+                        ).set_(storage, offset=0, size=shape, stride=stride)
                         expected_numel = torch.Size(shape).numel()
                         if tensor.numel() != expected_numel:
                             # Potentially raise error or return None depending on strictness needed
@@ -227,7 +225,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
             return input_ids
 
         for start_idx, end_idx in zip(start_indices, end_indices):
-            padded_ids.extend(input_ids[last_idx: start_idx + 1])
+            padded_ids.extend(input_ids[last_idx : start_idx + 1])
 
             if input_ids[start_idx] in self.data_start_token_ids:
                 data_idx += 1
@@ -381,7 +379,7 @@ def _get_chunked_prefill_embedding(
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
             continue
-        embedding_items_per_req = embedding_items[items_size[i]: items_size[i + 1]]
+        embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
         items_offset = items_offset_list[i]
         assert items_offset is not None, items_offset
         embedding_items_hash = get_embedding_hash(embedding_items_per_req)
