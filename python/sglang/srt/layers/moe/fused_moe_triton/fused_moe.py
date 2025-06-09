@@ -1671,12 +1671,7 @@ def fused_experts_impl(
 
         if no_combine:
             pass
-        elif _is_hip:
-            vllm_ops.moe_sum(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states[begin_chunk_idx:end_chunk_idx],
-            )
-        else:
+        elif _is_cuda:
             if topk_ids.shape[1] == 1 and routed_scaling_factor == 1.0:
                 pass  # we write directly into out_hidden_states
             elif topk_ids.shape[1] == 2 and routed_scaling_factor == 1.0:
@@ -1699,6 +1694,11 @@ def fused_experts_impl(
                         out_hidden_states[begin_chunk_idx:end_chunk_idx],
                         routed_scaling_factor,
                     )
+        else:
+            vllm_ops.moe_sum(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                out_hidden_states[begin_chunk_idx:end_chunk_idx],
+            )
 
     return out_hidden_states
 

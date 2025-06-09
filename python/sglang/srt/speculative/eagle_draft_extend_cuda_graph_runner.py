@@ -138,7 +138,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum(),
+            seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
             positions=positions,
             spec_algorithm=self.model_runner.spec_algorithm,
