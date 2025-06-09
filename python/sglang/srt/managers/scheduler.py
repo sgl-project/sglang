@@ -2149,14 +2149,18 @@ class Scheduler(
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
         tags = recv_req.tags
-        if tags is None:
+        if tags is None or len(tags) == 0:
             tags = ["weights", "kv_cache"]
+            print(f"resume_memory_occupation: after adjust {tags=}")
+            logger.info(f"resume_memory_occupation: after adjust {tags=}")
+
         if "weights" in tags:
             self.weights_memory_saver_adapter.check_validity(
                 caller_name="resume_memory_occupation"
             )
+            logger.info(f"resume_memory_occupation: before weights resume {tags=}")
             self.weights_memory_saver_adapter.resume()
-
+            logger.info(f"resume_memory_occupation: after weights resume {tags=}")
             _import_static_state(
                 self.tp_worker.worker.model_runner.model,
                 self.stashed_model_static_state,
@@ -2166,8 +2170,9 @@ class Scheduler(
             self.kv_cache_memory_saver_adapter.check_validity(
                 caller_name="resume_memory_occupation"
             )
+            logger.info(f"resume_memory_occupation: before kv_cache resume {tags=}")
             self.kv_cache_memory_saver_adapter.resume()
-
+            logger.info(f"resume_memory_occupation: after kv_cache resume {tags=}")
         return ResumeMemoryOccupationReqOutput()
 
     def slow_down(self, recv_req: SlowDownReqInput):
