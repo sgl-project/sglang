@@ -194,7 +194,7 @@ class LoRAManager:
                 weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"
             )
             lora_ranks_tensor = torch.tensor(
-                lora_ranks, dtype=torch.int64, pin_memory=True, device="cpu"
+                lora_ranks, dtype=torch.int32, pin_memory=True, device="cpu"
             )
             scalings_tensor = torch.tensor(
                 scalings, dtype=torch.float, pin_memory=True, device="cpu"
@@ -227,7 +227,7 @@ class LoRAManager:
             self.cuda_graph_batch_info.max_len = 1
             batch_info = self.cuda_graph_batch_info
         else:
-            weight_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+            weight_indices = torch.empty((bs,), dtype=torch.int32, device=self.device)
             lora_ranks = torch.zeros(
                 (self.max_loras_per_batch,), dtype=torch.int64, device=self.device
             )
