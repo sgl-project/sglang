@@ -12,8 +12,7 @@ concurrency:
 jobs:
   build-test:
     if: github.event_name == 'pull_request'
-    runs-on: sgl-kernel-build-node
-    environment: 'prod'
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         build_type: ['all']
@@ -27,11 +26,7 @@ jobs:
           tag=v${version}-xeon
 
           docker build . -f docker/Dockerfile.xeon  -t sglang_xeon --no-cache
-  unit-test:
-    if: github.event_name == 'pull_request'
-    needs: [build-test]
-    runs-on: sgl-kernel-build-node
-    steps:
+
       - name: Run container
         run: |
           docker run -dt \
@@ -70,7 +65,7 @@ jobs:
 
   finish:
     if: always()
-    needs: [build-test, unit-test]
+    needs: [build-test]
     runs-on: ubuntu-24.04
     steps:
       - name: Check all dependent job statuses
