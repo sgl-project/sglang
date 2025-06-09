@@ -467,7 +467,9 @@ class RadixCache(BasePrefixCache):
             if node.parent is None:
                 parent_block_hash = None
             else:
-                last_page_start = ((len(node.parent.key) - 1) // self.page_size) * self.page_size
+                last_page_start = (
+                    (len(node.parent.key) - 1) // self.page_size
+                ) * self.page_size
                 parent_parent_tokens = node.parent.key[last_page_start:]
                 parent_block_hash = hash(tuple(parent_parent_tokens))
 
@@ -537,4 +539,3 @@ if __name__ == "__main__":
     # tree.evict(5, evict_callback)
     # tree.evict(10, evict_callback)
     # tree.pretty_print()
-    
