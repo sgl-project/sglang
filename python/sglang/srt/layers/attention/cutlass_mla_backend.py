@@ -159,7 +159,6 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
             if spec_info is None:
                 # max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
                 max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
-                print(f"hack init_forward_metadata_capture_cuda_graph {max_seqlen_pad=}")
 
                 create_flashmla_kv_indices_triton[(bs,)](
                     self.req_to_token,
@@ -174,7 +173,6 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                 workspace_size = cutlass_mla_get_workspace_size(
                     max_seqlen_pad * PAGE_SIZE, bs
                 )
-                print(f"hack init_forward_metadata_capture_cuda_graph ({workspace_size=})")
                 # self.cuda_graph_mla_workspace = torch.empty(
                 #     workspace_size, device="cuda", dtype=torch.uint8
                 # )
@@ -211,7 +209,6 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
             seq_lens_cpu = seq_lens_cpu[:bs]
             max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
 
-            print("hi hack reset cuda_graph_kv_indices")
             self.cuda_graph_kv_indices[...] = -1
 
             create_flashmla_kv_indices_triton[(bs,)](
@@ -224,7 +221,6 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                 self.cuda_graph_kv_indices.stride(0),
                 PAGE_SIZE,
             )
-            print("hack init_forward_metadata_replay_cuda_graph remove some")
         else:
             super().init_forward_metadata_replay_cuda_graph(
                 bs,
