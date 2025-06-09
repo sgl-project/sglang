@@ -28,7 +28,11 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 
 import torch
 
-from sglang.srt.managers.mm_utils import TensorTransportMode, deserialize_tensors, serialize_tensors
+from sglang.srt.managers.mm_utils import (
+    TensorTransportMode,
+    deserialize_tensors,
+    serialize_tensors,
+)
 from sglang.srt.mm_utils import has_valid_data
 from sglang.utils import info_once
 
