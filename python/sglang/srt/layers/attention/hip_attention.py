@@ -9,6 +9,7 @@ https://arxiv.org/pdf/2406.09827
 import logging
 from typing import TYPE_CHECKING, Optional, Union
 
+import time
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -70,6 +71,8 @@ class HiPAttentionBackend(AttentionBackend):
         self.flashattention_backend = FlashAttentionBackend(
             model_runner=model_runner
         )
+        
+        self._last_tick = 0
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.flashattention_backend.init_forward_metadata(
@@ -263,8 +266,10 @@ class HiPAttentionBackend(AttentionBackend):
             end_event.synchronize()
 
             elapsed = start_event.elapsed_time(end_event)
+            elapsed_layer = (time.time() - self._last_tick) * 1000
+            self._last_tick = time.time()
             capture.report()
-            print(f'[hip] layer {layer.layer_id} took {elapsed:.2f} ms')
+            print(f'[hip] layer {layer.layer_id} took {elapsed:.2f} ms (layer: {elapsed_layer:.2f} ms)')
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
