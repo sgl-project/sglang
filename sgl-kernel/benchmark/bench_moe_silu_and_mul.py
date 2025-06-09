@@ -1,17 +1,21 @@
+import itertools
+
 import torch
 import triton
 from sgl_kernel import ep_moe_silu_and_mul
 
 from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_triton_kernel
 
-batch_sizes = [64, 128, 256, 512, 640, 768, 1024, 2048, 4096]
-configs = [(bs,) for bs in batch_sizes]
+batch_size_range = [64, 128, 256, 512, 640, 768, 1024, 2048, 4096]
+hidden_size_range = [1024, 2048, 4096, 8192]
+block_size_range = [128, 256, 512]
+configs = list(itertools.product(batch_size_range, hidden_size_range, block_size_range))
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["batch_size"],
-        x_vals=[list(_) for _ in configs],
+        x_names=["batch_size", "hidden_size", "block_size"],
+        x_vals=[list(cfg) for cfg in configs],
         line_arg="provider",
         line_vals=["cuda", "triton"],
         line_names=["CUDA Kernel", "Triton Kernel"],
@@ -21,12 +25,10 @@ configs = [(bs,) for bs in batch_sizes]
         args={},
     )
 )
-def benchmark(batch_size, provider):
+def benchmark(batch_size, hidden_size, block_size, provider):
     dtype = torch.bfloat16
     device = torch.device("cuda")
-    hidden_size, topk, start_expert_id, end_expert_id, block_size = 4096, 8, 0, 255, 512
 
-    hidden_size = 4096
     half_hidden_size = hidden_size // 2
     start_expert_id, end_expert_id = 0, 255
     block_size = 512

@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 
 #include <THC/THCAtomics.cuh>
+#include <algorithm>
 #include <flashinfer/vec_dtypes.cuh>
 
 #include "utils.h"
@@ -74,9 +75,13 @@ __global__ void ep_moe_act_and_mul_cuda_kernel(
     out_vec.store(dst_ptr + idx * vec_size);
   }
 
-#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
-#endif
+  const int64_t scalar_start = static_cast<int64_t>(vec_elements) * vec_size + thread_idx;
+#pragma unroll 1
+  for (int64_t idx = scalar_start; idx < half_hidden_size; idx += stride) {
+    float gate_f = static_cast<float>(gate_output_ptr[idx]);
+    scalar_t gate_q = silu_quantize<scalar_t>(gate_f);
+    dst_ptr[idx] = gate_q * up_output_ptr[idx] * scale_q;
+  }
 }
 
 void ep_moe_silu_and_mul(
@@ -88,12 +93,15 @@ void ep_moe_silu_and_mul(
     int64_t end_expert_id) {
   const int total_tokens = gateup_output.size(0);
   const int hidden_size = gateup_output.size(1);
-  TORCH_CHECK(hidden_size % 2 == 0, "hidden_size must be even.");
-  constexpr int BLOCK_SIZE = 512;
-  dim3 grid(total_tokens);
-  dim3 block(BLOCK_SIZE);
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(gateup_output.scalar_type(), scalar_t, [&] {
+    dim3 grid(total_tokens);
+    constexpr uint32_t vec_size = 16 / sizeof(scalar_t);
+    const int half_hidden_size = hidden_size >> 1;
+    uint32_t threads = (half_hidden_size + vec_size - 1) / vec_size;
+    threads = std::max<uint32_t>(threads, 256);
+    threads = ((threads + 31) & ~31U);
+    dim3 block(std::min(threads, 1024U));
     ep_moe_act_and_mul_cuda_kernel<scalar_t><<<grid, block>>>(
         static_cast<scalar_t*>(gateup_output.data_ptr()),
         static_cast<scalar_t*>(down_input.data_ptr()),

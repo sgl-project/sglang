@@ -78,16 +78,6 @@ def run_triton_kernel(
     return down_input
 
 
-def assert_close(a: torch.Tensor, b: torch.Tensor):
-    a32, b32 = a.float(), b.float()
-    if a.dtype is torch.float16:
-        torch.testing.assert_close(a32, b32, rtol=1e-5, atol=1e-5)
-    elif a.dtype is torch.bfloat16:
-        torch.testing.assert_close(a32, b32, rtol=1e-5, atol=1e-5)
-    else:
-        torch.testing.assert_close(a32, b32, rtol=1e-5, atol=1e-5)
-
-
 @pytest.mark.parametrize(
     "total_tokens,hidden_size",
     list(itertools.product([32, 256, 1024], [128, 256, 512])),
@@ -140,7 +130,12 @@ def test_ep_moe_silu_and_mul_vs_triton(
         hidden_size,
     )
 
-    assert_close(cuda_output, triton_output)
+    torch.testing.assert_close(
+        cuda_output,
+        triton_output,
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 if __name__ == "__main__":
