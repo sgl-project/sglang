@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.layers.attention.triton_ops.flex_prefill_attention import flex_prefill_attention
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -18,7 +19,7 @@ if TYPE_CHECKING:
 
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-
+from sglang.srt.utils import get_bool_env_var
 
 @dataclass
 class FlashAttentionMetadata:
@@ -646,7 +647,23 @@ class FlashAttentionBackend(AttentionBackend):
                         k,
                         k_rope,
                     )
+        if get_bool_env_var('SGL_USE_FLEXPREFILL'):
 
+            out = flex_prefill_attention(
+                q.view(forward_batch.batch_size, -1, layer.tp_q_head_num, layer.head_dim),
+                k.view(forward_batch.batch_size, -1, layer.tp_k_head_num, layer.head_dim),
+                v.view(forward_batch.batch_size, -1, layer.tp_v_head_num, layer.head_dim),
+                gamma=0.9,
+                tau=0.1,
+                min_budget=1024,
+                max_budget=None,
+                gqa_interleave=False,
+                block_size=128,
+                return_computational_ratio=False
+            )
+
+            return out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
 
