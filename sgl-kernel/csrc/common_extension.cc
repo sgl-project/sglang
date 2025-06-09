@@ -38,6 +38,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
   m.impl("all_reduce", torch::kCUDA, &all_reduce);
+
+  m.def("mscclpp_generate_unique_id", &mscclpp_generate_unique_id);
+  m.def(
+      "mscclpp_init_context(Tensor unique_id, int rank, int world_size, Tensor scratch, Tensor put_buffer, "
+      "int nranks_per_node, int[] rank_to_node, int[] rank_to_ib, int context_selection) -> int");
+  m.impl("mscclpp_init_context", torch::kCUDA, &mscclpp_init_context);
+
+  m.def("mscclpp_allreduce(int context, Tensor inp, Tensor! out, int nthreads, int nblocks) -> ()");
+  m.impl("mscclpp_allreduce", torch::kCUDA, &mscclpp_allreduce);
   /*
    * From csrc/attention
    */
@@ -161,13 +170,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
-      "n_share_experts_fusion, float routed_scaling_factor) -> "
+      "num_fused_shared_experts, float routed_scaling_factor) -> "
       "(Tensor[])");
   m.impl("moe_fused_gate", torch::kCUDA, &moe_fused_gate);
   m.def(
-      "ep_moe_pre_reorder(Tensor input_ptr, Tensor gateup_input_ptr, Tensor src2dst_ptr, Tensor topk_ids_ptr, Tensor "
-      "a1_scales_ptr, int start_expert_id, int end_expert_id, int topk, bool use_per_token_if_dynamic) -> ()");
+      "ep_moe_pre_reorder(Tensor input, Tensor gateup_input, Tensor src2dst, Tensor topk_ids, Tensor "
+      "a1_scales, int start_expert_id, int end_expert_id, int topk, bool use_per_token_if_dynamic) -> ()");
   m.impl("ep_moe_pre_reorder", torch::kCUDA, &ep_moe_pre_reorder);
+  m.def(
+      "ep_moe_post_reorder(Tensor down_output, Tensor output, Tensor src2dst, Tensor topk_ids, Tensor "
+      "topk_weights, int start_expert_id, int end_expert_id, int topk) -> ()");
+  m.impl("ep_moe_post_reorder", torch::kCUDA, &ep_moe_post_reorder);
   m.def(
       "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a_ptrs, Tensor b_ptrs, Tensor out_ptrs, Tensor "
       "a_scales_ptrs, Tensor b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
@@ -182,7 +195,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("shuffle_rows(Tensor input, Tensor dst2src_map, Tensor output) -> ()");
   m.impl("shuffle_rows", torch::kCUDA, &shuffle_rows);
-
+  m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
+  m.impl("apply_shuffle_mul_sum", torch::kCUDA, &apply_shuffle_mul_sum);
   /*
    * From csrc/speculative
    */
