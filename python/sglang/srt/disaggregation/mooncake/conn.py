@@ -191,7 +191,7 @@ class MooncakeKVManager(BaseKVManager):
             self.heartbeat_failures = {}
             self.session_pool = defaultdict(requests.Session)
             self.session_pool_lock = threading.Lock()
-            self.addr_to_rooms_tracker = defaultdict(list)
+            self.addr_to_rooms_tracker = defaultdict(set)
             self.connection_lock = threading.Lock()
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
@@ -504,12 +504,14 @@ class MooncakeKVManager(BaseKVManager):
                         if response.status_code == 200:
                             self.heartbeat_failures[bootstrap_addr] = 0
 
-                            for bootstrap_room in self.addr_to_rooms_tracker[
+                            current_rooms = self.addr_to_rooms_tracker[
                                 bootstrap_addr
-                            ]:
-                                # Remove KVPoll.Success requests from the map
+                            ].copy()
+
+                            for bootstrap_room in current_rooms:
+                                # Remove KVPoll.Success requests from the tracker
                                 if bootstrap_room not in self.request_status:
-                                    self.addr_to_rooms_tracker[bootstrap_addr].remove(
+                                    self.addr_to_rooms_tracker[bootstrap_addr].discard(
                                         bootstrap_room
                                     )
                         else:
@@ -560,6 +562,12 @@ class MooncakeKVManager(BaseKVManager):
             )
             return
 
+        if bootstrap_room not in self.transfer_infos:
+            # This means that the current rank is a dummy rank for this request,
+            # and it has already been marked as success, so there is no need to
+            # add further chunks into the transfer queue.
+            return
+
         # NOTE(shangming): sharding according to the dst_infos to make sure
         # requests with the same dst_sessions will be added into the same
         # queue, which enables early abort with failed sessions.
@@ -576,7 +584,6 @@ class MooncakeKVManager(BaseKVManager):
                 prefill_aux_index=aux_index,
             )
         )
-        self.update_status(bootstrap_room, KVPoll.WaitingForInput)
 
     def check_status(self, bootstrap_room: int):
         return self.request_status[bootstrap_room]
@@ -677,14 +684,15 @@ class MooncakeKVSender(BaseKVSender):
         self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
         self.aux_index = None
         self.bootstrap_server_url = bootstrap_addr
-        self.init_time = time.time()
         self.conclude_state = None
+        self.init_time = None
         # inner state
         self.curr_idx = 0
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices
         self.aux_index = aux_index
+        self.init_time = time.time()
 
     def send(
         self,
@@ -713,15 +721,16 @@ class MooncakeKVSender(BaseKVSender):
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
             elif status == KVPoll.Bootstrapping:
-                now = time.time()
-                elapsed = now - self.init_time
-                if elapsed >= self.kv_mgr.bootstrap_time_out:
-                    self.kv_mgr.record_failure(
-                        self.bootstrap_room,
-                        f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.Bootstrapping",
-                    )
-                    self.conclude_state = KVPoll.Failed
-                    return KVPoll.Failed
+                if self.init_time is not None:
+                    now = time.time()
+                    elapsed = now - self.init_time
+                    if elapsed >= self.kv_mgr.bootstrap_time_out:
+                        self.kv_mgr.record_failure(
+                            self.bootstrap_room,
+                            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.Bootstrapping",
+                        )
+                        self.conclude_state = KVPoll.Failed
+                        return KVPoll.Failed
 
             return status
         else:
@@ -877,9 +886,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
         assert len(self.bootstrap_infos) > 0
-        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].append(
-            self.bootstrap_room
-        )
+        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def _get_bootstrap_info_from_server(self, engine_rank, target_dp_group):

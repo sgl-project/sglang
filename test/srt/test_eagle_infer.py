@@ -19,9 +19,11 @@ from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
     run_logprob_check,
 )
@@ -577,6 +579,7 @@ class TestEAGLEServerTriton(TestEAGLEServer):
         )
 
 
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestEAGLEDraftExtend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -602,12 +605,16 @@ class TestEAGLEDraftExtend(CustomTestCase):
                 "fa3",
             ],
         )
+        cls.accept_len_threshold = 1.50
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
     def test_one_batch_accept_length(self):
+        resp = requests.get(self.base_url + "/flush_cache")
+        self.assertEqual(resp.status_code, 200)
+
         prompts = [
             "Hello, my name is",
             "The president of the United States is",
@@ -636,7 +643,91 @@ class TestEAGLEDraftExtend(CustomTestCase):
                 acc_length = 1.0
 
             print(f"{acc_length=}")
-            self.assertGreater(acc_length, 1.50)
+            self.assertGreater(acc_length, self.accept_len_threshold)
+
+
+class TestEAGLEDraftExtendFlashinfer(TestEAGLEDraftExtend):
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-draft-model-path",
+                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                "--speculative-num-steps",
+                1,
+                "--speculative-eagle-topk",
+                1,
+                "--speculative-num-draft-tokens",
+                2,
+                "--max-running-requests",
+                4,
+                "--attention-backend",
+                "flashinfer",
+            ],
+        )
+        cls.accept_len_threshold = 1.50
+
+
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
+class TestEAGLEDraftExtendTriton(TestEAGLEDraftExtend):
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-draft-model-path",
+                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+                "--speculative-num-steps",
+                1,
+                "--speculative-eagle-topk",
+                1,
+                "--speculative-num-draft-tokens",
+                2,
+                "--max-running-requests",
+                4,
+                "--attention-backend",
+                "triton",
+            ],
+        )
+        cls.accept_len_threshold = 1.50
+
+
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
+class TestEAGLEDraftExtendFlashinferMLA(TestEAGLEDraftExtend):
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            DEFAULT_MODEL_NAME_FOR_TEST_MLA,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                1,
+                "--speculative-eagle-topk",
+                1,
+                "--speculative-num-draft-tokens",
+                2,
+                "--max-running-requests",
+                4,
+                "--attention-backend",
+                "flashinfer",
+            ],
+        )
+        cls.accept_len_threshold = 1.85
 
 
 if __name__ == "__main__":
