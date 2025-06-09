@@ -27,7 +27,6 @@ from tqdm import tqdm
 class EvalArgs:
     seed: int = 42
     split: str = "validation"
-    # Default setting to make the benchmark available on A100 for most 7B models
     image_pixels_limit: int = -1
     result_filename: str = ""
     prompt_format_file: str = "prompt_format.yaml"
