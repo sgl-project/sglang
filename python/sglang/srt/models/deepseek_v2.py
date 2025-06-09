@@ -102,6 +102,8 @@ from sglang.srt.utils import (
     log_info_on_rank0,
 )
 
+import vTensor
+
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -125,6 +127,25 @@ if _use_aiter:
     from aiter.rotary_embedding import get_rope
 
 logger = logging.getLogger(__name__)
+
+
+class PrefetchStreamManager:
+    _stream_odd = None
+    _stream_even = None
+
+    @classmethod
+    def initialize_stream(cls):
+        assert cls._stream_odd is None
+        assert cls._stream_even is None
+        cls._stream_odd = torch.cuda.Stream()
+        cls._stream_even = torch.cuda.Stream()
+        return cls._stream_odd, cls._stream_even
+
+    @classmethod
+    def get_stream(cls):
+        assert cls._stream_odd is not None
+        assert cls._stream_even is not None
+        return cls._stream_odd, cls._stream_even
 
 
 class AttnForwardMethod(IntEnum):
@@ -577,11 +598,13 @@ class DeepseekV2AttentionMLA(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         layer_id: int = None,
+        vtensor_enable: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
+        self.vtensor_enable = vtensor_enable
         self.hidden_size = hidden_size
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -655,6 +678,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             prefix=add_prefix("o_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
+            vtensor_enable=self.layer_id and self.vtensor_enable,
+            layer_id=self.layer_id,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
@@ -1379,6 +1404,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
+        vtensor_enable: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         is_nextn: bool = False,
         prefix: str = "",
@@ -1392,6 +1418,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
         self.layer_id = layer_id
+        self.vtensor_enable = vtensor_enable
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
             hidden_size=self.hidden_size,
@@ -1408,6 +1435,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             layer_id=layer_id,
+            vtensor_enable = self.vtensor_enable,
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
@@ -1470,6 +1498,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
+        event_fwd: Optional[torch.cuda.Event] = None
     ) -> torch.Tensor:
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
@@ -1481,6 +1510,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
+
+        if event_fwd is not None:
+            event_fwd.record()
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -1578,6 +1610,7 @@ class DeepseekV2Model(nn.Module):
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
+        self.vtensor_enable = global_server_args_dict["vtensor_enable"]
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -1590,6 +1623,7 @@ class DeepseekV2Model(nn.Module):
                 DeepseekV2DecoderLayer(
                     config,
                     layer_id,
+                    self.vtensor_enable,
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_id}", prefix),
                     alt_stream=self.alt_stream,
@@ -1631,12 +1665,31 @@ class DeepseekV2Model(nn.Module):
             if forward_batch.can_run_tbo
             else total_num_layers
         )
-        for i in range(normal_num_layers):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual, zero_allocator
-                )
+        if self.vtensor_enable:
+            _stream_odd, _stream_even = PrefetchStreamManager.get_stream()
+            self.layers[1].self_attn.o_proj.prefetch_all_gather(_stream_odd)
+            for i in range(normal_num_layers):
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    layer = self.layers[i]
+                    if i < normal_num_layers - 2:
+                        hidden_states, residual = layer(
+                            positions, hidden_states, forward_batch, residual, zero_allocator, self.layers[i + 2].self_attn.o_proj.event_fwd
+                        )
+                        if i % 2 == 0:
+                            self.layers[i + 2].self_attn.o_proj.prefetch_all_gather(_stream_even)
+                        else:
+                            self.layers[i + 2].self_attn.o_proj.prefetch_all_gather(_stream_odd)
+                    else:
+                        hidden_states, residual = layer(
+                            positions, hidden_states, forward_batch, residual, zero_allocator
+                        )
+        else:
+            for i in range(normal_num_layers):
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    layer = self.layers[i]
+                    hidden_states, residual = layer(
+                        positions, hidden_states, forward_batch, residual, zero_allocator
+                    )
 
         if normal_num_layers != total_num_layers:
             hidden_states, residual = model_forward_maybe_tbo(
@@ -1673,6 +1726,17 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
+        if global_server_args_dict["vtensor_enable"]:
+            world_size = self.tp_size
+            assert world_size > 1, "tensor parallel size must be greater than 1"
+            if world_size > 8:
+                world_size = 8
+            weight_type_size = 2
+            if quant_config is not None and quant_config.is_checkpoint_fp8_serialized:
+                weight_type_size = 1
+            numel_size = config.num_attention_heads * config.v_head_dim * config.hidden_size // world_size
+            vTensor.init_shared_phy_blocks(world_size - 1, numel_size * weight_type_size)
+            vTensor.init_unique_phy_blocks(config.num_hidden_layers, numel_size * weight_type_size)
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )

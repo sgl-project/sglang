@@ -258,6 +258,12 @@ class CudaGraphRunner:
                     ),
                 }
 
+            # vtensor support
+            self.vtensor_enable = global_server_args_dict["vtensor_enable"]
+            if self.vtensor_enable:
+                from sglang.srt.models.deepseek_v2 import PrefetchStreamManager
+                self._stream_odd, self._stream_even = PrefetchStreamManager.initialize_stream()
+
             # Speculative_inference
             if (
                 model_runner.spec_algorithm.is_eagle3()
@@ -514,8 +520,16 @@ class CudaGraphRunner:
             run_once()
 
         global global_graph_memory_pool
-        with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=stream):
-            out = run_once()
+        if self.vtensor_enable:
+            with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=stream):
+                self._stream_odd.wait_stream(stream)
+                self._stream_even.wait_stream(stream)
+                out = run_once()
+                stream.wait_stream(self._stream_odd)
+                stream.wait_stream(self._stream_even)
+        else:
+            with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=stream):
+                out = run_once()
 
         global_graph_memory_pool = graph.pool()
         return graph, out

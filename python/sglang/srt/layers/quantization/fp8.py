@@ -219,6 +219,7 @@ class Fp8LinearMethod(LinearMethodBase):
         input_size: int,
         output_size: int,
         params_dtype: torch.dtype,
+        vtensor_weight: torch.Tensor = None,
         **extra_weight_attrs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
@@ -263,9 +264,7 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
         weight = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition, input_size_per_partition, dtype=weight_dtype
-            ),
+            data=vtensor_weight if vtensor_weight is not None else torch.empty(output_size_per_partition, input_size_per_partition, dtype=weight_dtype),
             input_dim=1,
             output_dim=0,
             weight_loader=weight_loader,

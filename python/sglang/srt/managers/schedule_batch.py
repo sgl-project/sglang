@@ -96,6 +96,8 @@ global_server_args_dict = {
     "torchao_config": ServerArgs.torchao_config,
     "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
     "ep_num_redundant_experts": ServerArgs.ep_num_redundant_experts,
+    "vtensor_enable": ServerArgs.vtensor_enable,
+    "vtensor_port": ServerArgs.vtensor_port,
 }
 
 logger = logging.getLogger(__name__)

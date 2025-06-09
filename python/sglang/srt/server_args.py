@@ -213,6 +213,8 @@ class ServerArgs:
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     mm_attention_backend: Optional[str] = None
+    vtensor_enable: bool = False
+    vtensor_port: int = 10000
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -671,7 +673,6 @@ class ServerArgs:
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
         )
-
         # Memory and scheduling
         parser.add_argument(
             "--mem-fraction-static",
@@ -1484,6 +1485,19 @@ class ServerArgs:
             choices=["sdpa", "fa3", "triton_attn"],
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
+        )
+
+        parser.add_argument(
+            "--vtensor-enable",
+            action="store_true",
+            help="Enable vtensor to optimize attention weight",
+        )
+
+        parser.add_argument(
+            "--vtensor-port",
+            type=int,
+            default=10000,
+            help="Port used for vtensor communication. Default is 10000.",
         )
 
     @classmethod
