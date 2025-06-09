@@ -14,7 +14,7 @@ from sglang.test.test_utils import CustomTestCase
 
 convert_weight_packed = torch.ops.sgl_kernel.convert_weight_packed
 qkv_proj_with_rope = torch.ops.sgl_kernel.qkv_proj_with_rope
-fused_qkv_proj_with_rope = torch.ops.sgl_kernel.fused_qkv_proj_with_rope
+qkv_proj_with_rope_fused_weight = torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight
 torch.manual_seed(0)
 # constants
 kv_lora_rank = 512
@@ -190,7 +190,7 @@ class TestQKVProjWithROPE(CustomTestCase):
             True,
             None,
         )
-        fused_q_out, fused_k_out, fused_v_out = fused_qkv_proj_with_rope(
+        fused_q_out, fused_k_out, fused_v_out = qkv_proj_with_rope_fused_weight(
             hidden_states,
             fused_weight_packed,
             qb_packed,
@@ -281,7 +281,7 @@ class TestQKVProjWithROPE(CustomTestCase):
         fused_weight = torch.cat([w1_q, w3_q], dim=0)
         fused_weight_s = torch.cat([w1_s, w3_s], dim=0)
         w_fused_q_packed = convert_weight_packed(fused_weight)
-        fused_q_out, fused_k_out, fused_v_out = fused_qkv_proj_with_rope(
+        fused_q_out, fused_k_out, fused_v_out = qkv_proj_with_rope_fused_weight(
             hidden_states,
             w_fused_q_packed,
             w2_q_packed,
@@ -396,7 +396,7 @@ class TestQKVProjWithROPE(CustomTestCase):
             [q_a_proj_weight_scale_inv, kv_a_proj_with_mqa_weight_scale_inv], dim=0
         )
         fused_weight_packed = convert_weight_packed(fused_weight)
-        fused_q_out, fused_k_out, fused_v_out = fused_qkv_proj_with_rope(
+        fused_q_out, fused_k_out, fused_v_out = qkv_proj_with_rope_fused_weight(
             hidden_states,
             fused_weight_packed,
             fp8_q_b_proj_weight_packed,

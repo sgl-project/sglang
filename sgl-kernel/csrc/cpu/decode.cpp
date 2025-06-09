@@ -1448,7 +1448,7 @@ void decode_attention_cpu(
   // check if we have MLA here
   void* k_buffer_data = k_buffer.data_ptr();
   void* v_buffer_data = v_buffer.data_ptr();
-  const bool is_mla = (k_buffer_data == v_buffer_data) && (num_heads_kv == 1);
+  const bool is_mla = (k_buffer_data == v_buffer_data) && (num_heads_kv == 1) && (head_size == head_size_v + 64);
 
   // block length for k_buffer and v_buffer
   constexpr int BLOCK_N = 256;
