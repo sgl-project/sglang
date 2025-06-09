@@ -28,7 +28,7 @@ class EvalArgs:
     seed: int = 42
     split: str = "validation"
     # Default setting to make the benchmark available on A100 for most 7B models
-    image_pixels_limit: int = 4300000
+    image_pixels_limit: int = -1
     result_filename: str = ""
     prompt_format_file: str = "prompt_format.yaml"
     dataset_path: str = "MMMU/MMMU"
@@ -192,6 +192,8 @@ def prepare_samples(eval_args: EvalArgs):
                 skip_count += 1
             elif sample:
                 samples.append(sample)
+
+    samples.sort(key=lambda x: x["final_input_prompt"])
 
     print(
         f"Skipping {skip_count} samples with large images, {round((float(skip_count) / len(dataset)) * 100, 2)}% of dataset"
