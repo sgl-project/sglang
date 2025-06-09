@@ -4,7 +4,7 @@ Multi-modality utils
 
 import hashlib
 from abc import abstractmethod
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Literal, Any, Dict
 
 import numpy as np
 import torch
@@ -26,6 +26,134 @@ from sglang.utils import logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
 # propagation that can cause some log messages (like 'server is fired up') to not appear
 # in the console when multimodal support is enabled.
+
+# TODO(mick): nccl
+# cuda_ipc: for multiprocessing within the same machine
+
+TensorTransportMode = Literal["cuda_ipc", "auto"]
+
+# applied for tensor sent from TokenizerManager -> Scheduler
+global_tensor_ipc_mode: Optional[TensorTransportMode] = None
+
+
+def serialize_tensors(
+    data: Dict[str, Any], mode: TensorTransportMode
+) -> Dict[str, Any]:
+    """
+    Serializes CUDA tensors within a dictionary based on the specified mode.
+
+    Args:
+        data: The dictionary possibly containing CUDA tensors (e.g., mm_inputs).
+    """
+
+    def _serialize_tensor_recursive(data: Any, mode: TensorTransportMode) -> Any:
+        """Recursively processes data to serialize tensors based on mode."""
+        # print(f"serialize {data=}")
+        if isinstance(data, dict):
+            if "mm_items" in data:
+                data["mm_items"] = _serialize_tensor_recursive(data["mm_items"], mode)
+            return data
+        elif isinstance(data, list):
+            for item in data:
+                assert isinstance(item, MultimodalDataItem)
+            return [_serialize_tensor_recursive(item, mode) for item in data]
+        elif isinstance(data, MultimodalDataItem):
+            data.feature = _serialize_tensor_recursive(data.feature, mode)
+            return data
+        elif isinstance(data, torch.Tensor) and data.is_cuda:
+            if mode == "cuda_ipc":
+                try:
+                    storage = data.untyped_storage()
+                    handle = (
+                        storage._share_cuda_()
+                    )
+                    return (
+                        "cuda_ipc",
+                        handle,
+                        data.shape,
+                        data.dtype,
+                        data.stride(),
+                        data.device.index,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Failed to get CUDA IPC handle for tensor: {e}. Falling back to copy.",
+                        exc_info=True,
+                    )
+                    # Fallback to CPU copy if IPC fails
+                    return data.cpu()
+            else:  # mode == 'copy' or fallback
+                # Default: move to CPU for standard pickling
+                return data.cpu()
+        else:
+            # Keep non-CUDA tensors or other data types as is
+            return data
+
+    if mode == "auto" or data is None:
+        return data
+    if not isinstance(data, dict):
+        logger.warning(
+            "serialize_tensors expected a dict, but got %s. Returning original.",
+            type(data),
+        )
+        return data
+    return _serialize_tensor_recursive(data, mode)
+
+
+def deserialize_tensors(
+    data: Dict[str, Any], mode: TensorTransportMode
+) -> Dict[str, Any]:
+    """
+    Deserializes tensors within a dictionary based on the specified mode.
+
+    Args:
+        data: The dictionary received, possibly containing serialized tensor representations.
+        mode: The transport mode ('cuda_ipc', 'nccl', 'copy').
+
+    Returns:
+        A new dictionary with tensor representations replaced by actual tensors (or placeholders for NCCL).
+    """
+
+    def _deserialize_tensor_recursive(data: Any, mode: TensorTransportMode) -> Any:
+        """Recursively processes data to deserialize tensors based on mode."""
+        if isinstance(data, dict):
+            assert "mm_items" in data
+            data["mm_items"] = _deserialize_tensor_recursive(data["mm_items"], mode)
+            return data
+        elif isinstance(data, list):
+            return [_deserialize_tensor_recursive(item, mode) for item in data]
+        elif isinstance(data, MultimodalDataItem):
+            data.feature = _deserialize_tensor_recursive(data.feature, mode)
+            return data
+        elif isinstance(data, tuple) and len(data) > 1:
+            marker = data[0]
+            if marker == "cuda_ipc" and mode == "cuda_ipc":
+                # ('cuda_ipc', handle, shape, dtype, stride, device_index)
+                handle, shape, dtype, stride, device_index = data[1:]
+                try:
+                    # Ensure the current process is on the correct device context
+                    current_device = torch.device(f"cuda:{device_index}")
+                    with torch.cuda.device(current_device):
+                        storage = torch.UntypedStorage._new_shared_cuda(*handle)
+                        tensor = torch.empty(0, dtype=dtype, device=current_device).set_(
+                            storage, offset=0, size=shape, stride=stride
+                        )
+                        expected_numel = torch.Size(shape).numel()
+                        if tensor.numel() != expected_numel:
+                            # Potentially raise error or return None depending on strictness needed
+                            return None
+                        return tensor
+                except Exception as e:
+                    return None  # Indicate failure
+            else:
+                return data
+        else:
+            # Keep CPU tensors or other data types as is
+            return data
+
+    if not isinstance(data, dict):
+        return data
+    return _deserialize_tensor_recursive(data, mode)
 
 
 class MultiModalityDataPaddingPattern:
@@ -99,7 +227,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
             return input_ids
 
         for start_idx, end_idx in zip(start_indices, end_indices):
-            padded_ids.extend(input_ids[last_idx : start_idx + 1])
+            padded_ids.extend(input_ids[last_idx: start_idx + 1])
 
             if input_ids[start_idx] in self.data_start_token_ids:
                 data_idx += 1
@@ -253,7 +381,7 @@ def _get_chunked_prefill_embedding(
     for i in range(max_iterations):
         if items_size[i] == items_size[i + 1]:
             continue
-        embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
+        embedding_items_per_req = embedding_items[items_size[i]: items_size[i + 1]]
         items_offset = items_offset_list[i]
         assert items_offset is not None, items_offset
         embedding_items_hash = get_embedding_hash(embedding_items_per_req)

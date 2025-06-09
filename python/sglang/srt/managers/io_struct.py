@@ -27,11 +27,10 @@ from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 import torch
-from torch.distributed import Backend
 
-from sglang.srt.distributed import get_tensor_model_parallel_group
+from sglang.srt.managers.mm_utils import TensorTransportMode, deserialize_tensors, serialize_tensors
 from sglang.srt.mm_utils import has_valid_data
-from sglang.utils import info_once, logger
+from sglang.utils import info_once
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -484,190 +483,6 @@ class GenerateReqInput:
         )
 
 
-TensorTransportMode = Literal["cuda_ipc", "nccl", "copy", "auto"]
-
-
-def _serialize_tensor_recursive(data: Any, mode: TensorTransportMode) -> Any:
-    """Recursively processes data to serialize tensors based on mode."""
-    # print(f"serialize {data=}")
-    if isinstance(data, dict):
-        if "mm_items" in data:
-            data["mm_items"] = _serialize_tensor_recursive(data["mm_items"], mode)
-        return data
-        new_dict = {}
-        for k, v in data.items():
-            new_dict[k] = _serialize_tensor_recursive(v, mode)
-        return new_dict
-    elif isinstance(data, list):
-        for item in data:
-            assert isinstance(item, MultimodalDataItem)
-        return [_serialize_tensor_recursive(item, mode) for item in data]
-    elif isinstance(data, MultimodalDataItem):
-        data.feature = _serialize_tensor_recursive(data.feature, mode)
-        return data
-    #     return [_serialize_tensor_recursive(item, mode) for item in data]
-    elif isinstance(data, torch.Tensor) and data.is_cuda:
-        if mode == "cuda_ipc":
-            try:
-                # Note: _share_cuda_() might have limitations depending on the PyTorch version and context.
-                # It's generally used for multiprocessing within the same machine.
-                storage = data.untyped_storage()
-                handle = (
-                    storage._share_cuda_()
-                )  # Returns (manager_handle, storage_handle, size_bytes)
-                # Store handle, shape, dtype, stride, and device index
-                # print(f"{mode=}")
-                return (
-                    "cuda_ipc",
-                    handle,
-                    data.shape,
-                    data.dtype,
-                    data.stride(),
-                    data.device.index,
-                )
-            except Exception as e:
-                print(f"{mode=} failed")
-
-                logger.error(
-                    f"Failed to get CUDA IPC handle for tensor: {e}. Falling back to copy.",
-                    exc_info=True,
-                )
-                # Fallback to CPU copy if IPC fails
-                return data.cpu()
-        elif mode == "nccl":
-            # For NCCL, we don't serialize the data itself here.
-            # We just mark it as needing NCCL transfer later.
-            # The actual torch.distributed.send/recv will handle the data.
-            # Store shape, dtype, stride, and device index to recreate the tensor structure.
-            return (
-                "nccl_placeholder",
-                data.shape,
-                data.dtype,
-                data.stride(),
-                data.device.index,
-            )
-        else:  # mode == 'copy' or fallback
-            # Default: move to CPU for standard pickling
-            return data.cpu()
-    else:
-        # Keep non-CUDA tensors or other data types as is
-        return data
-
-
-def serialize_tensors(
-    data: Dict[str, Any], mode: TensorTransportMode
-) -> Dict[str, Any]:
-    """
-    Serializes CUDA tensors within a dictionary based on the specified mode.
-
-    Args:
-        data: The dictionary possibly containing CUDA tensors (e.g., mm_inputs).
-        mode: The transport mode ('cuda_ipc', 'nccl', 'copy').
-
-    Returns:
-        A new dictionary with CUDA tensors replaced by serializable representations
-        or placeholders.
-    """
-    # print(f"{data=}")
-    if data is None:
-        return None
-    if not isinstance(data, dict):
-        logger.warning(
-            "serialize_tensors expected a dict, but got %s. Returning original.",
-            type(data),
-        )
-        return data
-    return _serialize_tensor_recursive(data, mode)
-
-
-def _deserialize_tensor_recursive(data: Any, mode: TensorTransportMode) -> Any:
-    """Recursively processes data to deserialize tensors based on mode."""
-    # if isinstance(data, dict):
-    #     new_dict = {}
-    #     for k, v in data.items():
-    #         new_dict[k] = _deserialize_tensor_recursive(v, mode)
-    #     return new_dict
-    # print(f"deserialize {data=}")
-    if isinstance(data, dict):
-        assert "mm_items" in data
-        data["mm_items"] = _deserialize_tensor_recursive(data["mm_items"], mode)
-        return data
-    elif isinstance(data, list):
-        return [_deserialize_tensor_recursive(item, mode) for item in data]
-    elif isinstance(data, MultimodalDataItem):
-        data.feature = _deserialize_tensor_recursive(data.feature, mode)
-        return data
-    elif isinstance(data, tuple) and len(data) > 1:
-        marker = data[0]
-        if marker == "cuda_ipc" and mode == "cuda_ipc":
-            # print(f"cuda_ipc")
-            # ('cuda_ipc', handle, shape, dtype, stride, device_index)
-            handle, shape, dtype, stride, device_index = data[1:]
-            try:
-                # Ensure the current process is on the correct device context
-                current_device = torch.device(f"cuda:{device_index}")
-                with torch.cuda.device(current_device):
-                    storage = torch.UntypedStorage._new_shared_cuda(*handle)
-                    # Create a tensor view into the shared storage
-                    tensor = torch.empty(0, dtype=dtype, device=current_device).set_(
-                        storage, storage_offset=0, size=shape, stride=stride
-                    )
-                    # Check if the storage size matches expected size
-                    expected_numel = torch.Size(shape).numel()
-                    if tensor.numel() != expected_numel:
-                        logger.warning(
-                            f"CUDA IPC Deserialization: Reconstructed tensor element count {tensor.numel()} differs from expected {expected_numel}. Shape: {shape}"
-                        )
-                        # Potentially raise error or return None depending on strictness needed
-                        # return None
-                    return tensor
-            except Exception as e:
-                logger.error(
-                    f"Failed to reconstruct tensor from CUDA IPC handle: {e}. Returning None.",
-                    exc_info=True,
-                )
-                return None  # Indicate failure
-        elif marker == "nccl_placeholder" and mode == "nccl":
-            # ('nccl_placeholder', shape, dtype, stride, device_index)
-            # For NCCL, the actual data is received separately.
-            # Here, we might recreate an empty tensor on the correct device
-            # that will be filled by torch.distributed.recv later.
-            _, shape, dtype, stride, device_index = data
-            target_device = torch.device(f"cuda:{device_index}")
-            # Return the placeholder information, the receiving code will use it
-            # Alternatively, create the empty tensor now:
-            # return torch.empty(shape, dtype=dtype, device=target_device).as_strided(shape, stride)
-            return data  # Keep the placeholder, receiver uses info
-        else:
-            # Not a special tensor tuple, return as is
-            return data
-    else:
-        # Keep CPU tensors or other data types as is
-        return data
-
-
-def deserialize_tensors(
-    data: Dict[str, Any], mode: TensorTransportMode
-) -> Dict[str, Any]:
-    """
-    Deserializes tensors within a dictionary based on the specified mode.
-
-    Args:
-        data: The dictionary received, possibly containing serialized tensor representations.
-        mode: The transport mode ('cuda_ipc', 'nccl', 'copy').
-
-    Returns:
-        A new dictionary with tensor representations replaced by actual tensors (or placeholders for NCCL).
-    """
-    if not isinstance(data, dict):
-        logger.warning(
-            "deserialize_tensors expected a dict, but got %s. Returning original.",
-            type(data),
-        )
-        return data
-    return _deserialize_tensor_recursive(data, mode)
-
-
 global_effective_mode: Optional[TensorTransportMode] = None
 
 
@@ -725,45 +540,32 @@ class TokenizedGenerateReqInput:
         global global_effective_mode
 
         if global_effective_mode is None:
-            # print(f"determining: ")
             if (
                 "mm_inputs" in state
                 and state["mm_inputs"] is not None
                 and self._contains_feature()
             ):
-                # print(f"{self.mm_inputs=}")
                 effective_mode = self._determine_tensor_transport_mode()
-                # print(f"{effective_mode=}")
                 global_effective_mode = effective_mode
                 info_once(f"{global_effective_mode=}")
                 # sends only for the first time
                 state["effective_mode"] = global_effective_mode
 
-        # print(state["mm_inputs"])
-
-        state["mm_inputs"] = serialize_tensors(
-            state["mm_inputs"], global_effective_mode
-        )
-
-        # print(state["mm_inputs"])
-
-        # state["__tensor_transport_mode"] = effective_mode
+        if global_effective_mode is not None:
+            state["mm_inputs"] = serialize_tensors(
+                state["mm_inputs"], global_effective_mode
+            )
 
         return state
 
     def __setstate__(self, state):
-        # transport_mode = state.pop("__tensor_transport_mode", "copy")
         global global_effective_mode
-        # transport_mode = global_effective_mode
         if global_effective_mode is None:
             transport_mode = state.get("effective_mode", None)
             if transport_mode is not None:
                 global_effective_mode = transport_mode
 
-        # print(f"setting state {state=}")
-
         if global_effective_mode is None:
-            print(f"global_effective_mode unset, returning")
             self.__dict__.update(state)
             return
 
@@ -772,9 +574,6 @@ class TokenizedGenerateReqInput:
                 state["mm_inputs"], global_effective_mode
             )
 
-        if global_effective_mode == "nccl":
-            self._postprocess_nccl_tensors(state["mm_inputs"])
-
         self.__dict__.update(state)
 
     def _contains_cuda_feature(self) -> bool:
@@ -782,9 +581,6 @@ class TokenizedGenerateReqInput:
             return False
         for v in self.mm_inputs["mm_items"]:
             if isinstance(v.feature, torch.Tensor) and v.feature.is_cuda:
-                #     print(f"{v.feature=}")
-                #     print(f"{v=}")
-                #     print(f"{v.feature.device=}")
                 return True
         return False
 
@@ -797,62 +593,13 @@ class TokenizedGenerateReqInput:
         return False
 
     def _determine_tensor_transport_mode(self) -> TensorTransportMode:
-
         if self.tensor_transport_mode != "auto":
             return self.tensor_transport_mode
-
-        if self._is_cross_node():
-            return "nccl"
 
         if self._contains_cuda_feature():
             return "cuda_ipc"
 
-        return "copy"
-
-    def _is_cross_node(self):
-        # print(f"_is_cross_node")
-        try:
-            import torch.distributed as dist
-
-            print(f"{dist.get_backend()=}")
-            # from sglang.srt.distributed import get_world_group
-            device_group = get_tensor_model_parallel_group().device_group
-            return dist.get_backend(device_group) == Backend.NCCL
-            # return dist.get_backend() == Backend.NCCL
-        except Exception as e:
-            # FIXME: for rank==0 in tp, the dist is not initialized at this point
-            # print(f"{e=}")
-            # return get_world_group().pynccl_comm is not None
-            # global _TP
-            # return _TP is not None
-            if torch.distributed.is_initialized():
-                print(torch.distributed.get_world_size())
-                return torch.distributed.get_world_size() > 1
-            # return get_backend() == "nccl"
-            return False
-
-    def _postprocess_nccl_tensors(self, mm_inputs):
-        if not mm_inputs:
-            return
-
-        from sglang.srt.distributed import get_tp_group
-
-        for key in list(mm_inputs.keys()):
-            val = mm_inputs[key]
-            if isinstance(val, tuple) and val[0] == "nccl_placeholder":
-                _, shape, dtype, stride, device_idx = val
-
-                recv_tensor = torch.empty(
-                    shape, dtype=dtype, device=torch.device(f"cuda:{device_idx}")
-                )
-
-                torch.distributed.recv(
-                    tensor=recv_tensor,
-                    src=0,
-                    group=get_tp_group(),
-                )
-
-                mm_inputs[key] = recv_tensor
+        return "auto"
 
 
 @dataclass
