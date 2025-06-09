@@ -107,6 +107,7 @@ from sglang.srt.utils import (
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
     set_cuda_arch,
+    set_use_cpu,
 )
 
 _is_hip = is_hip()
@@ -198,6 +199,7 @@ class ModelRunner:
                 "use_mla_backend": self.use_mla_backend,
             }
         )
+        set_use_cpu(global_server_args_dict["device"] == "cpu")
 
         # CPU offload
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))

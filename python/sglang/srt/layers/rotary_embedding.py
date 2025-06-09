@@ -158,7 +158,7 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         positions = torch.add(positions, offsets) if offsets is not None else positions
-        if positions.device == torch.device("cpu") and _is_cpu_amx:
+        if _is_cpu_amx:
             return torch.ops.sgl_kernel.rotary_embedding_cpu(
                 positions,
                 query,
@@ -727,7 +727,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         positions = torch.add(positions, offsets) if offsets is not None else positions
-        if positions.device == torch.device("cpu") and _is_cpu_amx:
+        if _is_cpu_amx:
             return torch.ops.sgl_kernel.rotary_embedding_cpu(
                 positions, query, key, self.head_size, self.cos_sin_cache, False
             )

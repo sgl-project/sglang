@@ -169,6 +169,18 @@ def is_cpu() -> bool:
     )
 
 
+_USE_CPU = False
+
+
+def use_cpu():
+    return _USE_CPU
+
+
+def set_use_cpu(flag: bool):
+    global _USE_CPU
+    _USE_CPU = flag
+
+
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.

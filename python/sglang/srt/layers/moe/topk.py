@@ -28,11 +28,18 @@ from sglang.srt.managers.expert_location_dispatch import (
     topk_ids_logical_to_physical,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import cpu_has_amx_support, get_compiler_backend, is_cuda, is_hip
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_compiler_backend,
+    is_cuda,
+    is_hip,
+    use_cpu,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_cpu_amx = cpu_has_amx_support()
+_use_cpu = use_cpu()
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -344,8 +351,7 @@ def select_experts(
         assert topk_group is not None
         assert num_expert_group is not None
         if correction_bias is None:
-            device = hidden_states.device
-            if device == torch.device("cpu") and _is_cpu_amx:
+            if _use_cpu and _is_cpu_amx:
                 topk_weights, topk_ids = torch.ops.sgl_kernel.grouped_topk_cpu(
                     hidden_states,
                     router_logits,
@@ -368,8 +374,7 @@ def select_experts(
                     expert_location_dispatch_info=expert_location_dispatch_info,
                 )
         else:
-            device = hidden_states.device
-            if device == torch.device("cpu") and _is_cpu_amx:
+            if _use_cpu and _is_cpu_amx:
                 topk_weights, topk_ids = torch.ops.sgl_kernel.biased_grouped_topk_cpu(
                     hidden_states,
                     router_logits,
@@ -398,8 +403,7 @@ def select_experts(
             num_token_non_padded is None
         ), "num_token_non_padded is not yet supported in fused_topk_native"
         assert expert_location_dispatch_info is None
-        device = hidden_states.device
-        if device == torch.device("cpu") and _is_cpu_amx:
+        if _use_cpu and _is_cpu_amx:
             topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
