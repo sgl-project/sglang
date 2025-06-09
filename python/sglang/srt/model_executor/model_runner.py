@@ -35,6 +35,7 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
+    set_mscclpp_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
@@ -64,7 +65,10 @@ from sglang.srt.managers.expert_location import (
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.schedule_batch import (
+    GLOBAL_SERVER_ARGS_KEYS,
+    global_server_args_dict,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
@@ -77,11 +81,7 @@ from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
-from sglang.srt.model_loader.loader import (
-    DefaultModelLoader,
-    device_loading_context,
-    get_model_loader,
-)
+from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
@@ -91,6 +91,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -191,33 +192,10 @@ class ModelRunner:
 
         # Global vars
         global_server_args_dict.update(
-            {
-                "attention_backend": server_args.attention_backend,
-                "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
-                "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
-                "deepep_mode": server_args.deepep_mode,
-                "device": server_args.device,
-                "disable_chunked_prefix_cache": server_args.disable_chunked_prefix_cache,
-                "disable_radix_cache": server_args.disable_radix_cache,
-                "enable_nan_detection": server_args.enable_nan_detection,
-                "enable_dp_attention": server_args.enable_dp_attention,
-                "enable_two_batch_overlap": server_args.enable_two_batch_overlap,
-                "enable_dp_lm_head": server_args.enable_dp_lm_head,
-                "enable_ep_moe": server_args.enable_ep_moe,
-                "enable_deepep_moe": server_args.enable_deepep_moe,
-                "deepep_config": server_args.deepep_config,
-                "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
-                "moe_dense_tp_size": server_args.moe_dense_tp_size,
-                "ep_dispatch_algorithm": server_args.ep_dispatch_algorithm,
-                "n_share_experts_fusion": server_args.n_share_experts_fusion,
-                "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
-                "torchao_config": server_args.torchao_config,
-                "sampling_backend": server_args.sampling_backend,
-                "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
-                "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
+            {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
+            | {
+                # TODO it is indeed not a "server args"
                 "use_mla_backend": self.use_mla_backend,
-                "mm_attention_backend": server_args.mm_attention_backend,
-                "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
             }
         )
 
@@ -319,6 +297,16 @@ class ModelRunner:
     def model_specific_adjustment(self):
         server_args = self.server_args
 
+        if (
+            server_args.attention_backend == "intel_amx"
+            and server_args.device == "cpu"
+            and not cpu_has_amx_support()
+        ):
+            logger.info(
+                "The current platform does not support Intel AMX, will fallback to torch_native backend."
+            )
+            server_args.attention_backend = "torch_native"
+
         if server_args.attention_backend is None:
             """
             Auto select the fastest attention backend.
@@ -349,6 +337,15 @@ class ModelRunner:
                 # MLA architecture
                 if is_hopper_with_cuda_12_3():
                     server_args.attention_backend = "fa3"
+                elif _is_hip:
+                    head_num = self.model_config.get_num_kv_heads(self.tp_size)
+                    # TODO current aiter only support head number 16 or 128 head number
+                    if (
+                        head_num == 128 or head_num == 16
+                    ) and self.spec_algorithm.is_none():
+                        server_args.attention_backend = "aiter"
+                    else:
+                        server_args.attention_backend = "triton"
                 else:
                     server_args.attention_backend = "triton"
             logger.info(
@@ -357,6 +354,7 @@ class ModelRunner:
         elif self.use_mla_backend:
             if server_args.device != "cpu":
                 if server_args.attention_backend in [
+                    "aiter",
                     "flashinfer",
                     "fa3",
                     "triton",
@@ -371,7 +369,10 @@ class ModelRunner:
                         f"Invalid attention backend for MLA: {server_args.attention_backend}"
                     )
             else:
-                raise ValueError("MLA optimization not supported on CPU.")
+                if server_args.attention_backend != "intel_amx":
+                    raise ValueError(
+                        "MLA optimization not supported on CPU except for intel_amx backend."
+                    )
 
         if (
             server_args.attention_backend == "fa3"
@@ -456,6 +457,7 @@ class ModelRunner:
         else:
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
+        set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
 
         if not self.is_draft_worker:
             # Only initialize the distributed environment on the target model worker.
@@ -605,11 +607,14 @@ class ModelRunner:
             ) from None
 
     def update_expert_location(
-        self, new_expert_location_metadata: ExpertLocationMetadata
+        self,
+        new_expert_location_metadata: ExpertLocationMetadata,
+        update_layer_ids: List[int],
     ):
         self.expert_location_updater.update(
             self.model.routed_experts_weights_of_layer,
             new_expert_location_metadata,
+            update_layer_ids=update_layer_ids,
             nnodes=self.server_args.nnodes,
             rank=self.tp_rank,
         )
@@ -953,7 +958,7 @@ class ModelRunner:
 
         if self.req_to_token_pool is None:
             self.req_to_token_pool = ReqToTokenPool(
-                size=max_num_reqs + 1,
+                size=max_num_reqs,
                 max_context_len=self.model_config.context_len + 4,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
@@ -1080,10 +1085,6 @@ class ModelRunner:
 
             return AiterAttnBackend(self)
         elif self.server_args.attention_backend == "triton":
-            assert self.sliding_window_size is None, (
-                "Window attention is not supported in the triton attention backend. "
-                "Please use `--attention-backend flashinfer`."
-            )
             assert not self.model_config.is_encoder_decoder, (
                 "Cross attention is not supported in the triton attention backend. "
                 "Please use `--attention-backend flashinfer`."
@@ -1126,6 +1127,13 @@ class ModelRunner:
             )
 
             return CutlassMLABackend(self)
+        elif self.server_args.attention_backend == "intel_amx":
+            from sglang.srt.layers.attention.intel_amx_backend import (
+                IntelAMXAttnBackend,
+            )
+
+            logger.info(f"Intel AMX attention backend is enabled.")
+            return IntelAMXAttnBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
@@ -1243,7 +1251,7 @@ class ModelRunner:
             )
 
         if self.eplb_manager is not None:
-            self.eplb_manager.on_forward_pass_end(self.forward_pass_id)
+            self.eplb_manager.on_forward_pass_end()
 
         return output
 
