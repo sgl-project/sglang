@@ -500,6 +500,7 @@ class EAGLEWorker(TpModelWorker):
             )
         else:
             ret = EagleVerifyInput.create_for_idle(
+                self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
             )
@@ -759,6 +760,7 @@ class EAGLEWorker(TpModelWorker):
                 batch.spec_info.prepare_extend_after_decode(
                     batch,
                     self.speculative_num_steps,
+                    self.server_args.context_length,
                     pad_input=self.cuda_graph_runner_for_draft_extend is not None,
                 )
             else:
