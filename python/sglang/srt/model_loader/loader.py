@@ -2,6 +2,7 @@
 
 # ruff: noqa: SIM117
 import collections
+import concurrent
 import dataclasses
 import fnmatch
 import glob
@@ -11,14 +12,17 @@ import math
 import os
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
 
 import huggingface_hub
 import numpy as np
+import safetensors.torch
 import torch
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
@@ -41,6 +45,7 @@ from sglang.srt.model_loader.utils import (
     set_default_torch_dtype,
 )
 from sglang.srt.model_loader.weight_utils import (
+    _BAR_FORMAT,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
@@ -181,6 +186,9 @@ class BaseModelLoader(ABC):
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
+    # default number of thread when enable multithread weight loading
+    DEFAULT_NUM_THREADS = 8
+
     @dataclasses.dataclass
     class Source:
         """A source for weights."""
@@ -208,10 +216,19 @@ class DefaultModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        if load_config.model_loader_extra_config:
+        extra_config = (
+            {}
+            if load_config.model_loader_extra_config is None
+            else load_config.model_loader_extra_config.copy()
+        )
+        allowed_keys = {"enable_multithread_load", "num_threads"}
+        unexpected_keys = set(extra_config.keys()) - allowed_keys
+
+        if unexpected_keys:
             raise ValueError(
-                f"Model loader extra config is not supported for "
-                f"load format {load_config.load_format}"
+                f"Unexpected extra config keys for load format "
+                f"{load_config.load_format}: "
+                f"{unexpected_keys}"
             )
 
     def _maybe_download_from_modelscope(
@@ -364,6 +381,52 @@ class DefaultModelLoader(BaseModelLoader):
             model_config.model_path, model_config.revision, fall_back_to_pt=True
         )
 
+    def multi_thread_load_model_weight(
+        self, extra_config: Dict, hf_weights_files: List[str], use_safetensors: bool
+    ):
+        loaded_weight = []
+        enable_tqdm = (
+            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        )
+
+        def _load_safetensors_weights(st_file):
+            result = safetensors.torch.load_file(st_file, device="cpu")
+            return list(result.items())
+
+        def _load_pt_weights(bin_file):
+            state = torch.load(bin_file, map_location="cpu", weights_only=True)
+            return list(state.items())
+
+        num_threads = extra_config.get("num_threads", self.DEFAULT_NUM_THREADS)
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            future_to_file = {
+                executor.submit(
+                    _load_safetensors_weights if use_safetensors else _load_pt_weights,
+                    st_file,
+                ): st_file
+                for st_file in hf_weights_files
+            }
+
+            for future in tqdm(
+                concurrent.futures.as_completed(future_to_file),
+                total=len(hf_weights_files),
+                desc=(
+                    "Multi-thread loading safetensors checkpoint shards"
+                    if use_safetensors
+                    else "Multi-thread loading pt checkpoint shards"
+                ),
+                disable=not enable_tqdm,
+                bar_format=_BAR_FORMAT,
+            ):
+                try:
+                    items = future.result()
+                    loaded_weight.extend(items)
+                except Exception as exc:
+                    st_file = future_to_file[future]
+                    logger.error(f"{st_file} generated exception: {exc}")
+                    raise
+        return loaded_weight
+
     def load_model(
         self,
         *,
@@ -371,6 +434,7 @@ class DefaultModelLoader(BaseModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
         target_device = torch.device(device_config.device)
+        extra_config = self.load_config.model_loader_extra_config
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(
@@ -378,9 +442,22 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config,
                 )
 
-            self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
-            )
+            if not extra_config.get("enable_multithread_load", False):
+                self.load_weights_and_postprocess(
+                    model, self._get_all_weights(model_config, model), target_device
+                )
+            else:
+                # allow use multithread load model weight
+                hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
+                    model_config.model_path,
+                    model_config.revision,
+                    getattr(model, "fall_back_to_pt_during_load", True),
+                )
+
+                loaded_weight = self.multi_thread_load_model_weight(
+                    extra_config, hf_weights_files, use_safetensors
+                )
+                self.load_weights_and_postprocess(model, loaded_weight, target_device)
 
         return model.eval()
 
