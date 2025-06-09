@@ -207,7 +207,6 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
-        print(f"params_dict keys: {list(params_dict.keys())}")
         # Define the parameter mapping for stacked parameters
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -248,8 +247,6 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-                else:
-                    print(f"Warning: Parameter {param_name} not found in model")
 
     def get_hot_token_id(self):
         return self.hot_token_id
