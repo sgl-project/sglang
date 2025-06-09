@@ -568,7 +568,6 @@ class TokenizedGenerateReqInput:
             transport_mode = state.get("effective_mode", None)
             if transport_mode is not None:
                 global_effective_mode = transport_mode
-
         if global_effective_mode is None:
             self.__dict__.update(state)
             return
