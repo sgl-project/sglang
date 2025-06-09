@@ -544,7 +544,7 @@ def get_dataset(args, tokenizer):
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
             fixed_output_len=args.random_output_len,
-            random_sample=False,
+            random_sample=True,
         )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
@@ -683,8 +683,6 @@ def sample_mmmu_requests(
     except ImportError:
         raise ImportError("Please install datasets: pip install datasets")
 
-    print(f"{fixed_output_len=}")
-
     print("Loading MMMU dataset from HuggingFace...")
 
     try:
@@ -713,8 +711,6 @@ def sample_mmmu_requests(
         sample_dataset = mmmu_dataset
 
     print(f"Selected {len(sample_dataset)} examples for benchmarking")
-
-    # print(f"{sample_dataset=}")
 
     # Create prompts
     filtered_dataset = []
@@ -784,7 +780,6 @@ def sample_mmmu_requests(
         except Exception as e:
             print(f"Error processing example {i}: {e}")
 
-    # print(f"{filtered_dataset=}")
     print(f"\nCreated {len(filtered_dataset)} MMMU prompts")
     return filtered_dataset
 
