@@ -27,8 +27,7 @@ from tqdm import tqdm
 class EvalArgs:
     seed: int = 42
     split: str = "validation"
-    # Default setting to make the benchmark available on A100 for most 7B models
-    image_pixels_limit: int = 4300000
+    image_pixels_limit: int = -1
     result_filename: str = ""
     prompt_format_file: str = "prompt_format.yaml"
     dataset_path: str = "MMMU/MMMU"
@@ -190,7 +189,7 @@ def prepare_samples(eval_args: EvalArgs):
         sample = construct_prompt(sample, eval_args.config)
         image = sample["image"]
         width, height = image.size
-        if width * height >= eval_args.image_pixels_limit:
+        if 0 < eval_args.image_pixels_limit <= width * height:
             return None, True
         # Use a unique identifier for the image path to avoid potential collisions if indices reset
         image_path = f"{images_path}/image_{sample['id']}.png"
@@ -217,6 +216,8 @@ def prepare_samples(eval_args: EvalArgs):
             elif sample:
                 samples.append(sample)
 
+    samples.sort(key=lambda x: x["final_input_prompt"])
+
     print(
         f"Skipping {skip_count} samples with large images, {round((float(skip_count) / len(dataset)) * 100, 2)}% of dataset"
     )
@@ -226,7 +227,7 @@ def prepare_samples(eval_args: EvalArgs):
 
 def get_sampling_params(eval_args):
     max_new_tokens = 30
-    temperature = 0.001
+    temperature = 1e-9
 
     extra_request_body = {}
     if eval_args.extra_request_body:

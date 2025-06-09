@@ -135,14 +135,15 @@ def deserialize_tensors(
                         storage = torch.UntypedStorage._new_shared_cuda(*handle)
                         tensor = torch.empty(
                             0, dtype=dtype, device=current_device
-                        ).set_(storage, offset=0, size=shape, stride=stride)
+                        ).set_(storage, storage_offset=0, size=shape, stride=stride)
                         expected_numel = torch.Size(shape).numel()
                         if tensor.numel() != expected_numel:
+                            raise Exception("tensor.numel() != expected_numel")
                             # Potentially raise error or return None depending on strictness needed
                             return None
                         return tensor
                 except Exception as e:
-                    return None  # Indicate failure
+                    raise e
             else:
                 return data
         else:
