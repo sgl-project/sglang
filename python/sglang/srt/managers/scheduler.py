@@ -2053,9 +2053,22 @@ class Scheduler(
 
         # Sort in reverse order to avoid index issues when deleting
         for i in reversed(to_del):
+            # Abort method 1: directly pop from the queue
+            # This only works for requests that have not started anything.
+            # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
             self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
             logger.debug(f"Abort queued request. {req.rid=}")
+
+        # Delete the requests in the grammar queue
+        for req in self.grammar_queue:
+            # Abort method 2: call `set_finish_with_abort`
+            # The request will still run one prefill forward pass.
+            # In this case, we change the input_ids to be only one token to make this prefill cheap.
+            if req.rid.startswith(recv_req.rid):
+                logger.debug(f"Abort grammar queue request. {req.rid=}")
+                req.grammar.cancel()
+                req.set_finish_with_abort("Aborted by AbortReq.")
 
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:
@@ -2065,16 +2078,11 @@ class Scheduler(
 
         for req in reqs:
             if req.rid.startswith(recv_req.rid) and not req.finished():
+                # Abort method 3: set `to_abort=True`
+                # The request will still run one decode forward pass.
+                # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                # We must use to_abort because it is in a running batch
                 req.to_abort = True
-
-        # Delete the requests in the grammar queue
-        for req in self.grammar_queue:
-            if req.rid.startswith(recv_req.rid):
-                logger.debug(f"Abort grammar queue request. {req.rid=}")
-                req.grammar.cancel()
-                req.set_finish_with_abort("Aborted by AbortReq.")
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -2225,7 +2233,7 @@ class Scheduler(
     ) -> ProfileReqOutput | None:
         stage_str = f" for {stage.__str__()}" if stage else ""
         logger.info(
-            f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir}",
+            f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
         )
 
         activities = self.profiler_activities

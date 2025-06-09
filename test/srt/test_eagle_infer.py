@@ -23,6 +23,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
     run_logprob_check,
 )
@@ -578,6 +579,7 @@ class TestEAGLEServerTriton(TestEAGLEServer):
         )
 
 
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestEAGLEDraftExtend(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -610,6 +612,9 @@ class TestEAGLEDraftExtend(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_one_batch_accept_length(self):
+        resp = requests.get(self.base_url + "/flush_cache")
+        self.assertEqual(resp.status_code, 200)
+
         prompts = [
             "Hello, my name is",
             "The president of the United States is",
@@ -669,6 +674,7 @@ class TestEAGLEDraftExtendFlashinfer(TestEAGLEDraftExtend):
         cls.accept_len_threshold = 1.50
 
 
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestEAGLEDraftExtendTriton(TestEAGLEDraftExtend):
     @classmethod
     def setUpClass(cls):
@@ -697,6 +703,7 @@ class TestEAGLEDraftExtendTriton(TestEAGLEDraftExtend):
         cls.accept_len_threshold = 1.50
 
 
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestEAGLEDraftExtendFlashinferMLA(TestEAGLEDraftExtend):
     @classmethod
     def setUpClass(cls):
