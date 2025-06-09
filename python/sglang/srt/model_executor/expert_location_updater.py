@@ -12,8 +12,10 @@
 # limitations under the License.
 # ==============================================================================
 import logging
-from typing import Dict, List, Tuple
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
 
+import einops
 import torch
 import torch.distributed
 from torch.distributed import P2POp
@@ -22,6 +24,8 @@ from sglang.srt.managers.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
 )
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +38,7 @@ class ExpertLocationUpdater:
         self,
         routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
         new_expert_location_metadata: ExpertLocationMetadata,
+        update_layer_ids: List[int],
         nnodes: int,
         rank: int,
     ):
@@ -43,46 +48,107 @@ class ExpertLocationUpdater:
 
         old_expert_location_metadata = get_global_expert_location_metadata()
         _update_expert_weights(
-            routed_experts_weights_of_layer,
-            old_expert_location_metadata,
-            new_expert_location_metadata,
-            nnodes,
-            rank,
+            routed_experts_weights_of_layer=routed_experts_weights_of_layer,
+            old_expert_location_metadata=old_expert_location_metadata,
+            new_expert_location_metadata=new_expert_location_metadata,
+            update_layer_ids=update_layer_ids,
+            nnodes=nnodes,
+            rank=rank,
         )
-        old_expert_location_metadata.update(new_expert_location_metadata)
+        old_expert_location_metadata.update(
+            new_expert_location_metadata,
+            update_layer_ids=update_layer_ids,
+        )
 
 
-def _update_expert_weights(
+def _update_expert_weights(**kwargs):
+    if get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_CANARY"):
+        return _update_expert_weights_with_canary(**kwargs)
+    else:
+        return _update_expert_weights_raw(**kwargs)
+
+
+# can add watchdog as well
+def _update_expert_weights_with_canary(
     routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
     old_expert_location_metadata: ExpertLocationMetadata,
     new_expert_location_metadata: ExpertLocationMetadata,
+    update_layer_ids: List[int],
     nnodes: int,
     rank: int,
 ):
+    num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
+
+    def _get_canary_value(meta: ExpertLocationMetadata, layer_id: int):
+        return meta.physical_to_logical_map_cpu[
+            layer_id,
+            num_local_physical_experts * rank : num_local_physical_experts * (rank + 1),
+        ]
+
+    routed_experts_weights_of_layer = {
+        k: [x for x in v] for k, v in routed_experts_weights_of_layer.items()
+    }
+    for layer_id in update_layer_ids:
+        canary_tensor = (
+            _get_canary_value(old_expert_location_metadata, layer_id)
+            .clone()
+            .to(device=global_server_args_dict["device"], non_blocking=True)
+        )
+        routed_experts_weights_of_layer[layer_id].append(canary_tensor)
+
+    _update_expert_weights_raw(
+        routed_experts_weights_of_layer=routed_experts_weights_of_layer,
+        old_expert_location_metadata=old_expert_location_metadata,
+        new_expert_location_metadata=new_expert_location_metadata,
+        update_layer_ids=update_layer_ids,
+        nnodes=nnodes,
+        rank=rank,
+    )
+
+    for layer_id in update_layer_ids:
+        # can optimize speed if needed
+        expect_value = _get_canary_value(new_expert_location_metadata, layer_id)
+        actual_value = routed_experts_weights_of_layer[layer_id][-1].cpu()
+        assert torch.all(expect_value == actual_value), (
+            f"{expect_value=} {actual_value=} {layer_id=} "
+            f"{old_expert_location_metadata.physical_to_logical_map_cpu.tolist()=} "
+            f"{new_expert_location_metadata.physical_to_logical_map_cpu.tolist()=} "
+        )
+
+
+def _update_expert_weights_raw(
+    routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
+    old_expert_location_metadata: ExpertLocationMetadata,
+    new_expert_location_metadata: ExpertLocationMetadata,
+    update_layer_ids: List[int],
+    nnodes: int,
+    rank: int,
+):
+    log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
+
     temp_buffers = create_temp_buffers(
-        next(iter(routed_experts_weights_of_layer.values()))
+        routed_experts_weights_of_layer[update_layer_ids[0]]
     )
 
     world_size = torch.distributed.get_world_size()
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
     num_gpu_per_node = world_size // nnodes
 
-    old_physical_to_logical_map = (
-        old_expert_location_metadata.physical_to_logical_map.tolist()
-    )
-    new_physical_to_logical_map = (
-        new_expert_location_metadata.physical_to_logical_map.tolist()
-    )
-
-    for layer_id in sorted(routed_experts_weights_of_layer.keys()):
+    for layer_id in update_layer_ids:
         update_expert_weights_single_layer(
             routed_experts_weights=routed_experts_weights_of_layer[layer_id],
             temp_buffers=temp_buffers,
-            old_physical_to_logical_map=old_physical_to_logical_map[layer_id],
-            new_physical_to_logical_map=new_physical_to_logical_map[layer_id],
+            old_physical_to_logical_map=old_expert_location_metadata.physical_to_logical_map_cpu[
+                layer_id
+            ].tolist(),
+            new_physical_to_logical_map=new_expert_location_metadata.physical_to_logical_map_cpu[
+                layer_id
+            ].tolist(),
             num_local_physical_experts=num_local_physical_experts,
             num_gpu_per_node=num_gpu_per_node,
             rank=rank,
+            world_size=world_size,
+            log_metrics=log_metrics,
         )
 
 
@@ -98,7 +164,9 @@ def update_expert_weights_single_layer(
     num_local_physical_experts: int,
     num_gpu_per_node: int,
     rank: int,
+    world_size: Optional[int] = None,
     debug: bool = False,
+    log_metrics: bool = False,
 ):
     assert all(
         tensor.shape[0] == num_local_physical_experts
@@ -129,6 +197,14 @@ def update_expert_weights_single_layer(
         _create_isend_ops(p2p_op_infos)
         _execute_p2p_ops(p2p_op_infos)
         _execute_buffer2weight_copies(buffer2weight_copy_infos)
+
+        if log_metrics:
+            _log_p2p_op_metrics(
+                p2p_op_infos,
+                world_size=world_size,
+                num_gpu_per_node=num_gpu_per_node,
+                self_node_id=self_node_id,
+            )
 
         if debug:
             output_logs.append(f"{p2p_op_infos=}")
@@ -429,3 +505,53 @@ def _deduplicate_ordered(arr: List[int]):
         if len(output) == 0 or item != output[-1]:
             output.append(item)
     return output
+
+
+def _log_p2p_op_metrics(
+    p2p_op_infos: List[Tuple[int, List[P2POp]]],
+    num_gpu_per_node: int,
+    world_size: int,
+    self_node_id: int,
+):
+    text = ""
+    all_ops = [op for _, ops in p2p_op_infos for op in ops]
+
+    for direction, ops in _group_by(all_ops, _get_direction_from_op).items():
+        nbytes_of_gpu = [0] * world_size
+        for op in ops:
+            nbytes_of_gpu[op.peer] += op.tensor.nbytes
+        nbytes_of_gpu = torch.tensor(nbytes_of_gpu, dtype=torch.int64)
+
+        nbytes_of_node = einops.reduce(
+            nbytes_of_gpu,
+            "(num_nodes num_gpu_per_node) -> num_nodes",
+            num_gpu_per_node=num_gpu_per_node,
+            reduction="sum",
+        )
+
+        nbytes_curr_node = nbytes_of_node[self_node_id]
+        nbytes_cross_node = torch.sum(nbytes_of_node) - nbytes_curr_node
+
+        text += (
+            f"{direction}_nbytes_of_gpu={nbytes_of_gpu.tolist()} "
+            f"{direction}_nbytes_of_node={nbytes_of_node.tolist()} "
+            f"{direction}_nbytes_curr_node={nbytes_curr_node.item()} "
+            f"{direction}_nbytes_cross_node={nbytes_cross_node.item()} "
+        )
+
+    logger.info(f"[ExpertLocationUpdater] {text}")
+
+
+def _get_direction_from_op(op: P2POp):
+    if op.op == torch.distributed.isend:
+        return "isend"
+    if op.op == torch.distributed.irecv:
+        return "irecv"
+    raise NotImplementedError
+
+
+def _group_by(items, keyfunc):
+    ans = defaultdict(list)
+    for item in items:
+        ans[keyfunc(item)].append(item)
+    return dict(ans)

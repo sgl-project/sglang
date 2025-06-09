@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import os
+import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -12,6 +14,7 @@ import triton.language as tl
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -20,7 +23,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.build_eagle_tree import build_tree_kernel_efficient
 from sglang.srt.utils import fast_topk, is_cuda, is_hip, next_power_of_2
 
@@ -34,15 +36,15 @@ if is_cuda():
 elif is_hip():
     from sgl_kernel import verify_tree_greedy
 
-if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
-
-import logging
 
 logger = logging.getLogger(__name__)
 
 
+# Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
+SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
+
+TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 
 
 @dataclass
@@ -84,9 +86,9 @@ class EagleDraftInput:
         self,
         batch: ScheduleBatch,
         speculative_num_steps: int,
+        context_length: int,
         pad_input: bool = False,
     ):
-        assert len(self.verified_id) == len(batch.out_cache_loc)
         accept_length_cpu = batch.spec_info.accept_length_cpu
         batch.extend_lens = [x + 1 for x in accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
@@ -112,49 +114,49 @@ class EagleDraftInput:
         batch.input_ids = self.verified_id
         self.verified_id = new_verified_id
 
-        if pad_input:
-            batch_size = sum(not req.finished() for req in batch.reqs)
-            # Total constant input length after padding
-            static_len = speculative_num_steps + 1
-            # Total size after padding
-            padded_input_size = batch_size * static_len
+        if not pad_input:
+            return
 
-            padded_len = padded_input_size - batch.input_ids.shape[0]
-            if padded_len > 0:
-                new_input_ids = torch.nn.functional.pad(
-                    batch.input_ids, (0, padded_len), value=0
-                )
-                position_padding = torch.arange(
-                    padded_len, device=self.positions.device
-                )
-                new_positions = torch.cat([self.positions, position_padding])
+        batch_size = sum(not req.finished() for req in batch.reqs)
+        # Total constant input length after padding
+        static_len = speculative_num_steps + 1
+        # Total size after padding
+        padded_input_size = batch_size * static_len
 
-                # need dummy hidden states for the padded positions
-                hidden_states_dim = self.hidden_states.shape[-1]
-                new_hidden_states = torch.cat(
-                    [
-                        self.hidden_states,
-                        torch.zeros(
-                            (padded_len, hidden_states_dim),
-                            dtype=self.hidden_states.dtype,
-                            device=self.hidden_states.device,
-                        ),
-                    ],
-                    dim=0,
-                )
+        padded_len = padded_input_size - batch.input_ids.shape[0]
+        if padded_len > 0:
+            new_input_ids = torch.nn.functional.pad(
+                batch.input_ids, (0, padded_len), value=0
+            )
+            position_padding = torch.arange(padded_len, device=self.positions.device)
+            new_positions = torch.cat([self.positions, position_padding])
 
-                # allocate KV cache location for the padded tokens
-                padded_cache_loc = torch.zeros(
-                    padded_len,
-                    dtype=batch.out_cache_loc.dtype,
-                    device=batch.out_cache_loc.device,
-                )
-                new_out_cache_loc = torch.cat([batch.out_cache_loc, padded_cache_loc])
+            # need dummy hidden states for the padded positions
+            hidden_states_dim = self.hidden_states.shape[-1]
+            new_hidden_states = torch.cat(
+                [
+                    self.hidden_states,
+                    torch.zeros(
+                        (padded_len, hidden_states_dim),
+                        dtype=self.hidden_states.dtype,
+                        device=self.hidden_states.device,
+                    ),
+                ],
+                dim=0,
+            )
 
-                batch.input_ids = new_input_ids
-                self.hidden_states = new_hidden_states
-                self.positions = new_positions
-                batch.out_cache_loc = new_out_cache_loc
+            # allocate KV cache location for the padded tokens
+            padded_cache_loc = torch.zeros(
+                padded_len,
+                dtype=batch.out_cache_loc.dtype,
+                device=batch.out_cache_loc.device,
+            )
+            new_out_cache_loc = torch.cat([batch.out_cache_loc, padded_cache_loc])
+
+            batch.input_ids = new_input_ids
+            self.hidden_states = new_hidden_states
+            self.positions = new_positions
+            batch.out_cache_loc = new_out_cache_loc
 
     def generate_attn_arg_prefill(
         self,
@@ -232,8 +234,9 @@ class EagleVerifyInput:
     retrive_next_token: torch.Tensor
     retrive_next_sibling: torch.Tensor
     retrive_cum_len: torch.Tensor
-    draft_token_num: int
     spec_steps: int
+    topk: int
+    draft_token_num: int
     capture_hidden_mode: CaptureHiddenMode
     grammar: BaseGrammarObject = None
 
@@ -270,16 +273,17 @@ class EagleVerifyInput:
         )
 
         return cls(
-            draft_tokens,
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            None,
-            num_verify_tokens,
-            spec_steps,
-            CaptureHiddenMode.FULL,
+            draft_token=draft_tokens,
+            custom_mask=tree_mask,
+            positions=position,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            retrive_cum_len=None,
+            spec_steps=spec_steps,
+            topk=topk,
+            draft_token_num=num_verify_tokens,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
