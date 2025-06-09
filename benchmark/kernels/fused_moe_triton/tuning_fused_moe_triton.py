@@ -580,12 +580,6 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, required=False)
     parser.add_argument("--tune", action="store_true")
     parser.add_argument(
-        "--n-share-experts-fusion",
-        type=int,
-        default=0,
-        help="The number of shared_experts need to be replica to fuse with normal experts in deepseek v3/r1",
-    )
-    parser.add_argument(
         "--per-channel-quant",
         action="store_true",
         help="Per-channel quantization, when using channel-wise INT8, this parameter needs to be set",
