@@ -16,7 +16,6 @@
 import faulthandler
 import logging
 import os
-import pickle
 import signal
 import sys
 import threading
@@ -733,34 +732,26 @@ class Scheduler(
 
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
-
-                # This call updates `self.running_batch` and returns the next batch to execute.
                 mbs[mb_id] = self.get_next_batch_to_run()
-
-                # Persist the state of the decoding batch for this pipeline stage.
                 self.running_mbs[mb_id] = self.running_batch
-                self.cur_batch = mbs[mb_id]
 
-                next_pp_outputs = None
+                self.cur_batch = mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
                     result = self.run_batch(self.cur_batch)
 
-                    # Process result on the last rank
-                    if self.pp_group.is_last_rank:
-                        self.process_batch_result(self.cur_batch, result)
+                # Process result
+                self.process_batch_result(self.cur_batch, result)
+                self.cur_batch = self.update_running_batch(self.cur_batch)
+
+                if self.cur_batch is not None and not self.cur_batch.is_empty():
+                    self.running_batch = self.cur_batch
+                else:
+                    self.running_batch = self.get_idle_batch()
 
                 # (last rank) send the outputs to the next step
                 if self.pp_group.is_last_rank:
                     if self.cur_batch:
-                        finished_rids = [
-                            req.rid for req in self.cur_batch.reqs if req.finished()
-                        ]
-                        finished_rids_bytes = pickle.dumps(finished_rids)
-                        finished_rids_tensor = torch.frombuffer(
-                            bytearray(finished_rids_bytes), dtype=torch.uint8
-                        ).to(self.device)
-
                         next_token_ids, bids[mb_id] = (
                             result.next_token_ids,
                             result.bid,
@@ -768,7 +759,6 @@ class Scheduler(
                         pp_outputs = PPProxyTensors(
                             {
                                 "next_token_ids": next_token_ids,
-                                "finished_rids": finished_rids_tensor,
                             }
                         )
                         # send the output from the last round to let the next stage worker run post processing
@@ -776,58 +766,28 @@ class Scheduler(
                             pp_outputs.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
-                    else:
-                        # send a dummy tensor to notify the next stage
-                        finished_rids_bytes = pickle.dumps([])
-                        finished_rids_tensor = torch.frombuffer(
-                            bytearray(finished_rids_bytes), dtype=torch.uint8
-                        ).to(self.device)
-                        self.pp_group.send_tensor_dict(
-                            {
-                                "dummy": torch.zeros(1, device=self.device),
-                                "finished_rids": finished_rids_tensor,
-                            },
-                            all_gather_group=self.attn_tp_group,
-                        )
 
                 # receive outputs and post-process (filter finished reqs) the coming microbatch
                 next_mb_id = (mb_id + 1) % self.pp_size
+                next_pp_outputs = None
                 if mbs[next_mb_id] is not None:
                     next_pp_outputs: Optional[PPProxyTensors] = PPProxyTensors(
                         self.pp_group.recv_tensor_dict(
                             all_gather_group=self.attn_tp_group
                         )
                     )
-
-                    finished_rids_tensor = (
-                        next_pp_outputs.tensors.pop("finished_rids").cpu()
+                    mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
+                    output_result = GenerationBatchResult(
+                        logits_output=None,
+                        pp_hidden_states_proxy_tensors=None,
+                        next_token_ids=next_pp_outputs["next_token_ids"],
+                        extend_input_len_per_req=None,
+                        extend_logprob_start_len_per_req=None,
+                        bid=bids[next_mb_id],
+                        can_run_cuda_graph=result.can_run_cuda_graph,
                     )
-                    finished_rids = pickle.loads(finished_rids_tensor.numpy().tobytes())
-                    if finished_rids:
-                        for req in mbs[next_mb_id].reqs:
-                            if req.rid in finished_rids and not req.finished():
-                                req.finished_reason = "finished_by_pipeline"
-
-                    if "dummy" in next_pp_outputs.tensors:
-                        # The last stage has no running batch, so we can skip the result processing
-                        pass
-                    else:
-                        mbs[next_mb_id].output_ids = next_pp_outputs.tensors[
-                            "next_token_ids"
-                        ]
-                        output_result = GenerationBatchResult(
-                            logits_output=None,
-                            pp_hidden_states_proxy_tensors=None,
-                            next_token_ids=next_pp_outputs.tensors["next_token_ids"],
-                            extend_input_len_per_req=None,
-                            extend_logprob_start_len_per_req=None,
-                            bid=bids[next_mb_id],
-                            can_run_cuda_graph=result.can_run_cuda_graph,
-                        )
-                        self.process_batch_result(mbs[next_mb_id], output_result)
-
-                # This batch is done, it becomes the `last_batch` for the next iteration of this stage
-                last_mbs[mb_id] = self.cur_batch
+                    self.process_batch_result(mbs[next_mb_id], output_result)
+                    last_mbs[next_mb_id] = mbs[next_mb_id]
 
                 # (not last rank)
                 if not self.pp_group.is_last_rank:
@@ -838,19 +798,6 @@ class Scheduler(
                     if pp_outputs:
                         self.pp_group.send_tensor_dict(
                             pp_outputs.tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
-                    else:
-                        # send a dummy tensor to notify the next stage
-                        finished_rids_bytes = pickle.dumps([])
-                        finished_rids_tensor = torch.frombuffer(
-                            bytearray(finished_rids_bytes), dtype=torch.uint8
-                        ).to(self.device)
-                        self.pp_group.send_tensor_dict(
-                            {
-                                "dummy": torch.zeros(1, device=self.device),
-                                "finished_rids": finished_rids_tensor,
-                            },
                             all_gather_group=self.attn_tp_group,
                         )
 
@@ -878,6 +825,22 @@ class Scheduler(
             if server_is_idle:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
+
+            # (last rank) process the result and update the batch
+            if self.pp_group.is_last_rank:
+                self.process_batch_result(self.cur_batch, result)
+                self.cur_batch = self.update_running_batch(self.cur_batch)
+
+            # (all ranks) get the updated batch from the last rank
+            if self.pp_group.is_last_rank:
+                bcast_obj = self.cur_batch
+            else:
+                bcast_obj = None
+            point_to_point_pyobj(bcast_obj, self.pp_group.get_last_rank(), self.pp_group)
+            self.cur_batch = bcast_obj
+        else:
+            # Handle embedding request
+            assert self.pp_size == 1
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
@@ -2103,22 +2066,9 @@ class Scheduler(
 
         # Sort in reverse order to avoid index issues when deleting
         for i in reversed(to_del):
-            # Abort method 1: directly pop from the queue
-            # This only works for requests that have not started anything.
-            # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
             self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
             logger.debug(f"Abort queued request. {req.rid=}")
-
-        # Delete the requests in the grammar queue
-        for req in self.grammar_queue:
-            # Abort method 2: call `set_finish_with_abort`
-            # The request will still run one prefill forward pass.
-            # In this case, we change the input_ids to be only one token to make this prefill cheap.
-            if req.rid.startswith(recv_req.rid):
-                logger.debug(f"Abort grammar queue request. {req.rid=}")
-                req.grammar.cancel()
-                req.set_finish_with_abort("Aborted by AbortReq.")
 
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:
@@ -2128,11 +2078,16 @@ class Scheduler(
 
         for req in reqs:
             if req.rid.startswith(recv_req.rid) and not req.finished():
-                # Abort method 3: set `to_abort=True`
-                # The request will still run one decode forward pass.
-                # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
+                # We must use to_abort because it is in a running batch
                 req.to_abort = True
+
+        # Delete the requests in the grammar queue
+        for req in self.grammar_queue:
+            if req.rid.startswith(recv_req.rid):
+                logger.debug(f"Abort grammar queue request. {req.rid=}")
+                req.grammar.cancel()
+                req.set_finish_with_abort("Aborted by AbortReq.")
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -2283,7 +2238,7 @@ class Scheduler(
     ) -> ProfileReqOutput | None:
         stage_str = f" for {stage.__str__()}" if stage else ""
         logger.info(
-            f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
+            f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir}",
         )
 
         activities = self.profiler_activities

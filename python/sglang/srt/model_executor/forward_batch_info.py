@@ -104,7 +104,7 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.MIXED
         )
 
-    def is_cuda_graph(self):
+    def  is_cuda_graph(self):
         return (
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY

@@ -34,7 +34,9 @@ def import_processors():
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
             try:
+                logger.info(f"Attempting to import processor module: {name}")
                 module = importlib.import_module(name)
+                logger.info(f"Successfully imported module: {name}")
             except Exception as e:
                 logger.warning(f"Ignore import error when loading {name}: " f"{e}")
                 continue
@@ -49,6 +51,7 @@ def import_processors():
             ):
                 assert hasattr(cls, "models")
                 for arch in getattr(cls, "models"):
+                    logger.info(f"Registering processor {cls.__name__} for architecture {arch.__name__}")
                     PROCESSOR_MAPPING[arch] = cls
 
 

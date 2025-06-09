@@ -722,7 +722,16 @@ class GroupCoordinator:
             rank_object == rank_size
         ), "Received object sender rank does not match the size sender rank."
 
-        obj = pickle.loads(object_tensor.numpy().tobytes())
+        if size_tensor.numel() > 0:
+            obj_bytes = bytearray(size_tensor.item())
+            obj_tensor = torch.frombuffer(obj_bytes, dtype=torch.uint8)
+            torch.distributed.broadcast(obj_tensor, src=src, group=self.device_group)
+            assert (
+                obj_tensor.numel() == size_tensor.item()
+            ), "Received object size does not match the sent size."
+            obj = pickle.loads(obj_tensor.numpy().tobytes())
+        else:
+            obj = None
 
         return obj
 

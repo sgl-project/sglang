@@ -183,17 +183,35 @@ class CudaGraphRunner:
     def __init__(self, model_runner: ModelRunner):
         # Parse args
         self.model_runner = model_runner
+        self.server_args = model_runner.server_args
+        self.model_config = model_runner.model_config
+        self.device = model_runner.device
+        self.attn_backend = model_runner.attn_backend
+        self.pp_size = model_runner.pp_size
+        self.pp_rank = model_runner.pp_rank
+        self.enable_dp_attention = model_runner.server_args.enable_dp_attention
+        self.enable_sp_layernorm = model_runner.server_args.enable_sp_layernorm
+        self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
+        self.is_draft_worker = model_runner.is_draft_worker
+        self.capture_forward_mode = None
+        self.capture_hidden_mode = CaptureHiddenMode.NULL
+        self.tbo_plugin = TboCudaGraphRunnerPlugin()
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
-        self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
-        self.enable_dp_attention = model_runner.server_args.enable_dp_attention
-        self.enable_sp_layernorm = model_runner.server_args.enable_sp_layernorm
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
-        self.pp_size = model_runner.server_args.pp_size
+        self.num_tokens_per_bs = 1
+        if model_runner.spec_algorithm.is_eagle():
+            if self.model_runner.is_draft_worker:
+                raise RuntimeError("This should not happen")
+            else:
+                self.capture_forward_mode = ForwardMode.TARGET_VERIFY
+                self.num_tokens_per_bs = (
+                    self.model_runner.server_args.speculative_num_draft_tokens
+                )
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
@@ -546,7 +564,12 @@ class CudaGraphRunner:
         self.recapture_if_needed(forward_batch)
 
         raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_bs
+        if forward_batch.forward_mode.is_decode():
+            raw_num_token = raw_bs * self.num_tokens_per_bs
+        else:
+            # For prefill-like modes (e.g., TARGET_VERIFY) that can run in cuda graph,
+            # the number of tokens is the total length of input_ids.
+            raw_num_token = len(forward_batch.input_ids)
 
         # Pad
         if self.enable_dp_attention or self.enable_sp_layernorm:
@@ -566,6 +589,7 @@ class CudaGraphRunner:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
+
         num_token_non_padded = len(forward_batch.input_ids)
         self.num_token_non_padded[...] = num_token_non_padded
         self.tbo_plugin.replay_prepare(
@@ -620,8 +644,14 @@ class CudaGraphRunner:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
-            self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            # 同样需要检查流水线并行的非首个rank和张量是否为空
+            is_non_first_pp_rank = self.pp_size > 1 and self.pp_rank > 0
+
+            if not is_non_first_pp_rank and forward_batch.input_ids.numel() > 0:
+                self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+
+            if forward_batch.positions.numel() > 0:
+                self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
         self.graphs[self.bs].replay()

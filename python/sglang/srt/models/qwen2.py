@@ -299,17 +299,17 @@ class Qwen2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        if self.pp_group.is_first_rank:
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
+        # Get input embeddings
+        if pp_proxy_tensors is not None:
+            hidden_states = pp_proxy_tensors.tensors["hidden_states"]
+            residual = pp_proxy_tensors.tensors.get("residual")
+        elif input_embeds is not None:
+            hidden_states = input_embeds
             residual = None
         else:
-            assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            hidden_states = self.get_input_embedding(input_ids)
 
+        # Decoder layers
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
@@ -435,13 +435,18 @@ class Qwen2ForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
+        if get_embedding:
+            # Return the input embeddings
+            hidden_states = self.model.get_input_embedding(input_ids)
+            return hidden_states, None
+        else:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
 
         if self.pp_group.is_last_rank:
             if not get_embedding:

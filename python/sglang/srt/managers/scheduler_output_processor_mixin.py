@@ -38,149 +38,180 @@ class SchedulerOutputProcessorMixin:
         skip_stream_req = None
 
         if self.is_generation:
-            (
-                logits_output,
-                next_token_ids,
-                extend_input_len_per_req,
-                extend_logprob_start_len_per_req,
-            ) = (
-                result.logits_output,
-                result.next_token_ids,
-                result.extend_input_len_per_req,
-                result.extend_logprob_start_len_per_req,
-            )
-
-            if self.enable_overlap:
-                logits_output, next_token_ids, _ = (
-                    self.tp_worker.resolve_last_batch_result(launch_done)
+            if self.pp_rank == self.pp_size - 1:
+                (
+                    logits_output,
+                    next_token_ids,
+                    extend_input_len_per_req,
+                    extend_logprob_start_len_per_req,
+                ) = (
+                    result.logits_output,
+                    result.next_token_ids,
+                    result.extend_input_len_per_req,
+                    result.extend_logprob_start_len_per_req,
                 )
-            else:
-                # Move next_token_ids and logprobs to cpu
-                next_token_ids = next_token_ids.tolist()
-                if batch.return_logprob:
-                    if logits_output.next_token_logprobs is not None:
-                        logits_output.next_token_logprobs = (
-                            logits_output.next_token_logprobs.tolist()
-                        )
-                    if logits_output.input_token_logprobs is not None:
-                        logits_output.input_token_logprobs = tuple(
-                            logits_output.input_token_logprobs.tolist()
-                        )
 
-            hidden_state_offset = 0
+                if self.enable_overlap:
+                    logits_output, next_token_ids, _ = (
+                        self.tp_worker.resolve_last_batch_result(launch_done)
+                    )
+                else:
+                    # Move next_token_ids and logprobs to cpu
+                    if next_token_ids is not None:
+                        next_token_ids = next_token_ids.tolist()
+                    if batch.return_logprob:
+                        if logits_output.next_token_logprobs is not None:
+                            logits_output.next_token_logprobs = (
+                                logits_output.next_token_logprobs.tolist()
+                            )
+                        if logits_output.input_token_logprobs is not None:
+                            logits_output.input_token_logprobs = tuple(
+                                logits_output.input_token_logprobs.tolist()
+                            )
 
-            # Check finish conditions
-            logprob_pt = 0
-            for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-                if req.is_retracted:
-                    continue
+                hidden_state_offset = 0
 
-                if self.is_mixed_chunk and self.enable_overlap and req.finished():
-                    # Free the one delayed token for the mixed decode batch
-                    j = len(batch.out_cache_loc) - len(batch.reqs) + i
-                    self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
-                    continue
-
-                if req.is_chunked <= 0:
-                    # req output_ids are set here
-                    req.output_ids.append(next_token_id)
-                    req.check_finished()
-
-                    if req.finished():
-                        self.tree_cache.cache_finished_req(req)
-                        req.time_stats.completion_time = time.time()
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        # This updates radix so others can match
-                        self.tree_cache.cache_unfinished_req(req)
-
-                    if req.return_logprob:
-                        assert extend_logprob_start_len_per_req is not None
-                        assert extend_input_len_per_req is not None
-                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                        extend_input_len = extend_input_len_per_req[i]
-                        num_input_logprobs = extend_input_len - extend_logprob_start_len
-                        self.add_logprob_return_values(
-                            i,
-                            req,
-                            logprob_pt,
-                            next_token_ids,
-                            num_input_logprobs,
-                            logits_output,
-                        )
-                        logprob_pt += num_input_logprobs
-
-                    if (
-                        req.return_hidden_states
-                        and logits_output.hidden_states is not None
+                # Check finish conditions
+                logprob_pt = 0
+                if next_token_ids:
+                    for i, (req, next_token_id) in enumerate(
+                        zip(batch.reqs, next_token_ids)
                     ):
-                        req.hidden_states.append(
-                            logits_output.hidden_states[
-                                hidden_state_offset : (
-                                    hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
+                        if req.is_retracted:
+                            continue
+
+                        if (
+                            self.is_mixed_chunk
+                            and self.enable_overlap
+                            and req.finished()
+                        ):
+                            # Free the one delayed token for the mixed decode batch
+                            j = len(batch.out_cache_loc) - len(batch.reqs) + i
+                            self.token_to_kv_pool_allocator.free(
+                                batch.out_cache_loc[j : j + 1]
+                            )
+                            continue
+
+                        if req.is_chunked <= 0:
+                            # req output_ids are set here
+                            req.output_ids.append(next_token_id)
+                            req.check_finished()
+
+                            if req.finished():
+                                self.tree_cache.free_req(req)
+                                self.req_to_token_pool.free(req.req_pool_idx)
+                                if req.out_cache_loc is not None:
+                                    self.token_to_kv_pool_allocator.free(req.out_cache_loc)
+                                    req.out_cache_loc = None
+                                req.time_stats.completion_time = time.time()
+                            elif (
+                                not batch.decoding_reqs
+                                or req not in batch.decoding_reqs
+                            ):
+                                # This updates radix so others can match
+                                self.tree_cache.cache_unfinished_req(req)
+
+                            if req.return_logprob:
+                                assert extend_logprob_start_len_per_req is not None
+                                assert extend_input_len_per_req is not None
+                                extend_logprob_start_len = (
+                                    extend_logprob_start_len_per_req[i]
                                 )
-                            ]
-                            .cpu()
-                            .clone()
-                            .tolist()
-                        )
+                                extend_input_len = extend_input_len_per_req[i]
+                                num_input_logprobs = (
+                                    extend_input_len - extend_logprob_start_len
+                                )
+                                self.add_logprob_return_values(
+                                    i,
+                                    req,
+                                    logprob_pt,
+                                    next_token_ids,
+                                    num_input_logprobs,
+                                    logits_output,
+                                )
+                                logprob_pt += num_input_logprobs
 
-                    if req.grammar is not None:
-                        req.grammar.accept_token(next_token_id)
-                        req.grammar.finished = req.finished()
-                else:
-                    # being chunked reqs' prefill is not finished
-                    req.is_chunked -= 1
-                    # There is only at most one request being currently chunked.
-                    # Because this request does not finish prefill,
-                    # we don't want to stream the request currently being chunked.
-                    skip_stream_req = req
+                            if (
+                                req.return_hidden_states
+                                and logits_output.hidden_states is not None
+                            ):
+                                req.hidden_states.append(
+                                    logits_output.hidden_states[
+                                        hidden_state_offset : (
+                                            hidden_state_offset := hidden_state_offset
+                                            + len(req.origin_input_ids)
+                                        )
+                                    ]
+                                    .cpu()
+                                    .clone()
+                                    .tolist()
+                                )
 
-                    # Incrementally update input logprobs.
-                    if req.return_logprob:
-                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                        extend_input_len = extend_input_len_per_req[i]
-                        if extend_logprob_start_len < extend_input_len:
-                            # Update input logprobs.
-                            num_input_logprobs = (
-                                extend_input_len - extend_logprob_start_len
-                            )
-                            self.add_input_logprob_return_values(
-                                i,
-                                req,
-                                logits_output,
-                                logprob_pt,
-                                num_input_logprobs,
-                                last_prefill_chunk=False,
-                            )
-                            logprob_pt += num_input_logprobs
+                            if req.grammar is not None:
+                                req.grammar.accept_token(next_token_id)
+                                req.grammar.finished = req.finished()
+                        else:
+                            # being chunked reqs' prefill is not finished
+                            req.is_chunked -= 1
+                            # There is only at most one request being currently chunked.
+                            # Because this request does not finish prefill,
+                            # we don't want to stream the request currently being chunked.
+                            skip_stream_req = req
 
-            self.set_next_batch_sampling_info_done(batch)
-
+                            # Incrementally update input logprobs.
+                            if req.return_logprob:
+                                extend_logprob_start_len = (
+                                    extend_logprob_start_len_per_req[i]
+                                )
+                                extend_input_len = extend_input_len_per_req[i]
+                                if extend_logprob_start_len < extend_input_len:
+                                    # Update input logprobs.
+                                    num_input_logprobs = (
+                                        extend_input_len - extend_logprob_start_len
+                                    )
+                                    self.add_input_logprob_return_values(
+                                        i,
+                                        req,
+                                        logits_output,
+                                        logprob_pt,
+                                        num_input_logprobs,
+                                        last_prefill_chunk=False,
+                                    )
+                                    logprob_pt += num_input_logprobs
+                if self.pp_rank == self.pp_size - 1:
+                    self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+                self.set_next_batch_sampling_info_done(batch)
         else:  # embedding or reward model
-            embeddings, bid = result.embeddings, result.bid
-            embeddings = embeddings.tolist()
+            if self.pp_rank == self.pp_size - 1:
+                embeddings, bid = result.embeddings, result.bid
+                if embeddings is not None:
+                    embeddings = embeddings.tolist()
 
-            # Check finish conditions
-            for i, req in enumerate(batch.reqs):
-                if req.is_retracted:
-                    continue
+                # Check finish conditions
+                if embeddings:
+                    for i, req in enumerate(batch.reqs):
+                        if req.is_retracted:
+                            continue
 
-                req.embedding = embeddings[i]
-                if req.is_chunked <= 0:
-                    # Dummy output token for embedding models
-                    req.output_ids.append(0)
-                    req.check_finished()
+                        req.embedding = embeddings[i]
+                        if req.is_chunked <= 0:
+                            # Dummy output token for embedding models
+                            req.output_ids.append(0)
+                            req.check_finished()
 
-                    if req.finished():
-                        self.tree_cache.cache_finished_req(req)
-                    else:
-                        self.tree_cache.cache_unfinished_req(req)
-                else:
-                    # being chunked reqs' prefill is not finished
-                    req.is_chunked -= 1
+                            if req.finished():
+                                self.tree_cache.free_req(req)
+                                self.req_to_token_pool.free(req.req_pool_idx)
+                                if req.out_cache_loc is not None:
+                                    self.token_to_kv_pool_allocator.free(req.out_cache_loc)
+                                    req.out_cache_loc = None
+                            else:
+                                self.tree_cache.cache_unfinished_req(req)
+                        else:
+                            # being chunked reqs' prefill is not finished
+                            req.is_chunked -= 1
 
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+                self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
     def process_batch_result_decode(
         self: Scheduler,
@@ -235,8 +266,11 @@ class SchedulerOutputProcessorMixin:
 
             req.check_finished()
             if req.finished():
-                self.tree_cache.cache_finished_req(req)
-                req.time_stats.completion_time = time.time()
+                self.tree_cache.free_req(req)
+                self.req_to_token_pool.free(req.req_pool_idx)
+                if req.out_cache_loc is not None:
+                    self.token_to_kv_pool_allocator.free(req.out_cache_loc)
+                    req.out_cache_loc = None
 
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
@@ -644,9 +678,6 @@ class SchedulerOutputProcessorMixin:
 
         # Send to detokenizer
         if rids:
-            if self.model_config.is_multimodal_gen:
-                return
-
             self.send_to_detokenizer.send_pyobj(
                 BatchTokenIDOut(
                     rids,
