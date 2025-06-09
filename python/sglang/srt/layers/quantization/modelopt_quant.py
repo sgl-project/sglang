@@ -444,114 +444,62 @@ class ModelOptFp8MoEMethod:
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if not self.quant_config.is_checkpoint_fp8_serialized:
-            # Quantize weights on-the-fly for non-serialized checkpoints
-            from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+        """Process FP8 MoE weights after loading from serialized checkpoint.
 
-            # Initialize weight scales
-            layer.w13_weight_scale = torch.nn.Parameter(
-                torch.ones(
-                    layer.num_experts,
-                    dtype=torch.float32,
-                    device=layer.w13_weight.device,
-                ),
-                requires_grad=False,
-            )
-            layer.w2_weight_scale = torch.nn.Parameter(
-                torch.ones(
-                    layer.num_experts,
-                    dtype=torch.float32,
-                    device=layer.w2_weight.device,
-                ),
-                requires_grad=False,
-            )
+        Only supports pre-quantized checkpoints with FP8 weights and scales.
+        """
+        # Ensure weights are proper Parameters
+        layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
+        layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
-            # Quantize weights per expert
-            w13_weight = torch.empty_like(
-                layer.w13_weight.data, dtype=torch.float8_e4m3fn
+        # Handle scale parameters - choose ONE approach consistently
+
+        # Option A: Use Llama4-specific scalar scales (if available)
+        if (
+            hasattr(layer, "gate_up_proj_weight_scale")
+            and layer.gate_up_proj_weight_scale is not None
+        ):
+            layer.w13_weight_scale = Parameter(
+                layer.gate_up_proj_weight_scale.data, requires_grad=False
             )
-            w2_weight = torch.empty_like(
-                layer.w2_weight.data, dtype=torch.float8_e4m3fn
+            layer.w13_input_scale = (
+                Parameter(layer.gate_up_proj_input_scale.data, requires_grad=False)
+                if hasattr(layer, "gate_up_proj_input_scale")
+                else None
             )
 
-            for expert in range(layer.num_experts):
-                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                )
-                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                )
+            layer.w2_weight_scale = (
+                Parameter(layer.down_proj_weight_scale.data, requires_grad=False)
+                if hasattr(layer, "down_proj_weight_scale")
+                else None
+            )
+            layer.w2_input_scale = (
+                Parameter(layer.down_proj_input_scale.data, requires_grad=False)
+                if hasattr(layer, "down_proj_input_scale")
+                else None
+            )
 
-            layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-            layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-
-            # Set input scales to None for dynamic quantization
-            layer.w13_input_scale = None
-            layer.w2_input_scale = None
+        # Option B: Use standard per-expert scales (fallback)
         else:
-            # For serialized checkpoints, use requantize with max scale similar to linear layers
             if (
                 hasattr(layer, "w13_weight_scale")
                 and layer.w13_weight_scale is not None
             ):
-                # Apply max scale quantization and convert to per-channel if needed
-                max_w13_scale = layer.w13_weight_scale.max()
-                max_w2_scale = layer.w2_weight_scale.max()
-
-                # Convert to per-channel if cutlass is supported
-                if self.cutlass_fp8_supported:
-                    # For MoE, we need to handle per-expert per-channel scaling
-                    # This is more complex than linear layers
-                    pass  # TODO: Implement per-channel scaling for MoE if needed
-
-                layer.w13_weight_scale = torch.nn.Parameter(
-                    max_w13_scale.expand(layer.num_experts), requires_grad=False
+                layer.w13_weight_scale = Parameter(
+                    layer.w13_weight_scale.data, requires_grad=False
                 )
-                layer.w2_weight_scale = torch.nn.Parameter(
-                    max_w2_scale.expand(layer.num_experts), requires_grad=False
+            if hasattr(layer, "w2_weight_scale") and layer.w2_weight_scale is not None:
+                layer.w2_weight_scale = Parameter(
+                    layer.w2_weight_scale.data, requires_grad=False
                 )
-
-                # Process input scales
-                if (
-                    hasattr(layer, "w13_input_scale")
-                    and layer.w13_input_scale is not None
-                ):
-                    layer.w13_input_scale = torch.nn.Parameter(
-                        layer.w13_input_scale.max(), requires_grad=False
-                    )
-                if (
-                    hasattr(layer, "w2_input_scale")
-                    and layer.w2_input_scale is not None
-                ):
-                    layer.w2_input_scale = torch.nn.Parameter(
-                        layer.w2_input_scale.max(), requires_grad=False
-                    )
-
-                # Handle Llama4 scalar scale parameters
-                # NOTE: FP8 kernel expects scalar scales, not per-expert scales
-                # So we keep the checkpoint scales as-is (scalars) and use them directly
-                if (
-                    hasattr(layer, "gate_up_proj_weight_scale")
-                    and layer.gate_up_proj_weight_scale is not None
-                ):
-                    # Use the scalar scale directly for w13 (gate_up_proj)
-                    layer.w13_weight_scale = layer.gate_up_proj_weight_scale
-                if (
-                    hasattr(layer, "gate_up_proj_input_scale")
-                    and layer.gate_up_proj_input_scale is not None
-                ):
-                    layer.w13_input_scale = layer.gate_up_proj_input_scale
-                if (
-                    hasattr(layer, "down_proj_weight_scale")
-                    and layer.down_proj_weight_scale is not None
-                ):
-                    # Use the scalar scale directly for w2 (down_proj)
-                    layer.w2_weight_scale = layer.down_proj_weight_scale
-                if (
-                    hasattr(layer, "down_proj_input_scale")
-                    and layer.down_proj_input_scale is not None
-                ):
-                    layer.w2_input_scale = layer.down_proj_input_scale
+            if hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None:
+                layer.w13_input_scale = Parameter(
+                    layer.w13_input_scale.data, requires_grad=False
+                )
+            if hasattr(layer, "w2_input_scale") and layer.w2_input_scale is not None:
+                layer.w2_input_scale = Parameter(
+                    layer.w2_input_scale.data, requires_grad=False
+                )
 
     def apply(
         self,
