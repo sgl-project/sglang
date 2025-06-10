@@ -298,9 +298,14 @@ class EAGLEWorker(TpModelWorker):
                 self.verify(batch, spec_info)
             )
             # If it is None, it means all requests are finished
-            if self.check_forward_draft_extend_after_decode(batch):
+            need_forward, can_run_draft_extend_cuda_graph = (
+                self.check_forward_draft_extend_after_decode(batch)
+            )
+            if need_forward:
                 with self.draft_tp_context(self.draft_model_runner.tp_group):
-                    self.forward_draft_extend_after_decode(batch)
+                    self.forward_draft_extend_after_decode(
+                        batch, can_run_draft_extend_cuda_graph
+                    )
             return (
                 logits_output,
                 verify_output.verified_id,
@@ -331,7 +336,7 @@ class EAGLEWorker(TpModelWorker):
             and batch.spec_info.verified_id.shape[0] > 0
         )
         if not self.server_args.enable_dp_attention:
-            return local_need_forward
+            return local_need_forward, True
 
         local_info = torch.tensor(
             [
@@ -349,7 +354,8 @@ class EAGLEWorker(TpModelWorker):
             group=self.target_worker.get_tp_group().cpu_group,
         )
         need_forward = global_info[:, :, 0].any().item()
-        return need_forward
+        can_run_draft_extend_cuda_graph = global_info[:, :, 0].all().item()
+        return need_forward, can_run_draft_extend_cuda_graph
 
     def forward_target_extend(
         self, batch: ScheduleBatch
@@ -778,7 +784,9 @@ class EAGLEWorker(TpModelWorker):
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
-    def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
+    def forward_draft_extend_after_decode(
+        self, batch: ScheduleBatch, can_run_draft_extend_cuda_graph: bool
+    ):
 
         is_idle = batch.forward_mode.is_idle()
         origin_batch = None
@@ -814,10 +822,10 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
         else:
             forward_batch.seq_lens_sum = batch.seq_lens.sum().item()
-
         # Run
         can_cuda_graph = (
-            self.cuda_graph_runner_for_draft_extend
+            can_run_draft_extend_cuda_graph
+            and self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
         if can_cuda_graph:

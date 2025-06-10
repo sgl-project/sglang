@@ -309,7 +309,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         if bs != raw_bs:
             forward_batch.spec_info.accept_length = self.accept_length[:bs]
         forward_batch.spec_info.positions = None
-
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=self.req_pool_indices,
