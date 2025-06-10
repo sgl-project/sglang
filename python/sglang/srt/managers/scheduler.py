@@ -580,6 +580,7 @@ class Scheduler(
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
+        custom_pool_switch = os.environ.get("SGLANG_MOONCAKE_CUSTOM_POOL", False)
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
@@ -588,7 +589,14 @@ class Scheduler(
             req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
+            self.disagg_metadata_buffers = MetadataBuffers(
+                buffer_size,
+                custom_pool=(
+                    self.token_to_kv_pool_allocator.get_kvcache().custom_pool
+                    if custom_pool_switch
+                    else None
+                ),
+            )
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
@@ -629,7 +637,14 @@ class Scheduler(
             req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
+            self.disagg_metadata_buffers = MetadataBuffers(
+                buffer_size,
+                custom_pool=(
+                    self.token_to_kv_pool_allocator.get_kvcache().custom_pool
+                    if custom_pool_switch
+                    else None
+                ),
+            )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),

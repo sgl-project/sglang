@@ -26,6 +26,7 @@ KVCache actually holds the physical kv cache.
 
 import abc
 import logging
+import os
 import threading
 from enum import IntEnum
 from functools import wraps
@@ -263,6 +264,15 @@ class MHATokenToKVPool(KVCache):
 
         self.head_num = head_num
         self.head_dim = head_dim
+
+        # for disagg
+        self.custom_pool_switch = os.environ.get("SGLANG_MOONCAKE_CUSTOM_POOL", False)
+        if self.custom_pool_switch:
+            from sglang.srt.disaggregation.mooncake.memory_pool import CustomAllocator
+
+            allocator = CustomAllocator.get_allocator(self.device)
+            self.custom_pool = torch.cuda.MemPool(allocator.allocator())
+
         self._create_buffers()
 
         self.layer_transfer_counter = None
@@ -278,22 +288,41 @@ class MHATokenToKVPool(KVCache):
         with self.memory_saver_adapter.region():
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
-            self.v_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
+            if self.custom_pool_switch:
+                self.k_buffer = []
+                self.v_buffer = []
+
+                with torch.cuda.use_mem_pool(self.custom_pool):
+                    for _ in range(self.layer_num):
+                        k = torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        v = torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        self.k_buffer.append(k)
+                        self.v_buffer.append(v)
+            else:
+                self.k_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
 
     def _clear_buffers(self):
         del self.k_buffer
@@ -536,16 +565,36 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
 
+        # for disagg
+        self.custom_pool_switch = os.environ.get("SGLANG_MOONCAKE_CUSTOM_POOL", False)
+        if self.custom_pool_switch:
+            from sglang.srt.disaggregation.mooncake.memory_pool import CustomAllocator
+
+            allocator = CustomAllocator.get_allocator(self.device)
+            self.custom_pool = torch.cuda.MemPool(allocator.allocator())
+
         with self.memory_saver_adapter.region():
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.kv_buffer = [
-                torch.zeros(
-                    (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
-                    dtype=self.store_dtype,
-                    device=device,
-                )
-                for _ in range(layer_num)
-            ]
+            if self.custom_pool_switch:
+                self.kv_buffer = []
+
+                with torch.cuda.use_mem_pool(self.custom_pool):
+                    for _ in range(layer_num):
+                        kv = torch.zeros(
+                            (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
+                            dtype=self.store_dtype,
+                            device=device,
+                        )
+                        self.kv_buffer.append(kv)
+            else:
+                self.kv_buffer = [
+                    torch.zeros(
+                        (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
+                        dtype=self.store_dtype,
+                        device=device,
+                    )
+                    for _ in range(layer_num)
+                ]
 
         self.layer_transfer_counter = None
 
