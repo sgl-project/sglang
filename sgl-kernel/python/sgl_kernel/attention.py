@@ -54,8 +54,7 @@ def merge_state_v2(
 def cutlass_mla_decode(
     q_nope: torch.Tensor,
     q_pe: torch.Tensor,
-    k_nope: torch.Tensor,
-    k_pe: torch.Tensor,
+    kv_c_and_k_pe_cache: torch.Tensor,
     seq_lens: torch.Tensor,
     page_table: torch.Tensor,
     workspace: torch.Tensor,
@@ -63,21 +62,21 @@ def cutlass_mla_decode(
 ) -> torch.Tensor:
     assert q_nope.ndim == 3, f"q_nope must be a 3D tensor, but got {q_nope.ndim}"
     assert q_pe.ndim == 3, f"q_pe must be a 3D tensor, but got {q_pe.ndim}"
-    assert k_nope.ndim == 3, f"k_nope must be a 3D tensor, but got {k_nope.ndim}"
-    assert k_pe.ndim == 3, f"k_pe must be a 3D tensor, but got {k_pe.ndim}"
+    assert (
+        kv_c_and_k_pe_cache.ndim == 3
+    ), f"kv_c_and_k_pe_cache must be a 3D tensor, but got {kv_c_and_k_pe_cache.ndim}"
 
     B_q, H, D_q_nope = q_nope.shape
     B_q_2, H_2, D_q_pe = q_pe.shape
     assert (B_q == B_q_2) and (H == H_2)
 
-    _, PAGE_SIZE, D_k_nope = k_nope.shape
-    _, PAGE_SIZE_2, D_k_pe = k_pe.shape
-    assert PAGE_SIZE == PAGE_SIZE_2
+    _, PAGE_SIZE, D_ckv = kv_c_and_k_pe_cache.shape
 
     D_latent = 512
     D_rope = 64
-    assert D_q_nope == D_k_nope == D_latent
-    assert D_q_pe == D_k_pe == D_rope
+    assert D_q_nope == D_latent
+    assert D_q_pe == D_rope
+    assert D_ckv == D_latent + D_rope
 
     MAX_HEADS = 128
     assert H <= MAX_HEADS, f"H must be <= {MAX_HEADS}, but got {H}"
@@ -115,8 +114,7 @@ def cutlass_mla_decode(
         out,
         q_nope,
         q_pe,
-        k_nope,
-        k_pe,
+        kv_c_and_k_pe_cache,
         seq_lens,
         page_table,
         workspace,
