@@ -136,8 +136,7 @@ typename T::Fmha::Arguments args_from_options(
   using ElementAcc = typename T::ElementAcc;
   auto Q_nope_ptr = static_cast<Element*>(q_nope.data_ptr());
   auto Q_pe_ptr = static_cast<Element*>(q_pe.data_ptr());
-  auto K_nope_ptr = static_cast<Element*>(k_nope.data_ptr());
-  auto K_pe_ptr = static_cast<Element*>(k_pe.data_ptr());
+  auto C_ptr = static_cast<Element*>(kv_c_and_k_pe_cache.data_ptr());
   typename T::Fmha::Arguments arguments{
       problem_shape,
       {scale,
