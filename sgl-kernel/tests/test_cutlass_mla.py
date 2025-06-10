@@ -94,8 +94,11 @@ def test_cutlass_mla_decode(
     )
     workspace = torch.empty(workspace_size, device="cuda", dtype=torch.uint8)
 
-    q_nope = q[:, :, :dv].clone()
-    q_pe = q[:, :, dv:].clone()
+    # TODO temp
+    q_nope = q[:, :, :dv]
+    q_pe = q[:, :, dv:]
+    # q_nope = q[:, :, :dv].clone()
+    # q_pe = q[:, :, dv:].clone()
 
     out_ref = q.new_zeros(bs, h_q, dv)
     ref_mla(out_ref, q, kv_cache, scale, block_table, seq_lens)
