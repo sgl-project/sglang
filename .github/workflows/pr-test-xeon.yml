@@ -6,13 +6,13 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: pr-test-xeon-${{ github.ref }}
-  cancel-in-progress: true
+  group: pr-test-xeon
+  cancel-in-progress: false
 
 jobs:
   build-test:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: sgl-kernel-release-node
     strategy:
       matrix:
         build_type: ['all']
