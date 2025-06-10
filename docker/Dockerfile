@@ -23,7 +23,7 @@ RUN pip3 install datamodel_code_generator --break-system-packages
 WORKDIR /sgl-workspace
 
 ARG CUDA_VERSION
-RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six --break-system-packages \
+RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six --break-system-packages --ignore-installed \
     && git clone --depth=1 https://github.com/sgl-project/sglang.git \
     && if [ "$CUDA_VERSION" = "12.1.1" ]; then \
          export CUINDEX=121; \
