@@ -100,7 +100,7 @@ def cutlass_mla_decode(
         torch.float16,
         torch.bfloat16,
     ), f"q_nope.dtype needs to be fp16 or bf16 but got {q_nope.dtype}."
-    assert q_nope.dtype == q_pe.dtype == q_nope.dtype == k_pe.dtype
+    assert q_nope.dtype == q_pe.dtype == kv_c_and_k_pe_cache.dtype
     assert (
         seq_lens.dtype == torch.int32
     ), f"seq_lens.dtype needs to be int32 but got {seq_lens.dtype}."
