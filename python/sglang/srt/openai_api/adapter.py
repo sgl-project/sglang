@@ -1479,7 +1479,6 @@ async def v1_chat_completions(
         reasoning_parser_dict = {}
 
         async def generate_stream_resp():
-            tool_call_first = True
             is_firsts = {}
             stream_buffers = {}
             n_prev_tokens = {}
