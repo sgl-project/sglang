@@ -109,12 +109,14 @@ def cutlass_mla_decode(
         page_table.dtype == torch.int32
     ), f"page_table.dtype needs to be int32 but got {page_table.dtype}."
 
-    out = q_nope_and_q_pe.new_empty((B_q, MAX_HEADS, D_latent))
+    out = q_nope.new_empty((B_q, MAX_HEADS, D_latent))
 
     torch.ops.sgl_kernel.cutlass_mla_decode.default(
         out,
-        q_nope_and_q_pe,
-        kv_c_and_k_pe_cache,
+        q_nope,
+        q_pe,
+        k_nope,
+        k_pe,
         seq_lens,
         page_table,
         workspace,
