@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 import logging
-from fractions import Fraction # Added
-from typing import Any, Dict, List, Optional, Callable, Union # Added Callable, Union
+from fractions import Fraction  # Added
+from typing import Any, Callable, Dict, List, Optional, Union  # Added Callable, Union
 
 import torch
-from torch.nn import Parameter # Added
+from torch.nn import Parameter  # Added
 
-from sglang.srt.layers.linear import (
-    LinearBase, # Kept
-    LinearMethodBase, # Kept
-    UnquantizedLinearMethod, # Kept
-)
+from sglang.srt.layers.linear import LinearBase  # Kept
+from sglang.srt.layers.linear import LinearMethodBase  # Kept
+from sglang.srt.layers.linear import UnquantizedLinearMethod  # Kept
+
 # Removed PackedvLLMParameter, GroupQuantScaleParameter from here, will define AWQ versions
-from sglang.srt.layers.quantization.base_config import QuantizationConfig # Kept
+from sglang.srt.layers.quantization.base_config import QuantizationConfig  # Kept
 from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
@@ -24,15 +23,19 @@ logger = logging.getLogger(__name__)
 
 # Copied and modified from python/sglang/srt/layers/parameter.py
 
-def _adjust_shard_indexes_for_marlin(shard_size, shard_offset, marlin_tile_size): # Helper for _adjust_shard_indexes_for_packing
+
+def _adjust_shard_indexes_for_marlin(
+    shard_size, shard_offset, marlin_tile_size
+):  # Helper for _adjust_shard_indexes_for_packing
     return shard_size * marlin_tile_size, shard_offset * marlin_tile_size
 
+
 def _adjust_shard_indexes_for_packing(
-    shard_size, shard_offset, packed_factor, marlin_tile_size # Added marlin_tile_size
+    shard_size, shard_offset, packed_factor, marlin_tile_size  # Added marlin_tile_size
 ):
     shard_size = shard_size // packed_factor
     shard_offset = shard_offset // packed_factor
-    if marlin_tile_size is not None: # Added marlin_tile_size condition
+    if marlin_tile_size is not None:  # Added marlin_tile_size condition
         return _adjust_shard_indexes_for_marlin(
             shard_size=shard_size,
             shard_offset=shard_offset,
@@ -150,11 +153,15 @@ class _ColumnAWQParameter(BaseAWQParameter):
             )
 
         param_data = self.data
-        shard_id_val = tp_rank if shard_id == "q" else tp_rank // num_heads # Renamed shard_id to shard_id_val to avoid conflict
+        shard_id_val = (
+            tp_rank if shard_id == "q" else tp_rank // num_heads
+        )  # Renamed shard_id to shard_id_val to avoid conflict
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
         if not use_presharded_weights:
             loaded_weight = loaded_weight.narrow(
-                self.output_dim, shard_id_val * shard_size, shard_size # Used shard_id_val
+                self.output_dim,
+                shard_id_val * shard_size,
+                shard_size,  # Used shard_id_val
             )
 
         assert (
@@ -201,10 +208,11 @@ class AWQModelWeightParameter(_ColumnAWQParameter, RowAWQParameter):
     Parameter class for linear layer weights. Uses both column and
     row parallelism. (Renamed from ModelWeightParameter)
     """
+
     pass
 
 
-class PackedColumnAWQParameter(_ColumnAWQParameter): # Added this class
+class PackedColumnAWQParameter(_ColumnAWQParameter):  # Added this class
     """
     Parameter for model parameters which are packed on disk
     and support column parallelism only. (Renamed from PackedColumnParameter)
@@ -235,7 +243,7 @@ class PackedColumnAWQParameter(_ColumnAWQParameter): # Added this class
         return self._marlin_tile_size
 
     def adjust_shard_indexes_for_packing(self, shard_size, shard_offset):
-        return _adjust_shard_indexes_for_packing( # Uses the local function
+        return _adjust_shard_indexes_for_packing(  # Uses the local function
             shard_size=shard_size,
             shard_offset=shard_offset,
             packed_factor=self.packed_factor,
@@ -274,12 +282,13 @@ class PackedAWQParameter(AWQModelWeightParameter):
         return self._marlin_tile_size
 
     def adjust_shard_indexes_for_packing(self, shard_size, shard_offset):
-        return _adjust_shard_indexes_for_packing( # Uses the local function
+        return _adjust_shard_indexes_for_packing(  # Uses the local function
             shard_size=shard_size,
             shard_offset=shard_offset,
             packed_factor=self.packed_factor,
             marlin_tile_size=self.marlin_tile_size,
         )
+
 
 # End of copied and modified code from parameter.py
 
@@ -290,7 +299,8 @@ class FusedAWQLinearMethod(LinearMethodBase):
     Linear method for AWQ that handles packing and unpacking internally
     using torch.nn.Parameter for qweight and qzeros.
     """
-    def __init__(self, quant_config: "AWQConfig"): # Forward reference AWQConfig
+
+    def __init__(self, quant_config: "AWQConfig"):  # Forward reference AWQConfig
         self.quant_config = quant_config
 
     def create_weights(
@@ -313,31 +323,31 @@ class FusedAWQLinearMethod(LinearMethodBase):
         output_size_per_partition = sum(output_partition_sizes)
         # For qweight and qzeros, the packing is handled by awq_dequantize,
         # so the shape of the Parameter should be the packed shape.
-        packed_output_size_per_partition = output_size_per_partition // self.quant_config.pack_factor
+        packed_output_size_per_partition = (
+            output_size_per_partition // self.quant_config.pack_factor
+        )
 
         if output_size_per_partition % self.quant_config.pack_factor != 0:
             # This check might be redundant if the one for qweight/qzeros shape is correct
-            raise ValueError(
-                "The output size is not aligned with the pack factor."
-            )
+            raise ValueError("The output size is not aligned with the pack factor.")
 
         qweight_data = torch.empty(
             input_size_per_partition,
             packed_output_size_per_partition,
-            dtype=torch.int32, # AWQ kernels expect int32 for packed weights
+            dtype=torch.int32,  # AWQ kernels expect int32 for packed weights
         )
         qweight = Parameter(qweight_data, requires_grad=False)
 
         qzeros_data = torch.empty(
             input_size_per_partition // self.quant_config.group_size,
             packed_output_size_per_partition,
-            dtype=torch.int32, # AWQ kernels expect int32 for packed zeros
+            dtype=torch.int32,  # AWQ kernels expect int32 for packed zeros
         )
         qzeros = Parameter(qzeros_data, requires_grad=False)
 
         scales_data = torch.empty(
             input_size_per_partition // self.quant_config.group_size,
-            output_size_per_partition, # Scales are not packed
+            output_size_per_partition,  # Scales are not packed
             dtype=params_dtype,
         )
         scales = Parameter(scales_data, requires_grad=False)
@@ -350,7 +360,6 @@ class FusedAWQLinearMethod(LinearMethodBase):
         # Or pass them to apply method if preferred, but apply signature is fixed by LinearMethodBase
         # Storing on layer is a common pattern.
         layer.quant_config = self.quant_config
-
 
     def apply(
         self,
@@ -380,12 +389,15 @@ class FusedAWQLinearMethod(LinearMethodBase):
         out = torch.matmul(reshaped_x, dequantized_weight)
 
         if bias is not None:
-            out = out + bias # In-place add can cause issues with autograd if x requires grad
+            out = (
+                out + bias
+            )  # In-place add can cause issues with autograd if x requires grad
         return out.reshape(out_shape)
 
 
 # --- Existing AWQConfig and AWQLinearMethod ---
 # (Copied from the original python/sglang/srt/layers/quantization/awq.py)
+
 
 def is_layer_skipped_awq(prefix: str, modules_to_not_convert: List[str]):
     return any(module_name in prefix for module_name in modules_to_not_convert)
@@ -520,7 +532,7 @@ class AWQLinearMethod(LinearMethodBase):
         # class GroupQuantScaleParameter(_ColumnvLLMParameter, RowvLLMParameter): pass
         # So, I'll define GroupQuantScaleAWQParameter similarly.
 
-        qweight = PackedAWQParameter( # Uses the new PackedAWQParameter
+        qweight = PackedAWQParameter(  # Uses the new PackedAWQParameter
             data=torch.empty(
                 input_size_per_partition,
                 output_size_per_partition // self.quant_config.pack_factor,
@@ -533,7 +545,7 @@ class AWQLinearMethod(LinearMethodBase):
             weight_loader=weight_loader,
         )
 
-        qzeros = PackedAWQParameter( # Uses the new PackedAWQParameter
+        qzeros = PackedAWQParameter(  # Uses the new PackedAWQParameter
             data=torch.empty(
                 input_size_per_partition // self.quant_config.group_size,
                 output_size_per_partition // self.quant_config.pack_factor,
@@ -546,15 +558,17 @@ class AWQLinearMethod(LinearMethodBase):
             weight_loader=weight_loader,
         )
 
-        scales = GroupQuantScaleAWQParameter( # Uses the new GroupQuantScaleAWQParameter
-            data=torch.empty(
-                input_size_per_partition // self.quant_config.group_size,
-                output_size_per_partition,
-                dtype=params_dtype,
-            ),
-            input_dim=0,
-            output_dim=1,
-            weight_loader=weight_loader,
+        scales = (
+            GroupQuantScaleAWQParameter(  # Uses the new GroupQuantScaleAWQParameter
+                data=torch.empty(
+                    input_size_per_partition // self.quant_config.group_size,
+                    output_size_per_partition,
+                    dtype=params_dtype,
+                ),
+                input_dim=0,
+                output_dim=1,
+                weight_loader=weight_loader,
+            )
         )
 
         layer.register_parameter("qweight", qweight)
@@ -578,7 +592,9 @@ class AWQLinearMethod(LinearMethodBase):
         scales = layer.scales
         qzeros = layer.qzeros
         pack_factor = self.quant_config.pack_factor
-        out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,) # This assumes qweight is packed
+        out_shape = x.shape[:-1] + (
+            qweight.shape[-1] * pack_factor,
+        )  # This assumes qweight is packed
         reshaped_x = x.reshape(-1, x.shape[-1])
 
         if not _is_cuda:
@@ -591,8 +607,9 @@ class AWQLinearMethod(LinearMethodBase):
         out = torch.matmul(reshaped_x, out)
 
         if bias is not None:
-            out = out + bias # In-place add can cause issues
+            out = out + bias  # In-place add can cause issues
         return out.reshape(out_shape)
+
 
 # Define GroupQuantScaleAWQParameter used in AWQLinearMethod
 class GroupQuantScaleAWQParameter(_ColumnAWQParameter, RowAWQParameter):
@@ -600,4 +617,5 @@ class GroupQuantScaleAWQParameter(_ColumnAWQParameter, RowAWQParameter):
     Parameter class for weight scales loaded for weights with
     grouped quantization, adapted for AWQ.
     """
+
     pass
