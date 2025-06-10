@@ -126,8 +126,8 @@ typename T::Fmha::Arguments args_from_options(
   using StrideO = typename T::StrideO;
   using StrideLSE = typename T::StrideLSE;
 
-  int64_t q_nope_D_stride = q_nope.stride(2);
-  int64_t q_pe_D_stride = q_pe.stride(2);
+  int64_t q_nope_D_stride = q_nope.stride(1);
+  int64_t q_pe_D_stride = q_pe.stride(1);
 
   StrideQ stride_Q_nope = cute::make_tuple(
       static_cast<int64_t>(0 + q_nope_D_stride), _1{}, static_cast<int64_t>(H * (0 + q_nope_D_stride)));
