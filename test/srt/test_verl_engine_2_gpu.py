@@ -38,38 +38,16 @@ _ENABLE_UPDATE_WEIGHTS = True
 # _ENABLE_UPDATE_WEIGHTS = False
 
 # TODO maybe we should add more other models? should we keep it in sync with test_generation_models.py?
-CI_MODELS = [
-    dict(model_path="meta-llama/Llama-3.1-8B-Instruct"),
-    # Fail to run gemma-2-2b after transformers==4.48.3 -> 4.50.0
-    # dict(model_path="google/gemma-2-2b"),
-]
-ALL_OTHER_MODELS = [
+ALL_MODELS = [
     dict(model_path="meta-llama/Llama-3.2-1B-Instruct"),
     dict(model_path="Qwen/Qwen2-1.5B"),
-    dict(
-        model_path="Qwen/Qwen2.5-14B-Instruct",
-        mem_fraction_static=0.4,
-        tp_size=8,
-        tight_memory=True,
-        decode_tolerance=1.3,
-    ),  # test_generation_models.py same config (qwen + tp=8) gives 1.22 decode error
-    dict(model_path="HuggingFaceTB/SmolLM-135M-Instruct", tp_size=3),
     dict(model_path="allenai/OLMo-1B-0724-hf"),
-    dict(
-        model_path="THUDM/glm-4-9b-chat",
-        mem_fraction_static=0.1,
-        tp_size=8,
-        tight_memory=True,
-    ),
     dict(model_path="allenai/OLMo-2-1124-7B-Instruct"),
     dict(
         model_path="ibm-granite/granite-3.0-2b-instruct",
         prefill_tolerance=0.22,
         decode_tolerance=0.22,
     ),
-    # Fail to run these models in test_generation_models.py, need to fix that first
-    # dict(model_path="openai-community/gpt2"),
-    # dict(model_path="microsoft/Phi-3-small-8k-instruct"),
 ]
 
 
@@ -83,6 +61,7 @@ class TestVerlEngine(CustomTestCase):
         index: int,
         model_path: str,
         mem_fraction_static: float = 0.4,
+        dp_size: int = 1,
         tp_size: int = 2,
         tight_memory: bool = False,
         prefill_tolerance: float = 0.1,
@@ -94,11 +73,13 @@ class TestVerlEngine(CustomTestCase):
 
         processes = []
         output_reader, output_writer = mp.Pipe(duplex=False)
-        for tp_rank in range(tp_size):
+        world_size = dp_size * tp_size
+        for rank in range(world_size):
             p = Process(
                 target=_run_subprocess,
                 kwargs=dict(
-                    tp_rank=tp_rank,
+                    rank=rank,
+                    dp_size=dp_size,
                     tp_size=tp_size,
                     master_port=master_port,
                     output_writer=output_writer,
@@ -122,14 +103,15 @@ class TestVerlEngine(CustomTestCase):
             p.join()
 
     def test_ci_models(self):
-        for index, model_info in enumerate(CI_MODELS):
+        ci_models = [random.choice(ALL_MODELS)]
+        for index, model_info in enumerate(ci_models):
             self.assert_fragment_e2e_execution(index=index, **model_info)
 
     def test_others(self):
         if is_in_ci():
             return
 
-        for index, model_info in enumerate(ALL_OTHER_MODELS):
+        for index, model_info in enumerate(ALL_MODELS):
             self.assert_fragment_e2e_execution(index=index, **model_info)
 
     # def test_adhoc(self):
@@ -137,7 +119,8 @@ class TestVerlEngine(CustomTestCase):
 
 
 def _run_subprocess(
-    tp_rank: int,
+    rank: int,
+    dp_size: int,
     tp_size: int,
     master_port: int,
     output_writer,
@@ -148,18 +131,22 @@ def _run_subprocess(
     decode_tolerance: float,
 ):
     try:
-        print(f"subprocess[{tp_rank=}] Start {os.environ.get('CUDA_VISIBLE_DEVICES')=}")
+        print(f"subprocess[{rank=}] Start {os.environ.get('CUDA_VISIBLE_DEVICES')=}")
 
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(master_port)
-        torch.distributed.init_process_group(rank=tp_rank, world_size=tp_size)
-        torch.cuda.set_device(tp_rank)
+        torch.distributed.init_process_group(rank=rank, world_size=dp_size * tp_size)
+        torch.cuda.set_device(rank)
 
-        mesh_kwargs = dict(mesh_shape=(tp_size, 1), mesh_dim_names=["tp", "pp"])
+        base_gpu_id = rank // tp_size * tp_size
+
+        mesh_kwargs = dict(
+            mesh_shape=(dp_size, tp_size, 1), mesh_dim_names=["dp", "tp", "pp"]
+        )
         inference_device_mesh_device = init_device_mesh("cuda", **mesh_kwargs)
         inference_device_mesh_cpu = init_device_mesh("cpu", **mesh_kwargs)
         print(
-            f"subprocess[{tp_rank=}] {inference_device_mesh_device=} {inference_device_mesh_cpu=}"
+            f"subprocess[{rank=},{base_gpu_id=}] {inference_device_mesh_device=} {inference_device_mesh_cpu=}"
         )
 
         # hf model is used for comparison
@@ -178,7 +165,7 @@ def _run_subprocess(
             output_str_only=False,
         )
         print(
-            f"subprocess[{tp_rank=}] call hf.forward {hf_outputs=}",
+            f"subprocess[{rank=}] call hf.forward {hf_outputs=}",
             flush=True,
         )
 
@@ -188,22 +175,25 @@ def _run_subprocess(
                 torch.cuda.empty_cache()
 
             # test update weights
-            print(f"subprocess[{tp_rank=}] get_fsdp_state_dict", flush=True)
-            fsdp_state_dict = _get_fsdp_state_dict(hf_model=hf_model, tp_size=tp_size)
+            print(f"subprocess[{rank=}] get_fsdp_state_dict", flush=True)
+            fsdp_state_dict = _get_fsdp_state_dict(
+                hf_model=hf_model, world_size=dp_size * tp_size
+            )
 
         engine = VerlEngine(
             model_path=model_path,
             load_format="dummy" if _ENABLE_UPDATE_WEIGHTS else "auto",
             mem_fraction_static=mem_fraction_static,
             random_seed=42,
+            base_gpu_id=base_gpu_id,
             trust_remote_code=True,
             dtype=get_dtype_str(_TORCH_DTYPE),
             device_mesh_cpu=inference_device_mesh_cpu["tp"],
         )
-        print(f"subprocess[{tp_rank=}] {engine=}", flush=True)
+        print(f"subprocess[{rank=}] {engine=}", flush=True)
 
         if _ENABLE_UPDATE_WEIGHTS:
-            print(f"subprocess[{tp_rank=}] call update_weights_from_tensor", flush=True)
+            print(f"subprocess[{rank=}] call update_weights_from_tensor", flush=True)
             engine.update_weights_from_tensor(
                 [(k, v) for k, v in fsdp_state_dict.items()]
             )
@@ -221,7 +211,7 @@ def _run_subprocess(
                 engine=engine,
             )
             print(
-                f"subprocess[{tp_rank=}] call srt.forward {enable_batch=} {srt_outputs=}",
+                f"subprocess[{rank=}] call srt.forward {enable_batch=} {srt_outputs=}",
                 flush=True,
             )
 
@@ -232,13 +222,13 @@ def _run_subprocess(
                 decode_tolerance=decode_tolerance,
                 rouge_l_tolerance=1,
                 check_logprobs=not enable_batch,
-                debug_text=f"{enable_batch=} {tp_rank=}",
+                debug_text=f"{enable_batch=} {rank=}",
             )
 
         execution_ok = True
 
     except Exception as e:
-        print(f"subprocess[{tp_rank=}] has error: {e}", flush=True)
+        print(f"subprocess[{rank=}] has error: {e}", flush=True)
         traceback.print_exc()
         execution_ok = False
 
@@ -246,13 +236,13 @@ def _run_subprocess(
     output_writer.close()
 
     engine.shutdown()
-    print(f"subprocess[{tp_rank=}] end", flush=True)
+    print(f"subprocess[{rank=}] end", flush=True)
 
 
 # Adapted from https://github.com/volcengine/verl/blob/main/tests/rollout/run_fsdp_vllm.py
-def _get_fsdp_state_dict(hf_model, tp_size: int):
+def _get_fsdp_state_dict(hf_model, world_size: int):
     device_mesh = init_device_mesh(
-        "cuda", mesh_shape=(tp_size,), mesh_dim_names=["fsdp"]
+        "cuda", mesh_shape=(world_size,), mesh_dim_names=["fsdp"]
     )
 
     mixed_precision = MixedPrecision(

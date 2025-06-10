@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -1268,6 +1269,29 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             }
 
+            self.draft_extend_metadata = {
+                "cache_seqlens": torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                ),
+                "cu_seqlens_q": torch.zeros(
+                    max_bs + 1,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "cu_seqlens_k": torch.zeros(
+                    max_bs + 1, dtype=torch.int32, device=self.device
+                ),
+                "page_table": torch.zeros(
+                    max_bs,
+                    (self.max_context_len + self.page_size - 1) // self.page_size,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "strided_indices": torch.arange(
+                    0, self.max_context_len, self.page_size, device=self.device
+                ),
+            }
+
         if self.topk > 1:
             self.target_verify_metadata_topk_normal = {
                 "cache_seqlens": torch.zeros(
@@ -1508,6 +1532,32 @@ class FlashAttentionBackend(AttentionBackend):
 
                 self.target_verify_metadata_topk_normal[bs] = metadata
                 self.target_verify_metadata_topk_expand[bs] = metadata_expand
+        elif forward_mode.is_draft_extend():
+            metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
+                :bs
+            ]
+            metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+
+            num_tokens_per_bs = num_tokens // bs
+            metadata.max_seq_len_q = num_tokens_per_bs
+            metadata.max_seq_len_k = seq_lens.max().item()
+
+            metadata.cu_seqlens_q = torch.arange(
+                0,
+                bs * num_tokens_per_bs + 1,
+                num_tokens_per_bs,
+                dtype=torch.int32,
+                device=device,
+            )
+
+            metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][
+                : (bs + 1)
+            ]
+            metadata.page_table = self.draft_extend_metadata["page_table"][
+                req_pool_indices, :
+            ]
+
+            self.draft_extend_metadata[bs] = metadata
 
         if encoder_lens is not None:
             encoder_bs = encoder_lens.numel()
@@ -1608,29 +1658,21 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 # TODO: Handle local attention metadata for draft decode when llama4 eagle is supported
             else:
-                metadata = self.decode_cuda_graph_metadata[bs]
                 # Normal Decode
+                metadata = self.decode_cuda_graph_metadata[bs]
                 max_len = seq_lens_cpu.max().item()
+                max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                 metadata.max_seq_len_k = max_len
 
-                metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
-                # Optimize cumulative sequence length calculation
-                metadata.cu_seqlens_k[1:].copy_(
-                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32)
+                normal_decode_set_medadata(
+                    metadata,
+                    self.req_to_token,
+                    req_pool_indices,
+                    self.decode_cuda_graph_metadata["strided_indices"],
+                    max_seq_pages,
+                    seq_lens,
+                    self.page_size,
                 )
-
-                max_seq_pages = (
-                    metadata.max_seq_len_k + self.page_size - 1
-                ) // self.page_size
-                page_indices = self.req_to_token[
-                    req_pool_indices[:, None],
-                    self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages][
-                        None, :
-                    ],
-                ]
-                page_indices //= self.page_size
-                metadata.page_table[:, :max_seq_pages].copy_(page_indices)
-                metadata.page_table[:, max_seq_pages:].fill_(0)
 
                 self._update_local_attn_metadata_for_replay(metadata, bs)
         elif forward_mode.is_target_verify():
@@ -1732,6 +1774,29 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata_expand.max_seq_len_k = (
                     metadata_expand.cache_seqlens_int32.max().item()
                 )
+        elif forward_mode.is_draft_extend():
+            metadata = self.draft_extend_metadata[bs]
+            metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+
+            metadata.max_seq_len_k = seq_lens_cpu.max().item()
+            metadata.cu_seqlens_k[1:].copy_(
+                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+            )
+            accept_length = spec_info.accept_length[:bs]
+            metadata.max_seq_len_q = accept_length.max().item()
+            metadata.cu_seqlens_q[1:].copy_(
+                torch.cumsum(accept_length, dim=0, dtype=torch.int32)
+            )
+
+            max_seq_pages = (
+                metadata.max_seq_len_k + self.page_size - 1
+            ) // self.page_size
+            page_indices = self.req_to_token[
+                req_pool_indices[:, None],
+                self.draft_extend_metadata["strided_indices"][:max_seq_pages],
+            ]
+            page_indices //= self.page_size
+            metadata.page_table[:, :max_seq_pages].copy_(page_indices)
 
         if encoder_lens is not None:
             # Only support encoder size 1 for now
@@ -1991,3 +2056,23 @@ class FlashAttentionMultiStepBackend:
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 out_cache_loc=forward_batch.out_cache_loc,
             )
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def normal_decode_set_medadata(
+    metadata,
+    req_to_token,
+    req_pool_indices,
+    strided_indices,
+    max_seq_pages,
+    seq_lens,
+    page_size,
+):
+    metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+    metadata.cu_seqlens_k[1:].copy_(torch.cumsum(seq_lens, dim=0, dtype=torch.int32))
+    page_indices = req_to_token[
+        req_pool_indices[:, None],
+        strided_indices[:max_seq_pages][None, :],
+    ]
+    metadata.page_table[:, :max_seq_pages].copy_(page_indices // page_size)
+    metadata.page_table[:, max_seq_pages:].fill_(0)
