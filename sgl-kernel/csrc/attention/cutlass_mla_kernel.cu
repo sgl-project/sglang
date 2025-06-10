@@ -91,8 +91,10 @@ struct MlaSm100 {
 template <typename T>
 typename T::Fmha::Arguments args_from_options(
     at::Tensor const& out,
-    at::Tensor const& q_nope_and_q_pe,
-    at::Tensor const& kv_c_and_k_pe_cache,
+    at::Tensor const& q_nope,
+    at::Tensor const& q_pe,
+    at::Tensor const& k_nope,
+    at::Tensor const& k_pe,
     at::Tensor const& seq_lens,
     at::Tensor const& page_table,
     int64_t num_kv_splits) {
@@ -181,7 +183,7 @@ void runMla(
     cudaStream_t stream) {
   using MlaSm100Type = MlaSm100<Element, IsPaged128, PersistenceOption>;
   typename MlaSm100Type::Fmha fmha;
-  auto arguments = args_from_options<MlaSm100Type>(out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, num_kv_splits);
+  auto arguments = args_from_options<MlaSm100Type>(out, q_nope, q_pe, k_nope, k_pe, seq_lens, page_table, num_kv_splits);
 
   CUTLASS_CHECK(fmha.can_implement(arguments));
 
