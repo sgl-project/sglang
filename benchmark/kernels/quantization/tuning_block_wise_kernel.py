@@ -24,6 +24,9 @@ import torch
 import triton
 from tqdm import tqdm
 
+# Global lock for save_configs
+save_configs_lock = mp.Lock()
+
 mp.set_start_method("spawn", force=True)
 
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -312,6 +315,7 @@ def tune(M, N, K, block_size, out_dtype, search_space, input_type):
     return best_config
 
 
+
 def save_configs(
     N,
     K,
@@ -321,16 +325,31 @@ def save_configs(
     save_path,
     input_type="fp8",
 ) -> None:
-    os.makedirs(save_path, exist_ok=True)
-    device_name = get_device_name().replace(" ", "_")
-    json_file_name = f"N={N},K={K},device_name={device_name},dtype={input_type}_w8a8,block_shape=[{block_n}, {block_k}].json"
+    with save_configs_lock:
+        os.makedirs(save_path, exist_ok=True)
+        device_name = get_device_name().replace(" ", "_")
+        json_file_name = f"N={N},K={K},device_name={device_name},dtype={input_type}_w8a8,block_shape=[{block_n}, {block_k}].json"
 
-    config_file_path = os.path.join(save_path, json_file_name)
-    print(f"Writing best config to {config_file_path}...")
+        config_file_path = os.path.join(save_path, json_file_name)
+        print(f"Writing best config to {config_file_path}...")
 
-    with open(config_file_path, "w") as f:
-        json.dump(configs, f, indent=4)
-        f.write("\n")
+        # Load existing configs if file exists
+        existing_configs = {}
+        if os.path.exists(config_file_path):
+            with open(config_file_path, "r") as f:
+                existing_configs = json.load(f)
+
+        # Merge existing configs with new configs
+        merged_configs = {int(k): v for k, v in {**existing_configs, **configs}.items()}
+
+        # Sort configs by numeric keys
+        sorted_configs = dict(sorted(merged_configs.items()))
+
+        with open(config_file_path, "w") as f:
+            json.dump(sorted_configs, f, indent=4)
+            f.write("\n")
+
+
 
 
 def get_available_gpu_count():
