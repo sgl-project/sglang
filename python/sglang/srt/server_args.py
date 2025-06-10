@@ -228,6 +228,7 @@ class ServerArgs:
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_ib_device: Optional[str] = None
+    num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
 
     def __post_init__(self):
@@ -1480,6 +1481,12 @@ class ServerArgs:
             help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
             "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
             "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+        )
+        parser.add_argument(
+            "--num-reserved-decode-tokens",
+            type=int,
+            default=ServerArgs.num_reserved_decode_tokens,
+            help="Number of decode tokens that will have memory reserved when adding new request to the running batch.",
         )
         parser.add_argument(
             "--pdlb-url",
