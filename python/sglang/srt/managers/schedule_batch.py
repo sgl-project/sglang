@@ -37,6 +37,7 @@ import hashlib
 import logging
 import threading
 from enum import Enum, auto
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -51,6 +52,7 @@ from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -60,7 +62,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import flatten_nested_list, get_compiler_backend
+from sglang.srt.utils import flatten_nested_list, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -68,33 +70,38 @@ if TYPE_CHECKING:
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
+GLOBAL_SERVER_ARGS_KEYS = [
+    "attention_backend",
+    "debug_tensor_dump_inject",
+    "debug_tensor_dump_output_folder",
+    "chunked_prefill_size",
+    "deepep_mode",
+    "device",
+    "disable_chunked_prefix_cache",
+    "disable_radix_cache",
+    "enable_deepep_moe",
+    "enable_dp_attention",
+    "enable_two_batch_overlap",
+    "enable_dp_lm_head",
+    "enable_ep_moe",
+    "deepep_config",
+    "enable_nan_detection",
+    "flashinfer_mla_disable_ragged",
+    "max_micro_batch_size",
+    "moe_dense_tp_size",
+    "ep_dispatch_algorithm",
+    "disable_shared_experts_fusion",
+    "sampling_backend",
+    "speculative_accept_threshold_acc",
+    "speculative_accept_threshold_single",
+    "torchao_config",
+    "triton_attention_reduce_in_fp32",
+    "ep_num_redundant_experts",
+    "mm_attention_backend",
+]
+
 # Put some global args for easy access
-global_server_args_dict = {
-    "attention_backend": ServerArgs.attention_backend,
-    "chunked_prefill_size": ServerArgs.chunked_prefill_size,
-    "deepep_mode": ServerArgs.deepep_mode,
-    "device": ServerArgs.device,
-    "disable_chunked_prefix_cache": ServerArgs.disable_chunked_prefix_cache,
-    "disable_radix_cache": ServerArgs.disable_radix_cache,
-    "enable_deepep_moe": ServerArgs.enable_deepep_moe,
-    "enable_dp_attention": ServerArgs.enable_dp_attention,
-    "enable_two_batch_overlap": ServerArgs.enable_two_batch_overlap,
-    "enable_dp_lm_head": ServerArgs.enable_dp_lm_head,
-    "enable_ep_moe": ServerArgs.enable_ep_moe,
-    "deepep_config": ServerArgs.deepep_config,
-    "enable_nan_detection": ServerArgs.enable_nan_detection,
-    "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
-    "max_micro_batch_size": ServerArgs.max_micro_batch_size,
-    "moe_dense_tp_size": ServerArgs.moe_dense_tp_size,
-    "ep_dispatch_algorithm": ServerArgs.ep_dispatch_algorithm,
-    "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
-    "sampling_backend": ServerArgs.sampling_backend,
-    "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
-    "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
-    "torchao_config": ServerArgs.torchao_config,
-    "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
-    "ep_num_redundant_experts": ServerArgs.ep_num_redundant_experts,
-}
+global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
 
 logger = logging.getLogger(__name__)
 
@@ -186,7 +193,7 @@ class MultimodalDataItem:
     # the real data, pixel_values or audio_features
     # data: Union[List[torch.Tensor], List[np.ndarray]]
     pixel_values: Union[torch.Tensor, np.ndarray] = None
-    image_grid_thws: Union[torch.Tensor, np.ndarray] = None
+    image_grid_thw: Union[torch.Tensor, np.ndarray] = None
     video_grid_thws: Union[torch.Tensor, np.ndarray] = None
 
     image_emb_mask: Optional[torch.Tensor] = None
@@ -195,6 +202,9 @@ class MultimodalDataItem:
 
     # [num_images, (n, w, h)]
     tgt_size: Tuple[int, int] = None
+
+    # kimi-vl related
+    image_grid_hws: Optional[List[torch.Tensor]] = None
 
     audio_features: Union[torch.Tensor, np.ndarray] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
@@ -441,6 +451,7 @@ class Req:
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        data_parallel_rank: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -594,6 +605,9 @@ class Req:
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
         self.disagg_kv_sender: Optional[BaseKVSender] = None
+
+        # For data parallel rank routing
+        self.data_parallel_rank: Optional[int] = data_parallel_rank
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
@@ -770,6 +784,16 @@ class Req:
             prefix = f"Req Time Stats(rid={self.rid}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.get_type().value})"
         logger.info(f"{prefix}: {self.time_stats}")
         self.has_log_time_stats = True
+
+    def set_finish_with_abort(self, error_msg: str):
+        if get_tensor_model_parallel_rank() == 0:
+            logger.error(f"{error_msg}, {self.rid=}")
+        self.multimodal_inputs = None
+        self.grammar = None
+        self.origin_input_ids = [0]  # set it to one token to skip the long prefill
+        self.finished_reason = FINISH_ABORT(
+            error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
+        )
 
     def __repr__(self):
         return (
@@ -1257,7 +1281,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         # Write to req_to_token_pool
-        if global_server_args_dict["attention_backend"] != "torch_native":
+        if support_triton(global_server_args_dict.get("attention_backend")):
             # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
 
             write_req_to_token_pool_triton[(bs,)](
@@ -1321,7 +1345,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         page_size = self.token_to_kv_pool_allocator.page_size
         if page_size == 1:
             return len(self.reqs)
-        return sum(1 for req in self.reqs if req.seqlen % page_size == 0)
+        # In the decoding phase, the length of a request's KV cache should be
+        # the total length of the request minus 1
+        return sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
 
     def check_decode_mem(self, buf_multiplier=1):
         tokens_required = (
@@ -1610,7 +1636,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
-    def get_model_worker_batch(self) -> ModelWorkerBatch:
+    def get_model_worker_batch(
+        self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
+    ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
@@ -1620,16 +1648,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Create seq_lens_cpu when needed
         if (
-            (
+            global_server_args_dict["attention_backend"] == "fa3"
+            or (
                 global_server_args_dict["use_mla_backend"]
                 and global_server_args_dict["attention_backend"] == "flashinfer"
             )
             or global_server_args_dict["attention_backend"] == "flashmla"
-            or global_server_args_dict["attention_backend"] == "fa3"
             or global_server_args_dict["attention_backend"] == "cutlass_mla"
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
-            seq_lens_cpu = self.seq_lens.cpu()
+            seq_lens_cpu = (
+                seq_lens_cpu_cache
+                if seq_lens_cpu_cache is not None
+                else self.seq_lens.cpu()
+            )
         else:
             seq_lens_cpu = None
 
@@ -1648,6 +1680,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
             out_cache_loc=self.out_cache_loc,
+            seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=self.seq_lens_sum,
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
@@ -1657,7 +1690,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             tbo_split_seq_index=self.tbo_split_seq_index,
             global_forward_mode=self.global_forward_mode,
-            seq_lens_cpu=seq_lens_cpu,
             extend_num_tokens=self.extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -1719,11 +1751,11 @@ class ModelWorkerBatch:
     req_pool_indices: torch.Tensor
     # The sequence length
     seq_lens: torch.Tensor
-    seq_lens_cpu: Optional[torch.Tensor]
     # The indices of output tokens in the token_to_kv_pool_allocator
     out_cache_loc: torch.Tensor
 
-    # The sum of all sequence lengths
+    # The sequence length tensor on CPU
+    seq_lens_cpu: Optional[torch.Tensor]
     seq_lens_sum: int
 
     # For logprob
