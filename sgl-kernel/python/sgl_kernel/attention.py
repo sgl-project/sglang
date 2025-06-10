@@ -97,14 +97,11 @@ def cutlass_mla_decode(
     assert block_num % (128 / PAGE_SIZE) == 0
 
     # TODO(kaixih@nvidia): support fp8
-    assert q_nope_and_q_pe.dtype in (
+    assert q_nope.dtype in (
         torch.float16,
         torch.bfloat16,
-    ), f"q_nope_and_q_pe.dtype needs to be fp16 or bf16 but got {q_nope_and_q_pe.dtype}."
-    assert kv_c_and_k_pe_cache.dtype == q_nope_and_q_pe.dtype, (
-        f"kv_c_and_k_pe_cache.dtype needs to be the same as q_nope_and_q_pe.dtype, "
-        f"but got {kv_c_and_k_pe_cache.dtype}."
-    )
+    ), f"q_nope.dtype needs to be fp16 or bf16 but got {q_nope.dtype}."
+    assert q_nope.dtype == q_pe.dtype == q_nope.dtype == k_pe.dtype
     assert (
         seq_lens.dtype == torch.int32
     ), f"seq_lens.dtype needs to be int32 but got {seq_lens.dtype}."
