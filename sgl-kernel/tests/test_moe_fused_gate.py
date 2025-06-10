@@ -19,7 +19,7 @@ from sglang.srt.layers.moe.topk import biased_grouped_topk
         (512, 16, 8, 16),
     ],
 )
-@pytest.mark.parametrize("num_fused_shared_experts", [0, 1])
+@pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
 def test_moe_fused_gate_combined(seq_length, dtype, params, num_fused_shared_experts):
     num_experts, num_expert_group, topk_group, topk = params
 
@@ -27,7 +27,7 @@ def test_moe_fused_gate_combined(seq_length, dtype, params, num_fused_shared_exp
     tensor = torch.rand((seq_length, num_experts)).to(dtype).cuda()
     scores = tensor.clone()
     bias = torch.rand(num_experts).to(dtype).cuda()
-    topk = topk + min(1, num_fused_shared_experts)
+    topk = topk + num_fused_shared_experts
 
     output, indices = moe_fused_gate(
         tensor,
