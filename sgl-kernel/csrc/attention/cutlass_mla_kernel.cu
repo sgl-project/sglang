@@ -127,9 +127,9 @@ typename T::Fmha::Arguments args_from_options(
   using StrideLSE = typename T::StrideLSE;
 
   StrideQ stride_Q_nope = cute::make_tuple(
-      static_cast<int64_t>(q_nope.stride(1), _1{}, static_cast<int64_t>(q_nope.stride(0)));
+      static_cast<int64_t>(q_nope.stride(1)), _1{}, static_cast<int64_t>(q_nope.stride(0)));
   StrideQ stride_Q_pe = cute::make_tuple(
-      static_cast<int64_t>(q_pe.stride(1), _1{}, static_cast<int64_t>(q_pe.stride(0)));
+      static_cast<int64_t>(q_pe.stride(1)), _1{}, static_cast<int64_t>(q_pe.stride(0)));
 
   StrideK stride_C = cute::make_tuple(
       static_cast<int64_t>(0 + D_latent + D_rope), _1{}, static_cast<int64_t>(page_size * (D_latent + D_rope)));
