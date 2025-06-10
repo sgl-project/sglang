@@ -35,7 +35,6 @@ def ref_mla(
     return out
 
 
-# TODO temp
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("mean_seq_len", [128, 1024, 4096])
 @pytest.mark.parametrize("bs", [1, 2, 4])
@@ -43,13 +42,6 @@ def ref_mla(
 @pytest.mark.parametrize("block_size", [1, 16, 64, 128])
 @pytest.mark.parametrize("num_heads", [16, 32, 64, 128])
 @pytest.mark.parametrize("num_kv_splits", [-1, 1])
-# @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("mean_seq_len", [1024])
-# @pytest.mark.parametrize("bs", [4])
-# @pytest.mark.parametrize("varlen", [True])
-# @pytest.mark.parametrize("block_size", [128])
-# @pytest.mark.parametrize("num_heads", [128])
-# @pytest.mark.parametrize("num_kv_splits", [-1])
 def test_cutlass_mla_decode(
     dtype: torch.dtype,
     mean_seq_len: int,
@@ -94,9 +86,6 @@ def test_cutlass_mla_decode(
     )
     workspace = torch.empty(workspace_size, device="cuda", dtype=torch.uint8)
 
-    # TODO temp
-    # q_nope = q[:, :, :dv]
-    # q_pe = q[:, :, dv:]
     q_nope = q[:, :, :dv].clone()
     q_pe = q[:, :, dv:].clone()
 
