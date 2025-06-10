@@ -62,6 +62,7 @@ from typing import (
     Union,
 )
 
+import netifaces
 import numpy as np
 import psutil
 import requests
@@ -2095,6 +2096,23 @@ def get_free_port():
 
 
 def get_local_ip_by_remote() -> str:
+    interface = os.environ.get("SGLANG_DISAGGREGATION_LOCAL_IP_NIC", None)
+    if interface:
+        try:
+            addresses = netifaces.ifaddresses(interface)
+            if netifaces.AF_INET in addresses:
+                for addr_info in addresses[netifaces.AF_INET]:
+                    ip = addr_info.get("addr")
+                    if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+                        return ip
+            if netifaces.AF_INET6 in addresses:
+                for addr_info in addresses[netifaces.AF_INET6]:
+                    ip = addr_info.get("addr")
+                    if ip and not ip.startswith("fe80::") and ip != "::1":
+                        return ip.split("%")[0]
+        except (ValueError, KeyError):
+            pass
+
     # try ipv4
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
