@@ -29,7 +29,12 @@ if not is_hip():
     if use_vllm_custom_allreduce:
         custom_op = torch.ops._C_custom_ar
     else:
-        custom_op = sgl_kernel.allreduce
+        try:
+            import sgl_kernel
+
+            custom_op = sgl_kernel.allreduce
+        except ImportError as e:
+            logger.warning("Failed to import custom_ar from sgl_kernel with %r", e)
 
     # custom allreduce
     def init_custom_ar(
