@@ -233,6 +233,9 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        # For multi-head latent attention
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ):
         cache_loc = forward_batch.out_cache_loc
 
