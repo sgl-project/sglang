@@ -47,9 +47,6 @@ class TestReleaseMemoryOccupation(CustomTestCase):
 
         if _DEBUG_EXTRA:
             time.sleep(3)
-            print(
-                f"gpu_memory_usage_after_initial_generation: {get_gpu_memory_gb()} GB"
-            )
 
         self.assertEqual(
             _try_allocate_big_tensor(),
@@ -99,12 +96,12 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             params["expect_output_before_update_weights"],
         )
 
-        print("release_memory_occupation start")
         t = time.perf_counter()
         engine.release_memory_occupation()
         if _DEBUG_EXTRA:
-            print("release_memory_occupation", time.perf_counter() - t)
-            print(f"gpu_memory_usage_after_release: {get_gpu_memory_gb()} GB")
+            print(
+                f"Release took {time.perf_counter() - t:.2f}s, memory: {get_gpu_memory_gb():.1f} GB"
+            )
 
         if _DEBUG_EXTRA:
             time.sleep(5)
@@ -118,12 +115,12 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         if _DEBUG_EXTRA:
             time.sleep(5)
 
-        print("resume_memory_occupation start")
         t = time.perf_counter()
         engine.resume_memory_occupation()
         if _DEBUG_EXTRA:
-            print("resume_memory_occupation", time.perf_counter() - t)
-            print(f"gpu_memory_usage_after_resume: {get_gpu_memory_gb()} GB")
+            print(
+                f"Resume took {time.perf_counter() - t:.2f}s, memory: {get_gpu_memory_gb():.1f} GB"
+            )
 
         hf_model_new = AutoModelForCausalLM.from_pretrained(
             MOCK_UPDATED_MODEL_NAME_FOR_TEST, torch_dtype="bfloat16", device_map="cuda"
@@ -133,10 +130,6 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         # destroy the hf model
         del hf_model_new
         torch.cuda.empty_cache()
-        print(
-            "gpu_memory_usage_after_update_weights_and_destroy_hf_model",
-            get_gpu_memory_gb(),
-        )
 
         print("generate (#2)")
         outputs = engine.generate(params["prompt"], params["sampling_params"])["text"]
@@ -163,7 +156,6 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             params["expect_output_before_update_weights"],
         )
 
-        print("release_memory_occupation start")
         t = time.perf_counter()
         gpu_memory_usage_before_release_kv_cache = get_gpu_memory_gb()
         engine.release_memory_occupation(tags=["kv_cache"])
@@ -184,15 +176,9 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         )
 
         if _DEBUG_EXTRA:
-            print("release_memory_occupation", f"{time.perf_counter() - t:.2f} seconds")
+            print(f"Release took {time.perf_counter() - t:.2f}s")
             print(
-                f"gpu_memory_usage_before_release_kv_cache: {gpu_memory_usage_before_release_kv_cache} GB"
-            )
-            print(
-                f"gpu_memory_usage_after_release_kv_cache: {gpu_memory_usage_after_release_kv_cache} GB"
-            )
-            print(
-                f"gpu_memory_usage_after_release_weights: {gpu_memory_usage_after_release_weights} GB"
+                f"Memory: {gpu_memory_usage_before_release_kv_cache:.1f} → {gpu_memory_usage_after_release_kv_cache:.1f} → {gpu_memory_usage_after_release_weights:.1f} GB"
             )
 
         if _DEBUG_EXTRA:
@@ -207,7 +193,6 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         if _DEBUG_EXTRA:
             time.sleep(5)
 
-        print("resume_memory_occupation start")
         t = time.perf_counter()
         gpu_memory_usage_before_resume_weights = get_gpu_memory_gb()
         engine.resume_memory_occupation(tags=["weights"])
@@ -216,15 +201,13 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         hf_model_new = AutoModelForCausalLM.from_pretrained(
             MOCK_UPDATED_MODEL_NAME_FOR_TEST, torch_dtype="bfloat16", device_map="cuda"
         )
+        gpu_memory_usage_after_loaded_hf_model = get_gpu_memory_gb()
         self._test_update_weights(engine, hf_model_new, is_multi_stage=True)
 
         # destroy the hf model
         del hf_model_new
         torch.cuda.empty_cache()
-        print(
-            "gpu_memory_usage_after_update_weights_and_destroy_hf_model",
-            get_gpu_memory_gb(),
-        )
+        gpu_memory_usage_after_destroyed_hf_model = get_gpu_memory_gb()
 
         gpu_memory_usage_after_resume_weights = get_gpu_memory_gb()
         self.assertGreater(
@@ -240,18 +223,9 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         )
 
         if _DEBUG_EXTRA:
+            print(f"Resume + update took {time.perf_counter() - t:.2f}s")
             print(
-                "resume_memory_occupation and update weights",
-                f"{time.perf_counter() - t:.2f} seconds",
-            )
-            print(
-                f"gpu_memory_usage_before_resume_weights: {gpu_memory_usage_before_resume_weights} GB"
-            )
-            print(
-                f"gpu_memory_usage_after_resume_weights: {gpu_memory_usage_after_resume_weights} GB"
-            )
-            print(
-                f"gpu_memory_usage_after_resume_kv_cache: {gpu_memory_usage_after_resume_kv_cache} GB"
+                f"Memory: {gpu_memory_usage_before_resume_weights:.1f} → {gpu_memory_usage_after_resume_weights:.1f} → {gpu_memory_usage_after_loaded_hf_model:.1f} → {gpu_memory_usage_after_destroyed_hf_model:.1f} → {gpu_memory_usage_after_resume_kv_cache:.1f} GB"
             )
 
         print("generate (#2)")

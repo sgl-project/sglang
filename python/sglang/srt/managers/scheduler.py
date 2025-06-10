@@ -2144,12 +2144,9 @@ class Scheduler(
         tags = recv_req.tags
         if tags is None or len(tags) == 0:
             tags = ["weights", "kv_cache"]
-            print(f"resume_memory_occupation: after adjust {tags=}")
-            logger.info(f"resume_memory_occupation: after adjust {tags=}")
 
         if "weights" in tags:
             self.weights_memory_saver_adapter.resume()
-            print(f"resume_memory_occupation: before weights resume {tags=}")
             _import_static_state(
                 self.tp_worker.worker.model_runner.model,
                 self.stashed_model_static_state,
@@ -2157,7 +2154,6 @@ class Scheduler(
             del self.stashed_model_static_state
         if "kv_cache" in tags:
             self.kv_cache_memory_saver_adapter.resume()
-            logger.info(f"resume_memory_occupation: after kv_cache resume {tags=}")
         return ResumeMemoryOccupationReqOutput()
 
     def slow_down(self, recv_req: SlowDownReqInput):
