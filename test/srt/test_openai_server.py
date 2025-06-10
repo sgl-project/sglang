@@ -863,6 +863,7 @@ class TestOpenAIV1Score(CustomTestCase):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
+
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
