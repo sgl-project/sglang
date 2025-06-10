@@ -206,7 +206,7 @@ class MetadataBuffers:
     def __init__(self, size: int, max_top_logprobs_num: int = 128, custom_pool=None):
         self.custom_pool = custom_pool
 
-        if self.custom_pool is None:
+        if self.custom_pool is not None:
             self.output_ids = None
             self.output_token_logprobs_val = None
             self.output_token_logprobs_idx = None
