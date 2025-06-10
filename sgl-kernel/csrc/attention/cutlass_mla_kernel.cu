@@ -123,10 +123,14 @@ typename T::Fmha::Arguments args_from_options(
   using StrideO = typename T::StrideO;
   using StrideLSE = typename T::StrideLSE;
 
+  int64_t q_nope_D_stride = q_nope.stride(2);
+  int64_t q_pe_D_stride = q_pe.stride(2);
+
   StrideQ stride_Q_nope = cute::make_tuple(
-      static_cast<int64_t>(0 + D_latent), _1{}, static_cast<int64_t>(H * (0 + D_latent)));
+      static_cast<int64_t>(0 + q_nope_D_stride), _1{}, static_cast<int64_t>(H * (0 + q_nope_D_stride)));
   StrideQ stride_Q_pe = cute::make_tuple(
-      static_cast<int64_t>(0 + D_rope), _1{}, static_cast<int64_t>(H * (0 + D_rope)));
+      static_cast<int64_t>(0 + q_pe_D_stride), _1{}, static_cast<int64_t>(H * (0 + q_pe_D_stride)));
+
   StrideK stride_C = cute::make_tuple(
       static_cast<int64_t>(0 + D_latent + D_rope), _1{}, static_cast<int64_t>(page_size * (D_latent + D_rope)));
   StrideLSE stride_PT = cute::make_stride(_1{}, page_count_per_seq);
