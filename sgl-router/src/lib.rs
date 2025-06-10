@@ -6,6 +6,7 @@ pub mod router;
 pub mod server;
 pub mod service_discovery;
 pub mod tree;
+pub mod pd_types;
 use crate::prometheus::PrometheusConfig;
 
 #[pyclass(eq)]

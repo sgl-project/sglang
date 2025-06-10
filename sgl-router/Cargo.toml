@@ -33,6 +33,8 @@ futures = "0.3"
 # Added for metrics
 metrics = "0.24.2"
 metrics-exporter-prometheus = "0.17.0"
+anyhow = "1.0"
+typetag = "0.2"
 [profile.release]
 lto = "thin"
 codegen-units = 1
