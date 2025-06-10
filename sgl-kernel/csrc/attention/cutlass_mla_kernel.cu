@@ -30,7 +30,8 @@ limitations under the License.
 #if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
 void cutlass_mla_decode(
     torch::Tensor const& out,
-    torch::Tensor const& q_nope_and_q_pe,
+    torch::Tensor const& q_nope,
+    torch::Tensor const& q_pe,
     torch::Tensor const& kv_c_and_k_pe_cache,
     torch::Tensor const& seq_lens,
     torch::Tensor const& page_table,
@@ -217,9 +218,9 @@ void cutlass_mla_decode(
     torch::Tensor const& page_table,
     torch::Tensor const& workspace,
     int64_t num_kv_splits) {
-  auto in_dtype = q_nope_and_q_pe.dtype();
-  at::cuda::CUDAGuard device_guard{(char)q_nope_and_q_pe.get_device()};
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q_nope_and_q_pe.get_device());
+  auto in_dtype = q_nope.dtype();
+  at::cuda::CUDAGuard device_guard{(char)q_nope.get_device()};
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q_nope.get_device());
   const int page_size = kv_c_and_k_pe_cache.sizes()[1];
 
   // NOTE(alcanderian): IsPersistent has bug with manual split_kv.
