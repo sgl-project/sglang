@@ -43,45 +43,48 @@ class Llama4ForConditionalGeneration(nn.Module):
         # We need a more robust check since transformers auto-generates vision_config
         # for Llama4ForConditionalGeneration even for text-only models
 
-        # First check the original config.json to see if vision_config was explicitly defined
+        # Instead of checking config, check if vision model weights actually exist in the checkpoint
         import json as json_lib
         import os
 
         # Get the model path from the config if available
         model_path = getattr(config, "_name_or_path", None)
-        original_has_vision = False
+        has_vision_weights = False
 
-        if model_path and os.path.exists(os.path.join(model_path, "config.json")):
+        if model_path and os.path.exists(
+            os.path.join(model_path, "model.safetensors.index.json")
+        ):
             try:
-                with open(os.path.join(model_path, "config.json"), "r") as f:
-                    original_config = json_lib.load(f)
-                # Check if vision_config exists in the original file
-                original_has_vision = "vision_config" in original_config
+                with open(
+                    os.path.join(model_path, "model.safetensors.index.json"), "r"
+                ) as f:
+                    index_data = json_lib.load(f)
+                # Check if any vision model weights exist in the checkpoint
+                vision_weight_patterns = [
+                    "vision_model",
+                    "vision_tower",
+                    "multi_modal_projector",
+                ]
+                has_vision_weights = any(
+                    any(pattern in weight_name for pattern in vision_weight_patterns)
+                    for weight_name in index_data.get("weight_map", {}).keys()
+                )
                 if get_tensor_model_parallel_rank() == 0:
                     print(
-                        f"Debug: Original config has explicit vision_config: {original_has_vision}"
+                        f"Debug: Found vision weights in checkpoint: {has_vision_weights}"
                     )
             except:
-                # Fallback to checking the processed config
-                original_has_vision = (
-                    hasattr(config, "vision_config")
-                    and config.vision_config is not None
-                )
+                # Fallback: assume text-only since most checkpoints are text-only
+                has_vision_weights = False
                 if get_tensor_model_parallel_rank() == 0:
-                    print(
-                        f"Debug: Could not read original config, using processed config"
-                    )
+                    print(f"Debug: Could not read checkpoint index, assuming text-only")
         else:
-            # Fallback to checking the processed config
-            original_has_vision = (
-                hasattr(config, "vision_config") and config.vision_config is not None
-            )
+            # No checkpoint index found, assume text-only
+            has_vision_weights = False
             if get_tensor_model_parallel_rank() == 0:
-                print(
-                    f"Debug: No model path or config.json found, using processed config"
-                )
+                print(f"Debug: No checkpoint index found, assuming text-only")
 
-        self.has_vision = original_has_vision
+        self.has_vision = has_vision_weights
         if get_tensor_model_parallel_rank() == 0:
             print(f"Debug: has_vision: {self.has_vision}")
             print(f"Debug: model_path: {model_path}")
@@ -218,7 +221,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             ]
             print(
                 f"Debug: Scale parameters in model: {scale_params[:30]}"
-            )  # Show first 10
+            )  # Show first 30
 
         num_experts = (
             self.config.text_config.num_local_experts
@@ -251,7 +254,7 @@ class Llama4ForConditionalGeneration(nn.Module):
                 #     print(f"Skipping vision weight: {name} (text-only model)")
                 continue
 
-                # Special handling for scale parameters that have language_model. prefix
+            # Special handling for scale parameters that have language_model. prefix
             if (
                 "scale" in name
                 and "language_model.model.layers" in name
@@ -292,6 +295,98 @@ class Llama4ForConditionalGeneration(nn.Module):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
+                        loaded = True
+                        break
+
+                if loaded:
+                    continue
+                else:
+                    if is_main_rank:
+                        print(
+                            f"DEBUG: Scale parameter {name} -> {target_names} not found in model"
+                        )
+                    continue
+
+            # Special handling for scale parameters - add name mapping from checkpoint to model
+            elif "scale" in name and "experts" in name:
+                # Map checkpoint parameter names to model parameter names
+                name_mappings = {
+                    "gate_up_proj_weight_scale": "w13_weight_scale",
+                    "gate_up_proj_input_scale": "w13_input_scale",
+                    "down_proj_weight_scale": "w2_weight_scale",
+                    "down_proj_input_scale": "w2_input_scale",
+                }
+
+                target_names = []
+                for checkpoint_name, model_name in name_mappings.items():
+                    if checkpoint_name in name:
+                        # Replace the checkpoint name with model name AND add language_model prefix
+                        target_name = name.replace(checkpoint_name, model_name)
+                        if not target_name.startswith("language_model."):
+                            target_name = "language_model." + target_name
+                        target_names.append(target_name)
+                        break
+                else:
+                    # No mapping found, try original name with language_model prefix
+                    if not name.startswith("language_model."):
+                        target_names.append("language_model." + name)
+                    else:
+                        target_names.append(name)
+
+                # Try each possible target name
+                loaded = False
+                for target_name in target_names:
+                    if target_name in params_dict:
+                        if is_main_rank:
+                            print(
+                                f"DEBUG: Loading scale parameter: {name} -> {target_name}"
+                            )
+                        param = params_dict[target_name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+
+                        # Debug weight_loader info
+                        if is_main_rank:
+                            print(f"DEBUG: weight_loader type: {type(weight_loader)}")
+                            if hasattr(weight_loader, "__self__"):
+                                print(
+                                    f"DEBUG: weight_loader.__self__ type: {type(weight_loader.__self__)}"
+                                )
+
+                        # For MoE scale parameters, we need to provide weight_name, shard_id, and expert_id
+                        if hasattr(weight_loader, "__self__") and hasattr(
+                            weight_loader.__self__, "weight_loader"
+                        ):
+                            # This is a MoE layer, need to determine shard_id and expert_id
+                            if is_main_rank:
+                                print(f"DEBUG: Detected MoE layer for {target_name}")
+                            shard_ids = []
+                            if "w13" in target_name or "gate_up_proj" in name:
+                                # For gate_up_proj (w13), only load input_scale for w1 (w1 and w3 should be equal)
+                                shard_ids = ["w1"]
+                            elif "w2" in target_name or "down_proj" in name:
+                                shard_ids = ["w2"]
+                            else:
+                                shard_ids = ["w1"]  # Default fallback
+
+                            # Load the scale for all experts and relevant shard_ids
+                            for expert_id in range(num_experts):
+                                for shard_id in shard_ids:
+                                    if is_main_rank:
+                                        print(
+                                            f"DEBUG: Loading expert_id={expert_id}, shard_id={shard_id}"
+                                        )
+                                    weight_loader(
+                                        param, loaded_weight, name, shard_id, expert_id
+                                    )
+                        else:
+                            # Regular parameter loading
+                            if is_main_rank:
+                                print(
+                                    f"DEBUG: Regular parameter loading for {target_name}"
+                                )
+                            weight_loader(param, loaded_weight)
                         loaded = True
                         break
 
