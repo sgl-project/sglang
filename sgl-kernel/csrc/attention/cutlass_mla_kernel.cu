@@ -28,6 +28,7 @@ limitations under the License.
 
 // clang-format off
 #if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
+#error "dont be here"
 void cutlass_mla_decode(
     torch::Tensor const& out,
     torch::Tensor const& q_nope,
