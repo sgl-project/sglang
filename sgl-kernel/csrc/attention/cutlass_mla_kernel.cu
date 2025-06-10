@@ -20,9 +20,9 @@ limitations under the License.
 #include <cutlass/cutlass.h>
 #include <cutlass/kernel_hardware_info.h>
 #include <torch/all.h>
-#include <iostream>
 
 #include <cute/tensor.hpp>
+#include <iostream>
 
 #include "cutlass_sm100_mla/device/sm100_mla.hpp"
 #include "cutlass_sm100_mla/kernel/sm100_mla_tile_scheduler.hpp"
