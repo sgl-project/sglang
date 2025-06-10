@@ -483,6 +483,7 @@ class GenerateReqInput:
         )
 
 
+# applied for tensor sent from TokenizerManager -> Scheduler
 global_effective_mode: Optional[TensorTransportMode] = None
 
 
@@ -536,6 +537,8 @@ class TokenizedGenerateReqInput:
     tensor_transport_mode: TensorTransportMode = "auto"
 
     def __getstate__(self):
+        current_device_index = torch.cuda.current_device()
+        # print(f"{current_device_index=} getstate")
         state = dict(self.__dict__)
         global global_effective_mode
 
@@ -552,11 +555,15 @@ class TokenizedGenerateReqInput:
                 state["effective_mode"] = global_effective_mode
 
         if global_effective_mode is not None:
+            # since scheduler needs a clean Req to perform hash, make sure the following operations are on the clone
+            state["mm_inputs"] = copy.deepcopy(state["mm_inputs"])
+
             mm_inputs = state["mm_inputs"]
             for mm_item in mm_inputs["mm_items"]:
-                mm_item.feature = TransportableTensor(
-                    transport_mode=global_effective_mode, feature=mm_item.feature
-                )
+                if not isinstance(mm_item.feature, TransportableTensor):
+                    mm_item.feature = TransportableTensor(
+                        transport_mode=global_effective_mode, feature=mm_item.feature
+                    )
 
         return state
 
@@ -575,10 +582,14 @@ class TokenizedGenerateReqInput:
             mm_inputs = state["mm_inputs"]
 
             for mm_item in mm_inputs["mm_items"]:
-                print(f"{mm_item=}")
+                current_device_index = torch.cuda.current_device()
+                # print(f"{current_device_index=} {mm_item=}")
                 assert isinstance(mm_item.feature, TransportableTensor)
                 mm_item.feature = mm_item.feature.deserialize()
+                # print(f"after {current_device_index=}  {mm_item=}")
                 assert isinstance(mm_item.feature, torch.Tensor)
+            # print(f"after {state=}")
+
         else:
             print(f"mm_inputs not presented, returning")
 

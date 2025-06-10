@@ -31,9 +31,6 @@ from sglang.utils import info_once, logger
 # cuda_ipc: for intranode scenarios
 TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
 
-# applied for tensor sent from TokenizerManager -> Scheduler
-global_tensor_ipc_mode: Optional[TensorTransportMode] = None
-
 
 @dataclasses.dataclass
 class TransportableTensor:
@@ -42,49 +39,74 @@ class TransportableTensor:
     extra: Dict[str, Any] = None
 
     def __post_init__(self):
+        # print("TransportableTensor init")
         self.serialize()
 
     def serialize(self):
-        if isinstance(self.feature, torch.Tensor) and self.feature.is_cuda:
-            if self.transport_mode == "cuda_ipc":
-                try:
-                    storage = self.feature.untyped_storage()
-                    handle = storage._share_cuda_()
-                    self.extra = {
-                        "handle": handle,
-                        "shape": self.feature.shape,
-                        "dtype": self.feature.dtype,
-                        "stride": self.feature.stride(),
-                        "index": self.feature.device.index,
-                    }
-                    self.feature = None
-                except Exception as e:
-                    if isinstance(
-                        e, RuntimeError
-                    ) and "Attempted to send CUDA tensor received from another process" in str(
-                        e
-                    ):
-                        print_warning_once(
-                            "Attempted to re-share a CUDA tensor received via IPC. "
-                            "Cloning the tensor to continue. This may have a performance impact."
-                        )
+        current_device_index = torch.cuda.current_device()
+        # print(f"{current_device_index=} serialize")
+        if not (isinstance(self.feature, torch.Tensor) and self.feature.is_cuda):
+            return  # Do nothing for non-cuda tensors or if feature is already serialized
+
+        if self.transport_mode == "cuda_ipc":
+            try:
+                # First attempt to share
+                storage = self.feature.untyped_storage()
+                handle = storage._share_cuda_()
+                self.extra = {
+                    "handle": handle,
+                    "shape": self.feature.shape,
+                    "dtype": self.feature.dtype,
+                    "stride": self.feature.stride(),
+                    "index": self.feature.device.index,
+                }
+                self.feature = None
+            except Exception as e:
+                # Check if it's the specific re-sharing error
+                if isinstance(
+                    e, RuntimeError
+                ) and "Attempted to send CUDA tensor received from another process" in str(
+                    e
+                ):
+                    print_warning_once(
+                        "Re-sharing CUDA tensor via IPC. Cloning to proceed."
+                    )
+                    try:
+                        # Attempt to clone and re-share
                         cloned_data = self.feature.clone()
                         storage = cloned_data.untyped_storage()
                         handle = storage._share_cuda_()
                         self.extra = {
                             "handle": handle,
-                            "shape": self.feature.shape,
-                            "dtype": self.feature.dtype,
-                            "stride": self.feature.stride(),
-                            "index": self.feature.device.index,
+                            "shape": cloned_data.shape,
+                            "dtype": cloned_data.dtype,
+                            "stride": cloned_data.stride(),
+                            "index": cloned_data.device.index,
                         }
-                    self.feature = None
+                        self.feature = None
+                        return  # SUCCESS: Cloned and created IPC handle
+                    except Exception as e2:
+                        # If even cloning and sharing fails, fall back to CPU
+                        logger.error(
+                            f"Failed to get CUDA IPC handle even after cloning: {e2}. Falling back to CPU.",
+                            exc_info=True,
+                        )
+                        self.feature = self.feature.cpu()
+                        self.transport_mode = "default"
+                else:
+                    # For any other initial sharing error, fall back to CPU
                     logger.error(
-                        f"Failed to get CUDA IPC handle for tensor: {e}. Falling back to copy.",
+                        f"Failed to get CUDA IPC handle: {e}. Falling back to CPU.",
                         exc_info=True,
                     )
+                    self.feature = self.feature.cpu()
+                    self.transport_mode = "default"
+        else:  # transport_mode is 'default' or something else
+            self.feature = self.feature.cpu()
 
     def deserialize(self) -> torch.Tensor:
+        current_device_index = torch.cuda.current_device()
+        # print(f"{current_device_index=} deserialize")
         if self.transport_mode == "cuda_ipc":
             handle, shape, dtype, stride, source_device_index = (
                 self.extra["handle"],

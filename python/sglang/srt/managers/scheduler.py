@@ -1063,6 +1063,8 @@ class Scheduler(
                 )
             recv_reqs = work_reqs + control_reqs
         elif self.tp_size != 1:
+            current_device_index = torch.cuda.current_device()
+            # print(f"{current_device_index=} scheduler broadcasting pyobject")
             recv_reqs = broadcast_pyobj(
                 recv_reqs,
                 self.tp_group.rank,
