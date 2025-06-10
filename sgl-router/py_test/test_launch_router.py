@@ -42,6 +42,12 @@ class TestLaunchRouter(unittest.TestCase):
             selector=None,
             service_discovery_port=80,
             service_discovery_namespace=None,
+            prometheus_port=None,
+            prometheus_host=None,
+            # PD-specific attributes (empty for regular mode)
+            prefill_urls=None,
+            decode_urls=None,
+            pd_policy="cache_aware",
         )
 
     def create_router_args(self, **kwargs):
@@ -99,6 +105,43 @@ class TestLaunchRouter(unittest.TestCase):
             service_discovery_namespace="test-namespace",
         )
         self.run_router_process(args)
+
+    def test_launch_router_pd_mode_basic(self):
+        """Test basic PD router functionality without actually starting servers."""
+        # This test just verifies the PD router can be created and configured
+        # without actually starting it (which would require real prefill/decode servers)
+        from sglang_router import Router
+        from sglang_router.launch_router import RouterArgs
+
+        # Test RouterArgs parsing for PD mode
+        args = self.create_router_args(
+            policy="prefill_decode",
+            prefill_urls=[
+                ("http://prefill1:8080", 9000),
+                ("http://prefill2:8080", None),
+            ],
+            decode_urls=["http://decode1:8081", "http://decode2:8081"],
+            pd_policy="po2",
+        )
+
+        router_args = RouterArgs.from_cli_args(args)
+        self.assertEqual(router_args.policy, "prefill_decode")
+        self.assertEqual(router_args.pd_policy, "po2")
+        self.assertEqual(len(router_args.prefill_urls), 2)
+        self.assertEqual(len(router_args.decode_urls), 2)
+
+        # Test Router.new_pd() creation
+        router = Router.new_pd(
+            prefill_urls=[
+                ("http://prefill1:8080", 9000),
+                ("http://prefill2:8080", None),
+            ],
+            decode_urls=["http://decode1:8081", "http://decode2:8081"],
+            policy="cache_aware",
+            host="127.0.0.1",
+            port=3001,
+        )
+        self.assertIsNotNone(router)
 
 
 if __name__ == "__main__":
