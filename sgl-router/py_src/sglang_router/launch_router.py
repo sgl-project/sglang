@@ -31,6 +31,13 @@ class RouterArgs:
     host: str = "127.0.0.1"
     port: int = 30000
 
+    # PD-specific configuration
+    prefill_urls: List[tuple] = dataclasses.field(
+        default_factory=list
+    )  # List of (url, bootstrap_port)
+    decode_urls: List[str] = dataclasses.field(default_factory=list)
+    pd_policy: str = "cache_aware"  # For PD mode: "random", "po2", "cache_aware"
+
     # Routing policy
     policy: str = "cache_aware"
     worker_startup_timeout_secs: int = 300
@@ -40,7 +47,7 @@ class RouterArgs:
     balance_rel_threshold: float = 1.0001
     eviction_interval: int = 60
     max_tree_size: int = 2**24
-    max_payload_size: int = 4 * 1024 * 1024  # 4MB
+    max_payload_size: int = 256 * 1024 * 1024  # 256MB default for large batches
     verbose: bool = False
     log_dir: Optional[str] = None
     # Service discovery configuration
@@ -95,8 +102,29 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware"],
+            choices=["random", "round_robin", "cache_aware", "prefill_decode"],
             help="Load balancing policy to use",
+        )
+
+        # PD-specific arguments
+        parser.add_argument(
+            f"--{prefix}prefill-urls",
+            type=str,
+            nargs="+",
+            help="List of prefill server URLs with bootstrap ports (format: url:port:bootstrap_port or url:port)",
+        )
+        parser.add_argument(
+            f"--{prefix}decode-urls",
+            type=str,
+            nargs="+",
+            help="List of decode server URLs (format: url:port)",
+        )
+        parser.add_argument(
+            f"--{prefix}pd-policy",
+            type=str,
+            default=RouterArgs.pd_policy,
+            choices=["random", "po2", "cache_aware"],
+            help="PD selection policy (only used when policy=prefill_decode)",
         )
         parser.add_argument(
             f"--{prefix}worker-startup-timeout-secs",
@@ -205,11 +233,21 @@ class RouterArgs:
             use_router_prefix: If True, look for arguments with 'router-' prefix
         """
         prefix = "router_" if use_router_prefix else ""
-        worker_urls = args.worker_urls if args.worker_urls is not None else []
+        worker_urls = getattr(args, "worker_urls", [])
+
+        # Parse PD URLs
+        prefill_urls = cls._parse_prefill_urls(
+            getattr(args, f"{prefix}prefill_urls", None)
+        )
+        decode_urls = getattr(args, f"{prefix}decode_urls", None) or []
+
         return cls(
             worker_urls=worker_urls,
             host=args.host,
             port=args.port,
+            prefill_urls=prefill_urls,
+            decode_urls=decode_urls,
+            pd_policy=getattr(args, f"{prefix}pd_policy", "cache_aware"),
             policy=getattr(args, f"{prefix}policy"),
             worker_startup_timeout_secs=getattr(
                 args, f"{prefix}worker_startup_timeout_secs"
@@ -247,6 +285,31 @@ class RouterArgs:
                 selector[key] = value
         return selector
 
+    @staticmethod
+    def _parse_prefill_urls(prefill_url_list):
+        """Parse prefill URLs with optional bootstrap ports.
+
+        Format: url:port:bootstrap_port or url:port (bootstrap_port defaults to None)
+        Example: http://prefill1:8080:9000 or http://prefill1:8080
+        """
+        if not prefill_url_list:
+            return []
+
+        prefill_urls = []
+        for url_str in prefill_url_list:
+            if url_str.count(":") >= 3:  # http://host:port:bootstrap_port
+                # Split from the right to handle http:// properly
+                parts = url_str.rsplit(":", 1)
+                url = parts[0]
+                bootstrap_port = int(parts[1]) if parts[1] else None
+            else:  # http://host:port (no bootstrap port)
+                url = url_str
+                bootstrap_port = None
+
+            prefill_urls.append((url, bootstrap_port))
+
+        return prefill_urls
+
 
 def policy_from_str(policy_str: str) -> PolicyType:
     """Convert policy string to PolicyType enum."""
@@ -254,6 +317,7 @@ def policy_from_str(policy_str: str) -> PolicyType:
         "random": PolicyType.Random,
         "round_robin": PolicyType.RoundRobin,
         "cache_aware": PolicyType.CacheAware,
+        "prefill_decode": PolicyType.PrefillDecode,
     }
     return policy_map[policy_str]
 
@@ -277,28 +341,70 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
         else:
             router_args = args
 
-        router = Router(
-            worker_urls=router_args.worker_urls,
-            host=router_args.host,
-            port=router_args.port,
-            policy=policy_from_str(router_args.policy),
-            worker_startup_timeout_secs=router_args.worker_startup_timeout_secs,
-            worker_startup_check_interval=router_args.worker_startup_check_interval,
-            cache_threshold=router_args.cache_threshold,
-            balance_abs_threshold=router_args.balance_abs_threshold,
-            balance_rel_threshold=router_args.balance_rel_threshold,
-            eviction_interval_secs=router_args.eviction_interval,
-            max_tree_size=router_args.max_tree_size,
-            max_payload_size=router_args.max_payload_size,
-            verbose=router_args.verbose,
-            log_dir=router_args.log_dir,
-            service_discovery=router_args.service_discovery,
-            selector=router_args.selector,
-            service_discovery_port=router_args.service_discovery_port,
-            service_discovery_namespace=router_args.service_discovery_namespace,
-            prometheus_port=router_args.prometheus_port,
-            prometheus_host=router_args.prometheus_host,
-        )
+        # Check if this is PD mode
+        if router_args.policy == "prefill_decode":
+            # Validate PD configuration
+            if not router_args.prefill_urls:
+                raise ValueError("PrefillDecode policy requires --prefill-urls")
+            if not router_args.decode_urls:
+                raise ValueError("PrefillDecode policy requires --decode-urls")
+
+            # Import the Rust module to use new_pd
+            from sglang_router_rs import Router as _Router
+
+            # Create PD router using the new_pd constructor
+            rust_router = _Router.new_pd(
+                prefill_urls=router_args.prefill_urls,
+                decode_urls=router_args.decode_urls,
+                policy=router_args.pd_policy,
+                host=router_args.host,
+                port=router_args.port,
+                cache_threshold=router_args.cache_threshold,
+                balance_abs_threshold=router_args.balance_abs_threshold,
+                balance_rel_threshold=router_args.balance_rel_threshold,
+                eviction_interval_secs=router_args.eviction_interval,
+                max_tree_size=router_args.max_tree_size,
+                worker_startup_timeout_secs=router_args.worker_startup_timeout_secs,
+                worker_startup_check_interval=router_args.worker_startup_check_interval,
+                verbose=router_args.verbose,
+                log_dir=router_args.log_dir,
+                prometheus_port=router_args.prometheus_port,
+                prometheus_host=router_args.prometheus_host,
+            )
+
+            # Create a wrapper that has the same interface
+            class PDRouterWrapper:
+                def __init__(self, rust_router):
+                    self._router = rust_router
+
+                def start(self):
+                    return self._router.start()
+
+            router = PDRouterWrapper(rust_router)
+        else:
+            # Regular router mode
+            router = Router(
+                worker_urls=router_args.worker_urls,
+                host=router_args.host,
+                port=router_args.port,
+                policy=policy_from_str(router_args.policy),
+                worker_startup_timeout_secs=router_args.worker_startup_timeout_secs,
+                worker_startup_check_interval=router_args.worker_startup_check_interval,
+                cache_threshold=router_args.cache_threshold,
+                balance_abs_threshold=router_args.balance_abs_threshold,
+                balance_rel_threshold=router_args.balance_rel_threshold,
+                eviction_interval_secs=router_args.eviction_interval,
+                max_tree_size=router_args.max_tree_size,
+                max_payload_size=router_args.max_payload_size,
+                verbose=router_args.verbose,
+                log_dir=router_args.log_dir,
+                service_discovery=router_args.service_discovery,
+                selector=router_args.selector,
+                service_discovery_port=router_args.service_discovery_port,
+                service_discovery_namespace=router_args.service_discovery_namespace,
+                prometheus_port=router_args.prometheus_port,
+                prometheus_host=router_args.prometheus_host,
+            )
 
         router.start()
         return router
