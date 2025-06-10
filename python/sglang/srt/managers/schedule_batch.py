@@ -1590,7 +1590,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        self.seq_lens_sum = self.seq_lens.sum().item()
+        self.seq_lens_sum += self.seq_lens.sum().item()
         self.output_ids = self.output_ids[keep_indices_device]
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
@@ -1608,46 +1608,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.spec_info.filter_batch(keep_indices_device)
 
     def merge_batch(self, other: "ScheduleBatch"):
-        # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
-        # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
-        # needs to be called with pre-merged Batch.reqs.
-        self.sampling_info.merge_batch(other.sampling_info)
-
-        # Encoder-decoder infos
-        if self.model_config.is_encoder_decoder:
-            self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
-            self.encoder_lens_cpu.extend(other.encoder_lens_cpu)
-        self.req_pool_indices = torch.cat(
-            [self.req_pool_indices, other.req_pool_indices]
-        )
-        self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
-        self.out_cache_loc = None
-        self.seq_lens_sum += other.seq_lens_sum
-        if self.output_ids is not None:
-            self.output_ids = torch.cat([self.output_ids, other.output_ids])
-        if self.return_logprob and other.return_logprob:
-            self.top_logprobs_nums.extend(other.top_logprobs_nums)
-            self.token_ids_logprobs.extend(other.token_ids_logprobs)
-        elif self.return_logprob:
-            self.top_logprobs_nums.extend([0] * len(other.reqs))
-            self.token_ids_logprobs.extend([None] * len(other.reqs))
-        elif other.return_logprob:
-            self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
-            self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
+        # This is used for merging a prefill batch (other) into a running batch (self)
         self.reqs.extend(other.reqs)
+
         if self.multimodal_inputs is not None:
-            self.multimodal_inputs.extend(other.multimodal_inputs)
+            if other.multimodal_inputs is not None:
+                self.multimodal_inputs.extend(other.multimodal_inputs)
+        elif other.multimodal_inputs is not None:
+            self.multimodal_inputs = other.multimodal_inputs
 
-        self.return_logprob |= other.return_logprob
-        self.has_stream |= other.has_stream
-        self.has_grammar |= other.has_grammar
-        self.return_hidden_states |= other.return_hidden_states
+        self.req_pool_indices = torch.cat([self.req_pool_indices, other.req_pool_indices])
+        self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
+        self.output_ids = torch.cat([self.output_ids, other.output_ids])
 
-        if self.spec_info:
+        self.return_logprob = self.return_logprob or other.return_logprob
+        if self.return_logprob:
+            # Note: other batch can have different logprob settings. We need to unify them.
+            if self.top_logprobs_nums is None: self.top_logprobs_nums = []
+            if other.top_logprobs_nums is None: other.top_logprobs_nums = [0] * len(other.reqs)
+            self.top_logprobs_nums.extend(other.top_logprobs_nums)
+
+            if self.token_ids_logprobs is None: self.token_ids_logprobs = []
+            if other.token_ids_logprobs is None: other.token_ids_logprobs = [None] * len(other.reqs)
+            self.token_ids_logprobs.extend(other.token_ids_logprobs)
+
+        self.has_stream = self.has_stream or other.has_stream
+        self.has_grammar = self.has_grammar or other.has_grammar
+
+        self.sampling_info.merge_batch(other.sampling_info)
+        if self.spec_info and other.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
     def get_model_worker_batch(self) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
+            num_req = len(self.reqs)
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
             extend_seq_lens = self.extend_lens
@@ -1683,6 +1677,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             input_ids=self.input_ids,
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=self.out_cache_loc,
             seq_lens_sum=self.seq_lens_sum,
             return_logprob=self.return_logprob,
@@ -1693,7 +1688,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             tbo_split_seq_index=self.tbo_split_seq_index,
             global_forward_mode=self.global_forward_mode,
-            seq_lens_cpu=seq_lens_cpu,
             extend_num_tokens=self.extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -1727,17 +1721,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def copy(self):
-        # Only contain fields that will be used by process_batch_result
-        return ScheduleBatch(
-            reqs=self.reqs,
-            model_config=self.model_config,
-            forward_mode=self.forward_mode,
-            out_cache_loc=self.out_cache_loc,
-            return_logprob=self.return_logprob,
-            decoding_reqs=self.decoding_reqs,
-            spec_algorithm=self.spec_algorithm,
-            enable_custom_logit_processor=self.enable_custom_logit_processor,
-        )
+        # NOTE: This method is used by both `process_batch_result` and `update_running_batch`.
+        # A shallow copy is sufficient and correct for both purposes.
+        return copy.copy(self)
 
     def __str__(self):
         return (

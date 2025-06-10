@@ -794,8 +794,6 @@ class Scheduler(
                 self.cur_batch = mbs[mb_id]
                 result = None
                 if self.cur_batch:
-                    if self.cur_batch.forward_mode.is_decode():
-                        self.cur_batch = self.update_running_batch(self.cur_batch)
                     logger.info(
                         f"[PP{self.pp_rank} Sched] Running batch for mb_id={mb_id}. Batch: {self.cur_batch}"
                     )
@@ -1722,6 +1720,16 @@ class Scheduler(
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
             self.return_health_check_ct -= 1
             self.send_to_tokenizer.send_pyobj(HealthCheckOutput())
+
+        # Remove the finished requests from the running batch
+        if batch is not None and len(batch.reqs) > 0:
+            if self.pp_size == 1:
+                self.running_batch.reqs = [
+                    r for r in self.running_batch.reqs if r.rid not in rids_to_remove
+                ]
+            # self.running_batch.tbo_split_seq_index = [
+            #     r for r in self.running_batch.tbo_split_seq_index if r.rid not in rids_to_remove
+            # ]
 
     def prepare_dp_attn_batch(self, local_batch: ScheduleBatch):
         return self.prepare_dp_attn_batch_raw(
