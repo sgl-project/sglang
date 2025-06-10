@@ -20,6 +20,7 @@ limitations under the License.
 #include <cutlass/cutlass.h>
 #include <cutlass/kernel_hardware_info.h>
 #include <torch/all.h>
+#include <iostream>
 
 #include <cute/tensor.hpp>
 
@@ -145,6 +146,14 @@ typename T::Fmha::Arguments args_from_options(
   auto Q_nope_ptr = static_cast<Element*>(q_nope.data_ptr());
   auto Q_pe_ptr = static_cast<Element*>(q_pe.data_ptr());
   auto C_ptr = static_cast<Element*>(kv_c_and_k_pe_cache.data_ptr());
+  std::cout
+      << " Q_nope_ptr=" << Q_nope_ptr
+      << " Q_pe_ptr=" << Q_pe_ptr
+      << " C_ptr=" << C_ptr
+      << " stride_Q_nope=" << stride_Q_nope
+      << " stride_Q_pe=" << stride_Q_pe
+      << " stride_C=" << stride_C
+      << std::endl;
   typename T::Fmha::Arguments arguments{
       problem_shape,
       {scale,
