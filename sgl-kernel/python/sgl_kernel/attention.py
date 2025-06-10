@@ -61,12 +61,10 @@ def cutlass_mla_decode(
     workspace: torch.Tensor,
     num_kv_splits: int = -1,
 ) -> torch.Tensor:
-    assert (
-        q_nope_and_q_pe.ndim == 3
-    ), f"q_nope_and_q_pe must be a 3D tensor, but got {q_nope_and_q_pe.ndim}"
-    assert (
-        kv_c_and_k_pe_cache.ndim == 3
-    ), f"kv_c_and_k_pe_cache must be a 3D tensor, but got {kv_c_and_k_pe_cache.ndim}"
+    assert q_nope.ndim == 3, f"q_nope must be a 3D tensor, but got {q_nope.ndim}"
+    assert q_pe.ndim == 3, f"q_pe must be a 3D tensor, but got {q_pe.ndim}"
+    assert k_nope.ndim == 3, f"k_nope must be a 3D tensor, but got {k_nope.ndim}"
+    assert k_pe.ndim == 3, f"k_pe must be a 3D tensor, but got {k_pe.ndim}"
     B_q, H, D_q = q_nope_and_q_pe.shape
     _, PAGE_SIZE, D_ckv = kv_c_and_k_pe_cache.shape
 
