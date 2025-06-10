@@ -44,7 +44,10 @@ std::tuple<at::Tensor, at::Tensor> grouped_topk_cpu(
     int64_t topk,
     bool renormalize,
     int64_t num_expert_group,
-    int64_t topk_group);
+    int64_t topk_group,
+    int64_t num_fused_shared_experts,
+    std::optional<double> routed_scaling_factor,
+    std::optional<at::Tensor> num_token_non_padded);
 
 std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
     at::Tensor& hidden_states,
@@ -53,7 +56,10 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
     int64_t topk,
     bool renormalize,
     int64_t num_expert_group,
-    int64_t topk_group);
+    int64_t topk_group,
+    int64_t num_fused_shared_experts,
+    std::optional<double> routed_scaling_factor,
+    std::optional<at::Tensor> num_token_non_padded);
 
 // attention
 void decode_attention_cpu(
@@ -241,13 +247,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("topk_softmax_cpu", torch::kCPU, &topk_softmax_cpu);
   m.def(
       "grouped_topk_cpu(Tensor hidden_states, Tensor gating_output, int topk, bool renormalize, int num_expert_group, "
-      "int topk_group) -> (Tensor, Tensor)");
+      "int topk_group, int num_fused_shared_experts, float? routed_scaling_factor, Tensor? num_token_non_padded) -> "
+      "(Tensor, Tensor)");
   m.impl("grouped_topk_cpu", torch::kCPU, &grouped_topk_cpu);
 
   // biased group topk
   m.def(
       "biased_grouped_topk_cpu(Tensor hidden_states, Tensor gating_output, Tensor correction_bias, int topk, bool "
-      "renormalize, int num_expert_group, int topk_group) -> (Tensor, Tensor)");
+      "renormalize, int num_expert_group, int topk_group, int num_fused_shared_experts, float? routed_scaling_factor, "
+      "Tensor? num_token_non_padded) -> (Tensor, Tensor)");
   m.impl("biased_grouped_topk_cpu", torch::kCPU, &biased_grouped_topk_cpu);
 
   // decode
