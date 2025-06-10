@@ -606,10 +606,7 @@ class TokenizedGenerateReqInput:
     def _contains_feature(self) -> bool:
         if not self.mm_inputs:
             return False
-        for v in self.mm_inputs["mm_items"]:
-            if v is not None:
-                return True
-        return False
+        return any(v is not None for v in self.mm_inputs["mm_items"])
 
     def _determine_tensor_transport_mode(self) -> TensorTransportMode:
         if self.tensor_transport_mode != "auto":
