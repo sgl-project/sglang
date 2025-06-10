@@ -35,12 +35,14 @@ pub enum Router {
         timeout_secs: u64,
         interval_secs: u64,
         dp_awareness: bool,
+        api_key: Option<String>,
     },
     Random {
         worker_urls: Arc<RwLock<Vec<String>>>,
         timeout_secs: u64,
         interval_secs: u64,
         dp_awareness: bool,
+        api_key: Option<String>,
     },
     CacheAware {
         /*
@@ -113,6 +115,7 @@ pub enum Router {
         timeout_secs: u64,
         interval_secs: u64,
         dp_awareness: bool,
+        api_key: Option<String>,
         _eviction_thread: Option<thread::JoinHandle<()>>,
     },
 }
@@ -123,11 +126,13 @@ pub enum PolicyConfig {
         timeout_secs: u64,
         interval_secs: u64,
         dp_awareness: bool,
+        api_key: Option<String>,
     },
     RoundRobinConfig {
         timeout_secs: u64,
         interval_secs: u64,
         dp_awareness: bool,
+        api_key: Option<String>,
     },
     CacheAwareConfig {
         cache_threshold: f32,
@@ -138,6 +143,7 @@ pub enum PolicyConfig {
         timeout_secs: u64,
         interval_secs: u64,
         dp_awareness: bool,
+        api_key: Option<String>,
     },
 }
 
@@ -147,23 +153,26 @@ impl Router {
         gauge!("sgl_router_active_workers").set(worker_urls.len() as f64);
 
         // Get timeout and interval from policy config
-        let (timeout_secs, interval_secs, dp_awareness) = match &policy_config {
+        let (timeout_secs, interval_secs, dp_awareness, api_key) = match &policy_config {
             PolicyConfig::RandomConfig {
                 timeout_secs,
                 interval_secs,
                 dp_awareness,
-            } => (*timeout_secs, *interval_secs, *dp_awareness),
+                api_key,
+            } => (*timeout_secs, *interval_secs, *dp_awareness, api_key),
             PolicyConfig::RoundRobinConfig {
                 timeout_secs,
                 interval_secs,
                 dp_awareness,
-            } => (*timeout_secs, *interval_secs, *dp_awareness),
+                api_key,
+            } => (*timeout_secs, *interval_secs, *dp_awareness, api_key),
             PolicyConfig::CacheAwareConfig {
                 timeout_secs,
                 interval_secs,
                 dp_awareness,
+                api_key,
                 ..
-            } => (*timeout_secs, *interval_secs, *dp_awareness),
+            } => (*timeout_secs, *interval_secs, *dp_awareness, api_key),
         };
 
         // Wait until all workers are healthy
@@ -171,7 +180,7 @@ impl Router {
 
         let worker_urls = if dp_awareness {
             // worker address now in the format of "http://host:port@dp_rank"
-            match Self::get_dp_aware_workers(&worker_urls) {
+            match Self::get_dp_aware_workers(&worker_urls, api_key) {
                 Ok(urls) => urls,
                 Err(err) => return Err(format!("Failed to get dp-aware workers: {}", err)),
             }
@@ -185,22 +194,26 @@ impl Router {
                 timeout_secs,
                 interval_secs,
                 dp_awareness,
+                api_key,
             } => Router::Random {
                 worker_urls: Arc::new(RwLock::new(worker_urls)),
                 timeout_secs,
                 interval_secs,
                 dp_awareness,
+                api_key,
             },
             PolicyConfig::RoundRobinConfig {
                 timeout_secs,
                 interval_secs,
                 dp_awareness,
+                api_key,
             } => Router::RoundRobin {
                 worker_urls: Arc::new(RwLock::new(worker_urls)),
                 current_index: std::sync::atomic::AtomicUsize::new(0),
                 timeout_secs,
                 interval_secs,
                 dp_awareness,
+                api_key,
             },
             PolicyConfig::CacheAwareConfig {
                 cache_threshold,
@@ -211,6 +224,7 @@ impl Router {
                 timeout_secs,
                 interval_secs,
                 dp_awareness,
+                api_key,
             } => {
                 let mut running_queue = HashMap::new();
                 for url in &worker_urls {
@@ -264,6 +278,7 @@ impl Router {
                     timeout_secs,
                     interval_secs,
                     dp_awareness,
+                    api_key,
                     _eviction_thread: Some(eviction_thread),
                 }
             }
@@ -279,11 +294,19 @@ impl Router {
         }
     }
 
-    pub fn get_dp_awareness(&self) -> bool {
+    fn get_dp_awareness(&self) -> bool {
         match self {
             Router::RoundRobin { dp_awareness, .. } => *dp_awareness,
             Router::Random { dp_awareness, .. } => *dp_awareness,
             Router::CacheAware { dp_awareness, .. } => *dp_awareness,
+        }
+    }
+
+    fn get_api_key(&self) -> Option<String> {
+        match self {
+            Router::RoundRobin { api_key, .. } => api_key.clone(),
+            Router::Random { api_key, .. } => api_key.clone(),
+            Router::CacheAware { api_key, .. } => api_key.clone(),
         }
     }
 
@@ -345,12 +368,14 @@ impl Router {
         }
     }
 
-    fn get_worker_dp_size(worker_url: &str) -> Result<usize, String> {
+    fn get_worker_dp_size(worker_url: &str, api_key: &Option<String>) -> Result<usize, String> {
         let sync_client = reqwest::blocking::Client::new();
-        match sync_client
-            .get(&format!("{}/get_server_info", worker_url))
-            .send()
-        {
+        let mut req_builder = sync_client.get(&format!("{}/get_server_info", worker_url));
+        if let Some(key) = api_key {
+            req_builder = req_builder.bearer_auth(key);
+        }
+
+        match req_builder.send() {
             Ok(res) => {
                 if res.status().is_success() {
                     let server_info = res.text().unwrap();
@@ -380,11 +405,14 @@ impl Router {
     }
 
     // Given a list of workers, return a list of workers with dp_rank as suffix
-    fn get_dp_aware_workers(worker_urls: &[String]) -> Result<Vec<String>, String> {
+    fn get_dp_aware_workers(
+        worker_urls: &[String],
+        api_key: &Option<String>,
+    ) -> Result<Vec<String>, String> {
         let mut dp_aware_workers: Vec<String> = Vec::new();
 
         for url in worker_urls {
-            match Self::get_worker_dp_size(&url[..]) {
+            match Self::get_worker_dp_size(&url[..], api_key) {
                 Ok(dp_size) => {
                     for i in 0..dp_size {
                         let worker_url_dp = String::from(format!("{}@{}", &url, i));
@@ -872,22 +900,25 @@ impl Router {
     }
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
-        let (timeout_secs, interval_secs) = match self {
+        let (timeout_secs, interval_secs, api_key) = match self {
             Router::Random {
                 timeout_secs,
                 interval_secs,
+                api_key,
                 ..
-            } => (*timeout_secs, *interval_secs),
+            } => (*timeout_secs, *interval_secs, api_key),
             Router::RoundRobin {
                 timeout_secs,
                 interval_secs,
+                api_key,
                 ..
-            } => (*timeout_secs, *interval_secs),
+            } => (*timeout_secs, *interval_secs, api_key),
             Router::CacheAware {
                 timeout_secs,
                 interval_secs,
+                api_key,
                 ..
-            } => (*timeout_secs, *interval_secs),
+            } => (*timeout_secs, *interval_secs, api_key),
         };
 
         let start_time = std::time::Instant::now();
@@ -911,7 +942,7 @@ impl Router {
                         info!("Worker {} health check passed", worker_url);
                         if self.get_dp_awareness() {
                             let url_vec = vec![String::from(worker_url)];
-                            let dp_url_vec = match Self::get_dp_aware_workers(&url_vec) {
+                            let dp_url_vec = match Self::get_dp_aware_workers(&url_vec, api_key) {
                                 Ok(vec) => vec,
                                 Err(err) => return Err(format!("Failed to get dp-aware workers: {}", err)),
                             };

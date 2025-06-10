@@ -33,6 +33,9 @@ class Router:
         verbose: Enable verbose logging. Default: False
         log_dir: Directory to store log files. If None, logs are only output to console. Default: None
         dp_awareness: Enable data parallelism aware schedule. Default: False
+        api_key: The api key used for the authorization with the worker.
+            Useful when the dp aware scheduling strategy is enaled.
+            Default: None
         service_discovery: Enable Kubernetes service discovery. When enabled, the router will
             automatically discover worker pods based on the selector. Default: False
         selector: Dictionary mapping of label keys to values for Kubernetes pod selection.
@@ -62,6 +65,7 @@ class Router:
         verbose: bool = False,
         log_dir: Optional[str] = None,
         dp_awareness: bool = False,
+        api_key: Optional[str] = None,
         service_discovery: bool = False,
         selector: Dict[str, str] = None,
         service_discovery_port: int = 80,
@@ -88,6 +92,7 @@ class Router:
             verbose=verbose,
             log_dir=log_dir,
             dp_awareness=dp_awareness,
+            api_key=api_key,
             service_discovery=service_discovery,
             selector=selector,
             service_discovery_port=service_discovery_port,

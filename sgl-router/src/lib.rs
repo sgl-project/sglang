@@ -34,6 +34,7 @@ struct Router {
     verbose: bool,
     log_dir: Option<String>,
     dp_awareness: bool,
+    api_key: Option<String>,
     service_discovery: bool,
     selector: HashMap<String, String>,
     service_discovery_port: u16,
@@ -61,6 +62,7 @@ impl Router {
         verbose = false,
         log_dir = None,
         dp_awareness = false,
+        api_key = None,
         service_discovery = false,
         selector = HashMap::new(),
         service_discovery_port = 80,
@@ -84,6 +86,7 @@ impl Router {
         verbose: bool,
         log_dir: Option<String>,
         dp_awareness: bool,
+        api_key: Option<String>,
         service_discovery: bool,
         selector: HashMap<String, String>,
         service_discovery_port: u16,
@@ -107,6 +110,7 @@ impl Router {
             verbose,
             log_dir,
             dp_awareness,
+            api_key,
             service_discovery,
             selector,
             service_discovery_port,
@@ -122,11 +126,13 @@ impl Router {
                 timeout_secs: self.worker_startup_timeout_secs,
                 interval_secs: self.worker_startup_check_interval,
                 dp_awareness: self.dp_awareness,
+                api_key: self.api_key.clone(),
             },
             PolicyType::RoundRobin => router::PolicyConfig::RoundRobinConfig {
                 timeout_secs: self.worker_startup_timeout_secs,
                 interval_secs: self.worker_startup_check_interval,
                 dp_awareness: self.dp_awareness,
+                api_key: self.api_key.clone(),
             },
             PolicyType::CacheAware => router::PolicyConfig::CacheAwareConfig {
                 timeout_secs: self.worker_startup_timeout_secs,
@@ -137,6 +143,7 @@ impl Router {
                 eviction_interval_secs: self.eviction_interval_secs,
                 max_tree_size: self.max_tree_size,
                 dp_awareness: self.dp_awareness,
+                api_key: self.api_key.clone(),
             },
         };
 
