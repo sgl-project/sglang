@@ -1294,6 +1294,11 @@ class ServerArgs:
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
         )
         parser.add_argument(
+            "--disable-overlap-cg-plan",
+            action="store_true",
+            help="Disable the overlap optimization for cudagraph preparation in eagle verify.",
+        )
+        parser.add_argument(
             "--enable-mixed-chunk",
             action="store_true",
             help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
