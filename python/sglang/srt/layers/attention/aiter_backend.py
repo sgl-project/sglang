@@ -760,12 +760,12 @@ class AiterIndicesUpdaterPrefill:
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
 
-            # WA for CI test test_moe_eval_accuracy_large.py
-            # mha_batch_prefill will read 128 data to do computatoin
-            # if the real data is not enough the original padding value is 0
-            # but the 0 location will be put the nan value in cuda graph capture mode
+            # (TODO: Kk) WA - CI test_moe_eval_accuracy_large.py
+            # mha_batch_prefill reads 128 data to do computatoin
+            # if real data is not long enough then original padding value 0 is used
+            # but the 0 location will be made nan (noqa) in cuda graph capture mode
             # this will cause the output tensor value becomes nan
-            # Pick up the last index of pool that will not be changed
+            # WA is to assure that last index of pool not changed
             kv_indices = torch.full(
                 (paged_kernel_lens_sum + 128,),
                 self.pool_size,
