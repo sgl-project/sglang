@@ -5,6 +5,7 @@ from typing import Callable, List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.utils import is_sm100_supported
 
 try:
     from vllm import _custom_ops as ops
@@ -38,11 +39,10 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
 
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-use_aiter_moe = get_bool_env_var("SGLANG_AITER_MOE")
-
-if _is_hip and use_aiter_moe:
-    from aiter import gemm_a8w8_blockscale
+if _use_aiter:
+    from aiter import gemm_a8w8_blockscale_CK
 
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
@@ -82,12 +82,6 @@ def cutlass_fp8_supported():
     elif major == 8 and minor == 9:
         return cuda_version >= (12, 4)
     return False
-
-
-def is_sm100_supported(device=None) -> bool:
-    return (torch.cuda.get_device_capability(device)[0] == 10) and (
-        torch.version.cuda >= "12.8"
-    )
 
 
 def normalize_e4m3fn_to_e4m3fnuz(
@@ -141,7 +135,7 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
         return flashinfer_gemm_w8a8_block_fp8_linear
     elif CUTLASS_BLOCK_FP8_SUPPORTED:
         return cutlass_w8a8_block_fp8_linear_with_fallback
-    elif _is_hip and use_aiter_moe:
+    elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
     elif _ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
@@ -268,12 +262,9 @@ def aiter_w8a8_block_fp8_linear(
     q_input, x_scale = per_token_group_quant_fp8(
         input_2d, block_size[1], column_major_scales=False
     )
-    output = torch.zeros(
-        [q_input.shape[0], weight.shape[0]],
-        dtype=input_2d.dtype,
-        device=q_input.device,
+    output = gemm_a8w8_blockscale_CK(
+        q_input, weight, x_scale, weight_scale, dtype=input.dtype
     )
-    gemm_a8w8_blockscale(q_input, weight, x_scale, weight_scale, output)
 
     if bias is not None:
         output += bias

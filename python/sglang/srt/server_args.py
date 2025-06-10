@@ -182,7 +182,7 @@ class ServerArgs:
     eplb_rebalance_num_iterations: int = 1000
     eplb_rebalance_layers_per_chunk: Optional[int] = None
     expert_distribution_recorder_mode: Optional[
-        Literal["stat", "per_pass", "per_token"]
+        Literal["stat", "stat_approx", "per_pass", "per_token"]
     ] = None
     expert_distribution_recorder_buffer_size: Optional[int] = None
     enable_expert_distribution_metrics: bool = False
@@ -425,6 +425,12 @@ class ServerArgs:
                 "Overlap scheduler is disabled because of using "
                 "eagle speculative decoding."
             )
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using "
+                    "eagle speculative decoding."
+                )
 
             model_arch = get_model_arch(self)
 
@@ -447,7 +453,7 @@ class ServerArgs:
                     self.speculative_num_steps,
                     self.speculative_eagle_topk,
                     self.speculative_num_draft_tokens,
-                ) = auto_choose_speculative_params(model_arch)
+                ) = auto_choose_speculative_params(self)
 
             if self.page_size > 1 and self.speculative_eagle_topk > 1:
                 self.speculative_eagle_topk = 1
@@ -1007,13 +1013,13 @@ class ServerArgs:
             type=str,
             choices=[
                 "aiter",
-                "flashinfer",
-                "triton",
-                "torch_native",
-                "fa3",
-                "flashmla",
                 "cutlass_mla",
+                "fa3",
+                "flashinfer",
+                "flashmla",
                 "intel_amx",
+                "torch_native",
+                "triton",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
@@ -1655,12 +1661,23 @@ def get_model_arch(args: ServerArgs):
     return hf_config.architectures[0]
 
 
-def auto_choose_speculative_params(arch: str):
+def auto_choose_speculative_params(self: ServerArgs):
     """
     Automatically choose the parameters for speculative decoding.
 
     You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
     """
+    kwargs = {}
+
+    hf_config = get_config(
+        self.model_path,
+        trust_remote_code=self.trust_remote_code,
+        revision=self.revision,
+        model_override_args=json.loads(self.json_model_override_args),
+        **kwargs,
+    )
+    arch = hf_config.architectures[0]
+
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama
         return (5, 4, 8)
