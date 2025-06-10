@@ -112,6 +112,10 @@ class ServerArgs:
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
+    allowed_origins: Optional[str] = "*"
+    allow_credentials: bool = False
+    allowed_methods: Optional[str] = "*"
+    allowed_headers: Optional[str] = "*"
 
     # Data parallelism
     dp_size: int = 1
@@ -928,6 +932,18 @@ class ServerArgs:
             choices=list(ReasoningParser.DetectorMap.keys()),
             default=ServerArgs.reasoning_parser,
             help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
+        )
+        parser.add_argument(
+            "--allow-credentials", action="store_true", help="Allow credentials."
+        )
+        parser.add_argument(
+            "--allowed-origins", type=json.loads, default=["*"], help="Allowed origins."
+        )
+        parser.add_argument(
+            "--allowed-methods", type=json.loads, default=["*"], help="Allowed methods."
+        )
+        parser.add_argument(
+            "--allowed-headers", type=json.loads, default=["*"], help="Allowed headers."
         )
 
         # Data parallelism

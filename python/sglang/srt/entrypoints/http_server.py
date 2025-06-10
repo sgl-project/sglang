@@ -138,13 +138,6 @@ app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 
@@ -782,6 +775,14 @@ def launch_server(
         ),
     )
     app.warmup_thread = warmup_thread
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=server_args.allowed_origins,
+        allow_credentials=server_args.allow_credentials,
+        allow_methods=server_args.allowed_methods,
+        allow_headers=server_args.allowed_headers,
+    )
 
     try:
         # Update logging configs
