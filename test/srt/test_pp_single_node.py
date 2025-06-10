@@ -251,5 +251,33 @@ class TestFixedBugs(unittest.TestCase):
         )
 
 
+class TestTritonAttentionBackend(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = "http://127.0.0.1:23337"  # different ports to avoid conflicts
+        model = DEFAULT_MODEL_NAME_FOR_TEST
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+
+        self.assertGreater(metrics["accuracy"], 0.74)
+        # Wait a little bit so that the memory check happens.
+        time.sleep(4)
+
+
 if __name__ == "__main__":
     unittest.main()
