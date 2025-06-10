@@ -5,7 +5,7 @@
 Achieving a large batch size is the most important thing for attaining high throughput in offline batch inference.
 When the server is running at full load in a steady state, look for the following in the log:
 
-```Decode batch. #running-req: 233, #token: 370959, token usage: 0.82, gen throughput (token/s): 4594.01, #queue-req: 317```
+```Decode batch. #running-req: 233, #token: 370959, token usage: 0.82, cuda graph: True, gen throughput (token/s): 4594.01, #queue-req: 317```
 
 ### Adjust the request submission speed to control `#queue-req`
 
@@ -43,12 +43,18 @@ If you encounter out-of-memory (OOM) errors, you can adjust the following parame
 - If OOM occurs during decoding, try lowering `--max-running-requests`.
 - You can also reduce `--mem-fraction-static` to a smaller value, such as 0.8 or 0.7. This decreases the memory usage of the KV cache memory pool and helps prevent OOM errors during both prefill and decoding. However, it limits maximum concurrency and reduces peak throughput.
 
+### Tune `--cuda-graph-max-bs`
+By default, CUDA graph is enabled only for small batch sizes (e.g., less than 160 or 256).
+However, for some models, especially at large tensor parallelism sizes, CUDA graph can be useful for batch sizes up to 512 or 768.
+Therefore, it may be beneficial to increase `--cuda-graph-max-bs` to a larger value.
+Note that CUDA graph consumes more memory, so you may need to reduce `--mem-fraction-static` at the same time.
+
 ### Tune `--dp-size` and `--tp-size`
 
 Data parallelism is better for throughput. When there is enough GPU memory, always favor data parallelism for throughput. Refer to [sglang router](../router/router.md) for a better data parallelism rather than using `dp_size` parameter.
 
-## Try other options
+### Try other options
 
 - `torch.compile` accelerates small models on small batch sizes. You can enable it with `--enable-torch-compile`.
-- If the workload has many shared prefixes, try `--schedule-policy lpm`. Here, `lpm` stands for longest prefix match. It reorders requests to encourage more cache hits but introduces more scheduling overhead.
 - Try other quantization (e.g. FP8 quantizatioin) or other parallelism strategies (e.g. expert parallelism)
+- If the workload has many shared prefixes, try `--schedule-policy lpm`. Here, `lpm` stands for longest prefix match. It reorders requests to encourage more cache hits but introduces more scheduling overhead.
