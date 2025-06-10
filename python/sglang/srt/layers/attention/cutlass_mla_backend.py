@@ -275,7 +275,8 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         k_cache = k_cache.view(-1, PAGE_SIZE, self.kv_cache_dim)
 
         o = cutlass_mla_decode(
-            q_nope_and_q_pe=reshape_q,
+            q_nope=q_nope,
+            q_pe=q_rope,
             k_nope=k_cache[:, :, : layer.v_head_dim],
             k_pe=k_cache[:, :, layer.v_head_dim:],
             seq_lens=forward_batch.seq_lens.to(torch.int32),
