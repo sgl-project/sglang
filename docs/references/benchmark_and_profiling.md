@@ -52,6 +52,17 @@
   python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
   ```
 
+- Possible PyTorch Bug
+  If in any cases you encounter the following error (for example, using qwen 2.5 VL):
+  ```bash
+  RuntimeError: !stack.empty() INTERNAL ASSERT FAILED at "/pytorch/torch/csrc/autograd/profiler_python.cpp":983, please report a bug to PyTorch. Python replay stack is empty.
+  ```
+  This is likely a PyTorch Bug reported in [Bug: vLLM Profiler](https://github.com/vllm-project/vllm/issues/18240) and [Bug: torch.profiler.profile](https://github.com/pytorch/pytorch/issues/101632). As a workaround, you may disable `with_stack` with an environment variable such as follows:
+  ```bash
+  export SGLANG_PROFILE_WITH_STACK=False
+  python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
+  ```
+
 - View Traces
 
   Trace files can be loaded and visualized from:

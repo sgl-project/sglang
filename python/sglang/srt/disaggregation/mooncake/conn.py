@@ -562,6 +562,12 @@ class MooncakeKVManager(BaseKVManager):
             )
             return
 
+        if bootstrap_room not in self.transfer_infos:
+            # This means that the current rank is a dummy rank for this request,
+            # and it has already been marked as success, so there is no need to
+            # add further chunks into the transfer queue.
+            return
+
         # NOTE(shangming): sharding according to the dst_infos to make sure
         # requests with the same dst_sessions will be added into the same
         # queue, which enables early abort with failed sessions.
@@ -578,7 +584,6 @@ class MooncakeKVManager(BaseKVManager):
                 prefill_aux_index=aux_index,
             )
         )
-        self.update_status(bootstrap_room, KVPoll.WaitingForInput)
 
     def check_status(self, bootstrap_room: int):
         return self.request_status[bootstrap_room]
@@ -760,6 +765,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         mgr: MooncakeKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
+        data_parallel_rank: Optional[int] = None,
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
@@ -767,6 +773,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.session_id = self.kv_mgr.get_session_id()
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
         self.conclude_state = None
+        self.data_parallel_rank = data_parallel_rank
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
             self.prefill_tp_size, self.prefill_dp_size = (
@@ -840,7 +847,11 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.target_tp_rank = self.target_tp_ranks[0]
             self.required_dst_info_num = 1
 
-        self.target_dp_group = self.bootstrap_room % self.prefill_dp_size
+        if self.data_parallel_rank is not None:
+            logger.debug(f"Targeting DP rank: {self.data_parallel_rank}")
+            self.target_dp_group = self.data_parallel_rank
+        else:
+            self.target_dp_group = bootstrap_room % self.prefill_dp_size
 
         # NOTE: key distinguished by bootstrap_addr, target_dp_group, and target_tp_rank
         bootstrap_key = (
