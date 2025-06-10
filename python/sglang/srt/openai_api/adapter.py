@@ -1479,6 +1479,7 @@ async def v1_chat_completions(
         reasoning_parser_dict = {}
 
         async def generate_stream_resp():
+            tool_index_previous = -1
             is_firsts = {}
             stream_buffers = {}
             n_prev_tokens = {}
@@ -1643,7 +1644,6 @@ async def v1_chat_completions(
                             yield f"data: {chunk.model_dump_json()}\n\n"
 
                         # 2) if we found calls, we output them as separate chunk(s)
-                        tool_index_previous = -1
                         for call_item in calls:
                             tool_index_current = call_item.tool_index
                             # transform call_item -> FunctionResponse + ToolCall
