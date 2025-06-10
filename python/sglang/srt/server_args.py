@@ -182,7 +182,7 @@ class ServerArgs:
     eplb_rebalance_num_iterations: int = 1000
     eplb_rebalance_layers_per_chunk: Optional[int] = None
     expert_distribution_recorder_mode: Optional[
-        Literal["stat", "per_pass", "per_token"]
+        Literal["stat", "stat_approx", "per_pass", "per_token"]
     ] = None
     expert_distribution_recorder_buffer_size: Optional[int] = None
     enable_expert_distribution_metrics: bool = False
