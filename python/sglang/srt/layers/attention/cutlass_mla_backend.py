@@ -272,10 +272,11 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         q_rope = q_rope.to(self.q_data_type)
 
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = k_cache.view(-1, PAGE_SIZE, self.kv_cache_dim)
 
         o = cutlass_mla_decode(
             q_nope_and_q_pe=reshape_q,
-            kv_c_and_k_pe_cache=k_cache.view(-1, PAGE_SIZE, self.kv_cache_dim),
+            kv_c_and_k_pe_cache=k_cache,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             page_table=self.forward_metadata.block_kv_indices,
             workspace=self.forward_metadata.workspace,
