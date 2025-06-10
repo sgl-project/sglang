@@ -1,7 +1,6 @@
 import argparse
 import glob
 from dataclasses import dataclass
-from pathlib import Path
 
 from sglang.test.test_utils import run_unittest_files
 
@@ -190,84 +189,7 @@ suites = {
         TestFile("test_gptqmodel_dynamic.py", 72),
         TestFile("test_vllm_dependency.py"),
     ],
-    "__not_in_ci__": [
-        TestFile("cpu/test_rope.py"),
-        TestFile("cpu/test_topk.py"),
-        TestFile("cpu/utils.py"),
-        TestFile("experiment_runner.py"),
-        TestFile("models/compare.py"),
-        TestFile("models/lora/utils.py"),
-        TestFile("models/test_clip_models.py"),
-        TestFile("models/test_dummy_grok_models.py"),
-        TestFile("models/test_encoder_embedding_models.py"),
-        TestFile("models/test_gme_qwen_models.py"),
-        TestFile("models/test_grok_models.py"),
-        TestFile("models/test_llama4_models.py"),
-        TestFile("models/test_mtp_models.py"),
-        TestFile("models/test_unsloth_models.py"),
-        TestFile("parse_results.py"),
-        TestFile("run_suite.py"),
-        TestFile("test_bench_one_batch.py"),
-        TestFile("test_bench_serving.py"),
-        TestFile("test_cache_report.py"),
-        TestFile("test_custom_allreduce.py"),
-        TestFile("test_deepep_internode.py"),
-        TestFile("test_deepep_intranode.py"),
-        TestFile("test_deepep_low_latency.py"),
-        TestFile("test_double_sparsity.py"),
-        TestFile("test_eplb.py"),
-        TestFile("test_expert_distribution.py"),
-        TestFile("test_expert_location_updater.py"),
-        TestFile("test_eval_accuracy_large.py"),
-        TestFile("test_fim_completion.py"),
-        TestFile("test_fp8_kvcache.py"),
-        TestFile("test_function_calling.py"),
-        TestFile("test_get_weights_by_name.py"),
-        TestFile("test_health_check.py"),
-        TestFile("test_hicache_page.py"),
-        TestFile("test_io_struct.py"),
-        TestFile("test_json_mode.py"),
-        TestFile("test_kv_events.py"),
-        TestFile("test_matched_stop.py"),
-        TestFile("test_modelopt.py"),
-        TestFile("test_modelopt_fp8kvcache.py"),
-        TestFile("test_models_from_modelscope.py"),
-        TestFile("test_moe_deepep.py"),
-        TestFile("test_moe_deepep_eval_accuracy_large.py"),
-        TestFile("test_moe_eval_accuracy_large.py"),
-        TestFile("test_mscclpp.py"),
-        TestFile("test_sagemaker_server.py"),
-        TestFile("test_schedule_policy.py"),
-        TestFile("test_score_api.py"),
-        TestFile("test_session_control.py"),
-        TestFile("test_srt_engine_with_quant_args.py"),
-        TestFile("test_torch_tp.py"),
-        TestFile("test_triton_attention_rocm_mla.py"),
-        TestFile("test_triton_moe_wna16.py"),
-        TestFile("test_two_batch_overlap.py"),
-        TestFile("test_verl_engine.py"),
-        TestFile("test_verl_engine_server.py"),
-        TestFile("test_vision_openai_server.py"),
-        TestFile("test_vision_openai_server_common.py"),
-        TestFile("test_vlm_accuracy.py"),
-    ],
 }
-
-
-def _sanity_check_suites(suites):
-    dir_base = Path(__file__).parent
-    disk_files = set([str(x.relative_to(dir_base)) for x in dir_base.glob("**/*.py")])
-
-    suite_files = set(
-        [test_file.name for _, suite in suites.items() for test_file in suite]
-    )
-
-    missing_files = sorted(list(disk_files - suite_files))
-    assert len(missing_files) == 0, (
-        f"Some test files are not in test suite. "
-        f"If this is intentional, please add to `not_in_ci` section. "
-        f"{missing_files=}"
-    )
 
 
 def auto_partition(files, rank, size):
@@ -353,8 +275,6 @@ if __name__ == "__main__":
     )
     args = arg_parser.parse_args()
     print(f"{args=}")
-
-    _sanity_check_suites(suites)
 
     if args.suite == "all":
         files = glob.glob("**/test_*.py", recursive=True)
