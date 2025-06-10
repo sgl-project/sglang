@@ -116,6 +116,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
+    get_bool_env_var,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -569,6 +570,7 @@ class TokenizerManager:
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
                 return_hidden_states=obj.return_hidden_states,
+                data_parallel_rank=obj.data_parallel_rank,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -805,6 +807,8 @@ class TokenizerManager:
         profile_by_stage: bool = False,
     ):
         self.auto_create_handle_loop()
+        env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
+        with_stack = False if with_stack is False or env_with_stack is False else True
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
@@ -852,7 +856,7 @@ class TokenizerManager:
             obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
-        if True:
+        if True:  # Keep this redundant check to simplify some internal code sync
             # Hold the lock if it is not async. This means that weight sync
             # cannot run while requests are in progress.
             async with self.model_update_lock.writer_lock:

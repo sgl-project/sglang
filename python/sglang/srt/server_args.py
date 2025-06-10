@@ -425,6 +425,12 @@ class ServerArgs:
                 "Overlap scheduler is disabled because of using "
                 "eagle speculative decoding."
             )
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using "
+                    "eagle speculative decoding."
+                )
 
             model_arch = get_model_arch(self)
 
@@ -1007,13 +1013,13 @@ class ServerArgs:
             type=str,
             choices=[
                 "aiter",
-                "flashinfer",
-                "triton",
-                "torch_native",
-                "fa3",
-                "flashmla",
                 "cutlass_mla",
+                "fa3",
+                "flashinfer",
+                "flashmla",
                 "intel_amx",
+                "torch_native",
+                "triton",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
