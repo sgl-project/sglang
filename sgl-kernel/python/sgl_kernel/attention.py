@@ -65,15 +65,20 @@ def cutlass_mla_decode(
     assert q_pe.ndim == 3, f"q_pe must be a 3D tensor, but got {q_pe.ndim}"
     assert k_nope.ndim == 3, f"k_nope must be a 3D tensor, but got {k_nope.ndim}"
     assert k_pe.ndim == 3, f"k_pe must be a 3D tensor, but got {k_pe.ndim}"
-    B_q, H, D_q = q_nope_and_q_pe.shape
-    _, PAGE_SIZE, D_ckv = kv_c_and_k_pe_cache.shape
+
+    B_q, H, D_q_nope = q_nope.shape
+    B_q_2, H_2, D_q_pe = q_pe.shape
+    assert (B_q == B_q_2) and (H == H_2)
+
+    _, PAGE_SIZE, D_k_nope = k_nope.shape
+    _, PAGE_SIZE_2, D_k_pe = k_pe.shape
+    assert PAGE_SIZE == PAGE_SIZE_2
 
     D_latent = 512
     D_rope = 64
-    assert D_q == D_ckv and D_q == D_latent + D_rope, (
-        f"D_q must be equal to D_ckv and D_q must be equal to D_latent + D_rope, "
-        f"but got D_q = {D_q}, D_ckv = {D_ckv}, D_latent = {D_latent}, D_rope = {D_rope}"
-    )
+    assert D_q_nope == D_k_nope == D_latent
+    assert D_q_pe == D_k_pe == D_rope
+
     MAX_HEADS = 128
     assert H <= MAX_HEADS, f"H must be <= {MAX_HEADS}, but got {H}"
     if H < MAX_HEADS:
