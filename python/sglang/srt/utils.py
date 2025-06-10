@@ -837,6 +837,7 @@ class CustomCacheManager(FileCacheManager):
 
 
 def set_ulimit(target_soft_limit=65535):
+    # number of open files
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
 
@@ -845,6 +846,18 @@ def set_ulimit(target_soft_limit=65535):
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
             logger.warning(f"Fail to set RLIMIT_NOFILE: {e}")
+
+    # stack size
+    resource_type = resource.RLIMIT_STACK
+    current_soft, current_hard = resource.getrlimit(resource_type)
+    target_soft_limit_stack_size = 1024 * target_soft_limit
+    if current_soft < target_soft_limit_stack_size:
+        try:
+            resource.setrlimit(
+                resource_type, (target_soft_limit_stack_size, current_hard)
+            )
+        except ValueError as e:
+            logger.warning(f"Fail to set RLIMIT_STACK: {e}")
 
 
 def add_api_key_middleware(app, api_key: str):
