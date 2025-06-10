@@ -202,12 +202,12 @@ class CudaGraphRunner:
             model_runner.server_args.enable_two_batch_overlap
         )
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
-        self.tp_size = model_runner.server_args.tp_size
-        self.dp_size = model_runner.server_args.dp_size
-        self.pp_size = model_runner.server_args.pp_size
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self.tp_size = model_runner.server_args.tp_size
+        self.dp_size = model_runner.server_args.dp_size
+        self.pp_size = model_runner.server_args.pp_size
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
