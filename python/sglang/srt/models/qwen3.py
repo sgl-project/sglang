@@ -327,6 +327,8 @@ class Qwen3ForCausalLM(nn.Module, SupportsPP):
         params_dict = dict(self.named_parameters())
         filtered_weights = self.filter_weights_by_layers(weights)
         for name, loaded_weight in filtered_weights:
+            if "Embedding" in self.config.name_or_path:
+                name = add_prefix(name, "model")
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
