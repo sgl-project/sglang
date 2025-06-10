@@ -1042,7 +1042,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
-        q_nope_out = q_nope_out.transpose(0, 1)
+        # TODO try to remove the .transpose.contiguous by doing `B^T @ A^T`
+        q_nope_out = q_nope_out.transpose(0, 1).contiguous()
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
@@ -1050,7 +1051,11 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward_absorb_core(
         self, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
     ):
-        if self.attention_backend == "fa3" or self.attention_backend == "flashinfer":
+        if (
+            self.attention_backend == "fa3"
+            or self.attention_backend == "flashinfer"
+            or self.attention_backend == "cutlass_mla"
+        ):
             attn_output = self.attn_mqa(
                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
             )
