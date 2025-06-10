@@ -170,8 +170,10 @@ typename T::Fmha::Arguments args_from_options(
 template <typename Element, bool IsPaged128, typename PersistenceOption>
 void runMla(
     at::Tensor const& out,
-    at::Tensor const& q_nope_and_q_pe,
-    at::Tensor const& kv_c_and_k_pe_cache,
+    at::Tensor const& q_nope,
+    at::Tensor const& q_pe,
+    at::Tensor const& k_nope,
+    at::Tensor const& k_pe,
     at::Tensor const& seq_lens,
     at::Tensor const& page_table,
     at::Tensor const& workspace,
@@ -221,13 +223,13 @@ void cutlass_mla_decode(
     DISPATCH_BOOL(num_kv_splits <= 1, NotManualSplitKV, [&] {
       if (in_dtype == at::ScalarType::Half) {
         runMla<cutlass::half_t, IsPaged128, IsPersistent<NotManualSplitKV>>(
-          out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, num_kv_splits, stream);
+          out, q_nope, q_pe, k_nope, k_pe, seq_lens, page_table, workspace, num_kv_splits, stream);
       } else if (in_dtype == at::ScalarType::BFloat16) {
         runMla<cutlass::bfloat16_t, IsPaged128, IsPersistent<NotManualSplitKV>>(
-          out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, num_kv_splits, stream);
+          out, q_nope, q_pe, k_nope, k_pe, seq_lens, page_table, workspace, num_kv_splits, stream);
       } else if (in_dtype == at::ScalarType::Float8_e4m3fn) {
         runMla<cutlass::float_e4m3_t, IsPaged128, IsPersistent<NotManualSplitKV>>(
-          out, q_nope_and_q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, num_kv_splits, stream);
+          out, q_nope, q_pe, k_nope, k_pe, seq_lens, page_table, workspace, num_kv_splits, stream);
       } else {
         TORCH_CHECK(false, "Unsupported input data type of MLA");
       }
