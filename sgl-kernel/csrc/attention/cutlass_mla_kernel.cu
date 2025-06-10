@@ -123,8 +123,10 @@ typename T::Fmha::Arguments args_from_options(
   using StrideO = typename T::StrideO;
   using StrideLSE = typename T::StrideLSE;
 
-  StrideQ stride_Q = cute::make_tuple(
-      static_cast<int64_t>(0 + D_latent + D_rope), _1{}, static_cast<int64_t>(H * (0 + D_latent + D_rope)));
+  StrideQ stride_Q_nope = cute::make_tuple(
+      static_cast<int64_t>(0 + D_latent), _1{}, static_cast<int64_t>(H * (0 + D_latent)));
+  StrideQ stride_Q_pe = cute::make_tuple(
+      static_cast<int64_t>(0 + D_rope), _1{}, static_cast<int64_t>(H * (0 + D_rope)));
   StrideK stride_C = cute::make_tuple(
       static_cast<int64_t>(0 + D_latent + D_rope), _1{}, static_cast<int64_t>(page_size * (D_latent + D_rope)));
   StrideLSE stride_PT = cute::make_stride(_1{}, page_count_per_seq);
@@ -140,10 +142,10 @@ typename T::Fmha::Arguments args_from_options(
   typename T::Fmha::Arguments arguments{
       problem_shape,
       {scale,
-       Q_ptr,
-       stride_Q,
-       Q_ptr + D_latent,
-       stride_Q,
+       Q_nope_ptr,
+       stride_Q_nope,
+       Q_pe_ptr,
+       stride_Q_pe,
        C_ptr,
        stride_C,
        C_ptr + D_latent,
