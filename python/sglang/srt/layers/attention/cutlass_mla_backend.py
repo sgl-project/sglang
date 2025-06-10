@@ -257,10 +257,19 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                         v,
                     )
 
+        # Reshape inputs
+        if q_rope is not None:
+            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+        else:
+            reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            q_nope = reshaped_q[:, :, : layer.v_head_dim]
+            q_rope = reshaped_q[:, :, layer.v_head_dim :]
+
         bs = forward_batch.batch_size
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-
-        reshape_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
         o = cutlass_mla_decode(
             q_nope_and_q_pe=reshape_q.to(self.q_data_type),
