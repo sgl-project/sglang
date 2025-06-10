@@ -146,7 +146,6 @@ class ServerArgs:
     speculative_num_draft_tokens: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
-    speculative_draft_tp_size: Optional[int] = None
     speculative_token_map: Optional[str] = None
 
     # Expert parallelism
