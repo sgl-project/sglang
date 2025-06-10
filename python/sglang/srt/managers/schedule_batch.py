@@ -1637,7 +1637,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
-    def get_model_worker_batch(self) -> ModelWorkerBatch:
+    def get_model_worker_batch(
+        self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
+    ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
@@ -1647,16 +1649,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Create seq_lens_cpu when needed
         if (
-            (
+            global_server_args_dict["attention_backend"] == "fa3"
+            or (
                 global_server_args_dict["use_mla_backend"]
                 and global_server_args_dict["attention_backend"] == "flashinfer"
             )
             or global_server_args_dict["attention_backend"] == "flashmla"
-            or global_server_args_dict["attention_backend"] == "fa3"
             or global_server_args_dict["attention_backend"] == "cutlass_mla"
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
-            seq_lens_cpu = self.seq_lens.cpu()
+            seq_lens_cpu = (
+                seq_lens_cpu_cache
+                if seq_lens_cpu_cache is not None
+                else self.seq_lens.cpu()
+            )
         else:
             seq_lens_cpu = None
 
