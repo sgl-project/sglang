@@ -41,6 +41,12 @@ pub enum PDSelectionPolicy {
     },
 }
 
+impl Default for PDSelectionPolicy {
+    fn default() -> Self {
+        PDSelectionPolicy::Random
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

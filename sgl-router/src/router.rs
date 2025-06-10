@@ -1,4 +1,5 @@
 use crate::tree::Tree;
+use crate::pd_types::{EngineInfo, PDSelectionPolicy};
 use ::metrics::{counter, gauge, histogram};
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
@@ -41,66 +42,6 @@ pub enum Router {
         interval_secs: u64,
     },
     CacheAware {
-        /*
-            Cache-Aware Load Balancing Router
-
-            This router combines two strategies to optimize both cache utilization and request distribution:
-
-            1. Cache-Aware Routing (Approximate Tree)
-            2. Load Balancing (Shortest Queue with Balance Thresholds)
-
-            The router dynamically switches between these strategies based on load conditions:
-            - Uses load balancing when the system is imbalanced
-            - Uses cache-aware routing when the system is balanced
-
-            A system is considered imbalanced if both conditions are met:
-            1. (max - min) > abs_threshold
-            2. max > rel_threshold * min
-
-            Strategy Details:
-
-            1. Cache-Aware Routing (Approximate Tree)
-            -------------------------------------------
-            This strategy maintains an approximate radix tree for each worker based on request history,
-            eliminating the need for direct cache state queries. The tree stores raw text characters
-            instead of token IDs to avoid tokenization overhead.
-
-            Process:
-            a. For each request, find the worker with the highest prefix match
-            b. If match rate > cache_threshold:
-            Route to the worker with highest match (likely has relevant data cached)
-            c. If match rate ≤ cache_threshold:
-            Route to the worker with smallest tree size (most available cache capacity)
-            d. Background maintenance:
-            Periodically evict least recently used leaf nodes to prevent memory overflow
-
-            2. Load Balancing (Shortest Queue)
-            -------------------------------------------
-            This strategy tracks pending request counts per worker and routes new requests
-            to the least busy worker when the system is detected to be imbalanced.
-
-            Configuration Parameters:
-            ------------------------
-            1. cache_threshold: (float, 0.0 to 1.0)
-            Minimum prefix match ratio to use highest-match routing.
-            Below this threshold, routes to worker with most available cache space.
-
-            2. balance_abs_threshold: (integer)
-            Absolute difference threshold for load imbalance detection.
-            System is potentially imbalanced if (max_load - min_load) > abs_threshold
-
-            3. balance_rel_threshold: (float)
-            Relative ratio threshold for load imbalance detection.
-            System is potentially imbalanced if max_load > min_load * rel_threshold
-            Used in conjunction with abs_threshold to determine final imbalance state.
-
-            4. eviction_interval_secs: (integer)
-            Interval between LRU eviction cycles for the approximate trees.
-
-            5. max_tree_size: (integer)
-            Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
-            during the next eviction cycle.
-        */
         worker_urls: Arc<RwLock<Vec<String>>>,
         tree: Arc<Mutex<Tree>>,
         running_queue: Arc<Mutex<HashMap<String, usize>>>,
@@ -111,6 +52,14 @@ pub enum Router {
         timeout_secs: u64,
         interval_secs: u64,
         _eviction_thread: Option<thread::JoinHandle<()>>,
+    },
+    PrefillDecode {
+        prefill_workers: Arc<RwLock<Vec<EngineInfo>>>,
+        decode_workers: Arc<RwLock<Vec<EngineInfo>>>,
+        selection_policy: PDSelectionPolicy,
+        prefill_tree: Option<Arc<Mutex<Tree>>>,
+        timeout_secs: u64,
+        interval_secs: u64,
     },
 }
 
@@ -130,6 +79,13 @@ pub enum PolicyConfig {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        timeout_secs: u64,
+        interval_secs: u64,
+    },
+    PrefillDecodeConfig {
+        prefill_workers: Vec<EngineInfo>,
+        decode_workers: Vec<EngineInfo>,
+        selection_policy: PDSelectionPolicy,
         timeout_secs: u64,
         interval_secs: u64,
     },
@@ -155,10 +111,28 @@ impl Router {
                 interval_secs,
                 ..
             } => (*timeout_secs, *interval_secs),
+            PolicyConfig::PrefillDecodeConfig {
+                timeout_secs,
+                interval_secs,
+                ..
+            } => (*timeout_secs, *interval_secs),
         };
 
         // Wait until all workers are healthy
-        Self::wait_for_healthy_workers(&worker_urls, timeout_secs, interval_secs)?;
+        let combined_urls: Vec<String> = match &policy_config {
+            PolicyConfig::PrefillDecodeConfig {
+                prefill_workers,
+                decode_workers,
+                ..
+            } => {
+                let mut combined = Vec::new();
+                combined.extend(prefill_workers.iter().map(|e| e.url.clone()));
+                combined.extend(decode_workers.iter().map(|e| e.url.clone()));
+                combined
+            }
+            _ => worker_urls.clone(),
+        };
+        Self::wait_for_healthy_workers(&combined_urls, timeout_secs, interval_secs)?;
 
         // Create router based on policy...
         Ok(match policy_config {
@@ -242,6 +216,29 @@ impl Router {
                     _eviction_thread: Some(eviction_thread),
                 }
             }
+            PolicyConfig::PrefillDecodeConfig {
+                prefill_workers,
+                decode_workers,
+                selection_policy,
+                timeout_secs,
+                interval_secs,
+            } => {
+                // If CacheAware policy, create tree for prefill cache; else None.
+                let prefill_tree = if matches!(selection_policy, PDSelectionPolicy::CacheAware { .. }) {
+                    Some(Arc::new(Mutex::new(Tree::new())))
+                } else {
+                    None
+                };
+
+                Router::PrefillDecode {
+                    prefill_workers: Arc::new(RwLock::new(prefill_workers)),
+                    decode_workers: Arc::new(RwLock::new(decode_workers)),
+                    selection_policy,
+                    prefill_tree,
+                    timeout_secs,
+                    interval_secs,
+                }
+            }
         })
     }
 
@@ -251,6 +248,29 @@ impl Router {
             Router::RoundRobin { worker_urls, .. } => Arc::clone(worker_urls),
             Router::Random { worker_urls, .. } => Arc::clone(worker_urls),
             Router::CacheAware { worker_urls, .. } => Arc::clone(worker_urls),
+            Router::PrefillDecode {
+                prefill_workers,
+                decode_workers,
+                ..
+            } => {
+                // Combine both lists into a new Arc<RwLock<Vec<String>>>
+                let mut combined = Vec::new();
+                combined.extend(
+                    prefill_workers
+                        .read()
+                        .unwrap()
+                        .iter()
+                        .map(|e| e.url.clone()),
+                );
+                combined.extend(
+                    decode_workers
+                        .read()
+                        .unwrap()
+                        .iter()
+                        .map(|e| e.url.clone()),
+                );
+                Arc::new(RwLock::new(combined))
+            }
         }
     }
 
@@ -321,6 +341,14 @@ impl Router {
                     Err("No workers are available".to_string())
                 } else {
                     Ok(worker_urls.read().unwrap()[0].clone())
+                }
+            }
+            Router::PrefillDecode { decode_workers, .. } => {
+                let d = decode_workers.read().unwrap();
+                if d.is_empty() {
+                    Err("No decode workers are available".to_string())
+                } else {
+                    Ok(d[0].url.clone())
                 }
             }
         }
@@ -572,6 +600,29 @@ impl Router {
 
                 selected_url
             }
+            Router::PrefillDecode {
+                decode_workers,
+                selection_policy,
+                prefill_tree: _,
+                ..
+            } => {
+                // For Phase 1B: simple worker selection respecting PD policy.
+                let d_workers = decode_workers.read().unwrap();
+                if d_workers.is_empty() {
+                    panic!("No decode workers available");
+                }
+
+                match selection_policy {
+                    PDSelectionPolicy::Random | PDSelectionPolicy::PowerOfTwo => {
+                        let idx = rand::random::<usize>() % d_workers.len();
+                        d_workers[idx].url.clone()
+                    }
+                    PDSelectionPolicy::CacheAware { .. } => {
+                        // Simple fallback to first for now; detailed cache aware logic in Phase 3
+                        d_workers[0].url.clone()
+                    }
+                }
+            }
         };
 
         worker_url
@@ -741,6 +792,11 @@ impl Router {
                 interval_secs,
                 ..
             } => (*timeout_secs, *interval_secs),
+            Router::PrefillDecode {
+                timeout_secs,
+                interval_secs,
+                ..
+            } => (*timeout_secs, *interval_secs),
         };
 
         let start_time = std::time::Instant::now();
@@ -773,6 +829,9 @@ impl Router {
                                 info!("Added worker: {}", worker_url);
                                 urls.push(worker_url.to_string());
                                 gauge!("sgl_router_active_workers").set(urls.len() as f64);
+                            }
+                            Router::PrefillDecode { .. } => {
+                                return Err("Dynamic add_worker not supported for PrefillDecode yet".to_string());
                             }
                         }
 
@@ -849,6 +908,9 @@ impl Router {
                     warn!("Worker {} not found, skipping removal", worker_url);
                     return;
                 }
+            }
+            Router::PrefillDecode { .. } => {
+                warn!("remove_worker not implemented for PrefillDecode variant");
             }
         }
 
