@@ -28,11 +28,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 
 import torch
 
-from sglang.srt.managers.mm_utils import (
-    TensorTransportMode,
-    deserialize_tensors,
-    serialize_tensors,
-)
+from sglang.srt.managers.mm_utils import TensorTransportMode, TransportableTensor
 from sglang.srt.mm_utils import has_valid_data
 from sglang.utils import info_once
 
@@ -556,9 +552,11 @@ class TokenizedGenerateReqInput:
                 state["effective_mode"] = global_effective_mode
 
         if global_effective_mode is not None:
-            state["mm_inputs"] = serialize_tensors(
-                state["mm_inputs"], global_effective_mode
-            )
+            mm_inputs = state["mm_inputs"]
+            for mm_item in mm_inputs["mm_items"]:
+                mm_item.feature = TransportableTensor(
+                    transport_mode=global_effective_mode, feature=mm_item.feature
+                )
 
         return state
 
@@ -569,13 +567,20 @@ class TokenizedGenerateReqInput:
             if transport_mode is not None:
                 global_effective_mode = transport_mode
         if global_effective_mode is None:
+            print(f"{global_effective_mode=}, returning")
             self.__dict__.update(state)
             return
 
         if "mm_inputs" in state and state["mm_inputs"] is not None:
-            state["mm_inputs"] = deserialize_tensors(
-                state["mm_inputs"], global_effective_mode
-            )
+            mm_inputs = state["mm_inputs"]
+
+            for mm_item in mm_inputs["mm_items"]:
+                print(f"{mm_item=}")
+                assert isinstance(mm_item.feature, TransportableTensor)
+                mm_item.feature = mm_item.feature.deserialize()
+                assert isinstance(mm_item.feature, torch.Tensor)
+        else:
+            print(f"mm_inputs not presented, returning")
 
         self.__dict__.update(state)
 
@@ -599,10 +604,21 @@ class TokenizedGenerateReqInput:
         if self.tensor_transport_mode != "auto":
             return self.tensor_transport_mode
 
-        if self._contains_cuda_feature():
-            return "cuda_ipc"
+        # Fallback to cpu transport for multi-node deployments, as cuda_ipc is not applicable.
+        # We use bootstrap_host as an indicator for multi-node/disaggregated inference.
+        is_remote_bootstrap = (
+            self.bootstrap_host is not None
+            and self.bootstrap_host not in ["localhost", "127.0.0.1"]
+        )
 
-        return "auto"
+        if self._contains_cuda_feature():
+            if is_remote_bootstrap:
+                # Fallback to default CPU transport for multi-node
+                return "default"
+            else:
+                return "cuda_ipc"
+
+        return "default"
 
 
 @dataclass

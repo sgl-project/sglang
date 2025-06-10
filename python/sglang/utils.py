@@ -47,9 +47,6 @@ def info_once(message: str):
     logger.info(message)
 
 
-#
-
-
 def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
     """Convert a JSON schema to a string.
     Parameters

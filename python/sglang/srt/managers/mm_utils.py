@@ -20,7 +20,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import flatten_nested_list, print_warning_once
-from sglang.utils import logger
+from sglang.utils import info_once, logger
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
@@ -28,131 +28,109 @@ from sglang.utils import logger
 # in the console when multimodal support is enabled.
 
 # TODO(mick): nccl
-# cuda_ipc: for multiprocessing within the same machine
-
-TensorTransportMode = Literal["cuda_ipc", "auto"]
+# cuda_ipc: for intranode scenarios
+TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
 
 # applied for tensor sent from TokenizerManager -> Scheduler
 global_tensor_ipc_mode: Optional[TensorTransportMode] = None
 
 
-def serialize_tensors(
-    data: Dict[str, Any], mode: TensorTransportMode
-) -> Dict[str, Any]:
-    """
-    Serializes CUDA tensors within a dictionary based on the specified mode.
+@dataclasses.dataclass
+class TransportableTensor:
+    transport_mode: TensorTransportMode
+    feature: torch.tensor
+    extra: Dict[str, Any] = None
 
-    Args:
-        data: The dictionary possibly containing CUDA tensors (e.g., mm_inputs).
-    """
+    def __post_init__(self):
+        self.serialize()
 
-    def _serialize_tensor_recursive(data: Any, mode: TensorTransportMode) -> Any:
-        """Recursively processes data to serialize tensors based on mode."""
-        if isinstance(data, dict):
-            if "mm_items" in data:
-                data["mm_items"] = _serialize_tensor_recursive(data["mm_items"], mode)
-            return data
-        elif isinstance(data, list):
-            for item in data:
-                assert isinstance(item, MultimodalDataItem)
-            return [_serialize_tensor_recursive(item, mode) for item in data]
-        elif isinstance(data, MultimodalDataItem):
-            data.feature = _serialize_tensor_recursive(data.feature, mode)
-            return data
-        elif isinstance(data, torch.Tensor) and data.is_cuda:
-            if mode == "cuda_ipc":
+    def serialize(self):
+        if isinstance(self.feature, torch.Tensor) and self.feature.is_cuda:
+            if self.transport_mode == "cuda_ipc":
                 try:
-                    storage = data.untyped_storage()
+                    storage = self.feature.untyped_storage()
                     handle = storage._share_cuda_()
-                    return (
-                        "cuda_ipc",
-                        handle,
-                        data.shape,
-                        data.dtype,
-                        data.stride(),
-                        data.device.index,
-                    )
+                    self.extra = {
+                        "handle": handle,
+                        "shape": self.feature.shape,
+                        "dtype": self.feature.dtype,
+                        "stride": self.feature.stride(),
+                        "index": self.feature.device.index,
+                    }
+                    self.feature = None
                 except Exception as e:
+                    if isinstance(
+                        e, RuntimeError
+                    ) and "Attempted to send CUDA tensor received from another process" in str(
+                        e
+                    ):
+                        print_warning_once(
+                            "Attempted to re-share a CUDA tensor received via IPC. "
+                            "Cloning the tensor to continue. This may have a performance impact."
+                        )
+                        cloned_data = self.feature.clone()
+                        storage = cloned_data.untyped_storage()
+                        handle = storage._share_cuda_()
+                        self.extra = {
+                            "handle": handle,
+                            "shape": self.feature.shape,
+                            "dtype": self.feature.dtype,
+                            "stride": self.feature.stride(),
+                            "index": self.feature.device.index,
+                        }
+                    self.feature = None
                     logger.error(
                         f"Failed to get CUDA IPC handle for tensor: {e}. Falling back to copy.",
                         exc_info=True,
                     )
-                    # Fallback to CPU copy if IPC fails
-                    return data.cpu()
-            else:
-                # mode == 'copy' or fallback
-                # Default: move to CPU for standard pickling
-                return data.cpu()
-        else:
-            # Keep non-CUDA tensors or other data types as is
-            return data
 
-    if mode == "auto" or data is None:
-        return data
-    if not isinstance(data, dict):
-        logger.warning(
-            "serialize_tensors expected a dict, but got %s. Returning original.",
-            type(data),
-        )
-        return data
-    return _serialize_tensor_recursive(data, mode)
+    def deserialize(self) -> torch.Tensor:
+        if self.transport_mode == "cuda_ipc":
+            handle, shape, dtype, stride, source_device_index = (
+                self.extra["handle"],
+                self.extra["shape"],
+                self.extra["dtype"],
+                self.extra["stride"],
+                self.extra["index"],
+            )
+            try:
+                current_device_index = torch.cuda.current_device()
+                if source_device_index != current_device_index:
+                    # Check for peer-to-peer access capability before attempting to map.
+                    # A segfault can occur if P2P is not supported and this check is omitted.
+                    if not torch.cuda.can_device_access_peer(
+                        current_device_index, source_device_index
+                    ):
+                        raise RuntimeError(
+                            f"CUDA IPC Error: Attempting to access tensor on device {source_device_index} from "
+                            f"device {current_device_index}, but peer-to-peer access is not available. "
+                            "Please ensure your GPUs are on the same node, connected via a high-speed "
+                            "interconnect (e.g., NVLink), and that P2P is enabled."
+                        )
 
+                # Ensure the current process is on the correct device context to open the handle
+                target_device = torch.device(f"cuda:{source_device_index}")
 
-def deserialize_tensors(
-    data: Dict[str, Any], mode: TensorTransportMode
-) -> Dict[str, Any]:
-    """
-    Deserializes tensors within a dictionary based on the specified mode.
+                with torch.cuda.device(target_device):
+                    storage = torch.UntypedStorage._new_shared_cuda(*handle)
+                    tensor = torch.empty(0, dtype=dtype, device=target_device).set_(
+                        storage, storage_offset=0, size=shape, stride=stride
+                    )
+                    expected_numel = torch.Size(shape).numel()
+                    if tensor.numel() != expected_numel:
+                        raise Exception("tensor.numel() != expected_numel")
+                        # Potentially raise error or return None depending on strictness needed
+                        return self.feature
+                    info_once("succeed")
 
-    Args:
-        data: The dictionary received, possibly containing serialized tensor representations.
-        mode: The transport mode ('cuda_ipc', 'nccl', 'copy').
-
-    Returns:
-        A new dictionary with tensor representations replaced by actual tensors (or placeholders for NCCL).
-    """
-
-    def _deserialize_tensor_recursive(data: Any, mode: TensorTransportMode) -> Any:
-        """Recursively processes data to deserialize tensors based on mode."""
-        if isinstance(data, dict):
-            assert "mm_items" in data
-            data["mm_items"] = _deserialize_tensor_recursive(data["mm_items"], mode)
-            return data
-        elif isinstance(data, list):
-            return [_deserialize_tensor_recursive(item, mode) for item in data]
-        elif isinstance(data, MultimodalDataItem):
-            data.feature = _deserialize_tensor_recursive(data.feature, mode)
-            return data
-        elif isinstance(data, tuple) and len(data) > 1:
-            marker = data[0]
-            if marker == "cuda_ipc" and mode == "cuda_ipc":
-                # ('cuda_ipc', handle, shape, dtype, stride, device_index)
-                handle, shape, dtype, stride, device_index = data[1:]
-                try:
-                    # Ensure the current process is on the correct device context
-                    current_device = torch.device(f"cuda:{device_index}")
-                    with torch.cuda.device(current_device):
-                        storage = torch.UntypedStorage._new_shared_cuda(*handle)
-                        tensor = torch.empty(
-                            0, dtype=dtype, device=current_device
-                        ).set_(storage, storage_offset=0, size=shape, stride=stride)
-                        expected_numel = torch.Size(shape).numel()
-                        if tensor.numel() != expected_numel:
-                            raise Exception("tensor.numel() != expected_numel")
-                            # Potentially raise error or return None depending on strictness needed
-                            return None
-                        return tensor
-                except Exception as e:
-                    raise e
-            else:
-                return data
-        else:
-            # Keep CPU tensors or other data types as is
-            return data
-
-    if not isinstance(data, dict):
-        return data
-    return _deserialize_tensor_recursive(data, mode)
+                    return tensor
+                raise Exception("")
+            except Exception as e:
+                logger.error(
+                    f"Failed to deserialize CUDA IPC tensor: {e}", exc_info=True
+                )
+                raise e
+        return self.feature
 
 
 class MultiModalityDataPaddingPattern:
