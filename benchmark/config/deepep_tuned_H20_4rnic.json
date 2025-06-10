@@ -1,0 +1,16 @@
+{
+    "normal_dispatch": {
+        "num_sms": 24,
+        "num_max_nvl_chunked_send_tokens": 24,
+        "num_max_nvl_chunked_recv_tokens": 512,
+        "num_max_rdma_chunked_send_tokens": 8,
+        "num_max_rdma_chunked_recv_tokens": 128
+    },
+    "normal_combine": {
+        "num_sms": 24,
+        "num_max_nvl_chunked_send_tokens": 2,
+        "num_max_nvl_chunked_recv_tokens": 512,
+        "num_max_rdma_chunked_send_tokens": 16,
+        "num_max_rdma_chunked_recv_tokens": 128
+    }
+}

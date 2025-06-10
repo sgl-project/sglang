@@ -371,7 +371,7 @@ async def _generate_next_bootstrap_room(prefill_url: str):
         
         room = bootstrap_room_counters[prefill_url]
         bootstrap_room_counters[prefill_url] = (bootstrap_room_counters[prefill_url] + 1) % (2**63)
-        print(f"[hanhan] mini lb bootstrap room for {prefill_url}: {room}")
+        print(f"mini lb bootstrap room for {prefill_url}: {room}")
         return room
 
 
