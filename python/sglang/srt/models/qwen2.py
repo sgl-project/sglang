@@ -293,7 +293,7 @@ class Qwen2Model(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
@@ -308,6 +308,7 @@ class Qwen2Model(nn.Module):
             residual = None
         else:
             hidden_states = self.get_input_embedding(input_ids)
+            residual = None
 
         # Decoder layers
         for i in range(self.start_layer, self.end_layer):

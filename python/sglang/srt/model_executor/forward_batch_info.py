@@ -205,7 +205,7 @@ class ForwardBatch:
     prefix_chunk_kv_indices: Optional[List[torch.Tensor]] = None
 
     # For multimodal
-    mm_inputs: Optional[List[MultimodalInputs]] = None
+    mm_data: Optional["MultimodalInputs"] = None
 
     # Encoder-decoder
     encoder_cached: Optional[List[bool]] = None
@@ -258,6 +258,10 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List["ForwardBatch"]] = None
 
+    speculative_num_draft_tokens: Optional[int] = None
+    speculative_eagle_adapter_ids: Optional[torch.Tensor] = None
+    is_multimodal: Optional[bool] = None
+
     @classmethod
     def init_new(
         cls,
@@ -279,7 +283,7 @@ class ForwardBatch:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
-            mm_inputs=batch.multimodal_inputs,
+            mm_data=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
             encoder_lens_cpu=batch.encoder_lens_cpu,
@@ -304,6 +308,9 @@ class ForwardBatch:
                 len(batch.input_ids), dtype=torch.int32
             ).to(device, non_blocking=True),
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            speculative_num_draft_tokens=batch.speculative_num_draft_tokens,
+            speculative_eagle_adapter_ids=batch.speculative_eagle_adapter_ids,
+            is_multimodal=batch.is_multimodal,
         )
 
         # For DP attention
@@ -387,10 +394,10 @@ class ForwardBatch:
             if none, current batch contains no multimodal input
 
         """
-        if not self.mm_inputs or all(x is None for x in self.mm_inputs):
+        if not self.mm_data or all(x is None for x in self.mm_data):
             return None
         # Filter out None values
-        valid_inputs = [x for x in self.mm_inputs if x is not None]
+        valid_inputs = [x for x in self.mm_data if x is not None]
 
         # TODO: is it expensive?
         # a workaround to avoid importing `MultimodalInputs`
@@ -403,19 +410,19 @@ class ForwardBatch:
         return merged
 
     def contains_image_inputs(self) -> bool:
-        if self.mm_inputs is None:
+        if self.mm_data is None:
             return False
         return any(
             mm_input is not None and mm_input.contains_image_inputs()
-            for mm_input in self.mm_inputs
+            for mm_input in self.mm_data
         )
 
     def contains_audio_inputs(self) -> bool:
-        if self.mm_inputs is None:
+        if self.mm_data is None:
             return False
         return any(
             mm_input is not None and mm_input.contains_audio_inputs()
-            for mm_input in self.mm_inputs
+            for mm_input in self.mm_data
         )
 
     def contains_mm_inputs(self) -> bool:

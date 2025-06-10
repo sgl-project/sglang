@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import os
+import pickle
 import signal
 import sys
 import threading
@@ -650,29 +651,6 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
-    def event_loop(self):
-        disaggregation_mode: DisaggregationMode = self.disaggregation_mode
-        server_args = self.server_args
-
-        if disaggregation_mode == DisaggregationMode.NULL:
-            if server_args.pp_size > 1:
-                self.event_loop_pp()
-            elif self.enable_overlap:
-                self.event_loop_overlap()
-            else:
-                self.event_loop_normal()
-        elif disaggregation_mode == DisaggregationMode.PREFILL:
-            if self.enable_overlap:
-                self.event_loop_overlap_disagg_prefill()
-            else:
-                self.event_loop_normal_disagg_prefill()
-
-        elif disaggregation_mode == DisaggregationMode.DECODE:
-            if self.enable_overlap:
-                self.event_loop_overlap_disagg_decode()
-            else:
-                self.event_loop_normal_disagg_decode()
-
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -740,239 +718,106 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_pp(self):
         """A non-overlap scheduler loop for pipeline parallelism."""
-        last_mbs = [None] * self.pp_size
-        self.running_mbs = [
-            ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(self.pp_size)
-        ]
-
         while True:
-            # Step 1: Receive requests and prepare a pipeline of microbatches
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
-
-            mbs = [None] * self.pp_size
-            server_is_idle = True
-            for i in range(self.pp_size):
-                self.running_batch = self.running_mbs[i]
-                self.last_batch = last_mbs[i]
-                batch = self.get_next_batch_to_run()
-                if batch:
-                    server_is_idle = False
-                mbs[i] = batch
-                self.running_mbs[i] = self.running_batch
-
-            # Step 2: If idle, wait and restart loop to get new requests
-            if server_is_idle:
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
-                time.sleep(0.01)  # Avoid busy-waiting
+            # Step 1: Rank 0 decides on the next batch and broadcasts a signal to other ranks
+            cur_batch = None
+            if self.pp_rank == 0:
+                # Only rank 0 receives requests from the tokenizer
+                recv_reqs = self.recv_requests()
+                self.process_input_requests(recv_reqs)
+                self.move_ready_grammar_requests()
+                
+                # Rank 0 decides whether there's a batch to run
+                cur_batch = self.get_next_batch_to_run()
+                
+                # Create a simple signal dictionary with only scalar values
+                # This is easily serializable
+                batch_info = {"has_batch": cur_batch is not None}
+            else:
+                batch_info = {"has_batch": False}
+            
+            # Broadcast just the batch_info signal
+            if self.pp_size > 1:
+                batch_info_list = [batch_info]
+                torch.distributed.broadcast_object_list(
+                    batch_info_list, src=0, group=self.world_group.cpu_group
+                )
+                batch_info = batch_info_list[0]
+            
+            # If there's no batch (according to the signal), all ranks idle
+            if not batch_info["has_batch"]:
+                time.sleep(0.001)  # Sleep to avoid busy waiting
                 continue
 
-            # NEW: Pre-broadcast multimodal flags for all microbatches to avoid deadlock.
-            # This must be a collective call outside the pipeline execution loop.
-            is_multimodal_list = []
+            # Step 2: Rank 0 processes the real batch, other ranks create dummy batches
             if self.pp_rank == 0:
-                for mb in mbs:
-                    # Check if the microbatch has multimodal inputs.
-                    has_mm_input = bool(mb and mb.multimodal_inputs)
-                    is_multimodal_list.append(has_mm_input)
-
-            is_multimodal_list = broadcast_pyobj(
-                is_multimodal_list, self.pp_rank, self.pp_group.cpu_group, src=0
-            )
-
-            for i, mb in enumerate(mbs):
-                if mb:
-                    mb.is_multimodal = is_multimodal_list[i]
-
-            # Step 3: Execute the pipeline
-            bids = [None] * self.pp_size
-            results = [None] * self.pp_size
-            pp_outputs: Optional[PPProxyTensors] = None
-
-            for mb_id in range(self.pp_size):
-                self.cur_batch = mbs[mb_id]
-                result = None
-                if self.cur_batch:
-                    if self.cur_batch.forward_mode.is_decode():
-                        self.cur_batch = self.update_running_batch(self.cur_batch)
-                    logger.info(
-                        f"[PP{self.pp_rank} Sched] Running batch for mb_id={mb_id}. Batch: {self.cur_batch}"
-                    )
-                    result = self.run_batch(self.cur_batch)
-                    results[mb_id] = result
-                    logger.info(
-                        f"[PP{self.pp_rank} Sched] Finished running batch for mb_id={mb_id}."
-                    )
-
-                # Communication part for a 1-Fwd-1-Bwd pipeline schedule
-                # (last rank) send final output to first rank
-                if self.pp_group.is_last_rank:
-                    if self.cur_batch:
-                        next_token_ids, bids[mb_id] = (
-                            result.next_token_ids,
-                            result.bid,
-                        )
-                        pp_outputs_to_send = PPProxyTensors(
-                            {"next_token_ids": next_token_ids}
-                        )
-                        logger.info(
-                            f"[PP{self.pp_rank} Sched] Sending 'next_token_ids' for mb_id={mb_id} to rank 0."
-                        )
-                        self.pp_group.send_tensor_dict(
-                            pp_outputs_to_send.tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
-                        logger.info(
-                            f"[PP{self.pp_rank} Sched] Sent 'next_token_ids' for mb_id={mb_id}."
-                        )
-
-                # Receive final output from previous rank and process it for the *next* microbatch
-                next_mb_id = (mb_id + 1) % self.pp_size
-                next_pp_outputs = None
-                if mbs[next_mb_id] is not None:
-                    logger.info(
-                        f"[PP{self.pp_rank} Sched] Waiting to receive final outputs for next_mb_id={next_mb_id}."
-                    )
-                    next_pp_outputs = PPProxyTensors(
-                        self.pp_group.recv_tensor_dict(
-                            all_gather_group=self.attn_tp_group
-                        )
-                    )
-                    logger.info(
-                        f"[PP{self.pp_rank} Sched] Received final outputs for next_mb_id={next_mb_id}. Keys: {list(next_pp_outputs.tensors.keys())}"
-                    )
-
-                    mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
-
-                    first_valid_result = next(
-                        (r for r in results if r is not None), None
-                    )
-                    can_run_cuda_graph = (
-                        first_valid_result.can_run_cuda_graph
-                        if first_valid_result
-                        else False
-                    )
-
-                    output_result = GenerationBatchResult(
-                        logits_output=None,
-                        pp_hidden_states_proxy_tensors=None,
-                        next_token_ids=next_pp_outputs["next_token_ids"],
-                        extend_input_len_per_req=None,
-                        extend_logprob_start_len_per_req=None,
-                        bid=bids[next_mb_id],
-                        can_run_cuda_graph=can_run_cuda_graph,
-                    )
-                    self.process_batch_result(mbs[next_mb_id], output_result)
-                    last_mbs[next_mb_id] = mbs[next_mb_id]
-
-                # (not last rank) send hidden states to next rank and forward final output
-                if not self.pp_group.is_last_rank:
-                    if self.cur_batch:
-                        bids[mb_id] = result.bid
-
-                    if next_pp_outputs:
-                        logger.info(
-                            f"[PP{self.pp_rank} Sched] Forwarding final outputs to rank {self.pp_rank + 1}."
-                        )
-                        self.pp_group.send_tensor_dict(
-                            next_pp_outputs.tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
-                        logger.info(
-                            f"[PP{self.pp_rank} Sched] Forwarded final outputs."
-                        )
-
-                    if self.cur_batch:
-                        logger.info(
-                            f"[PP{self.pp_rank} Sched] Sending 'hidden_states' proxy to rank {self.pp_rank + 1}."
-                        )
-                        self.pp_group.send_tensor_dict(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
-                        logger.info(
-                            f"[PP{self.pp_rank} Sched] Sent 'hidden_states' proxy."
-                        )
-
-                pp_outputs = next_pp_outputs
+                self.cur_batch = cur_batch
+            else:
+                # Other ranks create an empty batch - they only need the tensor shapes
+                # The actual batch contents will be passed through pipeline parallelism
+                dummy_batch = ScheduleBatch([], None, forward_mode=ForwardMode.DECODE)
+                self.cur_batch = dummy_batch
+            
+            # Step 3: Execute the batch through pipeline parallelism
+            if self.cur_batch is not None:
+                reqs_to_process = []
+                if self.cur_batch.reqs:
+                    reqs_to_process.extend(self.cur_batch.reqs)
+                if hasattr(self.cur_batch, "decoding_reqs") and self.cur_batch.decoding_reqs:
+                    reqs_to_process.extend(self.cur_batch.decoding_reqs)
+                if hasattr(self.cur_batch, "chunked_req") and self.cur_batch.chunked_req:
+                    reqs_to_process.append(self.cur_batch.chunked_req)
+                
+                if reqs_to_process:
+                    unique_reqs = {req.rid: req for req in reqs_to_process}
+                    self.model_runner.run_forward(self.cur_batch)
+                    
+                    # Get return values from the last PP rank
+                    if self.pp_rank == self.pp_size - 1:
+                        if self.cur_batch.forward_mode.is_prefill() or self.cur_batch.forward_mode.is_decode():
+                            self.cur_batch.reqs_to_send = self.cur_batch.reqs
+                            self.ret_queue.put(self.cur_batch)
+            
+            # After a full pipeline cycle for the batch, update the running batch state
+            if self.pp_rank == 0 and self.cur_batch.forward_mode.is_decode():
+                self.running_batch = self.update_running_batch(self.cur_batch)
+            
+            # Barrier to ensure all ranks finish the current batch before starting a new cycle
+            if self.pp_size > 1:
+                torch.distributed.barrier(group=self.world_group.cpu_group)
 
     def recv_requests(self) -> List[Req]:
-        """Receive requests at the main entrypoint and broadcast to all other ranks."""
-        recv_reqs = []
+        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+        if self.pp_rank == 0:
+            if self.attn_tp_rank == 0:
+                recv_reqs = []
 
-        # Step 1: The designated entrypoint rank (pp=0, tp=0) gets requests from ZMQ
-        if self.pp_rank == 0 and self.attn_tp_rank == 0:
-            recv_reqs = []
+                while True:
+                    try:
+                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        recv_reqs.append(recv_req)
+                    except zmq.ZMQError:
+                        break
 
-            while True:
-                try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                except zmq.ZMQError:
-                    break
-                recv_reqs.append(recv_req)
-
-            while True:
-                try:
-                    recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-                except zmq.ZMQError:
-                    break
-                recv_reqs.append(recv_rpc)
+                while True:
+                    try:
+                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                        recv_reqs.append(recv_rpc)
+                    except zmq.ZMQError:
+                        break
+            else:
+                recv_reqs = None
         else:
-            # Other ranks will receive via broadcast.
             recv_reqs = None
 
-        # Step 2: Broadcast from PP=0 to other PP ranks (within each TP slice)
-        # We only do this on the first TP slice (attn_tp_rank == 0)
-        if self.pp_size > 1 and self.attn_tp_rank == 0:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs, self.pp_rank, self.pp_group.cpu_group, src=0
-            )
-
-        if self.server_args.enable_dp_attention:
-            if self.attn_tp_rank == 0:
-                work_reqs = [
-                    req
-                    for req in recv_reqs
-                    if isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
-                    )
-                ]
-                control_reqs = [
-                    req
-                    for req in recv_reqs
-                    if not isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
-                    )
-                ]
-            else:
-                work_reqs = None
-                control_reqs = None
-
-            if self.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
-                    src=self.attn_tp_group.ranks[0],
-                )
-            if self.tp_size != 1:
-                control_reqs = broadcast_pyobj(
-                    control_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
-                )
-            recv_reqs = work_reqs + control_reqs
-        elif self.tp_size > 1:
-            # This broadcast will happen on each PP stage,
-            # with tp_rank=0 as the source.
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.tp_group.rank,
-                self.tp_cpu_group,
-                src=self.tp_group.ranks[0],
-            )
+        # Broadcast to all ranks in the TP group
+        if self.tp_size > 1:
+             recv_reqs = broadcast_pyobj(
+                 recv_reqs,
+                 self.tp_group.rank,
+                 self.tp_cpu_group,
+                 src=self.tp_group.ranks[0],
+             )
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
@@ -1029,7 +874,6 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
-                data_parallel_rank=recv_req.data_parallel_rank or 0,
             )
             req.tokenizer = self.tokenizer
 
@@ -1646,9 +1490,6 @@ class Scheduler(
                     pp_hidden_states_proxy_tensors, _, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
                     )
-                    pp_hidden_states_proxy_tensors = PPProxyTensors(
-                        pp_hidden_states_proxy_tensors
-                    )
                 bid = model_worker_batch.bid
             else:
                 (
@@ -1658,9 +1499,10 @@ class Scheduler(
                     num_accepted_tokens,
                     can_run_cuda_graph,
                 ) = self.draft_worker.forward_batch_speculative_generation(batch)
-                bs = batch.batch_size()
-                self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
-                self.spec_num_total_forward_ct += bs
+                self.spec_num_total_accepted_tokens += (
+                    num_accepted_tokens + batch.batch_size()
+                )
+                self.spec_num_total_forward_ct += batch.batch_size()
                 self.num_generated_tokens += num_accepted_tokens
 
             if self.pp_group.is_last_rank:
@@ -2578,7 +2420,26 @@ def run_scheduler_process(
                 "max_req_input_len": scheduler.max_req_input_len,
             }
         )
-        scheduler.event_loop()
+        disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
+
+        if disaggregation_mode == DisaggregationMode.NULL:
+            if server_args.pp_size > 1:
+                scheduler.event_loop_pp()
+            elif scheduler.enable_overlap:
+                scheduler.event_loop_overlap()
+            else:
+                scheduler.event_loop_normal()
+        elif disaggregation_mode == DisaggregationMode.PREFILL:
+            if scheduler.enable_overlap:
+                scheduler.event_loop_overlap_disagg_prefill()
+            else:
+                scheduler.event_loop_normal_disagg_prefill()
+
+        elif disaggregation_mode == DisaggregationMode.DECODE:
+            if scheduler.enable_overlap:
+                scheduler.event_loop_overlap_disagg_decode()
+            else:
+                scheduler.event_loop_normal_disagg_decode()
 
     except Exception:
         traceback = get_exception_traceback()

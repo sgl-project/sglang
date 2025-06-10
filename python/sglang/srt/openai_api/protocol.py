@@ -187,6 +187,7 @@ class CompletionRequest(BaseModel):
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
+    data_parallel_rank: Optional[int] = None
 
 
 class CompletionResponseChoice(BaseModel):
@@ -195,6 +196,12 @@ class CompletionResponseChoice(BaseModel):
     logprobs: Optional[LogProbs] = None
     finish_reason: Literal["stop", "length", "content_filter", "abort"]
     matched_stop: Union[None, int, str] = None
+
+    # For PD disaggregation
+    bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
+    bootstrap_room: Optional[str] = None
+    data_parallel_rank: Optional[int] = None
 
 
 class CompletionResponse(BaseModel):
@@ -404,6 +411,7 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
+    data_parallel_rank: Optional[int] = None
 
 
 class ChatMessage(BaseModel):

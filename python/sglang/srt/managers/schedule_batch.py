@@ -44,6 +44,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+import time
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
@@ -446,6 +447,7 @@ class Req:
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        data_parallel_rank: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -595,9 +597,10 @@ class Req:
         self.queue_time_end = None
 
         # For disaggregation
-        self.bootstrap_host: str = bootstrap_host
-        self.bootstrap_port: Optional[int] = bootstrap_port
-        self.bootstrap_room: Optional[int] = bootstrap_room
+        self.bootstrap_host = bootstrap_host
+        self.bootstrap_port = bootstrap_port
+        self.bootstrap_room = bootstrap_room
+        self.data_parallel_rank = data_parallel_rank
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         # the start index of the sent kv cache
@@ -612,6 +615,16 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
+
+        # The following fields are used for metrics
+        self.arrival_time = time.time()
+
+        self.output_ids: List[int] = []
+        self.output_text: str = ""
+        self.output_special_tokens: List[str] = []
+        self.output_metadata: Dict = {}
+        self.next_node = None
+        self.event_queue: List[threading.Event] = []
 
     @property
     def seqlen(self):
@@ -892,6 +905,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Whether to return hidden states
     return_hidden_states: bool = False
+
+    # New instance attribute
+    is_multimodal: Optional[bool] = None
+
+    def __post_init__(self):
+        self.is_multimodal: Optional[bool] = None
 
     @classmethod
     def init_new(
@@ -1702,6 +1721,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             launch_done=self.launch_done,
+            is_multimodal=self.is_multimodal,
+            speculative_num_draft_tokens=None,
+            speculative_eagle_adapter_ids=None,
         )
 
     def copy(self):
@@ -1788,6 +1810,14 @@ class ModelWorkerBatch:
 
     # Overlap event
     launch_done: Optional[threading.Event] = None
+
+    # For pipeline parallelism
+    is_multimodal: Optional[bool] = None
+    speculative_num_draft_tokens: Optional[int] = None
+    speculative_eagle_adapter_ids: Optional[torch.Tensor] = None
+
+    def __post_init__(self):
+        self.is_multimodal: Optional[bool] = None
 
 
 @triton.jit

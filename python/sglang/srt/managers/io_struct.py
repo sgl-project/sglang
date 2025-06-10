@@ -462,7 +462,8 @@ class TokenizedGenerateReqInput:
     # For disaggregated inference
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
-    bootstrap_room: Optional[int] = None
+    bootstrap_room: Optional[str] = None
+    data_parallel_rank: Optional[int] = None
 
 
 @dataclass

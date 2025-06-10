@@ -24,11 +24,9 @@
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
 from functools import lru_cache, partial
-from inspect import signature
 from typing import Iterable, List, Optional, Tuple, Type
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -43,7 +41,6 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionRotaryEmbedding,
 )
 
-from sglang.srt.distributed import parallel_state
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -56,28 +53,13 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.qwen2_vl import Qwen2VLVideoInputs
-from sglang.srt.utils import add_prefix, flatten_nested_list
+from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
-
-
-# Add back the PPMissingLayer for non-last PP ranks
-class PPMissingLayer(nn.Module):
-    """A placeholder layer for pipeline parallelism used in non-last ranks."""
-    
-    def __init__(self):
-        super().__init__()
-        
-    def forward(self, *args, **kwargs):
-        return None
-    
-    @property
-    def weight(self):
-        return None
 
 
 class Qwen2_5_VLMLP(nn.Module):
@@ -452,8 +434,6 @@ class Qwen2_5_VisionTransformer(nn.Module):
 cached_get_processor = lru_cache(get_processor)
 
 
-# ... (imports from the beginning of the file, including `from inspect import signature`)
-
 class Qwen2_5_VLForConditionalGeneration(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
@@ -481,40 +461,36 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.config = config
-        self.pp_group = parallel_state.get_pp_group()
-        self.pp_rank = self.pp_group.rank_in_group
-        self.pp_size = self.pp_group.world_size
-        logger.info(f"[PP rank {self.pp_rank}] Initializing Qwen2_5_VLForConditionalGeneration.")
 
-        self.model = Qwen2Model(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        self.config = config
+        self.visual = Qwen2_5_VisionTransformer(
+            config.vision_config,
+            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+            # NOTE: Qwen2_5-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+            quant_config=quant_config,
+            prefix=add_prefix("visual", prefix),
         )
 
-        if self.pp_rank == self.pp_size - 1:
+        self.model = Qwen2Model(
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+        )
+
+        if config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
+        else:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
-        else:
-            self.lm_head = PPMissingLayer()
+        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
         self.logits_processor = LogitsProcessor(config)
-        self.image_token_idx = config.image_token_id
-        if self.pp_rank == 0:
-            logger.info(f"[PP rank {self.pp_rank}] Initializing visual model.")
-            self.visual = Qwen2_5_VisionTransformer(
-                config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
-                prefix=add_prefix("visual", prefix),
-            )
-        else:
-            # The other PP ranks use a placeholder layer to avoid occupying GPU memory / back-propagating params.
-            logger.info(f"[PP rank {self.pp_rank}] Using PPMissingLayer for visual model.")
-            self.visual = PPMissingLayer()
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
@@ -523,247 +499,119 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        """
-        Return the (total_seq, hidden) Tensor concatenated in the order of items.
-        - PP0 is responsible for the real calculation
-        - The other PP ranks get the same result through NCCL broadcast
-        """
-        device = next(self.parameters()).device
-        dtype = next(self.model.parameters()).dtype
-        logger.info(
-            f"[PP rank {self.pp_rank}] Entering get_image_feature for {len(items)} items."
+        # in qwen-vl, last dim is the same
+        pixel_values = torch.cat([item.pixel_values for item in items], dim=0).type(
+            self.visual.dtype
         )
+        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
+        assert pixel_values.dim() == 2, pixel_values.dim()
+        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
+        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        return image_embeds
 
-        if not items:
-            logger.info(
-                f"[PP rank {self.pp_rank}] No image items to process, returning an empty tensor."
-            )
-            return torch.empty(
-                (0, self.config.hidden_size),
-                device=device,
-                dtype=self.config.torch_dtype,
-            )
-
-        if self.pp_rank == 0:
-            pixel_values = torch.cat([it.pixel_values for it in items], dim=0).to(
-                device=self.visual.device, dtype=self.visual.dtype
-            )
-            grid_thw = torch.cat([it.image_grid_thw for it in items], dim=0)
-            embeds = self.visual(pixel_values, grid_thw)
-            embeds_flat = embeds.contiguous()
-
-            shape_tensor = torch.tensor(
-                embeds_flat.shape, device=device, dtype=torch.long
-            )
-            logger.info(f"[PP{self.pp_rank}] Broadcasting image feature shape: {shape_tensor.tolist()}")
-            dist.broadcast(shape_tensor, src=0, group=self.pp_group)
-            logger.info(f"[PP{self.pp_rank}] Broadcasting image features: {embeds_flat.shape}")
-            dist.broadcast(embeds_flat, src=0, group=self.pp_group)
-            logger.info(f"[PP{self.pp_rank}] Broadcast of image features complete.")
-        else:
-            shape_tensor = torch.empty(2, dtype=torch.long, device=device)
-            logger.info(f"[PP{self.pp_rank}] Receiving image feature shape.")
-            dist.broadcast(shape_tensor, src=0, group=self.pp_group)
-            logger.info(f"[PP{self.pp_rank}] Received image feature shape: {shape_tensor.tolist()}")
-            embeds_flat = torch.empty(
-                tuple(shape_tensor.tolist()), dtype=dtype, device=device
-            )
-            logger.info(f"[PP{self.pp_rank}] Receiving image features: {embeds_flat.shape}")
-            dist.broadcast(embeds_flat, src=0, group=self.pp_group)
-            logger.info(f"[PP{self.pp_rank}] Reception of image features complete.")
-
-        image_features = embeds_flat.to(self.config.torch_dtype)
-        return image_features
-    
     def _process_video_input(self, video_input: Qwen2VLVideoInputs) -> torch.Tensor:
-        # Not implemented yet
-        raise NotImplementedError("Video input is not supported yet.")
+        pixel_values_videos = video_input["pixel_values_videos"].type(self.visual.dtype)
+        video_embeds = self.visual(
+            pixel_values_videos, grid_thw=video_input["video_grid_thw"]
+        )
+        return video_embeds
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
     def forward(
         self,
-        input_ids: Optional[torch.Tensor],
+        input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-        input_embeds: Optional[torch.Tensor] = None,
     ):
-        logger.info(f"[PP{self.pp_rank}] Entering Qwen2_5_VL forward. input_ids_shape={input_ids.shape if input_ids is not None else 'None'}, pp_proxy_tensors={'Yes' if pp_proxy_tensors else 'No'}")
-        if get_embedding:
-            logger.info(f"[PP{self.pp_rank}] Forwarding to get_embedding.")
-            return self.model.embed_tokens(input_ids)
+        """Run forward pass for Qwen2_5-VL.
 
-        hidden_states = None
+        Args:
+            input_ids: Flattened (concatenated) input_ids corresponding to a
+                batch.
+            positions: Flattened (concatenated) position ids corresponding to a
+                batch.
+                **NOTE**: If mrope is enabled (default setting for Qwen2-VL
+                opensource models), the shape will be `(3, seq_len)`,
+                otherwise it will be `(seq_len,).
+                (Use input_metadata.mrope_positions to replace it)
+        """
+        if self.is_mrope_enabled:
+            positions = forward_batch.mrope_positions
 
-        # Part 1: Handle execution for ranks that have received pipelined data
-        if pp_proxy_tensors is not None and "hidden_states" in pp_proxy_tensors.tensors:
-            received_hidden_states = pp_proxy_tensors.tensors["hidden_states"]
-            logger.info(f"[PP{self.pp_rank}] Received hidden_states from previous stage. Shape: {received_hidden_states.shape}")
-            hidden_states = self.model(
-                input_ids=None,
-                input_embeds=received_hidden_states,
-                positions=positions,
-                forward_batch=forward_batch,
-            )
-        # Part 2: Handle the kick-off pass for a new request
-        else:
-            logger.info(f"[PP{self.pp_rank}] Kick-off pass for a new request.")
-            # All ranks execute this block on the first pass
-            # Step 2a: Get multimodal flag from the batch, which was pre-broadcasted by the scheduler.
-            is_multimodal = forward_batch.is_multimodal
-
-            # Step 2b: Only Rank 0 executes the model to start the pipeline
-            if self.pp_rank == 0:
-                logger.info(f"[PP{self.pp_rank}] Executing model on rank 0 to start pipeline.")
-                if is_multimodal:
-                    logger.info(f"[PP{self.pp_rank}] Multimodal path on rank 0.")
-                    if input_ids is None:
-                        # This must be an image-only request.
-                        mm_inputs_list = [
-                            mm_input
-                            for mm_input in forward_batch.mm_data
-                            if mm_input is not None
-                        ]
-                        all_items = flatten_nested_list(
-                            [mm_input.mm_items for mm_input in mm_inputs_list]
-                        )
-                        pixel_items = [
-                            item
-                            for item in all_items
-                            if hasattr(item, "pixel_values")
-                        ]
-                        input_embeds = self.get_image_feature(pixel_items)
-                        logger.info(f"[PP{self.pp_rank}] Calling model with image-only embeddings. Shape: {input_embeds.shape}")
-                        hidden_states = self.model(
-                            input_ids=None,
-                            input_embeds=input_embeds,
-                            positions=positions,
-                            forward_batch=forward_batch,
-                        )
-                    else:
-                        logger.info(f"[PP{self.pp_rank}] Calling general_mm_embed_routine.")
-                        hidden_states = general_mm_embed_routine(
-                            language_model=self.model,
-                            input_ids=input_ids,
-                            positions=positions,
-                            forward_batch=forward_batch,
-                            image_data_embedding_func=self.get_image_feature,
-                        )
-                else:
-                    logger.info(f"[PP{self.pp_rank}] Text-only path on rank 0. Calling model.")
-                    hidden_states = self.model(
-                        input_ids=input_ids,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                    )
-
-        # Part 3: Return logic for all cases
-        if self.pp_rank == self.pp_size - 1:
-            # Last rank
-            logger.info(f"[PP{self.pp_rank}] Last rank logic. hidden_states is {'None' if hidden_states is None else 'Not None'}")
-            if hidden_states is not None:
-                logger.info(f"[PP{self.pp_rank}] Computing logits. hidden_states_shape={hidden_states.shape}")
-                logits = self.logits_processor(
-                    input_ids, hidden_states, self.lm_head, forward_batch
+        if not (
+            forward_batch.forward_mode.is_decode()
+            or not forward_batch.contains_image_inputs()
+        ):
+            if self.is_mrope_enabled:
+                assert positions.ndim == 2 and positions.size(0) == 3, (
+                    "multimodal section rotary embedding requires "
+                    f"(3, seq_len) positions, but got {positions.size()}"
                 )
-                return logits
-            else:
-                return None
-        else:
-            # Intermediate ranks
-            logger.info(f"[PP{self.pp_rank}] Intermediate rank logic. hidden_states is {'None' if hidden_states is None else 'Not None'}")
-            if hidden_states is not None:
-                # If hidden_states is already a proxy tensor, just pass it through.
-                if isinstance(hidden_states, PPProxyTensors):
-                    logger.info(f"[PP{self.pp_rank}] Passing through existing proxy tensor with keys: {list(hidden_states.tensors.keys())}")
-                    return hidden_states
 
-                # Otherwise, it's a tensor that needs to be wrapped.
-                if isinstance(hidden_states, torch.Tensor):
-                    logger.info(f"[PP{self.pp_rank}] Returning new proxy tensor. hidden_states_shape={hidden_states.shape}")
-                else:
-                    logger.warning(f"[PP{self.pp_rank}] hidden_states is of unexpected type: {type(hidden_states)}")
-                return PPProxyTensors({"hidden_states": hidden_states})
-            else:
-                logger.info(f"[PP{self.pp_rank}] Returning empty proxy tensor.")
-                return PPProxyTensors({})
+        hidden_states = general_mm_embed_routine(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            language_model=self.model,
+            image_data_embedding_func=self.get_image_feature,
+            positions=positions,
+        )
+
+        if not get_embedding:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            return self.pooler(hidden_states, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        # Define the prefix map: {checkpoint_prefix: sglang_model_prefix}
-        prefix_map = {
-            "model.": "model.",
-            "lm_head.": "lm_head.",
-            "visual.": "visual.",
-        }
-        params_dict = dict(self.named_parameters())
-        for name, tensor in weights:
-            if self.pp_rank != 0 and name.startswith("visual."):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            ("gate_up_proj", "up_proj", 1),
+            ("gate_up_proj", "gate_proj", 0),
+        ]
+        params_dict = dict(self.named_parameters(remove_duplicate=False))
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name:
                 continue
 
-            # Special case for llava, which has a different prefix
-            if name.startswith("visual.vision_tower.vision_model."):
-                sglang_name = name.replace("visual.vision_tower.vision_model.", "visual.")
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                if "visual" in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
             else:
-                sglang_name = name
-                for old_prefix, new_prefix in prefix_map.items():
-                    if sglang_name.startswith(old_prefix):
-                        sglang_name = new_prefix + sglang_name[len(old_prefix) :]
-                        break
-            
-            if ".attn.qkv." in sglang_name:
-                sglang_name = sglang_name.replace(".attn.qkv.", ".attn.qkv_proj.")
+                if "visual" in name:
+                    # adapt to VisionAttention
+                    name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
 
-            is_stacked = False
-            for src_proj_name in self.bitsandbytes_stacked_params_mapping:
-                pattern_base = f".{src_proj_name}"
-                # Correctly check for weights ending with patterns like ".q_proj.weight" or ".q_proj.bias"
-                if sglang_name.endswith(f"{pattern_base}.weight") or sglang_name.endswith(
-                    f"{pattern_base}.bias"
-                ):
-                    (
-                        stacked_param_name,
-                        shard_idx,
-                    ) = self.bitsandbytes_stacked_params_mapping[src_proj_name]
-                    # Correctly replace the project name part with the stacked name
-                    final_name = sglang_name.replace(
-                        pattern_base, f".{stacked_param_name}"
-                    )
+                try:
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                except KeyError:
+                    print(params_dict.keys())
+                    raise
 
-                    if final_name in params_dict:
-                        param = params_dict[final_name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        sig = signature(weight_loader)
-                        if "loaded_shard_id" in sig.parameters:
-                            if src_proj_name in ["q_proj", "k_proj", "v_proj"]:
-                                loaded_shard_id = src_proj_name.split("_")[0]
-                            else:
-                                loaded_shard_id = shard_idx
-                            weight_loader(
-                                param, tensor, loaded_shard_id=loaded_shard_id
-                            )
-                        else:
-                            weight_loader(param, tensor)
-                        is_stacked = True
-                        break
-
-            if is_stacked:
-                continue
-
-            if sglang_name in params_dict:
-                param = params_dict[sglang_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, tensor)
-            else:
-                logger.warning(
-                    f"Weight loading failed. Skipped weight: '{name}'. "
-                    f"The corresponding parameter '{sglang_name}' was not found on this rank (PP rank {self.pp_rank})."
-                )
-            
+                weight_loader(param, loaded_weight)
 
 
 EntryClass = [Qwen2_5_VLForConditionalGeneration]
+
+

@@ -664,67 +664,60 @@ class GroupCoordinator:
         return obj_list
 
     def send_object(self, obj: Any, dst: int) -> None:
-        """Send the input object list to the destination rank."""
-        """NOTE: `dst` is the local rank of the destination rank."""
+        """
+        Sends a Python object to a destination process.
+        This method is part of a point-to-point operation.
+        The implementation is based on `torch.distributed.send` and `torch.distributed.recv`
+        and uses the `cpu_group` for reliable object serialization.
+        """
+        if self.world_size == 1:
+            raise RuntimeError("Single process has no other ranks to send to.")
 
-        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+        if self.use_message_queue_broadcaster:
+            self.mq_broadcaster.send(
+                pickle.dumps(obj), dst=dst, group=self.device_group
+            )
+            return
 
-        assert dst != self.rank_in_group, (
-            "Invalid destination rank. Destination rank is the same "
-            "as the current rank."
-        )
+        # 1. Pickle the object and create a CPU tensor from the bytes.
+        pickled_byte_obj = pickle.dumps(obj)
+        object_tensor = torch.frombuffer(pickled_byte_obj, dtype=torch.uint8)
 
-        # Serialize object to tensor and get the size as well
-        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
-
+        # 2. Send the size of the pickled object using the CPU group.
         size_tensor = torch.tensor(
             [object_tensor.numel()], dtype=torch.long, device="cpu"
         )
+        torch.distributed.send(size_tensor, dst=dst, group=self.cpu_group)
 
-        # Send object size
-
-        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
-
-        # Send object
-        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
-
-        return None
+        # 3. Send the pickled object itself using the CPU group.
+        torch.distributed.send(object_tensor, dst=dst, group=self.cpu_group)
 
     def recv_object(self, src: int) -> Any:
-        """Receive the input object list from the source rank."""
-        """NOTE: `src` is the local rank of the source rank."""
+        """
+        Receives a Python object from a source process.
+        This method is part of a point-to-point operation.
+        The implementation is based on `torch.distributed.send` and `torch.distributed.recv`
+        and uses the `cpu_group` for reliable object serialization.
+        """
+        if self.world_size == 1:
+            raise RuntimeError("Single process has no other ranks to receive from.")
 
-        assert src < self.world_size, f"Invalid src rank ({src})"
+        if self.use_message_queue_broadcaster:
+            pickled_byte_obj = self.mq_broadcaster.recv(
+                src=src, group=self.device_group
+            )
+            return pickle.loads(pickled_byte_obj)
 
-        assert (
-            src != self.rank_in_group
-        ), "Invalid source rank. Source rank is the same as the current rank."
-
+        # 1. Receive the size of the pickled object using the CPU group.
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
+        torch.distributed.recv(size_tensor, src=src, group=self.cpu_group)
 
-        # Receive object size
-        rank_size = torch.distributed.recv(
-            size_tensor, src=self.ranks[src], group=self.cpu_group
-        )
+        # 2. Receive the pickled object itself using the CPU group.
+        obj_tensor = torch.empty(size_tensor.item(), dtype=torch.uint8, device="cpu")
+        torch.distributed.recv(obj_tensor, src=src, group=self.cpu_group)
 
-        # Tensor to receive serialized objects into.
-        object_tensor = torch.empty(  # type: ignore[call-overload]
-            size_tensor.item(),  # type: ignore[arg-type]
-            dtype=torch.uint8,
-            device="cpu",
-        )
-
-        rank_object = torch.distributed.recv(
-            object_tensor, src=self.ranks[src], group=self.cpu_group
-        )
-
-        assert (
-            rank_object == rank_size
-        ), "Received object sender rank does not match the size sender rank."
-
-        obj = pickle.loads(object_tensor.numpy().tobytes())
-
-        return obj
+        # 3. Unpickle the object from the CPU tensor bytes.
+        return pickle.loads(obj_tensor.numpy().tobytes())
 
     def broadcast_tensor_dict(
         self,
