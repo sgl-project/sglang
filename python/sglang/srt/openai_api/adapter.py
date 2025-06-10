@@ -770,6 +770,13 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
     adapted_request, request = v1_generate_request(all_requests)
 
     if adapted_request.stream:
+        stream_options = request.stream_options
+        if stream_options:
+            include_usage = stream_options.include_usage
+            include_continuous_usage = include_usage and \
+                                       stream_options.continuous_usage_stats
+        else:
+            include_usage, include_continuous_usage = False, False
 
         async def generate_stream_resp():
             stream_buffers = {}
@@ -777,6 +784,30 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
             prompt_tokens = {}
             completion_tokens = {}
             cached_tokens = {}
+
+            def get_usage():
+                total_prompt_tokens = sum(
+                    tokens
+                    for i, tokens in prompt_tokens.items()
+                    if i % request.n == 0
+                )
+                total_completion_tokens = sum(
+                    tokens for tokens in completion_tokens.values()
+                )
+                cache_report = tokenizer_manager.server_args.enable_cache_report
+                if cache_report:
+                    cached_tokens_sum = sum(
+                        tokens for tokens in cached_tokens.values()
+                    )
+                    prompt_tokens_details = {"cached_tokens": cached_tokens_sum}
+                else:
+                    prompt_tokens_details = None
+                return UsageInfo(
+                    prompt_tokens=total_prompt_tokens,
+                    completion_tokens=total_completion_tokens,
+                    total_tokens=total_prompt_tokens + total_completion_tokens,
+                    prompt_tokens_details=prompt_tokens_details,
+                )
 
             try:
                 async for content in tokenizer_manager.generate_request(
@@ -871,38 +902,16 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
 
                     stream_buffers[index] = stream_buffer
                     n_prev_tokens[index] = n_prev_token
-
+                    if include_continuous_usage:
+                        chunk.usage = get_usage()
                     yield f"data: {chunk.model_dump_json()}\n\n"
-                if request.stream_options and request.stream_options.include_usage:
-                    total_prompt_tokens = sum(
-                        tokens
-                        for i, tokens in prompt_tokens.items()
-                        if i % request.n == 0
-                    )
-                    total_completion_tokens = sum(
-                        tokens for tokens in completion_tokens.values()
-                    )
-                    cache_report = tokenizer_manager.server_args.enable_cache_report
-                    if cache_report:
-                        cached_tokens_sum = sum(
-                            tokens for tokens in cached_tokens.values()
-                        )
-                        prompt_tokens_details = {"cached_tokens": cached_tokens_sum}
-                    else:
-                        prompt_tokens_details = None
-                    usage = UsageInfo(
-                        prompt_tokens=total_prompt_tokens,
-                        completion_tokens=total_completion_tokens,
-                        total_tokens=total_prompt_tokens + total_completion_tokens,
-                        prompt_tokens_details=prompt_tokens_details,
-                    )
-
+                if include_usage:
                     final_usage_chunk = CompletionStreamResponse(
                         id=content["meta_info"]["id"],
                         created=created,
                         choices=[],
                         model=request.model,
-                        usage=usage,
+                        usage=get_usage(),
                     )
                     final_usage_data = final_usage_chunk.model_dump_json(
                         exclude_none=True
@@ -1486,6 +1495,38 @@ async def v1_chat_completions(
             prompt_tokens = {}
             completion_tokens = {}
             cached_tokens = {}
+            def get_usage():
+                total_prompt_tokens = sum(
+                    tokens
+                    for i, tokens in prompt_tokens.items()
+                    if i % request.n == 0
+                )
+                total_completion_tokens = sum(
+                    tokens for tokens in completion_tokens.values()
+                )
+                cache_report = tokenizer_manager.server_args.enable_cache_report
+                if cache_report:
+                    cached_tokens_sum = sum(
+                        tokens for tokens in cached_tokens.values()
+                    )
+                    prompt_tokens_details = {"cached_tokens": cached_tokens_sum}
+                else:
+                    prompt_tokens_details = None
+                return UsageInfo(
+                    prompt_tokens=total_prompt_tokens,
+                    completion_tokens=total_completion_tokens,
+                    total_tokens=total_prompt_tokens + total_completion_tokens,
+                    prompt_tokens_details=prompt_tokens_details,
+                )
+
+            stream_options = request.stream_options
+            if stream_options:
+                include_usage = stream_options.include_usage
+                include_continuous_usage = include_usage and \
+                                           stream_options.continuous_usage_stats
+            else:
+                include_usage, include_continuous_usage = False, False
+
             try:
                 async for content in tokenizer_manager.generate_request(
                     adapted_request, raw_request
@@ -1571,6 +1612,8 @@ async def v1_chat_completions(
                             choices=[choice_data],
                             model=request.model,
                         )
+                        if include_continuous_usage:
+                            chunk.usage = get_usage()
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
                     text = content["text"]
@@ -1609,6 +1652,8 @@ async def v1_chat_completions(
                                 choices=[choice_data],
                                 model=request.model,
                             )
+                            if include_continuous_usage:
+                                chunk.usage = get_usage()
                             yield f"data: {chunk.model_dump_json()}\n\n"
                         if (delta and len(delta) == 0) or not delta:
                             stream_buffers[index] = new_stream_buffer
@@ -1641,6 +1686,8 @@ async def v1_chat_completions(
                                 choices=[choice_data],
                                 model=request.model,
                             )
+                            if include_continuous_usage:
+                                chunk.usage = get_usage()
                             yield f"data: {chunk.model_dump_json()}\n\n"
 
                         # 2) if we found calls, we output them as separate chunk(s)
@@ -1684,12 +1731,7 @@ async def v1_chat_completions(
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=index,
                                 delta=DeltaMessage(tool_calls=[tool_call]),
-                                finish_reason=(
-                                    None
-                                    if request.stream_options
-                                    and request.stream_options.include_usage
-                                    else finish_reason_type
-                                ),  # additional chunk will be return
+                                finish_reason=finish_reason_type
                             )
                             chunk = ChatCompletionStreamResponse(
                                 id=content["meta_info"]["id"],
@@ -1697,6 +1739,8 @@ async def v1_chat_completions(
                                 choices=[choice_data],
                                 model=request.model,
                             )
+                            if include_continuous_usage:
+                                chunk.usage = get_usage()
                             yield f"data: {chunk.model_dump_json()}\n\n"
 
                         stream_buffers[index] = new_stream_buffer
@@ -1704,19 +1748,11 @@ async def v1_chat_completions(
 
                     else:
                         # No tool calls => just treat this as normal text
-                        if delta or not (
-                            request.stream_options
-                            and request.stream_options.include_usage
-                        ):
+                        if delta:
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=index,
                                 delta=DeltaMessage(content=delta if delta else None),
-                                finish_reason=(
-                                    None
-                                    if request.stream_options
-                                    and request.stream_options.include_usage
-                                    else finish_reason_type
-                                ),
+                                finish_reason=finish_reason_type,
                                 matched_stop=(
                                     finish_reason["matched"]
                                     if finish_reason and "matched" in finish_reason
@@ -1730,6 +1766,8 @@ async def v1_chat_completions(
                                 choices=[choice_data],
                                 model=request.model,
                             )
+                            if include_continuous_usage:
+                                chunk.usage = get_usage()
                             yield f"data: {chunk.model_dump_json()}\n\n"
                             stream_buffers[index] = new_stream_buffer
                             is_firsts[index] = is_first
@@ -1742,46 +1780,21 @@ async def v1_chat_completions(
                         # if the stream ends with empty string after tool calls
                         finish_reason_type = "tool_calls"
 
-                if request.stream_options and request.stream_options.include_usage:
-                    total_prompt_tokens = sum(
-                        tokens
-                        for i, tokens in prompt_tokens.items()
-                        if i % request.n == 0
+                if include_usage:
+                    final_usage_chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=created,
+                        choices=[
+                            ChatCompletionResponseStreamChoice(
+                                index=index,
+                                delta=DeltaMessage(),
+                                finish_reason=finish_reason_type,
+                            )
+                        ],
+                        model=request.model,
+                        usage=get_usage(),
                     )
-                    total_completion_tokens = sum(
-                        tokens for tokens in completion_tokens.values()
-                    )
-                    cache_report = tokenizer_manager.server_args.enable_cache_report
-                    if cache_report:
-                        cached_tokens_sum = sum(
-                            tokens for tokens in cached_tokens.values()
-                        )
-                        prompt_tokens_details = {"cached_tokens": cached_tokens_sum}
-                    else:
-                        prompt_tokens_details = None
-                    usage = UsageInfo(
-                        prompt_tokens=total_prompt_tokens,
-                        completion_tokens=total_completion_tokens,
-                        total_tokens=total_prompt_tokens + total_completion_tokens,
-                        prompt_tokens_details=prompt_tokens_details,
-                    )
-
-                else:
-                    usage = None
-                final_usage_chunk = ChatCompletionStreamResponse(
-                    id=content["meta_info"]["id"],
-                    created=created,
-                    choices=[
-                        ChatCompletionResponseStreamChoice(
-                            index=index,
-                            delta=DeltaMessage(),
-                            finish_reason=finish_reason_type,
-                        )
-                    ],
-                    model=request.model,
-                    usage=usage,
-                )
-                yield f"data: {final_usage_chunk.model_dump_json()}\n\n"
+                    yield f"data: {final_usage_chunk.model_dump_json()}\n\n"
             except ValueError as e:
                 error = create_streaming_error_response(str(e))
                 yield f"data: {error}\n\n"
