@@ -156,14 +156,14 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
-	import torch_npu
-	default_rotary_mode = 'half'
-	if self.is_neox_style:
-	    default_rotary_mode = 'half'
-	else:
-	    default_rotary_mode = 'interleave'
-	query_out, key_out = torch_npu.npu_mrope(positions, query, key, self.cos_sin_cache, self.head_size, mrope_section=[0, 0, 0], rotary_mode=rotary_mode)
-	return query_out, key_out
+        import torch_npu
+        default_rotary_mode = 'half'
+        if self.is_neox_style:
+            default_rotary_mode = 'half'
+        else:
+            default_rotary_mode = 'interleave'
+        query_out, key_out = torch_npu.npu_mrope(positions, query, key, self.cos_sin_cache, self.head_size, mrope_section=[0, 0, 0], rotary_mode=rotary_mode)
+        return query_out, key_out
 
     def forward_cuda(
         self,

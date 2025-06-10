@@ -76,7 +76,7 @@ class CustomOp(nn.Module):
             return self.forward_cuda
         elif _is_hip:
             return self.forward_hip
-	elif _is_npu:
-	    return self.forward_npu
+        elif _is_npu:
+            return self.forward_npu
         else:
             return self.forward_native
