@@ -414,6 +414,7 @@ class MultimodalInputs:
 class WaitingStatus(Enum):
     UNREADY = auto()
     READY = auto()
+    LOADING = auto()
 
 class Req:
     """The input and output status of a request."""

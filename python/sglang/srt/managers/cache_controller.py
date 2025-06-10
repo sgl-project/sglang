@@ -431,39 +431,15 @@ class HiCacheController:
                     if not self.mooncake_l3_kv_pool.is_exist(keys[i]):
                         if self.page_size == 1:
                             value = self.mem_pool_host.get_flat_data(operation.host_indices[i])
-                            self.mooncake_l3_kv_pool.put(keys[i], value)
                         else:
                             value = self.mem_pool_host.get_flat_data(
                                 operation.host_indices[i * self.page_size: (i + 1) * self.page_size])
-                            self.mooncake_l3_kv_pool.put(keys[i], value)
+                        self.mooncake_l3_kv_pool.put(keys[i], value)
             except Empty:
                 continue
             except Exception as e:
                 logger.error(e)
 
-
-    def mooncake_l3_write_thread_func_layer_by_layer(self):
-        while not self.mooncake_l3_stop_event.is_set():
-            try:
-                operation = self.mooncake_l3_write_queue.get(block=True, timeout=1)
-                keys = operation.mooncake_keys
-
-                for layer_id in range(self.mem_pool_host.layer_num):
-                    for i in range(len(keys)):
-                        key_ = f"{keys[i]}_{layer_id}"
-                        if not self.mooncake_l3_kv_pool.is_exist(key_):
-                            if self.page_size == 1:
-                                value = self.mem_pool_host.get_flat_data_by_layer(operation.host_indices[i], layer_id)
-                                self.mooncake_l3_kv_pool.put(key_, value, device_id=self.device_id)
-                            else:
-                                value = self.mem_pool_host.get_flat_data_by_layer(
-                                    operation.host_indices[i * self.page_size: (i + 1) * self.page_size], layer_id)
-                                self.mooncake_l3_kv_pool.put(key_, value, device_id=self.device_id)
-
-            except Empty:
-                continue
-            except Exception as e:
-                logger.error(e)
 
 
     def load_thread_func_direct(self):
@@ -493,12 +469,8 @@ class HiCacheController:
             try:
                 operation = self.mooncake_l3_load_queue.get(block=True, timeout=1)
                 keys = operation.mooncake_keys
-                offset = 0
-                for key in keys:
-                    data = self.mooncake_l3_kv_pool.get(key)
-                    self.mem_pool_host.transfer(operation.host_indices[offset: offset + self.page_size], data)
-                    offset += self.page_size
-
+                batch_data = self.mooncake_l3_kv_pool.batch_get(keys)
+                self.mem_pool_host.batch_transfer(operation.host_indices, batch_data)
                 self.mem_pool_host.complete_io(operation.host_indices)
 
                 for node_id in operation.node_ids:

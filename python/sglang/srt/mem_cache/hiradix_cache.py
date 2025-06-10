@@ -55,23 +55,17 @@ def page_token_ids_to_key(
 
 def get_node_l3_keys(
     token_ids: List,
-    token_len: int,
+    current_token_len: int,
     local_rank: int = 0,
     page_size: int = 1,
 ):
     l3_keys = []
-    total_token_len = len(token_ids)
-    if page_size == 1:
-        # 每个token的key构建需要加上完整的前缀
-        for i in range(total_token_len - token_len, total_token_len):
-            l3_keys.append(token_ids_to_key(token_ids[:i + 1], local_rank))
-    else:
-        total_block_len = len(token_ids) // page_size
-        num_key = token_len // page_size
-        for i in range(total_block_len - num_key, total_block_len):
-            prefix_block_token_ids = token_ids[: i * page_size]
-            current_block_token_ids = token_ids[i * page_size : (i + 1) * page_size]
-            l3_keys.append(page_token_ids_to_key(prefix_block_token_ids, current_block_token_ids, local_rank))
+    total_block_len = len(token_ids) // page_size
+    current_block_len = current_token_len // page_size
+    for i in range(total_block_len - current_block_len, total_block_len):
+        prefix_block_token_ids = token_ids[: i * page_size]
+        current_block_token_ids = token_ids[i * page_size : (i + 1) * page_size]
+        l3_keys.append(page_token_ids_to_key(prefix_block_token_ids, current_block_token_ids, local_rank))
 
     return l3_keys
 
@@ -103,15 +97,16 @@ class HiRadixCache(RadixCache):
         self.mooncake_l3_kv_pool = None
         self.mooncake_l3_load_cache_event = None
         self.enable_mooncake_store_l3_cache = enable_mooncake_store_l3_cache
+        self.page_size = page_size
         if enable_mooncake_store_l3_cache:
             # TODO(huangtingwei9988):L3 cache only support write_through_selective and write_through write policy
             assert hicache_write_policy in ["write_through_selective", "write_through"]
-            self.mooncake_l3_kv_pool = MooncakeStore()
+            self.mooncake_l3_kv_pool = MooncakeStore(
+                self.token_to_kv_pool_host.get_flat_data(list(range(0,self.page_size))).shape)
             self.mooncake_l3_load_cache_event = threading.Event()
             self.l3_ongoing_load_back = {}
 
         self.tp_group = tp_cache_group
-        self.page_size = page_size
 
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
@@ -490,20 +485,6 @@ class HiRadixCache(RadixCache):
         else:
             return value, last_node
 
-    def delete_tree(self, node: TreeNode):
-        if node is None:
-            return
-        for _, child in node.children:
-            self.delete_tree(child)
-        del node
-
-    def l3_cache_detect(self, node: TreeNode):
-        if not node.l2_backuped and node.l3_backuped:
-            key_ = f"{node.l3_keys[-1]}_{0}"
-            if not self.mooncake_l3_kv_pool.is_exist(key_):
-                # L3 cache has been deleted
-                self.delete_tree(node)
-
     def _match_prefix_helper(self, node: TreeNode, key: List):
         total_key = key
         node.last_access_time = time.monotonic()
@@ -521,9 +502,6 @@ class HiRadixCache(RadixCache):
                 self.inc_hit_count(new_node, token_ids=total_key[:total_prefix_length])
                 if not new_node.evicted:
                     value.append(new_node.value)
-                else:
-                    self.l3_cache_detect(new_node)
-
                 node = new_node
                 key = key[prefix_len:]
                 break
@@ -531,8 +509,6 @@ class HiRadixCache(RadixCache):
                 self.inc_hit_count(child, token_ids=total_key[:total_prefix_length])
                 if not child.evicted:
                     value.append(child.value)
-                else:
-                    self.l3_cache_detect(child)
                 node = child
                 key = key[prefix_len:]
 
@@ -543,10 +519,11 @@ class HiRadixCache(RadixCache):
             # try to get the cross instance shared kv cache
             if len(key) and (not node.evicted or node.backuped):
                 l3_keys = get_node_l3_keys(total_key, len(key),
-                                           torch.cuda.current_device(), self.page_size)
+                                           torch.cuda.current_device(), self.page_size, node.l3_keys)
+                mooncake_exist_keys = self.mooncake_l3_kv_pool.batch_is_exist(l3_keys)
                 l3_exist_keys = []
                 for l3_key in l3_keys:
-                    if self.mooncake_l3_kv_pool.is_exist(l3_key):
+                    if mooncake_exist_keys[l3_key]:
                         l3_exist_keys.append(l3_key)
                     else:
                         break

@@ -994,6 +994,10 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=self.device, non_blocking=False
         )
 
+    def batch_transfer(self, indices, flat_data_list):
+        flat_data = torch.concat(flat_data_list, dim=2)
+        self.transfer(indices, flat_data)
+
     def get_flat_data(self, indices):
         return self.kv_buffer[:, :, indices]
 
@@ -1088,6 +1092,10 @@ class MLATokenToKVPoolHost(HostKVCache):
         self.kv_buffer[:, indices] = flat_data.to(
             device=self.device, non_blocking=False
         )
+
+    def batch_transfer(self, indices, flat_data_list):
+        flat_data = torch.concat(flat_data_list, dim=1)
+        self.transfer(indices, flat_data)
 
     def get_flat_data(self, indices):
         return self.kv_buffer[:, indices]

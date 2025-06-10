@@ -5,6 +5,7 @@ think of KV cache transfer operations as putting new KV cache entries
 into a remote KVStore-based lookup buffer and getting existing KV caches
 from this remote lookup buffer.
 """
+import ctypes
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Optional, List
 
+import numpy as np
 import torch
 from safetensors.torch import load as safetensors_load
 from safetensors.torch import save as safetensors_save
@@ -21,7 +23,20 @@ DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 1024  # 1.0 GiB
 
 logger = logging.getLogger(__name__)
 
-def byte2tensor(data: bytes):
+def tensor_to_bytes(tensor):
+    tensor = tensor.to("cpu")
+    length = int(np.prod(tensor.shape).item())
+    bytes_per_item = 2 # for bfloat16, other will change accordingly
+    total_bytes = length * bytes_per_item
+    ptr = tensor.data_ptr()
+    new_ptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ubyte))
+    data = np.ctypeslib.as_array(new_ptr, (total_bytes,))  # no internal copy
+    return data.tobytes()
+
+def bytes_to_tensor(data_bytes, tensor_shape):
+    return torch.frombuffer(data_bytes, dtype=torch.bfloat16).reshape(tensor_shape)
+
+def safetensors_bytes_to_tensor(data: bytes):
     loaded_tensors = safetensors_load(data)
     tensor = loaded_tensors["tensor"]
     if "device_id" not in loaded_tensors.keys():
@@ -32,7 +47,7 @@ def byte2tensor(data: bytes):
         'cuda', device_id) if device_id >= 0 else torch.device('cpu')
     return tensor.to(device)
 
-def tensor2byte(tensor_value: torch.Tensor):
+def safetensors_tensor_to_bytes(tensor_value: torch.Tensor):
     tensors = {"tensor": tensor_value}
     device_id = tensor_value.device.index if tensor_value.device.type == 'cuda' else -1
     if device_id != -1:
@@ -80,7 +95,8 @@ class MooncakeStoreConfig:
 class MooncakeStore:
 
     def __init__(
-        self
+        self,
+        page_tensor_shape
     ):
         try:
             from mooncake.store import MooncakeDistributedStore
@@ -105,6 +121,7 @@ class MooncakeStore:
             logger.info("Connect to Mooncake store successfully.")
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
+            self.page_tensor_shape = page_tensor_shape
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -195,7 +212,7 @@ class MooncakeStore:
         keys: List[str],
         values: List[torch.Tensor]
     ) -> None:
-        value_bytes = [tensor2byte(value) for value in values]
+        value_bytes = [tensor_to_bytes(value) for value in values]
         batches = {}
         for i in range(len(keys)):
             batches[keys[i]] = value_bytes[i]
@@ -211,7 +228,7 @@ class MooncakeStore:
         value: torch.Tensor
     ) -> None:
         """Put KVCache to Mooncake Store"""
-        value_bytes = tensor2byte(value)
+        value_bytes = tensor_to_bytes(value)
         try:
             self.store.put(key, value_bytes)
         except TypeError as err:
@@ -230,7 +247,7 @@ class MooncakeStore:
 
         if batch_data:
             if len(batch_data) > 0:
-                return [byte2tensor(data) for data in batch_data]
+                return [bytes_to_tensor(data, self.page_tensor_shape) for data in batch_data]
         return None
 
     def _get_impl(
@@ -245,6 +262,6 @@ class MooncakeStore:
             raise TypeError("Mooncake Store Get Type Error.") from err
 
         if data:
-            return byte2tensor(data)
+            return bytes_to_tensor(data, self.page_tensor_shape)
 
         return None
