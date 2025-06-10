@@ -1278,7 +1278,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-memory-saver",
             action="store_true",
-            help="Allow saving virtual memory mapping using release_memory_occupation and resume_memory_occupation",
+            help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
         )
         parser.add_argument(
             "--allow-auto-truncate",

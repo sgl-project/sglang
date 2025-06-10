@@ -7,14 +7,11 @@ from contextlib import contextmanager
 try:
     import torch_memory_saver
 
-    # Create memory savers with staggered timing to avoid address conflicts
     def _create_memory_saver_with_delay(instance_id):
-        """Create memory saver with delay to avoid address space conflicts."""
         # Small delay to let CUDA settle between instance creations
         time.sleep(1 * instance_id)
         return torch_memory_saver.TorchMemorySaver()
 
-    # Memory savers organized by purpose
     _memory_savers = {
         "weights": _create_memory_saver_with_delay(0),
         "kv_cache": _create_memory_saver_with_delay(1),
@@ -34,7 +31,6 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def configure_subprocess(enable: bool):
-    """Configure subprocess for torch memory saver. Call this once per process."""
     if not enable:
         logger.debug("torch memory saver is disabled, skipping configure_subprocess")
         yield
@@ -47,7 +43,6 @@ def configure_subprocess(enable: bool):
         yield
         return
 
-    # Use the real torch_memory_saver configure_subprocess context manager
     with torch_memory_saver.configure_subprocess():
         yield
 

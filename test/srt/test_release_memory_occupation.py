@@ -184,7 +184,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         )
 
         if _DEBUG_EXTRA:
-            print("release_memory_occupation", time.perf_counter() - t)
+            print("release_memory_occupation", f"{time.perf_counter() - t:.2f} seconds")
             print(
                 f"gpu_memory_usage_before_release_kv_cache: {gpu_memory_usage_before_release_kv_cache} GB"
             )
@@ -241,7 +241,8 @@ class TestReleaseMemoryOccupation(CustomTestCase):
 
         if _DEBUG_EXTRA:
             print(
-                "resume_memory_occupation and update weights", time.perf_counter() - t
+                "resume_memory_occupation and update weights",
+                f"{time.perf_counter() - t:.2f} seconds",
             )
             print(
                 f"gpu_memory_usage_before_resume_weights: {gpu_memory_usage_before_resume_weights} GB"

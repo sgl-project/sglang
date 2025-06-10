@@ -219,7 +219,7 @@ class ModelRunner:
         server_args = self.server_args
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver,
-            tag="weights",  # for model weight, we use weights memory saver
+            tag="weights",
         )
 
         if not self.is_draft_worker:

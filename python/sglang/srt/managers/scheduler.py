@@ -424,11 +424,11 @@ class Scheduler(
         # Init memory saver
         self.weights_memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver,
-            tag="weights",  # for model weight, we use weights memory saver
+            tag="weights",
         )
         self.kv_cache_memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver,
-            tag="kv_cache",  # for kv cache, we use kv_cache memory saver
+            tag="kv_cache",
         )
 
         # Init profiler
@@ -2137,8 +2137,7 @@ class Scheduler(
             self.weights_memory_saver_adapter.pause()
         if "kv_cache" in tags:
             self.kv_cache_memory_saver_adapter.pause()
-
-        self.flush_cache()
+            self.flush_cache()
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
