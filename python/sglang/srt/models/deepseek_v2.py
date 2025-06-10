@@ -1002,7 +1002,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
-        q_nope_out = q_nope_out.transpose(0, 1)
+        # TODO try to remove the .transpose.contiguous by doing `B^T @ A^T`
+        q_nope_out = q_nope_out.transpose(0, 1).contiguous()
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
