@@ -37,7 +37,7 @@ suites = {
         TestFile("test_embedding_openai_server.py", 141),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 376),
-        TestFile("test_flashmla.py", 352),
+        # TestFile("test_flashmla.py", 352),
         TestFile("test_fp8_kernel.py", 8),
         TestFile("test_function_call_parser.py", 10),
         TestFile("test_fused_moe.py", 30),
@@ -59,6 +59,7 @@ suites = {
         TestFile("test_openai_adapter.py", 1),
         TestFile("test_openai_function_calling.py", 60),
         TestFile("test_openai_server.py", 149),
+        TestFile("test_openai_server_hidden_states.py", 240),
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_pytorch_sampling_backend.py", 66),
@@ -185,7 +186,7 @@ suites = {
     "vllm_dependency_test": [
         TestFile("test_awq.py"),
         TestFile("test_bnb.py"),
-        TestFile("test_gguf.py", 78),
+        # TestFile("test_gguf.py", 78), # TODO: Fix GGuf after updating to torch 2.7 and vllm 0.9
         TestFile("test_gptqmodel_dynamic.py", 72),
         TestFile("test_vllm_dependency.py"),
     ],

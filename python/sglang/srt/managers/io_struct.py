@@ -99,12 +99,15 @@ class GenerateReqInput:
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
 
     # Whether to return hidden states
-    return_hidden_states: bool = False
+    return_hidden_states: Union[List[bool], bool] = False
 
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
 
     def contains_mm_input(self) -> bool:
         return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
@@ -406,7 +409,11 @@ class GenerateReqInput:
                 if self.custom_logit_processor is not None
                 else None
             ),
-            return_hidden_states=self.return_hidden_states,
+            return_hidden_states=(
+                self.return_hidden_states[i]
+                if isinstance(self.return_hidden_states, list)
+                else self.return_hidden_states
+            ),
             # if `__getitem__` is called, the bootstrap_host, bootstrap_port, bootstrap_room must be a list
             bootstrap_host=(
                 self.bootstrap_host[i] if self.bootstrap_host is not None else None
@@ -416,6 +423,9 @@ class GenerateReqInput:
             ),
             bootstrap_room=(
                 self.bootstrap_room[i] if self.bootstrap_room is not None else None
+            ),
+            data_parallel_rank=(
+                self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
         )
 
@@ -463,6 +473,9 @@ class TokenizedGenerateReqInput:
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
+
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
 
 
 @dataclass

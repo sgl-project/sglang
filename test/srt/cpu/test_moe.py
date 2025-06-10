@@ -33,7 +33,7 @@ def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
     topk_weights = torch.empty(B, topk, dtype=torch.float32)
     topk_ids = torch.empty(B, topk, dtype=torch.int32)
     topk_weights, topk_ids = kernel.grouped_topk_cpu(
-        a, score, topk, renormalize, G, topk_group
+        a, score, topk, renormalize, G, topk_group, 0, None, None
     )
 
     packed_w1 = kernel.convert_weight_packed(w1) if prepack else w1
