@@ -182,7 +182,7 @@ class ServerArgs:
     eplb_rebalance_num_iterations: int = 1000
     eplb_rebalance_layers_per_chunk: Optional[int] = None
     expert_distribution_recorder_mode: Optional[
-        Literal["stat", "per_pass", "per_token"]
+        Literal["stat", "stat_approx", "per_pass", "per_token"]
     ] = None
     expert_distribution_recorder_buffer_size: Optional[int] = None
     enable_expert_distribution_metrics: bool = False
@@ -425,6 +425,12 @@ class ServerArgs:
                 "Overlap scheduler is disabled because of using "
                 "eagle speculative decoding."
             )
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using "
+                    "eagle speculative decoding."
+                )
 
             model_arch = get_model_arch(self)
 
@@ -1007,13 +1013,13 @@ class ServerArgs:
             type=str,
             choices=[
                 "aiter",
-                "flashinfer",
-                "triton",
-                "torch_native",
-                "fa3",
-                "flashmla",
                 "cutlass_mla",
+                "fa3",
+                "flashinfer",
+                "flashmla",
                 "intel_amx",
+                "torch_native",
+                "triton",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",

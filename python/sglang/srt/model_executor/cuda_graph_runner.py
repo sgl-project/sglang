@@ -35,6 +35,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+    enable_num_token_non_padded,
 )
 from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
@@ -53,6 +54,16 @@ is_capture_mode = False
 
 def get_is_capture_mode():
     return is_capture_mode
+
+
+@contextmanager
+def model_capture_mode():
+    global is_capture_mode
+    is_capture_mode = True
+
+    yield
+
+    is_capture_mode = False
 
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
@@ -138,6 +149,8 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         gpu_mem = get_device_memory_capacity()
         if gpu_mem is not None and gpu_mem > 96 * 1024:
             capture_bs += list(range(160, 257, 8))
+        if gpu_mem is not None and gpu_mem > 180 * 1000:
+            capture_bs += list(range(256, 513, 16))
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
@@ -190,6 +203,9 @@ class CudaGraphRunner:
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.enable_dp_attention = model_runner.server_args.enable_dp_attention
         self.enable_sp_layernorm = model_runner.server_args.enable_sp_layernorm
+        self.enable_two_batch_overlap = (
+            model_runner.server_args.enable_two_batch_overlap
+        )
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
@@ -285,21 +301,12 @@ class CudaGraphRunner:
 
         # Capture
         try:
-            with self.model_capture_mode():
+            with model_capture_mode():
                 self.capture()
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
-
-    @contextmanager
-    def model_capture_mode(self):
-        global is_capture_mode
-        is_capture_mode = True
-
-        yield
-
-        is_capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.enable_dp_attention or self.enable_sp_layernorm:
@@ -327,9 +334,7 @@ class CudaGraphRunner:
         )
 
         is_tbo_supported = (
-            forward_batch.can_run_tbo
-            if self.model_runner.server_args.enable_two_batch_overlap
-            else True
+            forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
 
         return is_bs_supported and is_encoder_lens_supported and is_tbo_supported
@@ -549,13 +554,7 @@ class CudaGraphRunner:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
-        num_token_non_padded = len(forward_batch.input_ids)
-        self.num_token_non_padded[...] = num_token_non_padded
-        self.tbo_plugin.replay_prepare(
-            forward_mode=forward_batch.forward_mode,
-            bs=bs,
-            num_token_non_padded=num_token_non_padded,
-        )
+
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 self.seq_lens_cpu.fill_(1)
@@ -572,6 +571,14 @@ class CudaGraphRunner:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
         if self.enable_dp_attention or self.enable_sp_layernorm:
             self.global_num_tokens_gpu.copy_(forward_batch.global_num_tokens_gpu)
+        if enable_num_token_non_padded(self.model_runner.server_args):
+            self.num_token_non_padded.copy_(forward_batch.num_token_non_padded)
+        if self.enable_two_batch_overlap:
+            self.tbo_plugin.replay_prepare(
+                forward_mode=forward_batch.forward_mode,
+                bs=bs,
+                num_token_non_padded=len(forward_batch.input_ids),
+            )
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
@@ -644,6 +651,8 @@ class CudaGraphRunner:
                     topk=self.model_runner.server_args.speculative_eagle_topk,
                     draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
+                    seq_lens_sum=None,
+                    seq_lens_cpu=None,
                 )
 
         return spec_info
