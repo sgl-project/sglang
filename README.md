@@ -12,7 +12,7 @@
 
 --------------------------------------------------------------------------------
 
-| [**Blog**](https://lmsys.org/blog/2024-07-25-sglang-llama3/)
+| [**Blog**](https://lmsys.org/blog/2025-05-05-large-scale-ep/)
 | [**Documentation**](https://docs.sglang.ai/)
 | [**Join Slack**](https://slack.sglang.ai/)
 | [**Join Bi-Weekly Development Meeting**](https://meeting.sglang.ai/)
@@ -44,7 +44,7 @@ SGLang is a fast serving framework for large language models and vision language
 It makes your interaction with models faster and more controllable by co-designing the backend runtime and frontend language.
 The core features include:
 
-- **Fast Backend Runtime**: Provides efficient serving with RadixAttention for prefix caching, zero-overhead CPU scheduler, continuous batching, token attention (paged attention), speculative decoding, tensor parallelism, chunked prefill, structured outputs, quantization (FP8/INT4/AWQ/GPTQ), and multi-lora batching.
+- **Fast Backend Runtime**: Provides efficient serving with RadixAttention for prefix caching, zero-overhead CPU scheduler, prefill-decode disaggregation, speculative decoding, continuous batching, paged attention, tensor parallelism, pipeline parallelism, expert parallelism, structured outputs, chunked prefill, quantization (FP8/INT4/AWQ/GPTQ), and multi-lora batching.
 - **Flexible Frontend Language**: Offers an intuitive interface for programming LLM applications, including chained generation calls, advanced prompting, control flow, multi-modal inputs, parallelism, and external interactions.
 - **Extensive Model Support**: Supports a wide range of generative models (Llama, Gemma, Mistral, Qwen, DeepSeek, LLaVA, etc.), embedding models (e5-mistral, gte, mcdse) and reward models (Skywork), with easy extensibility for integrating new models.
 - **Active Community**: SGLang is open-source and backed by an active community with industry adoption.
