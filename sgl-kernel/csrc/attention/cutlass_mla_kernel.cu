@@ -93,8 +93,7 @@ typename T::Fmha::Arguments args_from_options(
     at::Tensor const& out,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
-    at::Tensor const& k_nope,
-    at::Tensor const& k_pe,
+    at::Tensor const& kv_c_and_k_pe_cache,
     at::Tensor const& seq_lens,
     at::Tensor const& page_table,
     int64_t num_kv_splits) {
@@ -176,8 +175,7 @@ void runMla(
     at::Tensor const& out,
     at::Tensor const& q_nope,
     at::Tensor const& q_pe,
-    at::Tensor const& k_nope,
-    at::Tensor const& k_pe,
+    at::Tensor const& kv_c_and_k_pe_cache,
     at::Tensor const& seq_lens,
     at::Tensor const& page_table,
     at::Tensor const& workspace,
@@ -185,7 +183,7 @@ void runMla(
     cudaStream_t stream) {
   using MlaSm100Type = MlaSm100<Element, IsPaged128, PersistenceOption>;
   typename MlaSm100Type::Fmha fmha;
-  auto arguments = args_from_options<MlaSm100Type>(out, q_nope, q_pe, k_nope, k_pe, seq_lens, page_table, num_kv_splits);
+  auto arguments = args_from_options<MlaSm100Type>(out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, num_kv_splits);
 
   CUTLASS_CHECK(fmha.can_implement(arguments));
 
@@ -209,8 +207,7 @@ void cutlass_mla_decode(
     torch::Tensor const& out,
     torch::Tensor const& q_nope,
     torch::Tensor const& q_pe,
-    torch::Tensor const& k_nope,
-    torch::Tensor const& k_pe,
+    torch::Tensor const& kv_c_and_k_pe_cache,
     torch::Tensor const& seq_lens,
     torch::Tensor const& page_table,
     torch::Tensor const& workspace,
@@ -227,13 +224,13 @@ void cutlass_mla_decode(
     DISPATCH_BOOL(num_kv_splits <= 1, NotManualSplitKV, [&] {
       if (in_dtype == at::ScalarType::Half) {
         runMla<cutlass::half_t, IsPaged128, IsPersistent<NotManualSplitKV>>(
-          out, q_nope, q_pe, k_nope, k_pe, seq_lens, page_table, workspace, num_kv_splits, stream);
+          out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, num_kv_splits, stream);
       } else if (in_dtype == at::ScalarType::BFloat16) {
         runMla<cutlass::bfloat16_t, IsPaged128, IsPersistent<NotManualSplitKV>>(
-          out, q_nope, q_pe, k_nope, k_pe, seq_lens, page_table, workspace, num_kv_splits, stream);
+          out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, num_kv_splits, stream);
       } else if (in_dtype == at::ScalarType::Float8_e4m3fn) {
         runMla<cutlass::float_e4m3_t, IsPaged128, IsPersistent<NotManualSplitKV>>(
-          out, q_nope, q_pe, k_nope, k_pe, seq_lens, page_table, workspace, num_kv_splits, stream);
+          out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, num_kv_splits, stream);
       } else {
         TORCH_CHECK(false, "Unsupported input data type of MLA");
       }
