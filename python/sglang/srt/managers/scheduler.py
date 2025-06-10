@@ -949,6 +949,7 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                data_parallel_rank=recv_req.data_parallel_rank,
             )
             req.tokenizer = self.tokenizer
 
@@ -1575,10 +1576,9 @@ class Scheduler(
                     num_accepted_tokens,
                     can_run_cuda_graph,
                 ) = self.draft_worker.forward_batch_speculative_generation(batch)
-                self.spec_num_total_accepted_tokens += (
-                    num_accepted_tokens + batch.batch_size()
-                )
-                self.spec_num_total_forward_ct += batch.batch_size()
+                bs = batch.batch_size()
+                self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
+                self.spec_num_total_forward_ct += bs
                 self.num_generated_tokens += num_accepted_tokens
 
             if self.pp_group.is_last_rank:
