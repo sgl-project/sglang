@@ -23,6 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.build_eagle_tree import build_tree_kernel_efficient
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -70,7 +71,6 @@ class EAGLEWorker(TpModelWorker):
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.padded_static_len = self.speculative_num_steps + 1
         self.enable_nan_detection = server_args.enable_nan_detection
         self.gpu_id = gpu_id
         self.device = server_args.device
@@ -79,6 +79,7 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.padded_static_len = -1
 
         # Override context length with target model's context length
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -185,7 +186,6 @@ class EAGLEWorker(TpModelWorker):
                     self.draft_model_runner,
                     skip_prefill=False,
                 )
-            self.padded_static_len = self.speculative_num_steps + 1
             self.has_prefill_wrapper_verify = True
         elif self.server_args.attention_backend == "triton":
             from sglang.srt.layers.attention.triton_backend import (
@@ -202,7 +202,6 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner,
                 skip_prefill=False,
             )
-            self.padded_static_len = self.speculative_num_steps + 1
             self.has_prefill_wrapper_verify = False
         elif self.server_args.attention_backend == "fa3":
             from sglang.srt.layers.attention.flashattention_backend import (
@@ -215,8 +214,10 @@ class EAGLEWorker(TpModelWorker):
                 self.topk,
                 self.speculative_num_steps,
             )
-            self.draft_extend_attn_backend = None
-            self.padded_static_len = self.speculative_num_steps + 1
+            self.draft_extend_attn_backend = FlashAttentionBackend(
+                self.draft_model_runner,
+                skip_prefill=False,
+            )
             self.has_prefill_wrapper_verify = False
         elif self.server_args.attention_backend == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import (
@@ -229,7 +230,6 @@ class EAGLEWorker(TpModelWorker):
                 self.speculative_num_steps,
             )
             self.draft_extend_attn_backend = None
-            self.padded_static_len = self.speculative_num_steps + 1
             self.has_prefill_wrapper_verify = False
         else:
             raise ValueError(
@@ -309,10 +309,12 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph,
             )
         elif batch.forward_mode.is_extend() or batch.is_extend_dp_batch():
-            logits_output, next_token_ids, bid = self.forward_target_extend(batch)
+            logits_output, next_token_ids, bid, seq_lens_cpu = (
+                self.forward_target_extend(batch)
+            )
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 self.forward_draft_extend(
-                    batch, logits_output.hidden_states, next_token_ids
+                    batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
             return logits_output, next_token_ids, bid, 0, False
         else:
@@ -370,7 +372,12 @@ class EAGLEWorker(TpModelWorker):
         logits_output, next_token_ids, _ = self.target_worker.forward_batch_generation(
             model_worker_batch
         )
-        return logits_output, next_token_ids, model_worker_batch.bid
+        return (
+            logits_output,
+            next_token_ids,
+            model_worker_batch.bid,
+            model_worker_batch.seq_lens_cpu,
+        )
 
     def draft(self, batch: ScheduleBatch):
         # Parse args
@@ -487,7 +494,14 @@ class EAGLEWorker(TpModelWorker):
 
         if not batch.forward_mode.is_idle():
             self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
-            ret = EagleVerifyInput.create(
+            (
+                tree_mask,
+                position,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                draft_tokens,
+            ) = build_tree_kernel_efficient(
                 spec_info.verified_id,
                 score_list,
                 token_list,
@@ -498,12 +512,28 @@ class EAGLEWorker(TpModelWorker):
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
             )
+            ret = EagleVerifyInput(
+                draft_token=draft_tokens,
+                custom_mask=tree_mask,
+                positions=position,
+                retrive_index=retrive_index,
+                retrive_next_token=retrive_next_token,
+                retrive_next_sibling=retrive_next_sibling,
+                retrive_cum_len=None,
+                spec_steps=self.speculative_num_steps,
+                topk=self.topk,
+                draft_token_num=self.server_args.speculative_num_draft_tokens,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                seq_lens_sum=forward_batch.seq_lens_sum,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+            )
         else:
             ret = EagleVerifyInput.create_for_idle(
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
             )
+
         return ret
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -567,7 +597,9 @@ class EAGLEWorker(TpModelWorker):
             batch.forward_mode = ForwardMode.TARGET_VERIFY
 
         batch.spec_info = spec_info
-        model_worker_batch = batch.get_model_worker_batch()
+        model_worker_batch = batch.get_model_worker_batch(
+            seq_lens_cpu_cache=spec_info.seq_lens_cpu
+        )
         model_worker_batch.spec_num_draft_tokens = self.speculative_num_draft_tokens
 
         if batch.has_grammar:
@@ -716,6 +748,7 @@ class EAGLEWorker(TpModelWorker):
         batch: ScheduleBatch,
         hidden_states: torch.Tensor,
         next_token_ids: List[int],
+        seq_lens_cpu: torch.Tensor,
     ):
         """Run draft model extend. This API modifies the states of the batch.
 
@@ -731,7 +764,9 @@ class EAGLEWorker(TpModelWorker):
 
         batch.spec_info.prepare_for_extend(batch)
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        model_worker_batch = batch.get_model_worker_batch()
+        model_worker_batch = batch.get_model_worker_batch(
+            seq_lens_cpu_cache=seq_lens_cpu
+        )
         model_worker_batch.spec_num_draft_tokens = 1
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
@@ -756,12 +791,9 @@ class EAGLEWorker(TpModelWorker):
                 return_logprob_backup = batch.return_logprob
 
                 # Prepare metadata
-                batch.forward_mode = ForwardMode.DRAFT_EXTEND
                 batch.spec_info.prepare_extend_after_decode(
                     batch,
                     self.speculative_num_steps,
-                    self.server_args.context_length,
-                    pad_input=self.cuda_graph_runner_for_draft_extend is not None,
                 )
             else:
                 origin_batch = batch
@@ -773,13 +805,15 @@ class EAGLEWorker(TpModelWorker):
                     topk=self.topk,
                 )
                 batch.forward_mode = ForwardMode.IDLE
-        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        batch.return_logprob = False
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.spec_num_draft_tokens = self.speculative_num_draft_tokens
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
+        if forward_batch.seq_lens_cpu is not None:
+            forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
+        else:
+            forward_batch.seq_lens_sum = batch.seq_lens.sum().item()
 
         # Run
         can_cuda_graph = (
@@ -790,6 +824,11 @@ class EAGLEWorker(TpModelWorker):
             logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                 forward_batch
             )
+            forward_batch.spec_info.topk_p, forward_batch.spec_info.topk_index = (
+                logits_output.topk_p,
+                logits_output.topk_index,
+            )
+            forward_batch.spec_info.hidden_states = logits_output.hidden_states
         else:
             if not is_idle and batch.spec_info.verified_id is not None:
                 self.draft_model_runner.attn_backend.init_forward_metadata(
@@ -798,9 +837,9 @@ class EAGLEWorker(TpModelWorker):
             logits_output = self.draft_model_runner.model.forward(
                 forward_batch.input_ids, forward_batch.positions, forward_batch
             )
+            self.capture_for_decode(logits_output, forward_batch.spec_info)
 
         self._detect_nan_if_needed(logits_output)
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
 
         if origin_batch is not None:
             batch = origin_batch
