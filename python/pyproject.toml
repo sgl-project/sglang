@@ -64,7 +64,7 @@ blackwell = [
     "sgl-kernel",
     "torch==2.7.1",
     "torchaudio==2.7.1",
-    "torchvision==0.22.0",
+    "torchvision==0.22.1",
     "cuda-python",
     "outlines>=0.0.44,<=0.1.11",
     "einops",
@@ -128,7 +128,7 @@ dev_cpu = ["sglang[all_cpu]", "sglang[test]"]
 
 [tool.setuptools.package-data]
 "sglang" = [
-    "srt/layers/moe/fused_moe_triton/configs/*.json",
+    "srt/layers/moe/fused_moe_triton/configs/*/*.json",
     "srt/layers/quantization/configs/*.json",
 ]
 
