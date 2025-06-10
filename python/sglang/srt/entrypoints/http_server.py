@@ -19,6 +19,8 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import importlib
+import inspect
 import json
 import logging
 import multiprocessing as multiprocessing
@@ -782,6 +784,18 @@ def launch_server(
         ),
     )
     app.warmup_thread = warmup_thread
+
+    for middleware in server_args.middleware:
+        module_path, object_name = middleware.rsplit(".", 1)
+        imported = getattr(importlib.import_module(module_path), object_name)
+        if inspect.isclass(imported):
+            app.add_middleware(imported)
+        elif inspect.iscoroutinefunction(imported):
+            app.middleware("http")(imported)
+        else:
+            raise ValueError(
+                f"Invalid middleware {middleware}. Must be a function or a class."
+            )
 
     try:
         # Update logging configs
