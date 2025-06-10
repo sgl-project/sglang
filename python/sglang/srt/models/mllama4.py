@@ -307,97 +307,8 @@ class Llama4ForConditionalGeneration(nn.Module):
                         )
                     continue
 
-            # Special handling for scale parameters - add name mapping from checkpoint to model
-            elif "scale" in name and "experts" in name:
-                # Map checkpoint parameter names to model parameter names
-                name_mappings = {
-                    "gate_up_proj_weight_scale": "w13_weight_scale",
-                    "gate_up_proj_input_scale": "w13_input_scale",
-                    "down_proj_weight_scale": "w2_weight_scale",
-                    "down_proj_input_scale": "w2_input_scale",
-                }
-
-                target_names = []
-                for checkpoint_name, model_name in name_mappings.items():
-                    if checkpoint_name in name:
-                        # Replace the checkpoint name with model name AND add language_model prefix
-                        target_name = name.replace(checkpoint_name, model_name)
-                        if not target_name.startswith("language_model."):
-                            target_name = "language_model." + target_name
-                        target_names.append(target_name)
-                        break
-                else:
-                    # No mapping found, try original name with language_model prefix
-                    if not name.startswith("language_model."):
-                        target_names.append("language_model." + name)
-                    else:
-                        target_names.append(name)
-
-                # Try each possible target name
-                loaded = False
-                for target_name in target_names:
-                    if target_name in params_dict:
-                        if is_main_rank:
-                            print(
-                                f"DEBUG: Loading scale parameter: {name} -> {target_name}"
-                            )
-                        param = params_dict[target_name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-
-                        # Debug weight_loader info
-                        if is_main_rank:
-                            print(f"DEBUG: weight_loader type: {type(weight_loader)}")
-                            if hasattr(weight_loader, "__self__"):
-                                print(
-                                    f"DEBUG: weight_loader.__self__ type: {type(weight_loader.__self__)}"
-                                )
-
-                        # For MoE scale parameters, we need to provide weight_name, shard_id, and expert_id
-                        if hasattr(weight_loader, "__self__") and hasattr(
-                            weight_loader.__self__, "weight_loader"
-                        ):
-                            # This is a MoE layer, need to determine shard_id and expert_id
-                            if is_main_rank:
-                                print(f"DEBUG: Detected MoE layer for {target_name}")
-                            shard_ids = []
-                            if "w13" in target_name or "gate_up_proj" in name:
-                                # For gate_up_proj (w13), only load input_scale for w1 (w1 and w3 should be equal)
-                                shard_ids = ["w1"]
-                            elif "w2" in target_name or "down_proj" in name:
-                                shard_ids = ["w2"]
-                            else:
-                                shard_ids = ["w1"]  # Default fallback
-
-                            # Load the scale for all experts and relevant shard_ids
-                            for expert_id in range(num_experts):
-                                for shard_id in shard_ids:
-                                    if is_main_rank:
-                                        print(
-                                            f"DEBUG: Loading expert_id={expert_id}, shard_id={shard_id}"
-                                        )
-                                    weight_loader(
-                                        param, loaded_weight, name, shard_id, expert_id
-                                    )
-                        else:
-                            # Regular parameter loading
-                            if is_main_rank:
-                                print(
-                                    f"DEBUG: Regular parameter loading for {target_name}"
-                                )
-                            weight_loader(param, loaded_weight)
-                        loaded = True
-                        break
-
-                if loaded:
-                    continue
-                else:
-                    if is_main_rank:
-                        print(
-                            f"DEBUG: Scale parameter {name} -> {target_names} not found in model"
-                        )
-                    continue
+            # MoE scale parameters are now handled directly by the MoE layer's weight_loader
+            # No special handling needed here - just let the normal flow handle it
 
             if not "vision" in name:
                 name, loaded_weight = self.permute_qk_weight_for_rotary(
@@ -422,14 +333,17 @@ class Llama4ForConditionalGeneration(nn.Module):
             else:
                 if ".experts" in name:
                     # NOTE: llama4 fp8 has different weight format for experts
-                    # Scale parameters are handled separately above
+                    # Scale parameters are now handled by the MoE layer's weight_loader directly
                     if "scale" in name:
-                        # Scale parameters should already be handled above
-                        if is_main_rank:
-                            print(
-                                f"DEBUG: Skipping scale parameter in expert section: {name}"
-                            )
-                        continue
+                        # Let scale parameters fall through to the normal weight loading flow
+                        # The MoE layer's weight_loader will handle them properly
+                        if name not in params_dict:
+                            continue
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
                     elif (
                         "experts.gate_up_proj" not in name
                         and "experts.down_proj" not in name

@@ -813,6 +813,24 @@ class FusedMoE(torch.nn.Module):
                 )
             return
 
+        if "ModelOpt" in self.quant_method.__class__.__name__:
+            if "weight_scale" in weight_name or "input_scale" in weight_name:
+                self._load_per_tensor_weight_scale(
+                    shard_id=shard_id,
+                    param=param,
+                    loaded_weight=loaded_weight,
+                    expert_id=expert_id,
+                )
+            elif "weight" in weight_name:
+                self._load_model_weight_or_group_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=tp_rank,
+                )
+            return
+
         # Case weight scales and zero_points
         if "scale" in weight_name or "zero" in weight_name:
             # load the weight scales and zp based on the quantization scheme

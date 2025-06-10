@@ -272,8 +272,7 @@ class ModelOptFp8KVCacheMethod(BaseKVCacheMethod):
 
 class ModelOptFp8MoEMethod:
     """MoE method for ModelOpt FP8.
-    Supports loading FP8 checkpoints with static weight scale and
-    dynamic/static activation scale.
+    Supports loading FP8 checkpoints with static weight scale and activation scale.
 
     Args:
         quant_config: The ModelOpt quantization config.
@@ -320,7 +319,6 @@ class ModelOptFp8MoEMethod:
         )
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        # Use ModelWeightParameter for consistency
         w13_weight = ModelWeightParameter(
             data=torch.empty(
                 num_experts, 2 * intermediate_size, hidden_size, dtype=weight_dtype
@@ -342,7 +340,9 @@ class ModelOptFp8MoEMethod:
         layer.register_parameter("w2_weight", w2_weight)
 
         if self.quant_config.is_checkpoint_fp8_serialized:
-            # WEIGHT SCALES - Per-tensor scaling for ModelOpt
+            # WEIGHT SCALES - Per-tensor scaling for ModelOpts
+            # should we Allocate 2 scales for w1 and w3 respectively.
+            # They will be combined to a single scale after weight loading.
             w13_weight_scale = PerTensorScaleParameter(
                 data=torch.full(
                     (num_experts,), torch.finfo(torch.float32).min, dtype=torch.float32
@@ -362,8 +362,6 @@ class ModelOptFp8MoEMethod:
             extra_weight_attrs.update(
                 {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
             )
-            # set_weight_attrs(w13_weight_scale, extra_weight_attrs)
-            # set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
             # INPUT SCALES - Per-tensor scaling for ModelOpt
             w13_input_scale = PerTensorScaleParameter(
@@ -380,74 +378,16 @@ class ModelOptFp8MoEMethod:
             )
             layer.register_parameter("w13_input_scale", w13_input_scale)
             layer.register_parameter("w2_input_scale", w2_input_scale)
-            # set_weight_attrs(w13_input_scale, extra_weight_attrs)
-            # set_weight_attrs(w2_input_scale, extra_weight_attrs)
-
-            # # ADDITIONAL SCALES for Llama4 checkpoint format - not needed
-            # # The issue should be fixed in weight loading logic with proper name mapping
-            # gate_up_proj_weight_scale = PerTensorScaleParameter(
-            #     data=torch.full(
-            #         (
-            #             1,
-            #         ),  # Single element tensor instead of scalar for PerTensorScaleParameter
-            #         torch.finfo(torch.float32).min,
-            #         dtype=torch.float32,
-            #     ),
-            #     weight_loader=weight_loader,
-            # )
-            # gate_up_proj_input_scale = PerTensorScaleParameter(
-            #     data=torch.full(
-            #         (
-            #             1,
-            #         ),  # Single element tensor instead of scalar for PerTensorScaleParameter
-            #         torch.finfo(torch.float32).min,
-            #         dtype=torch.float32,
-            #     ),
-            #     weight_loader=weight_loader,
-            # )
-            # down_proj_weight_scale = PerTensorScaleParameter(
-            #     data=torch.full(
-            #         (
-            #             1,
-            #         ),  # Single element tensor instead of scalar for PerTensorScaleParameter
-            #         torch.finfo(torch.float32).min,
-            #         dtype=torch.float32,
-            #     ),
-            #     weight_loader=weight_loader,
-            # )
-            # down_proj_input_scale = PerTensorScaleParameter(
-            #     data=torch.full(
-            #         (
-            #             1,
-            #         ),  # Single element tensor instead of scalar for PerTensorScaleParameter
-            #         torch.finfo(torch.float32).min,
-            #         dtype=torch.float32,
-            #     ),
-            #     weight_loader=weight_loader,
-            # )
-
-            # layer.register_parameter(
-            #     "gate_up_proj_weight_scale", gate_up_proj_weight_scale
-            # )
-            # layer.register_parameter(
-            #     "gate_up_proj_input_scale", gate_up_proj_input_scale
-            # )
-            # layer.register_parameter("down_proj_weight_scale", down_proj_weight_scale)
-            # layer.register_parameter("down_proj_input_scale", down_proj_input_scale)
-            # # No need for set_weight_attrs since PerTensorScaleParameter handles weight loading
-        else:
-            # For non-serialized checkpoints, will be quantized during loading
-            layer.w13_weight_scale = None
-            layer.w2_weight_scale = None
-            layer.w13_input_scale = None
-            layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process FP8 MoE weights after loading from serialized checkpoint.
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
-        # Ensure weights are proper Parameters
+        # Should we requantize the weights here?
+        # Fp8 moe kernel needs single weight scale for w13 per expert.
+        # We take the max then dequant and requant each expert?
+        #  Ensure weights are proper Parameters
         layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
         layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
