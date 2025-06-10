@@ -82,9 +82,13 @@ def cutlass_mla_decode(
     MAX_HEADS = 128
     assert H <= MAX_HEADS, f"H must be <= {MAX_HEADS}, but got {H}"
     if H < MAX_HEADS:
-        q_nope_and_q_pe_padded = q_nope_and_q_pe.new_empty((B_q, MAX_HEADS, D_q))
-        q_nope_and_q_pe_padded[:, :H] = q_nope_and_q_pe
-        q_nope_and_q_pe = q_nope_and_q_pe_padded
+        q_nope_padded = q_nope.new_empty((B_q, MAX_HEADS, D_q_nope))
+        q_nope_padded[:, :H] = q_nope
+        q_nope = q_nope_padded
+
+        q_pe_padded = q_pe.new_empty((B_q, MAX_HEADS, D_q_pe))
+        q_pe_padded[:, :H] = q_pe
+        q_pe = q_pe_padded
 
     assert len(page_table.shape) == 2
     B_block_table, block_num = page_table.shape
