@@ -1456,6 +1456,11 @@ class ServerArgs:
             default=ServerArgs.debug_tensor_dump_inject,
             help="Inject the outputs from jax as the input of every layer.",
         )
+        parser.add_argument(
+            "--debug-tensor-dump-prefill-only",
+            action="store_true",
+            help="Only dump the tensors for prefill requests (i.e. batch size > 1).",
+        )
 
         # Disaggregation
         parser.add_argument(
