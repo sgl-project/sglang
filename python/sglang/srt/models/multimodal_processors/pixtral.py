@@ -6,10 +6,12 @@ from transformers.models.pixtral.image_processing_pixtral import (
     _num_image_tokens as _get_pixtral_hf_num_image_tokens,
 )
 
-from sglang.srt.managers.multimodal_processor import MultimodalSpecialTokens
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.multimodal_processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
+)
+from sglang.srt.models.multimodal_processors.base_processor import (
+    MultimodalSpecialTokens,
 )
 from sglang.srt.models.pixtral import PixtralVisionModel
 

@@ -10,6 +10,9 @@ from sglang.srt.models.internvl import InternVLChatModel
 from sglang.srt.models.multimodal_processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
+from sglang.srt.models.multimodal_processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 
 
 class InternVLImageProcessor(SGLangBaseProcessor):

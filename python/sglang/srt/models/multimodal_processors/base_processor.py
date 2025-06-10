@@ -5,6 +5,7 @@ import multiprocessing as mp
 import os
 import re
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -12,9 +13,6 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
 
-from sglang.srt.managers.multimodal_processors.base_processor import (
-    MultimodalInputFormat,
-)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import encode_video, load_audio, load_image
 
@@ -29,6 +27,32 @@ class BaseMultiModalProcessorOutput:
 
     # audios
     audios: Optional[list[Union[np.ndarray, MultimodalDataItem]]] = None
+
+    def normalize(self):
+        for field_name in ["images", "audios"]:
+            field = getattr(self, field_name, None)
+            if field is not None and isinstance(field, list) and len(field) == 0:
+                setattr(self, field_name, None)
+
+
+class MultimodalInputFormat(Enum):
+    """Enum for different multimodal input formats."""
+
+    RAW_IMAGES = "raw_images"
+    PRECOMPUTED_FEATURES = "precomputed_features"
+    PIXEL_VALUES = "pixel_values"
+
+
+@dataclasses.dataclass
+class BaseMultiModalProcessorOutput:
+    # input_text, with each frame of video/image represented with a image_token
+    input_text: str
+
+    # frames loaded from image and video, in given order
+    images: Optional[list[Union[Image.Image, dict]]] = None
+
+    # audios
+    audios: Optional[list[Union[np.ndarray, dict]]] = None
 
     def normalize(self):
         for field_name in ["images", "audios"]:
