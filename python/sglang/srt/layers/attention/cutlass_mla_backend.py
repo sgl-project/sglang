@@ -273,6 +273,11 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
 
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
+        print(f'hi call cutlass_mla_decode '
+              f'{q_nope.shape=} {q_nope.stride()=} '
+              f'{q_rope.shape=} {q_rope.stride()=} '
+              f'{k_cache.shape=} {k_cache.stride()=} '
+              )
         o = cutlass_mla_decode(
             q_nope=q_nope,
             q_pe=q_rope,
