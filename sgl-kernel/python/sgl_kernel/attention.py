@@ -52,8 +52,10 @@ def merge_state_v2(
 
 
 def cutlass_mla_decode(
-    q_nope_and_q_pe: torch.Tensor,
-    kv_c_and_k_pe_cache: torch.Tensor,
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
     seq_lens: torch.Tensor,
     page_table: torch.Tensor,
     workspace: torch.Tensor,
