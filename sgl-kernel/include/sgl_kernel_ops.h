@@ -109,8 +109,10 @@ void cutlass_mla_decode(
     torch::Tensor const& kv_c_and_k_pe_cache,
     torch::Tensor const& seq_lens,
     torch::Tensor const& page_table,
-    torch::Tensor const& workspace);
-int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count = 0);
+    torch::Tensor const& workspace,
+    int64_t num_kv_splits = -1);
+int64_t cutlass_mla_get_workspace_size(
+    int64_t max_seq_len, int64_t num_batches, int64_t sm_count = 0, int64_t num_kv_splits = -1);
 /*
  * From csrc/elementwise
  */
@@ -275,6 +277,12 @@ void ep_moe_post_reorder(
     int64_t topk);
 
 void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor);
+
+void apply_shuffle_mul_sum(
+    const torch::Tensor& input,
+    torch::Tensor& output,
+    const torch::Tensor& permutation,
+    const std::optional<torch::Tensor>& factors);
 
 void cutlass_fp4_group_mm(
     torch::Tensor& output,
