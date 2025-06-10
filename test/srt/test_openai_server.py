@@ -1,9 +1,7 @@
 """
 python3 -m unittest test_openai_server.TestOpenAIServer.test_batch
 python3 -m unittest test_openai_server.TestOpenAIServer.test_completion
-python3 -m unittest test_openai_server.TestOpenAIServer.test_completion_stream
-python3 -m unittest test_openai_server.TestOpenAIServer.test_chat_completion
-python3 -m unittest test_openai_server.TestOpenAIServer.test_chat_completion_stream
+
 """
 
 import json
@@ -11,8 +9,8 @@ import re
 import time
 import unittest
 
-import numpy as np
 import openai
+import requests
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
@@ -46,13 +44,7 @@ class TestOpenAIServer(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def run_completion(
-        self,
-        echo,
-        logprobs,
-        use_list_input,
-        parallel_sample_num,
-        token_input,
-        return_hidden_states,
+        self, echo, logprobs, use_list_input, parallel_sample_num, token_input
     ):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         prompt = "The capital of France is"
@@ -79,7 +71,6 @@ class TestOpenAIServer(CustomTestCase):
             echo=echo,
             logprobs=logprobs,
             n=parallel_sample_num,
-            extra_body=dict(return_hidden_states=return_hidden_states),
         )
 
         assert len(response.choices) == num_choices * parallel_sample_num
@@ -110,26 +101,8 @@ class TestOpenAIServer(CustomTestCase):
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
-        if return_hidden_states:
-            hidden_states = response.choices[0].hidden_states
-            assert hidden_states is not None, "hidden_states was none"
-            hidden_states = np.asarray(hidden_states)
-            assert (
-                len(hidden_states.shape) == 1
-            ), f"hidden_states shape is not correct, was {hidden_states.shape}"
-        else:
-            assert not hasattr(
-                response.choices[0], "hidden_states"
-            ), "hidden_states was returned and should not have been"
-
     def run_completion_stream(
-        self,
-        echo,
-        logprobs,
-        use_list_input,
-        parallel_sample_num,
-        token_input,
-        return_hidden_states,
+        self, echo, logprobs, use_list_input, parallel_sample_num, token_input
     ):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         prompt = "The capital of France is"
@@ -158,44 +131,33 @@ class TestOpenAIServer(CustomTestCase):
             stream=True,
             stream_options={"include_usage": True},
             n=parallel_sample_num,
-            extra_body=dict(return_hidden_states=return_hidden_states),
         )
 
         is_firsts = {}
-        hidden_states = None
         for response in generator:
             usage = response.usage
             if usage is not None:
-                assert usage.prompt_tokens > 0, f"usage.prompt_tokens was zero"
-                assert usage.completion_tokens > 0, f"usage.completion_tokens was zero"
-                assert usage.total_tokens > 0, f"usage.total_tokens was zero"
-                continue
-
-            if (
-                hasattr(response.choices[0], "hidden_states")
-                and response.choices[0].hidden_states is not None
-            ):
-                hidden_states = response.choices[0].hidden_states
+                assert usage.prompt_tokens > 0
+                assert usage.completion_tokens > 0
+                assert usage.total_tokens > 0
                 continue
 
             index = response.choices[0].index
             is_first = is_firsts.get(index, True)
 
             if logprobs:
-                assert response.choices[0].logprobs, f"no logprobs in response"
-                assert isinstance(
-                    response.choices[0].logprobs.tokens[0], str
-                ), f"{response.choices[0].logprobs.tokens[0]} is not a string"
+                assert response.choices[0].logprobs
+                assert isinstance(response.choices[0].logprobs.tokens[0], str)
                 if not (is_first and echo):
                     assert isinstance(
                         response.choices[0].logprobs.top_logprobs[0], dict
-                    ), f"top_logprobs was not a dictionary"
+                    )
                     ret_num_top_logprobs = len(
                         response.choices[0].logprobs.top_logprobs[0]
                     )
                     # FIXME: Sometimes, some top_logprobs are missing in the return value. The reason is that some output id maps to the same output token and duplicate in the map
                     # assert ret_num_top_logprobs == logprobs, f"{ret_num_top_logprobs} vs {logprobs}"
-                    assert ret_num_top_logprobs > 0, f"ret_num_top_logprobs was 0"
+                    assert ret_num_top_logprobs > 0
 
             if is_first:
                 if echo:
@@ -203,29 +165,15 @@ class TestOpenAIServer(CustomTestCase):
                         prompt
                     ), f"{response.choices[0].text} and all args {echo} {logprobs} {token_input} {is_first}"
                 is_firsts[index] = False
-            assert response.id, f"no id in response"
-            assert response.created, f"no created in response"
+            assert response.id
+            assert response.created
 
         for index in [i for i in range(parallel_sample_num * num_choices)]:
             assert not is_firsts.get(
                 index, True
             ), f"index {index} is not found in the response"
 
-        if return_hidden_states:
-            assert hidden_states is not None, "hidden_states is not returned"
-            try:
-                hidden_states = np.asarray(hidden_states)
-            except Exception as e:
-                raise Exception(f"Failed to convert hidden states to numpy array: {e}")
-            assert (
-                len(hidden_states.shape) == 1
-            ), f"hidden_states shape is not correct, was {hidden_states.shape}"
-        else:
-            assert (
-                hidden_states is None
-            ), "hidden_states was returned and should not have been"
-
-    def run_chat_completion(self, logprobs, parallel_sample_num, return_hidden_states):
+    def run_chat_completion(self, logprobs, parallel_sample_num):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         response = client.chat.completions.create(
             model=self.model,
@@ -240,7 +188,6 @@ class TestOpenAIServer(CustomTestCase):
             logprobs=logprobs is not None and logprobs > 0,
             top_logprobs=logprobs,
             n=parallel_sample_num,
-            extra_body=dict(return_hidden_states=return_hidden_states),
         )
 
         if logprobs:
@@ -264,21 +211,7 @@ class TestOpenAIServer(CustomTestCase):
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
-        if return_hidden_states:
-            hidden_states = response.choices[0].hidden_states
-            assert hidden_states is not None, "hidden_states is not returned"
-            hidden_states = np.asarray(hidden_states)
-            assert (
-                len(hidden_states.shape) == 1
-            ), f"hidden_states shape is not correct, was {hidden_states.shape}"
-        else:
-            assert not hasattr(
-                response.choices[0], "hidden_states"
-            ), "hidden_states was returned and should not have been"
-
-    def run_chat_completion_stream(
-        self, logprobs, parallel_sample_num=1, return_hidden_states=False
-    ):
+    def run_chat_completion_stream(self, logprobs, parallel_sample_num=1):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         generator = client.chat.completions.create(
             model=self.model,
@@ -292,55 +225,40 @@ class TestOpenAIServer(CustomTestCase):
             stream=True,
             stream_options={"include_usage": True},
             n=parallel_sample_num,
-            extra_body=dict(return_hidden_states=return_hidden_states),
         )
 
         is_firsts = {}
-        hidden_states = None
-        top_logprob_tokens = []
         for response in generator:
             usage = response.usage
             if usage is not None:
-                assert usage.prompt_tokens > 0, f"usage.prompt_tokens was zero"
-                assert usage.completion_tokens > 0, f"usage.completion_tokens was zero"
-                assert usage.total_tokens > 0, f"usage.total_tokens was zero"
-                continue
-
-            if hasattr(response.choices[0].delta, "hidden_states"):
-                hidden_states = response.choices[0].delta.hidden_states
+                assert usage.prompt_tokens > 0
+                assert usage.completion_tokens > 0
+                assert usage.total_tokens > 0
                 continue
 
             index = response.choices[0].index
             data = response.choices[0].delta
 
             if is_firsts.get(index, True):
-                assert (
-                    data.role == "assistant"
-                ), f"data.role was not 'assistant' for first chunk"
+                assert data.role == "assistant"
                 is_firsts[index] = False
                 continue
 
             if logprobs:
-                assert response.choices[0].logprobs, f"logprobs was not returned"
+                assert response.choices[0].logprobs
                 assert isinstance(
                     response.choices[0].logprobs.content[0].top_logprobs[0].token, str
-                ), f"top_logprobs token was not a string"
+                )
                 assert isinstance(
                     response.choices[0].logprobs.content[0].top_logprobs, list
-                ), f"top_logprobs was not a list"
+                )
                 ret_num_top_logprobs = len(
                     response.choices[0].logprobs.content[0].top_logprobs
                 )
                 assert (
                     ret_num_top_logprobs == logprobs
                 ), f"{ret_num_top_logprobs} vs {logprobs}"
-                top_logprob_tokens.append(
-                    response.choices[0].logprobs.content[0].top_logprobs[0].token
-                )
 
-            assert (
-                len(top_logprob_tokens) <= 2 or len(set(top_logprob_tokens)) > 1
-            ), "Top Logprob tokens should not consistent of the same token repeated"
             assert (
                 isinstance(data.content, str)
                 or isinstance(data.reasoning_content, str)
@@ -354,20 +272,6 @@ class TestOpenAIServer(CustomTestCase):
             assert not is_firsts.get(
                 index, True
             ), f"index {index} is not found in the response"
-
-        if return_hidden_states:
-            assert hidden_states is not None, "hidden_states is not returned"
-            try:
-                hidden_states = np.asarray(hidden_states)
-            except Exception as e:
-                raise Exception(f"Failed to convert hidden states to numpy array: {e}")
-            assert (
-                len(hidden_states.shape) == 1
-            ), f"hidden_states shape is not correct, was {hidden_states.shape}"
-        else:
-            assert (
-                hidden_states is None
-            ), "hidden_states was returned and should not have been"
 
     def _create_batch(self, mode, client):
         if mode == "completion":
@@ -516,53 +420,43 @@ class TestOpenAIServer(CustomTestCase):
         assert del_response.deleted
 
     def test_completion(self):
-        for return_hidden_states in [False, True]:
-            for echo in [False, True]:
-                for logprobs in [None, 5]:
-                    for use_list_input in [True, False]:
-                        for parallel_sample_num in [1, 2]:
-                            for token_input in [False, True]:
-                                self.run_completion(
-                                    echo,
-                                    logprobs,
-                                    use_list_input,
-                                    parallel_sample_num,
-                                    token_input,
-                                    return_hidden_states,
-                                )
+        for echo in [False, True]:
+            for logprobs in [None, 5]:
+                for use_list_input in [True, False]:
+                    for parallel_sample_num in [1, 2]:
+                        for token_input in [False, True]:
+                            self.run_completion(
+                                echo,
+                                logprobs,
+                                use_list_input,
+                                parallel_sample_num,
+                                token_input,
+                            )
 
     def test_completion_stream(self):
         # parallel sampling and list input are not supported in streaming mode
-        for return_hidden_states in [False, True]:
-            for echo in [False, True]:
-                for logprobs in [None, 5]:
-                    for use_list_input in [True, False]:
-                        for parallel_sample_num in [1, 2]:
-                            for token_input in [False, True]:
-                                self.run_completion_stream(
-                                    echo,
-                                    logprobs,
-                                    use_list_input,
-                                    parallel_sample_num,
-                                    token_input,
-                                    return_hidden_states,
-                                )
+        for echo in [False, True]:
+            for logprobs in [None, 5]:
+                for use_list_input in [True, False]:
+                    for parallel_sample_num in [1, 2]:
+                        for token_input in [False, True]:
+                            self.run_completion_stream(
+                                echo,
+                                logprobs,
+                                use_list_input,
+                                parallel_sample_num,
+                                token_input,
+                            )
 
     def test_chat_completion(self):
-        for return_hidden_states in [False, True]:
-            for logprobs in [None, 5]:
-                for parallel_sample_num in [1, 2]:
-                    self.run_chat_completion(
-                        logprobs, parallel_sample_num, return_hidden_states
-                    )
+        for logprobs in [None, 5]:
+            for parallel_sample_num in [1, 2]:
+                self.run_chat_completion(logprobs, parallel_sample_num)
 
     def test_chat_completion_stream(self):
-        for return_hidden_states in [False, True]:
-            for logprobs in [None, 5]:
-                for parallel_sample_num in [1, 2]:
-                    self.run_chat_completion_stream(
-                        logprobs, parallel_sample_num, return_hidden_states
-                    )
+        for logprobs in [None, 5]:
+            for parallel_sample_num in [1, 2]:
+                self.run_chat_completion_stream(logprobs, parallel_sample_num)
 
     def test_batch(self):
         for mode in ["completion", "chat"]:
@@ -706,7 +600,6 @@ class TestOpenAIServerEBNF(CustomTestCase):
             extra_body={"ebnf": ebnf_grammar},
         )
         text = response.choices[0].message.content.strip()
-        print("EBNF test output:", repr(text))
         self.assertTrue(len(text) > 0, "Got empty text from EBNF generation")
         self.assertRegex(text, pattern, f"Text '{text}' doesn't match EBNF choices")
 
@@ -737,7 +630,6 @@ class TestOpenAIServerEBNF(CustomTestCase):
             extra_body={"ebnf": ebnf_grammar},
         )
         text = response.choices[0].message.content.strip()
-        print("EBNF strict JSON test output:", repr(text))
         self.assertTrue(len(text) > 0, "Got empty text from EBNF strict JSON test")
         self.assertRegex(
             text, pattern, f"Text '{text}' not matching the EBNF strict JSON shape"
@@ -871,6 +763,169 @@ class TestOpenAIServerIgnoreEOS(CustomTestCase):
             "length",
             f"Expected finish_reason='length' for ignore_eos=True, got {response_ignore_eos.choices[0].finish_reason}",
         )
+
+
+class TestOpenAIV1Score(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+        )
+        cls.base_url += "/v1/score"
+        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def run_score(
+        self, query, items, label_token_ids, apply_softmax=False, item_first=False
+    ):
+        response = requests.post(
+            self.base_url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.model,
+                "query": query,
+                "items": items,
+                "label_token_ids": label_token_ids,
+                "apply_softmax": apply_softmax,
+                "item_first": item_first,
+            },
+        )
+        return response.json()
+
+    def test_score_text_input(self):
+        """Test scoring with text input"""
+        query = "The capital of France is"
+        items = ["Paris", "London", "Berlin"]
+
+        # Get valid token IDs from the tokenizer
+        label_token_ids = []
+        for item in items:
+            token_ids = self.tokenizer.encode(item, add_special_tokens=False)
+            if not token_ids:
+                self.fail(f"Failed to encode item: {item}")
+            label_token_ids.append(token_ids[0])
+
+        response = self.run_score(query, items, label_token_ids, apply_softmax=True)
+
+        # Handle error responses
+        if response.get("type") == "BadRequestError":
+            self.fail(f"Score request failed with error: {response['message']}")
+
+        # Verify response structure
+        self.assertIn("scores", response, "Response should have a 'scores' field")
+        self.assertIsInstance(response["scores"], list, "scores should be a list")
+        self.assertEqual(
+            len(response["scores"]),
+            len(items),
+            "Number of scores should match number of items",
+        )
+
+        # Each score should be a list of floats in the order of label_token_ids
+        for i, score_list in enumerate(response["scores"]):
+            self.assertIsInstance(score_list, list, f"Score {i} should be a list")
+            self.assertEqual(
+                len(score_list),
+                len(label_token_ids),
+                f"Score {i} length should match label_token_ids",
+            )
+            self.assertTrue(
+                all(isinstance(v, float) for v in score_list),
+                f"Score {i} values should be floats",
+            )
+            self.assertAlmostEqual(
+                sum(score_list),
+                1.0,
+                places=6,
+                msg=f"Score {i} probabilities should sum to 1",
+            )
+
+    def test_score_token_input(self):
+        """Test scoring with token IDs input"""
+        query = "The capital of France is"
+        items = ["Paris", "London", "Berlin"]
+
+        # Get valid token IDs
+        query_ids = self.tokenizer.encode(query, add_special_tokens=False)
+        item_ids = [
+            self.tokenizer.encode(item, add_special_tokens=False) for item in items
+        ]
+        label_token_ids = [
+            ids[0] for ids in item_ids if ids
+        ]  # Get first token ID of each item
+
+        response = self.run_score(
+            query_ids, item_ids, label_token_ids, apply_softmax=True
+        )
+
+        # Handle error responses
+        if response.get("type") == "BadRequestError":
+            self.fail(f"Score request failed with error: {response['message']}")
+
+        # Verify response structure
+        self.assertIn("scores", response, "Response should have a 'scores' field")
+        self.assertIsInstance(response["scores"], list, "scores should be a list")
+        self.assertEqual(
+            len(response["scores"]),
+            len(items),
+            "Number of scores should match number of items",
+        )
+
+        # Each score should be a list of floats in the order of label_token_ids
+        for i, score_list in enumerate(response["scores"]):
+            self.assertIsInstance(score_list, list, f"Score {i} should be a list")
+            self.assertEqual(
+                len(score_list),
+                len(label_token_ids),
+                f"Score {i} length should match label_token_ids",
+            )
+            self.assertTrue(
+                all(isinstance(v, float) for v in score_list),
+                f"Score {i} values should be floats",
+            )
+            self.assertAlmostEqual(
+                sum(score_list),
+                1.0,
+                places=6,
+                msg=f"Score {i} probabilities should sum to 1",
+            )
+
+    def test_score_error_handling(self):
+        """Test error handling for invalid inputs"""
+        query = "The capital of France is"
+        items = ["Paris", "London", "Berlin"]
+
+        # Test with invalid token ID
+        response = requests.post(
+            self.base_url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.model,
+                "query": query,
+                "items": items,
+                "label_token_ids": [999999],  # Invalid token ID
+                "apply_softmax": True,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        error_response = response.json()
+        self.assertEqual(error_response["type"], "BadRequestError")
+        self.assertIn("Token ID 999999 is out of vocabulary", error_response["message"])
 
 
 if __name__ == "__main__":

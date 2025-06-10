@@ -1,8 +1,12 @@
 import logging
+from dataclasses import dataclass
 
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
+from sglang.srt.managers.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import DeepEPMode, load_json_config
+from sglang.srt.utils import DeepEPMode, get_int_env_var, load_json_config
 
 try:
     from deep_ep import Buffer, Config
@@ -15,7 +19,7 @@ try:
 except ImportError:
     use_deepep = False
 
-from enum import IntEnum, auto
+from enum import Enum, IntEnum, auto
 from typing import Optional, Tuple, Union
 
 import torch
@@ -64,9 +68,9 @@ class DeepEPBuffer:
         if deepep_mode.enable_normal():
             hidden_bytes = hidden_size * param_bytes
             for config in (
-                _DeepEPConfig.get_instance().normal_dispatch_config
+                DeepEPConfig.get_instance().normal_dispatch_config
                 or Buffer.get_dispatch_config(group.size()),
-                _DeepEPConfig.get_instance().normal_combine_config
+                DeepEPConfig.get_instance().normal_combine_config
                 or Buffer.get_combine_config(group.size()),
             ):
                 num_nvl_bytes = max(
@@ -89,12 +93,20 @@ class DeepEPBuffer:
                 ),
                 num_rdma_bytes,
             )
+
+        if deepep_mode == DeepEPMode.normal:
+            num_qps_per_rank = DeepEPConfig.get_instance().num_sms // 2
+        elif deepep_mode in [DeepEPMode.low_latency, DeepEPMode.auto]:
+            num_qps_per_rank = num_experts // group.size()
+        else:
+            raise NotImplementedError
+
         cls._buffer = Buffer(
             group,
             num_nvl_bytes,
             num_rdma_bytes,
             low_latency_mode=deepep_mode.enable_low_latency(),
-            num_qps_per_rank=(max(num_experts // group.size(), Buffer.num_sms // 2)),
+            num_qps_per_rank=num_qps_per_rank,
         )
         return cls._buffer
 
@@ -119,7 +131,7 @@ class DeepEPBuffer:
         cls._dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
 
 
-class _DeepEPConfig:
+class DeepEPConfig:
     _instance = None
 
     def __init__(self):
@@ -128,16 +140,23 @@ class _DeepEPConfig:
             config_parsed = load_json_config(config_str)
             if torch.distributed.get_rank() == 0:
                 logger.info(f"Use DeepEP Config: {config_parsed}")
-            self.normal_dispatch_config = Config(**config_parsed["normal_dispatch"])
-            self.normal_combine_config = Config(**config_parsed["normal_combine"])
+            config_dispatch = config_parsed["normal_dispatch"]
+            config_combine = config_parsed["normal_combine"]
+
+            self.normal_dispatch_config = Config(**config_dispatch)
+            self.normal_combine_config = Config(**config_combine)
+
+            assert config_dispatch["num_sms"] == config_combine["num_sms"]
+            self.num_sms = config_dispatch["num_sms"]
         else:
             self.normal_dispatch_config = None
             self.normal_combine_config = None
+            self.num_sms = Buffer.num_sms
 
     @classmethod
     def get_instance(cls):
         if cls._instance is None:
-            cls._instance = _DeepEPConfig()
+            cls._instance = DeepEPConfig()
         return cls._instance
 
 
@@ -169,7 +188,9 @@ class _DeepEPDispatcherImplBase:
         self.deepep_mode = deepep_mode
 
         self.params_bytes = 2
-        self.num_max_dispatch_tokens_per_rank = 128
+        self.num_max_dispatch_tokens_per_rank = get_int_env_var(
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
+        )
 
         self.handle = None
 
@@ -323,7 +344,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
             expert_alignment=128 if _ENABLE_JIT_DEEPGEMM else 1,
-            config=_DeepEPConfig.get_instance().normal_dispatch_config,
+            config=DeepEPConfig.get_instance().normal_dispatch_config,
+        )
+
+        get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
+            num_recv_tokens_per_expert_list,
+            num_tokens_per_rank=num_tokens_per_rank,
+            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
         )
 
         return (
@@ -423,7 +451,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             previous_event=previous_event,
             allocate_on_comm_stream=previous_event is not None,
-            config=_DeepEPConfig.get_instance().normal_combine_config,
+            config=DeepEPConfig.get_instance().normal_combine_config,
         )
         return combined_x, event
 
@@ -488,6 +516,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hook,
     ):
         hook() if self.return_recv_hook else event.current_stream_wait()
+
+        get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
+            masked_m
+        )
 
         reorder_topk_ids = seg_indptr = None
 
@@ -601,6 +633,14 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
 
+@dataclass
+class _Stage(Enum):
+    INITIAL = auto()
+    AFTER_DISPATCH_A = auto()
+    AFTER_DISPATCH_B = auto()
+    AFTER_COMBINE_A = auto()
+
+
 class DeepEPDispatcher:
     def __init__(
         self,
@@ -639,6 +679,8 @@ class DeepEPDispatcher:
                 **common_kwargs,
             )
 
+        self._stage = _Stage.INITIAL
+
     def dispatch(self, *args, **kwargs) -> Tuple:
         self.dispatch_a(*args, **kwargs)
         ret = self.dispatch_b()
@@ -651,6 +693,7 @@ class DeepEPDispatcher:
         topk_weights: torch.Tensor,
         forward_mode: ForwardMode = None,
     ):
+        self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
         inner_state = self._get_impl(forward_mode).dispatch_a(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
@@ -659,6 +702,7 @@ class DeepEPDispatcher:
         self._dispatch_intermediate_state = forward_mode, inner_state
 
     def dispatch_b(self):
+        self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
         forward_mode, inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
         return self._get_impl(forward_mode).dispatch_b(*inner_state)
@@ -675,6 +719,7 @@ class DeepEPDispatcher:
         topk_weights: torch.Tensor,
         forward_mode: ForwardMode,
     ):
+        self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl(forward_mode).combine_a(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
@@ -683,6 +728,7 @@ class DeepEPDispatcher:
         self._combine_intermediate_state = forward_mode, inner_state
 
     def combine_b(self):
+        self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
         forward_mode, inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
         return self._get_impl(forward_mode).combine_b(*inner_state)
@@ -695,3 +741,7 @@ class DeepEPDispatcher:
             return self._low_latency_dispatcher
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
+
+    def _update_stage(self, old_stage, new_stage):
+        assert self._stage == old_stage
+        self._stage = new_stage

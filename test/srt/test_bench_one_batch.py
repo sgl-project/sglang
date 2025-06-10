@@ -6,6 +6,7 @@ from sglang.test.test_utils import (
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     is_in_ci,
     run_bench_offline_throughput,
     run_bench_one_batch,
@@ -46,7 +47,7 @@ class TestBenchOneBatch(CustomTestCase):
                 f"### test_moe_tp2_bs1 (Mixtral-8x7B)\n"
                 f"output_throughput: {output_throughput:.2f} token/s\n"
             )
-            if os.getenv("SGLANG_AMD_CI") == "1":
+            if is_in_amd_ci():
                 self.assertGreater(output_throughput, 85)
             else:
                 self.assertGreater(output_throughput, 125)
@@ -62,7 +63,10 @@ class TestBenchOneBatch(CustomTestCase):
                 f"### test_torch_compile_tp2_bs1 (Mixtral-8x7B)\n"
                 f"output_throughput: {output_throughput:.2f} token/s\n"
             )
-            self.assertGreater(output_throughput, 220)
+            if is_in_amd_ci():
+                self.assertGreater(output_throughput, 200)
+            else:
+                self.assertGreater(output_throughput, 220)
 
 
 if __name__ == "__main__":

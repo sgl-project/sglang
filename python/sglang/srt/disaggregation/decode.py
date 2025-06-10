@@ -24,7 +24,8 @@ import logging
 import os
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from http import HTTPStatus
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -35,25 +36,87 @@ from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     FakeBootstrapHost,
     KVClassType,
+    MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
     is_mla_backend,
     kv_to_page_indices,
     poll_and_all_reduce,
+    prepare_abort,
 )
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.server_args import ServerArgs
+
+
+class DecodeReqToTokenPool:
+    """
+    The difference of DecodeReqToTokenPool and ReqToTokenPool is that
+    DecodeReqToTokenPool subscribes memory for pre-allocated requests.
+
+    In ReqToTokenPool, if `--max-running-requests` is 8,
+    #pre-allocated + #transfer + #running <= 8, but there are in fact more memory can carry pre-allocated requests.
+
+    In DecodeReqToTokenPool, if `--max-running-requests` is 8,
+    #running <= 8, #pre-allocated + #transfer <= pre_alloc_size, so we can use the free memory to pre-allocate requests to unblock prefill.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        device: str,
+        enable_memory_saver: bool,
+        pre_alloc_size: int,
+    ):
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
+
+        self.size = size
+        self.max_context_len = max_context_len
+        self.device = device
+        self.pre_alloc_size = pre_alloc_size
+        with memory_saver_adapter.region():
+            self.req_to_token = torch.zeros(
+                (size + pre_alloc_size, max_context_len),
+                dtype=torch.int32,
+                device=device,
+            )
+
+        self.free_slots = list(range(size + pre_alloc_size))
+
+    def write(self, indices, values):
+        self.req_to_token[indices] = values
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    def alloc(self, need_size: int) -> List[int]:
+        if need_size > len(self.free_slots):
+            return None
+
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+        return select_index
+
+    def free(self, free_index: Union[int, List[int]]):
+        if isinstance(free_index, (int,)):
+            self.free_slots.append(free_index)
+        else:
+            self.free_slots.extend(free_index)
+
+    def clear(self):
+        self.free_slots = list(range(self.size + self.pre_alloc_size))
 
 
 @dataclass
@@ -73,9 +136,9 @@ class DecodePreallocQueue:
         self,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        draft_token_to_kv_pool: Optional[KVCache],
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
-        metadata_buffers: List[torch.Tensor],
-        aux_dtype: torch.dtype,
+        metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         transfer_queue: DecodeTransferQueue,
         tree_cache: BasePrefixCache,
@@ -88,8 +151,8 @@ class DecodePreallocQueue:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
+        self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
-        self.aux_dtype = aux_dtype
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.scheduler = scheduler
@@ -116,19 +179,21 @@ class DecodePreallocQueue:
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
 
+        if self.draft_token_to_kv_pool is not None:
+            draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
+                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+            )
+            kv_data_ptrs += draft_kv_data_ptrs
+            kv_data_lens += draft_kv_data_lens
+            kv_item_lens += draft_kv_item_lens
+
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
 
-        kv_args.aux_data_ptrs = [
-            output_id_tensor.data_ptr() for output_id_tensor in self.metadata_buffers
-        ]
-        kv_args.aux_data_lens = [
-            metadata_buffer.nbytes for metadata_buffer in self.metadata_buffers
-        ]
-        kv_args.aux_item_lens = [
-            metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
-        ]
+        kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
+            self.metadata_buffers.get_buf_infos()
+        )
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -153,6 +218,7 @@ class DecodePreallocQueue:
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
             bootstrap_room=req.bootstrap_room,
+            data_parallel_rank=req.data_parallel_rank,
         )
         self.queue.append(DecodeRequest(req=req, kv_receiver=kv_receiver))
 
@@ -178,7 +244,17 @@ class DecodePreallocQueue:
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
             elif poll == KVPoll.Failed:
-                raise Exception("Handshake failed")
+                error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                try:
+                    decode_req.kv_receiver.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+                logger.error(error_message)
+                prepare_abort(
+                    decode_req.req,
+                    error_message,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
 
     def pop_preallocated(self) -> List[DecodeRequest]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
@@ -188,7 +264,18 @@ class DecodePreallocQueue:
         indices_to_remove = set()
         allocatable_tokens = self._allocatable_tokens()
 
+        # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
+            if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                self.scheduler.stream_output(
+                    [decode_req.req], decode_req.req.return_logprob
+                )
+                indices_to_remove.add(i)
+
+        for i, decode_req in enumerate(self.queue):
+            if i in indices_to_remove:
+                continue
+
             if not decode_req.waiting_for_input:
                 continue
 
@@ -308,18 +395,22 @@ class DecodeTransferQueue:
         self,
         gloo_group: ProcessGroup,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
-        metadata_buffers: torch.Tensor,
+        metadata_buffers: MetadataBuffers,
+        scheduler: Scheduler,
+        tree_cache: BasePrefixCache,
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.metadata_buffers = metadata_buffers
+        self.scheduler = scheduler
+        self.tree_cache = tree_cache
 
-    def add(self, req_conn: DecodeRequest) -> None:
-        self.queue.append(req_conn)
+    def add(self, decode_req: DecodeRequest) -> None:
+        self.queue.append(decode_req)
 
-    def extend(self, req_conns) -> None:
-        self.queue.extend(req_conns)
+    def extend(self, decode_reqs: List[DecodeRequest]) -> None:
+        self.queue.extend(decode_reqs)
 
     def pop_transferred(self) -> List[DecodeRequest]:
         if not self.queue:
@@ -333,18 +424,57 @@ class DecodeTransferQueue:
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if poll == KVPoll.Failed:
-                raise Exception("Transfer failed")
+                error_message = f"Decode transfer failed for request rank={self.scheduler.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                try:
+                    decode_req.kv_receiver.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+                logger.error(error_message)
+                prepare_abort(
+                    decode_req.req,
+                    error_message,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                self.scheduler.stream_output(
+                    [decode_req.req], decode_req.req.return_logprob
+                )
+                # unlock the kv cache or it will have memory leak
+                self.tree_cache.cache_finished_req(decode_req.req)
+                indices_to_remove.add(i)
+                continue
             elif poll == KVPoll.Success:
-                # pop and push it to waiting queue
+
                 idx = decode_req.metadata_buffer_index
-                assert len(decode_req.req.output_ids) == 0
-                output_id_buffer = self.metadata_buffers[0]
-                # the last dimension is padded by the same values.
-                output_id = output_id_buffer[idx][0].item()
-                assert len(decode_req.req.output_ids) == 0
-                assert decode_req.req.transferred_output_id is None
-                decode_req.req.transferred_output_id = output_id
-                transferred_reqs.append(decode_req)
+                (
+                    output_id,
+                    output_token_logprobs_val,
+                    output_token_logprobs_idx,
+                    output_top_logprobs_val,
+                    output_top_logprobs_idx,
+                ) = self.metadata_buffers.get_buf(idx)
+
+                decode_req.req.output_ids.append(output_id[0].item())
+
+                if decode_req.req.return_logprob:
+                    decode_req.req.output_token_logprobs_val.append(
+                        output_token_logprobs_val[0].item()
+                    )
+                    decode_req.req.output_token_logprobs_idx.append(
+                        output_token_logprobs_idx[0].item()
+                    )
+                    decode_req.req.output_top_logprobs_val.append(
+                        output_top_logprobs_val[
+                            : decode_req.req.top_logprobs_num
+                        ].tolist()
+                    )
+                    decode_req.req.output_top_logprobs_idx.append(
+                        output_top_logprobs_idx[
+                            : decode_req.req.top_logprobs_num
+                        ].tolist()
+                    )
+                if hasattr(decode_req.kv_receiver, "clear"):
+                    decode_req.kv_receiver.clear()
+                transferred_reqs.append(decode_req.req)
                 indices_to_remove.add(i)
             elif poll in [
                 KVPoll.Bootstrapping,
@@ -365,95 +495,6 @@ class DecodeTransferQueue:
         ]
 
         return transferred_reqs
-
-
-class ScheduleBatchDisaggregationDecodeMixin:
-
-    def prepare_for_prebuilt_extend(self: ScheduleBatch):
-        """
-        Prepare a prebuilt extend by populate metadata
-        Adapted from .prepare_for_extend().
-        """
-
-        self.forward_mode = ForwardMode.EXTEND
-        reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
-        extend_num_tokens = sum(len(ids) for ids in input_ids)
-        seq_lens = []
-        pre_lens = []
-        req_pool_indices = []
-
-        # Pre-calculate total size
-        total_size = sum(req.extend_input_len for req in reqs)
-        out_cache_loc = torch.empty(total_size, dtype=torch.int64, device=self.device)
-
-        # Fill the tensor in one pass
-        offset = 0
-        for i, req in enumerate(reqs):
-            req_pool_indices.append(req.req_pool_idx)
-
-            chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                : req.extend_input_len
-            ]
-            assert (
-                offset + req.extend_input_len <= total_size
-            ), f"Exceeds total size: offset={offset}, req.extend_input_len={req.extend_input_len}, total_size={total_size}"
-            out_cache_loc[offset : offset + req.extend_input_len] = chunk
-            offset += req.extend_input_len
-
-            pre_len = len(req.prefix_indices)
-            seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
-            seq_lens.append(seq_len)
-            if len(req.output_ids) == 0:
-                assert (
-                    seq_len - pre_len == req.extend_input_len
-                ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
-
-            req.cached_tokens += pre_len - req.already_computed
-            req.already_computed = seq_len
-            req.is_retracted = False
-            pre_lens.append(pre_len)
-            req.extend_logprob_start_len = 0
-
-        extend_input_logprob_token_ids = None
-
-        # Set fields
-        self.input_ids = torch.tensor(
-            sum(input_ids, []), dtype=torch.int32, device=self.device
-        )
-        self.req_pool_indices = torch.tensor(
-            req_pool_indices, dtype=torch.int64, device=self.device
-        )
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
-        self.out_cache_loc = out_cache_loc
-        self.seq_lens_sum = sum(seq_lens)
-        self.extend_num_tokens = extend_num_tokens
-        self.prefix_lens = [len(r.prefix_indices) for r in reqs]
-        self.extend_lens = [r.extend_input_len for r in reqs]
-        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
-        self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
-
-        # Build sampling info
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            self,
-            self.model_config.vocab_size,
-        )
-
-    def process_prebuilt_extend(
-        self: ScheduleBatch, server_args: ServerArgs, model_config: ModelConfig
-    ):
-        """Assign the buffered last input id to schedule batch"""
-        self.output_ids = []
-        for req in self.reqs:
-            if req.output_ids and len(req.output_ids) > 0:
-                # resumed retracted req
-                self.output_ids.append(req.output_ids[-1])
-            else:
-                assert req.transferred_output_id is not None
-                req.output_ids.append(req.transferred_output_id)
-                self.output_ids.append(req.transferred_output_id)
-            self.tree_cache.cache_unfinished_req(req)
-        self.output_ids = torch.tensor(self.output_ids, device=self.device)
 
 
 class SchedulerDisaggregationDecodeMixin:
@@ -488,7 +529,9 @@ class SchedulerDisaggregationDecodeMixin:
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
                     # Note: Logprobs should be handled on the prefill engine.
-                    self.stream_output(batch.reqs, False)
+                    self.stream_output(
+                        batch.reqs, any(req.return_logprob for req in batch.reqs)
+                    )
                     if prepare_dp_attn_flag:
                         self._prepare_idle_batch_and_run(None)
                 else:
@@ -534,7 +577,9 @@ class SchedulerDisaggregationDecodeMixin:
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
                     # Note: Logprobs should be handled on the prefill engine.
-                    self.stream_output(batch.reqs, False)
+                    self.stream_output(
+                        batch.reqs, any(req.return_logprob for req in batch.reqs)
+                    )
                     if prepare_dp_attn_flag:
                         batch_, result = self._prepare_idle_batch_and_run(
                             None, delay_process=True
@@ -547,7 +592,18 @@ class SchedulerDisaggregationDecodeMixin:
                         self.prepare_dp_attn_batch(batch)
                     result = self.run_batch(batch)
                     result_queue.append((batch.copy(), result))
+
+                    if (self.last_batch is None) or (not self.last_batch_in_queue):
+                        # Create a dummy first batch to start the pipeline for overlap schedule.
+                        # It is now used for triggering the sampling_info_done event.
+                        tmp_batch = ScheduleBatch(
+                            reqs=None,
+                            forward_mode=ForwardMode.DUMMY_FIRST,
+                            next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                        )
+                        self.set_next_batch_sampling_info_done(tmp_batch)
                     last_batch_in_queue = True
+
             elif prepare_dp_attn_flag:
                 batch, result = self._prepare_idle_batch_and_run(
                     None, delay_process=True
@@ -559,6 +615,9 @@ class SchedulerDisaggregationDecodeMixin:
             # Process the results of the previous batch but skip if the last batch is extend
             if self.last_batch and self.last_batch_in_queue:
                 tmp_batch, tmp_result = result_queue.popleft()
+                tmp_batch.next_batch_sampling_info = (
+                    self.tp_worker.cur_sampling_info if batch else None
+                )
                 self.process_batch_result(tmp_batch, tmp_result)
 
             if batch is None and (
@@ -607,6 +666,9 @@ class SchedulerDisaggregationDecodeMixin:
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
+        if self.grammar_queue:
+            self.move_ready_grammar_requests()
+
         if len(self.waiting_queue) == 0:
             return None
 
@@ -632,8 +694,6 @@ class SchedulerDisaggregationDecodeMixin:
         self.waiting_queue = waiting_queue
         if len(can_run_list) == 0:
             return None
-        # local import to avoid circular import
-        from sglang.srt.managers.schedule_batch import ScheduleBatch
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(
@@ -655,15 +715,8 @@ class SchedulerDisaggregationDecodeMixin:
 
     def process_decode_queue(self: Scheduler):
         req_conns = self.disagg_decode_prealloc_queue.pop_preallocated()
-
-        def _num_pre_alloc(req):
-            return len(req.req.origin_input_ids) + max(len(req.req.output_ids) - 1, 0)
-
-        self.num_tokens_pre_allocated += sum(_num_pre_alloc(req) for req in req_conns)
         self.disagg_decode_transfer_queue.extend(req_conns)
         alloc_reqs = (
             self.disagg_decode_transfer_queue.pop_transferred()
         )  # the requests which kv has arrived
-        self.num_tokens_pre_allocated -= sum(_num_pre_alloc(req) for req in alloc_reqs)
-
-        self.waiting_queue.extend([req.req for req in alloc_reqs])
+        self.waiting_queue.extend(alloc_reqs)

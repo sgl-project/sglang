@@ -1,8 +1,8 @@
 import base64
+import copy
 import io
 import json
 import os
-import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -48,6 +48,9 @@ class TestOpenAIVisionServer(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    def get_request_kwargs(self):
+        return {}
+
     def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
@@ -69,6 +72,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                 },
             ],
             temperature=0,
+            **(self.get_request_kwargs()),
         )
 
         assert response.choices[0].message.role == "assistant"
@@ -131,6 +135,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                 },
             ],
             temperature=0,
+            **(self.get_request_kwargs()),
         )
 
         assert response.choices[0].message.role == "assistant"
@@ -173,6 +178,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                 },
             ],
             temperature=0,
+            **(self.get_request_kwargs()),
         )
 
         assert response.choices[0].message.role == "assistant"
@@ -285,6 +291,7 @@ class TestOpenAIVisionServer(CustomTestCase):
             temperature=0,
             max_tokens=1024,
             stream=False,
+            **(self.get_request_kwargs()),
         )
 
         video_response = response.choices[0].message.content
@@ -294,20 +301,24 @@ class TestOpenAIVisionServer(CustomTestCase):
         print("-" * 30)
 
         # Add assertions to validate the video response
-        assert "iPod" in video_response or "device" in video_response, video_response
+        assert (
+            "iPod" in video_response or "device" in video_response
+        ), f"video_response: {video_response}, should contain 'iPod' or 'device'"
         assert (
             "man" in video_response
             or "person" in video_response
             or "individual" in video_response
             or "speaker" in video_response
-        ), video_response
+        ), f"video_response: {video_response}, should either have 'man' in video_response, or 'person' in video_response, or 'individual' in video_response or 'speaker' in video_response"
         assert (
             "present" in video_response
             or "examine" in video_response
             or "display" in video_response
             or "hold" in video_response
-        )
-        assert "black" in video_response or "dark" in video_response
+        ), f"video_response: {video_response}, should contain 'present', 'examine', 'display', or 'hold'"
+        assert (
+            "black" in video_response or "dark" in video_response
+        ), f"video_response: {video_response}, should contain 'black' or 'dark'"
         self.assertIsNotNone(video_response)
         self.assertGreater(len(video_response), 0)
 
@@ -320,6 +331,9 @@ class TestOpenAIVisionServer(CustomTestCase):
             + r""""number_of_cars":[\d]+"""
             + r"""\}"""
         )
+
+        extra_kwargs = self.get_request_kwargs()
+        extra_kwargs.setdefault("extra_body", {})["regex"] = regex
 
         response = client.chat.completions.create(
             model="default",
@@ -339,7 +353,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                 },
             ],
             temperature=0,
-            extra_body={"regex": regex},
+            **extra_kwargs,
         )
         text = response.choices[0].message.content
 
@@ -385,6 +399,7 @@ class TestOpenAIVisionServer(CustomTestCase):
                 {"role": "user", "content": content},
             ],
             temperature=0,
+            **(self.get_request_kwargs()),
         )
 
         assert response.choices[0].message.role == "assistant"
@@ -427,6 +442,7 @@ class TestOpenAIVisionServer(CustomTestCase):
             temperature=0,
             max_tokens=128,
             stream=False,
+            **(self.get_request_kwargs()),
         )
 
         audio_response = response.choices[0].message.content

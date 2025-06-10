@@ -1,24 +1,28 @@
 from __future__ import annotations
 
+import logging
 import os
+import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import (
+    Req,
     ScheduleBatch,
     get_last_loc,
     global_server_args_dict,
 )
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.speculative.build_eagle_tree import build_tree_kernel_efficient
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.utils import fast_topk, is_cuda, is_hip, next_power_of_2
 
 if is_cuda():
@@ -31,15 +35,15 @@ if is_cuda():
 elif is_hip():
     from sgl_kernel import verify_tree_greedy
 
-if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
-
-import logging
 
 logger = logging.getLogger(__name__)
 
 
+# Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
+SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
+
+TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 
 
 @dataclass
@@ -82,31 +86,27 @@ class EagleDraftInput:
         batch: ScheduleBatch,
         speculative_num_steps: int,
     ):
-        assert len(self.verified_id) == len(batch.out_cache_loc)
-        accept_length_cpu = batch.spec_info.accept_length_cpu
-        batch.extend_lens = [x + 1 for x in accept_length_cpu]
+        batch.forward_mode = ForwardMode.DRAFT_EXTEND
+        batch.input_ids = self.verified_id
+        batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
-        seq_lens_cpu = batch.seq_lens.tolist()
+        batch.return_logprob = False
 
-        self.positions = torch.empty_like(self.verified_id, dtype=torch.long)
-        new_verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
+        self.capture_hidden_mode = CaptureHiddenMode.LAST
         self.accept_length.add_(1)
+        self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
+        self.verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
 
-        create_extend_spec_info[(self.accept_length.numel(),)](
-            self.verified_id,
+        create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
+            batch.input_ids,
             batch.seq_lens,
             self.accept_length,
-            torch.cumsum(self.accept_length, axis=0, dtype=torch.int),
             self.positions,
-            new_verified_id,
-            next_power_of_2(speculative_num_steps + 1),
+            self.verified_id,
+            next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
         )
-
-        batch.seq_lens_sum = sum(seq_lens_cpu)
-        batch.input_ids = self.verified_id
-        self.verified_id = new_verified_id
 
     def generate_attn_arg_prefill(
         self,
@@ -123,8 +123,9 @@ class EagleDraftInput:
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
-        # TODO: replace cum_kv_seq_len[-1] with paged_kernel_lens_sum to avoid the device sync.
-        kv_indices = torch.empty(cum_kv_seq_len[-1], dtype=torch.int32, device="cuda")
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
+        )
 
         create_flashinfer_kv_indices_triton[(bs,)](
             req_to_token,
@@ -184,54 +185,13 @@ class EagleVerifyInput:
     retrive_next_token: torch.Tensor
     retrive_next_sibling: torch.Tensor
     retrive_cum_len: torch.Tensor
-    draft_token_num: int
     spec_steps: int
+    topk: int
+    draft_token_num: int
     capture_hidden_mode: CaptureHiddenMode
-
-    @classmethod
-    def create(
-        cls,
-        verified_id: torch.Tensor,
-        score_list: List[torch.Tensor],
-        token_list: List[torch.Tensor],
-        parents_list: List[torch.Tensor],
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        topk: int,
-        spec_steps: int,
-        num_verify_tokens: int,
-    ):
-        (
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            verified_id,
-            score_list,
-            token_list,
-            parents_list,
-            seq_lens,
-            seq_lens_sum,
-            topk,
-            spec_steps,
-            num_verify_tokens,
-        )
-
-        return cls(
-            draft_tokens,
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            None,
-            num_verify_tokens,
-            spec_steps,
-            CaptureHiddenMode.FULL,
-        )
+    seq_lens_sum: int
+    seq_lens_cpu: torch.Tensor
+    grammar: BaseGrammarObject = None
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
         batch.input_ids = self.draft_token
@@ -307,6 +267,7 @@ class EagleVerifyInput:
         logits_output: torch.Tensor,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         page_size: int,
+        vocab_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Verify and find accepted tokens based on logits output and batch
@@ -341,6 +302,13 @@ class EagleVerifyInput:
             sampling_info.apply_logits_bias(linear_penalty)
             logits_output.next_token_logits.add_(
                 torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
+            )
+
+        # Apply grammar mask
+        if vocab_mask is not None:
+            assert self.grammar is not None
+            self.grammar.apply_vocab_mask(
+                logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
 
         # Sample tokens
@@ -440,6 +408,15 @@ class EagleVerifyInput:
                     break
                 else:
                     new_accept_index_.append(idx)
+                    # update grammar state
+                    if req.grammar is not None:
+                        try:
+                            req.grammar.accept_token(id)
+                        except ValueError as e:
+                            logger.info(
+                                f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
+                            )
+                            raise e
             if not req.finished():
                 new_accept_index.extend(new_accept_index_)
                 unfinished_index.append(i)
@@ -544,26 +521,28 @@ class EagleVerifyInput:
 
 
 @triton.jit
-def create_extend_spec_info(
+def create_extend_after_decode_spec_info(
     verified_id,
-    seq_len,
-    accept_len,
-    accept_len_cum,
+    seq_lens,
+    accept_lens,
     positions,
     new_verified_id,
-    accept_len_upper: tl.constexpr,
+    bs_upper: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    offset = 0 if pid == 0 else tl.load(accept_len_cum + pid - 1)
-    seq_length = tl.load(seq_len + pid)
-    accept_length = tl.load(accept_len + pid)
-    positions_ptr = positions + offset
-    data = tl.arange(0, accept_len_upper)
-    mask = data < accept_length
-    tl.store(positions_ptr + data, seq_length - accept_length + data, mask)
+    offsets = tl.arange(0, bs_upper)
+    seq_length = tl.load(seq_lens + pid)
+    accept_length = tl.load(accept_lens + pid)
 
-    offset = tl.load(accept_len_cum + pid) - 1
-    verified_id_data = tl.load(verified_id + offset)
+    accept_len_cumsum = tl.sum(
+        tl.load(accept_lens + offsets, mask=offsets < pid, other=0)
+    )
+    positions_ptr = positions + accept_len_cumsum
+    mask = offsets < accept_length
+    tl.store(positions_ptr + offsets, seq_length - accept_length + offsets, mask)
+
+    accept_len_cumsum += accept_length - 1
+    verified_id_data = tl.load(verified_id + accept_len_cumsum)
     tl.store(new_verified_id + pid, verified_id_data)
 
 
@@ -584,8 +563,8 @@ def assign_req_to_token_pool(
     token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
 
     length_offset = tl.arange(0, bs_upper)
-    start = tl.load(start_offset + length_offset, mask=length_offset < pid)
-    end = tl.load(end_offset + length_offset, mask=length_offset < pid)
+    start = tl.load(start_offset + length_offset, mask=length_offset < pid, other=0)
+    end = tl.load(end_offset + length_offset, mask=length_offset < pid, other=0)
     out_offset = tl.sum(end - start, axis=0)
 
     out_cache_ptr = out_cache_loc + out_offset
@@ -666,7 +645,7 @@ def generate_draft_decode_kv_indices(
     iters += 1
 
     load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(paged_kernel_lens + load_offset, mask=load_offset < bid)
+    seq_lens = tl.load(paged_kernel_lens + load_offset, mask=load_offset < bid, other=0)
     seq_len = tl.load(paged_kernel_lens + bid)
     cum_seq_len = tl.sum(seq_lens)
 
@@ -695,7 +674,7 @@ def generate_draft_decode_kv_indices(
     zid = bid * topk + topk_id
     if zid == 0:
         zid = num_seqs * topk
-    positions = tl.load(positions + bs_offset, mask=bs_offset < zid)
+    positions = tl.load(positions + bs_offset, mask=bs_offset < zid, other=0)
     base = tl.sum(positions)
     tl.store(kv_indptr + zid, base + zid * iters)
 
@@ -713,7 +692,9 @@ def align_evict_mask_to_page_size(
     bid = tl.program_id(axis=0)
     seq_len = tl.load(seq_lens + bid)
     io_mask = t_range < num_draft_tokens
-    mask_row = tl.load(evict_mask + bid * num_draft_tokens + t_range, mask=io_mask)
+    mask_row = tl.load(
+        evict_mask + bid * num_draft_tokens + t_range, mask=io_mask, other=0
+    )
 
     num_trues = tl.sum(mask_row)
     num_false = num_draft_tokens - num_trues
@@ -801,3 +782,113 @@ def _generate_simulated_accept_index(
     accept_length.fill_(simulate_acc_len - 1)
     predict.fill_(100)  # some legit token id
     return sim_accept_index
+
+
+def traverse_tree(
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    grammar: BaseGrammarObject,
+    allocate_token_bitmask: torch.Tensor,
+):
+    """
+    Traverse the tree constructed by the draft model to generate the logits mask.
+    """
+    assert (
+        retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
+    )
+
+    allocate_token_bitmask.fill_(0)
+
+    def dfs(
+        curr: int,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+        parent_pos: int,
+    ):
+        if curr == 0:
+            # the first token generated by the target model, and thus it is always
+            # accepted from the previous iteration
+            accepted = True
+        else:
+            parent_bitmask = allocate_token_bitmask[parent_pos]
+            curr_token_id = draft_tokens[curr]
+            # 32 boolean bitmask values are packed into 32-bit integers
+            accepted = (
+                parent_bitmask[curr_token_id // 32] & (1 << (curr_token_id % 32))
+            ) != 0
+
+        if accepted:
+            if curr != 0:
+                # Accept the current token
+                grammar.accept_token(draft_tokens[curr])
+            if not grammar.is_terminated():
+                # Generate the bitmask for the current token
+                grammar.fill_vocab_mask(allocate_token_bitmask, curr)
+                if retrieve_next_token[curr] != -1:
+                    # Visit the child node
+                    dfs(
+                        retrieve_next_token[curr],
+                        retrieve_next_token,
+                        retrieve_next_sibling,
+                        curr,
+                    )
+
+            if curr != 0:
+                # Rollback the current token
+                grammar.rollback(1)
+
+        if retrieve_next_sibling[curr] != -1:
+            # Visit the sibling node
+            dfs(
+                retrieve_next_sibling[curr],
+                retrieve_next_token,
+                retrieve_next_sibling,
+                parent_pos,
+            )
+
+    dfs(0, retrieve_next_token, retrieve_next_sibling, -1)
+
+
+def generate_token_bitmask(
+    reqs: List[Req],
+    verify_input: EagleVerifyInput,
+    retrieve_next_token_cpu: torch.Tensor,
+    retrieve_next_sibling_cpu: torch.Tensor,
+    draft_tokens_cpu: torch.Tensor,
+    vocab_size: int,
+):
+    """
+    Generate the logit mask for structured output.
+    Draft model's token can be either valid or invalid with respect to the grammar.
+    We need to perform DFS to figure out:
+    1. which tokens are accepted by the grammar
+    2. what is the corresponding logit mask.
+    """
+
+    num_draft_tokens = draft_tokens_cpu.shape[-1]
+
+    allocate_token_bitmask = None
+    assert len(reqs) == retrieve_next_token_cpu.shape[0]
+    grammar = None
+    for i, req in enumerate(reqs):
+        if req.grammar is not None:
+            if allocate_token_bitmask is None:
+                allocate_token_bitmask = req.grammar.allocate_vocab_mask(
+                    vocab_size=vocab_size,
+                    batch_size=draft_tokens_cpu.numel(),
+                    device="cpu",
+                )
+            grammar = req.grammar
+            traverse_tree(
+                retrieve_next_token_cpu[i],
+                retrieve_next_sibling_cpu[i],
+                draft_tokens_cpu[i],
+                req.grammar,
+                allocate_token_bitmask[
+                    i * num_draft_tokens : (i + 1) * num_draft_tokens
+                ],
+            )
+
+    verify_input.grammar = grammar
+    return allocate_token_bitmask
