@@ -27,8 +27,8 @@ limitations under the License.
 #include "cutlass_sm100_mla/kernel/sm100_mla_tile_scheduler.hpp"
 
 // clang-format off
-#if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
-#error "dont be here"
+// #if !defined(CUDA_VERSION) || CUDA_VERSION < 12040
+// #error "dont be here"
 // void cutlass_mla_decode(
 //     torch::Tensor const& out,
 //     torch::Tensor const& q_nope,
@@ -42,7 +42,7 @@ limitations under the License.
 // int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count, int64_t num_kv_splits) {
 //   TORCH_CHECK(false, "CUDA version must be >= 12.4 for cutlass_mla_get_workspace_size");
 // }
-#else
+// #else
 
 #define CUTLASS_CHECK(status)                                                       \
   {                                                                                 \
@@ -267,5 +267,5 @@ int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches,
   return MlaSm100Type::Fmha::get_workspace_size(arguments);
 }
 
-#endif
+// #endif
 // clang-format on
