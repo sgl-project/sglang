@@ -1644,7 +1644,9 @@ async def v1_chat_completions(
                             yield f"data: {chunk.model_dump_json()}\n\n"
 
                         # 2) if we found calls, we output them as separate chunk(s)
+                        tool_index_previous = -1
                         for call_item in calls:
+                            tool_index_current = call_item.tool_index
                             # transform call_item -> FunctionResponse + ToolCall
                             if finish_reason_type == "stop":
                                 latest_delta_len = 0
@@ -1671,7 +1673,7 @@ async def v1_chat_completions(
                             tool_call = ToolCall(
                                 id=(
                                     f"call_{base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b'=').decode()}"
-                                    if tool_call_first
+                                    if tool_index_previous != tool_index_current
                                     else None
                                 ),
                                 index=call_item.tool_index,
@@ -1680,7 +1682,7 @@ async def v1_chat_completions(
                                     arguments=call_item.parameters,
                                 ),
                             )
-                            tool_call_first = False
+                            tool_index_previous = tool_index_current
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=index,
                                 delta=DeltaMessage(tool_calls=[tool_call]),
