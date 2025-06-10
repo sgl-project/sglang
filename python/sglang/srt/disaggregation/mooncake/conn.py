@@ -373,12 +373,12 @@ class MooncakeKVManager(BaseKVManager):
                     self.kv_args.kv_data_ptrs[layer_id],  # Prefill base ptr (all heads)
                     dst_kv_ptrs[
                         layer_id
-                    ],                                    # Decode base ptr (for its slice for this layer)
-                    item_len_of_prefill_rank_page,        # Prefill page size (all heads)2048
-                    item_len_of_decode_rank_page,         # Decode page stride (for its slice page) 1024
-                    src_slice_offset,                     # Offset to slice data in Prefill page
-                    dst_slice_offset,                     # Offset to slice data in Decode page
-                    slice_lens_per_page,                  # Length of slice data per page (actual data to send)
+                    ],  # Decode base ptr (for its slice for this layer)
+                    item_len_of_prefill_rank_page,  # Prefill page size (all heads)2048
+                    item_len_of_decode_rank_page,  # Decode page stride (for its slice page) 1024
+                    src_slice_offset,  # Offset to slice data in Prefill page
+                    dst_slice_offset,  # Offset to slice data in Decode page
+                    slice_lens_per_page,  # Length of slice data per page (actual data to send)
                 )
             )
 
@@ -413,9 +413,15 @@ class MooncakeKVManager(BaseKVManager):
                 # Iterate through each valid token slot within the current page
                 for token_slot_in_page in range(num_slots_in_this_page):
                     # Calculate start address of the current token slot
-                    src_token_slot_start_addr = src_page_start_addr + token_slot_in_page * bytes_per_token_on_prefill
-                    dst_token_slot_start_addr = dst_page_start_addr + token_slot_in_page * bytes_per_token_on_decode
-                    
+                    src_token_slot_start_addr = (
+                        src_page_start_addr
+                        + token_slot_in_page * bytes_per_token_on_prefill
+                    )
+                    dst_token_slot_start_addr = (
+                        dst_page_start_addr
+                        + token_slot_in_page * bytes_per_token_on_decode
+                    )
+
                     # Calculate final source and destination addresses by applying head-slice offsets
                     src_slice_addr = src_token_slot_start_addr + src_offset
                     dst_slice_addr = dst_token_slot_start_addr + dst_offset
@@ -435,7 +441,7 @@ class MooncakeKVManager(BaseKVManager):
                             f"transfer_sync failed with status {status} for session {mooncake_session_id}"
                         )
                         return status
-                    
+
                 tokens_processed += num_slots_in_this_page
 
             return 0
@@ -917,7 +923,11 @@ class MooncakeKVSender(BaseKVSender):
 
         if not is_last:
             self.kv_mgr.add_transfer_request(
-                self.bootstrap_room, kv_indices, index_slice, False, kv_indices_len = kv_indices_len,
+                self.bootstrap_room,
+                kv_indices,
+                index_slice,
+                False,
+                kv_indices_len=kv_indices_len,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -926,7 +936,7 @@ class MooncakeKVSender(BaseKVSender):
                 index_slice,
                 True,
                 aux_index=self.aux_index,
-                kv_indices_len = kv_indices_len,
+                kv_indices_len=kv_indices_len,
             )
 
     def poll(self) -> KVPoll:
@@ -1067,19 +1077,15 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 prefill_tp_size_per_dp_rank // local_tp_size_per_dp_rank
             )
 
-<<<<<<< HEAD
-        self.target_dp_group = self.bootstrap_room % self.prefill_dp_size
-        self.kv_mgr.required_prefill_info_num_map[self.bootstrap_room] = (
-            self.required_prefill_info_num
-        )
-=======
         if self.data_parallel_rank is not None:
             logger.debug(f"Targeting DP rank: {self.data_parallel_rank}")
             self.target_dp_group = self.data_parallel_rank
         else:
             self.target_dp_group = bootstrap_room % self.prefill_dp_size
 
->>>>>>> main
+        self.kv_mgr.required_prefill_info_num_map[self.bootstrap_room] = (
+            self.required_prefill_info_num
+        )
         # NOTE: key distinguished by bootstrap_addr, target_dp_group, and target_tp_rank
         bootstrap_key = (
             f"{self.bootstrap_addr}_{self.target_dp_group}_{self.target_tp_rank}"
