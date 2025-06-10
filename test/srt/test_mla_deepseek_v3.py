@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import requests
 import torch
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_cuda, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -49,6 +49,7 @@ class TestMLADeepseekV3(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
+@unittest.skipIf(not is_cuda(), "AMD currently does not support Eagle.")
 class TestDeepseekV3MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -108,6 +109,7 @@ class TestDeepseekV3MTP(CustomTestCase):
 
 
 # compatible with old APIs
+@unittest.skipIf(not is_cuda(), "AMD currently does not support Eagle.")
 class TestDeepseekV3MTPWithDraft(CustomTestCase):
     @classmethod
     def setUpClass(cls):
