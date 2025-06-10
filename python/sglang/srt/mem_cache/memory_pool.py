@@ -585,7 +585,7 @@ class MLATokenToKVPool(KVCache):
                             dtype=self.store_dtype,
                             device=device,
                         )
-                        self.kv_buffer.append(k)
+                        self.kv_buffer.append(kv)
             else:
                 self.kv_buffer = [
                     torch.zeros(
