@@ -369,6 +369,7 @@ class NixlKVSender(BaseKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int64],
+        kv_indices_len: int,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
