@@ -383,59 +383,58 @@ class ModelOptFp8MoEMethod:
             # set_weight_attrs(w13_input_scale, extra_weight_attrs)
             # set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
-            # ADDITIONAL SCALES for Llama4 checkpoint format
-            # These are per-layer scales (scalar) that match the checkpoint naming
-            # Use PerTensorScaleParameter for consistency with linear method
-            gate_up_proj_weight_scale = PerTensorScaleParameter(
-                data=torch.full(
-                    (
-                        1,
-                    ),  # Single element tensor instead of scalar for PerTensorScaleParameter
-                    torch.finfo(torch.float32).min,
-                    dtype=torch.float32,
-                ),
-                weight_loader=weight_loader,
-            )
-            gate_up_proj_input_scale = PerTensorScaleParameter(
-                data=torch.full(
-                    (
-                        1,
-                    ),  # Single element tensor instead of scalar for PerTensorScaleParameter
-                    torch.finfo(torch.float32).min,
-                    dtype=torch.float32,
-                ),
-                weight_loader=weight_loader,
-            )
-            down_proj_weight_scale = PerTensorScaleParameter(
-                data=torch.full(
-                    (
-                        1,
-                    ),  # Single element tensor instead of scalar for PerTensorScaleParameter
-                    torch.finfo(torch.float32).min,
-                    dtype=torch.float32,
-                ),
-                weight_loader=weight_loader,
-            )
-            down_proj_input_scale = PerTensorScaleParameter(
-                data=torch.full(
-                    (
-                        1,
-                    ),  # Single element tensor instead of scalar for PerTensorScaleParameter
-                    torch.finfo(torch.float32).min,
-                    dtype=torch.float32,
-                ),
-                weight_loader=weight_loader,
-            )
+            # # ADDITIONAL SCALES for Llama4 checkpoint format - not needed
+            # # The issue should be fixed in weight loading logic with proper name mapping
+            # gate_up_proj_weight_scale = PerTensorScaleParameter(
+            #     data=torch.full(
+            #         (
+            #             1,
+            #         ),  # Single element tensor instead of scalar for PerTensorScaleParameter
+            #         torch.finfo(torch.float32).min,
+            #         dtype=torch.float32,
+            #     ),
+            #     weight_loader=weight_loader,
+            # )
+            # gate_up_proj_input_scale = PerTensorScaleParameter(
+            #     data=torch.full(
+            #         (
+            #             1,
+            #         ),  # Single element tensor instead of scalar for PerTensorScaleParameter
+            #         torch.finfo(torch.float32).min,
+            #         dtype=torch.float32,
+            #     ),
+            #     weight_loader=weight_loader,
+            # )
+            # down_proj_weight_scale = PerTensorScaleParameter(
+            #     data=torch.full(
+            #         (
+            #             1,
+            #         ),  # Single element tensor instead of scalar for PerTensorScaleParameter
+            #         torch.finfo(torch.float32).min,
+            #         dtype=torch.float32,
+            #     ),
+            #     weight_loader=weight_loader,
+            # )
+            # down_proj_input_scale = PerTensorScaleParameter(
+            #     data=torch.full(
+            #         (
+            #             1,
+            #         ),  # Single element tensor instead of scalar for PerTensorScaleParameter
+            #         torch.finfo(torch.float32).min,
+            #         dtype=torch.float32,
+            #     ),
+            #     weight_loader=weight_loader,
+            # )
 
-            layer.register_parameter(
-                "gate_up_proj_weight_scale", gate_up_proj_weight_scale
-            )
-            layer.register_parameter(
-                "gate_up_proj_input_scale", gate_up_proj_input_scale
-            )
-            layer.register_parameter("down_proj_weight_scale", down_proj_weight_scale)
-            layer.register_parameter("down_proj_input_scale", down_proj_input_scale)
-            # No need for set_weight_attrs since PerTensorScaleParameter handles weight loading
+            # layer.register_parameter(
+            #     "gate_up_proj_weight_scale", gate_up_proj_weight_scale
+            # )
+            # layer.register_parameter(
+            #     "gate_up_proj_input_scale", gate_up_proj_input_scale
+            # )
+            # layer.register_parameter("down_proj_weight_scale", down_proj_weight_scale)
+            # layer.register_parameter("down_proj_input_scale", down_proj_input_scale)
+            # # No need for set_weight_attrs since PerTensorScaleParameter handles weight loading
         else:
             # For non-serialized checkpoints, will be quantized during loading
             layer.w13_weight_scale = None
@@ -452,54 +451,23 @@ class ModelOptFp8MoEMethod:
         layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
         layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
-        # Handle scale parameters - choose ONE approach consistently
-
-        # Option A: Use Llama4-specific scalar scales (if available)
-        if (
-            hasattr(layer, "gate_up_proj_weight_scale")
-            and layer.gate_up_proj_weight_scale is not None
-        ):
+        # Handle scale parameters - use standard per-expert scales
+        if hasattr(layer, "w13_weight_scale") and layer.w13_weight_scale is not None:
             layer.w13_weight_scale = Parameter(
-                layer.gate_up_proj_weight_scale.data, requires_grad=False
+                layer.w13_weight_scale.data, requires_grad=False
             )
-            layer.w13_input_scale = (
-                Parameter(layer.gate_up_proj_input_scale.data, requires_grad=False)
-                if hasattr(layer, "gate_up_proj_input_scale")
-                else None
+        if hasattr(layer, "w2_weight_scale") and layer.w2_weight_scale is not None:
+            layer.w2_weight_scale = Parameter(
+                layer.w2_weight_scale.data, requires_grad=False
             )
-
-            layer.w2_weight_scale = (
-                Parameter(layer.down_proj_weight_scale.data, requires_grad=False)
-                if hasattr(layer, "down_proj_weight_scale")
-                else None
+        if hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None:
+            layer.w13_input_scale = Parameter(
+                layer.w13_input_scale.data, requires_grad=False
             )
-            layer.w2_input_scale = (
-                Parameter(layer.down_proj_input_scale.data, requires_grad=False)
-                if hasattr(layer, "down_proj_input_scale")
-                else None
+        if hasattr(layer, "w2_input_scale") and layer.w2_input_scale is not None:
+            layer.w2_input_scale = Parameter(
+                layer.w2_input_scale.data, requires_grad=False
             )
-
-        # Option B: Use standard per-expert scales (fallback)
-        else:
-            if (
-                hasattr(layer, "w13_weight_scale")
-                and layer.w13_weight_scale is not None
-            ):
-                layer.w13_weight_scale = Parameter(
-                    layer.w13_weight_scale.data, requires_grad=False
-                )
-            if hasattr(layer, "w2_weight_scale") and layer.w2_weight_scale is not None:
-                layer.w2_weight_scale = Parameter(
-                    layer.w2_weight_scale.data, requires_grad=False
-                )
-            if hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None:
-                layer.w13_input_scale = Parameter(
-                    layer.w13_input_scale.data, requires_grad=False
-                )
-            if hasattr(layer, "w2_input_scale") and layer.w2_input_scale is not None:
-                layer.w2_input_scale = Parameter(
-                    layer.w2_input_scale.data, requires_grad=False
-                )
 
     def apply(
         self,
@@ -535,6 +503,23 @@ class ModelOptFp8MoEMethod:
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
         )
+
+        # Debug scale shapes
+        from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+        if get_tensor_model_parallel_rank() == 0:
+            print(
+                f"DEBUG: w13_weight_scale shape: {layer.w13_weight_scale.shape if layer.w13_weight_scale is not None else None}"
+            )
+            print(
+                f"DEBUG: w2_weight_scale shape: {layer.w2_weight_scale.shape if layer.w2_weight_scale is not None else None}"
+            )
+            print(
+                f"DEBUG: w13_input_scale shape: {layer.w13_input_scale.shape if layer.w13_input_scale is not None else None}"
+            )
+            print(
+                f"DEBUG: w2_input_scale shape: {layer.w2_input_scale.shape if layer.w2_input_scale is not None else None}"
+            )
 
         return fused_experts(
             x,
