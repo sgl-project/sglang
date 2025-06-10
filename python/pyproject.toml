@@ -176,7 +176,7 @@ dev_cpu = ["sglang[all_cpu]", "sglang[test]"]
 
 [tool.setuptools.package-data]
 "sglang" = [
-    "srt/layers/moe/fused_moe_triton/configs/*.json",
+    "srt/layers/moe/fused_moe_triton/configs/*/*.json",
     "srt/layers/quantization/configs/*.json",
 ]
 
