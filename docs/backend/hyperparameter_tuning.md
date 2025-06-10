@@ -27,6 +27,7 @@ If you see `KV cache pool is full. Retract requests.` occasionally but not frequ
 
 ### Tune `--mem-fraction-static` to increase the KV cache pool capacity
 GPU memory capacity = model weights + KV cache pool + activations + CUDA graph buffers
+
 mem_fraction_static = (model weights + KV cache pool) / GPU memory capacity.
 
 We want to increase the KV cache pool capacity to support a larger concurrency, so
