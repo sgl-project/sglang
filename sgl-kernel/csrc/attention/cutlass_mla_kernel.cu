@@ -99,10 +99,10 @@ typename T::Fmha::Arguments args_from_options(
     at::Tensor const& page_table,
     int64_t num_kv_splits) {
   cutlass::KernelHardwareInfo hw_info;
-  hw_info.device_id = q_nope_and_q_pe.device().index();
+  hw_info.device_id = q_nope.device().index();
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
-  int batches = q_nope_and_q_pe.sizes()[0];
+  int batches = q_nope.sizes()[0];
   int page_count_per_seq = page_table.sizes()[1];
   int page_count_total = kv_c_and_k_pe_cache.sizes()[0];
   int page_size = kv_c_and_k_pe_cache.sizes()[1];
@@ -135,8 +135,10 @@ typename T::Fmha::Arguments args_from_options(
   using Element = typename T::Element;
   using ElementOut = typename T::ElementOut;
   using ElementAcc = typename T::ElementAcc;
-  auto Q_ptr = static_cast<Element*>(q_nope_and_q_pe.data_ptr());
-  auto C_ptr = static_cast<Element*>(kv_c_and_k_pe_cache.data_ptr());
+  auto Q_nope_ptr = static_cast<Element*>(q_nope.data_ptr());
+  auto Q_pe_ptr = static_cast<Element*>(q_pe.data_ptr());
+  auto K_nope_ptr = static_cast<Element*>(k_nope.data_ptr());
+  auto K_pe_ptr = static_cast<Element*>(k_pe.data_ptr());
   typename T::Fmha::Arguments arguments{
       problem_shape,
       {scale,
