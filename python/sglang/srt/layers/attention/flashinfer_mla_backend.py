@@ -920,19 +920,18 @@ def fast_mla_decode_plan(
     self._page_size = page_size
     self._sm_scale = sm_scale
 
-    with self.device as device:
-        try:
-            # Standard version with just the required arguments (no use_profiler)
-            self._cached_module.plan.default(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                qo_indptr_cpu,
-                kv_indptr_cpu,
-                kv_len_arr_cpu,
-                num_heads,
-                head_dim_ckv,
-                causal,
-            )
-        except Exception as e:
-            raise RuntimeError(f"Error in alternate MLA plan: {e}")
+    try:
+        # Standard version with just the required arguments (no use_profiler)
+        self._cached_module.plan.default(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._pin_memory_int_workspace_buffer,
+            qo_indptr_cpu,
+            kv_indptr_cpu,
+            kv_len_arr_cpu,
+            num_heads,
+            head_dim_ckv,
+            causal,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Error in alternate MLA plan: {e}")
