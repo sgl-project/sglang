@@ -73,10 +73,9 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
 	if residual is not None:
-	    res1, res2, res3 = torch_npu.npu_add_rms_norm(residual, x, self.weight.data, self.variance_epsilon)
-	    return res1, res3
-	res = torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
-	return res
+	    out, _, residual_out = torch_npu.npu_add_rms_norm(residual, x, self.weight.data, self.variance_epsilon)
+	    return out, residual_out
+	return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
 
     def forward_aiter(
         self,
