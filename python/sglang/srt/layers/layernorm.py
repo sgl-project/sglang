@@ -20,10 +20,11 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
@@ -65,6 +66,17 @@ class RMSNorm(CustomOp):
             return x, residual
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         return out
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+	if residual is not None:
+	    res1, res2, res3 = torch_npu.npu_add_rms_norm(residual, x, self.weight.data, self.variance_epsilon)
+	    return res1, res3
+	res = torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
+	return res
 
     def forward_aiter(
         self,

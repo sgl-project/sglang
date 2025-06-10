@@ -50,6 +50,10 @@ class SiluAndMul(CustomOp):
         silu_and_mul(x, out)
         return out
 
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        import torch_npu
+	out = torch_npu.npu_swiglu(x)
+	return out
 
 class GeluAndMul(CustomOp):
     def __init__(self, approximate="tanh"):
