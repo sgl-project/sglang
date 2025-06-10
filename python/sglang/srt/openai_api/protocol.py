@@ -16,7 +16,7 @@
 import time
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field, root_validator
+from pydantic import BaseModel, Field, model_validator, root_validator
 from typing_extensions import Literal
 
 
@@ -404,6 +404,16 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
+
+    @model_validator(mode="after")
+    def validate(self):
+        # messages
+        if not self.messages:
+            raise ValueError("messages cannot be empty")
+        if self.messages[-1].role == "assistant" and len(self.messages) == 1:
+            # for https://github.com/sgl-project/sglang/issues/3579
+            raise ValueError("cannot just include messages that assistant roles")
+        return self
 
 
 class ChatMessage(BaseModel):
