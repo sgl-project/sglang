@@ -30,7 +30,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci_install_dependency.sh
-          pip install "vllm==0.8.4"
+          pip install "vllm==0.9.0.1"
           pip install "bitsandbytes>=0.44.0"
 
       - name: Run VLLM dependency tests
