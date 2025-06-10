@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.6.post5"
+version = "0.4.7"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -128,7 +128,7 @@ dev_cpu = ["sglang[all_cpu]", "sglang[test]"]
 
 [tool.setuptools.package-data]
 "sglang" = [
-    "srt/layers/moe/fused_moe_triton/configs/*.json",
+    "srt/layers/moe/fused_moe_triton/configs/*/*.json",
     "srt/layers/quantization/configs/*.json",
 ]
 
