@@ -153,6 +153,7 @@ typename T::Fmha::Arguments args_from_options(
       << " stride_Q_nope=" << stride_Q_nope
       << " stride_Q_pe=" << stride_Q_pe
       << " stride_C=" << stride_C
+      << " H=" << H
       << std::endl;
   typename T::Fmha::Arguments arguments{
       problem_shape,
