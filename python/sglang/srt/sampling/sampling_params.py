@@ -31,6 +31,7 @@ class SamplingParams:
     def __init__(
         self,
         max_new_tokens: int = 128,
+        thinking_budget: Optional[int] = None,
         stop: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
         temperature: float = 1.0,
@@ -59,6 +60,7 @@ class SamplingParams:
             self.stop_token_ids = set(stop_token_ids)
         else:
             self.stop_token_ids = None
+        self.thinking_budget = thinking_budget
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k

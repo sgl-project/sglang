@@ -1158,10 +1158,16 @@ def v1_chat_generate_request(
         lora_paths.append(request.lora_path)
         prompts.append(prompt)
 
+        thinking_budget = request.thinking_budget
+        enable_thinking = _get_enable_thinking_from_request(request)
+        if not enable_thinking:
+            thinking_budget = None
+
         sampling_params = {
             "temperature": request.temperature,
             "max_new_tokens": request.max_tokens or request.max_completion_tokens,
             "min_new_tokens": request.min_tokens,
+            "thinking_budget": thinking_budget,
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
             "top_p": request.top_p,
