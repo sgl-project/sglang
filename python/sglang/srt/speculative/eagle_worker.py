@@ -972,6 +972,22 @@ class EAGLEWorker(TpModelWorker):
 
         self.set_mab_strategy(self.default_mab_strategy)
 
+    def enable_mab_plotting(self, enable: bool = True):
+        """Enable or disable real-time MAB plotting."""
+        if self.use_mab:
+            self.mab_manager.enable_plotting(enable)
+    
+    def save_mab_plot(self, filename: str):
+        """Save MAB strategy history plot."""
+        if self.use_mab:
+            self.mab_manager.save_history_plot(filename)
+    
+    def get_mab_stats(self) -> Dict[str, Dict[str, float]]:
+        """Get MAB strategy statistics."""
+        if self.use_mab:
+            return self.mab_manager.get_strategy_stats()
+        return {}
+
 
 def load_token_map(token_map_path: str) -> List[int]:
     if not os.path.exists(token_map_path):
