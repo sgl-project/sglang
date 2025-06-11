@@ -14,6 +14,9 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 
+if _is_npu:
+    import torch_npu
+
 if _is_cuda:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
 
@@ -156,7 +159,6 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
-        import torch_npu
         default_rotary_mode = 'half'
         if self.is_neox_style:
             default_rotary_mode = 'half'

@@ -71,6 +71,9 @@ class CustomOp(nn.Module):
     def forward_cpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
+    def forward_npu(self, *args, **kwargs):
+        raise NotImplementedError
+
     def dispatch_forward(self):
         if _is_cuda:
             return self.forward_cuda
