@@ -63,7 +63,7 @@ class TransferKVChunk:
     index_slice: slice
     is_last: bool
     prefill_aux_index: Optional[int]
-    
+
 
 # decode
 @dataclasses.dataclass
