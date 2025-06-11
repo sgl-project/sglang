@@ -2126,21 +2126,6 @@ class Scheduler(
         tags = recv_req.tags
         import subprocess
 
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=memory.used",
-                "--format=csv,noheader,nounits",
-                f"--id={0}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        logger.info(
-            f"release_memory_occupation: before released weights: {result.stdout}"
-        )
-
         if tags is None:
             # for backward compatibility, default to release both weights and kv cache
             tags = ["weights", "kv_cache"]
@@ -2149,47 +2134,13 @@ class Scheduler(
         if "kv_cache" in tags:
             self.memory_saver_adapter.pause("kv_cache")
             self.flush_cache()
-            torch.cuda.synchronize()
-            time.sleep(3)
-        torch.distributed.barrier(self.tp_cpu_group)
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=memory.used",
-                "--format=csv,noheader,nounits",
-                f"--id={0}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        logger.info(
-            f"release_memory_occupation: after released kv_cache: {result.stdout}"
-        )
 
         if "weights" in tags:
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.worker.model_runner.model
             )
             self.memory_saver_adapter.pause("weights")
-            torch.cuda.synchronize()
-            time.sleep(3)
-        torch.distributed.barrier(self.tp_cpu_group)
-        # run nvidia-smi to check memory usage
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=memory.used",
-                "--format=csv,noheader,nounits",
-                f"--id={0}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        logger.info(
-            f"release_memory_occupation: after released weights: {result.stdout}"
-        )
+
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
@@ -2197,24 +2148,6 @@ class Scheduler(
         if tags is None or len(tags) == 0:
             tags = ["weights", "kv_cache"]
 
-        import subprocess
-
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=memory.used",
-                "--format=csv,noheader,nounits",
-                f"--id={0}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        logger.info(
-            f"resume_memory_occupation: before resumed weights: {result.stdout}"
-        )
-
-        # LIFO order: resume weights first (reverse of pause order)
         if "weights" in tags:
             self.memory_saver_adapter.resume("weights")
             _import_static_state(
@@ -2222,41 +2155,12 @@ class Scheduler(
                 self.stashed_model_static_state,
             )
             del self.stashed_model_static_state
-            torch.cuda.synchronize()
-            time.sleep(3)
-        torch.distributed.barrier(self.tp_cpu_group)
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=memory.used",
-                "--format=csv,noheader,nounits",
-                f"--id={0}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        logger.info(f"resume_memory_occupation: after resumed weights: {result.stdout}")
 
         if "kv_cache" in tags:
             self.memory_saver_adapter.resume("kv_cache")
             torch.cuda.synchronize()
             time.sleep(3)
 
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=memory.used",
-                "--format=csv,noheader,nounits",
-                f"--id={0}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        logger.info(
-            f"resume_memory_occupation: after resumed kv_cache: {result.stdout}"
-        )
         torch.distributed.barrier(self.tp_cpu_group)
         return ResumeMemoryOccupationReqOutput()
 
