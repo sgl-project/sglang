@@ -537,11 +537,11 @@ class TokenizedGenerateReqInput:
     tensor_transport_mode: TensorTransportMode = "auto"
 
     def __getstate__(self):
-        current_device_index = torch.cuda.current_device()
-        print(f"{current_device_index=} getstate")
+        """
+        Called before serializing
+        """
         state = dict(self.__dict__)
         global global_effective_mode
-
         if global_effective_mode is None:
             if (
                 "mm_inputs" in state
@@ -556,34 +556,19 @@ class TokenizedGenerateReqInput:
 
         if global_effective_mode is not None:
             original_mm_inputs = state["mm_inputs"]
-
-            # 2. 手动创建 mm_inputs 及其内容的浅拷贝，以避免修改原始对象
-            # 2.1. 浅拷贝最外层的 MultimodalInputs 容器
+            # shallow-copy
             new_mm_inputs = copy.copy(original_mm_inputs)
-
-            # 2.2. 为 mm_items 创建一个新的列表
             new_mm_items = []
-
-            # 2.3. 遍历原始 item，为每个 item 创建浅拷贝，然后在新拷贝上进行修改
             for original_item in original_mm_inputs["mm_items"]:
-                # 浅拷贝 MultimodalDataItem 对象
                 new_item = copy.copy(original_item)
-
-                # 现在可以安全地在新拷贝上进行修改，而不会影响原始的 item
                 if not isinstance(new_item.feature, TransportableTensor):
+                    # modify in-place
                     new_item.feature = TransportableTensor(
                         transport_mode=global_effective_mode, feature=new_item.feature
                     )
-                    new_item.feature.serialize()
-
                 new_mm_items.append(new_item)
-
-            # 2.4. 将新的 item 列表赋值给新的容器
             new_mm_inputs["mm_items"] = new_mm_items
-
-            # 3. 最后，将 state 字典中的引用指向我们新创建的、已修改的容器
             state["mm_inputs"] = new_mm_inputs
-
         return state
 
     def __setstate__(self, state):
@@ -602,10 +587,10 @@ class TokenizedGenerateReqInput:
 
             for mm_item in mm_inputs["mm_items"]:
                 current_device_index = torch.cuda.current_device()
-                print(f"{current_device_index=} {mm_item=}")
+                # print(f"{current_device_index=} {mm_item=}")
                 assert isinstance(mm_item.feature, TransportableTensor)
                 mm_item.feature = mm_item.feature.deserialize()
-                print(f"after {current_device_index=}  {mm_item=}")
+                # print(f"after {current_device_index=}  {mm_item=}")
                 assert isinstance(mm_item.feature, torch.Tensor)
             # print(f"after {state=}")
 
@@ -613,14 +598,6 @@ class TokenizedGenerateReqInput:
             print(f"mm_inputs not presented, returning")
 
         self.__dict__.update(state)
-
-    def _contains_cuda_feature(self) -> bool:
-        if not self.mm_inputs:
-            return False
-        for v in self.mm_inputs["mm_items"]:
-            if isinstance(v.feature, torch.Tensor) and v.feature.is_cuda:
-                return True
-        return False
 
     def _contains_feature(self) -> bool:
         if not self.mm_inputs:
@@ -638,14 +615,11 @@ class TokenizedGenerateReqInput:
             and self.bootstrap_host not in ["localhost", "127.0.0.1"]
         )
 
-        if self._contains_cuda_feature():
-            if is_remote_bootstrap:
-                # Fallback to default CPU transport for multi-node
-                return "default"
-            else:
-                return "cuda_ipc"
-
-        return "default"
+        if is_remote_bootstrap:
+            # Fallback to default CPU transport for multi-node
+            return "default"
+        else:
+            return "cuda_ipc"
 
 
 @dataclass

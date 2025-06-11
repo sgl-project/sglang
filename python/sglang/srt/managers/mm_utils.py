@@ -28,23 +28,35 @@ from sglang.utils import info_once, logger
 # in the console when multimodal support is enabled.
 
 # TODO(mick): nccl
-# cuda_ipc: for intranode scenarios
+# cuda_ipc: for intranode tensor sharing
+# default: default tensor transport (e.g., pickle)
 TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
 
 
 @dataclasses.dataclass
 class TransportableTensor:
+    """
+    A wrapper for torch.Tensor to facilitate efficient inter-process communication.
+
+    When serialized with `cuda_ipc`, it stores the CUDA IPC handle and metadata,
+    allowing the tensor to be reconstructed in another process without copying the
+    underlying data.
+
+    Attributes:
+        transport_mode: The method to use for transport (e.g., "cuda_ipc").
+        feature: The torch.Tensor to be transported. Becomes None after serialization
+                 if using `cuda_ipc`.
+        extra: A dictionary to store metadata required for deserialization,
+               such as the tensor's shape, dtype, and IPC handle.
+    """
     transport_mode: TensorTransportMode
     feature: torch.tensor
     extra: Dict[str, Any] = None
 
     def __post_init__(self):
-        print("TransportableTensor init")
-        # self.serialize()
+        self.serialize()
 
     def serialize(self):
-        current_device_index = torch.cuda.current_device()
-        print(f"{current_device_index=} serialize")
         if isinstance(self.feature, torch.Tensor) and self.feature.is_cuda:
             if self.transport_mode == "cuda_ipc":
                 try:
@@ -57,6 +69,7 @@ class TransportableTensor:
                         "stride": self.feature.stride(),
                         "index": self.feature.device.index,
                     }
+                    # make sure to empty to prevent tensor from pickling
                     self.feature = None
                 except Exception as e:
                     if isinstance(
@@ -87,14 +100,8 @@ class TransportableTensor:
                     )
                     self.feature = self.feature.cuda()
                     self.transport_mode = "default"
-                # logger.error(
-                #     f"Failed to get CUDA IPC handle for tensor: {e}. Falling back to copy.",
-                #     exc_info=True,
-                # )
 
     def deserialize(self) -> torch.Tensor:
-        current_device_index = torch.cuda.current_device()
-        print(f"{current_device_index=} deserialize")
         if self.transport_mode == "cuda_ipc":
             handle, shape, dtype, stride, source_device_index = (
                 self.extra["handle"],
@@ -128,13 +135,11 @@ class TransportableTensor:
                     )
                     expected_numel = torch.Size(shape).numel()
                     if tensor.numel() != expected_numel:
-                        raise Exception("tensor.numel() != expected_numel")
                         # Potentially raise error or return None depending on strictness needed
                         return self.feature
                     info_once("succeed")
 
                     return tensor
-                raise Exception("")
             except Exception as e:
                 logger.error(
                     f"Failed to deserialize CUDA IPC tensor: {e}", exc_info=True
