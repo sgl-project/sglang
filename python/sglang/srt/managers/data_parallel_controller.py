@@ -263,7 +263,7 @@ class DataParallelController:
                 self.workers[req.data_parallel_rank].send_pyobj(req)
             else:
                 if get_bool_env_var("SGLANG_HACK_DP_CONTROLLER_RANDOM_WORKER_INDEX"):
-                    worker_index = random.randint(1000000000) % len(self.workers)
+                    worker_index = random.randint(0, 1000000000) % len(self.workers)
                     print(f'hi hack SGLANG_HACK_DP_CONTROLLER_RANDOM_WORKER_INDEX thus {worker_index=}')
                 else:
                     worker_index = req.bootstrap_room % len(self.workers)
