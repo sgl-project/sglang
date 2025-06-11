@@ -40,7 +40,7 @@ RUN dpkg -i gdrcopy_*.deb
 ENV GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
 
 # IBGDA dependency
-RUN ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
+RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
 RUN apt-get install -y libfabric-dev
 
 # DeepEP
