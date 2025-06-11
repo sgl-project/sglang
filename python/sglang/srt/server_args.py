@@ -280,16 +280,19 @@ class ServerArgs:
                     reserved_mem = (9.5 + parallel_size / 2) * 1024
                 elif gpu_mem < 100 * 1024:
                     # H20. (chunked_prefill_size 8k, cuda_graph_max_bs 256)
-                    reserved_mem = (14 + parallel_size / 2) * 1024
+                    reserved_mem = (12 + parallel_size / 2) * 1024
                 elif gpu_mem < 160 * 1024:
                     # H200. (chunked_prefill_size 8k, cuda_graph_max_bs 256)
-                    reserved_mem = (14 + parallel_size / 2) * 1024
+                    reserved_mem = (12 + parallel_size / 2) * 1024
                 else:
                     # B200, MI300. (chunked_prefill_size 16k, cuda_graph_max_bs 512)
                     reserved_mem = 32 * 1024
 
                 if self.speculative_algorithm is not None:
                     # draft model and larger cuda graph buffers
+                    reserved_mem += 2 * 1024
+
+                if self.enable_dp_attention:
                     reserved_mem += 2 * 1024
 
                 self.mem_fraction_static = round((gpu_mem - reserved_mem) / gpu_mem, 3)
