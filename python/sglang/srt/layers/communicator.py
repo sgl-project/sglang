@@ -454,13 +454,6 @@ class CommunicateSummableTensorPairFn:
         ):
             return CommunicateSummableTensorPairFn._scatter
 
-        if (
-            (hidden_states_input_mode == ScatterMode.FULL)
-            and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
-            and (output_mode == ScatterMode.FULL)
-        ):
-            return CommunicateSummableTensorPairFn._scatter_hidden_states
-
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
         )
