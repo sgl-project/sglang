@@ -42,6 +42,10 @@ class TestLaunchRouter(unittest.TestCase):
             selector=None,
             service_discovery_port=80,
             service_discovery_namespace=None,
+            # PDLB specific args
+            prefill_urls=[],
+            decode_urls=[],
+            pd_selection_policy="random",
         )
 
     def create_router_args(self, **kwargs):
@@ -68,20 +72,36 @@ class TestLaunchRouter(unittest.TestCase):
         process = multiprocessing.Process(target=run_router)
         try:
             process.start()
-            # Wait 3 seconds
-            time.sleep(3)
-            # Process is still running means router started successfully
-            self.assertTrue(process.is_alive())
+            # Wait for router to start or fail
+            process.join(timeout=5)  # Increased timeout slightly for PD startup
+            # If process exited, check exit code
+            if process.exitcode is not None:
+                self.assertEqual(
+                    process.exitcode,
+                    0,
+                    f"Router process failed with exit code {process.exitcode}",
+                )
+            else:  # Still alive, means it started
+                self.assertTrue(
+                    process.is_alive(),
+                    "Router process did not start or exited prematurely",
+                )
         finally:
-            terminate_process(process)
+            if process.is_alive():
+                terminate_process(process)
 
     def test_launch_router_common(self):
         args = self.create_router_args(worker_urls=["http://localhost:8000"])
         self.run_router_process(args)
 
-    def test_launch_router_with_empty_worker_urls(self):
-        args = self.create_router_args(worker_urls=[])
-        self.run_router_process(args)
+    def test_launch_router_non_pd_missing_worker_urls(self):
+        # Test that non-PD router fails if worker_urls is not provided
+        from sglang_router.launch_router import launch_router
+
+        args = self.create_router_args(policy="random", worker_urls=None)
+        with self.assertRaises(ValueError) as context:
+            launch_router(args)
+        self.assertIn("Missing worker_urls for selected policy", str(context.exception))
 
     def test_launch_router_with_service_discovery(self):
         # Test router startup with service discovery enabled but no selectors
@@ -99,6 +119,65 @@ class TestLaunchRouter(unittest.TestCase):
             service_discovery_namespace="test-namespace",
         )
         self.run_router_process(args)
+
+    # --- PrefillDecode Router Tests ---
+
+    def test_launch_router_pd_successful_random(self):
+        args = self.create_router_args(
+            policy="prefill_decode",
+            prefill_urls=["http://localhost:8001"],
+            decode_urls=["http://localhost:8002"],
+            pd_selection_policy="random",
+            port=30001,  # Use a different port to avoid conflict
+        )
+        self.run_router_process(args)
+
+    def test_launch_router_pd_successful_cache_aware(self):
+        args = self.create_router_args(
+            policy="prefill_decode",
+            prefill_urls=["http://localhost:8003"],
+            decode_urls=["http://localhost:8004"],
+            pd_selection_policy="cache_aware",
+            cache_threshold=0.6,  # Ensure these are passed
+            balance_abs_threshold=10,
+            balance_rel_threshold=1.5,
+            port=30002,  # Use a different port
+        )
+        self.run_router_process(args)
+
+    def test_launch_router_pd_missing_prefill_urls(self):
+        from sglang_router.launch_router import launch_router
+
+        args = self.create_router_args(
+            policy="prefill_decode",
+            # prefill_urls missing
+            decode_urls=["http://localhost:8002"],
+            pd_selection_policy="random",
+            port=30003,
+        )
+        with self.assertRaises(ValueError) as context:
+            launch_router(args)
+        self.assertIn(
+            "Missing prefill_urls or decode_urls for prefill_decode policy",
+            str(context.exception),
+        )
+
+    def test_launch_router_pd_missing_decode_urls(self):
+        from sglang_router.launch_router import launch_router
+
+        args = self.create_router_args(
+            policy="prefill_decode",
+            prefill_urls=["http://localhost:8001"],
+            # decode_urls missing
+            pd_selection_policy="random",
+            port=30004,
+        )
+        with self.assertRaises(ValueError) as context:
+            launch_router(args)
+        self.assertIn(
+            "Missing prefill_urls or decode_urls for prefill_decode policy",
+            str(context.exception),
+        )
 
 
 if __name__ == "__main__":

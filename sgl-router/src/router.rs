@@ -500,11 +500,10 @@ impl Router {
         }
     }
 
-    // TODO: return Result<String, String> instead of panicking
-    fn select_generate_worker(&self, body: &Bytes, route: &str) -> String {
+    fn select_generate_worker(&self, body: &Bytes, route: &str) -> Result<String, String> {
         let text = self.get_text_from_request(&body, route);
 
-        let worker_url = match self {
+        let worker_url_result = match self {
             Router::RoundRobin {
                 worker_urls,
                 current_index,
@@ -517,12 +516,12 @@ impl Router {
                         |x| Some((x + 1) % worker_urls.read().unwrap().len()),
                     )
                     .unwrap();
-                worker_urls.read().unwrap()[idx].clone()
+                Ok(worker_urls.read().unwrap()[idx].clone())
             }
 
-            Router::Random { worker_urls, .. } => worker_urls.read().unwrap()
+            Router::Random { worker_urls, .. } => Ok(worker_urls.read().unwrap()
                 [rand::random::<usize>() % worker_urls.read().unwrap().len()]
-            .clone(),
+            .clone()),
 
             Router::CacheAware {
                 worker_urls,
@@ -598,7 +597,7 @@ impl Router {
 
                 tree.insert(&text, &selected_url);
 
-                selected_url
+                Ok(selected_url)
             }
             Router::PrefillDecode {
                 decode_workers,
@@ -609,23 +608,23 @@ impl Router {
                 // For Phase 1B: simple worker selection respecting PD policy.
                 let d_workers = decode_workers.read().unwrap();
                 if d_workers.is_empty() {
-                    panic!("No decode workers available");
+                    return Err("No decode workers available".to_string());
                 }
 
                 match selection_policy {
                     PDSelectionPolicy::Random | PDSelectionPolicy::PowerOfTwo => {
                         let idx = rand::random::<usize>() % d_workers.len();
-                        d_workers[idx].url.clone()
+                        Ok(d_workers[idx].url.clone())
                     }
                     PDSelectionPolicy::CacheAware { .. } => {
                         // Simple fallback to first for now; detailed cache aware logic in Phase 3
-                        d_workers[0].url.clone()
+                        Ok(d_workers[0].url.clone())
                     }
                 }
             }
         };
 
-        worker_url
+        worker_url_result
     }
 
     async fn send_generate_request(
@@ -724,7 +723,13 @@ impl Router {
         let mut total_retries = 0;
 
         while total_retries < MAX_TOTAL_RETRIES {
-            let worker_url = self.select_generate_worker(body, route);
+            let worker_url = match self.select_generate_worker(body, route) {
+                Ok(url) => url,
+                Err(e) => {
+                    error!("Failed to select worker in route_generate_request: {}", e);
+                    return HttpResponse::InternalServerError().body(format!("Failed to select worker: {}", e));
+                }
+            };
             let mut request_retries = 0;
 
             // Try the same worker multiple times
@@ -764,7 +769,7 @@ impl Router {
                 total_retries += 1;
 
                 if request_retries == MAX_REQUEST_RETRIES {
-                    warn!("Removing failed worker: {}", worker_url);
+                    warn!("Max retries for worker {} reached. Attempting to remove.", worker_url);
                     self.remove_worker(&worker_url);
                     break;
                 }
@@ -904,13 +909,15 @@ impl Router {
                     urls.remove(index);
                     info!("Removed worker: {}", worker_url);
                     gauge!("sgl_router_active_workers").set(urls.len() as f64);
+                    // Successfully removed
                 } else {
                     warn!("Worker {} not found, skipping removal", worker_url);
                     return;
                 }
             }
             Router::PrefillDecode { .. } => {
-                warn!("remove_worker not implemented for PrefillDecode variant");
+                warn!("remove_worker not supported for PrefillDecode variant");
+                return;
             }
         }
 
@@ -937,4 +944,140 @@ impl Router {
             );
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pd_types::{EngineInfo, EngineType, PDSelectionPolicy};
+    use bytes::Bytes;
+
+    // Helper to create PrefillDecodeConfig
+    fn create_pd_config(
+        prefill_urls: Vec<&str>,
+        decode_urls: Vec<&str>,
+        policy: PDSelectionPolicy,
+    ) -> PolicyConfig {
+        PolicyConfig::PrefillDecodeConfig {
+            prefill_workers: prefill_urls
+                .into_iter()
+                .map(|url| EngineInfo {
+                    engine_type: EngineType::Sglang, // Default for testing
+                    url: url.to_string(),
+                    bootstrap_port: None, // Default for testing
+                })
+                .collect(),
+            decode_workers: decode_urls
+                .into_iter()
+                .map(|url| EngineInfo {
+                    engine_type: EngineType::Sglang, // Default for testing
+                    url: url.to_string(),
+                    bootstrap_port: None, // Default for testing
+                })
+                .collect(),
+            selection_policy: policy,
+            timeout_secs: 5,
+            interval_secs: 1,
+        }
+    }
+
+    #[test]
+    fn test_router_new_pd_random_policy() {
+        let config = create_pd_config(vec!["http://p1"], vec!["http://d1"], PDSelectionPolicy::Random);
+        let router = Router::new(vec![], config).unwrap(); // worker_urls is empty for PD
+        match router {
+            Router::PrefillDecode { prefill_workers, decode_workers, selection_policy, prefill_tree, .. } => {
+                assert_eq!(prefill_workers.read().unwrap().len(), 1);
+                assert_eq!(prefill_workers.read().unwrap()[0].url, "http://p1");
+                assert_eq!(decode_workers.read().unwrap().len(), 1);
+                assert_eq!(decode_workers.read().unwrap()[0].url, "http://d1");
+                assert!(matches!(selection_policy, PDSelectionPolicy::Random));
+                assert!(prefill_tree.is_none(), "Prefill tree should be None for Random policy");
+            }
+            _ => panic!("Expected PrefillDecode router variant"),
+        }
+    }
+
+    #[test]
+    fn test_router_new_pd_cache_aware_policy() {
+        let config = create_pd_config(vec!["http://p1"], vec!["http://d1"], PDSelectionPolicy::CacheAware {cache_threshold: 0.5, balance_abs_threshold: 32, balance_rel_threshold: 1.0});
+        let router = Router::new(vec![], config).unwrap();
+        match router {
+            Router::PrefillDecode { selection_policy, prefill_tree, .. } => {
+                assert!(matches!(selection_policy, PDSelectionPolicy::CacheAware{..}));
+                assert!(prefill_tree.is_some(), "Prefill tree should be Some for CacheAware policy");
+            }
+            _ => panic!("Expected PrefillDecode router variant"),
+        }
+    }
+
+    #[test]
+    fn test_get_worker_urls_pd() {
+        let config = create_pd_config(vec!["http://p1", "http://p2"], vec!["http://d1"], PDSelectionPolicy::Random);
+        let router = Router::new(vec![], config).unwrap();
+        let urls = router.get_worker_urls(); // This should give combined prefill+decode for health checks
+        let locked_urls = urls.read().unwrap();
+        assert_eq!(locked_urls.len(), 3);
+        assert!(locked_urls.contains(&"http://p1".to_string()));
+        assert!(locked_urls.contains(&"http://p2".to_string()));
+        assert!(locked_urls.contains(&"http://d1".to_string()));
+    }
+
+    #[test]
+    fn test_select_first_worker_pd() {
+        let config = create_pd_config(vec!["http://p1"], vec!["http://d1", "http://d2"], PDSelectionPolicy::Random);
+        let router = Router::new(vec![], config).unwrap();
+        assert_eq!(router.select_first_worker().unwrap(), "http://d1", "Should select the first decode worker");
+    }
+
+    #[test]
+    fn test_select_first_worker_pd_no_decode_workers() {
+        let config = create_pd_config(vec!["http://p1"], vec![], PDSelectionPolicy::Random);
+        let router = Router::new(vec![], config).unwrap();
+        assert!(router.select_first_worker().is_err(), "Should err if no decode workers");
+    }
+
+    #[test]
+    fn test_select_generate_worker_pd_random() {
+        let config = create_pd_config(vec!["http://p1"], vec!["http://d1", "http://d2"], PDSelectionPolicy::Random);
+        let router = Router::new(vec![], config).unwrap();
+        let body = Bytes::new(); // Body content doesn't affect random selection
+        let selected = router.select_generate_worker(&body, "/generate").unwrap();
+        assert!(selected == "http://d1" || selected == "http://d2", "Should select from decode workers");
+    }
+
+    #[test]
+    fn test_select_generate_worker_pd_poweroftwo() {
+        // For Phase 1B, PowerOfTwo behaves like Random
+        let config = create_pd_config(vec!["http://p1"], vec!["http://d1", "http://d2"], PDSelectionPolicy::PowerOfTwo);
+        let router = Router::new(vec![], config).unwrap();
+        let body = Bytes::new();
+        let selected = router.select_generate_worker(&body, "/generate").unwrap();
+        assert!(selected == "http://d1" || selected == "http://d2", "PowerOfTwo should select from decode workers");
+    }
+
+    #[test]
+    fn test_select_generate_worker_pd_cache_aware_fallback() {
+        let config = create_pd_config(vec!["http://p1"], vec!["http://d1", "http://d2"], PDSelectionPolicy::CacheAware{cache_threshold: 0.5, balance_abs_threshold: 32, balance_rel_threshold: 1.0});
+        let router = Router::new(vec![], config).unwrap();
+        let body = Bytes::new();
+        // Phase 1B falls back to first decode worker for CacheAware
+        assert_eq!(router.select_generate_worker(&body, "/generate").unwrap(), "http://d1", "CacheAware should fallback to first decode worker in Phase 1B");
+    }
+
+    #[test]
+    fn test_select_generate_worker_pd_no_decode_workers() {
+        let config = create_pd_config(vec!["http://p1"], vec![], PDSelectionPolicy::Random);
+        let router = Router::new(vec![], config).unwrap();
+        let body = Bytes::new();
+        assert!(router.select_generate_worker(&body, "/generate").is_err(), "Should err if no decode workers for generate");
+    }
+
+    #[tokio::test]
+    async fn test_add_worker_pd_is_error() {
+        let config = create_pd_config(vec!["http://p1"], vec!["http://d1"], PDSelectionPolicy::Random);
+        let router = Router::new(vec![], config).unwrap();
+        assert!(router.add_worker("http://new_worker").await.is_err(), "add_worker should be unsupported for PD");
+    }
+
 }
