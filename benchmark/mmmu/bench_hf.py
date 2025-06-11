@@ -2,6 +2,9 @@ import argparse
 
 import PIL
 import torch
+from tqdm import tqdm
+from transformers import AutoModel, AutoProcessor, GenerationConfig
+
 from data_utils import save_json
 from eval_utils import (
     EvalArgs,
@@ -10,8 +13,6 @@ from eval_utils import (
     prepare_samples,
     process_result,
 )
-from tqdm import tqdm
-from transformers import AutoModel, AutoProcessor, GenerationConfig
 
 
 @torch.no_grad()
