@@ -137,18 +137,17 @@ def http_request(
             data = bytes(dumps(json), encoding="utf-8")
 
         try:
-            if verify:
-                if sys.version_info >= (3, 13):
-                    # Use SSL context for Python 3.13+
-                    import ssl
-
-                    context = ssl.create_default_context(cafile=verify)
-                    resp = urllib.request.urlopen(req, data=data, context=context)
-                else:
-                    # Use cafile parameter for older versions
-                    resp = urllib.request.urlopen(req, data=data, cafile=verify)
-            else:
+            if not verify:
                 resp = urllib.request.urlopen(req, data=data)
+            elif sys.version_info >= (3, 13):
+                # Use SSL context for Python 3.13+
+                import ssl
+
+                context = ssl.create_default_context(cafile=verify)
+                resp = urllib.request.urlopen(req, data=data, context=context)
+            else:
+                # Use cafile parameter for older versions
+                resp = urllib.request.urlopen(req, data=data, cafile=verify)
             return HttpResponse(resp)
         except urllib.error.HTTPError as e:
             return HttpResponse(e)
