@@ -5,13 +5,8 @@ import re
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, NamedTuple, Optional, Tuple
-import time
-import threading
 
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-import queue
 
 
 class MABConfig:
@@ -247,18 +242,6 @@ class MABGroupManager:
         self.mabs: Dict[int, BaseMAB] = {}
         self._init_mabs()
         self.accept_lengths = {}
-        
-        # Strategy history tracking
-        self.strategy_history = []
-        self.batch_size_history = []
-        self.timestamp_history = []
-        self.reward_history = []
-        self.start_time = time.time()
-        
-        # Real-time plotting
-        self.enable_realtime_plot = False
-        self.plot_queue = queue.Queue()
-        self.plot_thread = None
 
     def _init_mabs(self):
         """Initialize MAB instances for each group.
@@ -309,29 +292,14 @@ class MABGroupManager:
         """
         # Fast path for single strategy
         if len(self.strategies) == 1:
-            selected = self.strategies[0]
-        else:
-            # Get appropriate group and valid strategies
-            group = self._get_group(batch_size)
-            valid_strategies = self._get_valid_strategies(batch_size)
+            return self.strategies[0]
 
-            # Select strategy using the MAB algorithm
-            selected = self.mabs[group].select_strategy(valid_strategies)
-        
-        # Track the selection
-        self.strategy_history.append(selected)
-        self.batch_size_history.append(batch_size)
-        self.timestamp_history.append(time.time() - self.start_time)
-        
-        # Queue for real-time plotting if enabled
-        if self.enable_realtime_plot:
-            self.plot_queue.put({
-                'timestamp': self.timestamp_history[-1],
-                'strategy': selected,
-                'batch_size': batch_size
-            })
-        
-        return selected
+        # Get appropriate group and valid strategies
+        group = self._get_group(batch_size)
+        valid_strategies = self._get_valid_strategies(batch_size)
+
+        # Select strategy using the MAB algorithm
+        return self.mabs[group].select_strategy(valid_strategies)
 
     def record_strategy_metrics(
         self, batch_size: int, strategy: str, reward: float, accept_length: float
@@ -339,9 +307,6 @@ class MABGroupManager:
         """Record metrics for a strategy in appropriate group."""
         group = self._get_group(batch_size)
         self.mabs[group].strategy_metrics[strategy].add_metrics(reward, accept_length)
-        
-        # Track reward history
-        self.reward_history.append(reward)
 
     def get_stable_accept_length(self, strategy: str) -> float:
         """Get stable accept_length across all groups.
@@ -372,106 +337,3 @@ class MABGroupManager:
             )
 
         return self.accept_lengths.get(strategy, 0.0)
-    
-    def enable_plotting(self, enable: bool = True):
-        """Enable or disable real-time plotting."""
-        self.enable_realtime_plot = enable
-        if enable and self.plot_thread is None:
-            self.plot_thread = threading.Thread(target=self._realtime_plot_worker, daemon=True)
-            self.plot_thread.start()
-    
-    def _realtime_plot_worker(self):
-        """Worker thread for real-time plotting."""
-        plt.ion()
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10))
-        fig.suptitle(f'MAB Strategy Selection ({self.algorithm})')
-        
-        while self.enable_realtime_plot:
-            try:
-                # Get data from queue with timeout
-                data = self.plot_queue.get(timeout=0.1)
-                self.plot_queue.task_done()
-                
-                # Update plots
-                self._update_plots(fig, ax1, ax2, ax3)
-                plt.pause(0.01)
-                
-            except queue.Empty:
-                continue
-                
-        plt.close(fig)
-    
-    def _update_plots(self, fig, ax1, ax2, ax3):
-        """Update the plot axes with current data."""
-        if not self.timestamp_history:
-            return
-            
-        # Clear axes
-        ax1.clear()
-        ax2.clear()
-        ax3.clear()
-        
-        # Plot 1: Strategy selection over time
-        strategy_indices = {s: i for i, s in enumerate(self.strategies)}
-        strategy_nums = [strategy_indices[s] for s in self.strategy_history]
-        ax1.scatter(self.timestamp_history, strategy_nums, alpha=0.6, s=10)
-        ax1.set_yticks(list(strategy_indices.values()))
-        ax1.set_yticklabels(list(strategy_indices.keys()))
-        ax1.set_xlabel('Time (s)')
-        ax1.set_ylabel('Strategy')
-        ax1.set_title('Strategy Selection Over Time')
-        ax1.grid(True, alpha=0.3)
-        
-        # Plot 2: Batch size over time
-        ax2.plot(self.timestamp_history, self.batch_size_history, 'b-', alpha=0.7)
-        ax2.fill_between(self.timestamp_history, 0, self.batch_size_history, alpha=0.3)
-        ax2.set_xlabel('Time (s)')
-        ax2.set_ylabel('Batch Size')
-        ax2.set_title('Batch Size Over Time')
-        ax2.grid(True, alpha=0.3)
-        
-        # Plot 3: Reward over time (if available)
-        if self.reward_history:
-            # Moving average for rewards
-            window = min(50, len(self.reward_history))
-            if len(self.reward_history) >= window:
-                reward_ma = np.convolve(self.reward_history, np.ones(window)/window, mode='valid')
-                time_ma = self.timestamp_history[window-1:len(self.reward_history)]
-                ax3.plot(time_ma, reward_ma, 'g-', alpha=0.8, label='Moving Avg')
-            
-            ax3.scatter(self.timestamp_history[:len(self.reward_history)], 
-                       self.reward_history, alpha=0.3, s=5, label='Raw')
-            ax3.set_xlabel('Time (s)')
-            ax3.set_ylabel('Reward')
-            ax3.set_title('Reward Over Time')
-            ax3.grid(True, alpha=0.3)
-            ax3.legend()
-        
-        fig.tight_layout()
-    
-    def save_history_plot(self, filename: str):
-        """Save a plot of the strategy selection history."""
-        if not self.timestamp_history:
-            print("No history to plot")
-            return
-            
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10))
-        fig.suptitle(f'MAB Strategy Selection History ({self.algorithm})')
-        
-        self._update_plots(fig, ax1, ax2, ax3)
-        
-        plt.savefig(filename, dpi=150)
-        plt.close(fig)
-        print(f"Plot saved to {filename}")
-    
-    def get_strategy_stats(self) -> Dict[str, Dict[str, float]]:
-        """Get statistics for each strategy."""
-        stats = {}
-        for strategy in self.strategies:
-            strategy_count = self.strategy_history.count(strategy)
-            stats[strategy] = {
-                'count': strategy_count,
-                'percentage': strategy_count / len(self.strategy_history) * 100 if self.strategy_history else 0,
-                'avg_batch_size': np.mean([bs for s, bs in zip(self.strategy_history, self.batch_size_history) if s == strategy]) if strategy_count > 0 else 0
-            }
-        return stats
