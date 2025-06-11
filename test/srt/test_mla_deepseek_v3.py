@@ -49,7 +49,6 @@ class TestMLADeepseekV3(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
-@unittest.skipIf(not is_cuda(), "AMD currently does not support Eagle.")
 class TestDeepseekV3MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -109,7 +108,6 @@ class TestDeepseekV3MTP(CustomTestCase):
 
 
 # compatible with old APIs
-@unittest.skipIf(not is_cuda(), "AMD currently does not support Eagle.")
 class TestDeepseekV3MTPWithDraft(CustomTestCase):
     @classmethod
     def setUpClass(cls):

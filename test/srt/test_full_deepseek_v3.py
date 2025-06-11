@@ -73,7 +73,6 @@ class TestDeepseekV3(CustomTestCase):
                 self.assertGreater(speed, 75)
 
 
-@unittest.skipIf(not is_cuda(), "AMD currently does not support Eagle.")
 class TestDeepseekV3MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):

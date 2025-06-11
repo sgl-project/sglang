@@ -924,7 +924,6 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
         ret = await tokenizer_manager.generate_request(
             adapted_request, raw_request
         ).__anext__()
-        print(ret)
     except ValueError as e:
         return create_error_response(str(e))
 
