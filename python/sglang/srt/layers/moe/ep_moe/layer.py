@@ -294,6 +294,8 @@ class EPMoE(torch.nn.Module):
             )
         )
 
+        dispose_tensor(hidden_states)
+
         # GroupGemm-0
         gateup_input_fp8 = (
             gateup_input,
