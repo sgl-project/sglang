@@ -1112,7 +1112,7 @@ class ServerArgs:
             default=ServerArgs.speculative_token_map,
         )
         parser.add_argument(
-               "--speculative-eagle-mab-algorithm",
+            "--speculative-eagle-mab-algorithm",
             type=str,
             default="EG",
             choices=list(MABGroupManager.ALGORITHM_FACTORIES.keys()),
