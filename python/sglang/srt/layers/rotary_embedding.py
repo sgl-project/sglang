@@ -164,7 +164,8 @@ class RotaryEmbedding(CustomOp):
             default_rotary_mode = 'half'
         else:
             default_rotary_mode = 'interleave'
-        query_out, key_out = torch_npu.npu_mrope(positions, query, key, self.cos_sin_cache, self.head_size, mrope_section=[0, 0, 0], rotary_mode=rotary_mode)
+        mrope_section = [0, 0, 0]
+        query_out, key_out = torch_npu.npu_mrope(positions, query, key, self.cos_sin_cache, self.head_size, mrope_section=mrope_section, rotary_mode=rotary_mode)
         return query_out, key_out
 
     def forward_cuda(
