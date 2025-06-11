@@ -1356,47 +1356,29 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
-        if self.w_vc.dtype == torch.float8_e4m3fnuz:
-            # TODO(kernel): add bmm_fp8 for torch.float8_e4m3fnuz
-            attn_bmm_output = torch.bmm(
-                attn_output.to(torch.bfloat16).transpose(0, 1),
-                self.w_vc.to(torch.bfloat16) * self.w_scale,
-            )
-        elif self.w_vc.dtype == torch.float8_e4m3fn:
-            attn_output_val, attn_output_scale = input_to_float8(
-                attn_output.transpose(0, 1), torch.float8_e4m3fn
-            )
-            attn_bmm_output = bmm_fp8(
-                attn_output_val,
-                self.w_vc,
-                attn_output_scale,
-                self.w_scale,
-                torch.bfloat16,
-            )
-        else:
-            # [Note] Align shapes of bmm inputs.
-            # Shapes of inputs:
-            #   q_nope: [M, B, K]
-            #   original self.w_kc: [B, K, N]
-            #   current self.w_kc (which has been converted in PackWeightMethod): [B, N, K]
+        # [Note] Align shapes of bmm inputs.
+        # Shapes of inputs:
+        #   q_nope: [M, B, K]
+        #   original self.w_kc: [B, K, N]
+        #   current self.w_kc (which has been converted in PackWeightMethod): [B, N, K]
 
-            # Shapes of inputs to sgl_kernel.cpu.bmm:
-            #   out: [B, M, N]
-            #   mat1: [B, M, K]
-            #   mat2: [B, N, K]
-            B = self.w_vc.size(0)
-            N = self.w_vc.size(1)
-            M = attn_output.size(0)
-            output = torch.empty([M, int(B * N)], dtype=attn_output.dtype)
-            attn_bmm_output = output.view([M, B, N]).transpose_(0, 1)
-            torch.ops.sgl_kernel.bmm_cpu(
-                attn_bmm_output,
-                attn_output.transpose(0, 1),
-                self.w_vc,
-                True,  # is_vnni
-                None,  # scale
-            )
-            attn_output = output
+        # Shapes of inputs to sgl_kernel.cpu.bmm:
+        #   out: [B, M, N]
+        #   mat1: [B, M, K]
+        #   mat2: [B, N, K]
+        B = self.w_vc.size(0)
+        N = self.w_vc.size(1)
+        M = attn_output.size(0)
+        output = torch.empty([M, int(B * N)], dtype=attn_output.dtype)
+        attn_bmm_output = output.view([M, B, N]).transpose_(0, 1)
+        torch.ops.sgl_kernel.bmm_cpu(
+            attn_bmm_output,
+            attn_output.transpose(0, 1),
+            self.w_vc,
+            True,  # is_vnni
+            None,  # scale
+        )
+        attn_output = output
         output, _ = self.o_proj(attn_output)
 
         return output

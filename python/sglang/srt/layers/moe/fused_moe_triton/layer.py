@@ -274,6 +274,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 routed_scaling_factor=routed_scaling_factor,
             )
 
+            # TODO: support apply_router_weight_on_input in the fused_experts_cpu kernel
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,
