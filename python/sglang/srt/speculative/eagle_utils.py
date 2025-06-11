@@ -315,6 +315,7 @@ class EagleVerifyInput:
             )
 
         # Sample tokens
+        print("debugccccccc ,    ", batch.sampling_info.is_all_greedy)
         if batch.sampling_info.is_all_greedy:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
