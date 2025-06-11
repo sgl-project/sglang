@@ -120,8 +120,10 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
       reinterpret_cast<typename ScheduleConfig::LayoutSFB*>(layout_sfb.data_ptr())};
 
   cutlass::KernelHardwareInfo hw_info;
+  // TODO(qiyuhang): get device_id by cudaGetDevice
   hw_info.device_id = 0;
-  hw_info.sm_count = 132;
+  // TODO(qiyuhang): get sm_count by cudaGetDeviceProperties
+  hw_info.sm_count = 78;    // H20 config
 
   typename GemmKernel::EpilogueArguments epilogue_args{
       {},
@@ -140,7 +142,8 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
 
   at::cuda::CUDAGuard device_guard{(char)a_ptrs.get_device()};
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(a_ptrs.get_device());
-
+  
+  // TODO(qiyuhang): skip can_implement when problem_sizes_host is nullptr
   auto can_implement_status = gemm_op.can_implement(args);
   TORCH_CHECK(can_implement_status == cutlass::Status::kSuccess, "Failed to implement GEMM");
 
