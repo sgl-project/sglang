@@ -141,10 +141,9 @@ def http_request(
                 if sys.version_info >= (3, 13):
                     # Use SSL context for Python 3.13+
                     import ssl
+
                     context = ssl.create_default_context(cafile=verify)
-                    resp = urllib.request.urlopen(req,
-                                                           data=data,
-                                                           context=context)
+                    resp = urllib.request.urlopen(req, data=data, context=context)
                 else:
                     # Use cafile parameter for older versions
                     resp = urllib.request.urlopen(req, data=data, cafile=verify)
