@@ -2,7 +2,9 @@
 Usage:
 python3 -m unittest test_pp_single_node.TestPPAccuracy.test_gsm8k
 python3 -m unittest test_pp_single_node.TestQwenPPAccuracy.test_pp_consistency
+python3 -m unittest test_pp_single_node.TestQwenMoePPAccuracy.test_pp_consistency
 python3 -m unittest test_pp_single_node.TestFixedBugs.test_chunked_prefill_with_small_bs
+python3 -m unittest test_pp_single_node.TestTritonAttentionBackend.test_gsm8k
 """
 
 import time
@@ -254,12 +256,21 @@ class TestFixedBugs(unittest.TestCase):
 class TestTritonAttentionBackend(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.base_url = "http://127.0.0.1:23337"  # different ports to avoid conflicts
-        model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = "http://127.0.0.1:23337"
+        cls.process = popen_launch_server(
+            DEFAULT_MODEL_NAME_FOR_TEST,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--tp-size",
+                2,
+                "--pp-size",
+                2,
+                "--attention-backend",
+                "triton"
+            ],
+        )
 
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
         args = SimpleNamespace(
