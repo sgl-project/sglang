@@ -15,6 +15,8 @@
 
 from typing import Any, Dict, List, Optional, Union
 
+import torch
+
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
 
@@ -156,3 +158,42 @@ class SamplingParams:
                 else:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
             self.stop_str_max_len = stop_str_max_len
+
+
+def merge_bias_tensor(
+    lhs: Optional[torch.Tensor],
+    rhs: Optional[torch.Tensor],
+    bs1: int,
+    bs2: int,
+    device: str,
+    default: float,
+):
+    """Merge two bias tensors for batch merging.
+
+    Args:
+        lhs: Left-hand side tensor
+        rhs: Right-hand side tensor
+        bs1: Batch size of left-hand side tensor
+        bs2: Batch size of right-hand side tensor
+        device: Device to place the merged tensor on
+        default: Default value for missing tensor elements
+
+    Returns:
+        Merged tensor or None if both inputs are None
+    """
+    if lhs is None and rhs is None:
+        return None
+
+    if lhs is not None and rhs is not None:
+        return torch.cat([lhs, rhs])
+    else:
+        if lhs is not None:
+            shape, dtype = lhs.shape[1:], lhs.dtype
+        else:
+            shape, dtype = rhs.shape[1:], rhs.dtype
+
+        if lhs is None:
+            lhs = torch.empty((bs1, *shape), device=device, dtype=dtype).fill_(default)
+        if rhs is None:
+            rhs = torch.empty((bs2, *shape), device=device, dtype=dtype).fill_(default)
+        return torch.cat([lhs, rhs])
