@@ -71,6 +71,20 @@ def fused_topk_native(
     return topk_weights, topk_ids
 
 
+def fused_topk_cpu(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+):
+    return torch.ops.sgl_kernel.topk_softmax_cpu(
+        hidden_states=hidden_states,
+        gating_output=gating_output,
+        topk=topk,
+        renormalize=renormalize,
+    )
+
+
 def fused_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -382,6 +396,7 @@ def biased_grouped_topk_cpu(
 if _is_cpu and _use_cpu and _is_cpu_amx:
     biased_grouped_topk = biased_grouped_topk_cpu
     grouped_topk = grouped_topk_cpu
+    fused_topk_native = fused_topk_cpu
 
 
 def select_experts(
@@ -444,20 +459,12 @@ def select_experts(
             num_token_non_padded is None
         ), "num_token_non_padded is not yet supported in fused_topk_native"
         assert expert_location_dispatch_info is None
-        if _use_cpu and _is_cpu_amx:
-            topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-            )
-        else:
-            topk_weights, topk_ids = fused_topk_native(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-            )
+        topk_weights, topk_ids = fused_topk_native(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=top_k,
+            renormalize=renormalize,
+        )
     elif custom_routing_function is None:
         # Qwen3MOE uses fused_topk
         topk_weights, topk_ids = fused_topk(
