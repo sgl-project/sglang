@@ -63,14 +63,12 @@ class TestAWQIntegration(CustomTestCase):  # Renamed from TestAWQ to avoid confl
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=16,  # Reduced for faster CI
-            num_threads=4,  # Reduced for faster CI
+            num_examples=64,
+            num_threads=32,
         )
 
         metrics = run_eval(args)
-        self.assertGreater(
-            metrics["score"], 0.1
-        )  # Adjusted threshold, specific model might vary.
+        self.assertGreater(metrics["score"], 0.64)
 
 
 # New Unit Test Class for AWQ Methods
