@@ -17,11 +17,11 @@ def get_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
     device_config: DeviceConfig,
+    model_class: nn.Module = None
 ) -> nn.Module:
     loader = get_model_loader(load_config)
     return loader.load_model(
-        model_config=model_config,
-        device_config=device_config,
+        model_config=model_config, device_config=device_config, model_class=model_class
     )
 
 
