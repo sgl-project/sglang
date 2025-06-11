@@ -20,7 +20,7 @@ namespace {
 // minimal implementation of std::span<const int>/std::string_view
 struct token_view {
  public:
-  token_view(const std::vector<token_t>& tokens) : m_data(tokens.data()), m_size(tokens.size()) {}
+  token_view(const token_vec_t& tokens) : m_data(tokens.data()), m_size(tokens.size()) {}
   token_view(const token_t* data, std::size_t size) : m_data(data), m_size(size) {}
 
   std::array<token_view, 2> split(std::size_t offset) const {
