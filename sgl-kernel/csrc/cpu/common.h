@@ -113,6 +113,16 @@ inline T div_up(T x, T y) {
   return (x + y - 1) / y;
 }
 
+// you can only use at::get_thread_num() with at::parallel_for()
+// as it is lazy initialized, otherwise it will always return 0.
+inline int get_thread_num() {
+#if defined(_OPENMP)
+  return omp_get_thread_num();
+#else
+  return 0;
+#endif
+}
+
 template <typename T>
 inline void balance211(T n, T nth, T ith, T& n_start, T& n_end) {
 #if 0
@@ -165,7 +175,6 @@ int inline adjust_num_threads(int m) {
 
 template <typename func_t>
 inline void parallel_2d(int m, int n, const func_t& f) {
-
   // make sure we have even num_threads
   int nth = adjust_num_threads(m);
 
@@ -193,31 +202,57 @@ inline void parallel_2d(int m, int n, const func_t& f) {
 
 #if defined(_OPENMP)
 #pragma omp parallel num_threads(nth)
-{
-  int ith = omp_get_thread_num();
-  int ith_m = ith / nth_n;
-  int ith_n = ith % nth_n;
+  {
+    int ith = omp_get_thread_num();
+    int ith_m = ith / nth_n;
+    int ith_n = ith % nth_n;
 
-  int thread_block_m = div_up(m, nth_m);
-  int thread_block_n = div_up(n, nth_n);
+    int thread_block_m = div_up(m, nth_m);
+    int thread_block_n = div_up(n, nth_n);
 
-  int begin_m = ith_m * thread_block_m;
-  int end_m = std::min(m, begin_m + thread_block_m);
-  int begin_n = ith_n * thread_block_n;
-  int end_n = std::min(n, begin_n + thread_block_n);
+    int begin_m = ith_m * thread_block_m;
+    int end_m = std::min(m, begin_m + thread_block_m);
+    int begin_n = ith_n * thread_block_n;
+    int end_n = std::min(n, begin_n + thread_block_n);
 
-  f(begin_m, end_m, begin_n, end_n);
-}
+    f(begin_m, end_m, begin_n, end_n);
+  }
 #else
   f(0, m, 0, n);
 #endif
 }
 
+// 2d sequential loop: [mb0, mb1), [nb0, nb1)
+// do L2 cache for NB only (skip MB for now)
+template <typename func_t>
+inline void loop_2d(int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1, int64_t cache_blocks_nb, const func_t& f) {
+  for (int64_t nbb = nb0; nbb < nb1; nbb += cache_blocks_nb) {
+    for (int64_t mb = mb0; mb < mb1; ++mb) {
+      for (int64_t nb = nbb; nb < std::min(nbb + cache_blocks_nb, nb1); ++nb) {
+        f(mb, nb, nb - nbb);
+      }
+    }
+  }
+}
+
+#define MAX_CACHE_BLOCK_SIZE 4
+
 template <typename T>
-int get_cache_blocks(int BLOCK_SIZE, int K) {
+inline int get_cache_blocks(int BLOCK_SIZE, int K) {
   // L2 2MB and ratio of 50%
   const int L2_size = 2048 * 1024 >> 1;
   return std::max(1, int(L2_size / (BLOCK_SIZE * K * sizeof(T))));
+}
+
+template <>
+inline int get_cache_blocks<at::Float8_e4m3fn>(int BLOCK_SIZE, int K) {
+  // fp8 uses bf16 as accumulate type
+  // also limit max cache blocks to `MAX_CACHE_BLOCK_SIZE`
+  // since we need to do pre-unpack for weights
+  using accum_t = at::BFloat16;
+  const int L2_size = 2048 * 1024 >> 1;
+  int cache_block_size = std::max(1, int(L2_size / (BLOCK_SIZE * K * sizeof(accum_t))));
+  return std::min(MAX_CACHE_BLOCK_SIZE, cache_block_size);
 }
 
 // data indexing for dimension collapse
