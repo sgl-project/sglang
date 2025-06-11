@@ -315,7 +315,6 @@ def tune(M, N, K, block_size, out_dtype, search_space, input_type):
     return best_config
 
 
-
 def save_configs(
     N,
     K,
@@ -348,8 +347,6 @@ def save_configs(
         with open(config_file_path, "w") as f:
             json.dump(sorted_configs, f, indent=4)
             f.write("\n")
-
-
 
 
 def get_available_gpu_count():
