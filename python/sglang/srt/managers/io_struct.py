@@ -26,8 +26,6 @@ from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 
-import torch
-
 from sglang.srt.managers.mm_utils import TensorTransportMode, TransportableTensor
 from sglang.srt.mm_utils import has_valid_data
 from sglang.utils import info_once
@@ -484,7 +482,7 @@ class GenerateReqInput:
 
 
 # applied for tensor sent from TokenizerManager -> Scheduler
-global_effective_mode: Optional[TensorTransportMode] = None
+global_transport_mode: Optional[TensorTransportMode] = None
 
 
 @dataclass
@@ -534,27 +532,22 @@ class TokenizedGenerateReqInput:
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
-    tensor_transport_mode: TensorTransportMode = "auto"
-
     def __getstate__(self):
         """
         Called before serializing
         """
         state = dict(self.__dict__)
-        global global_effective_mode
-        if global_effective_mode is None:
-            if (
-                "mm_inputs" in state
-                and state["mm_inputs"] is not None
-                and self._contains_feature()
-            ):
-                effective_mode = self._determine_tensor_transport_mode()
-                global_effective_mode = effective_mode
-                info_once(f"{global_effective_mode=}")
-                # sends only for the first time
-                state["effective_mode"] = global_effective_mode
+        global global_transport_mode
+        if global_transport_mode is None:
+            if "mm_inputs" in state and state["mm_inputs"] is not None:
+                transport_mode = self._determine_tensor_transport_mode(
+                    global_transport_mode
+                )
+                global_transport_mode = transport_mode
+                info_once(f"{global_transport_mode=}")
 
-        if global_effective_mode is not None:
+        # turn feature into TransportableTensor
+        if global_transport_mode is not None:
             original_mm_inputs = state["mm_inputs"]
             # shallow-copy
             new_mm_inputs = copy.copy(original_mm_inputs)
@@ -564,7 +557,7 @@ class TokenizedGenerateReqInput:
                 if not isinstance(new_item.feature, TransportableTensor):
                     # modify in-place
                     new_item.feature = TransportableTensor(
-                        transport_mode=global_effective_mode, feature=new_item.feature
+                        transport_mode=global_transport_mode, feature=new_item.feature
                     )
                 new_mm_items.append(new_item)
             new_mm_inputs["mm_items"] = new_mm_items
@@ -572,41 +565,19 @@ class TokenizedGenerateReqInput:
         return state
 
     def __setstate__(self, state):
-        global global_effective_mode
-        if global_effective_mode is None:
-            transport_mode = state.get("effective_mode", None)
-            if transport_mode is not None:
-                global_effective_mode = transport_mode
-        if global_effective_mode is None:
-            print(f"{global_effective_mode=}, returning")
-            self.__dict__.update(state)
-            return
-
         if "mm_inputs" in state and state["mm_inputs"] is not None:
             mm_inputs = state["mm_inputs"]
-
             for mm_item in mm_inputs["mm_items"]:
-                current_device_index = torch.cuda.current_device()
-                # print(f"{current_device_index=} {mm_item=}")
-                assert isinstance(mm_item.feature, TransportableTensor)
-                mm_item.feature = mm_item.feature.deserialize()
-                # print(f"after {current_device_index=}  {mm_item=}")
-                assert isinstance(mm_item.feature, torch.Tensor)
-            # print(f"after {state=}")
-
-        else:
-            print(f"mm_inputs not presented, returning")
+                if isinstance(mm_item.feature, TransportableTensor):
+                    mm_item.feature = mm_item.feature.deserialize()
 
         self.__dict__.update(state)
 
-    def _contains_feature(self) -> bool:
-        if not self.mm_inputs:
-            return False
-        return any(v is not None for v in self.mm_inputs["mm_items"])
-
-    def _determine_tensor_transport_mode(self) -> TensorTransportMode:
-        if self.tensor_transport_mode != "auto":
-            return self.tensor_transport_mode
+    def _determine_tensor_transport_mode(
+        self, tensor_transport_mode: Optional[TensorTransportMode]
+    ) -> TensorTransportMode:
+        if tensor_transport_mode is not None and tensor_transport_mode != "auto":
+            return tensor_transport_mode
 
         # Fallback to cpu transport for multi-node deployments, as cuda_ipc is not applicable.
         # We use bootstrap_host as an indicator for multi-node/disaggregated inference.
