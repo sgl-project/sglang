@@ -15,9 +15,9 @@
 
 import platform
 import sys
-import torch
 from pathlib import Path
 
+import torch
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
@@ -30,6 +30,7 @@ def _get_version():
         for line in f:
             if line.startswith("version"):
                 return line.split("=")[1].strip().strip('"')
+
 
 operator_namespace = "sgl_kernel"
 include_dirs = [
@@ -49,9 +50,11 @@ cxx_flags = ["-O3"]
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
-amdgpu_target = torch.cuda.get_device_properties("cuda").gcnArchName.split(':')[0]
+amdgpu_target = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
 if amdgpu_target not in ["gfx942", "gfx950"]:
-    print(f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'.")
+    print(
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
+    )
     sys.exit(1)
 
 hipcc_flags = [
