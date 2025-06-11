@@ -153,7 +153,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
 
         gpu_mem = get_device_memory_capacity()
         if gpu_mem is not None:
-            if gpu_mem > 90 * 1024:  # H200
+            if gpu_mem > 90 * 1024:  # H200, H20
                 capture_bs += list(range(160, 257, 8))
             if gpu_mem > 160 * 1000:  # B200, MI300
                 capture_bs += list(range(256, 513, 16))
@@ -234,6 +234,10 @@ class CudaGraphRunner:
                 self.num_tokens_per_bs = (
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
+
+        # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
+        if model_runner.server_args.enable_return_hidden_states:
+            self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
@@ -342,11 +346,29 @@ class CudaGraphRunner:
             else True
         )
 
+        requested_capture_hidden_mode = max(
+            forward_batch.capture_hidden_mode,
+            (
+                forward_batch.spec_info.capture_hidden_mode
+                if getattr(forward_batch.spec_info, "capture_hidden_mode", None)
+                is not None
+                else CaptureHiddenMode.NULL
+            ),
+        )
+        capture_hidden_mode_matches = (
+            requested_capture_hidden_mode == CaptureHiddenMode.NULL
+            or requested_capture_hidden_mode == self.capture_hidden_mode
+        )
         is_tbo_supported = (
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
 
-        return is_bs_supported and is_encoder_lens_supported and is_tbo_supported
+        return (
+            is_bs_supported
+            and is_encoder_lens_supported
+            and is_tbo_supported
+            and capture_hidden_mode_matches
+        )
 
     def capture(self) -> None:
         profile_context = empty_context()
@@ -541,21 +563,34 @@ class CudaGraphRunner:
         return graph, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
-        # If the capture_hidden_mode changes, we need to recapture the graph
-        hidden_mode_from_spec_info = getattr(
+
+        # If the required capture_hidden_mode changes, we need to recapture the graph
+
+        # These are the different factors that can influence the capture_hidden_mode
+        capture_hidden_mode_required_by_forward_batch = (
+            forward_batch.capture_hidden_mode
+        )
+        capture_hidden_mode_required_by_spec_info = getattr(
             forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
         )
-        if (
-            forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
-            and self.capture_hidden_mode != CaptureHiddenMode.FULL
-        ):
-            self.capture_hidden_mode = CaptureHiddenMode.FULL
-            self.capture()
-        elif (
-            forward_batch.capture_hidden_mode != CaptureHiddenMode.FULL
-            and self.capture_hidden_mode != hidden_mode_from_spec_info
-        ):
-            self.capture_hidden_mode = hidden_mode_from_spec_info
+        capture_hidden_mode_required_for_returning_hidden_states = (
+            CaptureHiddenMode.FULL
+            if self.model_runner.server_args.enable_return_hidden_states
+            else CaptureHiddenMode.NULL
+        )
+
+        # Determine the highest capture_hidden_mode required
+        # (If we have FULL, we can emulate LAST or NULL)
+        # (If we have LAST, we can emulate NULL)
+        required_capture_hidden_mode = max(
+            capture_hidden_mode_required_by_forward_batch,
+            capture_hidden_mode_required_by_spec_info,
+            capture_hidden_mode_required_for_returning_hidden_states,
+        )
+
+        # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
+        if self.capture_hidden_mode != required_capture_hidden_mode:
+            self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
     def replay_prepare(
