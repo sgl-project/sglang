@@ -264,10 +264,8 @@ class TestTritonAttentionBackend(unittest.TestCase):
             base_url=DEFAULT_URL_FOR_TEST,
         )
         other_server_args = [
-            "--tp-size",
-            2,
             "--pp-size",
-            2,
+            4,
             "--attention-backend",
             "triton"
         ]
