@@ -39,11 +39,8 @@ class Llama4ForConditionalGeneration(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
-        # Check if this is a text-only model (no vision components)
-        # We need a more robust check since transformers auto-generates vision_config
-        # for Llama4ForConditionalGeneration even for text-only models
+        # Check if this is a text-only model (modelopt fp8 llama4 has no vision components)
 
-        # Instead of checking config, check if vision model weights actually exist in the checkpoint
         import json as json_lib
         import os
 
@@ -69,25 +66,14 @@ class Llama4ForConditionalGeneration(nn.Module):
                     any(pattern in weight_name for pattern in vision_weight_patterns)
                     for weight_name in index_data.get("weight_map", {}).keys()
                 )
-                if get_tensor_model_parallel_rank() == 0:
-                    print(
-                        f"Debug: Found vision weights in checkpoint: {has_vision_weights}"
-                    )
             except:
                 # Fallback: assume text-only since most checkpoints are text-only
                 has_vision_weights = False
-                if get_tensor_model_parallel_rank() == 0:
-                    print(f"Debug: Could not read checkpoint index, assuming text-only")
         else:
             # No checkpoint index found, assume text-only
             has_vision_weights = False
-            if get_tensor_model_parallel_rank() == 0:
-                print(f"Debug: No checkpoint index found, assuming text-only")
 
         self.has_vision = has_vision_weights
-        if get_tensor_model_parallel_rank() == 0:
-            print(f"Debug: has_vision: {self.has_vision}")
-            print(f"Debug: model_path: {model_path}")
 
         if self.has_vision:
             self.vision_model = Llama4VisionModel(config.vision_config)
@@ -193,11 +179,6 @@ class Llama4ForConditionalGeneration(nn.Module):
         # Only print debug info from rank 0 to avoid spam with multiple GPUs
         is_main_rank = get_tensor_model_parallel_rank() == 0
 
-        if is_main_rank:
-            print(
-                f"Debug: Loading weights for {'multimodal' if self.has_vision else 'text-only'} model"
-            )
-
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
@@ -210,26 +191,24 @@ class Llama4ForConditionalGeneration(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-        if is_main_rank:
-            print(f"Debug: Model has {len(params_dict)} parameters")
+        # if is_main_rank:
+        #     print(f"Debug: Model has {len(params_dict)} parameters")
 
-            # Debug: Show scale parameter names in the model
-            scale_params = [
-                name
-                for name in params_dict.keys()
-                if "scale" in name and "expert" in name
-            ]
-            print(
-                f"Debug: Scale parameters in model: {scale_params[:30]}"
-            )  # Show first 30
+        #     # Debug: Show scale parameter names in the model
+        #     scale_params = [
+        #         name
+        #         for name in params_dict.keys()
+        #         if "scale" in name and "expert" in name
+        #     ]
+        #     print(
+        #         f"Debug: Scale parameters in model: {scale_params[:30]}"
+        #     )  # Show first 30
 
         num_experts = (
             self.config.text_config.num_local_experts
             if hasattr(self.config, "text_config")
             else self.config.num_local_experts
         )
-        if is_main_rank:
-            print(f"Debug: Number of experts: {num_experts}")
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -240,75 +219,15 @@ class Llama4ForConditionalGeneration(nn.Module):
             num_experts=num_experts,
         )
 
-        # Note: Scale parameters will be handled separately since they have
-        # a different name pattern (language_model.model.layers.X... vs model.layers.X...)
-
         for name, loaded_weight in weights:
-            # Debug: Show scale parameter names
-            if is_main_rank and "scale" in name and "expert" in name:
-                print(f"DEBUG: Processing checkpoint scale parameter: {name}")
-
             # Skip vision weights if this is a text-only model
             if "vision" in name and not self.has_vision:
-                # if is_main_rank:
-                #     print(f"Skipping vision weight: {name} (text-only model)")
                 continue
 
-            # Special handling for scale parameters that have language_model. prefix
-            if (
-                "scale" in name
-                and "language_model.model.layers" in name
-                and "experts" in name
-            ):
-                # Transform language_model.model.layers.X.feed_forward.experts.*
-                # to model.layers.X.feed_forward.experts.*
-                transformed_name = name.replace("language_model.", "")
-
-                # Try multiple possible target names since the model may have duplicate scale parameters
-                target_names = []
-
-                if "gate_up_proj" in transformed_name:
-                    # Try both gate_up_proj (direct) and w13 (FusedMoE) naming
-                    target_names.append(transformed_name)  # Direct: gate_up_proj
-                    target_names.append(
-                        transformed_name.replace("gate_up_proj", "w13")
-                    )  # FusedMoE: w13
-                elif "down_proj" in transformed_name:
-                    # Try both down_proj (direct) and w2 (FusedMoE) naming
-                    target_names.append(transformed_name)  # Direct: down_proj
-                    target_names.append(
-                        transformed_name.replace("down_proj", "w2")
-                    )  # FusedMoE: w2
-                else:
-                    target_names.append(transformed_name)
-
-                # Try each possible target name
-                loaded = False
-                for target_name in target_names:
-                    if target_name in params_dict:
-                        if is_main_rank:
-                            print(
-                                f"DEBUG: Loading scale parameter: {name} -> {target_name}"
-                            )
-                        param = params_dict[target_name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                        loaded = True
-                        break
-
-                if loaded:
-                    continue
-                else:
-                    if is_main_rank:
-                        print(
-                            f"DEBUG: Scale parameter {name} -> {target_names} not found in model"
-                        )
-                    continue
-
-            # MoE scale parameters are now handled directly by the MoE layer's weight_loader
-            # No special handling needed here - just let the normal flow handle it
+            # General prefix transformation: add language_model prefix if not already present
+            # All model parameters have this prefix, but modelopt fp8 llama4 checkpoint weights don't
+            if not name.startswith("language_model.") and "vision" not in name:
+                name = f"language_model.{name}"
 
             if not "vision" in name:
                 name, loaded_weight = self.permute_qk_weight_for_rotary(
@@ -322,10 +241,6 @@ class Llama4ForConditionalGeneration(nn.Module):
                 if "vision" in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                if name not in params_dict:
-                    # if is_main_rank:
-                    #     print(f"Warning: Parameter {name} not found in model, skipping")
-                    break
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -334,30 +249,27 @@ class Llama4ForConditionalGeneration(nn.Module):
                 if ".experts" in name:
                     # NOTE: llama4 fp8 has different weight format for experts
                     # Scale parameters are now handled by the MoE layer's weight_loader directly
-                    if "scale" in name:
-                        # Let scale parameters fall through to the normal weight loading flow
-                        # The MoE layer's weight_loader will handle them properly
-                        if name not in params_dict:
-                            continue
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                    elif (
+                    # if "scale" in name:
+                    #     # Let scale parameters fall through to the normal weight loading flow
+                    #     # The MoE layer's weight_loader will handle them properly
+                    #     if name not in params_dict:
+                    #         continue
+                    #     param = params_dict[name]
+                    #     weight_loader = getattr(
+                    #         param, "weight_loader", default_weight_loader
+                    #     )
+                    #     weight_loader(param, loaded_weight)
+                    if (
                         "experts.gate_up_proj" not in name
                         and "experts.down_proj" not in name
                     ):
-                        # Handle other expert parameters through mapping
+                        # Handle other expert parameters through mapping, experts.8.down_proj.weight
+                        print(f"Debug: Loading expert parameter: {name}")
                         for mapping in expert_params_mapping:
                             param_name, weight_name, expert_id, shard_id = mapping
                             if weight_name not in name:
                                 continue
                             name = name.replace(weight_name, param_name)
-                            if name not in params_dict:
-                                # if is_main_rank:
-                                #     print(f"Warning: Expert parameter {name} not found in model, skipping")
-                                break
                             param = params_dict[name]
                             weight_loader = param.weight_loader
 
@@ -371,19 +283,6 @@ class Llama4ForConditionalGeneration(nn.Module):
                             break
                     else:
                         if ".gate_up_proj" in name:
-                            # Add safety checks for tensor dimensions
-                            # if is_main_rank:
-                            #     print(f"Debug: Processing gate_up_proj weight {name}, shape: {loaded_weight.shape}, dtype: {loaded_weight.dtype}")
-
-                            if loaded_weight.dim() == 0:
-                                # if is_main_rank:
-                                #     print(f"Warning: Skipping scalar weight {name}")
-                                continue
-                            elif loaded_weight.size(-1) < 2:
-                                # if is_main_rank:
-                                #     print(f"Warning: Cannot chunk weight {name} with last dimension {loaded_weight.size(-1)}")
-                                continue
-
                             name_list = [
                                 name.replace(
                                     ".experts.gate_up_proj", ".experts.w13_weight"
@@ -391,34 +290,16 @@ class Llama4ForConditionalGeneration(nn.Module):
                             ] * 2
                             loaded_weight_list = loaded_weight.chunk(2, dim=-1)
                             shard_id_list = ["w1", "w3"]
-                        elif ".down_proj" in name:
-                            # Add debugging for down_proj as well
-                            # if is_main_rank:
-                            #     print(f"Debug: Processing down_proj weight {name}, shape: {loaded_weight.shape}, dtype: {loaded_weight.dtype}")
-
-                            if loaded_weight.dim() == 0:
-                                # if is_main_rank:
-                                #     print(f"Warning: Skipping scalar weight {name}")
-                                continue
-
+                        else:
                             name_list = [
                                 name.replace(".experts.down_proj", ".experts.w2_weight")
                             ]
                             shard_id_list = ["w2"]
                             loaded_weight_list = [loaded_weight]
-                        else:
-                            # Unrecognized expert parameter
-                            # if is_main_rank:
-                            #     print(f"Warning: Unrecognized expert parameter {name}, skipping")
-                            continue
 
                         for name, loaded_weight, shard_id in zip(
                             name_list, loaded_weight_list, shard_id_list
                         ):
-                            if name not in params_dict:
-                                # if is_main_rank:
-                                #     print(f"Warning: Expert parameter {name} not found in model, skipping")
-                                continue
                             param = params_dict[name]
                             weight_loader = param.weight_loader
                             for expert_id in range(num_experts):
@@ -432,11 +313,6 @@ class Llama4ForConditionalGeneration(nn.Module):
                 else:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    # Skip parameters that don't exist in the text-only model
-                    if name not in params_dict:
-                        # if is_main_rank:
-                        #     print(f"Warning: Parameter {name} not found in model, skipping")
                         continue
                     param = params_dict[name]
                     weight_loader = getattr(
