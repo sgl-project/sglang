@@ -68,7 +68,6 @@ The core features include:
    :caption: Frontend Tutorial
 
    frontend/frontend.ipynb
-   frontend/frontend_reasoning.ipynb
    frontend/choices_methods.md
 
 .. toctree::
