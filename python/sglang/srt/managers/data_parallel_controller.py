@@ -15,7 +15,6 @@
 
 import logging
 import multiprocessing as mp
-import random
 import signal
 import threading
 import time
@@ -34,7 +33,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket, get_bool_env_var
+from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -262,12 +261,7 @@ class DataParallelController:
                 logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
                 self.workers[req.data_parallel_rank].send_pyobj(req)
             else:
-                if get_bool_env_var("SGLANG_HACK_DP_CONTROLLER_RANDOM_WORKER_INDEX"):
-                    worker_index = random.randint(1000000000) % len(self.workers)
-                    print(f'hi hack SGLANG_HACK_DP_CONTROLLER_RANDOM_WORKER_INDEX thus {worker_index=}')
-                else:
-                    worker_index = req.bootstrap_room % len(self.workers)
-                self.workers[worker_index].send_pyobj(req)
+                self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, input_requests):
         raise NotImplementedError()
