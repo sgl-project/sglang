@@ -56,7 +56,7 @@ class BaseKVSender(ABC):
         ...
 
     @abstractmethod
-    def send(self, kv_indices: npt.NDArray[np.int64], kv_indices_len: int):
+    def send(self, kv_indices: npt.NDArray[np.int64]):
         """
         Send the kv cache at the given kv indices to the decoder server
         """

@@ -63,8 +63,7 @@ class TransferKVChunk:
     index_slice: slice
     is_last: bool
     prefill_aux_index: Optional[int]
-    kv_indices_len: Optional[int]
-
+    
 
 # decode
 @dataclasses.dataclass
@@ -304,7 +303,6 @@ class MooncakeKVManager(BaseKVManager):
         dst_tp_rank: int,
         dst_tp_size: int,
         dst_kv_item_len: int,
-        kv_indices_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
         """
@@ -321,7 +319,6 @@ class MooncakeKVManager(BaseKVManager):
         num_kv_heads = self.kv_args.kv_head_num
         num_layers = len(self.kv_args.kv_data_ptrs)
         page_size = self.kv_args.page_size
-        num_tokens_in_chunk = kv_indices_len
 
         heads_per_decode_rank = num_kv_heads * local_tp_size // dst_tp_size
         heads_per_prefill_rank = num_kv_heads
@@ -402,16 +399,12 @@ class MooncakeKVManager(BaseKVManager):
                 prefill_page_idx = int(prefill_kv_indices[i])
                 decode_page_idx = int(dst_kv_indices[i])
 
-                # Dynamically calculate the number of valid token slots in the current page
-                remaining_tokens = num_tokens_in_chunk - tokens_processed
-                num_slots_in_this_page = min(page_size, remaining_tokens)
-
                 # Get the starting memory address for the current source and destination pages
                 src_page_start_addr = src_ptr + prefill_page_idx * src_item_len
                 dst_page_start_addr = dst_ptr + decode_page_idx * dst_item_len
 
                 # Iterate through each valid token slot within the current page
-                for token_slot_in_page in range(num_slots_in_this_page):
+                for token_slot_in_page in range(page_size):
                     # Calculate start address of the current token slot
                     src_token_slot_start_addr = (
                         src_page_start_addr
@@ -441,8 +434,6 @@ class MooncakeKVManager(BaseKVManager):
                             f"transfer_sync failed with status {status} for session {mooncake_session_id}"
                         )
                         return status
-
-                tokens_processed += num_slots_in_this_page
 
             return 0
 
@@ -563,7 +554,6 @@ class MooncakeKVManager(BaseKVManager):
                                 target_rank_registration_info.dst_tp_rank,
                                 target_rank_registration_info.dst_tp_size,
                                 target_rank_registration_info.dst_kv_item_len,
-                                kv_chunk.kv_indices_len,
                                 executor,
                             )
                         if ret != 0:
@@ -765,7 +755,6 @@ class MooncakeKVManager(BaseKVManager):
         index_slice: slice,
         is_last: bool,
         aux_index: Optional[int] = None,
-        kv_indices_len: Optional[int] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
@@ -799,7 +788,6 @@ class MooncakeKVManager(BaseKVManager):
                 index_slice=index_slice,
                 is_last=is_last,
                 prefill_aux_index=aux_index,
-                kv_indices_len=kv_indices_len,
             )
         )
 
@@ -915,7 +903,6 @@ class MooncakeKVSender(BaseKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int64],
-        kv_indices_len: int,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
@@ -927,7 +914,6 @@ class MooncakeKVSender(BaseKVSender):
                 kv_indices,
                 index_slice,
                 False,
-                kv_indices_len=kv_indices_len,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -936,7 +922,6 @@ class MooncakeKVSender(BaseKVSender):
                 index_slice,
                 True,
                 aux_index=self.aux_index,
-                kv_indices_len=kv_indices_len,
             )
 
     def poll(self) -> KVPoll:
