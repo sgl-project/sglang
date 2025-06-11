@@ -5,8 +5,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
+    init_sorted_ids_and_cumsum_buffer,
+)
 from sglang.srt.utils import is_cuda, is_hip
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import init_sorted_ids_and_cumsum_buffer
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -18,6 +20,7 @@ if _is_cuda or _is_hip:
 enable_moe_align_block_size_triton = bool(
     int(os.getenv("ENABLE_MOE_ALIGN_BLOCK_SIZE_TRITON", "0"))
 )
+
 
 def ceil_div(a, b):
     return (a + b - 1) // b

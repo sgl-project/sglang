@@ -11,6 +11,19 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
+    get_config_dtype_str,
+    try_get_optimal_moe_config,
+)
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
+    fused_moe_kernel,
+    fused_moe_kernel_gptq_awq,
+    moe_sum_reduce_torch_compile,
+    moe_sum_reduce_triton,
+)
+from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import (
+    moe_align_block_size,
+)
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -28,14 +41,6 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
 )
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
-    fused_moe_kernel,
-    fused_moe_kernel_gptq_awq,
-    moe_sum_reduce_triton,
-    moe_sum_reduce_torch_compile,
-)
-from sglang.srt.layers.moe.fused_moe_triton.moe_align_block_size import moe_align_block_size
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -48,6 +53,7 @@ else:
 
 logger = logging.getLogger(__name__)
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+
 
 def invoke_fused_moe_kernel(
     A: torch.Tensor,

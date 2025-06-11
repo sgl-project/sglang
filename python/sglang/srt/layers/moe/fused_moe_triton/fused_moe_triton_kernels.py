@@ -1,7 +1,9 @@
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.utils import next_power_of_2
+
 
 @triton.jit
 def write_zeros_to_output(
@@ -468,7 +470,6 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-
 # _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
 @triton.jit
 def _moe_sum_reduce_kernel(
@@ -614,5 +615,3 @@ def init_sorted_ids_and_cumsum_buffer(
     )
 
     return sorted_ids, cumsum_buffer
-
-
