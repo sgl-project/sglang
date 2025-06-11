@@ -13,7 +13,6 @@ namespace radix_tree_v2 {
 
 using token_t = std::int32_t;
 using token_vec_t = std::vector<token_t>;
-// the first element is pointer to device node, the second element is pointer to host node
 using NodeHandle = std::uintptr_t;
 
 struct RadixTree {
@@ -27,13 +26,20 @@ struct RadixTree {
   RadixTree& operator=(const RadixTree&) = delete;
   RadixTree& operator=(RadixTree&&) = delete;
 
+  /// @return Nodes that are locked and require write-through.
   std::vector<NodeHandle> insert(const token_vec_t& key, at::Tensor value);
+  /// @return (device indices that are matched, device node, host node)
   std::tuple<std::vector<at::Tensor>, NodeHandle, NodeHandle> match_prefix(const token_vec_t& key);
+  /// @return Device indices that need to be evicted (on python side).
   std::vector<at::Tensor> evict(std::size_t num_tokens);
+  /// @brief (Un-)Lock a node.
   void lock_ref(NodeHandle node_id, bool increment /* increment or decrement */);
 
+  /// @return How many size are still evictable (on device + not locked).
   std::size_t evictable_size() const;
+  /// @return How many size are protected (locked).
   std::size_t protected_size() const;
+  /// @return How many size are used on device.
   std::size_t total_size() const;
 
   struct Impl;

@@ -68,7 +68,7 @@ std::tuple<std::vector<at::Tensor>, NodeHandle, NodeHandle> RadixTree::match_pre
 
   // collect all the device indices
   std::vector<at::Tensor> device_indices{};
-  m_impl->walk_to_root(device_node, [&](TreeNode* n) { device_indices.push_back(n->indices()); });
+  m_impl->walk_to_root(device_node, [&](TreeNode* n) { device_indices.push_back(n->device_indices()); });
   std::reverse(device_indices.begin(), device_indices.end());
 
   return {std::move(device_indices), pointer_cast(device_node), pointer_cast(host_node)};
@@ -84,7 +84,7 @@ std::vector<at::Tensor> RadixTree::evict(std::size_t num_tokens) {
     const auto node = heap.top();
     heap.pop();
     _assert(node->on_gpu());
-    evicted_values.push_back(node->indices());
+    evicted_values.push_back(node->device_indices());
     num_evict += node->length();
     const auto parent = node->parent();
     if (!node->on_cpu()) {
@@ -121,9 +121,9 @@ std::size_t RadixTree::Impl::evict_host_batch(const std::vector<std::size_t>& si
   return num_success;
 }
 
-void RadixTree::lock_ref(NodeHandle node_ptr, bool increment) {
+void RadixTree::lock_ref(NodeHandle node_id, bool increment) {
   if (m_impl->disabled) return;
-  m_impl->lock_ref(pointer_cast(node_ptr), increment);
+  m_impl->lock_ref(node_id, increment);
 }
 
 std::size_t RadixTree::evictable_size() const {

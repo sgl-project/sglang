@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <unordered_map>
 #include <vector>
 
 #include "common.h"
@@ -38,22 +39,41 @@ struct RadixTree::Impl {
     m_cached_vec.reserve(page_size);
   }
 
-  // node: x -> [GPU]
-  TreeNode* create_device_node(TreeNode* parent, token_vec_t vec, at::Tensor indices) {
-    auto new_node = std::make_unique<TreeNode>();
-    auto result = new_node.get();
-    new_node->_unsafe_tokens() = std::move(vec);
-    new_node->_unsafe_indices() = std::move(indices);
-    m_evictable_size += new_node->length();
-    add_child(parent, std::move(new_node));
-    return result;
+  TreeNode* split_node(node_iterator_t it, std::size_t prefix) {
+    // from `parent -> old_node` to `parent-> new_node -> old_node`
+    // the prefix part of the old node is moved to the new node
+    auto old_node_ptr = std::move(it->second);
+    auto new_node_ptr = std::make_unique<TreeNode>();
+    auto* old_node = old_node_ptr.get();
+    auto* new_node = new_node_ptr.get();
+    auto* parent = old_node->parent();
+    // set up data structures
+    TreeNode::split_prefix(new_node, old_node, prefix);
+    // set up parent-child relationship
+    add_child(new_node, std::move(old_node_ptr));
+    add_child(parent, std::move(new_node_ptr), it);
+    m_node_map[new_node->node_id] = new_node;  // add to the map
+    return new_node;
   }
 
-  // node: [CPU] -> [CPU + GPU]
-  void load_to_device(TreeNode* node, at::Tensor new_indices) {
+  // node: x -> [GPU]
+  TreeNode* create_device_node(TreeNode* parent, token_vec_t vec, at::Tensor indices) {
+    auto new_node_ptr = std::make_unique<TreeNode>();
+    auto new_node = new_node_ptr.get();
+    new_node_ptr->_unsafe_tokens() = std::move(vec);
+    new_node_ptr->_unsafe_device_indices() = std::move(indices);
+    m_evictable_size += new_node_ptr->length();
+    add_child(parent, std::move(new_node_ptr));
+    m_node_map[new_node->node_id] = new_node;  // add to the map
+    return new_node;
+  }
+
+  // node: [CPU] -> x
+  void remove_host_node(TreeNode* node) {
     _assert(node->on_cpu_only());
-    node->_unsafe_indices() = std::move(new_indices);
-    m_evictable_size += node->length();
+    m_host_pool.free(node->host_indices());
+    node->parent()->erase_child(get_key(node));
+    m_node_map.erase(node->node_id);  // remove from the map
   }
 
   // node: [GPU] -> x
@@ -61,20 +81,21 @@ struct RadixTree::Impl {
     _assert(node->on_gpu_only());
     m_evictable_size -= node->length();
     node->parent()->erase_child(get_key(node));
+    m_node_map.erase(node->node_id);  // remove from the map
+  }
+
+  // node: [CPU] -> [CPU + GPU]
+  void load_to_device(TreeNode* node, at::Tensor new_indices) {
+    _assert(node->on_cpu_only());
+    node->_unsafe_device_indices() = std::move(new_indices);
+    m_evictable_size += node->length();
   }
 
   // node: [CPU + GPU] -> [CPU]
   void offload_to_host(TreeNode* node) {
     _assert(node->on_both());
-    node->_unsafe_indices().reset();
+    node->_unsafe_device_indices().reset();
     m_evictable_size -= node->length();
-  }
-
-  // node: [CPU] -> x
-  void remove_host_node(TreeNode* node) {
-    _assert(node->on_cpu_only());
-    m_host_pool.free(node->_unsafe_host_indices());
-    node->parent()->erase_child(get_key(node));
   }
 
   // increase the hit count of a node
@@ -115,22 +136,6 @@ struct RadixTree::Impl {
   // walk until the node is completely matched
   std::pair<TreeNode*, std::size_t> tree_walk(token_slice key) {
     // Some helper functions
-    const auto _split_node = [this](node_iterator_t it, std::size_t prefix) {
-      // from `parent -> old_node` to `parent-> new_node -> old_node`
-      // the prefix part of the old node is moved to the new node
-      auto old_node_ptr = std::move(it->second);
-      auto new_node_ptr = std::make_unique<TreeNode>();
-      auto* old_node = old_node_ptr.get();
-      auto* new_node = new_node_ptr.get();
-      auto* parent = old_node->parent();
-      // set up data structures
-      TreeNode::split_prefix(new_node, old_node, prefix);
-      // set up parent-child relationship
-      add_child(new_node, std::move(old_node_ptr));
-      add_child(parent, std::move(new_node_ptr), it);
-      return new_node;
-    };
-
     _assert(key.size() % page_size == 0, "Key should be page-aligned");
 
     std::size_t total_prefix_length = 0;
@@ -150,7 +155,7 @@ struct RadixTree::Impl {
 
       // split the node if the prefix is not the whole token vector
       if (prefix_length < node->length()) {
-        return {_split_node(it, prefix_length), total_prefix_length};
+        return {split_node(it, prefix_length), total_prefix_length};
       }
 
       // we have matched the whole key, continue to the next node
@@ -240,6 +245,10 @@ struct RadixTree::Impl {
       });
   }
 
+  void lock_ref(NodeHandle node_ptr, bool increment) {
+    return lock_ref(pointer_cast(node_ptr), increment);
+  }
+
   std::size_t total_size() {
     std::size_t size = 0;
     std::vector<TreeNode*> stack = {&m_root};
@@ -288,12 +297,20 @@ struct RadixTree::Impl {
 
   std::size_t evict_host_batch(const std::vector<std::size_t>& needed_sizes);
 
+  TreeNode* pointer_cast(NodeHandle node_id) {
+    auto it = m_node_map.find(node_id);
+    _assert(it != m_node_map.end(), "Node not found in the map");
+    return it->second;
+  }
+
   TreeNode m_root;               // root node of the tree
   std::size_t m_evictable_size;  // number of evictable tokens
   std::size_t m_protected_size;  // number of protected tokens
 
   token_vec_t m_cached_vec;       // cached vector of tokens for the current operation
   HiCacheMemoryPool m_host_pool;  // memory pool for host tensor indices
+
+  std::unordered_map<std::size_t, TreeNode*> m_node_map;  // map of node keys to nodes
 
  public:
   // some public constant configurations (without m_ prefix)

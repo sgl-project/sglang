@@ -67,7 +67,7 @@ struct TreeNode {
       : ref_count(0),
         hit_count(0),
         m_tokens(),
-        m_indices(),
+        m_device_indices(),
         m_host_indices(),
         m_parent(this),
         m_children(),
@@ -87,7 +87,7 @@ struct TreeNode {
   }
 
   bool on_gpu() const {
-    return m_indices.defined();
+    return m_device_indices.defined();
   }
 
   bool on_cpu() const {
@@ -150,7 +150,7 @@ struct TreeNode {
     return m_parent;
   }
 
-  // set up public fields for the new node
+  // set up all data structures except for parent-child relationship
   static void split_prefix(TreeNode* new_node, TreeNode* old_node, std::size_t prefix) {
     auto tokens = std::move(old_node->m_tokens);
     _assert(0 < prefix && prefix < tokens.size(), "Invalid prefix size for split");
@@ -162,15 +162,15 @@ struct TreeNode {
     // set up values
     const int64_t new_size = new_node->length();
     const int64_t old_size = old_node->length();
-    if (old_node->m_indices.defined()) {
-      auto new_indices = old_node->m_indices.split_with_sizes({new_size, old_size});
-      new_node->m_indices = std::move(new_indices[0]);
-      old_node->m_indices = std::move(new_indices[1]);
+    if (old_node->m_device_indices.defined()) {
+      auto new_indices = old_node->m_device_indices.split_with_sizes({new_size, old_size});
+      new_node->m_device_indices = std::move(new_indices[0]);
+      old_node->m_device_indices = std::move(new_indices[1]);
     }
     if (old_node->m_host_indices.defined()) {
-      auto new_host_indices = old_node->m_host_indices.split_with_sizes({new_size, old_size});
-      new_node->m_host_indices = std::move(new_host_indices[0]);
-      old_node->m_host_indices = std::move(new_host_indices[1]);
+      auto new_indices = old_node->m_host_indices.split_with_sizes({new_size, old_size});
+      new_node->m_host_indices = std::move(new_indices[0]);
+      old_node->m_host_indices = std::move(new_indices[1]);
     }
 
     // set up ref counts and hit counts
@@ -185,18 +185,19 @@ struct TreeNode {
     return it.first - a.begin();  // >= offset
   }
 
-  at::Tensor indices() const {
-    return m_indices;
+  at::Tensor device_indices() const {
+    return m_device_indices;
   }
   at::Tensor host_indices() const {
     return m_host_indices;
   }
 
+  // visiting tokens are always unsafe (use `diff_key` instead)
   token_vec_t& _unsafe_tokens() {
     return m_tokens;
   }
-  at::Tensor& _unsafe_indices() {
-    return m_indices;
+  at::Tensor& _unsafe_device_indices() {
+    return m_device_indices;
   }
   at::Tensor& _unsafe_host_indices() {
     return m_host_indices;
@@ -208,26 +209,19 @@ struct TreeNode {
 
  private:
   token_vec_t m_tokens;
-  at::Tensor m_indices;
+  at::Tensor m_device_indices;
   at::Tensor m_host_indices;  // indices of host value, if applicable
   TreeNode* m_parent;
   std::unordered_map<token_vec_t, std::unique_ptr<TreeNode>, std_vector_hash> m_children;
   timestamp_t m_last_access_time;
 
  public:
-  static constexpr std::size_t kMagic = 0x19260817;
-  const std::size_t node_id;         // unique ID for the node
-  const std::size_t magic = kMagic;  // magic number for debugging
+  const std::size_t node_id;  // unique ID for the node
 };
 
 inline std::uintptr_t pointer_cast(TreeNode* node) {
-  return reinterpret_cast<std::uintptr_t>(node);
-}
-
-inline TreeNode* pointer_cast(std::uintptr_t ptr) {
-  auto node = reinterpret_cast<TreeNode*>(ptr);
-  _assert(node->magic == node->kMagic, "Invalid pointer cast to TreeNode");
-  return node;
+  // return reinterpret_cast<std::uintptr_t>(node);
+  return node->node_id;
 }
 
 }  // namespace radix_tree_v2
