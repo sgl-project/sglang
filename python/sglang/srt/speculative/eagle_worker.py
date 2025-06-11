@@ -470,13 +470,16 @@ class EAGLEWorker(TpModelWorker):
                 device=self.device,
                 hidden_size=self.model_config.hidden_size,
                 topk=self.topk,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
             )
             spec_info = batch.spec_info
 
         # Get forward batch
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.spec_num_draft_tokens = self.topk
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
@@ -600,6 +603,7 @@ class EAGLEWorker(TpModelWorker):
 
         if not batch.forward_mode.is_idle():
             spec_info.prepare_for_verify(batch, self.page_size)
+            batch.return_hidden_states = False
             batch.forward_mode = ForwardMode.TARGET_VERIFY
 
         batch.spec_info = spec_info
@@ -607,6 +611,7 @@ class EAGLEWorker(TpModelWorker):
             seq_lens_cpu_cache=spec_info.seq_lens_cpu
         )
         model_worker_batch.spec_num_draft_tokens = self.speculative_num_draft_tokens
+        assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
         if batch.has_grammar:
             retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
@@ -670,6 +675,7 @@ class EAGLEWorker(TpModelWorker):
                 device=self.device,
                 hidden_size=self.model_config.hidden_size,
                 topk=self.topk,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
             )
             res = EagleVerifyOutput(
                 draft_input=draft_input,
@@ -763,17 +769,20 @@ class EAGLEWorker(TpModelWorker):
             hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # Sometimes we get hidden states produced by CaptureHiddenMode.FULL, so we have to select just the last
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids,
         )
 
+        batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=seq_lens_cpu
         )
         model_worker_batch.spec_num_draft_tokens = 1
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
@@ -811,10 +820,14 @@ class EAGLEWorker(TpModelWorker):
                     device=self.device,
                     hidden_size=self.model_config.hidden_size,
                     topk=self.topk,
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
                 batch.forward_mode = ForwardMode.IDLE
+        batch.return_hidden_states = False
+
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.spec_num_draft_tokens = self.speculative_num_draft_tokens
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )

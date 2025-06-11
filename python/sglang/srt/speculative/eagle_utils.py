@@ -86,7 +86,13 @@ class EagleDraftInput:
             pt += extend_len
 
     @classmethod
-    def create_for_idle(cls, device: torch.device, hidden_size: int, topk: int):
+    def create_for_idle(
+        cls,
+        device: torch.device,
+        hidden_size: int,
+        topk: int,
+        capture_hidden_mode: CaptureHiddenMode,
+    ):
         return cls(
             verified_id=None,
             hidden_states=torch.empty(
@@ -94,6 +100,7 @@ class EagleDraftInput:
             ),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
+            capture_hidden_mode=capture_hidden_mode,
         )
 
     def prepare_extend_after_decode(

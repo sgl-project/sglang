@@ -135,6 +135,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `download_dir` | Overrides the default Hugging Face cache directory for model weights. | None |
 | `base_gpu_id` | Sets the first GPU to use when distributing the model across multiple GPUs. | `0` |
 | `allow_auto_truncate`| Automatically truncate requests that exceed the maximum input length. | `False` |
+| `enable_return_hidden_states` | Enables returning hidden states to the user. | `False` |
 
 ## Logging
 
@@ -184,7 +185,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | Arguments | Description | Defaults |
 |----------|-------------|---------|
 | `speculative_draft_model_path` | The draft model path for speculative decoding. | None |
-| `speculative_algorithm` | The algorithm for speculative decoding. Currently [EAGLE](https://arxiv.org/html/2406.16858v1) and [EAGLE3](https://arxiv.org/pdf/2503.01840) are supported. Note that the radix cache, chunked prefill, and overlap scheduler are disabled when using eagle speculative decoding. | None |
+| `speculative_algorithm` | The algorithm for speculative decoding. Currently [EAGLE](https://arxiv.org/html/2406.16858v1) and [EAGLE3](https://arxiv.org/pdf/2503.01840) are supported. Note that the overlap scheduler is disabled when using eagle speculative decoding. | None |
 | `speculative_num_steps` | How many draft passes we run before verifying. | None |
 | `speculative_num_draft_tokens` | The number of tokens proposed in a draft. | None |
 | `speculative_eagle_topk` | The number of top candidates we keep for verification at each step for [Eagle](https://arxiv.org/html/2406.16858v1). | None |
