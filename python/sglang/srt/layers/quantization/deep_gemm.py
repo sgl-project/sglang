@@ -118,7 +118,7 @@ def _compile_warning_1():
     if not _IN_PRECOMPILE_STAGE and _IS_FIRST_RANK_ON_NODE:
         logger.warning(
             "Entering DeepGEMM JIT Pre-Compile session. "
-            "And it may takes a long time(Typically 10-20 mins) "
+            "It may takes a long time (typically 10-20 mins) "
             "if you have not run `sglang.compile_deep_gemm`. "
             "It is recommended to run `sglang.compile_deep_gemm` with same args as `sglang.launch_server`"
             " for pre-compilation to reduce the overhead if you have not run it before. "

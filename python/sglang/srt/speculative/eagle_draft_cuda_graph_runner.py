@@ -41,6 +41,9 @@ class EAGLEDraftCudaGraphRunner:
         self.tp_size = self.model_runner.tp_size
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.enable_profile_cuda_graph = (
+            model_runner.server_args.enable_profile_cuda_graph
+        )
         server_args = model_runner.server_args
 
         # Batch sizes to capture
@@ -114,9 +117,7 @@ class EAGLEDraftCudaGraphRunner:
         hidden_states = self.hidden_states[:num_seqs]
 
         spec_info = EagleDraftInput(
-            topk_p=topk_p,
-            topk_index=topk_index,
-            hidden_states=hidden_states,
+            topk_p=topk_p, topk_index=topk_index, hidden_states=hidden_states
         )
 
         # Forward batch
