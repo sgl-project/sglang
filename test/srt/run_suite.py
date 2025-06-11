@@ -27,6 +27,7 @@ suites = {
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_vlm_models.py", 437),
         TestFile("models/test_transformers_models.py", 320),
+        TestFile("test_awq.py", 180),
         TestFile("test_abort.py", 51),
         TestFile("test_block_int8.py", 22),
         TestFile("test_create_kvindices.py", 2),
@@ -184,7 +185,6 @@ suites = {
         TestFile("test_nightly_gsm8k_eval_amd.py"),
     ],
     "vllm_dependency_test": [
-        TestFile("test_awq.py"),
         TestFile("test_bnb.py"),
         # TestFile("test_gguf.py", 78), # TODO: Fix GGuf after updating to torch 2.7 and vllm 0.9
         TestFile("test_gptqmodel_dynamic.py", 72),
