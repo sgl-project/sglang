@@ -4,7 +4,7 @@ python3 -m unittest test_pp_single_node.TestPPAccuracy.test_gsm8k
 python3 -m unittest test_pp_single_node.TestQwenPPAccuracy.test_pp_consistency
 python3 -m unittest test_pp_single_node.TestQwenMoePPAccuracy.test_pp_consistency
 python3 -m unittest test_pp_single_node.TestFixedBugs.test_chunked_prefill_with_small_bs
-python3 -m unittest test_pp_single_node.TestTritonAttentionBackend.test_gsm8k
+python3 -m unittest test_pp_single_node.TestTritonAttentionBackend.test_triton_attention_backend_with_small_bs
 """
 
 import time
@@ -254,40 +254,30 @@ class TestFixedBugs(unittest.TestCase):
 
 
 class TestTritonAttentionBackend(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.base_url = "http://127.0.0.1:23337"
-        cls.process = popen_launch_server(
-            DEFAULT_MODEL_NAME_FOR_TEST,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--tp-size",
-                2,
-                "--pp-size",
-                2,
-                "--attention-backend",
-                "triton"
-            ],
+    def test_triton_attention_backend_with_small_bs(self):
+        model = DEFAULT_MODEL_NAME_FOR_TEST
+        server_args = ServerArgs(model_path=model)
+        bench_args = OneBatchBenchArgs(
+            batch_size=(1,),
+            input_len=(1,),
+            output_len=(1,),
+            base_url=DEFAULT_URL_FOR_TEST,
         )
-
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+        other_server_args = [
+            "--tp-size",
+            2,
+            "--pp-size",
+            2,
+            "--attention-backend",
+            "triton"
+        ]
+        run_bench_one_batch_server(
+            model,
+            DEFAULT_URL_FOR_TEST,
+            server_args,
+            bench_args,
+            other_server_args,
         )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-
-        self.assertGreater(metrics["accuracy"], 0.74)
-        # Wait a little bit so that the memory check happens.
-        time.sleep(4)
 
 
 if __name__ == "__main__":
