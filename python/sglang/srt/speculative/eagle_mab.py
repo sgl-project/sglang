@@ -253,7 +253,6 @@ class MABGroupManager:
         self.batch_size_history = []
         self.timestamp_history = []
         self.reward_history = []
-        self.accept_length_history = []
         self.start_time = time.time()
         
         # Real-time plotting
@@ -341,9 +340,8 @@ class MABGroupManager:
         group = self._get_group(batch_size)
         self.mabs[group].strategy_metrics[strategy].add_metrics(reward, accept_length)
         
-        # Track reward and accept length history
+        # Track reward history
         self.reward_history.append(reward)
-        self.accept_length_history.append(accept_length)
 
     def get_stable_accept_length(self, strategy: str) -> float:
         """Get stable accept_length across all groups.
@@ -385,8 +383,8 @@ class MABGroupManager:
     def _realtime_plot_worker(self):
         """Worker thread for real-time plotting."""
         plt.ion()
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 12))
-        fig.suptitle(f'MAB Strategy Selection ({self.algorithm})', fontsize=16)
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10))
+        fig.suptitle(f'MAB Strategy Selection ({self.algorithm})')
         
         while self.enable_realtime_plot:
             try:
@@ -413,119 +411,41 @@ class MABGroupManager:
         ax2.clear()
         ax3.clear()
         
-        # Plot 1: Strategy selection over time with batch size coloring
+        # Plot 1: Strategy selection over time
         strategy_indices = {s: i for i, s in enumerate(self.strategies)}
         strategy_nums = [strategy_indices[s] for s in self.strategy_history]
-        
-        # Use batch size for color mapping
-        scatter = ax1.scatter(self.timestamp_history, strategy_nums, 
-                            c=self.batch_size_history, 
-                            cmap='viridis', 
-                            alpha=0.6, 
-                            s=50,
-                            edgecolors='black',
-                            linewidth=0.5)
-        
-        # Add colorbar for batch size
-        cbar = plt.colorbar(scatter, ax=ax1)
-        cbar.set_label('Batch Size', rotation=270, labelpad=15)
-        
+        ax1.scatter(self.timestamp_history, strategy_nums, alpha=0.6, s=10)
         ax1.set_yticks(list(strategy_indices.values()))
         ax1.set_yticklabels(list(strategy_indices.keys()))
         ax1.set_xlabel('Time (s)')
         ax1.set_ylabel('Strategy')
-        ax1.set_title('Strategy Selection Over Time (colored by batch size)')
+        ax1.set_title('Strategy Selection Over Time')
         ax1.grid(True, alpha=0.3)
         
-        # Add horizontal lines to separate strategies
-        for i in range(len(self.strategies) - 1):
-            ax1.axhline(y=i + 0.5, color='gray', linestyle='--', alpha=0.3)
+        # Plot 2: Batch size over time
+        ax2.plot(self.timestamp_history, self.batch_size_history, 'b-', alpha=0.7)
+        ax2.fill_between(self.timestamp_history, 0, self.batch_size_history, alpha=0.3)
+        ax2.set_xlabel('Time (s)')
+        ax2.set_ylabel('Batch Size')
+        ax2.set_title('Batch Size Over Time')
+        ax2.grid(True, alpha=0.3)
         
-        # Plot 2: Accept length over time with strategy coloring
-        if len(self.accept_length_history) > 0:
-            # Create color map for strategies
-            strategy_colors = [strategy_indices[s] for s in self.strategy_history[:len(self.accept_length_history)]]
-            colors = plt.cm.tab10(np.array(strategy_colors) / max(len(self.strategies), 1))
-            
-            # Plot accept lengths
-            timestamps = self.timestamp_history[:len(self.accept_length_history)]
-            ax2.scatter(timestamps, self.accept_length_history, c=colors, alpha=0.6, s=30)
-            
-            # Add moving average
-            if len(self.accept_length_history) >= 10:
-                window = min(50, len(self.accept_length_history) // 2)
-                accept_ma = np.convolve(self.accept_length_history, np.ones(window)/window, mode='valid')
-                time_ma = timestamps[window-1:]
-                ax2.plot(time_ma, accept_ma, 'k-', alpha=0.8, linewidth=2, label='Moving Avg')
-            
-            # Add strategy labels with colors
-            for idx, strategy in enumerate(self.strategies):
-                ax2.scatter([], [], c=plt.cm.tab10(idx / max(len(self.strategies), 1)), 
-                          label=strategy, s=50)
-            
-            ax2.set_xlabel('Time (s)')
-            ax2.set_ylabel('Accept Length')
-            ax2.set_title('Accept Length Over Time (colored by strategy)')
-            ax2.grid(True, alpha=0.3)
-            ax2.legend(loc='upper right', fontsize=8)
-            
-            # Add text showing average accept length per strategy
-            strategy_accept_avgs = {}
-            for i, (strategy, accept_len) in enumerate(zip(self.strategy_history[:len(self.accept_length_history)], 
-                                                          self.accept_length_history)):
-                if strategy not in strategy_accept_avgs:
-                    strategy_accept_avgs[strategy] = []
-                strategy_accept_avgs[strategy].append(accept_len)
-            
-            text_y = 0.95
-            for strategy in self.strategies:
-                if strategy in strategy_accept_avgs:
-                    avg_accept = np.mean(strategy_accept_avgs[strategy])
-                    ax2.text(0.02, text_y, f'{strategy}: {avg_accept:.2f}', 
-                           transform=ax2.transAxes, fontsize=8,
-                           verticalalignment='top')
-                    text_y -= 0.05
-        
-        # Plot 3: Batch size and reward correlation
+        # Plot 3: Reward over time (if available)
         if self.reward_history:
-            # Create subplot with two y-axes
-            ax3_twin = ax3.twinx()
+            # Moving average for rewards
+            window = min(50, len(self.reward_history))
+            if len(self.reward_history) >= window:
+                reward_ma = np.convolve(self.reward_history, np.ones(window)/window, mode='valid')
+                time_ma = self.timestamp_history[window-1:len(self.reward_history)]
+                ax3.plot(time_ma, reward_ma, 'g-', alpha=0.8, label='Moving Avg')
             
-            # Plot batch size
-            line1 = ax3.plot(self.timestamp_history, self.batch_size_history, 
-                           'b-', alpha=0.7, label='Batch Size')
-            ax3.fill_between(self.timestamp_history, 0, self.batch_size_history, 
-                           alpha=0.2, color='blue')
+            ax3.scatter(self.timestamp_history[:len(self.reward_history)], 
+                       self.reward_history, alpha=0.3, s=5, label='Raw')
             ax3.set_xlabel('Time (s)')
-            ax3.set_ylabel('Batch Size', color='b')
-            ax3.tick_params(axis='y', labelcolor='b')
-            
-            # Plot reward on twin axis
-            if len(self.reward_history) > 0:
-                reward_timestamps = self.timestamp_history[:len(self.reward_history)]
-                line2 = ax3_twin.plot(reward_timestamps, self.reward_history, 
-                                    'r.', alpha=0.5, markersize=3, label='Reward')
-                
-                # Add moving average for rewards
-                if len(self.reward_history) >= 10:
-                    window = min(50, len(self.reward_history) // 2)
-                    reward_ma = np.convolve(self.reward_history, np.ones(window)/window, mode='valid')
-                    time_ma = reward_timestamps[window-1:]
-                    line3 = ax3_twin.plot(time_ma, reward_ma, 'r-', alpha=0.8, 
-                                        linewidth=2, label='Reward MA')
-                
-                ax3_twin.set_ylabel('Reward', color='r')
-                ax3_twin.tick_params(axis='y', labelcolor='r')
-                
-                # Combine legends
-                lines = line1 + line2
-                if len(self.reward_history) >= 10:
-                    lines = line1 + line2 + line3
-                labels = [l.get_label() for l in lines]
-                ax3.legend(lines, labels, loc='upper left')
-            
-            ax3.set_title('Batch Size vs Reward Over Time')
+            ax3.set_ylabel('Reward')
+            ax3.set_title('Reward Over Time')
             ax3.grid(True, alpha=0.3)
+            ax3.legend()
         
         fig.tight_layout()
     
@@ -535,12 +455,12 @@ class MABGroupManager:
             print("No history to plot")
             return
             
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 12))
-        fig.suptitle(f'MAB Strategy Selection History ({self.algorithm})', fontsize=16)
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10))
+        fig.suptitle(f'MAB Strategy Selection History ({self.algorithm})')
         
         self._update_plots(fig, ax1, ax2, ax3)
         
-        plt.savefig(filename, dpi=150, bbox_inches='tight')
+        plt.savefig(filename, dpi=150)
         plt.close(fig)
         print(f"Plot saved to {filename}")
     
