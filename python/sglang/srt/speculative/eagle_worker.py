@@ -3,6 +3,10 @@ import os
 import time
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple
+import threading
+import atexit
+from datetime import datetime
+import json
 
 import torch
 from huggingface_hub import snapshot_download
@@ -943,6 +947,19 @@ class EAGLEWorker(TpModelWorker):
             "mab_strategy": None,
             "batch_size": None,
         }
+        
+        # Set up automatic MAB plot saving
+        self.mab_output_dir = os.environ.get("MAB_OUTPUT_DIR", "mab_results")
+        self.mab_save_interval = int(os.environ.get("MAB_SAVE_INTERVAL", "60"))  # seconds
+        os.makedirs(self.mab_output_dir, exist_ok=True)
+        
+        # Start background thread for periodic saving
+        self.mab_save_thread = None
+        self.mab_save_enabled = True
+        self._start_mab_save_thread()
+        
+        # Register cleanup on shutdown
+        atexit.register(self._save_mab_final)
 
         # Set up resources for all strategies
         for mab_strategy in self.mab_strategies:
@@ -971,6 +988,84 @@ class EAGLEWorker(TpModelWorker):
             )
 
         self.set_mab_strategy(self.default_mab_strategy)
+    
+    def _start_mab_save_thread(self):
+        """Start background thread for periodic MAB plot saving."""
+        if self.mab_save_thread is None:
+            self.mab_save_thread = threading.Thread(
+                target=self._mab_save_loop,
+                daemon=True
+            )
+            self.mab_save_thread.start()
+            logger.info(f"Started MAB auto-save thread (interval: {self.mab_save_interval}s, output: {self.mab_output_dir})")
+    
+    def _mab_save_loop(self):
+        """Background loop to periodically save MAB plots."""
+        last_save_time = time.time()
+        
+        while self.mab_save_enabled:
+            current_time = time.time()
+            
+            if current_time - last_save_time >= self.mab_save_interval:
+                self._save_mab_snapshot()
+                last_save_time = current_time
+            
+            time.sleep(1)
+    
+    def _save_mab_snapshot(self):
+        """Save current MAB statistics and plot."""
+        if not self.use_mab:
+            return
+            
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        plot_file = os.path.join(self.mab_output_dir, f"mab_plot_{timestamp}.png")
+        
+        try:
+            # Save plot
+            self.mab_manager.save_history_plot(plot_file)
+            
+            # Also save statistics as JSON
+            stats = self.mab_manager.get_strategy_stats()
+            stats_file = os.path.join(self.mab_output_dir, f"mab_stats_{timestamp}.json")
+            
+            with open(stats_file, 'w') as f:
+                json.dump({
+                    'timestamp': timestamp,
+                    'algorithm': self.mab_algorithm,
+                    'strategies': self.mab_strategies,
+                    'window_size': self.mab_window_size,
+                    'statistics': stats,
+                    'total_requests': len(self.mab_manager.strategy_history)
+                }, f, indent=2)
+            
+            logger.info(f"Saved MAB snapshot: {plot_file} and {stats_file}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to save MAB snapshot: {e}")
+    
+    def _save_mab_final(self):
+        """Save final MAB plot on shutdown."""
+        if not self.use_mab:
+            return
+            
+        self.mab_save_enabled = False
+        
+        # Save final snapshot
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        plot_file = os.path.join(self.mab_output_dir, f"mab_plot_final_{timestamp}.png")
+        
+        try:
+            self.mab_manager.save_history_plot(plot_file)
+            
+            # Print final statistics
+            stats = self.mab_manager.get_strategy_stats()
+            logger.info(f"Final MAB Statistics (saved to {plot_file}):")
+            for strategy, strategy_stats in stats.items():
+                logger.info(f"  {strategy}: {strategy_stats['count']} selections "
+                           f"({strategy_stats['percentage']:.1f}%), "
+                           f"avg batch size: {strategy_stats['avg_batch_size']:.1f}")
+        except Exception as e:
+            logger.warning(f"Failed to save final MAB plot: {e}")
 
     def enable_mab_plotting(self, enable: bool = True):
         """Enable or disable real-time MAB plotting."""
