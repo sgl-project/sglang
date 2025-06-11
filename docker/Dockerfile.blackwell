@@ -28,7 +28,7 @@ RUN git clone --depth=1 https://github.com/sgl-project/sglang.git \
 
 RUN pip3 install nvidia-nccl-cu12==2.26.2.post1 --force-reinstall --no-deps --break-system-packages
 
-RUN pip3 install https://download.pytorch.org/whl/cu128/flashinfer/flashinfer_python-0.2.5%2Bcu128torch2.7-cp38-abi3-linux_x86_64.whl --break-system-packages
+RUN pip3 install flashinfer_python==0.2.6.post1 --break-system-packages
 
 ENV DEBIAN_FRONTEND=interactive
 

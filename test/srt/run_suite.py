@@ -59,6 +59,7 @@ suites = {
         TestFile("test_openai_adapter.py", 1),
         TestFile("test_openai_function_calling.py", 60),
         TestFile("test_openai_server.py", 149),
+        TestFile("test_openai_server_hidden_states.py", 240),
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_pytorch_sampling_backend.py", 66),
