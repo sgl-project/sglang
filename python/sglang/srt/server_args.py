@@ -28,7 +28,6 @@ from sglang.srt.utils import (
     configure_ipv6,
     get_device,
     get_device_memory_capacity,
-    is_cuda,
     is_flashinfer_available,
     is_hip,
     is_port_available,
@@ -214,8 +213,8 @@ class ServerArgs:
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
-    warmups: Optional[str] = None
     enable_return_hidden_states: bool = False
+    warmups: Optional[str] = None
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -536,10 +535,16 @@ class ServerArgs:
             help="The path of the tokenizer.",
         )
         parser.add_argument(
-            "--host", type=str, default=ServerArgs.host, help="The host of the server."
+            "--host",
+            type=str,
+            default=ServerArgs.host,
+            help="The host of the HTTP server.",
         )
         parser.add_argument(
-            "--port", type=int, default=ServerArgs.port, help="The port of the server."
+            "--port",
+            type=int,
+            default=ServerArgs.port,
+            help="The port of the HTTP server.",
         )
         parser.add_argument(
             "--tokenizer-mode",
@@ -694,6 +699,18 @@ class ServerArgs:
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
         )
+        parser.add_argument(
+            "--impl",
+            type=str,
+            default=ServerArgs.impl,
+            help="Which implementation of the model to use.\n\n"
+            '* "auto" will try to use the SGLang implementation if it exists '
+            "and fall back to the Transformers implementation if no SGLang "
+            "implementation is available.\n"
+            '* "sglang" will use the SGLang model implementation.\n'
+            '* "transformers" will use the Transformers model '
+            "implementation.\n",
+        )
 
         # Memory and scheduling
         parser.add_argument(
@@ -751,18 +768,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.page_size,
             help="The number of tokens in a page.",
-        )
-        parser.add_argument(
-            "--impl",
-            type=str,
-            default=ServerArgs.impl,
-            help="Which implementation of the model to use.\n\n"
-            '* "auto" will try to use the SGLang implementation if it exists '
-            "and fall back to the Transformers implementation if no SGLang "
-            "implementation is available.\n"
-            '* "sglang" will use the SGLang model implementation.\n'
-            '* "transformers" will use the Transformers model '
-            "implementation.\n",
         )
 
         # Other runtime options
@@ -1443,6 +1448,11 @@ class ServerArgs:
             help="Adopt base image processor instead of fast image processor.",
         )
         parser.add_argument(
+            "--enable-return-hidden-states",
+            action="store_true",
+            help="Enable returning hidden states with responses.",
+        )
+        parser.add_argument(
             "--warmups",
             type=str,
             required=False,
@@ -1468,12 +1478,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.debug_tensor_dump_inject,
             help="Inject the outputs from jax as the input of every layer.",
-        )
-
-        parser.add_argument(
-            "--enable-return-hidden-states",
-            action="store_true",
-            help="Enable returning hidden states with responses.",
         )
         parser.add_argument(
             "--debug-tensor-dump-prefill-only",
