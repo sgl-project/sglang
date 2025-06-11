@@ -96,6 +96,7 @@ class RuntimeEndpoint(BaseBackend):
             data = {
                 "text": prefix_str,
             }
+        data["sampling_params"] = {"max_new_tokens": 0}
 
         res = http_request(
             self.base_url + self.api_endpoint,
