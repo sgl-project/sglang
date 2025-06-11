@@ -538,7 +538,7 @@ class TokenizedGenerateReqInput:
 
     def __getstate__(self):
         current_device_index = torch.cuda.current_device()
-        # print(f"{current_device_index=} getstate")
+        print(f"{current_device_index=} getstate")
         state = dict(self.__dict__)
         global global_effective_mode
 
@@ -555,15 +555,34 @@ class TokenizedGenerateReqInput:
                 state["effective_mode"] = global_effective_mode
 
         if global_effective_mode is not None:
-            # since scheduler needs a clean Req to perform hash, make sure the following operations are on the clone
-            state["mm_inputs"] = copy.deepcopy(state["mm_inputs"])
+            original_mm_inputs = state["mm_inputs"]
 
-            mm_inputs = state["mm_inputs"]
-            for mm_item in mm_inputs["mm_items"]:
-                if not isinstance(mm_item.feature, TransportableTensor):
-                    mm_item.feature = TransportableTensor(
-                        transport_mode=global_effective_mode, feature=mm_item.feature
+            # 2. 手动创建 mm_inputs 及其内容的浅拷贝，以避免修改原始对象
+            # 2.1. 浅拷贝最外层的 MultimodalInputs 容器
+            new_mm_inputs = copy.copy(original_mm_inputs)
+
+            # 2.2. 为 mm_items 创建一个新的列表
+            new_mm_items = []
+
+            # 2.3. 遍历原始 item，为每个 item 创建浅拷贝，然后在新拷贝上进行修改
+            for original_item in original_mm_inputs["mm_items"]:
+                # 浅拷贝 MultimodalDataItem 对象
+                new_item = copy.copy(original_item)
+
+                # 现在可以安全地在新拷贝上进行修改，而不会影响原始的 item
+                if not isinstance(new_item.feature, TransportableTensor):
+                    new_item.feature = TransportableTensor(
+                        transport_mode=global_effective_mode, feature=new_item.feature
                     )
+                    new_item.feature.serialize()
+
+                new_mm_items.append(new_item)
+
+            # 2.4. 将新的 item 列表赋值给新的容器
+            new_mm_inputs["mm_items"] = new_mm_items
+
+            # 3. 最后，将 state 字典中的引用指向我们新创建的、已修改的容器
+            state["mm_inputs"] = new_mm_inputs
 
         return state
 
@@ -583,10 +602,10 @@ class TokenizedGenerateReqInput:
 
             for mm_item in mm_inputs["mm_items"]:
                 current_device_index = torch.cuda.current_device()
-                # print(f"{current_device_index=} {mm_item=}")
+                print(f"{current_device_index=} {mm_item=}")
                 assert isinstance(mm_item.feature, TransportableTensor)
                 mm_item.feature = mm_item.feature.deserialize()
-                # print(f"after {current_device_index=}  {mm_item=}")
+                print(f"after {current_device_index=}  {mm_item=}")
                 assert isinstance(mm_item.feature, torch.Tensor)
             # print(f"after {state=}")
 
