@@ -263,12 +263,7 @@ class TestTritonAttentionBackend(unittest.TestCase):
             output_len=(1,),
             base_url=DEFAULT_URL_FOR_TEST,
         )
-        other_server_args = [
-            "--pp-size",
-            4,
-            "--attention-backend",
-            "triton"
-        ]
+        other_server_args = ["--pp-size", 4, "--attention-backend", "triton"]
         run_bench_one_batch_server(
             model,
             DEFAULT_URL_FOR_TEST,
