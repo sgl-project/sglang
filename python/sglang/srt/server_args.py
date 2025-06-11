@@ -291,9 +291,8 @@ class ServerArgs:
                 if self.speculative_algorithm is not None:
                     # draft model and larger cuda graph buffers
                     reserved_mem += 2 * 1024
-
                 if self.enable_dp_attention:
-                    reserved_mem += 2 * 1024
+                    reserved_mem += 3 * 1024
 
                 self.mem_fraction_static = round((gpu_mem - reserved_mem) / gpu_mem, 3)
             else:
