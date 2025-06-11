@@ -180,10 +180,8 @@ impl Router {
 
         let worker_urls = if dp_awareness {
             // worker address now in the format of "http://host:port@dp_rank"
-            match Self::get_dp_aware_workers(&worker_urls, api_key) {
-                Ok(urls) => urls,
-                Err(err) => return Err(format!("Failed to get dp-aware workers: {}", err)),
-            }
+            Self::get_dp_aware_workers(&worker_urls, api_key)
+                .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?
         } else {
             worker_urls
         };
@@ -302,14 +300,6 @@ impl Router {
         }
     }
 
-    fn get_api_key(&self) -> Option<String> {
-        match self {
-            Router::RoundRobin { api_key, .. } => api_key.clone(),
-            Router::Random { api_key, .. } => api_key.clone(),
-            Router::CacheAware { api_key, .. } => api_key.clone(),
-        }
-    }
-
     fn wait_for_healthy_workers(
         worker_urls: &[String],
         timeout_secs: u64,
@@ -368,7 +358,10 @@ impl Router {
         }
     }
 
-    fn get_worker_dp_size(worker_url: &str, api_key: &Option<String>) -> Result<usize, String> {
+    fn get_worker_dp_size(
+        worker_url: &str,
+        api_key: &Option<String>
+    ) -> Result<usize, String> {
         let sync_client = reqwest::blocking::Client::new();
         let mut req_builder = sync_client.get(&format!("{}/get_server_info", worker_url));
         if let Some(key) = api_key {
@@ -378,29 +371,27 @@ impl Router {
         match req_builder.send() {
             Ok(res) => {
                 if res.status().is_success() {
-                    let server_info = res.text().unwrap();
-                    let server_info: serde_json::Value = match serde_json::from_str(&server_info) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let err_msg = format!("Failed to parse server info: {}", e);
-                            error!("{}", err_msg);
-                            return Err(err_msg);
-                        }
-                    };
-                    let dp_size = server_info["dp_size"].as_u64()
-                        .expect("dp_size should be extracted");
-                    return Ok(dp_size.try_into().unwrap());
+                    let server_info = res.text()
+                        .map_err(|e| format!("failed to read text from response: {}", e))?;
+
+                    let server_info: serde_json::Value = serde_json::from_str(&server_info)
+                        .map_err(|e| format!("failed to decode JSON: {}", e))?;
+
+                    let dp_size = server_info
+                        .get("dp_size")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| String::from("dp_size not found or not an u64"))?;
+
+                    Ok(if dp_size > usize::MAX as u64 {
+                        return Err(format!("dp_size is too large: {}", dp_size));
+                    } else {
+                        dp_size as usize
+                    })
                 } else {
-                    let err_msg = format!("Failed to get dp_size of worker: {}", worker_url);
-                    error!("{}", err_msg);
-                    return Err(err_msg);
+                    Err(format!("unexpected status code: {}", res.status()))
                 }
-            }
-            Err(_) => {
-                let err_msg = format!("Failed to get dp_size of worker: {}", worker_url);
-                error!("{}", err_msg);
-                return Err(err_msg);
-            }
+            },
+            Err(e) => Err(format!("error response: {}", e)),
         }
     }
 
@@ -418,8 +409,8 @@ impl Router {
                         let worker_url_dp = String::from(format!("{}@{}", &url, i));
                         dp_aware_workers.push(worker_url_dp);
                     }
-                }
-                Err(e) => return Err(format!("{}", e)),
+                },
+                Err(e) => return Err(format!("get_worker_dp_size failed: {}", e)),
             }
         }
 
@@ -453,7 +444,10 @@ impl Router {
             // Need to extract the URL from "http://host:port@dp_rank"
             let (worker_url_prefix, _dp_rank) = match Self::extract_dp_rank(worker_url) {
                 Ok(tup) => tup,
-                Err(_) => return HttpResponse::InternalServerError().finish(),
+                Err(e) => {
+                    error!("Failed to extract dp_rank: {}", e);
+                    return HttpResponse::InternalServerError().finish();
+                },
             };
             worker_url_prefix
         } else {
@@ -706,13 +700,13 @@ impl Router {
     fn extract_dp_rank(worker_url: &str) -> Result<(&str, usize), String> {
         let parts: Vec<&str> = worker_url.split('@').collect();
         if parts.len() != 2 {
-            return Err(format!("Invalid worker_url format: {}", worker_url));
+            return Err(format!("invalid worker_url format: {}", worker_url));
         }
 
         // Parse the second part (dp_rank) into an integer
         match parts[1].parse::<usize>() {
             Ok(dp_rank) => Ok((parts[0], dp_rank)),
-            Err(_) => Err(format!("Failed to parse dp_rank from worker_url: {}", worker_url)),
+            Err(_) => Err(format!("failed to parse dp_rank from worker_url: {}", worker_url)),
         }
     }
 
@@ -731,7 +725,10 @@ impl Router {
         let mut request_builder = if self.get_dp_awareness() {
             let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
                 Ok(tup) => tup,
-                Err(_) => return HttpResponse::InternalServerError().finish(),
+                Err(e) => {
+                    error!("Failed to extract dp_rank: {}", e);
+                    return HttpResponse::InternalServerError().finish();
+                },
             };
 
             // Parse the request body
@@ -741,17 +738,25 @@ impl Router {
             };
 
             // Insert the dp_rank_hint field
-            let map = json_val.as_object_mut().unwrap();
-            map.insert(
-                String::from("dp_rank_hint"),
-                serde_json::Value::Number(dp_rank.try_into().unwrap()),
-            );
+            if let Some(map) = json_val.as_object_mut() {
+                map.insert(String::from("dp_rank_hint"), serde_json::json!(dp_rank));
+                debug!("Modified request body: {}",
+                    serde_json::to_string(&json_val).unwrap_or(String::from("ERR")));
+            } else {
+                warn!("Failed to insert the dp_rank_hint field into the request body");
+                // still try to send the request
+            }
 
-            debug!("Modified request body: {}", serde_json::to_string(&json_val).unwrap());
-
+            let body = match serde_json::to_vec(&json_val) {
+                Ok(body) => body,
+                Err(e) => {
+                    error!("Failed to serialize the altered JSON value: {}", e);
+                    return HttpResponse::InternalServerError().finish();
+                },
+            };
             client
                 .post(format!("{}{}", worker_url_prefix, route))
-                .body(serde_json::to_vec(&json_val).unwrap())
+                .body(body)
         } else {
             client
                 .post(format!("{}{}", worker_url, route))
@@ -942,10 +947,8 @@ impl Router {
                         info!("Worker {} health check passed", worker_url);
                         if self.get_dp_awareness() {
                             let url_vec = vec![String::from(worker_url)];
-                            let dp_url_vec = match Self::get_dp_aware_workers(&url_vec, api_key) {
-                                Ok(vec) => vec,
-                                Err(err) => return Err(format!("Failed to get dp-aware workers: {}", err)),
-                            };
+                            let dp_url_vec = Self::get_dp_aware_workers(&url_vec, api_key)
+                                .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?;
 
                             match self {
                                 Router::RoundRobin { worker_urls, .. }
@@ -954,7 +957,7 @@ impl Router {
                                     let mut urls = worker_urls.write().unwrap();
                                     for dp_url in &dp_url_vec {
                                         if urls.contains(dp_url) {
-                                            info!("Worker {} already exists", dp_url);
+                                            warn!("Worker {} already exists", dp_url);
                                             continue;
                                         }
                                         info!("Added worker: {}", dp_url);
@@ -977,19 +980,19 @@ impl Router {
                                     running_queue
                                         .lock()
                                         .unwrap()
-                                        .insert(dp_url.to_string(), 0);  // TODO
+                                        .insert(dp_url.to_string(), 0);
 
                                     // Add worker to processed queue with initial count of 0
                                     processed_queue
                                         .lock()
                                         .unwrap()
-                                        .insert(dp_url.to_string(), 0);  // TODO
+                                        .insert(dp_url.to_string(), 0);
 
                                     // Add worker to tree
                                     tree
                                         .lock()
                                         .unwrap()
-                                        .insert(&"".to_string(), &dp_url);  // TODO
+                                        .insert(&"".to_string(), &dp_url);
                                 }
                             }
                         } else {
