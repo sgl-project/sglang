@@ -418,6 +418,20 @@ class TokenizerManager:
 
         obj.normalize_batch_and_arguments()
 
+        if isinstance(obj, GenerateReqInput):
+            return_hidden_states = obj.return_hidden_states
+            has_return_hidden_states = return_hidden_states == True or (
+                isinstance(return_hidden_states, list) and any(return_hidden_states)
+            )
+            if (
+                not self.server_args.enable_return_hidden_states
+                and has_return_hidden_states
+            ):
+                raise ValueError(
+                    "return_hidden_states=True requires the server to be started "
+                    "with --enable-return-hidden-states (ServerArgs.enable_return_hidden_states)."
+                )
+
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
             logger.info(
