@@ -7,15 +7,17 @@ from transformers.models.llama4.image_processing_llama4_fast import (
     get_best_fit,
 )
 
-from sglang.srt.managers.multimodal_processors.base_processor import (
-    BaseMultimodalProcessor,
-    MultimodalSpecialTokens,
-)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.mllama4 import Llama4ForConditionalGeneration
+from sglang.srt.models.multimodal_processors.base_processor import (
+    BaseMultimodalProcessor as SGLangBaseProcessor,
+)
+from sglang.srt.models.multimodal_processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 
 
-class Mllama4ImageProcessor(BaseMultimodalProcessor):
+class Mllama4ImageProcessor(SGLangBaseProcessor):
     models = [Llama4ForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor):
