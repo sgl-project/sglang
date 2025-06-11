@@ -422,13 +422,10 @@ class Scheduler(
         self.parent_process = psutil.Process().parent()
 
         # Init memory saver
-        self.weights_memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver,
-            tag="weights",
-        )
-        self.kv_cache_memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver,
-            tag="kv_cache",
+        from sglang.srt.torch_memory_saver_adapter import torch_memory_saver_adapter
+
+        self.memory_saver_adapter = torch_memory_saver_adapter(
+            server_args.enable_memory_saver
         )
 
         # Init profiler
@@ -1172,7 +1169,7 @@ class Scheduler(
         else:
             f += f"#queue-req: {len(self.waiting_queue)}"
 
-        logger.info(f)
+        # logger.info(f)
 
         if self.enable_metrics:
             cache_hit_rate = adder.log_hit_tokens / (
@@ -1239,7 +1236,7 @@ class Scheduler(
             f"#queue-req: {len(self.waiting_queue)}"
         )
 
-        logger.info(msg)
+        # logger.info(msg)
         if self.enable_metrics:
             self.stats.num_running_reqs = num_running_reqs
             self.stats.num_used_tokens = num_used
@@ -2127,18 +2124,72 @@ class Scheduler(
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         tags = recv_req.tags
+        import subprocess
+
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+                f"--id={0}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        logger.info(
+            f"release_memory_occupation: before released weights: {result.stdout}"
+        )
+
         if tags is None:
             # for backward compatibility, default to release both weights and kv cache
             tags = ["weights", "kv_cache"]
+
+        # LIFO order: pause kv_cache first, then weights
+        if "kv_cache" in tags:
+            self.memory_saver_adapter.pause("kv_cache")
+            self.flush_cache()
+            torch.cuda.synchronize()
+            time.sleep(3)
+        torch.distributed.barrier(self.tp_cpu_group)
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+                f"--id={0}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        logger.info(
+            f"release_memory_occupation: after released kv_cache: {result.stdout}"
+        )
+
         if "weights" in tags:
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.worker.model_runner.model
             )
-
-            self.weights_memory_saver_adapter.pause()
-        if "kv_cache" in tags:
-            self.kv_cache_memory_saver_adapter.pause()
-            self.flush_cache()
+            self.memory_saver_adapter.pause("weights")
+            torch.cuda.synchronize()
+            time.sleep(3)
+        torch.distributed.barrier(self.tp_cpu_group)
+        # run nvidia-smi to check memory usage
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+                f"--id={0}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        logger.info(
+            f"release_memory_occupation: after released weights: {result.stdout}"
+        )
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
@@ -2146,15 +2197,67 @@ class Scheduler(
         if tags is None or len(tags) == 0:
             tags = ["weights", "kv_cache"]
 
+        import subprocess
+
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+                f"--id={0}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        logger.info(
+            f"resume_memory_occupation: before resumed weights: {result.stdout}"
+        )
+
+        # LIFO order: resume weights first (reverse of pause order)
         if "weights" in tags:
-            self.weights_memory_saver_adapter.resume()
+            self.memory_saver_adapter.resume("weights")
             _import_static_state(
                 self.tp_worker.worker.model_runner.model,
                 self.stashed_model_static_state,
             )
             del self.stashed_model_static_state
+            torch.cuda.synchronize()
+            time.sleep(3)
+        torch.distributed.barrier(self.tp_cpu_group)
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+                f"--id={0}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        logger.info(f"resume_memory_occupation: after resumed weights: {result.stdout}")
+
         if "kv_cache" in tags:
-            self.kv_cache_memory_saver_adapter.resume()
+            self.memory_saver_adapter.resume("kv_cache")
+            torch.cuda.synchronize()
+            time.sleep(3)
+
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+                f"--id={0}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        logger.info(
+            f"resume_memory_occupation: after resumed kv_cache: {result.stdout}"
+        )
+        torch.distributed.barrier(self.tp_cpu_group)
         return ResumeMemoryOccupationReqOutput()
 
     def slow_down(self, recv_req: SlowDownReqInput):

@@ -7,24 +7,12 @@ from contextlib import contextmanager
 try:
     import torch_memory_saver
 
-    def _create_memory_saver_with_delay(instance_id):
-        # Small delay to let CUDA settle between instance creations
-        time.sleep(1 * instance_id)
-        return torch_memory_saver.TorchMemorySaver()
-
-    _memory_savers = {
-        "weights": _create_memory_saver_with_delay(0),
-        "kv_cache": _create_memory_saver_with_delay(1),
-    }
-
-    # Pre-created adapter instances for reuse
-    _adapters = {}
-    _noop_adapter = None
-
+    # Use the global singleton instance
+    _memory_saver = torch_memory_saver.memory_saver
     import_error = None
 except ImportError as e:
     import_error = e
-    pass
+    _memory_saver = None
 
 logger = logging.getLogger(__name__)
 
@@ -47,80 +35,84 @@ def configure_subprocess(enable: bool):
         yield
 
 
-class TorchMemorySaverAdapter(ABC):
-    @staticmethod
-    def create(enable: bool, tag: str = "weights"):
-        global _adapters, _noop_adapter
+@contextmanager
+def _noop_context():
+    """Noop context manager"""
+    yield
 
-        if tag not in ["weights", "kv_cache"]:
-            raise ValueError(f"Invalid tag '{tag}'. Must be 'weights' or 'kv_cache'")
 
-        if enable and import_error is not None:
+class TorchMemorySaverAdapter:
+    """Adapter for TorchMemorySaver with tag-based control"""
+
+    def __init__(self, enabled: bool = True):
+        """
+        Initialize adapter with enable/disable control
+
+        Args:
+            enabled: Whether to enable memory saving functionality
+        """
+        self._user_enabled = enabled
+
+        if import_error is not None:
             logger.warning(
                 "torch-memory-saver is not installed. Please install it "
                 "via `pip3 install torch-memory-saver`. "
             )
-            raise import_error
 
-        if enable:
-            if tag not in _adapters:
-                _adapters[tag] = _TorchMemorySaverAdapterReal(tag=tag)
-            return _adapters[tag]
+        logger.info(f"TorchMemorySaver adapter initialized with enabled={enabled}")
+
+    def region(self, tag: str):
+        """Context manager for memory region with specified tag"""
+        if self.enabled:
+            # Use the real torch_memory_saver context manager
+            logger.info(f"enter tms region for tag: {tag}")
+            return _memory_saver.region(tag=tag)
         else:
-            if _noop_adapter is None:
-                _noop_adapter = _TorchMemorySaverAdapterNoop()
-            return _noop_adapter
+            # Use noop context manager when disabled
+            logger.debug(f"memory saver disabled, using noop context for tag: {tag}")
+            return _noop_context()
 
-    def region(self):
-        raise NotImplementedError
+    def pause(self, tag: str):
+        """Pause memory for specific tag"""
+        if self.enabled:
+            logger.info(f"enter tms pause for tag: {tag}")
+            _memory_saver.pause(tag=tag)
+        else:
+            logger.debug(f"memory saver disabled, noop pause for tag: {tag}")
 
-    def pause(self):
-        raise NotImplementedError
+    def resume(self, tag: str):
+        """Resume memory for specific tag"""
+        if self.enabled:
+            logger.info(f"enter tms resume for tag: {tag}")
+            _memory_saver.resume(tag=tag)
+        else:
+            logger.debug(f"memory saver disabled, noop resume for tag: {tag}")
 
-    def resume(self):
-        raise NotImplementedError
+    def pause_weights(self):
+        """Convenience method to pause weights memory"""
+        self.pause("weights")
 
-    @property
-    def enabled(self):
-        raise NotImplementedError
+    def resume_weights(self):
+        """Convenience method to resume weights memory"""
+        self.resume("weights")
 
+    def pause_kv_cache(self):
+        """Convenience method to pause kv_cache memory"""
+        self.pause("kv_cache")
 
-class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
-    def __init__(self, tag: str):
-        self.tag = tag
-
-    def _get_memory_saver(self):
-        """Get the appropriate memory saver instance based on tag."""
-        return _memory_savers[self.tag]
-
-    def region(self):
-        return self._get_memory_saver().region()
-
-    def pause(self):
-        return self._get_memory_saver().pause()
-
-    def resume(self):
-        return self._get_memory_saver().resume()
-
-    @property
-    def enabled(self):
-        return self._get_memory_saver().enabled
-
-
-class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
-    def __init__(self):
-        pass
-
-    @contextmanager
-    def region(self):
-        yield
-
-    def pause(self):
-        pass
-
-    def resume(self):
-        pass
+    def resume_kv_cache(self):
+        """Convenience method to resume kv_cache memory"""
+        self.resume("kv_cache")
 
     @property
     def enabled(self):
-        return False
+        """Check if memory saver is enabled (both user setting and library availability)"""
+        return (
+            self._user_enabled and _memory_saver is not None and _memory_saver.enabled
+        )
+
+
+# Factory function for backward compatibility
+def torch_memory_saver_adapter(enabled: bool = True):
+    """Create a TorchMemorySaverAdapter instance with specified enabled state"""
+    return TorchMemorySaverAdapter(enabled=enabled)

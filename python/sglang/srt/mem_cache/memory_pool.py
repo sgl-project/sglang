@@ -61,15 +61,14 @@ class ReqToTokenPool:
         device: str,
         enable_memory_saver: bool,
     ):
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver,
-            tag="kv_cache",
-        )
+        from sglang.srt.torch_memory_saver_adapter import torch_memory_saver_adapter
+
+        memory_saver_adapter = torch_memory_saver_adapter(enable_memory_saver)
 
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        with memory_saver_adapter.region():
+        with memory_saver_adapter.region("kv_cache"):
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
@@ -125,10 +124,9 @@ class KVCache(abc.ABC):
         self.layer_num = layer_num
         self.start_layer = start_layer or 0
         self.end_layer = end_layer or layer_num - 1
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver,
-            tag="kv_cache",
-        )
+        from sglang.srt.torch_memory_saver_adapter import torch_memory_saver_adapter
+
+        self.memory_saver_adapter = torch_memory_saver_adapter(enable_memory_saver)
 
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
@@ -277,7 +275,7 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
-        with self.memory_saver_adapter.region():
+        with self.memory_saver_adapter.region("kv_cache"):
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.k_buffer = [
@@ -538,7 +536,7 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
 
-        with self.memory_saver_adapter.region():
+        with self.memory_saver_adapter.region("kv_cache"):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
             self.kv_buffer = [
                 torch.zeros(
@@ -673,7 +671,7 @@ class DoubleSparseTokenToKVPool(KVCache):
             end_layer,
         )
 
-        with self.memory_saver_adapter.region():
+        with self.memory_saver_adapter.region("kv_cache"):
             # [size, head_num, head_dim] for each layer
             self.k_buffer = [
                 torch.zeros(

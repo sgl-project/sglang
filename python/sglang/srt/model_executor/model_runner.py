@@ -217,9 +217,10 @@ class ModelRunner:
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=self.server_args.enable_memory_saver,
-            tag="weights",
+        from sglang.srt.torch_memory_saver_adapter import torch_memory_saver_adapter
+
+        self.memory_saver_adapter = torch_memory_saver_adapter(
+            self.server_args.enable_memory_saver
         )
 
         if not self.is_draft_worker:
@@ -540,7 +541,7 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
-        with self.memory_saver_adapter.region():
+        with self.memory_saver_adapter.region("weights"):
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
