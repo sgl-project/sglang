@@ -87,7 +87,7 @@ class GenerateReqInput:
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
-    # LoRA related
+    # The path to the LoRA
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     # Session info for continual prompting
@@ -99,7 +99,7 @@ class GenerateReqInput:
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
 
     # Whether to return hidden states
-    return_hidden_states: bool = False
+    return_hidden_states: Union[List[bool], bool] = False
 
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -409,7 +409,11 @@ class GenerateReqInput:
                 if self.custom_logit_processor is not None
                 else None
             ),
-            return_hidden_states=self.return_hidden_states,
+            return_hidden_states=(
+                self.return_hidden_states[i]
+                if isinstance(self.return_hidden_states, list)
+                else self.return_hidden_states
+            ),
             # if `__getitem__` is called, the bootstrap_host, bootstrap_port, bootstrap_room must be a list
             bootstrap_host=(
                 self.bootstrap_host[i] if self.bootstrap_host is not None else None
