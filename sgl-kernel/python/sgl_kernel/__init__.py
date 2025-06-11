@@ -25,6 +25,7 @@ from sgl_kernel.elementwise import (
     fused_add_rmsnorm,
     gelu_and_mul,
     gelu_tanh_and_mul,
+    gelu_quick,
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
     rmsnorm,

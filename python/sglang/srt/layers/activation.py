@@ -47,6 +47,8 @@ _is_hip = is_hip()
 
 if _is_cuda or _is_hip:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+if _is_hip:
+    from sgl_kernel import gelu_quick
 
 if is_npu():
     import torch_npu
@@ -101,7 +103,7 @@ class GeluAndMul(CustomOp):
             raise RuntimeError("GeluAndMul only support tanh or none")
         return out
 
-
+### TODO (Hubert): https://github.com/flashinfer-ai/flashinfer/blob/main/csrc/activation.cu#L29-L33 (gelu_tanh)
 class NewGELU(CustomOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         c = math.sqrt(2.0 / math.pi)
@@ -128,8 +130,9 @@ class QuickGELU(CustomOp):
         return x * torch.sigmoid(1.702 * x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO(zhyncs): Implement the CUDA kernel for QuickGELU in sgl-kernel
-        return self.forward_native(x)
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        gelu_quick(x, out)
+        return out
 
 
 class ScaledActivation(nn.Module):
@@ -229,3 +232,10 @@ if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_hip):
         "sgl-kernel is not available on Non-NV platforms or Non-AMX CPUs. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
+
+# TODO (Hubert): remove this dependency for CUDA
+if _is_cuda:
+    logger.info(
+        "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
+    )
+    from vllm.model_executor.layers.activation import QuickGELU

@@ -55,5 +55,33 @@ __global__ void act_and_mul_kernel(T* __restrict__ out, const T* __restrict__ in
   }
 }
 
+template <typename T, T (*Activation)(const T&)>
+__global__ void act_only_kernel(T* __restrict__ out, const T* __restrict__ input, const int d) {
+  constexpr uint32_t vec_size = kBytesToLoad / sizeof(T);
+  const int64_t token_idx = blockIdx.x;
+  const int64_t thread_idx = threadIdx.x;
+  const int64_t stride = blockDim.x;
+  const int64_t offset = token_idx * d;
+
+#pragma unroll 1
+  for (uint32_t idx = thread_idx; idx < d / vec_size; idx += stride) {
+    flashinfer::vec_t<T, vec_size> x_vec, y_vec, out_vec;
+    x_vec.cast_load(input + offset + idx * vec_size);
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      out_vec[i] = Activation(x_vec[i]);
+    }
+    out_vec.cast_store(out + token_idx * d + idx * vec_size);
+  }
+
+  const int64_t remaining_offset = d - d % (stride * vec_size);
+  // process the remaining elements
+#pragma unroll 1
+  for (int64_t idx = thread_idx; idx < d % (stride * vec_size); idx += stride) {
+    T x = input[offset + remaining_offset + idx];
+    out[token_idx * d + remaining_offset + idx] = Activation(x);
+  }
+}
+
 }  // namespace activation
 }  // namespace flashinfer
