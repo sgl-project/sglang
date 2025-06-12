@@ -1428,7 +1428,7 @@ class TokenizerManager:
                         "type": "abort",
                         "message": "Abort before prefill",
                     },
-                    "prompt_tokens": 1,
+                    "prompt_tokens": 0,
                     "completion_tokens": 0,
                 },
             }
