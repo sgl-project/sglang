@@ -737,13 +737,13 @@ impl Router {
                 Err(e) => return HttpResponse::BadRequest().body(format!("Invalid JSON: {}", e)),
             };
 
-            // Insert the dp_rank_hint field
+            // Insert the data_parallel_rank field
             if let Some(map) = json_val.as_object_mut() {
-                map.insert(String::from("dp_rank_hint"), serde_json::json!(dp_rank));
+                map.insert(String::from("data_parallel_rank"), serde_json::json!(dp_rank));
                 debug!("Modified request body: {}",
                     serde_json::to_string(&json_val).unwrap_or(String::from("ERR")));
             } else {
-                warn!("Failed to insert the dp_rank_hint field into the request body");
+                warn!("Failed to insert the data_parallel_rank field into the request body");
                 // still try to send the request
             }
 
