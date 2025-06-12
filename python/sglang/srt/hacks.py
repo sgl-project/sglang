@@ -163,14 +163,14 @@ def _requant_grouped_moe_weight(
 
     out_s = _transform_scale(out_s, mn=out_w.shape[-2])
 
-    print(
-        f"requant_grouped_moe_weight "
-        f"{type(weight)=} {type(weight_scale_inv)=} "
-        f"{weight.shape=} {weight.dtype=} "
-        f"{weight_scale_inv.shape=} {weight_scale_inv.dtype=} "
-        f"{out_w.shape=} {out_w.dtype=} "
-        f"{out_s.shape=} {out_s.dtype=} "
-    )
+    # print(
+    #     f"requant_grouped_moe_weight "
+    #     f"{type(weight)=} {type(weight_scale_inv)=} "
+    #     f"{weight.shape=} {weight.dtype=} "
+    #     f"{weight_scale_inv.shape=} {weight_scale_inv.dtype=} "
+    #     f"{out_w.shape=} {out_w.dtype=} "
+    #     f"{out_s.shape=} {out_s.dtype=} "
+    # )
 
     return out_w, out_s
 
