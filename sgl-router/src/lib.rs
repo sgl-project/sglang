@@ -113,18 +113,15 @@ impl Router {
     }
 
     fn start(&self) -> PyResult<()> {
+        let worker_start = router::WorkerStartConfig {
+            timeout_secs: self.worker_startup_timeout_secs,
+            interval_secs: self.worker_startup_check_interval,
+        };
         let policy_config = match &self.policy {
-            PolicyType::Random => router::PolicyConfig::RandomConfig {
-                timeout_secs: self.worker_startup_timeout_secs,
-                interval_secs: self.worker_startup_check_interval,
-            },
-            PolicyType::RoundRobin => router::PolicyConfig::RoundRobinConfig {
-                timeout_secs: self.worker_startup_timeout_secs,
-                interval_secs: self.worker_startup_check_interval,
-            },
+            PolicyType::Random => router::PolicyConfig::RandomConfig { worker_start },
+            PolicyType::RoundRobin => router::PolicyConfig::RoundRobinConfig { worker_start },
             PolicyType::CacheAware => router::PolicyConfig::CacheAwareConfig {
-                timeout_secs: self.worker_startup_timeout_secs,
-                interval_secs: self.worker_startup_check_interval,
+                worker_start,
                 cache_threshold: self.cache_threshold,
                 balance_abs_threshold: self.balance_abs_threshold,
                 balance_rel_threshold: self.balance_rel_threshold,
