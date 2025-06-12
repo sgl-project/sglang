@@ -702,7 +702,7 @@ def align_evict_mask_to_page_size(
     
     # Load current eviction mask
     io_mask = t_range < num_draft_tokens
-    mask_row = tl.load(evict_mask + bid * num_draft_tokens + t_range, mask=io_mask)
+    mask_row = tl.load(evict_mask + bid * num_draft_tokens + t_range, mask=io_mask, other=False)
     
     # Calculate current tokens we'd keep (False = keep, True = evict)
     num_to_evict = tl.sum(mask_row.to(tl.int32))
