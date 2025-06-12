@@ -237,6 +237,7 @@ set(SOURCES
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
     "csrc/moe/ep_moe_reorder_kernel.cu"
+    "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/speculative_sampling.cu"
     "csrc/speculative/packbit.cu"

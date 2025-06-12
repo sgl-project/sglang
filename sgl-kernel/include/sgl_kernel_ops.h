@@ -266,6 +266,14 @@ void ep_moe_pre_reorder(
     int64_t topk,
     bool use_per_token_if_dynamic);
 
+void ep_moe_silu_and_mul(
+    torch::Tensor gateup_output,
+    torch::Tensor down_input,
+    torch::Tensor reorder_topk_ids,
+    torch::Tensor scales,
+    int64_t start_expert_id,
+    int64_t end_expert_id);
+
 void ep_moe_post_reorder(
     torch::Tensor down_output,
     torch::Tensor output,
