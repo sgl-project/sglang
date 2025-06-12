@@ -485,9 +485,10 @@ class ModelRunner:
                     if baseline_complexity_score > 0
                     else 1.0
                 )
+                print(f"{complexity_ratio=}")
 
-                # every time the complexity grows 100%, adjust final factor for 2%
-                sensitivity_scale = 0.02
+                # every time the complexity grows 100%, adjust final factor for 3%
+                sensitivity_scale = 0.03
                 dynamic_adjustment_factor = 1.0 - sensitivity_scale * (
                     complexity_ratio - 1.0
                 )
