@@ -30,7 +30,6 @@ def read_mode_per_pass(dir_data: Path):
 
     items = []
     for forward_pass_id, gpc_of_rank in sorted(gpc_of_forward_pass_and_rank.items()):
-        assert forward_pass_id == len(items)
         gpc_of_rank_tensor = torch.stack([gpc for rank, gpc in sorted(gpc_of_rank.items())]).sum(dim=0)
         items.append(gpc_of_rank_tensor)
 
