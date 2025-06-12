@@ -17,7 +17,10 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.utils import add_prefix
 
 
@@ -218,6 +221,11 @@ class Llama4ForConditionalGeneration(nn.Module):
                 name, loaded_weight = self.permute_qk_weight_for_rotary(
                     name, loaded_weight
                 )
+
+            if "scale" in name and "expert" not in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
