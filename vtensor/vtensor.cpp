@@ -130,7 +130,10 @@ void VmmTensor::AllocMemory(int offset_index, int world_size, int pre_flag) {
 }
 
 torch::Tensor VmmTensor::SplitTensor(std::vector<int64_t> shape, torch::Dtype dtype, int offset_index) {
-    size_t offset_size = padded_size / world_size;
+    if (offset_v_ptr != 0) {
+        throw std::runtime_error("SplitTensor already called");
+    }
+    offset_size = padded_size / world_size;
     DRV_CALL(cuMemAddressReserve(&offset_v_ptr, offset_size, 0ULL, 0ULL, 0ULL));
     DRV_CALL(cuMemMap(offset_v_ptr, offset_size, 0ULL, this->u_p_block->alloc_handle, 0ULL));
     CUmemAccessDesc accessDesc = {};
@@ -166,7 +169,13 @@ torch::Tensor VmmTensor::GetTensor(std::vector<int64_t>& shape, torch::Dtype dty
 }
 
 VmmTensor::~VmmTensor() {
-    DRV_CALL(cuMemUnmap(v_ptr, padded_size));
+    if (v_ptr) {
+        DRV_CALL(cuMemUnmap(v_ptr, padded_size));
+        DRV_CALL(cuMemAddressFree(v_ptr, padded_size));
+    }
+    if (offset_v_ptr != 0) {
+        DRV_CALL(cuMemUnmap(offset_v_ptr, offset_size));
+        DRV_CALL(cuMemAddressFree(offset_v_ptr, offset_size));
+    }
     auto tmp = std::move(u_p_block);
-    DRV_CALL(cuMemAddressFree(v_ptr, padded_size));
 }

@@ -578,6 +578,7 @@ multimodal_model_archs = [
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "Phi4MMForCausalLM",
+    "VILAForConditionalGeneration",
 ]
 
 

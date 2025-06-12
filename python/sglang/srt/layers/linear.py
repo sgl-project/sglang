@@ -1198,14 +1198,13 @@ class RowParallelLinear(LinearBase):
         self.vtensor = None
         self.layer_id = layer_id
         if vtensor_enable and "o_proj" in prefix:
-            assert tp_size == 1, "FlowMLA currently only supported tp size == 1"
+            assert tp_size == 1, "FlowMLA does not support DP+TP currently"
             device_index = torch.cuda.current_device()
-            world_size = get_tensor_model_parallel_world_size()
-            if world_size > 8:
-                world_size = 8
+            # o_proj sharding should only be applied within a single machine, not across distributed nodes.
+            self.world_size = min(get_tensor_model_parallel_world_size(), 8)
             # TODO: only support float8_e4m3 weight
             weight_dtype = torch.float8_e4m3fn if quant_config is not None and quant_config.is_checkpoint_fp8_serialized else self.params_dtype
-            self.vtensor = vTensor.tensor((sum([self.output_size]), self.input_size), weight_dtype, device_index, world_size, self.layer_id % 2)
+            self.vtensor = vTensor.tensor((sum([self.output_size]), self.input_size), weight_dtype, device_index, self.world_size, self.layer_id % 2)
 
         self.quant_method.create_weights(
             layer=self,
@@ -1242,18 +1241,16 @@ class RowParallelLinear(LinearBase):
         if vtensor_pynccl is None and vtensor_enable:
             device_index = torch.cuda.current_device()
             shard_rank = device_index
-            # todo fix
+            # TODO more robust
             import socket
             master_ip_address = socket.gethostbyname(socket.gethostname())
             from sglang.srt.managers.schedule_batch import global_server_args_dict
             master_port = global_server_args_dict["vtensor_port"]
-            world_size = get_tensor_model_parallel_world_size()
-            if world_size >= 8:
-                world_size = 8
+            self.world_size = min(get_tensor_model_parallel_world_size(), 8)
             pg = StatelessProcessGroup.create(host=master_ip_address,
                                               port=master_port,
                                               rank=shard_rank,
-                                              world_size=world_size)
+                                              world_size=self.world_size)
             vtensor_pynccl = PyNcclCommunicator(pg, device=torch.cuda.current_device())
             vtensor_pynccl.disabled = False
             if quant_config is not None and quant_config.is_checkpoint_fp8_serialized:
@@ -1272,10 +1269,7 @@ class RowParallelLinear(LinearBase):
             self.weight_data = self.vtensor.to_torch_tensor()
             self.param_shape = self.vtensor.to_torch_tensor().shape
             device_index = torch.cuda.current_device()
-            world_size = get_tensor_model_parallel_world_size()
-            if world_size >= 8:
-                world_size = 8
-            self.input_buffer = self.vtensor.split_tensor((self.weight_data.numel() // world_size,), self.weight_data.dtype, device_index)
+            self.input_buffer = self.vtensor.split_tensor((self.weight_data.numel() // self.world_size,), self.weight_data.dtype, device_index)
             self.event_fwd = torch.cuda.Event()
             self.event_pre = torch.cuda.Event()
 
@@ -1342,7 +1336,7 @@ class RowParallelLinear(LinearBase):
         assert self.event_pre is not None
         assert self.event_fwd is not None
         assert self.weight_data is not None
-        if self.layer_id > 1:
+        if self.layer_id > 2:
             self.event_fwd.wait(stream=prefetch_stream)
         global vtensor_pynccl
         vtensor_pynccl.all_gather(self.weight_data, self.input_buffer, stream=prefetch_stream)

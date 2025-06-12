@@ -56,7 +56,8 @@ private:
 
     std::unique_ptr<PhyBlock> u_p_block;
     CUdeviceptr v_ptr;
-    CUdeviceptr offset_v_ptr;
+    CUdeviceptr offset_v_ptr = 0;
+    size_t offset_size = 0;
 };
 
 std::vector<std::shared_ptr<PhyBlock>> shared_phy_blocks_pre;

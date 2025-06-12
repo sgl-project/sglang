@@ -1674,7 +1674,9 @@ class DeepseekV2Model(nn.Module):
         )
         if self.vtensor_enable:
             _stream_odd, _stream_even = PrefetchStreamManager.get_stream()
+            # For layer 0, we set vtensor_enable = False.
             self.layers[1].self_attn.o_proj.prefetch_all_gather(_stream_odd)
+            self.layers[2].self_attn.o_proj.prefetch_all_gather(_stream_even)
             for i in range(normal_num_layers):
                 with get_global_expert_distribution_recorder().with_current_layer(i):
                     layer = self.layers[i]
@@ -1683,7 +1685,8 @@ class DeepseekV2Model(nn.Module):
                             positions, hidden_states, forward_batch, residual, zero_allocator, self.layers[i + 2].self_attn.o_proj.event_fwd
                         )
                         if i % 2 == 0:
-                            self.layers[i + 2].self_attn.o_proj.prefetch_all_gather(_stream_even)
+                            if i > 0:
+                                self.layers[i + 2].self_attn.o_proj.prefetch_all_gather(_stream_even)
                         else:
                             self.layers[i + 2].self_attn.o_proj.prefetch_all_gather(_stream_odd)
                     else:
@@ -1734,15 +1737,14 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         if global_server_args_dict["vtensor_enable"]:
-            world_size = self.tp_size
-            assert world_size > 1, "tensor parallel size must be greater than 1"
-            if world_size > 8:
-                world_size = 8
+            assert self.tp_size > 1, "tensor parallel size must be greater than 1"
+            # o_proj sharding should only be applied within a single machine, not across distributed nodes.
+            self.world_size = min(self.tp_size, 8)
             weight_type_size = 2
             if quant_config is not None and quant_config.is_checkpoint_fp8_serialized:
                 weight_type_size = 1
-            numel_size = config.num_attention_heads * config.v_head_dim * config.hidden_size // world_size
-            vTensor.init_shared_phy_blocks(world_size - 1, numel_size * weight_type_size)
+            numel_size = config.num_attention_heads * config.v_head_dim * config.hidden_size // self.world_size
+            vTensor.init_shared_phy_blocks(self.world_size - 1, numel_size * weight_type_size)
             vTensor.init_unique_phy_blocks(config.num_hidden_layers, numel_size * weight_type_size)
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)

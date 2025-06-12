@@ -22,5 +22,5 @@ setup(
     },
     author="antgroup",
     author_email="@antgroup.com",
-    description="GLake——VMM-based Tensor library"
+    description="VMM-based Tensor library for FlowMLA"
 )
