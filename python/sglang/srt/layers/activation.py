@@ -103,7 +103,7 @@ class GeluAndMul(CustomOp):
             raise RuntimeError("GeluAndMul only support tanh or none")
         return out
 
-### TODO (Hubert): https://github.com/flashinfer-ai/flashinfer/blob/main/csrc/activation.cu#L29-L33 (gelu_tanh)
+
 class NewGELU(CustomOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         c = math.sqrt(2.0 / math.pi)
@@ -130,6 +130,9 @@ class QuickGELU(CustomOp):
         return x * torch.sigmoid(1.702 * x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
         out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
         gelu_quick(x, out)
         return out
@@ -232,10 +235,3 @@ if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_hip):
         "sgl-kernel is not available on Non-NV platforms or Non-AMX CPUs. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
-
-# TODO (Hubert): remove this dependency for CUDA
-if _is_cuda:
-    logger.info(
-        "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
-    )
-    from vllm.model_executor.layers.activation import QuickGELU
