@@ -196,6 +196,7 @@ class ModelRunner:
             | {
                 # TODO it is indeed not a "server args"
                 "use_mla_backend": self.use_mla_backend,
+                "speculative_algorithm": self.spec_algorithm,
             }
         )
 
