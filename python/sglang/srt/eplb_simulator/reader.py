@@ -17,6 +17,9 @@ def read_mode_per_pass(dir_data: Path):
             assert gpc_of_forward_pass_and_rank[forward_pass_id].get(rank) is None
             gpc_of_forward_pass_and_rank[forward_pass_id][rank] = record["global_physical_count"]
 
+    forward_pass_ids = sorted(gpc_of_forward_pass_and_rank.keys())
+    print(f"Make {forward_pass_ids=} into array")
+
     items = []
     for forward_pass_id, gpc_of_rank in sorted(gpc_of_forward_pass_and_rank.items()):
         assert forward_pass_id == len(items)
@@ -29,4 +32,5 @@ def read_mode_per_pass(dir_data: Path):
     return dict(
         global_physical_count_of_forward_pass=gpc_of_forward_pass,
         last_physical_to_logical_map=last_physical_to_logical_map,
+        forward_pass_ids=forward_pass_ids,
     )
