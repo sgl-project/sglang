@@ -221,7 +221,9 @@ class HiPAttentionBackend(AttentionBackend):
                         cache_v=v,
                     )
                 )
-
+            
+            print('asdfasdf', type(k_chunk), k_chunk is not None)
+            
             q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
             
             o, _ = self.forward_paged_hip(
@@ -356,8 +358,9 @@ class HiPAttentionBackend(AttentionBackend):
             k_reshaped = k.reshape(-1, layer.tp_k_head_num, layer.head_dim)
             v_reshaped = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
             
-            if k_cache.dtype not in [torch.float32, torch.float16, torch.bfloat16]:
-                assert layer.k_scale is not None, "fp8 scale should be handled"
+            if k_cache is not None:
+                if k_cache.dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+                    assert layer.k_scale is not None, "fp8 scale should be handled"
 
             o, metadata = self.forward_paged_hip(
                 query=q_reshaped,
