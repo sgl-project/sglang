@@ -54,28 +54,13 @@ def get_physical_cpus_by_numa():
     return node_to_cpus
 
 
-# Compress sorted list of integers into range strings like 0-2,3,4-6
-def compress_ranges(cpu_list):
-    if not cpu_list:
-        return ""
-    ranges = []
-    start = prev = cpu_list[0]
-    for cpu in cpu_list[1:]:
-        if cpu == prev + 1:
-            prev = cpu
-        else:
-            ranges.append(f"{start}-{prev}" if start != prev else str(start))
-            start = prev = cpu
-    ranges.append(f"{start}-{prev}" if start != prev else str(start))
-    return ",".join(ranges)
-
-
 # Only physical cores are used. Logical cores are excluded.
 def get_cpu_ids_by_node():
     node_to_cpus = get_physical_cpus_by_numa()
     # Sort by NUMA node index
     cpu_ids = [
-        compress_ranges(sorted(node_to_cpus[node])) for node in sorted(node_to_cpus)
+        ",".join(map(str, sorted(node_to_cpus[node]))) for node in sorted(node_to_cpus)
     ]
-    # ['0-42', '43-85', '86-127', '128-170', '171-213', '214-255']
+
+    # ['0,1,2,3', '4,5,6,7', '8,9,10,11', '12,13,14,15', '16,17,18,19', '20,21,22,23']
     return cpu_ids
