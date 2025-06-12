@@ -100,10 +100,21 @@ class ModelOptFp8Config(QuantizationConfig):
                 "Check the `hf_quant_config.json` file for your model's configuration."
             )
 
+        # Convert exclude_modules to handle the language_model prefix that gets added by mllama4.py
+        # The checkpoint has weights like "model.layers.0.feed_forward.router"
+        # but SGLang processes them as "language_model.model.layers.0.feed_forward.router"
+        converted_exclude_modules = []
+        if exclude_modules:
+            for module in exclude_modules:
+                # Add both the original and the prefixed version to handle both cases
+                converted_exclude_modules.append(module)
+                if not module.startswith("language_model."):
+                    converted_exclude_modules.append(f"language_model.{module}")
+
         return cls(
             is_checkpoint_fp8_serialized=True,
             kv_cache_quant_method=kv_cache_quant_method,
-            exclude_modules=exclude_modules,
+            exclude_modules=converted_exclude_modules,
         )
 
     def get_quant_method(
@@ -112,6 +123,25 @@ class ModelOptFp8Config(QuantizationConfig):
         if self.exclude_modules and any(
             module in prefix for module in self.exclude_modules
         ):
+            # Debug: Print when excluding layers (only from rank 0)
+            if (
+                hasattr(torch.distributed, "get_rank")
+                and torch.distributed.is_initialized()
+            ):
+                try:
+                    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+                    if get_tensor_model_parallel_rank() == 0:
+                        matching_excludes = [
+                            module
+                            for module in self.exclude_modules
+                            if module in prefix
+                        ]
+                        print(
+                            f"DEBUG: Excluding layer '{prefix}' due to exclude_modules: {matching_excludes}"
+                        )
+                except:
+                    pass
             return None
 
         if isinstance(layer, LinearBase):
@@ -359,6 +389,62 @@ class ModelOptFp8MoEMethod:
             layer.register_parameter("w2_input_scale", w2_input_scale)
             set_weight_attrs(w13_input_scale, extra_weight_attrs)
             set_weight_attrs(w2_input_scale, extra_weight_attrs)
+
+            # ADDITIONAL SCALES for Llama4 checkpoint format
+            # These are per-layer scales (scalar) that match the checkpoint naming
+            # Use PerTensorScaleParameter for consistency with linear method
+            from sglang.srt.layers.parameter import PerTensorScaleParameter
+
+            gate_up_proj_weight_scale = PerTensorScaleParameter(
+                data=torch.full(
+                    (
+                        1,
+                    ),  # Single element tensor instead of scalar for PerTensorScaleParameter
+                    torch.finfo(torch.float32).min,
+                    dtype=torch.float32,
+                ),
+                weight_loader=weight_loader,
+            )
+            gate_up_proj_input_scale = PerTensorScaleParameter(
+                data=torch.full(
+                    (
+                        1,
+                    ),  # Single element tensor instead of scalar for PerTensorScaleParameter
+                    torch.finfo(torch.float32).min,
+                    dtype=torch.float32,
+                ),
+                weight_loader=weight_loader,
+            )
+            down_proj_weight_scale = PerTensorScaleParameter(
+                data=torch.full(
+                    (
+                        1,
+                    ),  # Single element tensor instead of scalar for PerTensorScaleParameter
+                    torch.finfo(torch.float32).min,
+                    dtype=torch.float32,
+                ),
+                weight_loader=weight_loader,
+            )
+            down_proj_input_scale = PerTensorScaleParameter(
+                data=torch.full(
+                    (
+                        1,
+                    ),  # Single element tensor instead of scalar for PerTensorScaleParameter
+                    torch.finfo(torch.float32).min,
+                    dtype=torch.float32,
+                ),
+                weight_loader=weight_loader,
+            )
+
+            layer.register_parameter(
+                "gate_up_proj_weight_scale", gate_up_proj_weight_scale
+            )
+            layer.register_parameter(
+                "gate_up_proj_input_scale", gate_up_proj_input_scale
+            )
+            layer.register_parameter("down_proj_weight_scale", down_proj_weight_scale)
+            layer.register_parameter("down_proj_input_scale", down_proj_input_scale)
+            # No need for set_weight_attrs since PerTensorScaleParameter handles weight loading
         else:
             # For non-serialized checkpoints, will be quantized during loading
             layer.w13_weight_scale = None
@@ -449,6 +535,32 @@ class ModelOptFp8MoEMethod:
                     layer.w2_input_scale = torch.nn.Parameter(
                         layer.w2_input_scale.max(), requires_grad=False
                     )
+
+                # Handle Llama4 scalar scale parameters
+                # NOTE: FP8 kernel expects scalar scales, not per-expert scales
+                # So we keep the checkpoint scales as-is (scalars) and use them directly
+                if (
+                    hasattr(layer, "gate_up_proj_weight_scale")
+                    and layer.gate_up_proj_weight_scale is not None
+                ):
+                    # Use the scalar scale directly for w13 (gate_up_proj)
+                    layer.w13_weight_scale = layer.gate_up_proj_weight_scale
+                if (
+                    hasattr(layer, "gate_up_proj_input_scale")
+                    and layer.gate_up_proj_input_scale is not None
+                ):
+                    layer.w13_input_scale = layer.gate_up_proj_input_scale
+                if (
+                    hasattr(layer, "down_proj_weight_scale")
+                    and layer.down_proj_weight_scale is not None
+                ):
+                    # Use the scalar scale directly for w2 (down_proj)
+                    layer.w2_weight_scale = layer.down_proj_weight_scale
+                if (
+                    hasattr(layer, "down_proj_input_scale")
+                    and layer.down_proj_input_scale is not None
+                ):
+                    layer.w2_input_scale = layer.down_proj_input_scale
 
     def apply(
         self,
