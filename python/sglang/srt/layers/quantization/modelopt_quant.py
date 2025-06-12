@@ -305,8 +305,8 @@ class ModelOptFp8MoEMethod:
             data=torch.empty(
                 num_experts, 2 * intermediate_size, hidden_size, dtype=weight_dtype
             ),
-            input_dim=2,  # hidden_size is input dimension
-            output_dim=1,  # intermediate_size is output dimension
+            input_dim=2,
+            output_dim=1,
             weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight", w13_weight)
@@ -315,8 +315,8 @@ class ModelOptFp8MoEMethod:
             data=torch.empty(
                 num_experts, hidden_size, intermediate_size, dtype=weight_dtype
             ),
-            input_dim=2,  # intermediate_size is input dimension
-            output_dim=1,  # hidden_size is output dimension
+            input_dim=2,
+            output_dim=1,
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight", w2_weight)
@@ -364,7 +364,7 @@ class ModelOptFp8MoEMethod:
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
-        # Ensure weights are proper Parameters
+
         layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
         layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 

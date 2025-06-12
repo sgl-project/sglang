@@ -1,4 +1,6 @@
 import json
+import json as json_lib
+import os
 from collections.abc import Iterable
 from typing import List, Optional, Set, Tuple
 
@@ -45,46 +47,12 @@ class Llama4ForConditionalGeneration(nn.Module):
         self.quant_config = quant_config
 
         # Check if this is a text-only model (modelopt fp8 llama4 has no vision components)
-
-        import json as json_lib
-        import os
-
-        # Get the model path from the config if available
-        model_path = getattr(config, "_name_or_path", None)
-        has_vision_weights = False
-
-        if model_path and os.path.exists(
-            os.path.join(model_path, "model.safetensors.index.json")
-        ):
-            try:
-                with open(
-                    os.path.join(model_path, "model.safetensors.index.json"), "r"
-                ) as f:
-                    index_data = json_lib.load(f)
-                # Check if any vision model weights exist in the checkpoint
-                vision_weight_patterns = [
-                    "vision_model",
-                    "vision_tower",
-                    "multi_modal_projector",
-                ]
-                has_vision_weights = any(
-                    any(pattern in weight_name for pattern in vision_weight_patterns)
-                    for weight_name in index_data.get("weight_map", {}).keys()
-                )
-            except:
-                # Fallback: assume text-only since most checkpoints are text-only
-                has_vision_weights = False
-        else:
-            # No checkpoint index found, assume text-only
-            has_vision_weights = False
-
-        self.has_vision = has_vision_weights
+        self.has_vision = self._has_vision_weights(config)
 
         if self.has_vision:
             self.vision_model = Llama4VisionModel(config.vision_config)
             self.multi_modal_projector = Llama4MultiModalProjector(config)
         else:
-            # For text-only models, set these to None
             self.vision_model = None
             self.multi_modal_projector = None
 
@@ -100,6 +68,31 @@ class Llama4ForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(
             config.text_config if hasattr(config, "text_config") else config
         )
+
+    def _has_vision_weights(self, config) -> bool:
+        """Check if the model has vision components by examining the checkpoint."""
+        model_path = getattr(config, "_name_or_path", None)
+        if not model_path:
+            return False
+
+        index_file = os.path.join(model_path, "model.safetensors.index.json")
+        if not os.path.exists(index_file):
+            return False
+
+        try:
+            with open(index_file, "r") as f:
+                index_data = json_lib.load(f)
+
+            vision_patterns = ["vision_model", "vision_tower", "multi_modal_projector"]
+            weight_names = index_data.get("weight_map", {}).keys()
+
+            return any(
+                pattern in weight_name
+                for weight_name in weight_names
+                for pattern in vision_patterns
+            )
+        except (OSError, json_lib.JSONDecodeError, KeyError):
+            return False
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -181,9 +174,6 @@ class Llama4ForConditionalGeneration(nn.Module):
         return name, loaded_weight
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
-        # Only print debug info from rank 0 to avoid spam with multiple GPUs
-        is_main_rank = get_tensor_model_parallel_rank() == 0
-
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
@@ -196,15 +186,12 @@ class Llama4ForConditionalGeneration(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-
         num_experts = (
             self.config.text_config.num_local_experts
             if hasattr(self.config, "text_config")
             else self.config.num_local_experts
         )
 
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -213,216 +200,188 @@ class Llama4ForConditionalGeneration(nn.Module):
         )
 
         for name, loaded_weight in weights:
-            # Skip vision weights if this is a text-only model
-            if "vision" in name and not self.has_vision:
+            if not self._should_load_weight(name):
                 continue
 
-            # General prefix transformation: add language_model prefix if not already present
-            # All model parameters have this prefix, but modelopt fp8 llama4 checkpoint weights don't
-            if not name.startswith("language_model.") and "vision" not in name:
-                name = f"language_model.{name}"
+            name = self._transform_weight_name(name)
+            if name is None:
+                continue
 
-            if not "vision" in name:
+            if "vision" not in name:
                 name, loaded_weight = self.permute_qk_weight_for_rotary(
                     name, loaded_weight
                 )
 
-            if "scale" in name and "expert" not in name:
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
+            if self._handle_scale_remapping(name, params_dict):
+                continue
 
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
+            if self._handle_stacked_params(
+                name, loaded_weight, stacked_params_mapping, params_dict
+            ):
+                continue
 
-                if "vision" in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
+            if self._handle_expert_weights(
+                name, loaded_weight, expert_params_mapping, params_dict, num_experts
+            ):
+                continue
+
+            self._handle_default_weight(name, loaded_weight, params_dict)
+
+    def _should_load_weight(self, name: str) -> bool:
+        """Check if we should load this weight."""
+        return not ("vision" in name and not self.has_vision)
+
+    def _transform_weight_name(self, name: str) -> str:
+        """Transform weight name by adding language_model prefix if needed."""
+        if not name.startswith("language_model.") and "vision" not in name:
+            return f"language_model.{name}"
+        return name
+
+    def _handle_scale_remapping(self, name: str, params_dict: dict) -> bool:
+        """Handle scale parameter remapping. Returns True if handled."""
+        if "scale" in name and "expert" not in name:
+            remapped_name = maybe_remap_kv_scale_name(name, params_dict)
+            return remapped_name is None
+        return False
+
+    def _handle_stacked_params(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        stacked_params_mapping: list,
+        params_dict: dict,
+    ) -> bool:
+        """Handle stacked parameter loading. Returns True if handled."""
+        for param_name, weight_name, shard_id in stacked_params_mapping:
+            if weight_name in name and "vision" not in name:
+                transformed_name = name.replace(weight_name, param_name)
+                param = params_dict[transformed_name]
+                param.weight_loader(param, loaded_weight, shard_id)
+                return True
+        return False
+
+    def _handle_expert_weights(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        expert_params_mapping: list,
+        params_dict: dict,
+        num_experts: int,
+    ) -> bool:
+        """Handle expert weight loading. Returns True if handled."""
+        if ".experts" not in name:
+            return False
+
+        if "experts.gate_up_proj" not in name and "experts.down_proj" not in name:
+            return self._handle_other_expert_params(
+                name, loaded_weight, expert_params_mapping, params_dict
+            )
+
+        if "scale" in name:
+            return self._handle_expert_scale_params(
+                name, loaded_weight, params_dict, num_experts
+            )
+        else:
+            return self._handle_expert_weight_params(
+                name, loaded_weight, params_dict, num_experts
+            )
+
+    def _handle_other_expert_params(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        expert_params_mapping: list,
+        params_dict: dict,
+    ) -> bool:
+        """Handle other expert parameters through mapping."""
+        for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+            if weight_name in name:
+                transformed_name = name.replace(weight_name, param_name)
+                param = params_dict[transformed_name]
+                param.weight_loader(
+                    param, loaded_weight, name, shard_id=shard_id, expert_id=expert_id
+                )
+                return True
+        return False
+
+    def _handle_expert_scale_params(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict,
+        num_experts: int,
+    ) -> bool:
+        """Handle expert scale parameters."""
+        # Transform name based on projection type
+        if ".gate_up_proj" in name:
+            transformed_name = name.replace(".experts.gate_up_proj", ".experts.w13")
+        else:  # down_proj
+            transformed_name = name.replace(".experts.down_proj", ".experts.w2")
+
+        if transformed_name not in params_dict:
+            return True  # Skip if parameter not found
+
+        param = params_dict[transformed_name]
+        weight_loader = param.weight_loader
+
+        # Load scale for all experts
+        for expert_id in range(num_experts):
+            if ".gate_up_proj" in name:
+                # Load for both w1 and w3 shards
+                weight_loader(param, loaded_weight, transformed_name, "w1", expert_id)
+                weight_loader(param, loaded_weight, transformed_name, "w3", expert_id)
             else:
-                if ".experts" in name:
-                    # NOTE: llama4 fp8 has different weight format for experts
-                    # exclude shared_expert.xxx
-                    # Scale parameters are now handled by the MoE layer's weight_loader directly
-                    if (
-                        "experts.gate_up_proj" not in name
-                        and "experts.down_proj" not in name
-                    ):
-                        # Handle other expert parameters through mapping, experts.8.down_proj.weight, this is for RH llama4 fp8 checkpoint
-                        for mapping in expert_params_mapping:
-                            param_name, weight_name, expert_id, shard_id = mapping
-                            if weight_name not in name:
-                                continue
-                            name = name.replace(weight_name, param_name)
-                            param = params_dict[name]
-                            weight_loader = param.weight_loader
+                # Load for w2 shard
+                weight_loader(param, loaded_weight, transformed_name, "w2", expert_id)
 
-                            weight_loader(
-                                param,
-                                loaded_weight,
-                                name,
-                                shard_id=shard_id,
-                                expert_id=expert_id,
-                            )
-                            break
-                    else:
-                        # Handle scale parameters differently from weight parameters
-                        if "scale" in name:
-                            # Scale parameters might have expert IDs in their names
-                            # Check if this matches the expert parameter pattern: experts.{expert_id}.{param_name}
-                            import re
+        return True
 
-                            expert_match = re.search(r"experts\.(\d+)\.", name)
-                            if expert_match:
-                                expert_id = int(expert_match.group(1))
-                                if is_main_rank:
-                                    print(
-                                        f"Debug: Found expert_id {expert_id} in scale parameter: {name}"
-                                    )
+    def _handle_expert_weight_params(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict,
+        num_experts: int,
+    ) -> bool:
+        """Handle expert weight parameters."""
+        if ".gate_up_proj" in name:
+            name_list = [
+                name.replace(".experts.gate_up_proj", ".experts.w13_weight")
+            ] * 2
+            loaded_weight_list = loaded_weight.chunk(2, dim=-1)
+            shard_id_list = ["w1", "w3"]
+        else:
+            name_list = [name.replace(".experts.down_proj", ".experts.w2_weight")]
+            shard_id_list = ["w2"]
+            loaded_weight_list = [loaded_weight]
 
-                                # Transform the name
-                                if ".gate_up_proj" in name:
-                                    transformed_name = name.replace(
-                                        ".experts.gate_up_proj", ".experts.w13"
-                                    )
-                                    shard_id = "w13"
-                                else:  # down_proj
-                                    transformed_name = name.replace(
-                                        ".experts.down_proj", ".experts.w2"
-                                    )
-                                    shard_id = "w2"
+        for param_name, weight_chunk, shard_id in zip(
+            name_list, loaded_weight_list, shard_id_list
+        ):
+            param = params_dict[param_name]
+            weight_loader = param.weight_loader
+            for expert_id in range(num_experts):
+                weight_loader(
+                    param,
+                    weight_chunk[expert_id].T,
+                    param_name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
 
-                                if is_main_rank:
-                                    print(
-                                        f"Debug: Loading scale parameter: {name} -> {transformed_name}"
-                                    )
+        return True
 
-                                if transformed_name in params_dict:
-                                    param = params_dict[transformed_name]
-                                    weight_loader = param.weight_loader
+    def _handle_default_weight(
+        self, name: str, loaded_weight: torch.Tensor, params_dict: dict
+    ):
+        """Handle default weight loading."""
+        # Skip loading extra bias for GPTQ models
+        if name.endswith(".bias") and name not in params_dict:
+            return
 
-                                    # Load the same scale for all experts
-                                    for expert_id in range(num_experts):
-                                        # For gate_up_proj scales, load for both w1 and w3 shards
-                                        if ".gate_up_proj" in name:
-                                            # Load the same scale for both w1 and w3
-                                            weight_loader(
-                                                param,
-                                                loaded_weight,
-                                                transformed_name,
-                                                "w1",
-                                                expert_id,
-                                            )
-                                            weight_loader(
-                                                param,
-                                                loaded_weight,
-                                                transformed_name,
-                                                "w3",
-                                                expert_id,
-                                            )
-                                        else:
-                                            # For down_proj, just load w2
-                                            weight_loader(
-                                                param,
-                                                loaded_weight,
-                                                transformed_name,
-                                                "w2",
-                                                expert_id,
-                                            )
-                            else:
-                                # No expert ID found - this is a single scale for all experts
-                                # Replicate the same scale across all experts
-                                # Transform the name
-                                if ".gate_up_proj" in name:
-                                    transformed_name = name.replace(
-                                        ".experts.gate_up_proj", ".experts.w13"
-                                    )
-                                    shard_id = "w13"
-                                else:  # down_proj
-                                    transformed_name = name.replace(
-                                        ".experts.down_proj", ".experts.w2"
-                                    )
-                                    shard_id = "w2"
-
-                                if transformed_name in params_dict:
-                                    param = params_dict[transformed_name]
-                                    weight_loader = param.weight_loader
-
-                                    # Load the same scale for all experts
-                                    for expert_id in range(num_experts):
-                                        # For gate_up_proj scales, load for both w1 and w3 shards
-                                        if ".gate_up_proj" in name:
-                                            # Load the same scale for both w1 and w3
-                                            weight_loader(
-                                                param,
-                                                loaded_weight,
-                                                transformed_name,
-                                                "w1",
-                                                expert_id,
-                                            )
-                                            weight_loader(
-                                                param,
-                                                loaded_weight,
-                                                transformed_name,
-                                                "w3",
-                                                expert_id,
-                                            )
-                                        else:
-                                            # For down_proj, just load w2
-                                            weight_loader(
-                                                param,
-                                                loaded_weight,
-                                                transformed_name,
-                                                "w2",
-                                                expert_id,
-                                            )
-                                else:
-                                    pass  # Parameter not found, skip
-                        else:
-                            # Weight parameters: Handle with expert iteration
-                            if ".gate_up_proj" in name:
-                                name_list = [
-                                    name.replace(
-                                        ".experts.gate_up_proj", ".experts.w13_weight"
-                                    )
-                                ] * 2
-                                loaded_weight_list = loaded_weight.chunk(2, dim=-1)
-                                shard_id_list = ["w1", "w3"]
-                            else:
-                                name_list = [
-                                    name.replace(
-                                        ".experts.down_proj", ".experts.w2_weight"
-                                    )
-                                ]
-                                shard_id_list = ["w2"]
-                                loaded_weight_list = [loaded_weight]
-
-                            for name, loaded_weight, shard_id in zip(
-                                name_list, loaded_weight_list, shard_id_list
-                            ):
-                                param = params_dict[name]
-                                weight_loader = param.weight_loader
-                                for expert_id in range(num_experts):
-                                    weight_loader(
-                                        param,
-                                        loaded_weight[expert_id].T,
-                                        name,
-                                        shard_id=shard_id,
-                                        expert_id=expert_id,
-                                    )
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+        param = params_dict[name]
+        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+        weight_loader(param, loaded_weight)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if hasattr(self.language_model, "set_eagle3_layers_to_capture"):
