@@ -12,8 +12,8 @@ RPD profiler is a low-overhead cross-platform profiler. Therefore, the same RPD 
 
 ```bash
 # install other tools
-apt-get install sqlite3 libsqlite3-dev
-apt-get install libfmt-dev
+apt-get update -y
+apt-get install -y sqlite3 libsqlite3-dev libfmt-dev
 
 # download and install RPD
 git clone https://github.com/ROCm/rocmProfileData.git
