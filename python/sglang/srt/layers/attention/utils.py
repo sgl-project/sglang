@@ -1,3 +1,4 @@
+import torch
 import triton
 import triton.language as tl
 
@@ -92,3 +93,70 @@ def create_flashmla_kv_indices_triton(
             data // PAGED_SIZE,
             mask=mask_out,
         )
+
+
+def create_flashinfer_kv_indices(
+    bs,
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices_ptr,
+    page_kernel_lens_ptr,
+    kv_indptr,
+    kv_start_idx,
+    kv_indices_ptr,
+    req_to_token_ptr_stride,
+):
+    BLOCK_SIZE = 128
+    req_to_token_ptr = req_to_token_ptr.view(-1)
+    kv_indices_ptr = kv_indices_ptr.view(-1)
+
+    for pid in range(bs):
+        # find the req pool idx, this is for batch to token
+        req_pool_index = req_pool_indices_ptr[pid]
+        kv_indices_offset = kv_indptr[pid]
+
+        kv_start = 0
+        kv_end = page_kernel_lens_ptr[pid]
+
+        num_loop = (kv_end - kv_start + BLOCK_SIZE - 1) // BLOCK_SIZE
+        for i in range(num_loop):
+            # index into req_to_token_ptr needs to be int64
+            offset = i * BLOCK_SIZE
+            data = req_to_token_ptr[
+                req_pool_index * req_to_token_ptr_stride
+                + kv_start
+                + offset : req_pool_index * req_to_token_ptr_stride
+                + kv_start
+                + offset
+                + BLOCK_SIZE
+            ]
+
+            kv_indices_ptr[
+                kv_indices_offset + offset : kv_indices_offset + offset + BLOCK_SIZE
+            ] = data
+
+
+def create_flashmla_kv_indices(
+    bs,
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices_ptr,
+    page_kernel_lens_ptr,
+    kv_start_idx,
+    kv_indices_ptr,
+    req_to_token_ptr_stride,
+    kv_indices_ptr_stride,
+    PAGED_SIZE=128,
+):
+    req_to_token_ptr = req_to_token_ptr.view(-1)
+
+    for pid in range(bs):
+        # find the req pool idx, this is for batch to token
+        req_pool_index = req_pool_indices_ptr[pid]
+
+        kv_start = 0
+        kv_end = page_kernel_lens_ptr[pid]
+        num_pages = (kv_end - kv_start + PAGED_SIZE - 1) // PAGED_SIZE
+
+        for i in range(num_pages):
+            req_to_token_ptr_start = req_pool_index * req_to_token_ptr_stride + kv_start
+            paged_offset = req_to_token_ptr_start + i * PAGED_SIZE
+            kv_indices_ptr[pid, i] = req_to_token_ptr[paged_offset] // PAGED_SIZE

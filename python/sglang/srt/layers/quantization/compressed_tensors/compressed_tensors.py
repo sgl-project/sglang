@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe im
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
     CompressedTensorsW8A8Fp8,
+    CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
@@ -47,6 +48,8 @@ try:
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
+
+from sglang.srt.utils import is_cuda, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -233,20 +236,21 @@ class CompressedTensorsConfig(QuantizationConfig):
         return []
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
-        capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
+        if is_cuda():
+            capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
 
-        if capability_tuple is not None:
-            capability = capability_tuple.to_int()
-            supported = capability >= min_capability
-            if error and not supported:
-                raise RuntimeError(
-                    "Quantization scheme is not supported for ",
-                    f"the current GPU. Min capability: {min_capability}. ",
-                    f"Current capability: {capability}.",
-                )
-            return supported
+            if capability_tuple is not None:
+                capability = capability_tuple.to_int()
+                supported = capability >= min_capability
+                if error and not supported:
+                    raise RuntimeError(
+                        "Quantization scheme is not supported for ",
+                        f"the current GPU. Min capability: {min_capability}. ",
+                        f"Current capability: {capability}.",
+                    )
+                return supported
         else:
-            return False
+            return is_npu()
 
     def _is_static_tensor_w8a8(
         self, weight_quant: BaseModel, input_quant: BaseModel
@@ -301,6 +305,39 @@ class CompressedTensorsConfig(QuantizationConfig):
         ]
         if not (
             is_floating_point
+            and is_symmetric_weight
+            and is_static_weight
+            and is_per_tensor_or_channel_weight
+        ):
+            return False
+
+        # Dynamic quantization is always supported if weights supported.
+        if input_quant.dynamic:
+            return True
+
+        # Confirm activation scheme is supported.
+        is_symmetric_activation = input_quant.symmetric
+        is_per_tensor_activation = input_quant.strategy == QuantizationStrategy.TENSOR
+        return is_symmetric_activation and is_per_tensor_activation
+
+    def _is_int8_w8a8(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
+        # Confirm weights and activations quantized.
+        if weight_quant is None or input_quant is None:
+            return False
+
+        # Confirm weight scheme is supported.
+        is_int_point = (
+            weight_quant.type == QuantizationType.INT
+            and input_quant.type == QuantizationType.INT
+        )
+        is_symmetric_weight = weight_quant.symmetric
+        is_static_weight = not weight_quant.dynamic
+        is_per_tensor_or_channel_weight = weight_quant.strategy in [
+            QuantizationStrategy.TENSOR,
+            QuantizationStrategy.CHANNEL,
+        ]
+        if not (
+            is_int_point
             and is_symmetric_weight
             and is_static_weight
             and is_per_tensor_or_channel_weight

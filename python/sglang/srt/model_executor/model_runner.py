@@ -302,6 +302,7 @@ class ModelRunner:
             server_args.max_running_requests,
             server_args.max_total_tokens,
         )
+        self.enable_dynamo_compile = False
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
@@ -309,6 +310,14 @@ class ModelRunner:
         else:
             self.cuda_graph_runner = None
             self.init_attention_backend()
+            self.enable_dynamo_compile = True
+            if self.enable_dynamo_compile:
+                self.model = torch.compile(
+                    self.model,
+                    dynamic=True,
+                    backend=get_compiler_backend(),
+                    fullgraph=True,
+                )
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
@@ -401,6 +410,7 @@ class ModelRunner:
                     "fa3",
                     "triton",
                     "flashmla",
+                    "npumla",
                     "cutlass_mla",
                 ]:
                     logger.info(
@@ -1254,6 +1264,10 @@ class ModelRunner:
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
             return FlashMLABackend(self)
+        elif self.server_args.attention_backend == "npumla":
+            from sglang.srt.layers.attention.npumla_backend import NpuMLABackend
+
+            return NpuMLABackend(self)
         elif self.server_args.attention_backend == "fa3":
             assert (
                 torch.cuda.get_device_capability()[0] == 8 and not self.use_mla_backend
@@ -1426,6 +1440,32 @@ class ModelRunner:
 
         return output
 
+    def mark_static(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        def mark_tensor_static(model_input, is_cache=False):
+            if model_input is not None:
+                if isinstance(model_input, torch.Tensor):
+                    torch._dynamo.mark_static(model_input)
+                elif is_cache:
+                    for buffer_per_layer in model_input:
+                        torch._dynamo.mark_static(buffer_per_layer)
+                elif isinstance(model_input, PPProxyTensors):
+                    for a, b in model_input.tensors.items():
+                        torch._dynamo.mark_static(b)
+                elif isinstance(model_input, tuple):
+                    for a in model_input:
+                        mark_tensor_static(a)
+
+        mark_tensor_static(pp_proxy_tensors)
+        mark_tensor_static(forward_batch.input_ids)
+        mark_tensor_static(forward_batch.positions)
+        mark_tensor_static(forward_batch.input_embeds)
+        mark_tensor_static(forward_batch.out_cache_loc)
+        mark_tensor_static(forward_batch.token_to_kv_pool.kv_buffer, True)
+
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -1437,6 +1477,9 @@ class ModelRunner:
             and self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(forward_batch)
         )
+        if not can_run_cuda_graph and self.enable_dynamo_compile:
+            self.mark_static(forward_batch, pp_proxy_tensors)
+
         if can_run_cuda_graph:
             ret = self.cuda_graph_runner.replay(
                 forward_batch,

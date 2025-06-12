@@ -352,9 +352,9 @@ class ServerArgs:
             )
             self.page_size = 64
 
-        if self.attention_backend == "cutlass_mla":
+        if self.attention_backend in ["cutlass_mla", "npumla"]:
             logger.warning(
-                "Cutlass MLA only supports a page_size of 128, change page_size to 128."
+                "Cutlass MLA and NpuMLA only support a page_size of 128, change page_size to 128."
             )
             self.page_size = 128
 
@@ -1111,6 +1111,7 @@ class ServerArgs:
                 "fa3",
                 "flashinfer",
                 "flashmla",
+                "npumla",
                 "intel_amx",
                 "torch_native",
                 "triton",

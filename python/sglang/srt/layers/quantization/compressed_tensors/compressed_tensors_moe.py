@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8MoEMethod
 from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
 
 _is_cuda = is_cuda()
@@ -74,6 +75,8 @@ class CompressedTensorsMoEMethod:
             return CompressedTensorsWNA16MoEMethod(quant_config)
         elif quant_config._is_fp8_w8a8(weight_quant, input_quant):
             return CompressedTensorsW8A8Fp8MoEMethod(quant_config)
+        elif quant_config._is_int8_w8a8(weight_quant, input_quant):
+            return W8A8Int8MoEMethod(quant_config)
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"

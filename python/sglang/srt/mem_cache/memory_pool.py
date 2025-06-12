@@ -37,12 +37,23 @@ import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import debug_timing, get_bool_env_var, is_cuda, next_power_of_2
+from sglang.srt.utils import (
+    debug_timing,
+    get_bool_env_var,
+    is_cuda,
+    is_npu,
+    next_power_of_2,
+)
+
+_is_cuda = is_cuda()
+_is_npu = is_npu()
+
+if _is_npu:
+    import torch_npu
 
 logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
-_is_cuda = is_cuda()
 
 
 class ReqToTokenPool:
@@ -634,6 +645,16 @@ def set_mla_kv_buffer_triton(
     )
 
 
+def set_mla_kv_buffer_npu(
+    kv_buffer: torch.Tensor,
+    loc_tensor: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+):
+    key_states = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
+    torch_npu.scatter_update_(kv_buffer, loc_tensor, key_states, axis=-2)
+
+
 class MLATokenToKVPool(KVCache):
     def __init__(
         self,
@@ -682,9 +703,10 @@ class MLATokenToKVPool(KVCache):
                 else nullcontext()
             ):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                size_align = (size + page_size) // 128 * 128
                 self.kv_buffer = [
                     torch.zeros(
-                        (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
+                        (size_align, 1, kv_lora_rank + qk_rope_head_dim),
                         dtype=self.store_dtype,
                         device=device,
                     )
@@ -755,7 +777,15 @@ class MLATokenToKVPool(KVCache):
                 self.store_dtype
             )
         else:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+            if _is_npu and len(loc.size()) > 0 and loc.ndim == 1:
+                torch_npu.scatter_update_(
+                    self.kv_buffer[layer_id - self.start_layer].unsqueeze(0),
+                    loc[0],
+                    cache_k.unsqueeze(0),
+                    axis=1,
+                )
+            else:
+                self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
     def set_mla_kv_buffer(
         self,
@@ -772,9 +802,14 @@ class MLATokenToKVPool(KVCache):
             cache_k_nope = cache_k_nope.view(self.store_dtype)
             cache_k_rope = cache_k_rope.view(self.store_dtype)
 
-        set_mla_kv_buffer_triton(
-            self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
-        )
+        if _is_npu:
+            set_mla_kv_buffer_npu(
+                self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
+            )
+        else:
+            set_mla_kv_buffer_triton(
+                self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
+            )
 
     def get_flat_data(self, indices):
         # prepare a large chunk of contiguous data for efficient transfer
