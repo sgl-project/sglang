@@ -84,7 +84,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
         )
         engine = sgl.Engine(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            custom_weight_loader=custom_loader_name,
+            custom_weight_loader=[custom_loader_name],
         )
 
         write_param_names = [

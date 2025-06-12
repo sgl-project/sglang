@@ -1535,6 +1535,7 @@ class ServerArgs:
         parser.add_argument(
             "--custom-weight-loader",
             type=str,
+            nargs="*",
             default=None,
             help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
         )
