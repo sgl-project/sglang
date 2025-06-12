@@ -11,6 +11,12 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.moe.ep_moe.fbgemm_grouped_gemm import (
+    grouped_gemm as fbgemm_grouped_gemm,
+)
+from sglang.srt.layers.moe.ep_moe.fbgemm_grouped_gemm import (
+    grouped_gemm_fp8_rowwise as fbgemm_grouped_gemm_fp8_rowwise,
+)
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
@@ -18,7 +24,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     grouped_gemm_triton,
     post_reorder_triton_kernel,
     pre_reorder_triton_kernel,
-    run_moe_ep_preproess,
+    run_moe_ep_preprocess,
     silu_and_mul_masked_post_quant_fwd,
     silu_and_mul_triton_kernel,
     tma_align_input_scale,
@@ -61,19 +67,21 @@ logger = logging.getLogger(__name__)
 
 
 class GroupedGemmRunner(torch.nn.Module):
-    flashinfer_gemm_warpper = None
+    flashinfer_gemm_wrapper = None
 
     def __init__(
         self,
         device,
         use_flashinfer: bool = False,
+        use_fbgemm: bool = False,
         use_per_token_if_dynamic: bool = True,
     ):
         super().__init__()
         self.device = device
         self.use_flashinfer = use_flashinfer
+        self.use_fbgemm = use_fbgemm
         self.use_per_token_if_dynamic = use_per_token_if_dynamic
-        if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_warpper is None:
+        if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_wrapper is None:
             GroupedGemmRunner._init_flashinfer_wrapper(device)
 
     @classmethod
@@ -83,7 +91,7 @@ class GroupedGemmRunner(torch.nn.Module):
         workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.int8, device=device
         )
-        cls.flashinfer_gemm_warpper = SegmentGEMMWrapper(workspace_buffer)
+        cls.flashinfer_gemm_wrapper = SegmentGEMMWrapper(workspace_buffer)
 
     # c = a * b
     def forward(
@@ -104,8 +112,8 @@ class GroupedGemmRunner(torch.nn.Module):
         if self.use_flashinfer:
             # TODO: flashinfer
             assert False
-            assert GroupedGemmRunner.flashinfer_gemm_warpper is not None
-            c = GroupedGemmRunner.flashinfer_gemm_warpper.run(
+            assert GroupedGemmRunner.flashinfer_gemm_wrapper is not None
+            c = GroupedGemmRunner.flashinfer_gemm_wrapper.run(
                 x=a,
                 weights=b,
                 batch_size=batch_size,
@@ -113,6 +121,25 @@ class GroupedGemmRunner(torch.nn.Module):
                 seg_indptr=seg_indptr,
                 weight_indices=weight_indices,
             )
+        elif self.use_fbgemm and weight_column_major:
+            b_fbgemm = b.contiguous().reshape(-1, b.shape[2])
+            assert seg_indptr is not None, "FBGemm needs seg_indptr"
+            m_sizes = seg_indptr[1:] - seg_indptr[:-1]
+            if use_fp8_w8a8:
+                # TODO: Currently fbgemm only supports rowwise fp8. We need to
+                # change it to blockwise fp8 to fully support the placement for
+                # quant.
+                assert scale_a is not None and scale_b is not None
+                c = fbgemm_grouped_gemm_fp8_rowwise(
+                    a.to(torch.float8_e4m3fn),
+                    b_fbgemm.to(torch.float8_e4m3fn),
+                    m_sizes,
+                    scale_a.to(torch.float32),
+                    scale_b.to(torch.float32),
+                    use_fast_accum=True,
+                )
+            else:
+                c = fbgemm_grouped_gemm(a, b_fbgemm, m_sizes, use_fast_accum=True)
         else:
             assert weight_column_major == True
             c = grouped_gemm_triton(
@@ -238,6 +265,7 @@ class EPMoE(torch.nn.Module):
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device,
                 use_flashinfer=False,  # TODO: use flashinfer
+                use_fbgemm=True,
                 use_per_token_if_dynamic=self.use_per_token_if_dynamic,
             )
 
@@ -257,7 +285,7 @@ class EPMoE(torch.nn.Module):
             ),
         )
 
-        reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
+        reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preprocess(
             topk_ids, self.num_experts
         )
 
@@ -995,7 +1023,9 @@ class DeepEPMoE(EPMoE):
         assert self.activation == "silu"
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
-                hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
+                hidden_states.device,
+                use_flashinfer=False,
+                use_fbgemm=False,  # TODO: use flashinfer
             )
 
         if self.activation_scheme == "dynamic" and not self.use_block_quant:

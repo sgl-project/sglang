@@ -9,7 +9,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     grouped_gemm_triton,
     post_reorder_triton_kernel,
     pre_reorder_triton_kernel,
-    run_moe_ep_preproess,
+    run_moe_ep_preprocess,
     silu_and_mul_triton_kernel,
 )
 from sglang.srt.layers.moe.topk import select_experts
@@ -52,7 +52,7 @@ def ep_moe(
         custom_routing_function=custom_routing_function,
     )
 
-    reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(topk_ids, num_experts)
+    reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preprocess(topk_ids, num_experts)
 
     gateup_input = torch.empty(
         (int(hidden_states.shape[0] * top_k), hidden_states.shape[1]),
