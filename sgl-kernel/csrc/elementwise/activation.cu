@@ -54,9 +54,9 @@ __device__ __forceinline__ T gelu(const T& x) {
 #endif
 }
 
-// TODO (Hubert): x * torch.sigmoid(1.702 * x)
+// gelu_quick(x) = x * torch.sigmoid(1.702 * x)
 template <typename T>
-__device__ __forceinline__ T gelu_quick(const T& x) {
+__device__ __forceinline__ T gelu_quick_kernel(const T& x) {
 #if USE_ROCM
   float f32_val = castToFloat(x);
   return castFromFloat<T>(f32_val / (1.0f + expf(-f32_val * 1.702f)));
@@ -85,12 +85,12 @@ __device__ __forceinline__ T gelu_tanh(const T& x) {
 #endif
 }
 
-void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
+void silu_and_mul(at::Tensor& out, at::Tensor& input) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
@@ -103,12 +103,12 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
   });
 }
 
-void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
+void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
@@ -121,12 +121,12 @@ void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) 
   });
 }
 
-void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
+void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
@@ -139,18 +139,18 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
   });
 }
 
-void gelu_quick_only(at::Tensor &out, const at::Tensor &input, int64_t cuda_stream) {
+void gelu_quick(at::Tensor& out, const at::Tensor& input) {
   int d = input.size(-1);
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     dim3 block(std::min(d / vec_size, 1024U));
-    flashinfer::activation::act_only_kernel<c_type, gelu_quick>
+    flashinfer::activation::act_only_kernel<c_type, gelu_quick_kernel>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 
     return true;

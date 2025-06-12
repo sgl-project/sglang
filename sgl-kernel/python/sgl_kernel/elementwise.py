@@ -179,7 +179,7 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernel.silu_and_mul.default(out, input, get_cuda_stream())
+    torch.ops.sgl_kernel.silu_and_mul.default(out, input)
     return out
 
 
@@ -194,7 +194,7 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernel.gelu_tanh_and_mul.default(out, input, get_cuda_stream())
+    torch.ops.sgl_kernel.gelu_tanh_and_mul.default(out, input)
     return out
 
 
@@ -209,11 +209,8 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             device=input.device,
             dtype=input.dtype,
         )
-    torch.ops.sgl_kernel.gelu_and_mul.default(out, input, get_cuda_stream())
+    torch.ops.sgl_kernel.gelu_and_mul.default(out, input)
     return out
-
-def _check_shape_act_only(t_in: torch.Tensor, t_out: torch.Tensor) -> None:
-    assert t_in.shape == t_out.shape, f"{t_in.shape} != {t_out.shape}"
 
 
 def gelu_quick(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
@@ -230,11 +227,11 @@ def gelu_quick(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
         )
 
     if out is not None:
-        _check_shape_act_only(input, out)
+        assert input.shape == out.shape, f"{input.shape} != {out.shape}"
     else:
         out = torch.empty_like(input)
 
-    torch.ops.sgl_kernel.gelu_quick(out, input, torch.cuda.current_stream().cuda_stream)
+    torch.ops.sgl_kernel.gelu_quick(out, input)
     return out
 
 
