@@ -191,18 +191,6 @@ class Llama4ForConditionalGeneration(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
-        # if is_main_rank:
-        #     print(f"Debug: Model has {len(params_dict)} parameters")
-
-        #     # Debug: Show scale parameter names in the model
-        #     scale_params = [
-        #         name
-        #         for name in params_dict.keys()
-        #         if "scale" in name and "expert" in name
-        #     ]
-        #     print(
-        #         f"Debug: Scale parameters in model: {scale_params[:30]}"
-        #     )  # Show first 30
 
         num_experts = (
             self.config.text_config.num_local_experts
@@ -248,23 +236,13 @@ class Llama4ForConditionalGeneration(nn.Module):
             else:
                 if ".experts" in name:
                     # NOTE: llama4 fp8 has different weight format for experts
+                    # exclude shared_expert.xxx
                     # Scale parameters are now handled by the MoE layer's weight_loader directly
-                    # if "scale" in name:
-                    #     # Let scale parameters fall through to the normal weight loading flow
-                    #     # The MoE layer's weight_loader will handle them properly
-                    #     if name not in params_dict:
-                    #         continue
-                    #     param = params_dict[name]
-                    #     weight_loader = getattr(
-                    #         param, "weight_loader", default_weight_loader
-                    #     )
-                    #     weight_loader(param, loaded_weight)
                     if (
                         "experts.gate_up_proj" not in name
                         and "experts.down_proj" not in name
                     ):
-                        # Handle other expert parameters through mapping, experts.8.down_proj.weight
-                        print(f"Debug: Loading expert parameter: {name}")
+                        # Handle other expert parameters through mapping, experts.8.down_proj.weight, this is for RH llama4 fp8 checkpoint
                         for mapping in expert_params_mapping:
                             param_name, weight_name, expert_id, shard_id = mapping
                             if weight_name not in name:
@@ -282,34 +260,150 @@ class Llama4ForConditionalGeneration(nn.Module):
                             )
                             break
                     else:
-                        if ".gate_up_proj" in name:
-                            name_list = [
-                                name.replace(
-                                    ".experts.gate_up_proj", ".experts.w13_weight"
-                                )
-                            ] * 2
-                            loaded_weight_list = loaded_weight.chunk(2, dim=-1)
-                            shard_id_list = ["w1", "w3"]
-                        else:
-                            name_list = [
-                                name.replace(".experts.down_proj", ".experts.w2_weight")
-                            ]
-                            shard_id_list = ["w2"]
-                            loaded_weight_list = [loaded_weight]
+                        # Handle scale parameters differently from weight parameters
+                        if "scale" in name:
+                            # Scale parameters might have expert IDs in their names
+                            # Check if this matches the expert parameter pattern: experts.{expert_id}.{param_name}
+                            import re
 
-                        for name, loaded_weight, shard_id in zip(
-                            name_list, loaded_weight_list, shard_id_list
-                        ):
-                            param = params_dict[name]
-                            weight_loader = param.weight_loader
-                            for expert_id in range(num_experts):
-                                weight_loader(
-                                    param,
-                                    loaded_weight[expert_id].T,
-                                    name,
-                                    shard_id=shard_id,
-                                    expert_id=expert_id,
-                                )
+                            expert_match = re.search(r"experts\.(\d+)\.", name)
+                            if expert_match:
+                                expert_id = int(expert_match.group(1))
+                                if is_main_rank:
+                                    print(
+                                        f"Debug: Found expert_id {expert_id} in scale parameter: {name}"
+                                    )
+
+                                # Transform the name
+                                if ".gate_up_proj" in name:
+                                    transformed_name = name.replace(
+                                        ".experts.gate_up_proj", ".experts.w13"
+                                    )
+                                    shard_id = "w13"
+                                else:  # down_proj
+                                    transformed_name = name.replace(
+                                        ".experts.down_proj", ".experts.w2"
+                                    )
+                                    shard_id = "w2"
+
+                                if is_main_rank:
+                                    print(
+                                        f"Debug: Loading scale parameter: {name} -> {transformed_name}"
+                                    )
+
+                                if transformed_name in params_dict:
+                                    param = params_dict[transformed_name]
+                                    weight_loader = param.weight_loader
+
+                                    # Load the same scale for all experts
+                                    for expert_id in range(num_experts):
+                                        # For gate_up_proj scales, load for both w1 and w3 shards
+                                        if ".gate_up_proj" in name:
+                                            # Load the same scale for both w1 and w3
+                                            weight_loader(
+                                                param,
+                                                loaded_weight,
+                                                transformed_name,
+                                                "w1",
+                                                expert_id,
+                                            )
+                                            weight_loader(
+                                                param,
+                                                loaded_weight,
+                                                transformed_name,
+                                                "w3",
+                                                expert_id,
+                                            )
+                                        else:
+                                            # For down_proj, just load w2
+                                            weight_loader(
+                                                param,
+                                                loaded_weight,
+                                                transformed_name,
+                                                "w2",
+                                                expert_id,
+                                            )
+                            else:
+                                # No expert ID found - this is a single scale for all experts
+                                # Replicate the same scale across all experts
+                                # Transform the name
+                                if ".gate_up_proj" in name:
+                                    transformed_name = name.replace(
+                                        ".experts.gate_up_proj", ".experts.w13"
+                                    )
+                                    shard_id = "w13"
+                                else:  # down_proj
+                                    transformed_name = name.replace(
+                                        ".experts.down_proj", ".experts.w2"
+                                    )
+                                    shard_id = "w2"
+
+                                if transformed_name in params_dict:
+                                    param = params_dict[transformed_name]
+                                    weight_loader = param.weight_loader
+
+                                    # Load the same scale for all experts
+                                    for expert_id in range(num_experts):
+                                        # For gate_up_proj scales, load for both w1 and w3 shards
+                                        if ".gate_up_proj" in name:
+                                            # Load the same scale for both w1 and w3
+                                            weight_loader(
+                                                param,
+                                                loaded_weight,
+                                                transformed_name,
+                                                "w1",
+                                                expert_id,
+                                            )
+                                            weight_loader(
+                                                param,
+                                                loaded_weight,
+                                                transformed_name,
+                                                "w3",
+                                                expert_id,
+                                            )
+                                        else:
+                                            # For down_proj, just load w2
+                                            weight_loader(
+                                                param,
+                                                loaded_weight,
+                                                transformed_name,
+                                                "w2",
+                                                expert_id,
+                                            )
+                                else:
+                                    pass  # Parameter not found, skip
+                        else:
+                            # Weight parameters: Handle with expert iteration
+                            if ".gate_up_proj" in name:
+                                name_list = [
+                                    name.replace(
+                                        ".experts.gate_up_proj", ".experts.w13_weight"
+                                    )
+                                ] * 2
+                                loaded_weight_list = loaded_weight.chunk(2, dim=-1)
+                                shard_id_list = ["w1", "w3"]
+                            else:
+                                name_list = [
+                                    name.replace(
+                                        ".experts.down_proj", ".experts.w2_weight"
+                                    )
+                                ]
+                                shard_id_list = ["w2"]
+                                loaded_weight_list = [loaded_weight]
+
+                            for name, loaded_weight, shard_id in zip(
+                                name_list, loaded_weight_list, shard_id_list
+                            ):
+                                param = params_dict[name]
+                                weight_loader = param.weight_loader
+                                for expert_id in range(num_experts):
+                                    weight_loader(
+                                        param,
+                                        loaded_weight[expert_id].T,
+                                        name,
+                                        shard_id=shard_id,
+                                        expert_id=expert_id,
+                                    )
                 else:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
