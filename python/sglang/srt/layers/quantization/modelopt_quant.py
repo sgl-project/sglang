@@ -26,6 +26,7 @@ from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
     is_layer_skipped,
+    per_tensor_dequantize,
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -341,11 +342,13 @@ class ModelOptFp8MoEMethod:
 
         if self.quant_config.is_checkpoint_fp8_serialized:
             # WEIGHT SCALES - Per-tensor scaling for ModelOpts
-            # should we Allocate 2 scales for w1 and w3 respectively.
+            # Allocate 2 scales for w1 and w3 respectively.
             # They will be combined to a single scale after weight loading.
             w13_weight_scale = PerTensorScaleParameter(
                 data=torch.full(
-                    (num_experts,), torch.finfo(torch.float32).min, dtype=torch.float32
+                    (num_experts, 2),
+                    torch.finfo(torch.float32).min,
+                    dtype=torch.float32,
                 ),
                 weight_loader=weight_loader,
             )
@@ -384,18 +387,51 @@ class ModelOptFp8MoEMethod:
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
-        # Should we requantize the weights here?
-        # Fp8 moe kernel needs single weight scale for w13 per expert.
-        # We take the max then dequant and requant each expert?
-        #  Ensure weights are proper Parameters
+        # Ensure weights are proper Parameters
         layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
         layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
-        # Handle scale parameters - use standard per-expert scales
+        # Handle scale parameters
         if hasattr(layer, "w13_weight_scale") and layer.w13_weight_scale is not None:
-            layer.w13_weight_scale = Parameter(
-                layer.w13_weight_scale.data, requires_grad=False
-            )
+            # Fp8 moe kernel needs single weight scale for w13 per expert.
+            # We take the max of the w1 and w3 scales then dequant and requant each expert.
+            if layer.w13_weight_scale.dim() == 2:  # Shape: (num_experts, 2)
+                from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+
+                # Get the maximum scale across w1 and w3 for each expert
+                max_w13_scales = layer.w13_weight_scale.max(dim=1).values
+
+                # Requantize each expert's weights using the combined scale
+                # w13_weight has shape (num_experts, 2 * intermediate_size, hidden_size)
+                # where the first intermediate_size rows are w1, the next are w3
+                intermediate_size = layer.w13_weight.shape[1] // 2
+                for expert_id in range(layer.w13_weight.shape[0]):
+                    start = 0
+                    for shard_id in range(2):  # w1 and w3
+                        # Dequantize using the original scale for this shard
+                        dq_weight = per_tensor_dequantize(
+                            layer.w13_weight[expert_id][
+                                start : start + intermediate_size, :
+                            ],
+                            layer.w13_weight_scale[expert_id][shard_id],
+                        )
+                        # Requantize using the combined max scale
+                        (
+                            layer.w13_weight[expert_id][
+                                start : start + intermediate_size, :
+                            ],
+                            _,
+                        ) = scaled_fp8_quant(dq_weight, max_w13_scales[expert_id])
+
+                        start += intermediate_size
+
+                # Update the scale parameter to be per-expert instead of per-shard
+                layer.w13_weight_scale = Parameter(max_w13_scales, requires_grad=False)
+            else:
+                layer.w13_weight_scale = Parameter(
+                    layer.w13_weight_scale.data, requires_grad=False
+                )
+
         if hasattr(layer, "w2_weight_scale") and layer.w2_weight_scale is not None:
             layer.w2_weight_scale = Parameter(
                 layer.w2_weight_scale.data, requires_grad=False
@@ -443,23 +479,6 @@ class ModelOptFp8MoEMethod:
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
         )
-
-        # Debug scale shapes
-        from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-        if get_tensor_model_parallel_rank() == 0:
-            print(
-                f"DEBUG: w13_weight_scale shape: {layer.w13_weight_scale.shape if layer.w13_weight_scale is not None else None}"
-            )
-            print(
-                f"DEBUG: w2_weight_scale shape: {layer.w2_weight_scale.shape if layer.w2_weight_scale is not None else None}"
-            )
-            print(
-                f"DEBUG: w13_input_scale shape: {layer.w13_input_scale.shape if layer.w13_input_scale is not None else None}"
-            )
-            print(
-                f"DEBUG: w2_input_scale shape: {layer.w2_input_scale.shape if layer.w2_input_scale is not None else None}"
-            )
 
         return fused_experts(
             x,
