@@ -222,8 +222,6 @@ class HiPAttentionBackend(AttentionBackend):
                     )
                 )
             
-            print('asdfasdf', type(k_chunk), k_chunk is not None)
-            
             q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
             
             o, _ = self.forward_paged_hip(
