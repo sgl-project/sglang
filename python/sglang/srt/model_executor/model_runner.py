@@ -30,7 +30,6 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
-from sglang.srt.cpu_utils import get_cpu_ids_by_node
 from sglang.srt.distributed import (
     get_tp_group,
     get_world_group,
@@ -103,6 +102,7 @@ from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
+    get_cpu_ids_by_node,
     init_custom_process_group,
     is_cuda,
     is_fa3_default_architecture,
