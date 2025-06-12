@@ -84,6 +84,7 @@ def ep_moe(
         top_k,
         hidden_states.shape[1],
         BLOCK_SIZE=512,
+        use_per_token_if_dynamic=True,
     )
 
     seg_indptr_cur_rank = seg_indptr[start_expert_id : end_expert_id + 2]
