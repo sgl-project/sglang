@@ -1156,15 +1156,15 @@ class Scheduler(
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-            f"#running-req: {running_bs}, "
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
             f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)}, "
-            f += f"time: {gap_latency:.2f} "
+            f += f"input throughput (token/s): {self.last_input_throughput:.2f} "
         else:
+            f += f"#running-req: {running_bs}, "
             f += f"#queue-req: {len(self.waiting_queue)}"
 
         logger.info(f)
