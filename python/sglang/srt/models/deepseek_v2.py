@@ -23,6 +23,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import vTensor
 from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
@@ -101,8 +102,6 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     log_info_on_rank0,
 )
-
-import vTensor
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -1442,7 +1441,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             layer_id=layer_id,
-            vtensor_enable = self.vtensor_enable,
+            vtensor_enable=self.vtensor_enable,
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
@@ -1505,7 +1504,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
-        event_fwd: Optional[torch.cuda.Event] = None
+        event_fwd: Optional[torch.cuda.Event] = None,
     ) -> torch.Tensor:
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
@@ -1682,23 +1681,40 @@ class DeepseekV2Model(nn.Module):
                     layer = self.layers[i]
                     if i < normal_num_layers - 2:
                         hidden_states, residual = layer(
-                            positions, hidden_states, forward_batch, residual, zero_allocator, self.layers[i + 2].self_attn.o_proj.event_fwd
+                            positions,
+                            hidden_states,
+                            forward_batch,
+                            residual,
+                            zero_allocator,
+                            self.layers[i + 2].self_attn.o_proj.event_fwd,
                         )
                         if i % 2 == 0:
                             if i > 0:
-                                self.layers[i + 2].self_attn.o_proj.prefetch_all_gather(_stream_even)
+                                self.layers[i + 2].self_attn.o_proj.prefetch_all_gather(
+                                    _stream_even
+                                )
                         else:
-                            self.layers[i + 2].self_attn.o_proj.prefetch_all_gather(_stream_odd)
+                            self.layers[i + 2].self_attn.o_proj.prefetch_all_gather(
+                                _stream_odd
+                            )
                     else:
                         hidden_states, residual = layer(
-                            positions, hidden_states, forward_batch, residual, zero_allocator
+                            positions,
+                            hidden_states,
+                            forward_batch,
+                            residual,
+                            zero_allocator,
                         )
         else:
             for i in range(normal_num_layers):
                 with get_global_expert_distribution_recorder().with_current_layer(i):
                     layer = self.layers[i]
                     hidden_states, residual = layer(
-                        positions, hidden_states, forward_batch, residual, zero_allocator
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        zero_allocator,
                     )
 
         if normal_num_layers != total_num_layers:
@@ -1743,9 +1759,18 @@ class DeepseekV2ForCausalLM(nn.Module):
             weight_type_size = 2
             if quant_config is not None and quant_config.is_checkpoint_fp8_serialized:
                 weight_type_size = 1
-            numel_size = config.num_attention_heads * config.v_head_dim * config.hidden_size // self.world_size
-            vTensor.init_shared_phy_blocks(self.world_size - 1, numel_size * weight_type_size)
-            vTensor.init_unique_phy_blocks(config.num_hidden_layers, numel_size * weight_type_size)
+            numel_size = (
+                config.num_attention_heads
+                * config.v_head_dim
+                * config.hidden_size
+                // self.world_size
+            )
+            vTensor.init_shared_phy_blocks(
+                self.world_size - 1, numel_size * weight_type_size
+            )
+            vTensor.init_unique_phy_blocks(
+                config.num_hidden_layers, numel_size * weight_type_size
+            )
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )

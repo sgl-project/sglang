@@ -291,7 +291,10 @@ class CudaGraphRunner:
             self.vtensor_enable = global_server_args_dict["vtensor_enable"]
             if self.vtensor_enable:
                 from sglang.srt.models.deepseek_v2 import PrefetchStreamManager
-                self._stream_odd, self._stream_even = PrefetchStreamManager.initialize_stream()
+
+                self._stream_odd, self._stream_even = (
+                    PrefetchStreamManager.initialize_stream()
+                )
 
             # Speculative_inference
             if model_runner.spec_algorithm.is_eagle3():
