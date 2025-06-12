@@ -102,12 +102,9 @@ class ModelOptFp8Config(QuantizationConfig):
             )
 
         # Convert exclude_modules to handle the language_model prefix that gets added by mllama4.py
-        # The checkpoint has weights like "model.layers.0.feed_forward.router"
-        # but SGLang processes them as "language_model.model.layers.0.feed_forward.router"
         converted_exclude_modules = []
         if exclude_modules:
             for module in exclude_modules:
-                # Add both the original and the prefixed version to handle both cases
                 converted_exclude_modules.append(module)
                 if not module.startswith("language_model."):
                     converted_exclude_modules.append(f"language_model.{module}")
