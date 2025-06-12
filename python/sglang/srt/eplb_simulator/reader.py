@@ -18,14 +18,8 @@ def read_mode_per_pass(dir_data: Path):
             gpc_of_forward_pass_and_rank[forward_pass_id][rank] = record["global_physical_count"]
 
     items = []
-    for forward_pass_id, gpc_of_rank in sorted(
-        gpc_of_forward_pass_and_rank.items()):
-        gpc_of_rank_tensor = torch.stack(
-            [
-                gpc
-                for rank, gpc in sorted(gpc_of_rank.items())
-            ]
-        ).sum(dim=0)
+    for forward_pass_id, gpc_of_rank in sorted(gpc_of_forward_pass_and_rank.items()):
+        gpc_of_rank_tensor = torch.stack([gpc for rank, gpc in sorted(gpc_of_rank.items())]).sum(dim=0)
         items.append(gpc_of_rank_tensor)
 
     gpc_of_forward_pass = torch.stack(items)
