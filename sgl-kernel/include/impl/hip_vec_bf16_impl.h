@@ -147,13 +147,13 @@ struct vec_t<nv_bfloat16, vec_size> {
     return reinterpret_cast<nv_bfloat16*>(&data);
   }
   FLASHINFER_INLINE void load(const nv_bfloat16* ptr) {
-#pragma unoll
+#pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       data[i] = ((uint4*)ptr)[i];
     }
   }
   FLASHINFER_INLINE void store(nv_bfloat16* ptr) const {
-#pragma unoll
+#pragma unroll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       ((uint4*)ptr)[i] = data[i];
     }
