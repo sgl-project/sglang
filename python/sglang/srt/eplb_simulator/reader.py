@@ -6,6 +6,8 @@ from tqdm import tqdm
 
 
 def read_mode_per_pass(dir_data: Path):
+    """Read data from ExpertDistributionRecorder when recorded with mode `per_pass`"""
+
     # gpc := global_physical_count
     gpc_of_forward_pass_and_rank = defaultdict(lambda: defaultdict())
     for path in tqdm(list(dir_data.glob("*.pt"))):
