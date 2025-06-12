@@ -483,8 +483,6 @@ class ModelRunner:
 
         if not self.is_draft_worker:
             if self.device == "cpu":
-                import sgl_kernel
-
                 # Bind OpenMP threads to CPU cores
                 assert (
                     cpu_has_amx_support()
