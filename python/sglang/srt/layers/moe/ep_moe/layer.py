@@ -697,9 +697,9 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        print(
-            f"hi {self.__class__.__name__=} create_weights {self.block_quant=} {self.quant_config.weight_block_size=}"
-        )
+        # print(
+        #     f"hi {self.__class__.__name__=} create_weights {self.block_quant=} {self.quant_config.weight_block_size=}"
+        # )
 
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.float8_e4m3fn
