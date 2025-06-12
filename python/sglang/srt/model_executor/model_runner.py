@@ -470,7 +470,6 @@ class ModelRunner:
 
                 # Set local size to hint SGLang to use shared memory based AllReduce
                 os.environ["LOCAL_SIZE"] = str(self.tp_size)
-                # TODO: check if we need to save torch.ops.sgl_kernel somewhere like we did for sgl_common_op?
                 torch.ops.sgl_kernel.initialize(self.tp_size, self.tp_rank)
 
             # Only initialize the distributed environment on the target model worker.
