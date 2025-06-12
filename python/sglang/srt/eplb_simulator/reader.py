@@ -4,6 +4,12 @@ from pathlib import Path
 
 from tqdm import tqdm
 
+from sglang.srt.managers.expert_distribution import _convert_global_physical_count_to_logical_count
+from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
+
+_ = ModelConfigForExpertLocation
+convert_global_physical_count_to_logical_count = _convert_global_physical_count_to_logical_count
+
 
 def read_mode_per_pass(dir_data: Path):
     """Read data from ExpertDistributionRecorder when recorded with mode `per_pass`"""
