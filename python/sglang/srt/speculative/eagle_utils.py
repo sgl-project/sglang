@@ -792,10 +792,6 @@ def select_top_k_tokens(
                 0, hidden_states.shape[0], step=topk, device="cuda"
             ).repeat_interleave(topk)
             hidden_states = hidden_states[selected_input_index, :]
-        else:
-            hidden_states = torch.empty(
-                [0, hidden_states.shape[1]], dtype=hidden_states.dtype, device="cuda"
-            )
 
         tree_info = (
             expand_scores,  # shape: (b, topk, topk)

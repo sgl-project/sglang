@@ -1788,6 +1788,7 @@ class Scheduler(
             if not disable_cuda_graph:
                 local_batch.can_run_dp_cuda_graph = can_cuda_graph
 
+        # TODO(ch-wan): refactor: any(is_extend_in_batch) now is a part of local_batch. Remove it from here.
         return local_batch, any(is_extend_in_batch)
 
     def get_idle_batch(self):

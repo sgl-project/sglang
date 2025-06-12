@@ -114,7 +114,8 @@ class EAGLEDraftCudaGraphRunner:
             )
 
     def can_run(self, forward_batch: ForwardBatch):
-        if self.enable_dp_attention or self.enable_sp_layernorm:
+        if self.enable_dp_attention:
+            # TODO(ch-wan): check --moe-dense-tp-size and --enable-dp-lm-head
             if not forward_batch.can_run_dp_cuda_graph:
                 return False
             total_batch_size = (

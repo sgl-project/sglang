@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List
 
@@ -14,6 +15,8 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
