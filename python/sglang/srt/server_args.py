@@ -836,7 +836,7 @@ class ServerArgs:
             "--schedule-policy",
             type=str,
             default=ServerArgs.schedule_policy,
-            choices=["lpm", "random", "fcfs", "dfs-weight"],
+            choices=["lpm", "random", "fcfs", "dfs-weight", "lof"],
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
