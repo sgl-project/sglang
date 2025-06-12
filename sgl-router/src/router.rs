@@ -969,13 +969,18 @@ impl Router {
 
                             // If cache aware, initialize the queues for the new worker
                             if let Router::CacheAware {
+                                worker_urls,
                                 running_queue,
                                 processed_queue,
                                 tree,
                                 ..
                             } = self
                             {
+                                let urls = worker_urls.read().unwrap();
                                 for dp_url in &dp_url_vec {
+                                    if urls.contains(dp_url) {
+                                        continue;
+                                    }
                                     // Add worker to running queue with initial count of 0
                                     running_queue
                                         .lock()
@@ -1109,13 +1114,18 @@ impl Router {
 
             // if cache aware, remove the workers from the tree and queues
             if let Router::CacheAware {
+                worker_urls,
                 tree,
                 running_queue,
                 processed_queue,
                 ..
             } = self
             {
+                let urls = worker_urls.read().unwrap();
                 for dp_url in candidate_workers.iter() {
+                    if !urls.contains(dp_url) {
+                        continue;
+                    }
                     tree
                         .lock()
                         .unwrap()
