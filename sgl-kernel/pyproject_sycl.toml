@@ -1,15 +1,14 @@
 [build-system]
 requires = [
   "scikit-build-core>=0.10",
-  "pytorch-triton-xpu @ https://download.pytorch.org/whl/test/pytorch_triton_xpu-3.3.0-cp39-cp39-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-  "torch @ https://download.pytorch.org/whl/test/xpu/torch-2.7.0%2Bxpu-cp39-cp39-linux_x86_64.whl",
+  "pytorch-triton-xpu @ https://download.pytorch.org/whl/test/pytorch_triton_xpu-3.3.1-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
   "wheel",
 ]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "sgl-kernel"
-version = "0.0.8"
+version = "0.11.0"
 description = "Kernel Library for SGLang"
 readme = "README.md"
 requires-python = ">=3.9"

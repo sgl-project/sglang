@@ -32,7 +32,7 @@ struct AWQDequantizeKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
 
   void sycl_ker_config_convention(sycl::handler& cgh) {}
 
-  [[intel::reqd_sub_group_size(SgSize)]] void operator()(sycl::nd_item<2> item) const {
+  [[sycl::reqd_sub_group_size(SgSize)]] void operator()(sycl::nd_item<2> item) const {
     int col = item.get_global_id(1);
     int row = item.get_global_id(0);
 
