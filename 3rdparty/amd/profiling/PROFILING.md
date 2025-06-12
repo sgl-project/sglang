@@ -8,9 +8,7 @@ Two primary methods are covered:
 ### Profiling SGLang Infer System with RPD Profiler
 RPD profiler is a low-overhead cross-platform profiler. Therefore, the same RPD code augment not only works for profiling on ROCm/AMD GPUs, but also works for profiling on CUDA/Nvidia GPUs as well. To do RPD profiling on SGLang repository, please follow the code examples and similar techniques:
 
-1. Install RPD with rpd.patch applied during installation using install_rpd.sh, both files are in this directory.
-
-install_rpd.sh
+1. Install RPD with the instructions found in the repo: https://github.com/ROCm/rocmProfileData/tree/master. Summarized install instructions are as below:
 
 ```bash
 # install other tools
@@ -22,135 +20,46 @@ git clone https://github.com/ROCm/rocmProfileData.git
 
 # install rpd module
 cd rocmProfileData/
-make
-make install
-cd rocpd_python
-python setup.py install
+make && make install
 ```
 
-rpd.patch
-
-```bash
-diff --git a/rpd_tracer/Makefile b/rpd_tracer/Makefile
-index e9d9feb..b2e9e1a 100644
---- a/rpd_tracer/Makefile
-+++ b/rpd_tracer/Makefile
-@@ -16,7 +16,7 @@ ifneq (,$(HIP_PATH))
-         $(info Building with roctracer)
-         RPD_LIBS += -L/opt/rocm/lib -lroctracer64 -lroctx64 -lamdhip64 -lrocm_smi64
-         RPD_INCLUDES += -I/opt/rocm/include -I/opt/rocm/include/roctracer -I/opt/rocm/include/hsa
--        RPD_SRCS += RoctracerDataSource.cpp RocmSmiDataSource.cpp
-+        RPD_SRCS += RoctracerDataSource.cpp
-         RPD_INCLUDES += -D__HIP_PLATFORM_AMD__
- endif
-```
-2. Add loadTracer.sh file included in this directory to /sglang/python/sglang.
-
-loadTracer.sh
-
-```bash
-#!/bin/bash
-################################################################################
-# Copyright (c) 2021 - 2023 Advanced Micro Devices, Inc. All rights reserved.
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-# THE SOFTWARE.
-################################################################################
-OUTPUT_FILE="trace.rpd"
-
-if [ "$1" = "-o" ] ; then
-  OUTPUT_FILE=$2
-  shift
-  shift
-fi
-
-if [ -e ${OUTPUT_FILE} ] ; then
-  rm ${OUTPUT_FILE}
-fi
-
-python3 -m rocpd.schema --create ${OUTPUT_FILE}
-if [ $? != 0 ] ; then
-  echo "Error: Could not create rpd file. Please run 'python setup.py install' from the rocpd_python dir"
-  exit
-fi
-
-export RPDT_FILENAME=${OUTPUT_FILE}
-export RPDT_AUTOSTART=0
-LD_PRELOAD=librocm-smi_64:librpd_tracer.so "$@"
-```
-3. Apply patch (provided in this directory) with "git apply rpd_profile_server_enable.patch" if the main profiling purpose is to get info on gpu kernels as well as limited cpu activity info.
+2. Use following code snippets in the server code if the main profiling purpose is to get info on gpu kernels as well as limited cpu activity info.
 
 #### Common Notes 1
-Please note that although we are doing TP=8 in the example, we purposely only log RPD profiling on 2 ranks in the patch file (i.e.tp_rank=0/1) for profiling/visualization convenience, as even Perfetto streaming mode can only load maximal 8GB json file for visualization. With 2 ranks logged in RPD profiling, we could still check whether there are issues among ranks (e.g. load imbalance issue, nccl issue), and at the same time, we could log relatively longer time duration before the json file generated from RPD file hits 8GB size.
+Please note that although we are doing TP=8 in the example, we purposely only log RPD profiling on 0/1 rank in the patch file (i.e.tp_rank=0 and 1) for profiling/visualization convenience, as even Perfetto streaming mode can only load maximal 8GB json file for visualization. With 0 and 1 rank logged in RPD profiling, we could still check whether there are issues among ranks (e.g. load imbalance issue, nccl issue), and at the same time, we could log relatively longer time duration before the json file generated from RPD file hits 8GB size.
 
-rpd_profile_server_enable.patch
+`sglang/python/sglang/srt/managers/scheduler.py` has an option for passing or setting on "RPD" profiler option and use the start and stop methods accordingly.
 
 ```bash
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 62d1ff9..9021c01 100644
+index a44515ab..1e28fd7c 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -71,6 +71,8 @@ from sglang.srt.utils import (
-     suppress_other_loggers,
- )
- from sglang.utils import get_exception_traceback
-+from rpdTracerControl import rpdTracerControl
-+rpdTracerControl.skipCreate()
+@@ -2193,7 +2193,7 @@ class Scheduler(
+         if output_dir is None:
+             output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+         if activities is None:
+-            activities = ["CPU", "GPU"]
++            activities = ["CPU", "GPU", "RPD"]
 
- logger = logging.getLogger(__name__)
+         self.torch_profiler_output_dir = output_dir
+         self.torch_profiler_with_stack = with_stack
+@@ -2262,9 +2262,12 @@ class Scheduler(
 
-@@ -245,6 +247,7 @@ class Scheduler:
-                 ],
-                 with_stack=True,
-             )
-+            self.rpd = rpdTracerControl()
-
-     @torch.inference_mode()
-     def event_loop(self):
-@@ -1027,15 +1030,24 @@ class Scheduler:
-     def start_profile(self) -> None:
-         if self.profiler is None:
-             raise RuntimeError("Profiler is not enabled.")
--        self.profiler.start()
-+        #self.profiler.start() #block pytorch profiler for rpd profiler enabling
-+        if self.tp_rank == 0 or self.tp_rank == 1:
-+            self.rpd.start()
-+            self.rpd.rangePush("", "rpd profile range", "")
-+            logger.info("rpd is enabled")
-
-     def stop_profile(self) -> None:
-         if self.profiler is None:
-             raise RuntimeError("Profiler is not enabled.")
--        self.profiler.stop()
--        self.profiler.export_chrome_trace(
--            self.torch_profiler_trace_dir + "/" + str(time.time()) + ".trace.json.gz"
--        )
-+        #self.profiler.stop()
-+        #self.profiler.export_chrome_trace(
-+        #    self.torch_profiler_trace_dir + "/" + str(time.time()) + ".trace.json.gz"
-+        #)
-+        if self.tp_rank ==0 or self.tp_rank ==1:
-+            self.rpd.rangePop()
-+            self.rpd.stop()
-+            self.rpd.flush()
-+            logger.info("rpd is done")
-         logger.info("Profiler is done")
+             self.rpd_profiler = rpdTracerControl()
+             self.rpd_profiler.setPythonTrace(True)
+-            self.rpd_profiler.start()
+-            self.rpd_profiler.rangePush("", "rpd profile range", "")
+-            self.profile_in_progress = True
++
++            if self.tp_rank == 0 or self.tp_rank == 1:
++               self.rpd_profiler.start()
++               self.rpd_profiler.rangePush("", "rpd profile range", "")
++               self.profile_in_progress = True
++
 ```
+
+You can also set `--rpd` option via starting a client app for profiling i.e python/sglang/profiler.py.
 
 #### Advanced Debugging with RPD Profiler
 Sometimes, we want to use rpd profiler to capture more CPU and python activities in order to debug some challenging issues (e.g. root cause of load imbalance across gpu processes, root cause of bubbles, etc). Only in such cases, we need to apply patch "git apply rpd_profile_server_enable_wCPU_activities.patch", where 3 files are modified.
