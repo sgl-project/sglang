@@ -271,7 +271,7 @@ class EagleVerifyInput:
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> EagleVerifyOutput:
         """
         Verify and find accepted tokens based on logits output and batch
         (which contains spec decoding information).
