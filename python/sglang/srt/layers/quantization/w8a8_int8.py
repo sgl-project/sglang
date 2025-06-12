@@ -124,7 +124,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
-        if layer.use_intel_amx_backend:
+        if getattr(layer, "use_intel_amx_backend", False):
             return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
                 x,
                 layer.weight,
@@ -281,7 +281,7 @@ class W8A8Int8MoEMethod:
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        if layer.use_intel_amx_backend:
+        if getattr(layer, "use_intel_amx_backend", False):
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,

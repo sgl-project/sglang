@@ -413,9 +413,8 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if (
-            hasattr(self, "shared_experts")
-            and self.shared_experts.gate_up_proj.use_intel_amx_backend
+        if hasattr(self, "shared_experts") and getattr(
+            self.shared_experts.gate_up_proj, "use_intel_amx_backend", False
         ):
             return self.forward_cpu(hidden_states)
 
@@ -441,10 +440,9 @@ class DeepseekV2MoE(nn.Module):
             hidden_states=hidden_states, router_logits=router_logits
         )
 
-        assert (
-            self.shared_experts.gate_up_proj.use_intel_amx_backend
-            == self.shared_experts.down_proj.use_intel_amx_backend
-        )
+        assert getattr(
+            self.shared_experts.gate_up_proj, "use_intel_amx_backend", False
+        ) == getattr(self.shared_experts.down_proj, "use_intel_amx_backend", False)
         # [Note] inplace should be False in fused_experts.
         # If inplace is True in fused_experts (self.experts), hidden_states will be changed after fused_experts
         # While hidden_states is still needed in shared_expert.
