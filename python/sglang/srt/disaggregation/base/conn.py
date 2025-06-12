@@ -18,7 +18,8 @@ class KVArgs:
     aux_item_lens: list[int]
     ib_device: str
     gpu_id: int
-
+    kv_head_num: int
+    page_size: int
 
 class KVPoll:
     Failed = 0
