@@ -352,50 +352,18 @@ class Llama4ForConditionalGeneration(nn.Module):
             return True
 
         param = params_dict[transformed_name]
-        weight_loader = param.weight_loader
 
-        # For scale parameters, we need to handle them differently
-        if "scale" in name:
-            if expert_match:
-                # If we have a specific expert ID, only load for that expert
-                expert_id = int(expert_match.group(1))
-                # For scale parameters, we can directly set the value
-                param.data[expert_id] = loaded_weight
-            else:
-                # No expert ID found - this is a single scale for all experts
-                # Load the same scale for all experts
-                for expert_id in range(num_experts):
-                    param.data[expert_id] = loaded_weight
-            return True
-
-        # For non-scale parameters, use the weight loader
+        # Handle scale parameters
         if expert_match:
             # If we have a specific expert ID, only load for that expert
             expert_id = int(expert_match.group(1))
-            if ".gate_up_proj" in name:
-                # Load for both w1 and w3 shards
-                weight_loader(param, loaded_weight, transformed_name, "w1", expert_id)
-                weight_loader(param, loaded_weight, transformed_name, "w3", expert_id)
-            else:
-                # Load for w2 shard
-                weight_loader(param, loaded_weight, transformed_name, "w2", expert_id)
+            # For scale parameters, we can directly set the value
+            param.data[expert_id] = loaded_weight
         else:
             # No expert ID found - this is a single scale for all experts
             # Load the same scale for all experts
             for expert_id in range(num_experts):
-                if ".gate_up_proj" in name:
-                    # Load for both w1 and w3 shards
-                    weight_loader(
-                        param, loaded_weight, transformed_name, "w1", expert_id
-                    )
-                    weight_loader(
-                        param, loaded_weight, transformed_name, "w3", expert_id
-                    )
-                else:
-                    # Load for w2 shard
-                    weight_loader(
-                        param, loaded_weight, transformed_name, "w2", expert_id
-                    )
+                param.data[expert_id] = loaded_weight
 
         return True
 
