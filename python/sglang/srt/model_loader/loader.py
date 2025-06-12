@@ -1259,12 +1259,19 @@ class GGUFModelLoader(BaseModelLoader):
         ):
             model_config.hf_config.update({"tie_word_embeddings": True})
 
+        target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
+            with target_device:
                 model = _initialize_model(model_config, self.load_config)
             model.load_weights(
                 self._get_weights_iterator(local_model_path, gguf_weights_map)
             )
+
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
         return model
 
 
