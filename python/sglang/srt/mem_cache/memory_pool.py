@@ -36,12 +36,20 @@ import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import debug_timing, get_bool_env_var, is_cuda, next_power_of_2
+from sglang.srt.utils import debug_timing, get_bool_env_var, is_cuda, next_power_of_2, is_npu
 
 logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
+_is_npu = is_npu()
+
+if is_npu():
+    try:
+        import torch_npu
+    except ImportError:
+        logger.warning("torch_npu is not installed. NPU support will be disabled.")
+        _is_npu = False
 
 
 class ReqToTokenPool:
@@ -417,8 +425,12 @@ class MHATokenToKVPool(KVCache):
                 self.v_buffer[layer_id - self.start_layer][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
         else:
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+            if _is_npu and loc.size() > 0 and loc.ndim == 1:
+                torch_npu.scatter_update_(self.k_buffer[layer_id - self.start_layer].unsqueeze(0), loc[0], cache_k.unsqueeze(0))
+                torch_npu.scatter_update_(self.v_buffer[layer_id - self.start_layer].unsqueeze(0), loc[0], cache_v.unsqueeze(0))
+            else:
+                self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         copy_all_layer_kv_cache[(len(self.data_ptrs),)](

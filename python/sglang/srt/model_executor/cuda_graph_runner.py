@@ -19,6 +19,7 @@ import bisect
 import inspect
 import logging
 import os
+from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
@@ -200,9 +201,41 @@ def set_global_graph_memory_pool(val):
     global_graph_memory_pool = val
 
 
-class CudaGraphRunner:
-    """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
+class DeviceRunnerBase(ABC):
+    """
+    Abstract base class for hardware-specific graph runners, providing unified interfaces
+    for AI accelerator device operations. This class abstracts common execution workflows
+    and enforces implementation of critical device management methods in derived classes.
 
+    Key Responsibilities:
+    1. Device lifecycle management: Initialization, warm-up, and resource teardown
+    2. Batch processing: Data preparation and execution flow control
+    3. Execution mode switching: Support for both graph compilation and eager execution
+    4. State validation: Runtime capability checks and fallback mechanisms
+
+    Required Abstract Methods:
+    - initialize(): Configure hardware-specific environment and allocate resources
+    - prepare_forward_batch(batch: Any) -> Any: Preprocess input data for device execution
+    - warm_up(): Pre-execution calibration for performance stabilization
+    - can_run() -> bool: Verify device readiness and operational constraints
+    - replay(): Execute precompiled graph or replay captured execution sequence
+
+    Implementation Guidelines for Subclasses:
+    1. Handle device-specific memory management in prepare_forward_batch()
+    2. Implement hardware warm-up routines with actual kernel executions
+    3. In replay(), ensure thread safety for concurrent execution environments
+    4. Manage graph capture/replay states for stateful devices (e.g. NPU/CUDA)
+
+    Example subclassing:
+    class CustomDeviceRunner(DeviceRunnerBase):
+        def __init__(self, device_config: Dict):
+            super().__init__()
+            # Hardware-specific initialization
+
+        # Implement all abstract methods with device-specific logic
+
+    Note: Concrete subclasses must be instantiated with valid hardware context.
+    """
     def __init__(self, model_runner: ModelRunner):
         # Parse args
         self.model_runner = model_runner
@@ -228,7 +261,7 @@ class CudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-        rank0_log(f"Capture cuda graph bs {self.capture_bs}")
+        rank0_log(f"Device: {model_runner.device}, capture bs {self.capture_bs}, compile bs {self.compile_bs}")
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
@@ -261,14 +294,11 @@ class CudaGraphRunner:
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
 
-        if self.enable_torch_compile:
-            set_torch_compile_config()
-
         if self.model_runner.server_args.lora_paths is not None:
             self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)
 
         # Graph inputs
-        with torch.device("cuda"):
+        with torch.device(model_runner.device):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.seq_lens = torch.full(
@@ -320,16 +350,157 @@ class CudaGraphRunner:
                 else:
                     assert self.require_attn_tp_gather
                     self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
-
             self.custom_mask = torch.ones(
                 (
-                    (self.seq_lens.sum().item() + self.max_num_token)
-                    * self.num_tokens_per_bs
+                        (self.seq_lens.sum().item() + self.max_num_token)
+                        * self.num_tokens_per_bs
                 ),
                 dtype=torch.bool,
-                device="cuda",
+                device=self.model_runner.device,
+            )
+    def prepare_forward_batch(self, bs: int, num_tokens: int) -> ForwardBatch:
+        # Graph inputs
+        input_ids = self.input_ids[:num_tokens]
+        req_pool_indices = self.req_pool_indices[:bs]
+        seq_lens = self.seq_lens[:bs]
+        out_cache_loc = self.out_cache_loc[:num_tokens]
+        positions = self.positions[:num_tokens]
+        if self.is_encoder_decoder:
+            encoder_lens = self.encoder_lens[:bs]
+        else:
+            encoder_lens = None
+        mrope_positions = self.mrope_positions[:, :bs]
+        self.num_token_non_padded[...] = num_tokens
+
+        # pipeline parallelism
+        if self.pp_size > 1:
+            pp_proxy_tensors = PPProxyTensors(
+                {k: v[:num_tokens] for k, v in self.pp_proxy_tensors.items()}
             )
 
+        if self.require_mlp_tp_gather:
+            self.global_num_tokens_gpu.copy_(
+                torch.tensor(
+                    [
+                        num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
+                        for i in range(self.dp_size)
+                    ],
+                    dtype=torch.int32,
+                    device=input_ids.device,
+                )
+            )
+            global_num_tokens = self.global_num_tokens_gpu
+            gathered_buffer = self.gathered_buffer[:num_tokens]
+        elif self.require_attn_tp_gather:
+            self.global_num_tokens_gpu.copy_(
+                torch.tensor(
+                    [num_tokens],
+                    dtype=torch.int32,
+                    device=input_ids.device,
+                )
+            )
+            global_num_tokens = self.global_num_tokens_gpu
+            gathered_buffer = self.gathered_buffer[:num_tokens]
+        else:
+            global_num_tokens = None
+            gathered_buffer = None
+
+        spec_info = self.get_spec_info(num_tokens)
+        if self.capture_hidden_mode != CaptureHiddenMode.FULL:
+            self.capture_hidden_mode = (
+                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+            )
+
+        if self.model_runner.server_args.lora_paths is not None:
+            # Currently, if the lora_path in `lora_paths` is None, the lora backend will use a
+            # different logic to handle lora, so we need to set `lora_paths` to a list of non-None
+            # values if lora is enabled.
+            lora_paths = [next(iter(self.model_runner.server_args.lora_paths))] * bs
+        else:
+            lora_paths = None
+
+        forward_batch = ForwardBatch(
+            forward_mode=self.capture_forward_mode,
+            batch_size=bs,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            attn_backend=self.model_runner.attn_backend,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=seq_lens.sum().item(),
+            encoder_lens=encoder_lens,
+            return_logprob=False,
+            positions=positions,
+            global_num_tokens_gpu=global_num_tokens,
+            gathered_buffer=gathered_buffer,
+            mrope_positions=mrope_positions,
+            spec_algorithm=self.model_runner.spec_algorithm,
+            spec_info=spec_info,
+            capture_hidden_mode=self.capture_hidden_mode,
+            num_token_non_padded=self.num_token_non_padded,
+            global_forward_mode=self.capture_forward_mode,
+            lora_paths=lora_paths,
+        )
+        return forward_batch
+
+    @abstractmethod
+    def warm_up(self):
+        raise NotImplementedError
+
+
+    @abstractmethod
+    def can_run(self, forward_batch: ForwardBatch):
+        raise NotImplementedError
+
+    @abstractmethod
+    def replay(
+            self,
+            forward_batch: ForwardBatch,
+            skip_attn_backend_init: bool = False,
+            pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        raise NotImplementedError
+
+
+    def get_spec_info(self, num_tokens: int):
+        spec_info = None
+        if self.model_runner.spec_algorithm.is_eagle():
+            from sglang.srt.speculative.eagle_utils import EagleVerifyInput
+
+            if self.model_runner.is_draft_worker:
+                raise RuntimeError("This should not happen.")
+            else:
+                spec_info = EagleVerifyInput(
+                    draft_token=None,
+                    custom_mask=self.custom_mask,
+                    positions=None,
+                    retrive_index=None,
+                    retrive_next_token=None,
+                    retrive_next_sibling=None,
+                    retrive_cum_len=None,
+                    spec_steps=self.model_runner.server_args.speculative_num_steps,
+                    topk=self.model_runner.server_args.speculative_eagle_topk,
+                    draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    seq_lens_sum=None,
+                    seq_lens_cpu=None,
+                )
+
+        return spec_info
+
+
+class CudaGraphRunner(DeviceRunnerBase):
+    """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
+
+    def __init__(self, model_runner: ModelRunner):
+        super().__init__(model_runner=model_runner)
+        self.warm_up()
+
+    def warm_up(self):
+        if self.enable_torch_compile:
+            set_torch_compile_config()
         # Capture
         try:
             with model_capture_mode():
@@ -457,103 +628,19 @@ class CudaGraphRunner:
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
+        forward_batch = self.prepare_forward_batch(bs, num_tokens)
+        self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens)
 
-        # Graph inputs
-        input_ids = self.input_ids[:num_tokens]
-        req_pool_indices = self.req_pool_indices[:bs]
-        seq_lens = self.seq_lens[:bs]
-        out_cache_loc = self.out_cache_loc[:num_tokens]
-        positions = self.positions[:num_tokens]
-        if self.is_encoder_decoder:
-            encoder_lens = self.encoder_lens[:bs]
-        else:
-            encoder_lens = None
-        mrope_positions = self.mrope_positions[:, :bs]
-        self.num_token_non_padded[...] = num_tokens
-
-        # pipeline parallelism
-        if self.pp_size > 1:
-            pp_proxy_tensors = PPProxyTensors(
-                {k: v[:num_tokens] for k, v in self.pp_proxy_tensors.items()}
-            )
-
-        if self.require_mlp_tp_gather:
-            self.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [
-                        num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
-                        for i in range(self.dp_size)
-                    ],
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            global_num_tokens = self.global_num_tokens_gpu
-            gathered_buffer = self.gathered_buffer[:num_tokens]
-        elif self.require_attn_tp_gather:
-            self.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            global_num_tokens = self.global_num_tokens_gpu
-            gathered_buffer = self.gathered_buffer[:num_tokens]
-        else:
-            global_num_tokens = None
-            gathered_buffer = None
-
-        spec_info = self.get_spec_info(num_tokens)
-        if self.capture_hidden_mode != CaptureHiddenMode.FULL:
-            self.capture_hidden_mode = (
-                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
-            )
-
-        if self.model_runner.server_args.lora_paths is not None:
-            # Currently, if the lora_path in `lora_paths` is None, the lora backend will use a
-            # different logic to handle lora, so we need to set `lora_paths` to a list of non-None
-            # values if lora is enabled.
-            lora_paths = [next(iter(self.model_runner.server_args.lora_paths))] * bs
-        else:
-            lora_paths = None
-
-        forward_batch = ForwardBatch(
-            forward_mode=self.capture_forward_mode,
-            batch_size=bs,
-            input_ids=input_ids,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.model_runner.attn_backend,
-            out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum().item(),
-            encoder_lens=encoder_lens,
-            return_logprob=False,
-            positions=positions,
-            global_num_tokens_gpu=global_num_tokens,
-            gathered_buffer=gathered_buffer,
-            mrope_positions=mrope_positions,
-            spec_algorithm=self.model_runner.spec_algorithm,
-            spec_info=spec_info,
-            capture_hidden_mode=self.capture_hidden_mode,
-            num_token_non_padded=self.num_token_non_padded,
-            global_forward_mode=self.capture_forward_mode,
-            lora_paths=lora_paths,
-        )
-        self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
-
-        if lora_paths is not None:
+        if forward_batch.lora_paths is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             num_tokens,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.encoder_lens,
             forward_batch.forward_mode,
             forward_batch.spec_info,
         )
@@ -569,11 +656,11 @@ class CudaGraphRunner:
                 and "pp_proxy_tensors" in inspect.signature(forward).parameters
             ):
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+                    {k: v.clone() for k, v in forward_batch.pp_proxy_tensors.tensors.items()}
                 )
 
             logits_output_or_pp_proxy_tensors = forward(
-                input_ids,
+                forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
                 **kwargs,
@@ -728,32 +815,6 @@ class CudaGraphRunner:
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
-
-    def get_spec_info(self, num_tokens: int):
-        spec_info = None
-        if self.model_runner.spec_algorithm.is_eagle():
-            from sglang.srt.speculative.eagle_utils import EagleVerifyInput
-
-            if self.model_runner.is_draft_worker:
-                raise RuntimeError("This should not happen.")
-            else:
-                spec_info = EagleVerifyInput(
-                    draft_token=None,
-                    custom_mask=self.custom_mask,
-                    positions=None,
-                    retrive_index=None,
-                    retrive_next_token=None,
-                    retrive_next_sibling=None,
-                    retrive_cum_len=None,
-                    spec_steps=self.model_runner.server_args.speculative_num_steps,
-                    topk=self.model_runner.server_args.speculative_eagle_topk,
-                    draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
-                    seq_lens_sum=None,
-                    seq_lens_cpu=None,
-                )
-
-        return spec_info
 
 
 CUDA_GRAPH_CAPTURE_FAILED_MSG = (
