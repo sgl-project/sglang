@@ -427,7 +427,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.block_quant:
-            if layer.use_intel_amx_backend:
+            if getattr(layer, "use_intel_amx_backend", False):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
                     x,
                     layer.weight,
@@ -990,7 +990,7 @@ class Fp8MoEMethod:
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        if layer.use_intel_amx_backend:
+        if getattr(layer, "use_intel_amx_backend", False):
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,
