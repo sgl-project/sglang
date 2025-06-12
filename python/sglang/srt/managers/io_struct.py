@@ -87,7 +87,7 @@ class GenerateReqInput:
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
-    # LoRA related
+    # The path to the LoRA
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     # Session info for continual prompting
