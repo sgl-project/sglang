@@ -22,7 +22,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.utils import get_bool_env_var, next_power_of_2, get_int_env_var
+from sglang.srt.utils import get_bool_env_var, next_power_of_2
 
 
 @triton.jit
@@ -271,8 +271,7 @@ class PagedTokenToKVPoolAllocator:
             self.free_pages,
             out_indices,
             self.ret_values,
-            next_power_of_2(max(bs, get_int_env_var("SGLANG_HACK_ALLOC_DECODE_KERNEL_MIN_BS", 0))),
-            # next_power_of_2(bs),
+            next_power_of_2(bs),
             self.page_size,
         )
 
