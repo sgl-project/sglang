@@ -210,6 +210,16 @@ class Llama4ForConditionalGeneration(nn.Module):
         if is_main_rank:
             print(f"Debug: Model has {len(params_dict)} parameters")
 
+            # Debug: Show scale parameter names in the model
+            scale_params = [
+                name
+                for name in params_dict.keys()
+                if "scale" in name and "expert" in name
+            ]
+            print(
+                f"Debug: Scale parameters in model: {scale_params[:30]}"
+            )  # Show first 10
+
         num_experts = (
             self.config.text_config.num_local_experts
             if hasattr(self.config, "text_config")
@@ -227,12 +237,72 @@ class Llama4ForConditionalGeneration(nn.Module):
             num_experts=num_experts,
         )
 
+        # Note: Scale parameters will be handled separately since they have
+        # a different name pattern (language_model.model.layers.X... vs model.layers.X...)
+
         for name, loaded_weight in weights:
+            # Debug: Show scale parameter names
+            if is_main_rank and "scale" in name and "expert" in name:
+                print(f"DEBUG: Processing checkpoint scale parameter: {name}")
+
             # Skip vision weights if this is a text-only model
             if "vision" in name and not self.has_vision:
                 # if is_main_rank:
                 #     print(f"Skipping vision weight: {name} (text-only model)")
                 continue
+
+                # Special handling for scale parameters that have language_model. prefix
+            if (
+                "scale" in name
+                and "language_model.model.layers" in name
+                and "experts" in name
+            ):
+                # Transform language_model.model.layers.X.feed_forward.experts.*
+                # to model.layers.X.feed_forward.experts.*
+                transformed_name = name.replace("language_model.", "")
+
+                # Try multiple possible target names since the model may have duplicate scale parameters
+                target_names = []
+
+                if "gate_up_proj" in transformed_name:
+                    # Try both gate_up_proj (direct) and w13 (FusedMoE) naming
+                    target_names.append(transformed_name)  # Direct: gate_up_proj
+                    target_names.append(
+                        transformed_name.replace("gate_up_proj", "w13")
+                    )  # FusedMoE: w13
+                elif "down_proj" in transformed_name:
+                    # Try both down_proj (direct) and w2 (FusedMoE) naming
+                    target_names.append(transformed_name)  # Direct: down_proj
+                    target_names.append(
+                        transformed_name.replace("down_proj", "w2")
+                    )  # FusedMoE: w2
+                else:
+                    target_names.append(transformed_name)
+
+                # Try each possible target name
+                loaded = False
+                for target_name in target_names:
+                    if target_name in params_dict:
+                        if is_main_rank:
+                            print(
+                                f"DEBUG: Loading scale parameter: {name} -> {target_name}"
+                            )
+                        param = params_dict[target_name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                        loaded = True
+                        break
+
+                if loaded:
+                    continue
+                else:
+                    if is_main_rank:
+                        print(
+                            f"DEBUG: Scale parameter {name} -> {target_names} not found in model"
+                        )
+                    continue
 
             if not "vision" in name:
                 name, loaded_weight = self.permute_qk_weight_for_rotary(
@@ -257,10 +327,19 @@ class Llama4ForConditionalGeneration(nn.Module):
             else:
                 if ".experts" in name:
                     # NOTE: llama4 fp8 has different weight format for experts
-                    if (
+                    # Scale parameters are handled separately above
+                    if "scale" in name:
+                        # Scale parameters should already be handled above
+                        if is_main_rank:
+                            print(
+                                f"DEBUG: Skipping scale parameter in expert section: {name}"
+                            )
+                        continue
+                    elif (
                         "experts.gate_up_proj" not in name
                         and "experts.down_proj" not in name
                     ):
+                        # Handle other expert parameters through mapping
                         for mapping in expert_params_mapping:
                             param_name, weight_name, expert_id, shard_id = mapping
                             if weight_name not in name:
@@ -272,6 +351,7 @@ class Llama4ForConditionalGeneration(nn.Module):
                                 break
                             param = params_dict[name]
                             weight_loader = param.weight_loader
+
                             weight_loader(
                                 param,
                                 loaded_weight,
@@ -302,7 +382,7 @@ class Llama4ForConditionalGeneration(nn.Module):
                             ] * 2
                             loaded_weight_list = loaded_weight.chunk(2, dim=-1)
                             shard_id_list = ["w1", "w3"]
-                        else:
+                        elif ".down_proj" in name:
                             # Add debugging for down_proj as well
                             # if is_main_rank:
                             #     print(f"Debug: Processing down_proj weight {name}, shape: {loaded_weight.shape}, dtype: {loaded_weight.dtype}")
@@ -317,6 +397,12 @@ class Llama4ForConditionalGeneration(nn.Module):
                             ]
                             shard_id_list = ["w2"]
                             loaded_weight_list = [loaded_weight]
+                        else:
+                            # Unrecognized expert parameter
+                            # if is_main_rank:
+                            #     print(f"Warning: Unrecognized expert parameter {name}, skipping")
+                            continue
+
                         for name, loaded_weight, shard_id in zip(
                             name_list, loaded_weight_list, shard_id_list
                         ):
