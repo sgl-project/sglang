@@ -830,6 +830,8 @@ class SlowDownReqOutput:
 class AbortReq:
     # The request id
     rid: str
+    # Whether to abort all requests
+    abort_all: bool = False
 
 
 @dataclass
