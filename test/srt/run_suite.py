@@ -193,6 +193,7 @@ suites = {
         TestFile("cpu/test_qkv_proj_with_rope.py"),
         TestFile("cpu/test_rope.py"),
         TestFile("cpu/test_shared_expert.py"),
+        TestFile("cpu/test_topk.py"),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
