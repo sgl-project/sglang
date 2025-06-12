@@ -764,7 +764,7 @@ class ModelRunner:
             _model_load_weights_direct(self.model, named_tensors)
         elif load_format in self.server_args.custom_weight_loader:
             custom_loader = dynamic_import(load_format)
-            custom_loader.load(self.model, named_tensors)
+            custom_loader(self.model, named_tensors)
         elif load_format is None:
             self.model.load_weights(named_tensors)
         else:
