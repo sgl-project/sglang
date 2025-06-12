@@ -250,7 +250,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         assert activation == "silu", f"activation = {activation} is not supported."
 
         # TODO: rebase when #6641 lands
-        if layer.use_intel_amx_backend:
+        if getattr(layer, "use_intel_amx_backend", False):
             topk_weights, topk_ids = select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
