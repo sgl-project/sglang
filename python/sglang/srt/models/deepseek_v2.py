@@ -747,7 +747,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
         )
 
-        # If we have self.fused_qkv_a_proj_with_mqa, we will choose the torch.ops.sgl_kernel.fused_qkv_proj_with_rope kernel
+        # If we have self.fused_qkv_a_proj_with_mqa, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
         # which requires self.w_kc and self.w_vc to be packed.
         # If not, we will use torch.bmm and weight shouldn't be packed in this case
         if hasattr(self, "fused_qkv_a_proj_with_mqa"):
@@ -1242,41 +1242,43 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.q_lora_rank is not None and self.use_intel_amx_backend
         ), "forward_absorb_fused_mla_rope_cpu_prepare requires q_lora_rank is not None and use_intel_amx_backend"
 
-        q_input, k_input, v_input = torch.ops.sgl_kernel.fused_qkv_proj_with_rope(
-            hidden_states,
-            self.fused_qkv_a_proj_with_mqa.weight,
-            self.q_b_proj.weight,
-            self.w_kc,
-            self.q_a_layernorm.weight,
-            self.kv_a_layernorm.weight,
-            positions,
-            self.rotary_emb.cos_sin_cache,
-            self.kv_a_layernorm.variance_epsilon,
-            self.qkv_proj_with_rope_is_int8,
-            self.qkv_proj_with_rope_is_fp8,
-            (
-                self.fused_qkv_a_proj_with_mqa.weight_scale
-                if self.qkv_proj_with_rope_is_int8
-                else (
-                    self.fused_qkv_a_proj_with_mqa.weight_scale_inv
-                    if self.qkv_proj_with_rope_is_fp8
-                    else None
-                )
-            ),
-            (
-                self.q_b_proj.weight_scale
-                if self.qkv_proj_with_rope_is_int8
-                else (
-                    self.q_b_proj.weight_scale_inv
-                    if self.qkv_proj_with_rope_is_fp8
-                    else None
-                )
-            ),
-            True,  # is_vnni
-            self.weight_block_size,
-            self.q_lora_rank,
-            self.kv_lora_rank,
-            self.qk_rope_head_dim,
+        q_input, k_input, v_input = (
+            torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight(
+                hidden_states,
+                self.fused_qkv_a_proj_with_mqa.weight,
+                self.q_b_proj.weight,
+                self.w_kc,
+                self.q_a_layernorm.weight,
+                self.kv_a_layernorm.weight,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.kv_a_layernorm.variance_epsilon,
+                self.qkv_proj_with_rope_is_int8,
+                self.qkv_proj_with_rope_is_fp8,
+                (
+                    self.fused_qkv_a_proj_with_mqa.weight_scale
+                    if self.qkv_proj_with_rope_is_int8
+                    else (
+                        self.fused_qkv_a_proj_with_mqa.weight_scale_inv
+                        if self.qkv_proj_with_rope_is_fp8
+                        else None
+                    )
+                ),
+                (
+                    self.q_b_proj.weight_scale
+                    if self.qkv_proj_with_rope_is_int8
+                    else (
+                        self.q_b_proj.weight_scale_inv
+                        if self.qkv_proj_with_rope_is_fp8
+                        else None
+                    )
+                ),
+                True,  # is_vnni
+                self.weight_block_size,
+                self.q_lora_rank,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+            )
         )
         return (q_input, k_input, v_input, forward_batch, zero_allocator)
 
