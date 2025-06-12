@@ -51,14 +51,13 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import (
+    is_fp8_fnuz,
     scaled_fp8_quant,
     sglang_per_token_quant_fp8,
-    is_fp8_fnuz,
 )
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import DeepEPMode, dispose_tensor, is_hip, set_weight_attrs
-
 
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
