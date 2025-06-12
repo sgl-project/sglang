@@ -167,7 +167,7 @@ def merge_bias_tensor(
     bs2: int,
     device: str,
     default: float,
-):
+) -> Optional[torch.Tensor]:
     """Merge two bias tensors for batch merging.
 
     Args:
