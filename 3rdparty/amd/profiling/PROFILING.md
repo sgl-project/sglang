@@ -6,23 +6,26 @@ Two primary methods are covered:
 - [PyTorch Profiler](https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html)
 
 ### Profiling SGLang Infer System with RPD Profiler
-RPD profiler is a low-overhead cross-platform profiler. Therefore, the same RPD code augment not only works for profiling on ROCm/AMD GPUs, but also works for profiling on CUDA/Nvidia GPUs as well. To do RPD profiling on SGLang repository, please use scripts and patch files included in this directory and follow the steps below:
+RPD profiler is a low-overhead cross-platform profiler. Therefore, the same RPD code augment not only works for profiling on ROCm/AMD GPUs, but also works for profiling on CUDA/Nvidia GPUs as well. To do RPD profiling on SGLang repository, please follow the code examples and similar techniques:
+
 1. Install RPD with rpd.patch applied during installation using install_rpd.sh, both files are in this directory.
 
 install_rpd.sh
 
 ```bash
+# install other tools
+apt-get install sqlite3 libsqlite3-dev
+apt-get install libfmt-dev
+
 # download and install RPD
-apt update && apt install -y sqlite3 libsqlite3-dev libfmt-dev
+git clone https://github.com/ROCm/rocmProfileData.git
 
 # install rpd module
-git clone https://github.com/ROCmSoftwarePlatform/rocmProfileData
-cd rocmProfileData
-git checkout 976899e9c6dbc6dd2bccf770818e4e44125590ac
-git apply rpd.patch
-make && make install
-cd rocpd_python && python setup.py install && cd ..
-cd rpd_tracer && make clean;make install && python setup.py install && cd ..
+cd rocmProfileData/
+make
+make install
+cd rocpd_python
+python setup.py install
 ```
 
 rpd.patch
