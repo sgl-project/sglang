@@ -8,9 +8,12 @@ Two primary methods are covered:
 ### Profiling SGLang Infer System with RPD Profiler
 RPD profiler is a low-overhead cross-platform profiler. Therefore, the same RPD code augment not only works for profiling on ROCm/AMD GPUs, but also works for profiling on CUDA/Nvidia GPUs as well. To do RPD profiling on SGLang repository, please follow the code examples and similar techniques:
 
-1. Install RPD with the instructions found in the repo: https://github.com/ROCm/rocmProfileData/tree/master. Summarized install instructions are as below:
+1. Install RPD with the instructions found in the repo: https://github.com/ROCm/rocmProfileData/tree/master. You can directly use install_rpd.sh.
+Summarized install instructions in install_rpd.sh are as below:
 
 ```bash
+#!/bin/bash
+
 # install other tools
 apt-get update -y
 apt-get install -y sqlite3 libsqlite3-dev libfmt-dev
@@ -21,6 +24,7 @@ git clone https://github.com/ROCm/rocmProfileData.git
 # install rpd module
 cd rocmProfileData/
 make && make install
+
 ```
 
 2. Use following code snippets in the server code if the main profiling purpose is to get info on gpu kernels as well as limited cpu activity info.
