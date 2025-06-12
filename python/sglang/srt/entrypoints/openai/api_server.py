@@ -53,14 +53,14 @@ async def lifespan(app: FastAPI):
         f"SGLang OpenAI server (PID: {os.getpid()}) is initializing with args: {server_args}"
     )
 
-    # TODO: Enable metrics 
+    # TODO: Enable metrics
     # Initialize engine state attribute to None for now
     app.state.engine = None
 
     yield
 
     # Lifespan shutdown
-    if hasattr(app.state, 'engine') and app.state.engine is not None:
+    if hasattr(app.state, "engine") and app.state.engine is not None:
         logger.info("SGLang engine is shutting down.")
         # Add engine cleanup logic here when implemented
 
