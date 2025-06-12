@@ -301,19 +301,19 @@ void int8_scaled_mm_kernel_impl(
 
   const bool use_brgemm = can_use_brgemm<int8_t>(M);
 
+  // l2 cache block for n
+  int64_t cache_blocks_nb = get_cache_blocks<int8_t>(BLOCK_N, K);
+
   // K + 4 after compensation
   const int64_t packed_row_size = get_row_size<int8_t>(K);
 
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
-    at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
-      int64_t mb{0}, nb{0};
-      data_index_init(begin, mb, MB, nb, NB);
+    parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
 
       // for brgemm, use int32_t for accumulate
       alignas(64) int32_t Ctmp[BLOCK_M * BLOCK_N];
 
-      for (int i = begin; i < end; ++i) {
-        UNUSED(i);
+      loop_2d(mb0, mb1, nb0, nb1, cache_blocks_nb, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
         int mb_start = mb * BLOCK_M;
         int mb_size = std::min(M - mb_start, BLOCK_M);
         int nb_start = nb * BLOCK_N;
@@ -334,10 +334,7 @@ void int8_scaled_mm_kernel_impl(
             /* ldb */ nb_size,
             /* ldc */ N,
             /* brg */ use_brgemm);
-
-        // move to the next index
-        data_index_step(mb, MB, nb, NB);
-      }
+      });
 
       if (use_brgemm) {
         at::native::cpublas::brgemm_release();

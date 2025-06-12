@@ -105,7 +105,20 @@ namespace {
 
 #define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
 
-// parallel routines
+
+// [NB] Parallel Routines
+//
+//  * at::parallel_for - applies for most of generic use cases, this will be compiled
+//                       agains openmp in default torch release.
+//
+//  * parallel_for     - same function as above, can choose payload partition scheme in
+//                       balance211.
+//
+//  * parallel_2d      - parallel for 2 dimensions, used in GEMM, etc.
+//                       this one will do payload balance across 2 dimensions.
+//
+
+// grain size for each thread
 constexpr int GRAIN_SIZE = 1024;
 
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
@@ -123,6 +136,7 @@ inline int get_thread_num() {
 #endif
 }
 
+// balance payload across each thread
 template <typename T>
 inline void balance211(T n, T nth, T ith, T& n_start, T& n_end) {
 #if 0
@@ -224,6 +238,10 @@ inline void parallel_2d(int m, int n, const func_t& f) {
 
 // 2d sequential loop: [mb0, mb1), [nb0, nb1)
 // do L2 cache for NB only (skip MB for now)
+//
+// loop order: [NB/BlkSize, MB, BlkSize]
+// TODO: implement reverse order of [MB/BlkSize, NB, BlkSize]
+//
 template <typename func_t>
 inline void loop_2d(int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1, int64_t cache_blocks_nb, const func_t& f) {
   for (int64_t nbb = nb0; nbb < nb1; nbb += cache_blocks_nb) {
