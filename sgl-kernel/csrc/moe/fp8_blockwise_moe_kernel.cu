@@ -46,11 +46,10 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace) {
-  using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
   using ElementA = cutlass::float_e4m3_t;
   using ElementB = cutlass::float_e4m3_t;
-  using ElementC = OutType;
-  using ElementD = ElementC;
+  using ElementC = void;
+  using ElementD = OutType;
   using ElementAccumulator = float;
   using LayoutA = cutlass::layout::RowMajor;
   using LayoutB = cutlass::layout::ColumnMajor;
@@ -58,11 +57,11 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
 
   static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
   static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
-  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementD>::value;
 
   using ArchTag = cutlass::arch::Sm90;
   using OperatorClass = cutlass::arch::OpClassTensorOp;
-  using FusionOperation = cutlass::epilogue::fusion::LinearCombination<ElementC, ElementAccumulator>;
+  using FusionOperation = cutlass::epilogue::fusion::LinearCombination<ElementD, ElementAccumulator>;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag,
@@ -72,7 +71,7 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
       cutlass::epilogue::collective::EpilogueTileAuto,
       ElementAccumulator,
       ElementAccumulator,
-      ElementC,
+      ElementC, // Use void to avoid load Matrix C
       LayoutC*,
       AlignmentC,
       ElementD,
@@ -120,10 +119,8 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
       reinterpret_cast<typename ScheduleConfig::LayoutSFB*>(layout_sfb.data_ptr())};
 
   cutlass::KernelHardwareInfo hw_info;
-  // TODO(qiyuhang): get device_id by cudaGetDevice
-  hw_info.device_id = 0;
-  // TODO(qiyuhang): get sm_count by cudaGetDeviceProperties
-  hw_info.sm_count = 78;    // H20 config
+  hw_info.device_id = c10::cuda::current_device();
+  hw_info.sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
   typename GemmKernel::EpilogueArguments epilogue_args{
       {},
