@@ -26,11 +26,9 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from sglang.srt import debug_utils
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
-from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import (
     get_tp_group,
     get_world_group,
@@ -47,9 +45,10 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.quantization import (
-    deep_gemm_wrapper,
-    monkey_patch_isinstance_for_vllm_base_layer,
+from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base_layer
+from sglang.srt.layers.quantization.deep_gemm import (
+    _ENABLE_JIT_DEEPGEMM,
+    update_deep_gemm_config,
 )
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
@@ -94,7 +93,6 @@ from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     cpu_has_amx_support,
-    dynamic_import,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -112,7 +110,6 @@ from sglang.srt.utils import (
 )
 
 _is_hip = is_hip()
-_is_cpu_amx_available = cpu_has_amx_support()
 
 # Use a small KV cache pool size for tests in CI
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
@@ -195,33 +192,10 @@ class ModelRunner:
 
         # Global vars
         global_server_args_dict.update(
-            {
-                "attention_backend": server_args.attention_backend,
-                "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
-                "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
-                "deepep_mode": server_args.deepep_mode,
-                "device": server_args.device,
-                "disable_chunked_prefix_cache": server_args.disable_chunked_prefix_cache,
-                "disable_radix_cache": server_args.disable_radix_cache,
-                "enable_nan_detection": server_args.enable_nan_detection,
-                "enable_dp_attention": server_args.enable_dp_attention,
-                "enable_two_batch_overlap": server_args.enable_two_batch_overlap,
-                "enable_dp_lm_head": server_args.enable_dp_lm_head,
-                "enable_ep_moe": server_args.enable_ep_moe,
-                "enable_deepep_moe": server_args.enable_deepep_moe,
-                "deepep_config": server_args.deepep_config,
-                "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
-                "moe_dense_tp_size": server_args.moe_dense_tp_size,
-                "ep_dispatch_algorithm": server_args.ep_dispatch_algorithm,
-                "n_share_experts_fusion": server_args.n_share_experts_fusion,
-                "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
-                "torchao_config": server_args.torchao_config,
-                "sampling_backend": server_args.sampling_backend,
-                "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
-                "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
-                "speculative_algorithm": self.spec_algorithm,
+            {k: getattr(server_args, k) for k in GLOBAL_SERVER_ARGS_KEYS}
+            | {
+                # TODO it is indeed not a "server args"
                 "use_mla_backend": self.use_mla_backend,
-                "speculative_algorithm": self.spec_algorithm,
             }
         )
 
@@ -232,8 +206,8 @@ class ModelRunner:
         min_per_gpu_memory = self.init_torch_distributed()
 
         # Update deep gemm configure
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
+        if _ENABLE_JIT_DEEPGEMM:
+            update_deep_gemm_config(gpu_id, server_args)
 
         # If it is a draft model, tp_group can be different
         self.initialize(min_per_gpu_memory)
@@ -245,7 +219,6 @@ class ModelRunner:
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
-
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
@@ -327,7 +300,7 @@ class ModelRunner:
         if (
             server_args.attention_backend == "intel_amx"
             and server_args.device == "cpu"
-            and not _is_cpu_amx_available
+            and not cpu_has_amx_support()
         ):
             logger.info(
                 "The current platform does not support Intel AMX, will fallback to torch_native backend."
@@ -571,7 +544,7 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
+        with self.memory_saver_adapter.region():
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
@@ -789,9 +762,6 @@ class ModelRunner:
         ]
         if load_format == "direct":
             _model_load_weights_direct(self.model, named_tensors)
-        elif load_format in self.server_args.custom_weight_loader:
-            custom_loader = dynamic_import(load_format)
-            custom_loader(self.model, named_tensors)
         elif load_format is None:
             self.model.load_weights(named_tensors)
         else:
