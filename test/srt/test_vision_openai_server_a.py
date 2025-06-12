@@ -28,6 +28,10 @@ class TestQwen2VLServer(TestOpenAIVisionServer):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
+            other_args=[
+                "--mem-fraction-static",
+                "0.5",
+            ],
         )
         cls.base_url += "/v1"
 
@@ -132,6 +136,8 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.7",
             ],
         )
         cls.base_url += "/v1"
