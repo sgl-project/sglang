@@ -43,6 +43,8 @@ if(DEFINED ENV{CONDA_PREFIX})
     set(CONDA_LIB_DIR "$ENV{CONDA_PREFIX}/lib")
     message(STATUS "Using Conda lib dir: ${CONDA_LIB_DIR}")
     link_directories(${CONDA_LIB_DIR})
+    set(CONDA_INCLUDE_DIR "$ENV{CONDA_PREFIX}/include")
+    include_directories(${CONDA_INCLUDE_DIR})
 
     # Look for libnuma in Conda's lib directory
     find_library(NUMA_LIB numa HINTS "${CONDA_LIB_DIR}")
