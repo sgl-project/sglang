@@ -117,10 +117,8 @@ class EagleDraftInput:
         req_to_token: torch.Tensor,
     ):
         bs = self.accept_length.numel()
-
         qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         qo_indptr[1:] = torch.cumsum(self.accept_length, dim=0)
-
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
@@ -140,7 +138,6 @@ class EagleDraftInput:
             kv_indices,
             req_to_token.size(1),
         )
-
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
     def filter_batch(self, new_indices: torch.Tensor):
