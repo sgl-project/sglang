@@ -124,25 +124,6 @@ class ModelOptFp8Config(QuantizationConfig):
         if self.exclude_modules and any(
             module in prefix for module in self.exclude_modules
         ):
-            # Debug: Print when excluding layers (only from rank 0)
-            if (
-                hasattr(torch.distributed, "get_rank")
-                and torch.distributed.is_initialized()
-            ):
-                try:
-                    from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-                    if get_tensor_model_parallel_rank() == 0:
-                        matching_excludes = [
-                            module
-                            for module in self.exclude_modules
-                            if module in prefix
-                        ]
-                        print(
-                            f"DEBUG: Excluding layer '{prefix}' due to exclude_modules: {matching_excludes}"
-                        )
-                except:
-                    pass
             return None
 
         if isinstance(layer, LinearBase):
@@ -368,15 +349,11 @@ class ModelOptFp8MoEMethod:
 
             # INPUT SCALES - Per-tensor scaling for ModelOpt
             w13_input_scale = PerTensorScaleParameter(
-                data=torch.full(
-                    (num_experts,), torch.finfo(torch.float32).min, dtype=torch.float32
-                ),
+                data=torch.full((num_experts,), 1.0, dtype=torch.float32),
                 weight_loader=weight_loader,
             )
             w2_input_scale = PerTensorScaleParameter(
-                data=torch.full(
-                    (num_experts,), torch.finfo(torch.float32).min, dtype=torch.float32
-                ),
+                data=torch.full((num_experts,), 1.0, dtype=torch.float32),
                 weight_loader=weight_loader,
             )
             layer.register_parameter("w13_input_scale", w13_input_scale)
@@ -438,11 +415,11 @@ class ModelOptFp8MoEMethod:
             )
         if hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None:
             layer.w13_input_scale = Parameter(
-                layer.w13_input_scale.data, requires_grad=False
+                layer.w13_input_scale.max(), requires_grad=False
             )
         if hasattr(layer, "w2_input_scale") and layer.w2_input_scale is not None:
             layer.w2_input_scale = Parameter(
-                layer.w2_input_scale.data, requires_grad=False
+                layer.w2_input_scale.max(), requires_grad=False
             )
 
     def apply(
