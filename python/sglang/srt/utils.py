@@ -2392,6 +2392,9 @@ def get_physical_cpus_by_numa():
                 key
             ] = cpu  # pick first CPU seen for that physical core
 
+    # Retrieves CPUs that the current process is allowed to run on
+    cpus_allowed_list = psutil.Process().cpu_affinity()
+
     # Convert to list of physical CPUs per node
     # 0: [0,1,2,...,42]
     # ...
@@ -2401,7 +2404,8 @@ def get_physical_cpus_by_numa():
     node_to_cpus = {}
     for node, core_to_cpu in physical_by_node.items():
         cpus = sorted(core_to_cpu.values())
-        node_to_cpus[node] = cpus
+        allowed_cpus = set(cpus).intersection(cpus_allowed_list)
+        node_to_cpus[node] = allowed_cpus
 
     return node_to_cpus
 
