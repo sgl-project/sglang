@@ -454,8 +454,20 @@ class MHATokenToKVPool(KVCache):
                 self.v_buffer[layer_id - self.start_layer][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
         else:
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+            if _is_npu and loc.ndim == 1:
+                torch_npu.npu_scatter_nd_update_(
+                    self.k_buffer[layer_id - self.start_layer],
+                    loc.view(-1, 1),
+                    cache_k,
+                )
+                torch_npu.npu_scatter_nd_update_(
+                    self.v_buffer[layer_id - self.start_layer],
+                    loc.view(-1, 1),
+                    cache_v,
+                )
+            else:
+                self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         copy_all_layer_kv_cache[(len(self.data_ptrs),)](
