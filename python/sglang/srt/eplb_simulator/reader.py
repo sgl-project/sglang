@@ -25,4 +25,7 @@ def read_mode_per_pass(dir_data: Path):
     gpc_of_forward_pass = torch.stack(items)
     print(f"{gpc_of_forward_pass.shape=}")
 
-    return gpc_of_forward_pass, last_physical_to_logical_map
+    return dict(
+        global_physical_count_of_forward_pass=gpc_of_forward_pass,
+        last_physical_to_logical_map=last_physical_to_logical_map,
+    )
