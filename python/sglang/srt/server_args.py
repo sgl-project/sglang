@@ -230,6 +230,9 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
 
+    # For model weight update
+    custom_weight_loader: Optional[List[str]] = None
+
     def __post_init__(self):
         # Expert parallelism
         if self.enable_ep_moe:
@@ -518,6 +521,9 @@ class ServerArgs:
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
         )
+
+        if self.custom_weight_loader is None:
+            self.custom_weight_loader = []
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -1525,6 +1531,12 @@ class ServerArgs:
             type=str,
             default=None,
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
+        )
+        parser.add_argument(
+            "--custom-weight-loader",
+            type=str,
+            default=None,
+            help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
         )
 
     @classmethod
