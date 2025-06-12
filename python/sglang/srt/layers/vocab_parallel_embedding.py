@@ -26,6 +26,7 @@ from sglang.srt.utils import (
     is_cpu,
     set_weight_attrs,
 )
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
@@ -253,7 +254,10 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.org_vocab_size = org_num_embeddings or num_embeddings
 
         # Support the case where the vocab size is not divisible by the TP size.
-        if pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size != 0:
+        if (
+            global_server_args_dict["device"] == "cpu"
+            and pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size != 0
+        ):
             padding_size *= self.tp_size
         self.padding_size = padding_size
 
