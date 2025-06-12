@@ -236,6 +236,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 activation=activation,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 no_combine=no_combine,
+                routed_scaling_factor=routed_scaling_factor,
             )
 
     def forward_cpu(
@@ -370,6 +371,7 @@ class FusedMoE(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
+        self.hidden_size = hidden_size
         self.tp_size = (
             tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
         )
@@ -610,7 +612,8 @@ class FusedMoE(torch.nn.Module):
             loaded_weight = loaded_weight.to(param.data.device)
 
             if (
-                param.data[expert_id] != 1
+                "compressed" in self.quant_method.__class__.__name__.lower()
+                and param.data[expert_id] != 1
                 and (param.data[expert_id] - loaded_weight).abs() > 1e-5
             ):
                 raise ValueError(
@@ -633,6 +636,23 @@ class FusedMoE(torch.nn.Module):
                 expert_data=expert_data,
                 tp_rank=tp_rank,
             )
+            return
+        if "ModelOpt" in self.quant_method.__class__.__name__:
+            if "weight_scale_2" in weight_name or "input_scale" in weight_name:
+                self._load_per_tensor_weight_scale(
+                    shard_id=shard_id,
+                    param=param,
+                    loaded_weight=loaded_weight,
+                    expert_id=expert_id,
+                )
+            elif "weight" in weight_name:
+                self._load_model_weight_or_group_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=tp_rank,
+                )
             return
 
         # Case weight scales and zero_points
