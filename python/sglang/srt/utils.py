@@ -17,6 +17,7 @@ import base64
 import builtins
 import ctypes
 import dataclasses
+import functools
 import importlib
 import io
 import ipaddress
@@ -837,6 +838,7 @@ class CustomCacheManager(FileCacheManager):
 
 
 def set_ulimit(target_soft_limit=65535):
+    # number of open files
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
 
@@ -845,6 +847,18 @@ def set_ulimit(target_soft_limit=65535):
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
             logger.warning(f"Fail to set RLIMIT_NOFILE: {e}")
+
+    # stack size
+    resource_type = resource.RLIMIT_STACK
+    current_soft, current_hard = resource.getrlimit(resource_type)
+    target_soft_limit_stack_size = 1024 * target_soft_limit
+    if current_soft < target_soft_limit_stack_size:
+        try:
+            resource.setrlimit(
+                resource_type, (target_soft_limit_stack_size, current_hard)
+            )
+        except ValueError as e:
+            logger.warning(f"Fail to set RLIMIT_STACK: {e}")
 
 
 def add_api_key_middleware(app, api_key: str):
@@ -1371,6 +1385,11 @@ def crash_on_warnings():
 def print_warning_once(msg: str) -> None:
     # Set the stacklevel to 2 to print the caller's line info
     logger.warning(msg, stacklevel=2)
+
+
+@functools.lru_cache(None)
+def print_info_once(msg: str) -> None:
+    logger.info(msg)
 
 
 def get_device_name(device_id: int = 0) -> str:
@@ -1928,14 +1947,16 @@ def next_power_of_2(n: int):
 setattr(triton, "next_power_of_2", next_power_of_2)
 
 
-@contextmanager
-def empty_context(*args, **kwargs):
-    try:
-        # Setup code goes here
-        yield
-    finally:
-        # Cleanup code goes here
+class EmptyContextManager:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
         pass
+
+
+def empty_context(*args, **kwargs):
+    return EmptyContextManager()
 
 
 def add_prefix(name: str, prefix: str) -> str:
@@ -2193,6 +2214,45 @@ class Withable(Generic[T]):
         finally:
             assert self._value is new_value
             self._value = None
+
+
+def merge_bias_tensor(
+    lhs: Optional[torch.Tensor],
+    rhs: Optional[torch.Tensor],
+    bs1: int,
+    bs2: int,
+    device: str,
+    default: float,
+):
+    """Merge two bias tensors for batch merging.
+
+    Args:
+        lhs: Left-hand side tensor
+        rhs: Right-hand side tensor
+        bs1: Batch size of left-hand side tensor
+        bs2: Batch size of right-hand side tensor
+        device: Device to place the merged tensor on
+        default: Default value for missing tensor elements
+
+    Returns:
+        Merged tensor or None if both inputs are None
+    """
+    if lhs is None and rhs is None:
+        return None
+
+    if lhs is not None and rhs is not None:
+        return torch.cat([lhs, rhs])
+    else:
+        if lhs is not None:
+            shape, dtype = lhs.shape[1:], lhs.dtype
+        else:
+            shape, dtype = rhs.shape[1:], rhs.dtype
+
+        if lhs is None:
+            lhs = torch.empty((bs1, *shape), device=device, dtype=dtype).fill_(default)
+        if rhs is None:
+            rhs = torch.empty((bs2, *shape), device=device, dtype=dtype).fill_(default)
+        return torch.cat([lhs, rhs])
 
 
 def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:

@@ -109,8 +109,10 @@ void cutlass_mla_decode(
     torch::Tensor const& kv_c_and_k_pe_cache,
     torch::Tensor const& seq_lens,
     torch::Tensor const& page_table,
-    torch::Tensor const& workspace);
-int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count = 0);
+    torch::Tensor const& workspace,
+    int64_t num_kv_splits = -1);
+int64_t cutlass_mla_get_workspace_size(
+    int64_t max_seq_len, int64_t num_batches, int64_t sm_count = 0, int64_t num_kv_splits = -1);
 /*
  * From csrc/elementwise
  */
@@ -263,6 +265,14 @@ void ep_moe_pre_reorder(
     int64_t end_expert_id,
     int64_t topk,
     bool use_per_token_if_dynamic);
+
+void ep_moe_silu_and_mul(
+    torch::Tensor gateup_output,
+    torch::Tensor down_input,
+    torch::Tensor reorder_topk_ids,
+    torch::Tensor scales,
+    int64_t start_expert_id,
+    int64_t end_expert_id);
 
 void ep_moe_post_reorder(
     torch::Tensor down_output,

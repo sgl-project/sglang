@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import os
+import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -12,6 +14,7 @@ import triton.language as tl
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -19,9 +22,7 @@ from sglang.srt.managers.schedule_batch import (
     global_server_args_dict,
 )
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.speculative.build_eagle_tree import build_tree_kernel_efficient
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.utils import fast_topk, is_cuda, is_hip, next_power_of_2
 
 if is_cuda():
@@ -34,15 +35,15 @@ if is_cuda():
 elif is_hip():
     from sgl_kernel import verify_tree_greedy
 
-if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
-
-import logging
 
 logger = logging.getLogger(__name__)
 
 
+# Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
+SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
+
+TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 
 
 @dataclass
@@ -84,77 +85,28 @@ class EagleDraftInput:
         self,
         batch: ScheduleBatch,
         speculative_num_steps: int,
-        pad_input: bool = False,
     ):
-        assert len(self.verified_id) == len(batch.out_cache_loc)
-        accept_length_cpu = batch.spec_info.accept_length_cpu
-        batch.extend_lens = [x + 1 for x in accept_length_cpu]
+        batch.forward_mode = ForwardMode.DRAFT_EXTEND
+        batch.input_ids = self.verified_id
+        batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
-        seq_lens_cpu = batch.seq_lens.tolist()
+        batch.return_logprob = False
 
-        self.positions = torch.empty_like(self.verified_id, dtype=torch.long)
-        new_verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
+        self.capture_hidden_mode = CaptureHiddenMode.LAST
         self.accept_length.add_(1)
+        self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
+        self.verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
 
-        create_extend_spec_info[(self.accept_length.numel(),)](
-            self.verified_id,
+        create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
+            batch.input_ids,
             batch.seq_lens,
             self.accept_length,
-            torch.cumsum(self.accept_length, axis=0, dtype=torch.int),
             self.positions,
-            new_verified_id,
-            next_power_of_2(speculative_num_steps + 1),
+            self.verified_id,
+            next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
         )
-
-        batch.seq_lens_sum = sum(seq_lens_cpu)
-        batch.input_ids = self.verified_id
-        self.verified_id = new_verified_id
-
-        if pad_input:
-            batch_size = sum(not req.finished() for req in batch.reqs)
-            # Total constant input length after padding
-            static_len = speculative_num_steps + 1
-            # Total size after padding
-            padded_input_size = batch_size * static_len
-
-            padded_len = padded_input_size - batch.input_ids.shape[0]
-            if padded_len > 0:
-                new_input_ids = torch.nn.functional.pad(
-                    batch.input_ids, (0, padded_len), value=0
-                )
-                position_padding = torch.arange(
-                    padded_len, device=self.positions.device
-                )
-                new_positions = torch.cat([self.positions, position_padding])
-
-                # need dummy hidden states for the padded positions
-                hidden_states_dim = self.hidden_states.shape[-1]
-                new_hidden_states = torch.cat(
-                    [
-                        self.hidden_states,
-                        torch.zeros(
-                            (padded_len, hidden_states_dim),
-                            dtype=self.hidden_states.dtype,
-                            device=self.hidden_states.device,
-                        ),
-                    ],
-                    dim=0,
-                )
-
-                # allocate KV cache location for the padded tokens
-                padded_cache_loc = torch.zeros(
-                    padded_len,
-                    dtype=batch.out_cache_loc.dtype,
-                    device=batch.out_cache_loc.device,
-                )
-                new_out_cache_loc = torch.cat([batch.out_cache_loc, padded_cache_loc])
-
-                batch.input_ids = new_input_ids
-                self.hidden_states = new_hidden_states
-                self.positions = new_positions
-                batch.out_cache_loc = new_out_cache_loc
 
     def generate_attn_arg_prefill(
         self,
@@ -171,8 +123,12 @@ class EagleDraftInput:
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
-        # TODO: replace cum_kv_seq_len[-1] with paged_kernel_lens_sum to avoid the device sync.
-        kv_indices = torch.empty(cum_kv_seq_len[-1], dtype=torch.int32, device="cuda")
+        if paged_kernel_lens_sum is None:
+            paged_kernel_lens_sum = cum_kv_seq_len[-1]
+
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
+        )
 
         create_flashinfer_kv_indices_triton[(bs,)](
             req_to_token,
@@ -236,53 +192,9 @@ class EagleVerifyInput:
     topk: int
     draft_token_num: int
     capture_hidden_mode: CaptureHiddenMode
+    seq_lens_sum: int
+    seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
-
-    @classmethod
-    def create(
-        cls,
-        verified_id: torch.Tensor,
-        score_list: List[torch.Tensor],
-        token_list: List[torch.Tensor],
-        parents_list: List[torch.Tensor],
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        topk: int,
-        spec_steps: int,
-        num_verify_tokens: int,
-    ):
-        (
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            verified_id,
-            score_list,
-            token_list,
-            parents_list,
-            seq_lens,
-            seq_lens_sum,
-            topk,
-            spec_steps,
-            num_verify_tokens,
-        )
-
-        return cls(
-            draft_token=draft_tokens,
-            custom_mask=tree_mask,
-            positions=position,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            retrive_cum_len=None,
-            spec_steps=spec_steps,
-            topk=topk,
-            draft_token_num=num_verify_tokens,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-        )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
         batch.input_ids = self.draft_token
@@ -612,26 +524,28 @@ class EagleVerifyInput:
 
 
 @triton.jit
-def create_extend_spec_info(
+def create_extend_after_decode_spec_info(
     verified_id,
-    seq_len,
-    accept_len,
-    accept_len_cum,
+    seq_lens,
+    accept_lens,
     positions,
     new_verified_id,
-    accept_len_upper: tl.constexpr,
+    bs_upper: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    offset = 0 if pid == 0 else tl.load(accept_len_cum + pid - 1)
-    seq_length = tl.load(seq_len + pid)
-    accept_length = tl.load(accept_len + pid)
-    positions_ptr = positions + offset
-    data = tl.arange(0, accept_len_upper)
-    mask = data < accept_length
-    tl.store(positions_ptr + data, seq_length - accept_length + data, mask)
+    offsets = tl.arange(0, bs_upper)
+    seq_length = tl.load(seq_lens + pid)
+    accept_length = tl.load(accept_lens + pid)
 
-    offset = tl.load(accept_len_cum + pid) - 1
-    verified_id_data = tl.load(verified_id + offset)
+    accept_len_cumsum = tl.sum(
+        tl.load(accept_lens + offsets, mask=offsets < pid, other=0)
+    )
+    positions_ptr = positions + accept_len_cumsum
+    mask = offsets < accept_length
+    tl.store(positions_ptr + offsets, seq_length - accept_length + offsets, mask)
+
+    accept_len_cumsum += accept_length - 1
+    verified_id_data = tl.load(verified_id + accept_len_cumsum)
     tl.store(new_verified_id + pid, verified_id_data)
 
 
@@ -652,8 +566,8 @@ def assign_req_to_token_pool(
     token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
 
     length_offset = tl.arange(0, bs_upper)
-    start = tl.load(start_offset + length_offset, mask=length_offset < pid)
-    end = tl.load(end_offset + length_offset, mask=length_offset < pid)
+    start = tl.load(start_offset + length_offset, mask=length_offset < pid, other=0)
+    end = tl.load(end_offset + length_offset, mask=length_offset < pid, other=0)
     out_offset = tl.sum(end - start, axis=0)
 
     out_cache_ptr = out_cache_loc + out_offset
@@ -734,7 +648,7 @@ def generate_draft_decode_kv_indices(
     iters += 1
 
     load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(paged_kernel_lens + load_offset, mask=load_offset < bid)
+    seq_lens = tl.load(paged_kernel_lens + load_offset, mask=load_offset < bid, other=0)
     seq_len = tl.load(paged_kernel_lens + bid)
     cum_seq_len = tl.sum(seq_lens)
 
@@ -763,7 +677,7 @@ def generate_draft_decode_kv_indices(
     zid = bid * topk + topk_id
     if zid == 0:
         zid = num_seqs * topk
-    positions = tl.load(positions + bs_offset, mask=bs_offset < zid)
+    positions = tl.load(positions + bs_offset, mask=bs_offset < zid, other=0)
     base = tl.sum(positions)
     tl.store(kv_indptr + zid, base + zid * iters)
 
@@ -781,7 +695,9 @@ def align_evict_mask_to_page_size(
     bid = tl.program_id(axis=0)
     seq_len = tl.load(seq_lens + bid)
     io_mask = t_range < num_draft_tokens
-    mask_row = tl.load(evict_mask + bid * num_draft_tokens + t_range, mask=io_mask)
+    mask_row = tl.load(
+        evict_mask + bid * num_draft_tokens + t_range, mask=io_mask, other=0
+    )
 
     num_trues = tl.sum(mask_row)
     num_false = num_draft_tokens - num_trues

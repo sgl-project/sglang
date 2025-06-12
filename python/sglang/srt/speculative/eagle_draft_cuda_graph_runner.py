@@ -10,6 +10,7 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
     get_batch_sizes_to_capture,
     get_global_graph_memory_pool,
+    model_capture_mode,
     set_global_graph_memory_pool,
     set_torch_compile_config,
 )
@@ -40,6 +41,9 @@ class EAGLEDraftCudaGraphRunner:
         self.tp_size = self.model_runner.tp_size
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.enable_profile_cuda_graph = (
+            model_runner.server_args.enable_profile_cuda_graph
+        )
         server_args = model_runner.server_args
 
         # Batch sizes to capture
@@ -80,7 +84,8 @@ class EAGLEDraftCudaGraphRunner:
 
         # Capture
         try:
-            self.capture()
+            with model_capture_mode():
+                self.capture()
         except RuntimeError as e:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
@@ -112,9 +117,7 @@ class EAGLEDraftCudaGraphRunner:
         hidden_states = self.hidden_states[:num_seqs]
 
         spec_info = EagleDraftInput(
-            topk_p=topk_p,
-            topk_index=topk_index,
-            hidden_states=hidden_states,
+            topk_p=topk_p, topk_index=topk_index, hidden_states=hidden_states
         )
 
         # Forward batch
@@ -127,7 +130,7 @@ class EAGLEDraftCudaGraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum(),
+            seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
             positions=positions,
             spec_algorithm=self.model_runner.spec_algorithm,
@@ -209,7 +212,7 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.positions = self.positions[:num_tokens]
 
         # Special handle for seq_len_cpu used when flashinfer mla is used
-        if (forward_batch.seq_lens_cpu is not None) and (bs != raw_bs):
+        if forward_batch.seq_lens_cpu is not None and bs != raw_bs:
             self.seq_lens_cpu.fill_(1)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
             forward_batch.seq_lens_cpu = self.seq_lens_cpu[:bs]

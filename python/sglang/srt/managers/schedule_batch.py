@@ -72,32 +72,33 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 GLOBAL_SERVER_ARGS_KEYS = [
     "attention_backend",
+    "mm_attention_backend",
     "debug_tensor_dump_inject",
     "debug_tensor_dump_output_folder",
     "chunked_prefill_size",
-    "deepep_mode",
     "device",
     "disable_chunked_prefix_cache",
     "disable_radix_cache",
-    "enable_deepep_moe",
     "enable_dp_attention",
     "enable_two_batch_overlap",
     "enable_dp_lm_head",
+    "enable_deepep_moe",
+    "deepep_mode",
     "enable_ep_moe",
+    "moe_dense_tp_size",
+    "ep_dispatch_algorithm",
     "deepep_config",
+    "ep_num_redundant_experts",
     "enable_nan_detection",
     "flashinfer_mla_disable_ragged",
     "max_micro_batch_size",
-    "moe_dense_tp_size",
-    "ep_dispatch_algorithm",
     "disable_shared_experts_fusion",
     "sampling_backend",
     "speculative_accept_threshold_acc",
     "speculative_accept_threshold_single",
     "torchao_config",
     "triton_attention_reduce_in_fp32",
-    "ep_num_redundant_experts",
-    "mm_attention_backend",
+    "num_reserved_decode_tokens",
 ]
 
 # Put some global args for easy access
@@ -451,6 +452,7 @@ class Req:
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        data_parallel_rank: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -604,6 +606,9 @@ class Req:
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
         self.disagg_kv_sender: Optional[BaseKVSender] = None
+
+        # For data parallel rank routing
+        self.data_parallel_rank: Optional[int] = data_parallel_rank
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
@@ -1632,7 +1637,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
-    def get_model_worker_batch(self) -> ModelWorkerBatch:
+    def get_model_worker_batch(
+        self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
+    ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
             extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
         else:
@@ -1642,16 +1649,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Create seq_lens_cpu when needed
         if (
-            (
+            global_server_args_dict["attention_backend"] == "fa3"
+            or (
                 global_server_args_dict["use_mla_backend"]
                 and global_server_args_dict["attention_backend"] == "flashinfer"
             )
             or global_server_args_dict["attention_backend"] == "flashmla"
-            or global_server_args_dict["attention_backend"] == "fa3"
             or global_server_args_dict["attention_backend"] == "cutlass_mla"
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
-            seq_lens_cpu = self.seq_lens.cpu()
+            seq_lens_cpu = (
+                seq_lens_cpu_cache
+                if seq_lens_cpu_cache is not None
+                else self.seq_lens.cpu()
+            )
         else:
             seq_lens_cpu = None
 
@@ -1670,6 +1681,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
             out_cache_loc=self.out_cache_loc,
+            seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=self.seq_lens_sum,
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
@@ -1679,7 +1691,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             tbo_split_seq_index=self.tbo_split_seq_index,
             global_forward_mode=self.global_forward_mode,
-            seq_lens_cpu=seq_lens_cpu,
             extend_num_tokens=self.extend_num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -1741,11 +1752,11 @@ class ModelWorkerBatch:
     req_pool_indices: torch.Tensor
     # The sequence length
     seq_lens: torch.Tensor
-    seq_lens_cpu: Optional[torch.Tensor]
     # The indices of output tokens in the token_to_kv_pool_allocator
     out_cache_loc: torch.Tensor
 
-    # The sum of all sequence lengths
+    # The sequence length tensor on CPU
+    seq_lens_cpu: Optional[torch.Tensor]
     seq_lens_sum: int
 
     # For logprob
