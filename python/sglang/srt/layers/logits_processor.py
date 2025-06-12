@@ -442,7 +442,7 @@ class LogitsProcessor(nn.Module):
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
         if hasattr(lm_head, "weight"):
-            if lm_head.use_intel_amx_backend:
+            if getattr(lm_head, "use_intel_amx_backend", False):
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),
                     lm_head.weight,

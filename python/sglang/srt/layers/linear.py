@@ -180,7 +180,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
-        if layer.use_intel_amx_backend:
+        if getattr(layer, "use_intel_amx_backend", False):
             return torch.ops.sgl_kernel.weight_packed_linear(
                 x, layer.weight, bias, True  # is_vnni
             )

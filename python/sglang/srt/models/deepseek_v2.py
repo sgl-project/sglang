@@ -216,7 +216,7 @@ class MoEGate(nn.Module):
         self.quant_method = PackWeightMethod(weight_names=["weight"])
 
     def forward(self, hidden_states):
-        if self.use_intel_amx_backend:
+        if getattr(self, "use_intel_amx_backend", False):
             return torch.ops.sgl_kernel.weight_packed_linear(
                 hidden_states,
                 self.weight,
@@ -787,9 +787,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 else:
                     return AttnForwardMethod.MLA
             else:
-                if (
-                    hasattr(self, "fused_qkv_a_proj_with_mqa")
-                    and self.use_intel_amx_backend
+                if hasattr(self, "fused_qkv_a_proj_with_mqa") and getattr(
+                    self, "use_intel_amx_backend", False
                 ):
                     return AttnForwardMethod.MLA_FUSED_ROPE_CPU
                 else:
@@ -1238,8 +1237,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        assert (
-            self.q_lora_rank is not None and self.use_intel_amx_backend
+        assert self.q_lora_rank is not None and getattr(
+            self, "use_intel_amx_backend", False
         ), "forward_absorb_fused_mla_rope_cpu_prepare requires q_lora_rank is not None and use_intel_amx_backend"
 
         q_input, k_input, v_input = (
@@ -1358,8 +1357,8 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward_absorb_fused_mla_rope_cpu_core(
         self, q_input, k_input, v_input, forward_batch, zero_allocator
     ):
-        assert (
-            self.q_lora_rank is not None and self.use_intel_amx_backend
+        assert self.q_lora_rank is not None and getattr(
+            self, "use_intel_amx_backend", False
         ), "forward_absorb_fused_mla_rope_cpu_core requires q_lora_rank is not None and use_intel_amx_backend"
 
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
