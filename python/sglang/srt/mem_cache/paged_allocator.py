@@ -12,6 +12,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 
 """
 Page-aligned memory pool.
@@ -265,6 +266,7 @@ class PagedTokenToKVPoolAllocator:
 
         bs = len(seq_lens)
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+        print(f"hi [{get_tensor_model_parallel_rank()}] call alloc_decode_kernel {bs=}")
         alloc_decode_kernel[(bs,)](
             seq_lens,
             last_loc,
