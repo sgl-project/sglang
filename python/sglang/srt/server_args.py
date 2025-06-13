@@ -90,6 +90,7 @@ class ServerArgs:
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
     gpu_id_step: int = 1
+    sleep_on_idle: bool = False
 
     # Logging
     log_level: str = "info"
@@ -843,6 +844,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.gpu_id_step,
             help="The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,...",
+        )
+        parser.add_argument(
+            "--sleep-on-idle",
+            action="store_true",
+            help="Reduce CPU usage when sglang is idle.",
         )
 
         # Logging
