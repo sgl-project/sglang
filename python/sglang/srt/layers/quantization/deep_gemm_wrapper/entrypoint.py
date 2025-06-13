@@ -63,7 +63,9 @@ def grouped_gemm_nt_f8f8bf16_masked(
     _, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
 
-    with compile_utils.deep_gemm_execution_hook(expected_m, n, k, num_groups, kernel_type):
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
         _grouped_gemm_nt_f8f8bf16_masked_raw(lhs, rhs, out, masked_m, expected_m)
 
 
@@ -98,7 +100,6 @@ def gemm_nt_f8f8bf16(
             out,
             recipe=TODO_handle_recipe,
         )
-
 
 
 # TODO improve?

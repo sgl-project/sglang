@@ -321,6 +321,7 @@ def _log_jit_build(M: int, N: int, K: int, kernel_type: DeepGemmKernelType):
     yield
     RuntimeCache.get = origin_func
 
+
 @contextmanager
 def deep_gemm_execution_hook(
     m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
@@ -328,4 +329,3 @@ def deep_gemm_execution_hook(
     _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
     with _log_jit_build(m, n, k, kernel_type):
         yield
-
