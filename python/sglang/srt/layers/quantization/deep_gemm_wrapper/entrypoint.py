@@ -85,7 +85,6 @@ def gemm_nt_f8f8bf16(
         )
 
 
-# TODO improve?
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     compile_utils.update_deep_gemm_config(gpu_id, server_args)
 
