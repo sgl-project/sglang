@@ -82,8 +82,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_hip:
     from aiter import ActivationType, QuantType
-    from aiter.fused_moe_bf16_asm import asm_moe, ck_moe_2stages
     from aiter.fused_moe import fused_moe
+    from aiter.fused_moe_bf16_asm import asm_moe, ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
 
 if not _is_cuda:
@@ -1068,18 +1068,18 @@ class Fp8MoEMethod:
                     activation == "silu"
                 ), f"_use_aiter: FP8 bloack_quant {activation=} will be supported later, unset _use_aiter"
                 return fused_moe(
-                        x,
-                        layer.w13_weight,
-                        layer.w2_weight,
-                        topk_weights,
-                        topk_ids,
-                        w1_scale=layer.w13_weight_scale_inv,
-                        w2_scale=layer.w2_weight_scale_inv,
-                        quant_type=QuantType.per_128x128,
-                        activation=(
-                            ActivationType.Silu
-                            if activation == "silu"
-                            else ActivationType.Gelu
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    w1_scale=layer.w13_weight_scale_inv,
+                    w2_scale=layer.w2_weight_scale_inv,
+                    quant_type=QuantType.per_128x128,
+                    activation=(
+                        ActivationType.Silu
+                        if activation == "silu"
+                        else ActivationType.Gelu
                     ),
                     expert_mask=None,
                 )
