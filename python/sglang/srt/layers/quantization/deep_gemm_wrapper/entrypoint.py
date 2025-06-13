@@ -1,7 +1,6 @@
 import torch
 from typing import Tuple
 
-
 # TODO from layer.py
 # try:
 #     from deep_gemm import fp8_m_grouped_gemm_nt_masked, m_grouped_fp8_gemm_nt_contiguous
@@ -18,6 +17,9 @@ from typing import Tuple
 #     print("hi layer.py use deep_gemm old version")
 
 
+ENABLE_JIT_DEEPGEMM = TODO
+
+
 def grouped_gemm_nt_f8f8bf16_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -28,6 +30,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
     TODO_recipe_arg
     TODO
 
+
 def grouped_gemm_nt_f8f8bf16_contig(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -36,11 +39,10 @@ def grouped_gemm_nt_f8f8bf16_contig(
 ):
     TODO
 
+
 def gemm_nt_f8f8bf16(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
 ):
     TODO
-
-ENABLE_DEEPGEMM = TODO

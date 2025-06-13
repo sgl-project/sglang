@@ -920,7 +920,7 @@ class DeepEPMoE(EPMoE):
         )
         self.deepep_mode = deepep_mode
         if self.deepep_mode.enable_low_latency():
-            assert deep_gemm_wrapper.ENABLE_DEEPGEMM, f"DeepEP {self.deepep_mode} mode requires deep_gemm"
+            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM, f"DeepEP {self.deepep_mode} mode requires deep_gemm"
         self.w13_weight_fp8 = (
             self.w13_weight,
             (
