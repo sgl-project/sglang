@@ -35,13 +35,13 @@ from sglang.srt.speculative.eagle_utils import (
     EagleVerifyInput,
     EagleVerifyOutput,
     assign_draft_cache_locs,
+    fast_topk,
     generate_token_bitmask,
     select_top_k_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     empty_context,
-    fast_topk,
     get_available_gpu_memory,
     is_cuda,
     next_power_of_2,
@@ -266,7 +266,7 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
+            f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
         # Capture extend
@@ -281,7 +281,7 @@ class EAGLEWorker(TpModelWorker):
             )
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
-                f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. avail mem={after_mem:.2f} GB. mem usage={(before_mem - after_mem):.2f} GB."
+                f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
     @property
@@ -624,7 +624,7 @@ class EAGLEWorker(TpModelWorker):
             if vocab_mask is not None:
                 assert spec_info.grammar is not None
                 vocab_mask = vocab_mask.to(spec_info.retrive_next_token.device)
-                # otherwise, this vocab mask will be the one from the previous extend stage
+                # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
 
