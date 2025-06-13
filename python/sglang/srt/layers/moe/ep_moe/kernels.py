@@ -4,6 +4,7 @@ from typing import List, Optional
 import torch
 import triton
 
+from sglang.math_utils import ceil_div
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import dispose_tensor, get_bool_env_var, is_cuda
 
@@ -1028,7 +1029,6 @@ def get_tma_aligned_size(x: int, element_size: int) -> int:
     tma_alignment_bytes = 16
     assert tma_alignment_bytes % element_size == 0
     alignment = tma_alignment_bytes // element_size
-    TODO_handle_ceil_div_function
     return ceil_div(x, alignment) * alignment
 
 
