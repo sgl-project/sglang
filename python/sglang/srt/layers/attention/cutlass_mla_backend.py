@@ -233,25 +233,49 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        # For multi-head latent attention
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ):
         cache_loc = forward_batch.out_cache_loc
 
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    cache_loc,
-                    k,
-                    v,
-                )
-        bs = forward_batch.batch_size
+                if k_rope is not None:
+                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                    )
+                else:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                    )
+
+        # Reshape inputs
+        if q_rope is not None:
+            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+        else:
+            reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            q_nope = reshaped_q[:, :, : layer.v_head_dim]
+            q_rope = reshaped_q[:, :, layer.v_head_dim :]
+
+        q_nope = q_nope.to(self.q_data_type)
+        q_rope = q_rope.to(self.q_data_type)
+
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
-        reshape_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-
         o = cutlass_mla_decode(
-            q_nope_and_q_pe=reshape_q.to(self.q_data_type),
+            q_nope=q_nope,
+            q_pe=q_rope,
             kv_c_and_k_pe_cache=k_cache.view(-1, PAGE_SIZE, self.kv_cache_dim),
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             page_table=self.forward_metadata.block_kv_indices,
