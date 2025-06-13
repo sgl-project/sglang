@@ -17,6 +17,7 @@ import base64
 import builtins
 import ctypes
 import dataclasses
+import functools
 import importlib
 import io
 import ipaddress
@@ -25,6 +26,7 @@ import json
 import logging
 import os
 import pickle
+import platform
 import random
 import re
 import resource
@@ -44,6 +46,7 @@ from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
+from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
@@ -155,6 +158,15 @@ def is_xpu() -> bool:
 
 def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
+
+
+def is_cpu() -> bool:
+    machine = platform.machine().lower()
+    return (
+        machine in ("x86_64", "amd64", "i386", "i686")
+        and hasattr(torch, "cpu")
+        and torch.cpu.is_available()
+    )
 
 
 def is_flashinfer_available():
@@ -826,6 +838,7 @@ class CustomCacheManager(FileCacheManager):
 
 
 def set_ulimit(target_soft_limit=65535):
+    # number of open files
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
 
@@ -834,6 +847,18 @@ def set_ulimit(target_soft_limit=65535):
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
             logger.warning(f"Fail to set RLIMIT_NOFILE: {e}")
+
+    # stack size
+    resource_type = resource.RLIMIT_STACK
+    current_soft, current_hard = resource.getrlimit(resource_type)
+    target_soft_limit_stack_size = 1024 * target_soft_limit
+    if current_soft < target_soft_limit_stack_size:
+        try:
+            resource.setrlimit(
+                resource_type, (target_soft_limit_stack_size, current_hard)
+            )
+        except ValueError as e:
+            logger.warning(f"Fail to set RLIMIT_STACK: {e}")
 
 
 def add_api_key_middleware(app, api_key: str):
@@ -1360,6 +1385,11 @@ def crash_on_warnings():
 def print_warning_once(msg: str) -> None:
     # Set the stacklevel to 2 to print the caller's line info
     logger.warning(msg, stacklevel=2)
+
+
+@functools.lru_cache(None)
+def print_info_once(msg: str) -> None:
+    logger.info(msg)
 
 
 def get_device_name(device_id: int = 0) -> str:
@@ -1917,14 +1947,16 @@ def next_power_of_2(n: int):
 setattr(triton, "next_power_of_2", next_power_of_2)
 
 
-@contextmanager
-def empty_context(*args, **kwargs):
-    try:
-        # Setup code goes here
-        yield
-    finally:
-        # Cleanup code goes here
+class EmptyContextManager:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
         pass
+
+
+def empty_context(*args, **kwargs):
+    return EmptyContextManager()
 
 
 def add_prefix(name: str, prefix: str) -> str:
@@ -2025,6 +2057,14 @@ class DeepEPMode(Enum):
             return DeepEPMode.normal
 
 
+def is_non_idle_and_non_empty(forward_mode, hidden_states):
+    return (
+        (forward_mode is not None)
+        and not forward_mode.is_idle()
+        and hidden_states.shape[0] > 0
+    )
+
+
 def fast_topk(values, topk, dim):
     if topk == 1:
         # Use max along the specified dimension to get both value and index
@@ -2046,6 +2086,12 @@ is_ampere_with_cuda_12_3 = lambda: _check(8)
 is_hopper_with_cuda_12_3 = lambda: _check(9)
 
 
+def is_blackwell():
+    if not is_cuda():
+        return False
+    return torch.cuda.get_device_capability()[0] == 10
+
+
 def get_free_port():
     # try ipv4
     try:
@@ -2065,6 +2111,14 @@ def get_local_ip_by_remote() -> str:
     try:
         s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
+    except Exception:
+        pass
+
+    try:
+        hostname = socket.gethostname()
+        ip = socket.gethostbyname(hostname)
+        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+            return ip
     except Exception:
         pass
 
@@ -2160,3 +2214,129 @@ class Withable(Generic[T]):
         finally:
             assert self._value is new_value
             self._value = None
+
+
+def merge_bias_tensor(
+    lhs: Optional[torch.Tensor],
+    rhs: Optional[torch.Tensor],
+    bs1: int,
+    bs2: int,
+    device: str,
+    default: float,
+):
+    """Merge two bias tensors for batch merging.
+
+    Args:
+        lhs: Left-hand side tensor
+        rhs: Right-hand side tensor
+        bs1: Batch size of left-hand side tensor
+        bs2: Batch size of right-hand side tensor
+        device: Device to place the merged tensor on
+        default: Default value for missing tensor elements
+
+    Returns:
+        Merged tensor or None if both inputs are None
+    """
+    if lhs is None and rhs is None:
+        return None
+
+    if lhs is not None and rhs is not None:
+        return torch.cat([lhs, rhs])
+    else:
+        if lhs is not None:
+            shape, dtype = lhs.shape[1:], lhs.dtype
+        else:
+            shape, dtype = rhs.shape[1:], rhs.dtype
+
+        if lhs is None:
+            lhs = torch.empty((bs1, *shape), device=device, dtype=dtype).fill_(default)
+        if rhs is None:
+            rhs = torch.empty((bs2, *shape), device=device, dtype=dtype).fill_(default)
+        return torch.cat([lhs, rhs])
+
+
+def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
+    import huggingface_hub as hf
+
+    # Build cache path
+    cache_path = os.path.join(
+        hf.constants.HF_HUB_CACHE,
+        hf.constants.REPO_ID_SEPARATOR.join(["models", *repo_id.split("/")]),
+    )
+
+    # Get revision from main ref if not specified
+    if not revision:
+        ref_path = os.path.join(cache_path, "refs", "main")
+        if os.path.isfile(ref_path):
+            with open(ref_path) as f:
+                revision = f.read().strip()
+
+    # List files from revision directory
+    if revision:
+        rev_dir = os.path.join(cache_path, "snapshots", revision)
+        if os.path.isdir(rev_dir):
+            return rev_dir
+
+    return None
+
+
+def read_system_prompt_from_file(model_name: str) -> str:
+    """Read system prompt from a file in the HuggingFace cache directory.
+
+    Args:
+        model_name: The model name to construct the file path
+
+    Returns:
+        The system prompt content from the file, or empty string if file not found
+    """
+    try:
+        local_repo_dir = find_local_repo_dir(model_name)
+        if local_repo_dir:
+            system_prompt_file = os.path.join(local_repo_dir, "SYSTEM_PROMPT.txt")
+            if os.path.exists(system_prompt_file):
+                with open(system_prompt_file, "r", encoding="utf-8") as f:
+                    return f.read()
+
+        return ""
+    except Exception:
+        # If anything fails, return empty string
+        return ""
+
+
+def bind_or_assign(target, source):
+    if target is not None:
+        target.copy_(source)
+        return target
+    else:
+        return source
+
+
+def support_triton(backend: str) -> bool:
+    return backend not in ["torch_native", "intel_amx"]
+
+
+try:
+    import sgl_kernel
+
+    is_intel_amx_backend_available = hasattr(
+        torch.ops.sgl_kernel, "convert_weight_packed"
+    )
+except:
+    is_intel_amx_backend_available = False
+
+
+def cpu_has_amx_support():
+    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
+
+
+class LazyValue:
+    def __init__(self, creator: Callable):
+        self._creator = creator
+        self._value = None
+
+    @property
+    def value(self):
+        if self._creator is not None:
+            self._value = self._creator()
+            self._creator = None
+        return self._value

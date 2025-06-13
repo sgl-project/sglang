@@ -15,21 +15,18 @@ echo "ARCH:  $ARCH"
 if [ ${ARCH} = "aarch64" ]; then
    LIBCUDA_ARCH="sbsa"
    BUILDER_NAME="pytorch/manylinuxaarch64-builder"
+   CMAKE_BUILD_PARALLEL_LEVEL=16
 else
    LIBCUDA_ARCH=${ARCH}
-   if [ ${CUDA_VERSION} = "12.8" ]; then
-      BUILDER_NAME="pytorch/manylinux2_28-builder"
-   else
-      BUILDER_NAME="pytorch/manylinux-builder"
-   fi
+   BUILDER_NAME="pytorch/manylinux2_28-builder"
 fi
 
 if [ ${CUDA_VERSION} = "12.8" ]; then
    DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
-   TORCH_INSTALL="pip install --no-cache-dir --pre torch --index-url https://download.pytorch.org/whl/nightly/cu${CUDA_VERSION//.}"
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.7.1 --index-url https://download.pytorch.org/whl/cu${CUDA_VERSION//.}"
 else
    DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
-   TORCH_INSTALL="pip install --no-cache-dir torch==2.6.0 --index-url https://download.pytorch.org/whl/cu${CUDA_VERSION//.}"
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.7.1"
 fi
 
 docker run --rm \
@@ -44,12 +41,16 @@ docker run --rm \
    tar -xzf cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz
    mv cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH} /opt/cmake
    export PATH=/opt/cmake/bin:\$PATH
+   export LD_LIBRARY_PATH=/lib64:\$LD_LIBRARY_PATH
 
    # Debugging CMake
    echo \"PATH: \$PATH\"
    which cmake
    cmake --version
 
+   yum install numactl-devel -y && \
+   yum install libibverbs -y && \
+   ln -sv /usr/lib64/libibverbs.so.1 /usr/lib64/libibverbs.so && \
    ${PYTHON_ROOT_PATH}/bin/${TORCH_INSTALL} && \
    ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core && \
    export TORCH_CUDA_ARCH_LIST='7.5 8.0 8.9 9.0+PTX' && \

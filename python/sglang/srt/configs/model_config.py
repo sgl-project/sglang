@@ -16,7 +16,7 @@ import json
 import logging
 import math
 import os
-from enum import IntEnum, auto
+from enum import Enum, IntEnum, auto
 from typing import List, Optional, Set, Union
 
 import torch
@@ -39,6 +39,12 @@ class AttentionArch(IntEnum):
     MHA = auto()
 
 
+class ModelImpl(str, Enum):
+    AUTO = "auto"
+    SGLANG = "sglang"
+    TRANSFORMERS = "transformers"
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -53,11 +59,13 @@ class ModelConfig:
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
+        impl: Union[str, ModelImpl] = ModelImpl.AUTO,
     ) -> None:
 
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
+        self.impl = impl
 
         # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
@@ -196,6 +204,22 @@ class ModelConfig:
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
         else:
+            if (
+                "MistralModel" in self.hf_config.architectures
+                or "MixtralForCausalLM" in self.hf_config.architectures
+                or "MistralForCausalLM" in self.hf_config.architectures
+            ):
+                if getattr(self, "head_dim", None) is None:
+                    self.head_dim = (
+                        self.hf_config.hidden_size // self.hf_config.num_attention_heads
+                    )
+                    # In transformers==4.52.3, the head_dim is null in MistralConfig
+                    if (
+                        not hasattr(self.hf_text_config, "head_dim")
+                        or self.hf_text_config.head_dim is None
+                    ):
+                        setattr(self.hf_text_config, "head_dim", self.head_dim)
+
             self.attention_arch = AttentionArch.MHA
 
         self.num_attention_heads = self.hf_text_config.num_attention_heads
@@ -240,6 +264,7 @@ class ModelConfig:
             enable_multimodal=server_args.enable_multimodal,
             dtype=server_args.dtype,
             quantization=server_args.quantization,
+            impl=server_args.impl,
             **kwargs,
         )
 
@@ -552,6 +577,8 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
+    "Phi4MMForCausalLM",
+    "VILAForConditionalGeneration",
 ]
 
 

@@ -18,6 +18,7 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.managers import expert_location_dispatch
 from sglang.srt.managers.expert_distribution import (
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
@@ -65,6 +66,8 @@ def fused_topk(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -86,9 +89,27 @@ def fused_topk(
     )
     del token_expert_indicies
 
+    return _fused_topk_postprocess(
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        renormalize=renormalize,
+        expert_location_dispatch_info=expert_location_dispatch_info,
+        num_token_non_padded=num_token_non_padded,
+    )
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def _fused_topk_postprocess(
+    topk_weights,
+    topk_ids,
+    renormalize,
+    expert_location_dispatch_info,
+    num_token_non_padded,
+):
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-
+    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
 
 
@@ -101,7 +122,7 @@ def grouped_topk(
     renormalize: bool,
     num_expert_group: int = 0,
     topk_group: int = 0,
-    n_share_experts_fusion: int = 0,
+    num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
@@ -126,10 +147,10 @@ def grouped_topk(
     )  # [n, e]
     tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
     topk_weights, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
-    if n_share_experts_fusion:
+    if num_fused_shared_experts:
         topk_ids[:, -1] = torch.randint(
             low=num_experts,
-            high=num_experts + n_share_experts_fusion,
+            high=num_experts + num_fused_shared_experts,
             size=(topk_ids.size(0),),
             dtype=topk_ids.dtype,
             device=topk_ids.device,
@@ -139,7 +160,7 @@ def grouped_topk(
     if renormalize:
         topk_weights_sum = (
             topk_weights.sum(dim=-1, keepdim=True)
-            if n_share_experts_fusion == 0
+            if num_fused_shared_experts == 0
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
         )
         topk_weights = topk_weights / topk_weights_sum
@@ -158,7 +179,7 @@ def biased_grouped_topk_impl(
     renormalize: bool,
     num_expert_group: int = 0,
     topk_group: int = 0,
-    n_share_experts_fusion: int = 0,
+    num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
@@ -190,10 +211,10 @@ def biased_grouped_topk_impl(
     _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
     topk_weights = scores.gather(1, topk_ids)
 
-    if n_share_experts_fusion:
+    if num_fused_shared_experts:
         topk_ids[:, -1] = torch.randint(
             low=num_experts,
-            high=num_experts + n_share_experts_fusion,
+            high=num_experts + num_fused_shared_experts,
             size=(topk_ids.size(0),),
             dtype=topk_ids.dtype,
             device=topk_ids.device,
@@ -203,7 +224,7 @@ def biased_grouped_topk_impl(
     if renormalize:
         topk_weights_sum = (
             topk_weights.sum(dim=-1, keepdim=True)
-            if n_share_experts_fusion == 0
+            if num_fused_shared_experts == 0
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
         )
         topk_weights = topk_weights / topk_weights_sum
@@ -237,7 +258,7 @@ def biased_grouped_topk(
     num_expert_group: int = 0,
     topk_group: int = 0,
     compiled: bool = True,
-    n_share_experts_fusion: int = 0,
+    num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
@@ -245,7 +266,7 @@ def biased_grouped_topk(
     assert (
         routed_scaling_factor is not None
     ), "routed_scaling_factor is required for biased_grouped_topk"
-    # TODO: moe_fused_gate kernel is not supported for n_share_experts_fusion > 0 now.
+    # TODO: moe_fused_gate kernel is not supported for num_fused_shared_experts > 0 now.
     if (
         _is_cuda
         and gating_output.shape[1] // num_expert_group
@@ -258,7 +279,7 @@ def biased_grouped_topk(
             num_expert_group,
             topk_group,
             topk,
-            n_share_experts_fusion,
+            num_fused_shared_experts,
             routed_scaling_factor,
         )
         # TODO merge into kernel for this branch
@@ -286,7 +307,7 @@ def biased_grouped_topk(
             renormalize,
             num_expert_group,
             topk_group,
-            n_share_experts_fusion=n_share_experts_fusion,
+            num_fused_shared_experts=num_fused_shared_experts,
             routed_scaling_factor=routed_scaling_factor,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
@@ -301,6 +322,7 @@ def select_experts(
     renormalize: bool,
     topk_group: Optional[int] = None,
     num_expert_group: Optional[int] = None,
+    num_fused_shared_experts: int = 0,
     custom_routing_function: Optional[Callable] = None,
     correction_bias: Optional[torch.Tensor] = None,
     torch_native: bool = False,
@@ -308,7 +330,14 @@ def select_experts(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
-    n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
+    router_logits, correction_bias = (
+        expert_location_dispatch.transform_select_experts_inputs(
+            router_logits=router_logits,
+            correction_bias=correction_bias,
+            info=expert_location_dispatch_info,
+        )
+    )
+
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     if use_grouped_topk:
         assert topk_group is not None
@@ -321,7 +350,7 @@ def select_experts(
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
-                n_share_experts_fusion=n_share_experts_fusion,
+                num_fused_shared_experts=num_fused_shared_experts,
                 routed_scaling_factor=routed_scaling_factor,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
@@ -335,7 +364,7 @@ def select_experts(
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
-                n_share_experts_fusion=n_share_experts_fusion,
+                num_fused_shared_experts=num_fused_shared_experts,
                 routed_scaling_factor=routed_scaling_factor,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
@@ -352,15 +381,14 @@ def select_experts(
             renormalize=renormalize,
         )
     elif custom_routing_function is None:
-        assert (
-            num_token_non_padded is None
-        ), "num_token_non_padded is not yet supported in fused_topk"
-        assert expert_location_dispatch_info is None
+        # Qwen3MOE uses fused_topk
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=top_k,
             renormalize=renormalize,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
         )
     else:
         assert (

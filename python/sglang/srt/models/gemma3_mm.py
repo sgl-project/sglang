@@ -282,19 +282,33 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
-        if any(item.precomputed_features is not None for item in items):
-            if not all(item.precomputed_features is not None for item in items):
-                raise NotImplementedError(
-                    "MM inputs where only some items are precomputed."
-                )
-            return torch.concat([item.precomputed_features for item in items])
-        pixel_values = torch.stack(
-            flatten_nested_list([item.pixel_values for item in items]), dim=0
-        )
-        pixel_values = pixel_values.to(device=self.vision_tower.device)
-        pixel_values = pixel_values.to(dtype=self.language_model.dtype())
+        # Process images one by one to handle flatten_batch=True constraint in vision_tower
+        all_pixel_values = flatten_nested_list([item.pixel_values for item in items])
+        vision_outputs_list = []
 
-        vision_outputs = self.vision_tower(pixel_values=pixel_values)
+        for pixel_values_batch in all_pixel_values:
+            # Normalize input shape to [batch_size, channels, height, width]
+            if pixel_values_batch.dim() == 5:
+                pixel_values_batch = pixel_values_batch.squeeze(0)
+            elif pixel_values_batch.dim() == 3:
+                pixel_values_batch = pixel_values_batch.unsqueeze(0)
+            elif pixel_values_batch.dim() != 4:
+                raise ValueError(
+                    f"Unexpected pixel_values shape: {pixel_values_batch.shape}"
+                )
+
+            # Process each image in the batch
+            batch_size = pixel_values_batch.shape[0]
+            for i in range(batch_size):
+                pixel_value = pixel_values_batch[i : i + 1]  # Keep batch dimension as 1
+                pixel_value = pixel_value.to(
+                    device=self.vision_tower.device, dtype=self.language_model.dtype()
+                )
+                vision_output = self.vision_tower(pixel_values=pixel_value)
+                vision_outputs_list.append(vision_output)
+
+        # Concatenate all vision outputs
+        vision_outputs = torch.cat(vision_outputs_list, dim=0)
         image_features = self.multi_modal_projector(vision_outputs)
         return image_features
 

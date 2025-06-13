@@ -41,7 +41,7 @@ ENV LANGUAGE en_US:en
 ENV LC_ALL en_US.UTF-8
 
 # Install minimal Python packages
-RUN python3 -m pip install --no-cache-dir \
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
     pytest \
     black \
     isort \
@@ -223,6 +223,9 @@ setopt HIST_IGNORE_ALL_DUPS
 setopt HIST_FIND_NO_DUPS
 setopt INC_APPEND_HISTORY
 EOF
+
+RUN set -euxo ; \
+    curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
