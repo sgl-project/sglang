@@ -1,7 +1,7 @@
 import logging
 from dataclasses import dataclass
 
-from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
+from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
@@ -241,17 +241,15 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        raise Exception("should not visit here")
         topk_idx = topk_idx.to(torch.int64)
-        if _ENABLE_JIT_DEEPGEMM:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(hidden_states, 128)
         previous_event = Buffer.capture() if self.async_finish else None
         return hidden_states, topk_idx, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
-        raise Exception("should not visit here")
-        if _ENABLE_JIT_DEEPGEMM:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             (
                 hidden_states,
                 topk_idx,
@@ -353,7 +351,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128 if _ENABLE_JIT_DEEPGEMM else 1,
+            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
 
@@ -417,8 +415,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        raise Exception("should not visit here")
-        if _ENABLE_JIT_DEEPGEMM:
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             output = hidden_states
         else:
             if hidden_states.shape[0] > 0:
@@ -448,7 +445,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return output, previous_event
 
     def combine_b(self, output, previous_event):
-        raise Exception("should not visit here")
         hidden_states, event = self._combine_core(output, previous_event)
         event.current_stream_wait() if self.async_finish else ()
         self.handle = None
