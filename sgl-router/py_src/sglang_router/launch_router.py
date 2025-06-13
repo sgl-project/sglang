@@ -38,9 +38,11 @@ class RouterArgs:
     cache_threshold: float = 0.5
     balance_abs_threshold: int = 32
     balance_rel_threshold: float = 1.0001
+    input_char_length_threshold: int = 0
     eviction_interval: int = 60
     max_tree_size: int = 2**24
     max_payload_size: int = 4 * 1024 * 1024  # 4MB
+    round_robin_tie_breaking: bool = False
     verbose: bool = False
     log_dir: Optional[str] = None
     # Service discovery configuration
@@ -129,6 +131,12 @@ class RouterArgs:
             help="Load balancing is triggered when (max_load - min_load) > abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache aware",
         )
         parser.add_argument(
+            f"--{prefix}input-char-length-threshold",
+            type=int,
+            default=RouterArgs.input_char_length_threshold,
+            help="Input character length threshold for load balancing",
+        )
+        parser.add_argument(
             f"--{prefix}eviction-interval",
             type=int,
             default=RouterArgs.eviction_interval,
@@ -145,6 +153,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_payload_size,
             help="Maximum payload size in bytes",
+        )
+        parser.add_argument(
+            f"--{prefix}round-robin-tie-breaking",
+            action="store_true",
+            default=RouterArgs.round_robin_tie_breaking,
+            help="Enable tie-breaking in round-robin policy",
         )
         parser.add_argument(
             f"--{prefix}verbose",
@@ -220,9 +234,15 @@ class RouterArgs:
             cache_threshold=getattr(args, f"{prefix}cache_threshold"),
             balance_abs_threshold=getattr(args, f"{prefix}balance_abs_threshold"),
             balance_rel_threshold=getattr(args, f"{prefix}balance_rel_threshold"),
+            input_char_length_threshold=getattr(
+                args, f"{prefix}input_char_length_threshold"
+            ),
             eviction_interval=getattr(args, f"{prefix}eviction_interval"),
             max_tree_size=getattr(args, f"{prefix}max_tree_size"),
             max_payload_size=getattr(args, f"{prefix}max_payload_size"),
+            round_robin_tie_breaking=getattr(
+                args, f"{prefix}round_robin_tie_breaking", False
+            ),
             verbose=getattr(args, f"{prefix}verbose", False),
             log_dir=getattr(args, f"{prefix}log_dir", None),
             service_discovery=getattr(args, f"{prefix}service_discovery", False),
@@ -287,9 +307,11 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             cache_threshold=router_args.cache_threshold,
             balance_abs_threshold=router_args.balance_abs_threshold,
             balance_rel_threshold=router_args.balance_rel_threshold,
+            input_char_length_threshold=router_args.input_char_length_threshold,
             eviction_interval_secs=router_args.eviction_interval,
             max_tree_size=router_args.max_tree_size,
             max_payload_size=router_args.max_payload_size,
+            round_robin_tie_breaking=router_args.round_robin_tie_breaking,
             verbose=router_args.verbose,
             log_dir=router_args.log_dir,
             service_discovery=router_args.service_discovery,
