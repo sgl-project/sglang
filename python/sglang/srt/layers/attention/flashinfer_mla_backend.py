@@ -33,7 +33,7 @@ from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import is_flashinfer_available, pkg_version_not_less_than
+from sglang.srt.utils import is_flashinfer_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -110,9 +110,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             self.q_indptr_decode = q_indptr_decode_buf
 
         fmha_backend = "auto"
-        if is_sm100_supported() and pkg_version_not_less_than(
-            "flashinfer_python", "0.2.6"
-        ):
+        if is_sm100_supported():
             fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
