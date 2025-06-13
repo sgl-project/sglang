@@ -1,9 +1,10 @@
-import os
-from curses import flash
 from typing import Callable, List, Optional, Tuple
 
+import einops
 import torch
 
+from sglang.math_utils import align
+from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.utils import is_sm100_supported
 
@@ -14,7 +15,6 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
 
-from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
@@ -137,7 +137,7 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
-    elif _ENABLE_JIT_DEEPGEMM:
+    elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
     else:
         return triton_w8a8_block_fp8_linear
