@@ -53,6 +53,7 @@ from sglang.srt.layers.quantization.deep_gemm import (
 )
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_distribution import (
@@ -315,7 +316,8 @@ class ModelRunner:
                 1.2 In other cases, we will use flashinfer if available, otherwise use triton.
             2. Models with MLA Architecture and using FA3
                 2.1 We will use FA3 backend on hopper.
-                2.2 Otherwise, we will use triton backend.
+                2.2 We will use Flashinfer backend on blackwell.
+                2.3 Otherwise, we will use triton backend.
             """
 
             if not self.use_mla_backend:
@@ -336,6 +338,8 @@ class ModelRunner:
                 # MLA architecture
                 if is_hopper_with_cuda_12_3():
                     server_args.attention_backend = "fa3"
+                elif is_sm100_supported():
+                    server_args.attention_backend = "flashinfer"
                 elif _is_hip:
                     head_num = self.model_config.get_num_kv_heads(self.tp_size)
                     # TODO current aiter only support head number 16 or 128 head number
@@ -913,12 +917,26 @@ class ModelRunner:
             )
 
         if self.req_to_token_pool is None:
-            self.req_to_token_pool = ReqToTokenPool(
-                size=max_num_reqs,
-                max_context_len=self.model_config.context_len + 4,
-                device=self.device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-            )
+            if self.server_args.disaggregation_mode == "decode":
+                from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+
+                # subscribe memory for pre-allocated requests
+                # if max_num_reqs <= 32, we pre-allocate 2x requests
+                pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
+                self.req_to_token_pool = DecodeReqToTokenPool(
+                    size=max_num_reqs,
+                    max_context_len=self.model_config.context_len + 4,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    pre_alloc_size=pre_alloc_size,
+                )
+            else:
+                self.req_to_token_pool = ReqToTokenPool(
+                    size=max_num_reqs,
+                    max_context_len=self.model_config.context_len + 4,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker

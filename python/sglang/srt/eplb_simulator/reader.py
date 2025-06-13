@@ -1,14 +1,16 @@
-import torch
 from collections import defaultdict
 from pathlib import Path
 
+import torch
 from tqdm import tqdm
 
-from sglang.srt.managers.expert_distribution import _convert_global_physical_count_to_logical_count
-from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
+from sglang.srt.managers.expert_distribution import (
+    _convert_global_physical_count_to_logical_count,
+)
 
-_ = ModelConfigForExpertLocation
-convert_global_physical_count_to_logical_count = _convert_global_physical_count_to_logical_count
+convert_global_physical_count_to_logical_count = (
+    _convert_global_physical_count_to_logical_count
+)
 
 
 def read_mode_per_pass(dir_data: Path):
@@ -22,15 +24,21 @@ def read_mode_per_pass(dir_data: Path):
         for record in data_pack["records"]:
             forward_pass_id = record["forward_pass_id"]
             rank = record["rank"]
-            assert gpc_of_forward_pass_and_rank[forward_pass_id].get(rank) is None, f"Duplicated {forward_pass_id=} {rank=}"
-            gpc_of_forward_pass_and_rank[forward_pass_id][rank] = record["global_physical_count"]
+            assert (
+                gpc_of_forward_pass_and_rank[forward_pass_id].get(rank) is None
+            ), f"Duplicated {forward_pass_id=} {rank=}"
+            gpc_of_forward_pass_and_rank[forward_pass_id][rank] = record[
+                "global_physical_count"
+            ]
 
     forward_pass_ids = sorted(gpc_of_forward_pass_and_rank.keys())
     print(f"Make {forward_pass_ids=} into array")
 
     items = []
     for forward_pass_id, gpc_of_rank in sorted(gpc_of_forward_pass_and_rank.items()):
-        gpc_of_rank_tensor = torch.stack([gpc for rank, gpc in sorted(gpc_of_rank.items())]).sum(dim=0)
+        gpc_of_rank_tensor = torch.stack(
+            [gpc for rank, gpc in sorted(gpc_of_rank.items())]
+        ).sum(dim=0)
         items.append(gpc_of_rank_tensor)
 
     gpc_of_forward_pass = torch.stack(items)
