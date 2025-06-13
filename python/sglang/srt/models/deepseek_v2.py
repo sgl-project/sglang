@@ -274,6 +274,9 @@ class DeepseekV2MoE(nn.Module):
             ),
         )
 
+        if global_server_args_dict["enable_pplx_moe"]:
+            self.experts.max_tokens_across_dp = global_server_args_dict["max_tokens_across_dp"]
+
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
@@ -286,7 +289,7 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if global_server_args_dict["enable_deepep_moe"]
+                    if global_server_args_dict["enable_deepep_moe"] or global_server_args_dict["enable_pplx_moe"]
                     else {}
                 ),
             )
@@ -334,10 +337,26 @@ class DeepseekV2MoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
     ) -> torch.Tensor:
-        if not self._enable_deepep_moe:
-            return self.forward_normal(hidden_states)
-        else:
+        if global_server_args_dict["enable_deepep_moe"]:
             return self.forward_deepep(hidden_states, forward_batch)
+        elif global_server_args_dict["enable_pplx_moe"]:
+            return self.forward_pplx(hidden_states, forward_batch)
+        else:
+            return self.forward_normal(hidden_states)
+
+    def forward_pplx(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+        shared_output = None
+        router_logits = None
+        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
+            router_logits = self.gate(hidden_states)
+            shared_output = self._forward_shared_experts(hidden_states)
+        final_hidden_states = (
+            self.experts(hidden_states, router_logits)
+            * self.routed_scaling_factor
+        )
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
+        return final_hidden_states
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
         shared_output = self._forward_shared_experts(hidden_states)
@@ -1728,7 +1747,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
             elif (
                 global_server_args_dict["enable_deepep_moe"]
-                or global_server_args_dict["enable_ep_moe"]
+                or global_server_args_dict["enable_ep_moe"] or global_server_args_dict["enable_pplx_moe"]
             ):
                 self.num_fused_shared_experts = 0
                 global_server_args_dict["disable_shared_experts_fusion"] = True
@@ -1745,7 +1764,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 and (
                     not (
                         global_server_args_dict["enable_deepep_moe"]
-                        or global_server_args_dict["enable_ep_moe"]
+                        or global_server_args_dict["enable_ep_moe"] or global_server_args_dict["enable_pplx_moe"]
                     )
                 )
             ):

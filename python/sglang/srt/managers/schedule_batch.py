@@ -99,6 +99,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "torchao_config",
     "triton_attention_reduce_in_fp32",
     "num_reserved_decode_tokens",
+    "max_tokens_across_dp",
+    "enable_pplx_moe",
 ]
 
 # Put some global args for easy access

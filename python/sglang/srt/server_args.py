@@ -152,6 +152,7 @@ class ServerArgs:
     ep_size: int = 1
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
+    enable_pplx_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -230,6 +231,7 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
+    max_tokens_across_dp: int = 2048
 
     def __post_init__(self):
         # Expert parallelism
@@ -740,6 +742,12 @@ class ServerArgs:
             help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         )
         parser.add_argument(
+            "--max-tokens-across-dp",
+            type=int,
+            default=ServerArgs.max_tokens_across_dp,
+            help="The maximum number of tokens accross dp group. default value is 2048"
+        )
+        parser.add_argument(
             "--max-prefill-tokens",
             type=int,
             default=ServerArgs.max_prefill_tokens,
@@ -1138,6 +1146,11 @@ class ServerArgs:
             "--enable-deepep-moe",
             action="store_true",
             help="Enabling DeepEP MoE implementation for EP MoE.",
+        )
+        parser.add_argument(
+            "--enable-pplx-moe",
+            action="store_true",
+            help="Enabling PPlx MoE implementation for EP MoE."
         )
         parser.add_argument(
             "--deepep-mode",
