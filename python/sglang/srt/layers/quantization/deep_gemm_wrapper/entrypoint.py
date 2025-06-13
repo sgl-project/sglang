@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 import torch
 from typing import Tuple
 
@@ -49,6 +51,20 @@ def gemm_nt_f8f8bf16(
 ):
     TODO
 
+
 # TODO improve?
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     TODO
+
+
+@contextmanager
+def configure_deep_gemm_num_sms(num_sms):
+    if num_sms is None:
+        yield
+    else:
+        original_num_sms = deep_gemm.get_num_sms()
+        deep_gemm.set_num_sms(num_sms)
+        try:
+            yield
+        finally:
+            deep_gemm.set_num_sms(original_num_sms)
