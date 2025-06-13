@@ -1976,10 +1976,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                         experts.w2_weight_fp8,
                     ]:
                         _requant_grouped_moe_weight_inplace(self, w[0], w[1])
-                else:
-                    print(
-                        "hack_requant_moe_weight_at_post_load_weights skip handling experts since not DeepEPMoE"
-                    )
             else:
                 mlp = layer.mlp
                 assert isinstance(mlp, DeepseekV2MLP)
