@@ -25,8 +25,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
-
-from sglang.srt.layers.quantization import deep_gemm_wrapper
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -56,6 +54,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,

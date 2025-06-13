@@ -479,7 +479,9 @@ def _model_forward_tbo(
     )
     del inputs
 
-    with deep_gemm_wrapper.configure_deep_gemm_num_sms(operations_strategy.deep_gemm_num_sms):
+    with deep_gemm_wrapper.configure_deep_gemm_num_sms(
+        operations_strategy.deep_gemm_num_sms
+    ):
         outputs_arr = execute_overlapped_operations(
             inputs_arr=inputs_arr,
             operations_arr=[operations_strategy.operations] * 2,

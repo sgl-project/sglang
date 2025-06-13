@@ -3,17 +3,8 @@ from typing import Callable, List, Optional, Tuple
 
 import einops
 import torch
-from torch.nn import Module
-
-from sglang.srt.layers.quantization import deep_gemm_wrapper
-from sglang.srt.managers.expert_location import get_global_expert_location_metadata
-from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.managers.schedule_batch import global_server_args_dict
-
 from sgl_kernel import silu_and_mul
-from sglang.srt.layers.quantization.fp8_kernel import (
-    sglang_per_token_group_quant_fp8,
-)
+from torch.nn import Module
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
@@ -35,6 +26,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE, FusedMoEMethodBase
 from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -42,8 +34,12 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
+    sglang_per_token_group_quant_fp8,
     sglang_per_token_quant_fp8,
 )
+from sglang.srt.managers.expert_location import get_global_expert_location_metadata
+from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import (
     DeepEPMode,
@@ -919,7 +915,9 @@ class DeepEPMoE(EPMoE):
         )
         self.deepep_mode = deepep_mode
         if self.deepep_mode.enable_low_latency():
-            assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM, f"DeepEP {self.deepep_mode} mode requires deep_gemm"
+            assert (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
         self.w13_weight_fp8 = (
             self.w13_weight,
             (

@@ -1,7 +1,7 @@
 from contextlib import contextmanager
+from typing import Tuple
 
 import torch
-from typing import Tuple
 
 from sglang.srt.server_args import ServerArgs
 

@@ -46,7 +46,10 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base_layer, deep_gemm_wrapper
+from sglang.srt.layers.quantization import (
+    deep_gemm_wrapper,
+    monkey_patch_isinstance_for_vllm_base_layer,
+)
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils import is_sm100_supported

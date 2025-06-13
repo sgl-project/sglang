@@ -396,5 +396,3 @@ def _log_jit_build(M: int, N: int, K: int, kernel_type: DeepGemmKernelType):
     RuntimeCache.get = __patched_func
     yield
     RuntimeCache.get = origin_func
-
-
