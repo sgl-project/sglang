@@ -13,34 +13,25 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var, get_device_sm, get_int_env_var, is_cuda
 
 logger = logging.getLogger(__name__)
-# _ENABLE_JIT_DEEPGEMM = False
-#
-# try:
-#     import deep_gemm
-#     from deep_gemm import get_num_sms
-#     from deep_gemm.jit import build
-#     from deep_gemm.jit.compiler import get_nvcc_compiler
-#     from deep_gemm.jit_kernels.gemm import get_best_configs
-#     from deep_gemm.jit_kernels.runtime import FP8GemmRuntime, GemmType
-#
-#     sm_version = get_device_sm()
-#     if sm_version == 90:
-#         if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
-#             _ENABLE_JIT_DEEPGEMM = True
-# except ImportError:
-#     logger.warning("Failed to import deepgemm, disable _ENABLE_JIT_DEEPGEMM.")
 
+_ENABLE_JIT_DEEPGEMM = False
 
 try:
-    from deep_gemm import fp8_gemm_nt as deep_gemm_fp8_gemm_nt
+    import deep_gemm
+    # TODO useful for warmup etc
+    # from deep_gemm import get_num_sms
+    # from deep_gemm.jit import build
+    # from deep_gemm.jit.compiler import get_nvcc_compiler
+    # from deep_gemm.jit_kernels.gemm import get_best_configs
+    # from deep_gemm.jit_kernels.runtime import FP8GemmRuntime, GemmType
 
-    print("hi deep_gemm.py use deep_gemm new version")
+    sm_version = get_device_sm()
+    if sm_version == 90:
+        if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
+            _ENABLE_JIT_DEEPGEMM = True
 except ImportError:
-    from deep_gemm import gemm_fp8_fp8_bf16_nt as deep_gemm_fp8_gemm_nt
+    logger.warning("Failed to import deepgemm, disable _ENABLE_JIT_DEEPGEMM.")
 
-    print("hi deep_gemm.py use deep_gemm old version")
-
-_ENABLE_JIT_DEEPGEMM = True
 
 
 
