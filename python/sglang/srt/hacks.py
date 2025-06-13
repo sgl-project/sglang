@@ -8,7 +8,7 @@ from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 
 
-def requant_weight_ue8m0_inplace(that, weight, weight_scale_inv, weight_block_size):
+def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
     assert isinstance(weight, torch.nn.Parameter)
     assert isinstance(weight_scale_inv, torch.nn.Parameter)
     weight.data, weight_scale_inv.data = _requant_weight_ue8m0(
