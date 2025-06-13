@@ -90,6 +90,7 @@ class DeepseekModelNextN(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
+
         if hidden_states.shape[0] > 0:
             hidden_states = self.eh_proj(
                 torch.cat(
@@ -108,7 +109,6 @@ class DeepseekModelNextN(nn.Module):
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-
         return hidden_states
 
 

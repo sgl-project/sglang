@@ -265,12 +265,7 @@ def dp_gather_partial(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
 ):
-    _dp_gather(
-        global_tokens,
-        local_tokens,
-        forward_batch,
-        is_partial=True,
-    )
+    _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=True)
 
 
 def dp_gather_replicate(

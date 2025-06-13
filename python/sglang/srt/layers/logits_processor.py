@@ -482,6 +482,7 @@ class LogitsProcessor(nn.Module):
 
         if self.final_logit_softcapping:
             fused_softcap(logits, self.final_logit_softcapping)
+
         return logits
 
     @staticmethod

@@ -853,7 +853,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     can_run_dp_cuda_graph: bool = False
-    global_is_extend_in_batch: bool = False
+    is_extend_in_batch: bool = False
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
 
@@ -940,16 +940,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_empty(self):
         return len(self.reqs) == 0
-
-    def is_extend_dp_batch(self):
-        return self.global_is_extend_in_batch
-
-    def is_decode_dp_batch(self):
-        return (
-            not self.global_is_extend_in_batch
-            and self.global_num_tokens is not None
-            and sum(self.global_num_tokens) > 0
-        )
 
     def alloc_req_slots(self, num_reqs: int):
         req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
@@ -1769,7 +1759,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
-            global_is_extend_in_batch=self.global_is_extend_in_batch,
+            is_extend_in_batch=self.is_extend_in_batch,
         )
 
     def __str__(self):
