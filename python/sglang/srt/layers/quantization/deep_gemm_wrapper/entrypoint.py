@@ -2,6 +2,22 @@ import torch
 from typing import Tuple
 
 
+# TODO from layer.py
+# try:
+#     from deep_gemm import fp8_m_grouped_gemm_nt_masked, m_grouped_fp8_gemm_nt_contiguous
+#
+#     print("hi layer.py use deep_gemm new version")
+# except ImportError:
+#     from deep_gemm import (
+#         m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
+#         m_grouped_gemm_fp8_fp8_bf16_nt_masked,
+#     )
+#
+#     m_grouped_fp8_gemm_nt_contiguous = m_grouped_gemm_fp8_fp8_bf16_nt_contiguous
+#     fp8_m_grouped_gemm_nt_masked = m_grouped_gemm_fp8_fp8_bf16_nt_masked
+#     print("hi layer.py use deep_gemm old version")
+
+
 def grouped_gemm_nt_f8f8bf16_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],

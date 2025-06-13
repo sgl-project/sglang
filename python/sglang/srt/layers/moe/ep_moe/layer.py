@@ -10,30 +10,12 @@ from sglang.srt.managers.expert_location import get_global_expert_location_metad
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 
-try:
-    from deep_gemm import fp8_m_grouped_gemm_nt_masked, m_grouped_fp8_gemm_nt_contiguous
+from sgl_kernel import silu_and_mul
+from sglang.srt.layers.quantization.fp8_kernel import (
+    sglang_per_token_group_quant_fp8,
+)
 
-    print("hi layer.py use deep_gemm new version")
-except ImportError:
-    from deep_gemm import (
-        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
-        m_grouped_gemm_fp8_fp8_bf16_nt_masked,
-    )
-
-    m_grouped_fp8_gemm_nt_contiguous = m_grouped_gemm_fp8_fp8_bf16_nt_contiguous
-    fp8_m_grouped_gemm_nt_masked = m_grouped_gemm_fp8_fp8_bf16_nt_masked
-    print("hi layer.py use deep_gemm old version")
-
-try:
-    from sgl_kernel import silu_and_mul
-
-    from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
-    )
-
-    use_deep_gemm = True
-except ImportError:
-    use_deep_gemm = False
+use_deep_gemm = TODO
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
