@@ -8,7 +8,12 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import BatchEmbeddingOut, BatchTokenIDOut
-from sglang.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_LENGTH,
+    BaseFinishReason,
+    Req,
+    ScheduleBatch,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -528,15 +533,41 @@ class SchedulerOutputProcessorMixin:
                         and not self.model_config.is_multimodal_gen
                     )
 
+                    # Skip streaming remaining tokens when sampling_params.max_new_tokens <= 1 when disaggregation is activated
+                    if (
+                        self.disaggregation_mode == DisaggregationMode.DECODE
+                        and len(req.output_ids) > req.sampling_params.max_new_tokens
+                    ):
+                        should_output = False
+
             if should_output:
                 send_token_offset = req.send_token_offset
                 send_output_token_logprobs_offset = (
                     req.send_output_token_logprobs_offset
                 )
                 rids.append(req.rid)
-                finished_reasons.append(
-                    req.finished_reason.to_json() if req.finished_reason else None
-                )
+
+                # Respect sampling_params.max_new_tokens and early finish when disaggregation is activated
+                if (
+                    req.sampling_params.max_new_tokens <= 1
+                    and self.disaggregation_mode == DisaggregationMode.DECODE
+                    and len(req.output_ids) >= req.sampling_params.max_new_tokens
+                ):
+                    # Manually set the finished reason to FINISH_LENGTH
+                    finished_reason = FINISH_LENGTH(
+                        length=req.sampling_params.max_new_tokens
+                    ).to_json()
+                    finished_reasons.append(finished_reason)
+                    # Truncate the output ids to the max new tokens when req.stream is False
+                    req.output_ids = (
+                        req.output_ids[: req.sampling_params.max_new_tokens]
+                        if len(req.output_ids) > req.sampling_params.max_new_tokens
+                        else req.output_ids
+                    )
+                else:
+                    finished_reasons.append(
+                        req.finished_reason.to_json() if req.finished_reason else None
+                    )
                 decoded_texts.append(req.decoded_text)
                 decode_ids, read_offset = req.init_incremental_detokenize()
 

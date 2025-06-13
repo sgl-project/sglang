@@ -1162,6 +1162,12 @@ class TokenizerManager:
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
+                # Skip the error report caused by early finish when disaggregation is activated
+                if self.disaggregation_mode == DisaggregationMode.DECODE:
+                    finish_reason = recv_obj.finished_reasons[i]
+                    if "type" in finish_reason and finish_reason["type"] == "length":
+                        continue
+
                 logger.error(
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
