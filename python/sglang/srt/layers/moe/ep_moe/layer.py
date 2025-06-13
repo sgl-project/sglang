@@ -15,8 +15,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
 
-use_deep_gemm = TODO
-
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -921,6 +919,7 @@ class DeepEPMoE(EPMoE):
         )
         self.deepep_mode = deepep_mode
         if self.deepep_mode.enable_low_latency():
+            TODO_use_deep_gemm
             assert use_deep_gemm, f"DeepEP {self.deepep_mode} mode requires deep_gemm"
         self.w13_weight_fp8 = (
             self.w13_weight,
