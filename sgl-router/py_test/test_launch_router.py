@@ -38,6 +38,7 @@ class TestLaunchRouter(unittest.TestCase):
             max_payload_size=4 * 1024 * 1024,  # 4MB
             verbose=False,
             log_dir=None,
+            log_level=None,
             service_discovery=False,
             selector=None,
             service_discovery_port=80,
