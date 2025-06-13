@@ -40,6 +40,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
     out: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
+    recipe=None,
 ):
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
@@ -48,7 +49,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
-        _grouped_gemm_nt_f8f8bf16_masked_raw(lhs, rhs, out, masked_m, expected_m)
+        _grouped_gemm_nt_f8f8bf16_masked_raw(lhs, rhs, out, masked_m, expected_m, recipe=recipe)
 
 
 def grouped_gemm_nt_f8f8bf16_contig(
@@ -80,7 +81,6 @@ def gemm_nt_f8f8bf16(
             lhs,
             rhs,
             out,
-            recipe=TODO_handle_recipe,
         )
 
 
