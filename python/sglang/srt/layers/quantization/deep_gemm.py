@@ -122,6 +122,7 @@ class DeepGemmKernelHelper:
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
 
 
+# TODO improve naming
 def _compile_warning_1():
     if not _IN_PRECOMPILE_STAGE and _IS_FIRST_RANK_ON_NODE:
         logger.warning(
@@ -135,6 +136,7 @@ def _compile_warning_1():
         )
 
 
+# TODO improve naming
 def _compile_warning_2():
     logger.warning(
         "Entering DeepGEMM JIT Single Kernel Compile session. "
