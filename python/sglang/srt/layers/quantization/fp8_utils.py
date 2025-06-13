@@ -239,12 +239,22 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         column_major_scales=True,
         scale_tma_aligned=True,
     )
+
+    if get_bool_env_var("SGLANG_W8A8_DEEPGEMM_SANITY_CHECK_UE8M0"):
+        _check_ue8m0("x_scale", x_scale)
+        _check_ue8m0("weight_scale", weight_scale)
+
     output = w8a8_block_fp8_matmul_deepgemm(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
     )
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
+
+
+def _check_ue8m0(name, x):
+    x_ceil = ceil_to_ue8m0(x)
+    assert torch.all(x == x_ceil), f"{name=} {x=} {x_ceil=}"
 
 
 def aiter_w8a8_block_fp8_linear(
@@ -390,6 +400,11 @@ def block_quant_dequant(
             x_dq_block_tile[:, :] = x_q_block_tile.to(torch.float32) * x_s[j][i]
 
     return x_dq_block
+
+
+# COPIED FROM DeepGEMM
+def ceil_to_ue8m0(x: torch.Tensor):
+    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 
 
 def channel_quant_to_tensor_quant(
