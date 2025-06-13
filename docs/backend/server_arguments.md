@@ -54,59 +54,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 ## Model, processor and tokenizer
 
 | Arguments | Description | Defaults |
-|----------|-------------|---------|
-| `model_path` | The path of the model weights. This can be a local folder or a Hugging Face repo ID. | None |
-| `tokenizer_path` | The path of the tokenizer. Defaults to the `model_path`. | None |
-| `tokenizer_mode` | See [different mode](https://huggingface.co/docs/transformers/en/main_classes/tokenizer). | `auto` |
-| `load_format` | The format of the model weights to load.  | `auto` |
-| `trust_remote_code` | Whether or not to allow for custom models defined on the Hub in their own modeling files. | `False` |
-| `dtype` | Dtype used for the model. | `auto` |
-| `kv_cache_dtype` | Dtype of the kv cache. | `auto` |
-| `context_length` | The model's maximum context length. Defaults to None (will use the value from the model's config.json instead). Note that extending the default might lead to strange behavior. | None |
-| `device` | The device we put the model. | None |
-| `impl` | The implementation of the model to use. Defaults to SGlang implementation and fall back to transformers if needed | `auto` |
-| `served_model_name` | Override the model name returned by the v1/models endpoint in OpenAI API server.| None |
-| `is_embedding` | Set to `true` to perform [embedding](./openai_api_embeddings.ipynb) / [encode](https://docs.sglang.ai/backend/native_api#Encode-(embedding-model)) and [reward](https://docs.sglang.ai/backend/native_api#Classify-(reward-model)) tasks. | `False` |
-| `revision` | Adjust if a specific version of the model should be used. | None |
-| `skip_tokenizer_init` | Set to `true` to provide the tokens to the engine and get the output tokens directly, typically used in RLHF. See [example](https://github.com/sgl-project/sglang/blob/main/examples/runtime/token_in_token_out/). | `False` |
-| `json_model_override_args` | A dictionary in JSON string format used to override default model configurations. | `"{}"` |
-| `disable_fast_image_processor` | Adopt base image processor instead of fast image processor (which is by default). See [details](https://huggingface.co/docs/transformers/main/en/main_classes/image_processor#image-processor). | `False` |
-
-## Serving: HTTP & API
-
-### HTTP Server configuration
-
-| Arguments | Description | Defaults |
-|----------|-------------|---------|
-| `host` | Host for the HTTP server. | `"127.0.0.1"` |
-| `port` | Port for the HTTP server. | `30000` |
-
-### API configuration
-
-| Arguments | Description | Defaults |
-|-----------|-------------|---------|
-| `api_key` | Sets an API key for the server and the OpenAI-compatible API. | None |
-| `file_storage_path` | Directory for storing uploaded or generated files from API calls. | `"sglang_storage"` |
-| `enable_cache_report` | If set, includes detailed usage of cached tokens in the response usage. | `False` |
-
-## Parallelism
-
-### Tensor parallelism
-
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `tp_size` | The number of GPUs the model weights get sharded over. Mainly for saving memory rather than for high throughput, see [this tutorial: How Tensor Parallel works?](https://pytorch.org/tutorials/intermediate/TP_tutorial.html#how-tensor-parallel-works). | `1` |
-
-### Data parallelism
-
-| Arguments | Description | Defaults |
-|-----------|-------------|---------|
-| `dp_size` | For non-DeepSeek models, this is the the number of data-parallel copies of the model. For DeepSeek models, this is the group size of [data parallel attention](https://docs.sglang.ai/references/deepseek.html#data-parallelism-attention) on DeepSeek models. | `1` |
-| `load_balance_method` | Will be deprecated. Load balancing strategy for data parallel requests. | `"round_robin"` |
-
-### Expert parallelism
-
-| Arguments | Description | Defaults |
 |-----------|-------------|----------|
 | `--model-path` | The path of the model weights. This can be a local folder or a Hugging Face repo ID. | None |
 | `--tokenizer-path` | The path of the tokenizer. | None |
