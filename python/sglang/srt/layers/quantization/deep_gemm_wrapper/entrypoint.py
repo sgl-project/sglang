@@ -38,7 +38,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
     _, n, _ = rhs[0].shape
     kernel_type = DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
 
-    with _with_deep_gemm_execution(expected_m, n, k, num_groups, kernel_type):
+    with _deep_gemm_execution_hook(expected_m, n, k, num_groups, kernel_type):
         _grouped_gemm_nt_f8f8bf16_masked_raw(
             lhs, rhs, out, masked_m, expected_m
         )
@@ -54,7 +54,7 @@ def grouped_gemm_nt_f8f8bf16_contig(
     num_groups, n, _ = rhs[0].shape
     kernel_type = DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG
 
-    with _with_deep_gemm_execution(m, n, k, num_groups, kernel_type):
+    with _deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         _grouped_gemm_nt_f8f8bf16_contig_raw(lhs, rhs, out, m_indices)
 
 
@@ -68,7 +68,7 @@ def gemm_nt_f8f8bf16(
     num_groups = 1
     kernel_type = DeepGemmKernelType.GEMM_NT_F8F8BF16
 
-    with _with_deep_gemm_execution(m, n, k, num_groups, kernel_type):
+    with _deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         _gemm_nt_f8f8bf16_raw(
             lhs,
             rhs,
@@ -78,7 +78,7 @@ def gemm_nt_f8f8bf16(
 
 
 @contextmanager
-def _with_deep_gemm_execution(m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType):
+def _deep_gemm_execution_hook(m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType):
     _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
     with _log_jit_build(m, n, k, kernel_type):
         yield
