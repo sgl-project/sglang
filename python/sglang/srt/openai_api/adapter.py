@@ -1088,7 +1088,7 @@ def v1_chat_generate_request(
     
                     if (
                         "tool_calls" in processed_msg
-                        and type(processed_msg["tool_calls"]) is list
+                        and isinstance(processed_msg.get("tool_calls"), list)
                     ):
                         for call in processed_msg["tool_calls"]:
                             try:
