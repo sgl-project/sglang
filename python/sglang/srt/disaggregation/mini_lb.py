@@ -316,14 +316,16 @@ async def handle_chat_completion_request(request_data: dict):
 async def handle_completion_request(request_data: dict):
     return await _forward_to_backend(request_data, "v1/completions")
 
+
 _next_bootstrap_room = 0
+
 
 def _generate_bootstrap_room():
     if get_bool_env_var("SGLANG_HACK_SEQ_BOOTSTRAP_ROOM"):
         global _next_bootstrap_room
         ans = _next_bootstrap_room
         _next_bootstrap_room += 1
-        print(f'hi _generate_bootstrap_room hack SGLANG_HACK_SEQ_BOOTSTRAP_ROOM {ans=}')
+        print(f"hi _generate_bootstrap_room hack SGLANG_HACK_SEQ_BOOTSTRAP_ROOM {ans=}")
         return ans
 
     return random.randint(0, 2**63 - 1)

@@ -257,7 +257,6 @@ def silu_and_mul_triton_kernel(
             tl.store(down_input_ptr + offset, silu_mul_output, mask=mask)
 
 
-
 # copy from https://github.com/ModelTC/lightllm/blob/a000ab69098654df4731f5b12587dd4e7f0a4f41/lightllm/common/fused_moe/moe_silu_and_mul_mix_quant_ep.py
 @triton.jit
 def _silu_and_mul_post_quant_kernel(
