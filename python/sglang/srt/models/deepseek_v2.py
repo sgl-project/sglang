@@ -66,6 +66,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
     normalize_e4m3fn_to_e4m3fnuz,
+    requant_weight_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
@@ -1934,6 +1935,61 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
+
+        if False:  # TODO (pr-chain)
+            self._weight_requant_ue8m0()
+
+    def _weight_requant_ue8m0(self):
+        weight_block_size = self.quant_config.weight_block_size
+
+        moe_layers = list(
+            range(
+                self.config.first_k_dense_replace,
+                self.config.num_hidden_layers,
+                self.config.moe_layer_freq,
+            )
+        )
+
+        for layer_id in range(self.config.num_hidden_layers):
+            layer = self.model.layers[layer_id]
+
+            for module in [
+                layer.self_attn.fused_qkv_a_proj_with_mqa,
+                layer.self_attn.q_b_proj,
+                layer.self_attn.kv_b_proj,
+                layer.self_attn.o_proj,
+            ]:
+                requant_weight_ue8m0_inplace(
+                    module.weight, module.weight_scale_inv, weight_block_size
+                )
+
+            if layer_id in moe_layers:
+                shared_experts = layer.mlp.shared_experts
+                for module in [
+                    shared_experts.gate_up_proj,
+                    shared_experts.down_proj,
+                ]:
+                    requant_weight_ue8m0_inplace(
+                        module.weight, module.weight_scale_inv, weight_block_size
+                    )
+
+                experts = layer.mlp.experts
+                if isinstance(experts, DeepEPMoE):
+                    for w in [
+                        experts.w13_weight_fp8,
+                        experts.w2_weight_fp8,
+                    ]:
+                        requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
+            else:
+                mlp = layer.mlp
+                assert isinstance(mlp, DeepseekV2MLP)
+                for module in [
+                    mlp.gate_up_proj,
+                    mlp.down_proj,
+                ]:
+                    requant_weight_ue8m0_inplace(
+                        module.weight, module.weight_scale_inv, weight_block_size
+                    )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 
