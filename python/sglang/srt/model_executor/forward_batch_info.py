@@ -29,9 +29,9 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
-import dataclasses
 from dataclasses import dataclass
 from enum import IntEnum, auto
+from functools import total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -118,12 +118,14 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
 
+@total_ordering
 class CaptureHiddenMode(IntEnum):
-    NULL = auto()
-    # Capture hidden states of all tokens.
-    FULL = auto()
+    # Do not capture anything.
+    NULL = 0
     # Capture a hidden state of the last token.
-    LAST = auto()
+    LAST = 1
+    # Capture hidden states of all tokens.
+    FULL = 2
 
     def need_capture(self):
         return self != CaptureHiddenMode.NULL
@@ -133,6 +135,9 @@ class CaptureHiddenMode(IntEnum):
 
     def is_last(self):
         return self == CaptureHiddenMode.LAST
+
+    def __lt__(self, other):
+        return self.value < other.value
 
 
 @dataclass
@@ -254,6 +259,7 @@ class ForwardBatch:
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
+    # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List["ForwardBatch"]] = None
@@ -266,12 +272,6 @@ class ForwardBatch:
     ):
         from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
 
-        device = model_runner.device
-        extend_input_logprob_token_ids_gpu = None
-        if batch.extend_input_logprob_token_ids is not None:
-            extend_input_logprob_token_ids_gpu = (
-                batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
-            )
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -285,6 +285,7 @@ class ForwardBatch:
             encoder_lens_cpu=batch.encoder_lens_cpu,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
+            seq_lens_cpu=batch.seq_lens_cpu,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
@@ -299,12 +300,19 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
-            extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
-            num_token_non_padded=torch.tensor(
-                len(batch.input_ids), dtype=torch.int32
-            ).to(device, non_blocking=True),
             tbo_split_seq_index=batch.tbo_split_seq_index,
         )
+        device = model_runner.device
+
+        if batch.extend_input_logprob_token_ids is not None:
+            ret.extend_input_logprob_token_ids_gpu = (
+                batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
+            )
+
+        if enable_num_token_non_padded(model_runner.server_args):
+            ret.num_token_non_padded = torch.tensor(
+                len(batch.input_ids), dtype=torch.int32
+            ).to(device, non_blocking=True)
 
         # For DP attention
         if batch.global_num_tokens is not None:
@@ -324,6 +332,7 @@ class ForwardBatch:
                 dtype=model_runner.dtype,
                 device=device,
             )
+
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
             TboForwardBatchPreparer.prepare(ret)
@@ -335,10 +344,6 @@ class ForwardBatch:
             and getattr(ret.spec_info, "positions", None) is not None
         ):
             ret.positions = ret.spec_info.positions
-
-        # Get seq_lens_cpu if needed
-        if ret.seq_lens_cpu is None:
-            ret.seq_lens_cpu = batch.seq_lens_cpu
 
         # Init position information
         if ret.forward_mode.is_decode():
@@ -604,6 +609,10 @@ class ForwardBatch:
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
+
+
+def enable_num_token_non_padded(server_args):
+    return server_args.enable_ep_moe or server_args.enable_deepep_moe
 
 
 class PPProxyTensors:

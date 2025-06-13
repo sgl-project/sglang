@@ -24,6 +24,7 @@ from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -178,6 +179,27 @@ class EmbeddingBatchResult:
     bid: int
 
 
+class IdleSleeper:
+    """
+    In setups which have long inactivity periods it is desirable to reduce
+    system power consumption when sglang does nothing. This would lead not only
+    to power savings, but also to more CPU thermal headroom when a request
+    eventually comes. This is important in cases when multiple GPUs are connected
+    as each GPU would otherwise pin one thread at 100% CPU usage.
+
+    The simplest solution is to use zmq.Poller on all sockets that may receive
+    data that needs handling immediately.
+    """
+
+    def __init__(self, sockets):
+        self.poller = zmq.Poller()
+        for s in sockets:
+            self.poller.register(s, zmq.POLLIN)
+
+    def maybe_sleep(self):
+        self.poller.poll(1000)
+
+
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerDisaggregationDecodeMixin,
@@ -227,6 +249,8 @@ class Scheduler(
 
         # Init inter-process communication
         context = zmq.Context(2)
+        self.idle_sleeper = None
+
         if self.pp_rank == 0 and self.attn_tp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -249,6 +273,13 @@ class Scheduler(
             self.recv_from_rpc = get_zmq_socket(
                 context, zmq.DEALER, port_args.rpc_ipc_name, False
             )
+            if self.server_args.sleep_on_idle:
+                self.idle_sleeper = IdleSleeper(
+                    [
+                        self.recv_from_tokenizer,
+                        self.recv_from_rpc,
+                    ]
+                )
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
@@ -477,6 +508,10 @@ class Scheduler(
         )
         self.init_disaggregation()
 
+    def maybe_sleep_on_idle(self):
+        if self.idle_sleeper is not None:
+            self.idle_sleeper.maybe_sleep()
+
     def init_tokenizer(self):
         server_args = self.server_args
 
@@ -571,7 +606,9 @@ class Scheduler(
 
     def init_kv_events(self, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
-            self.kv_event_publisher = EventPublisherFactory.create(kv_events_config)
+            self.kv_event_publisher = EventPublisherFactory.create(
+                kv_events_config, self.attn_dp_rank
+            )
 
     def init_disaggregation(self):
         self.transfer_backend = TransferBackend(
@@ -664,6 +701,7 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
+                self.maybe_sleep_on_idle()
 
             self.last_batch = batch
 
@@ -708,6 +746,7 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
+                self.maybe_sleep_on_idle()
 
             self.last_batch = batch
 
@@ -813,6 +852,7 @@ class Scheduler(
             if server_is_idle:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
+                self.maybe_sleep_on_idle()
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
@@ -946,6 +986,7 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                data_parallel_rank=recv_req.data_parallel_rank,
             )
             req.tokenizer = self.tokenizer
 
@@ -1152,15 +1193,15 @@ class Scheduler(
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-            f"#running-req: {running_bs}, "
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
             f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)}, "
-            f += f"time: {gap_latency:.2f} "
+            f += f"input throughput (token/s): {self.last_input_throughput:.2f} "
         else:
+            f += f"#running-req: {running_bs}, "
             f += f"#queue-req: {len(self.waiting_queue)}"
 
         logger.info(f)
@@ -1571,10 +1612,9 @@ class Scheduler(
                     num_accepted_tokens,
                     can_run_cuda_graph,
                 ) = self.draft_worker.forward_batch_speculative_generation(batch)
-                self.spec_num_total_accepted_tokens += (
-                    num_accepted_tokens + batch.batch_size()
-                )
-                self.spec_num_total_forward_ct += batch.batch_size()
+                bs = batch.batch_size()
+                self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
+                self.spec_num_total_forward_ct += bs
                 self.num_generated_tokens += num_accepted_tokens
 
             if self.pp_group.is_last_rank:
@@ -1988,7 +2028,7 @@ class Scheduler(
             self.cum_spec_accept_length = self.cum_spec_accept_count = 0
             for k, v in server_args_dict.items():
                 global_server_args_dict[k] = v
-            logger.info(f"Global server args updated! " f"{global_server_args_dict=}")
+            logger.info(f"Global server args updated! {global_server_args_dict=}")
         return SetInternalStateReqOutput(
             updated=True,
             server_args=global_server_args_dict,
@@ -2038,9 +2078,22 @@ class Scheduler(
 
         # Sort in reverse order to avoid index issues when deleting
         for i in reversed(to_del):
+            # Abort method 1: directly pop from the queue
+            # This only works for requests that have not started anything.
+            # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
             self.send_to_tokenizer.send_pyobj(AbortReq(req.rid))
             logger.debug(f"Abort queued request. {req.rid=}")
+
+        # Delete the requests in the grammar queue
+        for req in self.grammar_queue:
+            # Abort method 2: call `set_finish_with_abort`
+            # The request will still run one prefill forward pass.
+            # In this case, we change the input_ids to be only one token to make this prefill cheap.
+            if req.rid.startswith(recv_req.rid):
+                logger.debug(f"Abort grammar queue request. {req.rid=}")
+                req.grammar.cancel()
+                req.set_finish_with_abort("Aborted by AbortReq.")
 
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:
@@ -2050,16 +2103,11 @@ class Scheduler(
 
         for req in reqs:
             if req.rid.startswith(recv_req.rid) and not req.finished():
+                # Abort method 3: set `to_abort=True`
+                # The request will still run one decode forward pass.
+                # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
-                # We must use to_abort because it is in a running batch
                 req.to_abort = True
-
-        # Delete the requests in the grammar queue
-        for req in self.grammar_queue:
-            if req.rid.startswith(recv_req.rid):
-                logger.debug(f"Abort grammar queue request. {req.rid=}")
-                req.grammar.cancel()
-                req.set_finish_with_abort("Aborted by AbortReq.")
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -2210,7 +2258,7 @@ class Scheduler(
     ) -> ProfileReqOutput | None:
         stage_str = f" for {stage.__str__()}" if stage else ""
         logger.info(
-            f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir}",
+            f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
         )
 
         activities = self.profiler_activities
@@ -2280,6 +2328,9 @@ class Scheduler(
                 success=False,
                 message="Profiling is not in progress. Call /start_profile first.",
             )
+
+        if not Path(self.torch_profiler_output_dir).exists():
+            Path(self.torch_profiler_output_dir).mkdir(parents=True, exist_ok=True)
 
         stage_suffix = f"-{stage.__str__()}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
