@@ -1094,13 +1094,16 @@ def v1_chat_generate_request(
                             try:
                                 if (
                                     "arguments" in call["function"]
-                                    and type(call["function"]["arguments"]) is str
+                                    and isinstance(call["function"]["arguments"], str)
                                 ):
                                     call["function"]["arguments"] = json.loads(
                                         call["function"]["arguments"]
                                     )
-                            except:
-                                continue
+                            except json.JSONDecodeError as e:
+                                # Log a warning or error if JSON parsing fails for arguments
+                                logger.warning(f"Failed to parse tool call arguments as JSON: {e}")
+                                # Decide whether to continue or raise the exception based on desired behavior
+                                continue # Or raise e if strict parsing is required
                     if isinstance(processed_msg.get("content"), list):
                         for chunk in processed_msg["content"]:
                             if isinstance(chunk, dict) and chunk.get("type") == "text":
