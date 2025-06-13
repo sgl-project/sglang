@@ -7,7 +7,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from tqdm.contrib.concurrent import thread_map
 
-from sglang.srt.layers.quantization.deep_gemm_wrapper import ENABLE_JIT_DEEPGEMM, DEEPGEMM_REQUIRE_UE8M0
+from sglang.srt.layers.quantization.deep_gemm_wrapper import ENABLE_JIT_DEEPGEMM
+from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import DEEPGEMM_V202506
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
@@ -326,7 +327,7 @@ def deep_gemm_execution_hook(
     m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
 ):
     # not supported yet
-    if DEEPGEMM_REQUIRE_UE8M0:
+    if DEEPGEMM_V202506:
         yield
         return
 
