@@ -39,7 +39,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 logger = logging.getLogger(__name__)
 
-_DEBUG_LL_INSERT_SLOWNESS = get_bool_env_var("SGLANG_DEEPEP_DEBUG_LL_INSERT_SLOWNESS")
 
 
 class DeepEPDispatchMode(IntEnum):
@@ -523,12 +522,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         event,
         hook,
     ):
-        if _DEBUG_LL_INSERT_SLOWNESS:
-            device = global_server_args_dict["device"]
-            mat_0 = torch.zeros((2048, 2048), dtype=torch.float, device=device)
-            mat_1 = torch.zeros((2048, 2048), dtype=torch.float, device=device)
-            mat_0 @ mat_1
-
         hook() if self.return_recv_hook else event.current_stream_wait()
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
@@ -623,12 +616,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return hidden_states, event, hook
 
     def combine_b(self, hidden_states, event, hook):
-        if _DEBUG_LL_INSERT_SLOWNESS:
-            device = global_server_args_dict["device"]
-            mat_0 = torch.zeros((2048, 2048), dtype=torch.float, device=device)
-            mat_1 = torch.zeros((2048, 2048), dtype=torch.float, device=device)
-            mat_0 @ mat_1
-
         hook() if self.return_recv_hook else event.current_stream_wait()
         return hidden_states
 
