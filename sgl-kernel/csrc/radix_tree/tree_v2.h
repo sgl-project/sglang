@@ -1,7 +1,5 @@
 #pragma once
-#include <ATen/Tensor.h>
 #include <ATen/core/TensorBody.h>
-#include <ATen/core/ivalue.h>
 #include <c10/core/Device.h>
 
 #include <cstdint>
@@ -13,7 +11,7 @@
 
 namespace radix_tree_v2 {
 
-struct RadixTree : torch::CustomClassHolder {
+struct RadixTree {
  public:
   RadixTree(bool disabled, bool use_hicache, int64_t page_size, int64_t host_size, int64_t threshold);
   ~RadixTree();
@@ -38,6 +36,9 @@ struct RadixTree : torch::CustomClassHolder {
 
   /// @brief Commit a transaction and return the device index.
   void commit_write_through(NodeHandle node_id, bool success);
+
+  /// @brief Clear and reset the tree.
+  void reset();
 
   /// @return How many size are still evictable (on device + not locked).
   int64_t evictable_size() const;

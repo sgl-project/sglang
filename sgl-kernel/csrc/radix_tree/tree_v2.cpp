@@ -70,7 +70,7 @@ std::tuple<std::vector<NodeHandle>, int64_t> RadixTree::insert(const token_vec_t
   _assert(device_prefix_length == offset, "Something goes wrong...");
 
   // don't write through if hicache is disabled (no host memory)
-  if (!m_impl->use_hicache) return {{}, static_cast<int64_t>(device_prefix_length)};
+  if (!m_impl->use_hicache) return {std::vector<NodeHandle>{}, static_cast<int64_t>(device_prefix_length)};
 
   // reverse so that the nodes closer to the root are written back first
   std::reverse(potential_write_nodes.begin(), potential_write_nodes.end());
@@ -208,6 +208,10 @@ void RadixTree::commit_write_through(NodeHandle node_id, bool success) {
   m_impl->lock_ref(node, /*increment=*/false);  // unlock the node
 }
 
+void RadixTree::reset() {
+  m_impl->reset();
+}
+
 }  // namespace radix_tree_v2
 
 // TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
@@ -238,5 +242,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("protected_size", &RadixTree::protected_size)
       .def("total_size", &RadixTree::total_size)
       .def("start_write_through", &RadixTree::start_write_through)
-      .def("commit_write_through", &RadixTree::commit_write_through);
+      .def("commit_write_through", &RadixTree::commit_write_through)
+      .def("reset", &RadixTree::reset);
 }

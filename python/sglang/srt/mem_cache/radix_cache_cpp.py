@@ -379,7 +379,7 @@ class RadixCacheCpp(BasePrefixCache):
             node (TreeNodeCppHandle): The handle of the node to decrement the reference count for.
         """
         self.tree.lock_ref(node, False) # do not increment
-    
+
     def inc_lock_ref(self, node: TreeNode):
         """
         Increment the reference count of from a node to root of the radix tree.

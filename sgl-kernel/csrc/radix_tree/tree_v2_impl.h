@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -266,6 +267,15 @@ struct RadixTree::Impl {
     auto it = m_node_map.find(node_id);
     _assert(it != m_node_map.end(), "Node not found in the map");
     return it->second;
+  }
+
+  void reset() {
+    std::destroy_at(&m_root);    // destroy the root node
+    ::new (&m_root) TreeNode{};  // reinitialize the root node
+    m_evictable_size = 0;
+    m_protected_size = 0;
+    m_node_map.clear();
+    m_host_pool.reset();  // clear the host memory pool
   }
 
  private:

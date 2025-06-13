@@ -111,5 +111,10 @@ if TYPE_CHECKING:
                 int: The total size of the radix tree.
             """
             return super().total_size()
+        def reset(self) -> None:
+            """
+            Resets the radix tree, clearing all nodes and indices.
+            """
+            return super().reset()
 else:
     RadixTreeCpp = radix_tree_cpp.RadixTree
