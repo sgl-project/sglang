@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 # try:
 #     from deep_gemm import get_num_sms
 #     from deep_gemm.jit import build
-#     from deep_gemm.jit.compiler import get_nvcc_compiler
 #     from deep_gemm.jit_kernels.gemm import get_best_configs
 #     from deep_gemm.jit_kernels.runtime import FP8GemmRuntime, GemmType
 
@@ -41,8 +40,9 @@ os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
 # NVRTC may have performance loss with some cases.
 # And NVCC JIT speed is also 9x faster in the ref commit
 _USE_NVRTC_DEFAULT = "0"
-if _ENABLE_JIT_DEEPGEMM:
+if ENABLE_JIT_DEEPGEMM:
     try:
+        from deep_gemm.jit.compiler import get_nvcc_compiler
         get_nvcc_compiler()
     except:
         logger.warning(
