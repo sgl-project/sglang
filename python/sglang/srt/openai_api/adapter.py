@@ -1178,6 +1178,7 @@ def v1_chat_generate_request(
                 audio_data = conv.audio_data
                 modalities = conv.modalities
                 stop = conv.stop_str or [] if not request.ignore_eos else []
+                stop = stop.copy() if isinstance(stop, list) else [stop]
 
                 if request.stop:
                     if isinstance(request.stop, str):
