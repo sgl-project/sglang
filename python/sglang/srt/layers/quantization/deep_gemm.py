@@ -43,9 +43,6 @@ except ImportError:
 _ENABLE_JIT_DEEPGEMM = True
 
 
-def get_enable_jit_deepgemm():
-    return _ENABLE_JIT_DEEPGEMM
-
 
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
 _ENABLE_JIT_DEEPGEMM_PRECOMPILE = get_bool_env_var(
