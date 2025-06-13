@@ -238,7 +238,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         block_size[1],
         column_major_scales=True,
         scale_tma_aligned=True,
-        scale_ue8m0=True,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
     )
 
     if get_bool_env_var("SGLANG_W8A8_DEEPGEMM_EXTRA_SANITY_CHECK"):
