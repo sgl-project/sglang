@@ -18,7 +18,7 @@ try:
     # from deep_gemm.jit_kernels.runtime import FP8GemmRuntime, GemmType
 
     sm_version = get_device_sm()
-    if sm_version == 90:
+    if sm_version >= 90:
         if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
             ENABLE_JIT_DEEPGEMM = True
 except ImportError:
