@@ -1659,15 +1659,17 @@ class PortArgs:
                 scheduler_input_port = (
                     port_base + 3
                 )  # TokenizerManager to DataParallelController
+                rpc_port = port_base + 2
             else:
                 scheduler_input_port = port_base + 3 + 1 + dp_rank
+                rpc_port = port_base + 200 + dp_rank
 
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
                 scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
                 nccl_port=port,
-                rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
+                rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
             )
 
 
