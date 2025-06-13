@@ -15,12 +15,6 @@ if _is_cuda:
         sglang_per_token_group_quant_fp8 as per_token_group_quant_fp8,
     )
 
-    TODO_handle_ceil_div
-    try:
-        from deep_gemm import ceil_div
-    except ImportError:
-        logger.error(f"Failed to import ceil_div from deep_gemm.")
-
 import triton.language as tl
 
 
@@ -1034,6 +1028,7 @@ def get_tma_aligned_size(x: int, element_size: int) -> int:
     tma_alignment_bytes = 16
     assert tma_alignment_bytes % element_size == 0
     alignment = tma_alignment_bytes // element_size
+    TODO_handle_ceil_div_function
     return ceil_div(x, alignment) * alignment
 
 
