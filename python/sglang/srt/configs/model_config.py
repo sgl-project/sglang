@@ -68,6 +68,7 @@ class ModelConfig:
         self.quantization = quantization
         self.impl = impl
         self.modelopt_quant = modelopt_quant
+        self.impl = impl
 
         # Parse args
         self.maybe_pull_model_tokenizer_from_remote()
@@ -268,6 +269,7 @@ class ModelConfig:
             quantization=server_args.quantization,
             impl=server_args.impl,
             modelopt_quant=server_args.modelopt_quant,
+            impl=server_args.impl,
             **kwargs,
         )
 

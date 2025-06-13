@@ -771,6 +771,18 @@ class ServerArgs:
             default=ServerArgs.page_size,
             help="The number of tokens in a page.",
         )
+        parser.add_argument(
+            "--impl",
+            type=str,
+            default=ServerArgs.impl,
+            help="Which implementation of the model to use.\n\n"
+            '* "auto" will try to use the SGLang implementation if it exists '
+            "and fall back to the Transformers implementation if no SGLang "
+            "implementation is available.\n"
+            '* "sglang" will use the SGLang model implementation.\n'
+            '* "transformers" will use the Transformers model '
+            "implementation.\n",
+        )
 
         # Other runtime options
         parser.add_argument(
