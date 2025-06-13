@@ -582,13 +582,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         """
         buffer = self._get_buffer()
 
-        extra_kwargs = {}
-        if get_bool_env_var("SGLANG_HACK_DEEPEP_LOW_LATENCY_DISPATCH_EXTRA_KWARGS"):
-            extra_kwargs = dict(
-                round_scale=True,
-                use_ue8m0=True,
-            )
-
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
@@ -598,7 +591,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 use_fp8=use_fp8,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
-                **extra_kwargs,
+                round_scale=deep_gemm_wrapper.DEEPGEMM_V202506,
+                use_ue8m0=deep_gemm_wrapper.DEEPGEMM_V202506,
             )
         )
         return packed_recv_hidden, packed_recv_count, event, hook
