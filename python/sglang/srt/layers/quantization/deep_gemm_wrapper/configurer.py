@@ -20,3 +20,9 @@ def _compute_enable_deep_gemm():
 
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
+
+try:
+    from deep_gemm import fp8_gemm_nt
+    DEEPGEMM_REQUIRE_UE8M0 = True
+except ImportError:
+    DEEPGEMM_REQUIRE_UE8M0 = False

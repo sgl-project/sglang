@@ -5,7 +5,7 @@ from typing import Tuple
 import torch
 
 from sglang.srt.layers.quantization.deep_gemm_wrapper import compile_utils
-from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM, DEEPGEMM_REQUIRE_UE8M0
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
 
-    try:
+    if DEEPGEMM_REQUIRE_UE8M0:
         from deep_gemm import fp8_gemm_nt as _gemm_nt_f8f8bf16_raw
         from deep_gemm import (
             fp8_m_grouped_gemm_nt_masked as _grouped_gemm_nt_f8f8bf16_masked_raw,
@@ -21,9 +21,7 @@ if ENABLE_JIT_DEEPGEMM:
         from deep_gemm import (
             m_grouped_fp8_gemm_nt_contiguous as _grouped_gemm_nt_f8f8bf16_contig_raw,
         )
-
-        DEEPGEMM_REQUIRE_UE8M0 = True
-    except ImportError:
+    else:
         from deep_gemm import gemm_fp8_fp8_bf16_nt as _gemm_nt_f8f8bf16_raw
         from deep_gemm import (
             m_grouped_gemm_fp8_fp8_bf16_nt_contiguous as _grouped_gemm_nt_f8f8bf16_contig_raw,
@@ -31,8 +29,6 @@ if ENABLE_JIT_DEEPGEMM:
         from deep_gemm import (
             m_grouped_gemm_fp8_fp8_bf16_nt_masked as _grouped_gemm_nt_f8f8bf16_masked_raw,
         )
-
-        DEEPGEMM_REQUIRE_UE8M0 = False
 
 
 def grouped_gemm_nt_f8f8bf16_masked(
