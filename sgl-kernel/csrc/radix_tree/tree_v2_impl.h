@@ -121,7 +121,7 @@ struct RadixTree::Impl {
     return alloc_host(nodes, sizes);
   }
 
-  // walk until the node is completely matched
+  /// @return (last node on cpu, matched prefix length on cpu)
   std::pair<TreeNode*, std::size_t> tree_walk(token_slice key) {
     // Some helper functions
     _assert(key.size() % page_size == 0, "Key should be page-aligned");

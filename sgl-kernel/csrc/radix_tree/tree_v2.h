@@ -24,8 +24,8 @@ struct RadixTree : torch::CustomClassHolder {
   RadixTree& operator=(const RadixTree&) = delete;
   RadixTree& operator=(RadixTree&&) = delete;
 
-  /// @return Nodes that are locked and require write-through.
-  std::vector<NodeHandle> insert(const token_vec_t& key, at::Tensor value);
+  /// @return (nodes that are locked and require write-through, prefix length matched on device)
+  std::tuple<std::vector<NodeHandle>, int64_t> insert(const token_vec_t& key, at::Tensor value);
   /// @return (device indices that are matched, device node, host node)
   std::tuple<std::vector<at::Tensor>, int64_t, NodeHandle, NodeHandle> match_prefix(const token_vec_t& key);
   /// @return Device indices that need to be evicted (on python side).

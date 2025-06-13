@@ -5,8 +5,8 @@
 #include <ATen/ops/tensor.h>
 #include <ATen/ops/zeros.h>
 #include <c10/util/irange.h>
-#include <torch/library.h>
 #include <pybind11/pybind11.h>
+#include <torch/library.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -33,7 +33,7 @@ RadixTree::RadixTree(bool disabled, bool use_hicache, int64_t page_size, int64_t
 
 RadixTree::~RadixTree() = default;
 
-std::vector<NodeHandle> RadixTree::insert(const token_vec_t& _key, const at::Tensor value) {
+std::tuple<std::vector<NodeHandle>, int64_t> RadixTree::insert(const token_vec_t& _key, const at::Tensor value) {
   if (m_impl->disabled) return {};
   const auto key = token_slice{_key.data(), m_impl->align(_key.size())};
 
@@ -41,32 +41,36 @@ std::vector<NodeHandle> RadixTree::insert(const token_vec_t& _key, const at::Ten
   std::vector<TreeNode*> potential_write_nodes;
 
   // walk the tree to find the right place to insert
-  const auto [host_node, total_prefix_length] = m_impl->tree_walk(key);
+  const auto [host_node, host_prefix_length] = m_impl->tree_walk(key);
 
-  if (total_prefix_length != key.size()) {
+  if (host_prefix_length != key.size()) {
     const auto new_node = m_impl->create_device_node(
         host_node,
-        {key.begin() + total_prefix_length, key.end()},
-        value.slice(/*dim=*/0, total_prefix_length, key.size()));
+        {key.begin() + host_prefix_length, key.end()},
+        value.slice(/*dim=*/0, host_prefix_length, key.size()));
     if (m_impl->need_write_through(new_node)) {
       potential_write_nodes.push_back(new_node);
     }
   }
 
-  std::size_t offset = total_prefix_length;
+  std::size_t offset = host_prefix_length;
   const auto device_node = m_impl->walk_to_device(host_node, [&](TreeNode* n) {
     m_impl->update_device(n, value.slice(/*dim=*/0, offset - n->length(), offset));
     offset = offset - n->length();
   });
+
+  std::size_t device_prefix_length = 0;
   m_impl->walk_to_root(device_node, [&](TreeNode* n) {
+    device_prefix_length += n->length();
     n->hit_count++;
     if (m_impl->need_write_through(n)) {
       potential_write_nodes.push_back(n);
     }
   });
+  _assert(device_prefix_length == offset, "Something goes wrong...");
 
   // don't write through if hicache is disabled (no host memory)
-  if (!m_impl->use_hicache) return {};
+  if (!m_impl->use_hicache) return {{}, static_cast<int64_t>(device_prefix_length)};
 
   // reverse so that the nodes closer to the root are written back first
   std::reverse(potential_write_nodes.begin(), potential_write_nodes.end());
@@ -78,7 +82,8 @@ std::vector<NodeHandle> RadixTree::insert(const token_vec_t& _key, const at::Ten
   for (const auto i : c10::irange(written_through)) {
     write_through_node_handles[i] = node2id(potential_write_nodes[i]);
   }
-  return write_through_node_handles;
+
+  return {std::move(write_through_node_handles), static_cast<int64_t>(device_prefix_length)};
 }
 
 std::tuple<std::vector<at::Tensor>, int64_t, NodeHandle, NodeHandle> RadixTree::match_prefix(const token_vec_t& _key) {
