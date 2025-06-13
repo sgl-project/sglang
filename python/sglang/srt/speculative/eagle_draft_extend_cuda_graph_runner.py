@@ -202,6 +202,8 @@ class EAGLEDraftExtendCudaGraphRunner:
         raw_bs = forward_batch.batch_size
         num_tokens = forward_batch.input_ids.shape[0]
 
+        print(f"{raw_bs=}, {len(forward_batch.req_pool_indices)=}")
+
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
         if bs * self.num_tokens_per_bs != num_tokens:
