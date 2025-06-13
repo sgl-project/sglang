@@ -34,7 +34,7 @@ class Router:
         log_dir: Directory to store log files. If None, logs are only output to console. Default: None
         dp_awareness: Enable data parallelism aware schedule. Default: False
         api_key: The api key used for the authorization with the worker.
-            Useful when the dp aware scheduling strategy is enaled.
+            Useful when the dp aware scheduling strategy is enabled.
             Default: None
         service_discovery: Enable Kubernetes service discovery. When enabled, the router will
             automatically discover worker pods based on the selector. Default: False

@@ -485,11 +485,8 @@ class TestLaunchServer(unittest.TestCase):
         # 2. Use the /add_worker API to add it to the router
         # It will be used by router after it is healthy
         with requests.Session() as session:
-            response = session.post(
-                f"{self.base_url}/add_worker?url={worker_url}"
-            )
-            print(f"status code: {response.status_code}, "
-                  f"response: {response.text}")
+            response = session.post(f"{self.base_url}/add_worker?url={worker_url}")
+            print(f"status code: {response.status_code}, response: {response.text}")
             self.assertEqual(response.status_code, 200)
 
         # 3. Run mmlu
@@ -510,11 +507,8 @@ class TestLaunchServer(unittest.TestCase):
 
         # 4. Use the /remove_worker API to remove it from the router
         with requests.Session() as session:
-            response = session.post(
-                f"{self.base_url}/remove_worker?url={worker_url}"
-            )
-            print(f"status code: {response.status_code}, "
-                  f"response: {response.text}")
+            response = session.post(f"{self.base_url}/remove_worker?url={worker_url}")
+            print(f"status code: {response.status_code}, response: {response.text}")
             self.assertEqual(response.status_code, 200)
 
         # 5. Run mmlu again
@@ -549,11 +543,8 @@ class TestLaunchServer(unittest.TestCase):
         # 2. Use the /add_worker API to add it to the router
         # It will be used by router after it is healthy
         with requests.Session() as session:
-            response = session.post(
-                f"{self.base_url}/add_worker?url={worker_url}"
-            )
-            print(f"status code: {response.status_code}, "
-                  f"response: {response.text}")
+            response = session.post(f"{self.base_url}/add_worker?url={worker_url}")
+            print(f"status code: {response.status_code}, response: {response.text}")
             self.assertEqual(response.status_code, 200)
 
         # Start a thread to kill the worker after 10 seconds to mimic
@@ -654,8 +645,7 @@ class TestLaunchServer(unittest.TestCase):
                 f"{self.base_url}/generate",
                 json={"text": "Kanye west is, ", "temperature": 0},
             )
-            print(f"status code: {response.status_code}, "
-                  f"response: {response.text}")
+            print(f"status code: {response.status_code}, response: {response.text}")
             self.assertEqual(
                 response.status_code,
                 401,
@@ -669,8 +659,7 @@ class TestLaunchServer(unittest.TestCase):
                 json={"text": "Kanye west is, ", "temperature": 0},
                 headers={"Authorization": "Bearer 123"},
             )
-            print(f"status code: {response.status_code}, "
-                  f"response: {response.text}")
+            print(f"status code: {response.status_code}, response: {response.text}")
             self.assertEqual(
                 response.status_code,
                 401,
@@ -684,12 +673,11 @@ class TestLaunchServer(unittest.TestCase):
                 json={"text": "Kanye west is ", "temperature": 0},
                 headers={"Authorization": "Bearer correct_api_key"},
             )
-            print(f"status code: {response.status_code}, "
-                  f"response: {response.text}")
+            print(f"status code: {response.status_code}, response: {response.text}")
             self.assertEqual(
                 response.status_code,
                 200,
-                f"Request with correct api key should succeed bug got status {response.status_code}"
+                f"Request with correct api key should succeed but got status {response.status_code}",
             )
 
 
