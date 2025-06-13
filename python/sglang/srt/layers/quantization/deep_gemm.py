@@ -331,7 +331,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
     _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
 
     with _log_jit_build(expected_m, n, k, kernel_type):
-        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+        _grouped_gemm_nt_f8f8bf16_masked_raw(
             lhs, rhs, out, masked_m, expected_m
         )
 
@@ -349,7 +349,7 @@ def grouped_gemm_nt_f8f8bf16_contig(
     _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
 
     with _log_jit_build(m, n, k, kernel_type):
-        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs, rhs, out, m_indices)
+        _grouped_gemm_nt_f8f8bf16_contig_raw(lhs, rhs, out, m_indices)
 
 
 def gemm_nt_f8f8bf16(
@@ -364,7 +364,7 @@ def gemm_nt_f8f8bf16(
     _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, 1)
 
     with _log_jit_build(m, n, k, kernel_type):
-        deep_gemm_fp8_gemm_nt(
+        _gemm_nt_f8f8bf16_raw(
             lhs,
             rhs,
             out,
