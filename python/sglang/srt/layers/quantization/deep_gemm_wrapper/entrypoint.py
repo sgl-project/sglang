@@ -72,8 +72,7 @@ def gemm_nt_f8f8bf16(
             lhs,
             rhs,
             out,
-            # NOTE HACK
-            recipe=(1, 128, 128),
+            recipe=TODO_handle_recipe,
         )
 
 
