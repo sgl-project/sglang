@@ -138,8 +138,6 @@ class MiniCPMAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
-        # set rope as fp32 instead of bf16
-        self.rotary_emb.cos_sin_cache = self.rotary_emb._compute_cos_sin_cache()
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -334,6 +332,9 @@ class MiniCPMForCausalLM(nn.Module):
         else:
             lm_head = self.lm_head
         return self.logits_processor(input_ids, hidden_states, lm_head, forward_batch)
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
