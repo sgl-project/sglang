@@ -39,6 +39,14 @@ find_package(Torch REQUIRED)
 # clean Torch Flag
 clear_cuda_arches(CMAKE_FLAG)
 
+if("${CUDA_VERSION}" VERSION_EQUAL "12.8")
+  set(DeepGEMM_REPO "https://github.com/sgl-project/DeepGEMM")
+  set(DeepGEMM_TAG "blackwell")
+else()
+  set(DeepGEMM_REPO "https://github.com/deepseek-ai/DeepGEMM")
+  set(DeepGEMM_TAG "8dfa3298274bfe6b242f6f8a3e6f3eff2707dd9f")
+endif()
+
 include(FetchContent)
 
 # cutlass
@@ -52,8 +60,8 @@ FetchContent_Populate(repo-cutlass)
 # DeepGEMM
 FetchContent_Declare(
     repo-deepgemm
-    GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM
-    GIT_TAG        8dfa3298274bfe6b242f6f8a3e6f3eff2707dd9f
+    GIT_REPOSITORY ${DeepGEMM_REPO}
+    GIT_TAG        ${DeepGEMM_TAG}
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -237,6 +245,7 @@ set(SOURCES
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
     "csrc/moe/ep_moe_reorder_kernel.cu"
+    "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/speculative_sampling.cu"
     "csrc/speculative/packbit.cu"
