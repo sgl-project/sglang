@@ -44,10 +44,6 @@ if _is_cuda:
         sgl_per_token_quant_fp8,
     )
 
-    from sglang.srt.layers.quantization.deep_gemm import (
-        gemm_nt_f8f8bf16 as deep_gemm_gemm_nt_f8f8bf16,
-    )
-
 logger = logging.getLogger(__name__)
 
 
@@ -76,7 +72,7 @@ if supports_custom_op():
         Bs: torch.Tensor,
         C: torch.Tensor,
     ) -> None:
-        deep_gemm_gemm_nt_f8f8bf16((A, As), (B, Bs), C)
+        deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
     def deep_gemm_fp8_fp8_bf16_nt_fake(
         A: torch.Tensor,
@@ -828,7 +824,7 @@ def w8a8_block_fp8_matmul_deepgemm(
     if supports_custom_op():
         torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
     else:
-        deep_gemm_gemm_nt_f8f8bf16((A, As), (B, Bs), C)
+        deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
     return C
 
