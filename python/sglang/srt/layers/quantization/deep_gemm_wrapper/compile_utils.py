@@ -11,7 +11,6 @@ from tqdm.contrib.concurrent import thread_map
 from sglang.srt.layers.quantization.deep_gemm_wrapper import DeepGemmKernelType
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var, get_device_sm, get_int_env_var, is_cuda
-from enum import IntEnum, auto
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +44,7 @@ _USE_NVRTC_DEFAULT = "0"
 if ENABLE_JIT_DEEPGEMM:
     try:
         from deep_gemm.jit.compiler import get_nvcc_compiler
+
         get_nvcc_compiler()
     except:
         logger.warning(
@@ -53,8 +53,6 @@ if ENABLE_JIT_DEEPGEMM:
         )
         _USE_NVRTC_DEFAULT = "1"
 os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", _USE_NVRTC_DEFAULT)
-
-
 
 
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):

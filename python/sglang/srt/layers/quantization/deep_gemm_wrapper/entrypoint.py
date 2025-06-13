@@ -5,9 +5,11 @@ from typing import Tuple
 import torch
 
 from sglang.srt.layers.quantization.deep_gemm_wrapper import compile_utils
-from sglang.srt.layers.quantization.deep_gemm_wrapper.compile_utils import DeepGemmKernelType
+from sglang.srt.layers.quantization.deep_gemm_wrapper.compile_utils import (
+    DeepGemmKernelType,
+)
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_device_sm, get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, get_device_sm
 
 logger = logging.getLogger(__name__)
 
@@ -32,18 +34,22 @@ if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
 
     try:
+        from deep_gemm import fp8_gemm_nt as _gemm_nt_f8f8bf16_raw
         from deep_gemm import (
             fp8_m_grouped_gemm_nt_masked as _grouped_gemm_nt_f8f8bf16_masked_raw,
+        )
+        from deep_gemm import (
             m_grouped_fp8_gemm_nt_contiguous as _grouped_gemm_nt_f8f8bf16_contig_raw,
-            fp8_gemm_nt as _gemm_nt_f8f8bf16_raw,
         )
 
         DEEPGEMM_REQUIRE_UE8M0 = True
     except ImportError:
+        from deep_gemm import gemm_fp8_fp8_bf16_nt as _gemm_nt_f8f8bf16_raw
+        from deep_gemm import (
+            m_grouped_gemm_fp8_fp8_bf16_nt_contiguous as _grouped_gemm_nt_f8f8bf16_contig_raw,
+        )
         from deep_gemm import (
             m_grouped_gemm_fp8_fp8_bf16_nt_masked as _grouped_gemm_nt_f8f8bf16_masked_raw,
-            m_grouped_gemm_fp8_fp8_bf16_nt_contiguous as _grouped_gemm_nt_f8f8bf16_contig_raw,
-            gemm_fp8_fp8_bf16_nt as _gemm_nt_f8f8bf16_raw,
         )
 
         DEEPGEMM_REQUIRE_UE8M0 = False
@@ -61,9 +67,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
     kernel_type = DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
 
     with _deep_gemm_execution_hook(expected_m, n, k, num_groups, kernel_type):
-        _grouped_gemm_nt_f8f8bf16_masked_raw(
-            lhs, rhs, out, masked_m, expected_m
-        )
+        _grouped_gemm_nt_f8f8bf16_masked_raw(lhs, rhs, out, masked_m, expected_m)
 
 
 def grouped_gemm_nt_f8f8bf16_contig(
@@ -100,7 +104,9 @@ def gemm_nt_f8f8bf16(
 
 
 @contextmanager
-def _deep_gemm_execution_hook(m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType):
+def _deep_gemm_execution_hook(
+    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+):
     compile_utils.maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
     with compile_utils.log_jit_build(m, n, k, kernel_type):
         yield
