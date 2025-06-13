@@ -1138,7 +1138,7 @@ class DeepEPMoE(EPMoE):
             dtype=torch.bfloat16,
         )
         input_tensor[1] = tma_align_input_scale(input_tensor[1])
-        m_grouped_fp8_gemm_nt_contiguous(
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             input_tensor, self.w13_weight_fp8, gateup_output, m_indices
         )
         del input_tensor
@@ -1162,7 +1162,7 @@ class DeepEPMoE(EPMoE):
         )
         del down_input
         down_input_scale = tma_align_input_scale(down_input_scale)
-        m_grouped_fp8_gemm_nt_contiguous(
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
             self.w2_weight_fp8,
             down_output,
