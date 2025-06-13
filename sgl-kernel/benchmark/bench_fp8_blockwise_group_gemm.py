@@ -54,7 +54,7 @@ def construct_contiguous_grouped(
 ]:
     alignment = get_m_alignment_for_contiguous_layout()
     group_ms = [
-        int(expected_m_per_group * random.uniform(0.7, 1.3)) for _ in range(num_groups)
+        int(expected_m_per_group) for _ in range(num_groups)
     ]
     m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
 
@@ -112,14 +112,13 @@ def bench_deepgemm(
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     latencies: list[float] = []
+    start_event.record()
     for _ in range(num_run):
-        start_event.record()
         run_deepgemm()
-        end_event.record()
-        end_event.synchronize()
-        latencies.append(start_event.elapsed_time(end_event))
+    end_event.record()
+    end_event.synchronize()
     torch.cuda.synchronize()
-    avg = sum(latencies) / num_run * 1000  # us
+    avg = start_event.elapsed_time(end_event) / num_run * 1000  # us
 
     return avg, m
 
@@ -148,9 +147,10 @@ def bench_cutlass(
     a_scales_tensors = []
     b_scales_tensors = []
 
+    # TODO(@TianQiLin666666): Unique group_ms in all bench function
     group_ms = [
         alignment
-        * ceil_div(int(expected_m_per_group * random.uniform(0.7, 1.3)), alignment)
+        * ceil_div(int(expected_m_per_group), alignment)
         for _ in range(num_groups)
     ]
     for g in range(num_groups):
@@ -233,15 +233,13 @@ def bench_cutlass(
     # run
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
-    latencies: list[float] = []
+    start_event.record()
     for _ in range(num_run):
-        start_event.record()
         run_cutlass()
-        end_event.record()
-        end_event.synchronize()
-        latencies.append(start_event.elapsed_time(end_event))
+    end_event.record()
+    end_event.synchronize()
     torch.cuda.synchronize()
-    avg = sum(latencies) / num_run * 1000  # us
+    avg = start_event.elapsed_time(end_event) / num_run * 1000  # us
 
     return avg, expert_offsets[-1]
 
