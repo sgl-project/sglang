@@ -1285,6 +1285,7 @@ class DeepEPMoE(EPMoE):
             down_input_scale,
             scale_block_size,
             masked_m,
+            scale_ue8m0=True,
         )
         del gateup_output
 

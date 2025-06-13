@@ -257,10 +257,6 @@ def silu_and_mul_triton_kernel(
             tl.store(down_input_ptr + offset, silu_mul_output, mask=mask)
 
 
-CONSTEXPR_HACK_SILU_AND_MUL_POST_QUANT_KERNEL_EXTRA_CEIL = tl.constexpr(
-    get_bool_env_var("SGLANG_HACK_SILU_AND_MUL_POST_QUANT_KERNEL_EXTRA_CEIL")
-)
-
 
 # copy from https://github.com/ModelTC/lightllm/blob/a000ab69098654df4731f5b12587dd4e7f0a4f41/lightllm/common/fused_moe/moe_silu_and_mul_mix_quant_ep.py
 @triton.jit
@@ -283,6 +279,7 @@ def _silu_and_mul_post_quant_kernel(
     fp8_min,
     BLOCK_N: tl.constexpr,
     NUM_STAGE: tl.constexpr,
+    SCALE_UE8M0: tl.constexpr,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -324,7 +321,7 @@ def _silu_and_mul_post_quant_kernel(
         gate_up = up * gate
         _absmax = tl.maximum(tl.max(tl.abs(gate_up)), 1e-10)
         output_s = _absmax / fp8_max
-        if CONSTEXPR_HACK_SILU_AND_MUL_POST_QUANT_KERNEL_EXTRA_CEIL:
+        if SCALE_UE8M0:
             output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
         output_q = tl.clamp(gate_up / output_s, fp8_min, fp8_max).to(
             output_ptr.dtype.element_ty
@@ -346,6 +343,7 @@ def silu_and_mul_masked_post_quant_fwd(
     output_scale: torch.Tensor,
     quant_group_size: int,
     masked_m: torch.Tensor,
+    scale_ue8m0: bool = False,
 ):
     """
     input shape [expert_num, token_num_padded, hidden_dim]
@@ -402,6 +400,7 @@ def silu_and_mul_masked_post_quant_fwd(
         BLOCK_N=BLOCK_N,
         NUM_STAGE=NUM_STAGES,
         num_warps=num_warps,
+        SCALE_UE8M0=scale_ue8m0,
     )
     return
 
