@@ -93,6 +93,72 @@ class GroupedGemmRunner(torch.nn.Module):
         )
         cls.flashinfer_gemm_wrapper = SegmentGEMMWrapper(workspace_buffer)
 
+    def prepare_fbgemm_inputs(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        seg_indptr: torch.Tensor,
+        weight_indices: Optional[torch.Tensor] = None,
+        scale_b: Optional[torch.Tensor] = None,
+        use_cuda_graph: bool = False,
+        max_groups: Optional[int] = None,
+    ):
+        """
+        Prepares input tensors for fbgemm_grouped_gemm.
+
+        Args:
+            a: Input tensor of shape [M, K]
+            b: Expert weights of shape [G, N, K]
+            seg_indptr: Tensor of shape [G+1], row index pointer
+            weight_indices: Optional tensor of shape [G'], routing order
+            scale_b: Optional tensor of shape [G]
+            use_cuda_graph: Whether to pad to max_groups
+            max_groups: Max number of groups in cuda graph (for padding)
+
+        Returns:
+            b_fbgemm: [G_eff * N, K]
+            m_sizes: [G_eff]
+            scale_b: [G_eff] or None
+        """
+        device = a.device
+        dtype = b.dtype
+        G, N, K = b.shape
+
+        m_sizes = seg_indptr[1:] - seg_indptr[:-1]  # [G]
+        if weight_indices is not None:
+            weight_indices = weight_indices.to(torch.int64)
+            m_sizes = m_sizes[weight_indices]
+            b = b.index_select(0, weight_indices)
+            if scale_b is not None:
+                scale_b = scale_b.index_select(0, weight_indices)
+
+        # Filter m_size == 0  group
+        non_zero_mask = m_sizes > 0
+        b = b[non_zero_mask]
+        m_sizes = m_sizes[non_zero_mask]
+        if scale_b is not None:
+            scale_b = scale_b[non_zero_mask]
+
+        # Flattern B to format for FBGEMM [G_eff * N, K]
+        b_fbgemm = b.contiguous().view(-1, K)
+
+        if use_cuda_graph:
+            assert (
+                max_groups is not None
+            ), "Must specify max_groups for cuda graph capture"
+            pad_len = max_groups - m_sizes.shape[0]
+            if pad_len > 0:
+                m_sizes = torch.cat(
+                    [m_sizes, torch.zeros(pad_len, dtype=m_sizes.dtype, device=device)]
+                )
+                if scale_b is not None:
+                    scale_b = torch.cat(
+                        [
+                            scale_b,
+                            torch.ones(pad_len, dtype=scale_b.dtype, device=device),
+                        ]
+                    )
+        return b_fbgemm, m_sizes, scale_b
+
     # c = a * b
     def forward(
         self,
@@ -122,11 +188,21 @@ class GroupedGemmRunner(torch.nn.Module):
                 weight_indices=weight_indices,
             )
         elif self.use_fbgemm:
-            m_sizes = seg_indptr[1:] - seg_indptr[:-1]
-            non_zero_mask = m_sizes > 0
+            # m_sizes = seg_indptr[1:] - seg_indptr[:-1]
+            # non_zero_mask = m_sizes > 0
 
-            filtered_b = b[non_zero_mask]
-            m_sizes = m_sizes[non_zero_mask]
+            # filtered_b = b[non_zero_mask]
+            # m_sizes = m_sizes[non_zero_mask]
+
+            b_fbgemm, m_sizes, scale_b = self.prepare_fbgemm_inputs(
+                a=a,
+                b=b,
+                seg_indptr=seg_indptr,
+                weight_indices=weight_indices,
+                scale_b=scale_b,
+                use_cuda_graph=self.use_cuda_graph,
+                max_groups=self.max_groups,  # 你可以在构造时设定最大组数
+            )
 
             assert seg_indptr is not None, "FBGemm needs seg_indptr"
             if use_fp8_w8a8:
@@ -151,8 +227,9 @@ class GroupedGemmRunner(torch.nn.Module):
                 )
             else:
                 c = fbgemm_grouped_gemm(
-                    x=a.to(torch.bfloat16),
-                    w=filtered_b.reshape(-1, filtered_b.shape[2]).contiguous(),
+                    a.to(torch.bfloat16),
+                    # w=filtered_b.reshape(-1, filtered_b.shape[2]).contiguous(),
+                    b_fbgemm.to(torch.bfloat16),
                     m_sizes=m_sizes,
                     use_fast_accum=True,
                 )
