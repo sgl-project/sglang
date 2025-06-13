@@ -14,12 +14,13 @@ from sglang.srt.utils import get_bool_env_var, get_device_sm, get_int_env_var, i
 
 logger = logging.getLogger(__name__)
 
-# TODO
-# try:
-#     from deep_gemm import get_num_sms
-#     from deep_gemm.jit import build
-#     from deep_gemm.jit_kernels.gemm import get_best_configs
-#     from deep_gemm.jit_kernels.runtime import FP8GemmRuntime, GemmType
+try:
+    from deep_gemm import get_num_sms
+    from deep_gemm.jit import build
+    from deep_gemm.jit_kernels.gemm import get_best_configs
+    from deep_gemm.jit_kernels.runtime import FP8GemmRuntime, GemmType
+except ImportError:
+    pass
 
 
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
