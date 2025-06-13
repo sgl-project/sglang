@@ -1242,7 +1242,9 @@ class DeepEPMoE(EPMoE):
             (
                 down_input_scale
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                else deep_gemm_wrapper.get_col_major_tma_aligned_tensor(down_input_scale)
+                else deep_gemm_wrapper.get_col_major_tma_aligned_tensor(
+                    down_input_scale
+                )
             ),
         )
         down_output = torch.empty(

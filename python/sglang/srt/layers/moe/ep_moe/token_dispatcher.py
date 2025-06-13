@@ -6,11 +6,7 @@ from sglang.srt.managers.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import (
-    DeepEPMode,
-    get_int_env_var,
-    load_json_config,
-)
+from sglang.srt.utils import DeepEPMode, get_int_env_var, load_json_config
 
 try:
     from deep_ep import Buffer, Config
@@ -37,7 +33,6 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 logger = logging.getLogger(__name__)
-
 
 
 class DeepEPDispatchMode(IntEnum):

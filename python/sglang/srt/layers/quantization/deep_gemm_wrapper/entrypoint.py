@@ -7,7 +7,8 @@ import torch
 from sglang.srt.layers.quantization.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
     DEEPGEMM_SCALE_UE8M0,
-    ENABLE_JIT_DEEPGEMM, DEEPGEMM_V202506,
+    DEEPGEMM_V202506,
+    ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
 
@@ -26,13 +27,13 @@ if ENABLE_JIT_DEEPGEMM:
         )
     else:
         from deep_gemm import gemm_fp8_fp8_bf16_nt as _gemm_nt_f8f8bf16_raw
+        from deep_gemm import get_col_major_tma_aligned_tensor
         from deep_gemm import (
             m_grouped_gemm_fp8_fp8_bf16_nt_contiguous as _grouped_gemm_nt_f8f8bf16_contig_raw,
         )
         from deep_gemm import (
             m_grouped_gemm_fp8_fp8_bf16_nt_masked as _grouped_gemm_nt_f8f8bf16_masked_raw,
         )
-        from deep_gemm import get_col_major_tma_aligned_tensor
 
 
 def grouped_gemm_nt_f8f8bf16_masked(
