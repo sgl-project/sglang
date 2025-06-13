@@ -257,7 +257,7 @@ _KERNEL_HELPER_DICT: Dict[DeepGemmKernelType, DeepGemmKernelHelper] = {
 }
 
 
-def maybe_compile_deep_gemm_one_type_all(
+def _maybe_compile_deep_gemm_one_type_all(
     kernel_type: DeepGemmKernelType,
     n: int,
     k: int,
@@ -298,7 +298,7 @@ def maybe_compile_deep_gemm_one_type_all(
 
 
 @contextmanager
-def log_jit_build(M: int, N: int, K: int, kernel_type: DeepGemmKernelType):
+def _log_jit_build(M: int, N: int, K: int, kernel_type: DeepGemmKernelType):
     if _IN_PRECOMPILE_STAGE:
         yield
         return
@@ -320,3 +320,12 @@ def log_jit_build(M: int, N: int, K: int, kernel_type: DeepGemmKernelType):
     RuntimeCache.get = __patched_func
     yield
     RuntimeCache.get = origin_func
+
+@contextmanager
+def deep_gemm_execution_hook(
+    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+):
+    _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
+    with _log_jit_build(m, n, k, kernel_type):
+        yield
+
