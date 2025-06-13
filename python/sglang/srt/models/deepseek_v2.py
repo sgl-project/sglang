@@ -1939,6 +1939,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         self._weight_requant_ue8m0()
 
     def _weight_requant_ue8m0(self):
+        weight_block_size = self.quant_config.weight_block_size
+
         moe_layers = list(
             range(
                 self.config.first_k_dense_replace,
@@ -1946,6 +1948,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self.config.moe_layer_freq,
             )
         )
+
         for layer_id in range(self.config.num_hidden_layers):
             layer = self.model.layers[layer_id]
 
@@ -1956,7 +1959,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 layer.self_attn.o_proj,
             ]:
                 requant_weight_ue8m0_inplace(
-                    self, module.weight, module.weight_scale_inv
+                    module.weight, module.weight_scale_inv, weight_block_size
                 )
 
             if layer_id in moe_layers:
@@ -1966,7 +1969,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     shared_experts.down_proj,
                 ]:
                     requant_weight_ue8m0_inplace(
-                        self, module.weight, module.weight_scale_inv
+                        module.weight, module.weight_scale_inv, weight_block_size
                     )
 
                 experts = layer.mlp.experts
@@ -1975,7 +1978,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         experts.w13_weight_fp8,
                         experts.w2_weight_fp8,
                     ]:
-                        requant_weight_ue8m0_inplace(self, w[0], w[1])
+                        requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
             else:
                 mlp = layer.mlp
                 assert isinstance(mlp, DeepseekV2MLP)
@@ -1984,7 +1987,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     mlp.down_proj,
                 ]:
                     requant_weight_ue8m0_inplace(
-                        self, module.weight, module.weight_scale_inv
+                        module.weight, module.weight_scale_inv, weight_block_size
                     )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):

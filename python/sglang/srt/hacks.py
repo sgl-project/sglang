@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, List
 
 import deep_gemm.utils.layout
 import torch
@@ -8,18 +8,19 @@ from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 
 
-def requant_weight_ue8m0_inplace(that, weight, weight_scale_inv):
+def requant_weight_ue8m0_inplace(that, weight, weight_scale_inv, weight_block_size):
     assert isinstance(weight, torch.nn.Parameter)
     assert isinstance(weight_scale_inv, torch.nn.Parameter)
     weight.data, weight_scale_inv.data = _requant_weight_ue8m0(
-        that, weight, weight_scale_inv
+        weight, weight_scale_inv, weight_block_size
     )
 
 
 def _requant_weight_ue8m0(
-        that, weight: torch.Tensor, weight_scale_inv: torch.Tensor
+        weight: torch.Tensor,
+        weight_scale_inv: torch.Tensor,
+        weight_block_size: List[int],
 ):
-    weight_block_size = that.quant_config.weight_block_size
     assert weight_block_size == [128, 128]
 
     *_, n, k = weight.shape
