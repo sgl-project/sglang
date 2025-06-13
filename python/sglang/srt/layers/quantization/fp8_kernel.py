@@ -23,7 +23,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
+from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_device_core_count,
@@ -823,7 +823,7 @@ def w8a8_block_fp8_matmul_deepgemm(
     M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
 
     # Deepgemm only supports output tensor type as bfloat16
-    assert C.dtype == torch.bfloat16 and _ENABLE_JIT_DEEPGEMM
+    assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
 
     if supports_custom_op():
         torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
@@ -922,7 +922,7 @@ def w8a8_block_fp8_matmul(
     block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
-    if output_dtype == torch.bfloat16 and _ENABLE_JIT_DEEPGEMM:
+    if output_dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return w8a8_block_fp8_matmul_deepgemm(
             A, B, As, Bs, block_size, output_dtype=output_dtype
         )

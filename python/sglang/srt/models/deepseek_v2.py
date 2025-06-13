@@ -25,6 +25,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
+
+from sglang.srt.layers.quantization import deep_gemm_wrapper
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -55,7 +57,6 @@ from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_tensor_quant_mla_fp8,
@@ -1852,7 +1853,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         and weight_block_size[1] == 128
                         and model_dtype == torch.bfloat16
                     ):
-                        if _ENABLE_JIT_DEEPGEMM and get_bool_env_var(
+                        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and get_bool_env_var(
                             "SGL_USE_DEEPGEMM_BMM", "false"
                         ):
                             block_scale = weight_scale
