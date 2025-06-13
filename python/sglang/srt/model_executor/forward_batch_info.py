@@ -246,6 +246,10 @@ class ForwardBatch:
     gathered_buffer: Optional[torch.Tensor] = None
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
+    gathered_buffer_tp2dp: Optional[torch.Tensor] = None
+    gathered_buffer_dp2tp: Optional[torch.Tensor] = None
+    dp_mla_tp2dp_plan_meta: Optional[torch.Tensor] = None
+    dp_mla_dp2tp_plan_meta: Optional[torch.Tensor] = None
 
     # Speculative decoding
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
@@ -332,6 +336,13 @@ class ForwardBatch:
                 dtype=model_runner.dtype,
                 device=device,
             )
+            if model_runner.server_args.enable_dp_mla:
+                ret.gathered_buffer_tp2dp = model_runner.get_gathered_buffer_tp2dp()[
+                    : batch.input_ids.shape[0]
+                ]
+                ret.gathered_buffer_dp2tp = model_runner.get_gathered_buffer_dp2tp()[
+                    :sum_len
+                ]
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)

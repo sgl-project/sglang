@@ -213,6 +213,7 @@ class GroupCoordinator:
         use_npu_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
+        use_custom_alltoall: bool = False,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -292,6 +293,18 @@ class GroupCoordinator:
                     f"Setup Custom allreduce failed with {e}. To silence this "
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
+
+        from sglang.srt.distributed.device_communicators.custom_all_to_all import (
+            CustomAlltoAll,
+        )
+
+        self.ca2a_comm: Optional[CustomAlltoAll] = None
+        if use_custom_alltoall and self.world_size > 1:
+            # Initialize a custom fast all-reduce implementation.
+            self.ca2a_comm = CustomAlltoAll(
+                group=self.cpu_group,
+                device=self.device,
+            )
 
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
             HpuCommunicator,
@@ -419,6 +432,48 @@ class GroupCoordinator:
                 maybe_pymscclpp_context = pymscclpp_comm.change_state(enable=True)
             with maybe_pynccl_context, maybe_pymscclpp_context:
                 yield graph_capture_context
+
+    def register_output_buffer(self, output: torch.Tensor, buffer_tag: str):
+        ca2a_comm = self.ca2a_comm
+        assert ca2a_comm is not None
+        assert not ca2a_comm.disabled
+        ca2a_comm.register_output_buffer(output, buffer_tag)
+
+    def custom_all_to_all(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        plan_meta: torch.Tensor,
+        buffer_tag: str,
+    ) -> None:
+        ca2a_comm = self.ca2a_comm
+        assert ca2a_comm is not None
+        assert not ca2a_comm.disabled
+        ca2a_comm.custom_all_to_all(output, input, plan_meta, buffer_tag)
+
+    def custom_all_to_all_plan(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        output_split_sizes: torch.Tensor,
+        input_split_sizes: torch.Tensor,
+        chunk_size: int,
+        output_split_offsets: Optional[torch.Tensor] = None,
+        input_split_offsets: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        ca2a_comm = self.ca2a_comm
+        assert ca2a_comm is not None
+        assert not ca2a_comm.disabled
+        plan_meta = ca2a_comm.custom_all_to_all_plan(
+            output,
+            input,
+            output_split_sizes,
+            input_split_sizes,
+            chunk_size,
+            output_split_offsets,
+            input_split_offsets,
+        )
+        return plan_meta
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
@@ -971,6 +1026,9 @@ class GroupCoordinator:
             self.pynccl_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
+        if self.ca2a_comm is not None:
+            self.ca2a_comm.close()
+            self.ca2a_comm = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
@@ -1008,6 +1066,7 @@ def init_model_parallel_group(
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
     use_mscclpp_allreduce: Optional[bool] = None,
+    use_custom_alltoall: bool = False,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1025,6 +1084,7 @@ def init_model_parallel_group(
         use_npu_communicator=True,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
+        use_custom_alltoall=use_custom_alltoall,
     )
 
 
@@ -1147,6 +1207,7 @@ def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
+    use_custom_alltoall: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1202,6 +1263,7 @@ def initialize_model_parallel(
             "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
         ),
         group_name="tp",
+        use_custom_alltoall=use_custom_alltoall,
     )
 
     # Build the pipeline model-parallel groups.
