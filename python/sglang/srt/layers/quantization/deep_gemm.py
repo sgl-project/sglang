@@ -14,25 +14,6 @@ from sglang.srt.utils import get_bool_env_var, get_device_sm, get_int_env_var, i
 
 logger = logging.getLogger(__name__)
 
-_ENABLE_JIT_DEEPGEMM = False
-
-try:
-    import deep_gemm
-    # TODO useful for warmup etc
-    # from deep_gemm import get_num_sms
-    # from deep_gemm.jit import build
-    # from deep_gemm.jit.compiler import get_nvcc_compiler
-    # from deep_gemm.jit_kernels.gemm import get_best_configs
-    # from deep_gemm.jit_kernels.runtime import FP8GemmRuntime, GemmType
-
-    sm_version = get_device_sm()
-    if sm_version == 90:
-        if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
-            _ENABLE_JIT_DEEPGEMM = True
-except ImportError:
-    logger.warning("Failed to import deepgemm, disable _ENABLE_JIT_DEEPGEMM.")
-
-
 
 
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
