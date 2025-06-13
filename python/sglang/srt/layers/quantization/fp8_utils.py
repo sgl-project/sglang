@@ -3,6 +3,7 @@ from typing import Callable, List, Optional, Tuple
 import einops
 import torch
 
+from sglang.math_utils import align
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.utils import is_sm100_supported
@@ -253,16 +254,9 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 
 
 def _check_ue8m0(name, x):
-    x_ceil = _ceil_to_ue8m0(x)
+    x_ceil = ceil_to_ue8m0(x)
     assert torch.all(x == x_ceil), f"{name=} {x=} {x_ceil=}"
 
-
-# COPIED FROM DEEPGEMM
-def _ceil_to_ue8m0(x: torch.Tensor):
-    # NOTE view -> reshape
-    # NOTE remove to allow cuda graph
-    # assert x.reshape(-1).amax().item() > 0
-    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 
 
 def aiter_w8a8_block_fp8_linear(
@@ -462,23 +456,9 @@ def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-# TODO move?
-# COPIED FROM DeepGEMM
-def ceil_div(x: int, y: int) -> int:
-    return (x + y - 1) // y
 
-
-# TODO move?
-# COPIED FROM DeepGEMM
-def align(x: int, y: int) -> int:
-    return ceil_div(x, y) * y
-
-
-# TODO move?
 # COPIED FROM DeepGEMM
 def ceil_to_ue8m0(x: torch.Tensor):
-    assert x.view(-1).amax().item() > 0
-    # TODO: stronger tests
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 
 

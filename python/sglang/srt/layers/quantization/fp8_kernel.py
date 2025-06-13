@@ -23,6 +23,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.math_utils import align
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.utils import (
     direct_register_custom_op,
@@ -323,15 +324,6 @@ def sglang_per_token_group_quant_fp8(
 
     return x_q, x_s
 
-
-# TODO move
-def align(x: int, y: int) -> int:
-    return ceil_div(x, y) * y
-
-
-# TODO move
-def ceil_div(x: int, y: int) -> int:
-    return (x + y - 1) // y
 
 
 def sglang_per_token_quant_fp8(
