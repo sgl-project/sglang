@@ -49,7 +49,9 @@ def grouped_gemm_nt_f8f8bf16_masked(
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
-        _grouped_gemm_nt_f8f8bf16_masked_raw(lhs, rhs, out, masked_m, expected_m, recipe=recipe)
+        _grouped_gemm_nt_f8f8bf16_masked_raw(
+            lhs, rhs, out, masked_m, expected_m, recipe=recipe
+        )
 
 
 def grouped_gemm_nt_f8f8bf16_contig(
