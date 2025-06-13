@@ -3,7 +3,7 @@ from typing import Tuple
 
 import torch
 
-from sglang.srt.layers.quantization.deep_gemm_wrapper.warmup import DeepGemmKernelType
+from sglang.srt.layers.quantization.deep_gemm_wrapper.utils import DeepGemmKernelType
 from sglang.srt.server_args import ServerArgs
 
 TODO_handle_no_deepgemm
