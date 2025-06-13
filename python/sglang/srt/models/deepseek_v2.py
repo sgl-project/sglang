@@ -27,7 +27,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
-from sglang.srt import debug_utils, hacks
+from sglang.srt import hacks
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -389,15 +389,6 @@ class DeepseekV2MoE(nn.Module):
                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
 
-        debug_utils.dumper.dump(
-            "moe_before_dispatch__hidden_states", hidden_states, layer_id=self.layer_id
-        )
-        debug_utils.dumper.dump(
-            "moe_before_dispatch__topk_idx", topk_idx, layer_id=self.layer_id
-        )
-        debug_utils.dumper.dump(
-            "moe_before_dispatch__topk_weights", topk_weights, layer_id=self.layer_id
-        )
         if self.ep_size > 1:
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             (
@@ -415,21 +406,6 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights=topk_weights,
                 forward_mode=forward_mode,
             )
-        debug_utils.dumper.dump(
-            "moe_after_dispatch__hidden_states", hidden_states, layer_id=self.layer_id
-        )
-        debug_utils.dumper.dump(
-            "moe_after_dispatch__topk_idx", topk_idx, layer_id=self.layer_id
-        )
-        debug_utils.dumper.dump(
-            "moe_after_dispatch__topk_weights", topk_weights, layer_id=self.layer_id
-        )
-        debug_utils.dumper.dump(
-            "moe_after_dispatch__masked_m", masked_m, layer_id=self.layer_id
-        )
-        debug_utils.dumper.dump(
-            "moe_after_dispatch__expected_m", expected_m, layer_id=self.layer_id
-        )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
@@ -448,14 +424,6 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights=topk_weights,
                 forward_mode=forward_mode,
             )
-        debug_utils.dumper.dump(
-            "moe_after_combine__final_hidden_states",
-            final_hidden_states,
-            layer_id=self.layer_id,
-        )
-        debug_utils.dumper.dump(
-            "moe_shared_output", shared_output, layer_id=self.layer_id
-        )
         if shared_output is not None:
             x = shared_output
             x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
@@ -463,11 +431,6 @@ class DeepseekV2MoE(nn.Module):
         else:
             final_hidden_states *= self.routed_scaling_factor
 
-        debug_utils.dumper.dump(
-            "moe_output_final_hidden_states",
-            final_hidden_states,
-            layer_id=self.layer_id,
-        )
         return final_hidden_states
 
     def _forward_shared_experts(self, hidden_states):
@@ -1522,12 +1485,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-        debug_utils.dumper.dump(
-            "layer_start_hidden_states", hidden_states, layer_id=self.layer_id
-        )
-        debug_utils.dumper.dump(
-            "layer_start_residual", hidden_states, layer_id=self.layer_id
-        )
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -1817,10 +1774,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        debug_utils.dumper.dump("causal_lm__input_ids", input_ids)
-        debug_utils.dumper.dump("causal_lm__positions", positions)
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        debug_utils.dumper.dump("causal_lm__output_hidden_states", hidden_states)
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
