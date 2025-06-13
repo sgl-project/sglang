@@ -10,7 +10,8 @@ from typing import Generator
 
 import pytest
 import requests
-from psutil import Process
+
+from sglang.srt.utils import kill_process_tree  # reuse SGLang helper
 
 SERVER_MODULE = "sglang.srt.entrypoints.openai.api_server"
 DEFAULT_MODEL = "dummy-model"
@@ -37,15 +38,8 @@ def _wait_until_healthy(proc: subprocess.Popen, base: str, timeout: float) -> No
     raise RuntimeError("api_server readiness probe timed out")
 
 
-def _kill_tree(pid: int) -> None:
-    p = Process(pid)
-    for c in p.children(recursive=True):
-        c.kill()
-    p.kill()
-    p.wait(10)
-
-
 def launch_openai_server(model: str = DEFAULT_MODEL, **kw):
+    """Spawn the draft OpenAI-compatible server and wait until it’s ready."""
     port = _pick_free_port()
     cmd = [
         sys.executable,
@@ -61,11 +55,14 @@ def launch_openai_server(model: str = DEFAULT_MODEL, **kw):
     ]
     env = {**os.environ, **kw.get("env", {})}
 
-    # Use a NamedTemporaryFile so the child never blocks,
-    # but we can still dump logs if something goes wrong.
+    # Write logs to a temp file so the child never blocks on a full pipe.
     log_file = tempfile.NamedTemporaryFile("w+", delete=False)
     proc = subprocess.Popen(
-        cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT, text=True
+        cmd,
+        env=env,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
 
     base = f"http://127.0.0.1:{port}"
@@ -82,7 +79,8 @@ def launch_openai_server(model: str = DEFAULT_MODEL, **kw):
 
 @pytest.fixture(scope="session")
 def openai_server() -> Generator[str, None, None]:
+    """PyTest fixture that provides the server’s base URL and cleans up."""
     proc, base, log_file = launch_openai_server()
     yield base
-    _kill_tree(proc.pid)
+    kill_process_tree(proc.pid)
     log_file.close()
