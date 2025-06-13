@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ExpertLocationMetadata:
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
+    physical_to_logical_map_cpu: torch.Tensor
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
     # (layers, num_logical_experts)
@@ -203,6 +204,7 @@ class ExpertLocationMetadata:
 
         return ExpertLocationMetadata(
             physical_to_logical_map=physical_to_logical_map,
+            physical_to_logical_map_cpu=physical_to_logical_map.cpu(),
             logical_to_all_physical_map=logical_to_all_physical_map_padded,
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
             logical_to_rank_dispatch_physical_map=(
@@ -223,6 +225,7 @@ class ExpertLocationMetadata:
     def update(
         self,
         other: "ExpertLocationMetadata",
+        update_layer_ids: List[int],
     ):
         for field in [
             "ep_size",
@@ -231,15 +234,21 @@ class ExpertLocationMetadata:
 
         for field in [
             "physical_to_logical_map",
+            "physical_to_logical_map_cpu",
             "logical_to_all_physical_map",
             "logical_to_all_physical_map_num_valid",
             "logical_to_rank_dispatch_physical_map",
         ]:
-            src = getattr(other, field)
-            dst = getattr(self, field)
-            assert (src is not None) == (dst is not None)
-            if dst is not None:
-                dst[...] = src
+            other_field = getattr(other, field)
+            self_field = getattr(self, field)
+            assert (other_field is not None) == (self_field is not None)
+            if self_field is not None:
+                mask_update = torch.tensor(
+                    [i in update_layer_ids for i in range(self.num_layers)]
+                )
+                mask_update = mask_update.view(*([-1] + [1] * (self_field.dim() - 1)))
+                mask_update = mask_update.to(self_field.device, non_blocking=True)
+                self_field[...] = torch.where(mask_update, other_field, self_field)
 
     # -------------------------------- usage ------------------------------------
 

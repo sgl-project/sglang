@@ -6,10 +6,12 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.srt.model_executor.cuda_graph_runner import (
+    CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
     LogitsProcessorOutput,
     get_batch_sizes_to_capture,
     get_global_graph_memory_pool,
+    model_capture_mode,
     set_global_graph_memory_pool,
     set_torch_compile_config,
 )
@@ -18,7 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.speculative.eagle_utils import EagleDraftInput
+from sglang.srt.speculative.eagle_utils import EagleDraftInput, fast_topk
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -36,6 +38,10 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.tp_size = self.model_runner.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.topk = model_runner.server_args.speculative_eagle_topk
+        self.enable_profile_cuda_graph = (
+            model_runner.server_args.enable_profile_cuda_graph
+        )
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         self.padded_static_len = -1
 
@@ -86,16 +92,11 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         # Capture
         try:
-            self.capture()
+            with model_capture_mode():
+                self.capture()
         except RuntimeError as e:
             raise Exception(
-                f"Capture CUDA graph failed: {e}\n"
-                "Possible solutions:\n"
-                "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
-                "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
-                "3. disable torch compile by not using --enable-torch-compile\n"
-                "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
-                "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
+                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
     def can_run(self, forward_batch: ForwardBatch):
@@ -143,7 +144,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum(),
+            seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
             positions=positions,
             spec_algorithm=self.model_runner.spec_algorithm,
@@ -175,6 +176,8 @@ class EAGLEDraftExtendCudaGraphRunner:
                 forward_batch.positions,
                 forward_batch,
             )
+            probs = torch.softmax(ret.next_token_logits, dim=-1)
+            ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -200,11 +203,10 @@ class EAGLEDraftExtendCudaGraphRunner:
         # in the batch, which will not be counted as num_seqs
         raw_bs = forward_batch.batch_size
         num_tokens = forward_batch.input_ids.shape[0]
-        assert raw_bs * self.num_tokens_per_bs == num_tokens
 
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
-        if bs != raw_bs:
+        if bs * self.num_tokens_per_bs != num_tokens:
             self.seq_lens.fill_(1)
             self.accept_length.fill_(1)
             self.out_cache_loc.zero_()
@@ -224,9 +226,9 @@ class EAGLEDraftExtendCudaGraphRunner:
                 self.seq_lens_cpu.fill_(1)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
 
-        forward_batch.spec_info.positions = None
         if bs != raw_bs:
             forward_batch.spec_info.accept_length = self.accept_length[:bs]
+        forward_batch.spec_info.positions = None
 
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
@@ -244,8 +246,11 @@ class EAGLEDraftExtendCudaGraphRunner:
         out = self.output_buffers[bs]
         if bs != raw_bs:
             forward_batch.spec_info.accept_length = self.accept_length[:raw_bs]
+            out_copy = out
             out = LogitsProcessorOutput(
                 next_token_logits=out.next_token_logits[:raw_bs],
                 hidden_states=out.hidden_states[:raw_bs],
             )
+            out.topk_p = out_copy.topk_p[:raw_bs]
+            out.topk_index = out_copy.topk_index[:raw_bs]
         return out
