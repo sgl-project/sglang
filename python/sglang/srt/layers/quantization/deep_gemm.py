@@ -62,15 +62,15 @@ os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
 # NVRTC may have performance loss with some cases.
 # And NVCC JIT speed is also 9x faster in the ref commit
 _USE_NVRTC_DEFAULT = "0"
-# if _ENABLE_JIT_DEEPGEMM:
-#     try:
-#         get_nvcc_compiler()
-#     except:
-#         logger.warning(
-#             "NVCC Compiler not found, use NVRTC for DeepGEMM JIT "
-#             "and may have performance loss with some cases."
-#         )
-#         _USE_NVRTC_DEFAULT = "1"
+if _ENABLE_JIT_DEEPGEMM:
+    try:
+        get_nvcc_compiler()
+    except:
+        logger.warning(
+            "NVCC Compiler not found, use NVRTC for DeepGEMM JIT "
+            "and may have performance loss with some cases."
+        )
+        _USE_NVRTC_DEFAULT = "1"
 os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", _USE_NVRTC_DEFAULT)
 
 
