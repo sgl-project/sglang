@@ -86,7 +86,7 @@ class EagleDraftInput:
             pt += extend_len
 
     @classmethod
-    def create_for_idle(
+    def create_idle_input(
         cls,
         device: torch.device,
         hidden_size: int,
@@ -219,7 +219,7 @@ class EagleVerifyInput:
     grammar: BaseGrammarObject = None
 
     @classmethod
-    def create_for_idle(cls, topk: int, spec_steps: int, num_verify_tokens: int):
+    def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
         return cls(
             draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
             custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
@@ -559,6 +559,7 @@ class EagleVerifyInput:
                         batch.req_pool_indices
                     )
             batch.out_cache_loc = batch.out_cache_loc[new_accept_index]
+
             return EagleVerifyOutput(
                 draft_input=draft_input,
                 logits_output=logits_output,
