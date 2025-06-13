@@ -5,7 +5,7 @@ from typing import Tuple
 import torch
 
 from sglang.srt.layers.quantization.deep_gemm_wrapper import compile_utils
-from sglang.srt.layers.quantization.deep_gemm_wrapper.utils import DeepGemmKernelType
+from sglang.srt.layers.quantization.deep_gemm_wrapper.compile_utils import DeepGemmKernelType
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_device_sm, get_bool_env_var
 
