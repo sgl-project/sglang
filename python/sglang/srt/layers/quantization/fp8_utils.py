@@ -402,6 +402,8 @@ def block_quant_dequant(
     return (x_q_block.to(torch.float32) * x_scale_repeat).to(dtype)
 
 
+
+
 def channel_quant_to_tensor_quant(
     x_q_channel: torch.Tensor,
     x_s: torch.Tensor,

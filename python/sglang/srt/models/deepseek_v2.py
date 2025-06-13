@@ -1955,7 +1955,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 layer.self_attn.kv_b_proj,
                 layer.self_attn.o_proj,
             ]:
-                _requant_grouped_moe_weight_inplace(
+                requant_weight_ue8m0_inplace(
                     self, module.weight, module.weight_scale_inv
                 )
 
@@ -1965,7 +1965,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     shared_experts.gate_up_proj,
                     shared_experts.down_proj,
                 ]:
-                    _requant_grouped_moe_weight_inplace(
+                    requant_weight_ue8m0_inplace(
                         self, module.weight, module.weight_scale_inv
                     )
 
@@ -1975,7 +1975,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         experts.w13_weight_fp8,
                         experts.w2_weight_fp8,
                     ]:
-                        _requant_grouped_moe_weight_inplace(self, w[0], w[1])
+                        requant_weight_ue8m0_inplace(self, w[0], w[1])
             else:
                 mlp = layer.mlp
                 assert isinstance(mlp, DeepseekV2MLP)
@@ -1983,7 +1983,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     mlp.gate_up_proj,
                     mlp.down_proj,
                 ]:
-                    _requant_grouped_moe_weight_inplace(
+                    requant_weight_ue8m0_inplace(
                         self, module.weight, module.weight_scale_inv
                     )
 

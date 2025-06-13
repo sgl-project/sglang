@@ -66,15 +66,15 @@ from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 
 
 
-def _requant_grouped_moe_weight_inplace(that, weight, weight_scale_inv):
+def requant_weight_ue8m0_inplace(that, weight, weight_scale_inv):
     assert isinstance(weight, torch.nn.Parameter)
     assert isinstance(weight_scale_inv, torch.nn.Parameter)
-    weight.data, weight_scale_inv.data = _requant_grouped_moe_weight(
+    weight.data, weight_scale_inv.data = _requant_weight_ue8m0(
         that, weight, weight_scale_inv
     )
 
 
-def _requant_grouped_moe_weight(
+def _requant_weight_ue8m0(
     that, weight: torch.Tensor, weight_scale_inv: torch.Tensor
 ):
     weight_block_size = that.quant_config.weight_block_size
