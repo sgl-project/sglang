@@ -224,6 +224,7 @@ def _compile_gemm_nt_f8f8bf16_one(
     _ = build("gemm_fp8_fp8_bf16_nt", code, FP8GemmRuntime, kwargs)
 
 
+# TODO further refactor warmup-related
 _KERNEL_HELPER_DICT: Dict[DeepGemmKernelType, DeepGemmKernelHelper] = {
     DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: DeepGemmKernelHelper(
         name="m_grouped_gemm_fp8_fp8_bf16_nt_masked",
