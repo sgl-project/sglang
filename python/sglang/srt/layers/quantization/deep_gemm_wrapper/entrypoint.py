@@ -5,21 +5,21 @@ import torch
 
 from sglang.srt.server_args import ServerArgs
 
-# TODO from layer.py
-# try:
-#     from deep_gemm import fp8_m_grouped_gemm_nt_masked, m_grouped_fp8_gemm_nt_contiguous
-#
-#     print("hi layer.py use deep_gemm new version")
-# except ImportError:
-#     from deep_gemm import (
-#         m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
-#         m_grouped_gemm_fp8_fp8_bf16_nt_masked,
-#     )
-#
-#     m_grouped_fp8_gemm_nt_contiguous = m_grouped_gemm_fp8_fp8_bf16_nt_contiguous
-#     fp8_m_grouped_gemm_nt_masked = m_grouped_gemm_fp8_fp8_bf16_nt_masked
-#     print("hi layer.py use deep_gemm old version")
+TODO_handle_no_deepgemm
+try:
+    from deep_gemm import (
+        fp8_m_grouped_gemm_nt_masked as _grouped_gemm_nt_f8f8bf16_masked_raw,
+        m_grouped_fp8_gemm_nt_contiguous as _grouped_gemm_nt_f8f8bf16_contig_raw,
+    )
 
+    DEEPGEMM_REQUIRE_UE8M0 = True
+except ImportError:
+    from deep_gemm import (
+        m_grouped_gemm_fp8_fp8_bf16_nt_masked as _grouped_gemm_nt_f8f8bf16_masked_raw,
+        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous as _grouped_gemm_nt_f8f8bf16_contig_raw,
+    )
+
+    DEEPGEMM_REQUIRE_UE8M0 = False
 
 ENABLE_JIT_DEEPGEMM = TODO
 
