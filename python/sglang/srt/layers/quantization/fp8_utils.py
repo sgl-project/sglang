@@ -380,7 +380,9 @@ def block_quant_dequant(
     *_, n, k = x_q_block.shape
 
     # ... n_scale k_scale -> ... (n_scale block_n) (k_scale block_k)
-    x_scale_repeat = x_s.repeat_interleave(block_n, dim=-2).repeat_interleave(block_k, dim=-1)
+    x_scale_repeat = x_s.repeat_interleave(block_n, dim=-2).repeat_interleave(
+        block_k, dim=-1
+    )
     x_scale_repeat = x_scale_repeat[..., :n, :k]
 
     return (x_q_block.to(torch.float32) * x_scale_repeat).to(dtype)
