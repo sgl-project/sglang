@@ -435,6 +435,7 @@ def _requant_weight_ue8m0(
     # NOTE copy and modified from DeepGEMM
     def _transform_scale(sf, mn: int):
         import deep_gemm.utils.layout
+
         sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
         sf = deep_gemm.utils.layout.get_col_major_tma_aligned_packed_tensor(sf)
         return sf
@@ -472,12 +473,14 @@ def ceil_div(x: int, y: int) -> int:
 def align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
+
 # TODO move?
 # COPIED FROM DeepGEMM
 def ceil_to_ue8m0(x: torch.Tensor):
     assert x.view(-1).amax().item() > 0
     # TODO: stronger tests
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
+
 
 def channel_quant_to_tensor_quant(
     x_q_channel: torch.Tensor,
