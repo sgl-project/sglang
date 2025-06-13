@@ -6,7 +6,7 @@ from sglang.srt.managers.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import DeepEPMode, load_json_config
+from sglang.srt.utils import DeepEPMode, get_int_env_var, load_json_config
 
 try:
     from deep_ep import Buffer, Config
@@ -93,17 +93,20 @@ class DeepEPBuffer:
                 ),
                 num_rdma_bytes,
             )
+
+        if deepep_mode == DeepEPMode.normal:
+            num_qps_per_rank = DeepEPConfig.get_instance().num_sms // 2
+        elif deepep_mode in [DeepEPMode.low_latency, DeepEPMode.auto]:
+            num_qps_per_rank = num_experts // group.size()
+        else:
+            raise NotImplementedError
+
         cls._buffer = Buffer(
             group,
             num_nvl_bytes,
             num_rdma_bytes,
             low_latency_mode=deepep_mode.enable_low_latency(),
-            num_qps_per_rank=(
-                max(
-                    num_experts // group.size(),
-                    DeepEPConfig.get_instance().num_sms // 2,
-                )
-            ),
+            num_qps_per_rank=num_qps_per_rank,
         )
         return cls._buffer
 
@@ -185,7 +188,9 @@ class _DeepEPDispatcherImplBase:
         self.deepep_mode = deepep_mode
 
         self.params_bytes = 2
-        self.num_max_dispatch_tokens_per_rank = 128
+        self.num_max_dispatch_tokens_per_rank = get_int_env_var(
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
+        )
 
         self.handle = None
 

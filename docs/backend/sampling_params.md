@@ -6,22 +6,30 @@ If you want a high-level endpoint that can automatically handle chat templates, 
 
 ## `/generate` Endpoint
 
-The `/generate` endpoint accepts the following parameters in JSON format. For detailed usage, see the [native API doc](./native_api.ipynb).
+The `/generate` endpoint accepts the following parameters in JSON format. For detailed usage, see the [native API doc](./native_api.ipynb). The object is defined at `io_struct.py::GenerateReqInput`. You can also read the source code to find more arguments and docs.
 
-| Argument               | Type/Default                                            | Description                                                                                                                                    |
-|------------------------|---------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
-| text                   | `Optional[Union[List[str], str]] = None`                | The input prompt. Can be a single prompt or a batch of prompts.                                                                                |
-| input_ids              | `Optional[Union[List[List[int]], List[int]]] = None`    | Alternative to `text`. Specify the input as token IDs instead of text.                                                                         |
-| sampling_params        | `Optional[Union[List[Dict], Dict]] = None`              | The sampling parameters as described in the sections below.                                                                                    |
-| return_logprob         | `Optional[Union[List[bool], bool]] = None`              | Whether to return log probabilities for tokens.                                                                                                |
-| logprob_start_len      | `Optional[Union[List[int], int]] = None`                | If returning log probabilities, specifies the start position in the prompt. Default is "-1", which returns logprobs only for output tokens.   |
-| top_logprobs_num       | `Optional[Union[List[int], int]] = None`                | If returning log probabilities, specifies the number of top logprobs to return at each position.                                               |
-| stream                 | `bool = False`                                          | Whether to stream the output.                                                                                                                  |
-| lora_path              | `Optional[Union[List[Optional[str]], Optional[str]]] = None`| Path to LoRA weights.                                                                                                                          |
-| custom_logit_processor | `Optional[Union[List[Optional[str]], str]] = None`      | Custom logit processor for advanced sampling control. For usage see below.                                                                     |
-| return_hidden_states   | `bool = False`                                          | Whether to return hidden states of the model. Note that each time it changes, the CUDA graph will be recaptured, which might lead to a performance hit. See the [examples](https://github.com/sgl-project/sglang/blob/main/examples/runtime/hidden_states) for more information. |
+| Argument                   | Type/Default                                                                 | Description                                                                                                                                                     |
+|----------------------------|------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| text                       | `Optional[Union[List[str], str]] = None`                                     | The input prompt. Can be a single prompt or a batch of prompts.                                                                                                 |
+| input_ids                  | `Optional[Union[List[List[int]], List[int]]] = None`                         | The token IDs for text; one can specify either text or input_ids.                                                                                               |
+| input_embeds               | `Optional[Union[List[List[List[float]]], List[List[float]]]] = None`         | The embeddings for input_ids; one can specify either text, input_ids, or input_embeds.                                                                          |
+| image_data                 | `Optional[Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]] = None` | The image input. Can be an image instance, file name, URL, or base64 encoded string. Can be a single image, list of images, or list of lists of images. |
+| audio_data                 | `Optional[Union[List[AudioDataItem], AudioDataItem]] = None`                 | The audio input. Can be a file name, URL, or base64 encoded string.                                                                                             |
+| sampling_params            | `Optional[Union[List[Dict], Dict]] = None`                                   | The sampling parameters as described in the sections below.                                                                                                     |
+| rid                        | `Optional[Union[List[str], str]] = None`                                     | The request ID.                                                                                                                                                 |
+| return_logprob             | `Optional[Union[List[bool], bool]] = None`                                   | Whether to return log probabilities for tokens.                                                                                                                 |
+| logprob_start_len          | `Optional[Union[List[int], int]] = None`                                     | If return_logprob, the start location in the prompt for returning logprobs. Default is "-1", which returns logprobs for output tokens only.                     |
+| top_logprobs_num           | `Optional[Union[List[int], int]] = None`                                     | If return_logprob, the number of top logprobs to return at each position.                                                                                       |
+| token_ids_logprob          | `Optional[Union[List[List[int]], List[int]]] = None`                         | If return_logprob, the token IDs to return logprob for.                                                                                                         |
+| return_text_in_logprobs    | `bool = False`                                                               | Whether to detokenize tokens in text in the returned logprobs.                                                                                                  |
+| stream                     | `bool = False`                                                               | Whether to stream output.                                                                                                                                       |
+| lora_path                  | `Optional[Union[List[Optional[str]], Optional[str]]] = None`                 | The path to the LoRA.                                                                                                                                           |
+| custom_logit_processor     | `Optional[Union[List[Optional[str]], str]] = None`                           | Custom logit processor for advanced sampling control. Must be a serialized instance of `CustomLogitProcessor` using its `to_str()` method. For usage see below. |
+| return_hidden_states       | `Union[List[bool], bool] = False`                                            | Whether to return hidden states.                                                                                                                                |
 
 ## Sampling parameters
+
+The object is defined at `sampling_params.py::SamplingParams`. You can also read the source code to find more arguments and docs.
 
 ### Core parameters
 
@@ -47,22 +55,22 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
 
 Please refer to our dedicated guide on [constrained decoding](./structured_outputs.ipynb) for the following parameters.
 
-| Argument     | Type/Default                    | Description                                                                                                                                    |
-|--------------|---------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
-| json_schema  | `Optional[str] = None`          | JSON schema for structured outputs.                                                                                                            |
-| regex        | `Optional[str] = None`          | Regex for structured outputs.                                                                                                                  |
-| ebnf         | `Optional[str] = None`          | EBNF for structured outputs.                                                                                                                   |
+| Argument        | Type/Default                    | Description                                                                                                                                    |
+|-----------------|---------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
+| json_schema     | `Optional[str] = None`          | JSON schema for structured outputs.                                                                                                            |
+| regex           | `Optional[str] = None`          | Regex for structured outputs.                                                                                                                  |
+| ebnf            | `Optional[str] = None`          | EBNF for structured outputs.                                                                                                                   |
+| structural_tag  | `Optional[str] = None`          | The structal tag for structured outputs.                                                                                                       |
 
 ### Other options
 
 | Argument                      | Type/Default                    | Description                                                                                                                                    |
 |-------------------------------|---------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
 | n                             | `int = 1`                       | Specifies the number of output sequences to generate per request. (Generating multiple outputs in one request (n > 1) is discouraged; repeating the same prompts several times offers better control and efficiency.) |
-| spaces_between_special_tokens | `bool = True`                   | Whether or not to add spaces between special tokens during detokenization.                                                                     |
-| no_stop_trim                  | `bool = False`                  | Don't trim stop words or EOS token from the generated text.                                                                                    |
-| continue_final_message        | `bool = False`                  | When enabled, the final assistant message is removed and its content is used as a prefill so that the model continues that message instead of starting a new turn. See [openai_chat_with_response_prefill.py](https://github.com/sgl-project/sglang/blob/main/examples/runtime/openai_chat_with_response_prefill.py) for examples. |
 | ignore_eos                    | `bool = False`                  | Don't stop generation when EOS token is sampled.                                                                                               |
 | skip_special_tokens           | `bool = True`                   | Remove special tokens during decoding.                                                                                                         |
+| spaces_between_special_tokens | `bool = True`                   | Whether or not to add spaces between special tokens during detokenization.                                                                     |
+| no_stop_trim                  | `bool = False`                  | Don't trim stop words or EOS token from the generated text.                                                                                    |
 | custom_params                 | `Optional[List[Optional[Dict[str, Any]]]] = None` | Used when employing `CustomLogitProcessor`. For usage, see below.                                                                              |
 
 ## Examples
@@ -177,15 +185,15 @@ You can specify a JSON schema, regular expression or [EBNF](https://en.wikipedia
 
 SGLang supports two grammar backends:
 
-- [Outlines](https://github.com/dottxt-ai/outlines) (default): Supports JSON schema and regular expression constraints.
-- [XGrammar](https://github.com/mlc-ai/xgrammar): Supports JSON schema, regular expression, and EBNF constraints.
+- [Outlines](https://github.com/dottxt-ai/outlines): Supports JSON schema and regular expression constraints.
+- [XGrammar](https://github.com/mlc-ai/xgrammar) (default): Supports JSON schema, regular expression, and EBNF constraints.
   - XGrammar currently uses the [GGML BNF format](https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md).
 
-Initialize the XGrammar backend using `--grammar-backend xgrammar` flag:
+If instead you want to initialize the Outlines backend, you can use `--grammar-backend outlines` flag:
 
 ```bash
 python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
---port 30000 --host 0.0.0.0 --grammar-backend [xgrammar|outlines] # xgrammar or outlines (default: outlines)
+--port 30000 --host 0.0.0.0 --grammar-backend [xgrammar|outlines] # xgrammar or outlines (default: xgrammar)
 ```
 
 ```python

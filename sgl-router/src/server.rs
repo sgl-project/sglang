@@ -1,4 +1,5 @@
 use crate::logging::{self, LoggingConfig};
+use crate::prometheus::{self, PrometheusConfig};
 use crate::router::PolicyConfig;
 use crate::router::Router;
 use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
@@ -17,7 +18,7 @@ use tracing::{error, info, warn, Level};
 
 #[derive(Debug)]
 pub struct AppState {
-    router: Router,
+    router: Arc<Router>,
     client: Client,
 }
 
@@ -28,7 +29,7 @@ impl AppState {
         policy_config: PolicyConfig,
     ) -> Result<Self, String> {
         // Create router based on policy
-        let router = Router::new(worker_urls, policy_config)?;
+        let router = Arc::new(Router::new(worker_urls, policy_config)?);
         Ok(Self { router, client })
     }
 }
@@ -161,6 +162,7 @@ pub struct ServerConfig {
     pub max_payload_size: usize,
     pub log_dir: Option<String>,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
+    pub prometheus_config: Option<PrometheusConfig>,
 }
 
 pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
@@ -184,6 +186,17 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         None
     };
 
+    // Initialize prometheus metrics exporter
+    if let Some(prometheus_config) = config.prometheus_config {
+        info!(
+            "🚧 Initializing Prometheus metrics on {}:{}",
+            prometheus_config.host, prometheus_config.port
+        );
+        prometheus::start_prometheus(prometheus_config);
+    } else {
+        info!("🚧 Prometheus metrics disabled");
+    }
+
     info!("🚧 Initializing router on {}:{}", config.host, config.port);
     info!("🚧 Initializing workers on {:?}", config.worker_urls);
     info!("🚧 Policy Config: {:?}", config.policy_config);
@@ -205,24 +218,23 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         .build()
         .expect("Failed to create HTTP client");
 
-    let app_state = web::Data::new(
-        AppState::new(
-            config.worker_urls.clone(),
-            client.clone(), // Clone the client here
-            config.policy_config.clone(),
-        )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
-    );
+    let app_state_init = AppState::new(
+        config.worker_urls.clone(),
+        client.clone(),
+        config.policy_config.clone(),
+    )
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let router_arc = Arc::clone(&app_state_init.router);
+    let app_state = web::Data::new(app_state_init);
 
     // Start the service discovery if enabled
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {
-            let worker_urls = Arc::clone(&app_state.router.get_worker_urls());
-
-            match start_service_discovery(service_discovery_config, worker_urls).await {
+            info!("🚧 Initializing Kubernetes service discovery");
+            // Pass the Arc<Router> directly
+            match start_service_discovery(service_discovery_config, router_arc).await {
                 Ok(handle) => {
                     info!("✅ Service discovery started successfully");
-
                     // Spawn a task to handle the service discovery thread
                     spawn(async move {
                         if let Err(e) = handle.await {
@@ -239,7 +251,10 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     }
 
     info!("✅ Serving router on {}:{}", config.host, config.port);
-    info!("✅ Serving workers on {:?}", config.worker_urls);
+    info!(
+        "✅ Serving workers on {:?}",
+        app_state.router.get_worker_urls().read().unwrap()
+    );
 
     HttpServer::new(move || {
         App::new()

@@ -15,11 +15,13 @@ python3 -m sglang.launch_server \
 
 Below the supported models are summarized in a table.
 
-If unsure if a specific architecture is implemented you may look it up via Github search. For example to search for `Qwen2_5_VLForConditionalGeneration` use the expression
+If you are unsure if a specific architecture is implemented, you can search for it via GitHub. For example, to search for `Qwen2_5_VLForConditionalGeneration`, use the expression:
+
 ```
 repo:sgl-project/sglang path:/^python\/sglang\/srt\/models\// Qwen2_5_VLForConditionalGeneration
 ```
-in Github search.
+
+in the GitHub search bar.
 
 
 | Model Family (Variants)    | Example HuggingFace Identifier             | Chat Template    | Description                                                                                                                                                                                                     |

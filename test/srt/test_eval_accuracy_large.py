@@ -37,11 +37,6 @@ class TestEvalAccuracyLarge(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def tearDown(self):
-        # Delay between tests to allow GPU memory cleanup
-        if os.getenv("SGLANG_AMD_CI") == "1":
-            time.sleep(180)
-
     def test_mmlu(self):
         args = SimpleNamespace(
             base_url=self.base_url,
