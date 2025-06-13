@@ -7,6 +7,8 @@ from typing import Callable, Optional, Union
 import torch
 from torch.nn import Parameter
 
+from sglang.srt.utils import use_cpu
+
 __all__ = [
     "BasevLLMParameter",
     "PackedvLLMParameter",
@@ -20,6 +22,8 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+_use_cpu = use_cpu()
 
 
 class BasevLLMParameter(Parameter):
@@ -94,10 +98,9 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         if not use_presharded_weights:
             shard_size = self.data.shape[self.output_dim]
 
-            from sglang.srt.managers.schedule_batch import global_server_args_dict
             from sglang.srt.utils import narrow_padded_param_and_loaded_weight
 
-            if global_server_args_dict["device"] == "cpu":
+            if _use_cpu:
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     self.data,
                     loaded_weight,
@@ -135,10 +138,9 @@ class _ColumnvLLMParameter(BasevLLMParameter):
 
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
 
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
         from sglang.srt.utils import narrow_padded_param_and_loaded_weight
 
-        if global_server_args_dict["device"] == "cpu":
+        if _use_cpu:
             param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 param_data,
                 loaded_weight,
@@ -217,10 +219,9 @@ class RowvLLMParameter(BasevLLMParameter):
         if not use_presharded_weights:
             shard_size = self.data.shape[self.input_dim]
 
-            from sglang.srt.managers.schedule_batch import global_server_args_dict
             from sglang.srt.utils import narrow_padded_param_and_loaded_weight
 
-            if global_server_args_dict["device"] == "cpu":
+            if _use_cpu:
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     self.data,
                     loaded_weight,

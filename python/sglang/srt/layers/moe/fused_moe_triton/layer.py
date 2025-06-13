@@ -27,6 +27,7 @@ from sglang.srt.utils import (
     get_actual_shard_size,
     narrow_padded_param_and_loaded_weight,
     set_weight_attrs,
+    use_cpu,
 )
 
 if torch.cuda.is_available():
@@ -46,6 +47,8 @@ if _use_aiter:
     from aiter.fused_moe import fused_moe
     from aiter.fused_moe_bf16_asm import ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
+
+_use_cpu = use_cpu()
 
 logger = logging.getLogger(__name__)
 
@@ -583,9 +586,7 @@ class FusedMoE(torch.nn.Module):
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
 
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
-
-        if global_server_args_dict["device"] == "cpu":
+        if _use_cpu:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
