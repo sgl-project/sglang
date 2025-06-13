@@ -7,6 +7,8 @@ from sglang.srt.layers.quantization.deep_gemm_wrapper.utils import DeepGemmKerne
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_device_sm, get_bool_env_var
 
+logger = logging.getLogger(__name__)
+
 ENABLE_JIT_DEEPGEMM = False
 try:
     import deep_gemm
