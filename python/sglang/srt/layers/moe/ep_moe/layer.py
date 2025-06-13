@@ -1206,7 +1206,7 @@ class DeepEPMoE(EPMoE):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_fp8[0].device, dtype=torch.bfloat16
         )
-        fp8_m_grouped_gemm_nt_masked(
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
             hidden_states_fp8,
             self.w13_weight_fp8,
             gateup_output,

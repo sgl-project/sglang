@@ -25,6 +25,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
     masked_m: torch.Tensor,
     expected_m: int,
 ):
+    TODO_recipe_arg
     TODO
 
 def grouped_gemm_nt_f8f8bf16_contig(
