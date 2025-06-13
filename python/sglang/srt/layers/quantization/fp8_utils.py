@@ -380,6 +380,7 @@ def block_quant_dequant(
 
     return (x_q_block.to(torch.float32) * x_scale_repeat).to(dtype)
 
+
 def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
     assert isinstance(weight, torch.nn.Parameter)
     assert isinstance(weight_scale_inv, torch.nn.Parameter)

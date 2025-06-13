@@ -1932,7 +1932,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
-        if False: # TODO (pr-chain)
+        if False:  # TODO (pr-chain)
             self._weight_requant_ue8m0()
 
     def _weight_requant_ue8m0(self):
