@@ -17,13 +17,7 @@ using node_iterator_t = typename TreeNode::iterator_t;
 
 struct RadixTree::Impl {
  public:
-  Impl(
-      bool disabled,
-      bool use_hicache,
-      at::Device device,
-      std::size_t page_size,
-      std::size_t host_size,
-      std::size_t threshold)
+  Impl(bool disabled, bool use_hicache, std::size_t page_size, std::size_t host_size, std::size_t threshold)
       : m_root(),
         m_evictable_size(0),
         m_protected_size(0),
@@ -31,7 +25,6 @@ struct RadixTree::Impl {
         m_host_pool(page_size, host_size),
         disabled(disabled),
         use_hicache(use_hicache),
-        device(device),
         page_size(page_size),
         threshold(threshold) {
     _assert(page_size > 0, "Page size must be greater than zero");
@@ -78,22 +71,22 @@ struct RadixTree::Impl {
 
   // node: [GPU] -> x
   void remove_device_node(TreeNode* node) {
-    _assert(node->on_gpu_only());
+    _assert(node->on_gpu_only() && node->ref_count == 0);
     m_evictable_size -= node->length();
     node->parent()->erase_child(get_key(node));
     m_node_map.erase(node->node_id);  // remove from the map
   }
 
   // node: [CPU] -> [CPU + GPU]
-  void load_to_device(TreeNode* node, at::Tensor new_indices) {
-    _assert(node->on_cpu_only());
+  void update_device(TreeNode* node, at::Tensor new_indices) {
+    _assert(node->on_cpu_only() && node->ref_count == 0);
     node->_unsafe_device_indices() = std::move(new_indices);
     m_evictable_size += node->length();
   }
 
   // node: [CPU + GPU] -> [CPU]
-  void offload_to_host(TreeNode* node) {
-    _assert(node->on_both());
+  void free_device(TreeNode* node) {
+    _assert(node->on_both() && node->ref_count == 0);
     node->_unsafe_device_indices().reset();
     m_evictable_size -= node->length();
   }
@@ -106,31 +99,26 @@ struct RadixTree::Impl {
 
   // return number of nodes that are written through
   // this will make some nodes: [GPU] -> [CPU + GPU]
-  std::size_t try_write_through(const std::vector<NodeHandle>& nodes) {
+  std::size_t try_write_through(const std::vector<TreeNode*>& nodes) {
     if (!use_hicache) return 0;  // no write-through if hierarchical cache is not used
     std::size_t remain_size = m_host_pool.available_size();
-    std::vector<std::size_t> sizes;
+    std::vector<std::size_t> sizes(nodes.size());
 
-    for (const auto& node_handle : nodes) {
-      auto* node = pointer_cast(node_handle);
+    for (const auto i : c10::irange(nodes.size())) {
+      const auto node = nodes[i];
       _assert(need_write_through(node), "Node does not need write-through");
       if (const auto needed = node->length(); needed > remain_size) {
-        sizes.push_back(needed - remain_size);
+        sizes[i] = needed - remain_size;
         remain_size = 0;  // no more space left
       } else {
+        sizes[i] = 0;
         remain_size -= needed;
+        node->is_writting_through = true;
       }
     }
 
     // best effort to reserve space for the host indices
-    const auto written_through = nodes.size() - sizes.size() + evict_host_batch(sizes);
-    for (std::size_t i : c10::irange(written_through)) {
-      auto* node = pointer_cast(nodes[i]);
-      node->_unsafe_host_indices() = m_host_pool.alloc(node->length());
-      lock_ref(node, /*increment=*/true);  // lock the node to be written through
-    }
-
-    return written_through;
+    return alloc_host(nodes, sizes);
   }
 
   // walk until the node is completely matched
@@ -246,7 +234,7 @@ struct RadixTree::Impl {
   }
 
   void lock_ref(NodeHandle node_ptr, bool increment) {
-    return lock_ref(pointer_cast(node_ptr), increment);
+    return lock_ref(id2node(node_ptr), increment);
   }
 
   std::size_t total_size() {
@@ -274,6 +262,12 @@ struct RadixTree::Impl {
     return (size / page_size) * page_size;  // align to page size
   }
 
+  TreeNode* id2node(NodeHandle node_id) {
+    auto it = m_node_map.find(node_id);
+    _assert(it != m_node_map.end(), "Node not found in the map");
+    return it->second;
+  }
+
  private:
   // some auxiliary functions
   token_vec_t& get_key(token_slice tokens) {
@@ -295,17 +289,11 @@ struct RadixTree::Impl {
     parent->add_child(it, std::move(child));
   }
 
-  std::size_t evict_host_batch(const std::vector<std::size_t>& needed_sizes);
-
-  TreeNode* pointer_cast(NodeHandle node_id) {
-    auto it = m_node_map.find(node_id);
-    _assert(it != m_node_map.end(), "Node not found in the map");
-    return it->second;
-  }
+  std::size_t alloc_host(const std::vector<TreeNode*>& nodes, const std::vector<std::size_t>& needed_sizes);
 
   TreeNode m_root;               // root node of the tree
-  std::size_t m_evictable_size;  // number of evictable tokens
-  std::size_t m_protected_size;  // number of protected tokens
+  std::size_t m_evictable_size;  // number of evictable tokens on GPU (lock ref = 0)
+  std::size_t m_protected_size;  // number of protected tokens on GPU (lock ref > 0)
 
   token_vec_t m_cached_vec;       // cached vector of tokens for the current operation
   HiCacheMemoryPool m_host_pool;  // memory pool for host tensor indices
@@ -316,7 +304,6 @@ struct RadixTree::Impl {
   // some public constant configurations (without m_ prefix)
   const bool disabled;          // whether the cache is enabled, or just a temporary cache
   const bool use_hicache;       // whether to use the HiCache for this tree
-  const at::Device device;      // device type of the tree
   const std::size_t page_size;  // size of each page in the cache
   const std::size_t threshold;  // threshold for write_through
 };

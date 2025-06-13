@@ -1,11 +1,13 @@
 #pragma once
+#include <ATen/core/TensorBody.h>
+
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <memory>
 #include <unordered_map>
 
 #include "common.h"
-#include "tree_v2.h"
 
 namespace radix_tree_v2 {
 
@@ -66,6 +68,7 @@ struct TreeNode {
   TreeNode()
       : ref_count(0),
         hit_count(0),
+        is_writting_through(false),
         m_tokens(),
         m_device_indices(),
         m_host_indices(),
@@ -206,6 +209,7 @@ struct TreeNode {
  public:
   std::size_t ref_count;
   std::size_t hit_count;
+  bool is_writting_through;  // used to prevent concurrent writes
 
  private:
   token_vec_t m_tokens;
@@ -218,10 +222,5 @@ struct TreeNode {
  public:
   const std::size_t node_id;  // unique ID for the node
 };
-
-inline std::uintptr_t pointer_cast(TreeNode* node) {
-  // return reinterpret_cast<std::uintptr_t>(node);
-  return node->node_id;
-}
 
 }  // namespace radix_tree_v2
