@@ -258,7 +258,6 @@ class EagleVerifyInput:
             kv_indices,
             req_to_token.size(1),
         )
-        print(f"{qo_indptr=}")
         return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
     def verify(

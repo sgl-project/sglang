@@ -86,7 +86,9 @@ class EAGLEDraftExtendCudaGraphRunner:
 
             self.seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
-            self.accept_length = torch.ones((self.max_bs,), dtype=torch.int32)
+            self.accept_length = torch.full(
+                (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
+            )
 
         # Capture
         try:
@@ -201,8 +203,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         # in the batch, which will not be counted as num_seqs
         raw_bs = forward_batch.batch_size
         num_tokens = forward_batch.input_ids.shape[0]
-
-        print(f"{raw_bs=}, {len(forward_batch.req_pool_indices)=}")
 
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
