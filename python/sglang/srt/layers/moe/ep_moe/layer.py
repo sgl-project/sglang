@@ -5,7 +5,6 @@ import einops
 import torch
 from torch.nn import Module
 
-from sglang.srt import debug_utils
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -1215,27 +1214,9 @@ class DeepEPMoE(EPMoE):
         assert self.quant_method is not None
         assert self.activation == "silu"
 
-        debug_utils.dumper.dump(
-            "deepepmoe__hidden_states_raw", hidden_states_fp8, layer_id=self.layer_id
-        )
-
         if get_bool_env_var("SGLANG_HACK_DEEPEPMOE_EXTRA_NEWVER_QUANT_INPUT", "false"):
             assert hidden_states_fp8.dtype == torch.bfloat16
             hidden_states_fp8 = _modified_construct_masked_grouped_x(hidden_states_fp8)
-
-        debug_utils.dumper.dump(
-            "deepepmoe__hidden_states_fp8", hidden_states_fp8, layer_id=self.layer_id
-        )
-        # debug_utils.dumper.dump(
-        #     "deepepmoe__w13_weight_fp8_a",
-        #     self.w13_weight_fp8[0].data,
-        #     layer_id=self.layer_id,
-        # )
-        # debug_utils.dumper.dump(
-        #     "deepepmoe__w13_weight_fp8_b",
-        #     self.w13_weight_fp8[1].data,
-        #     layer_id=self.layer_id,
-        # )
 
         # GroupGemm-0
         num_groups, m, k = hidden_states_fp8[0].size()
@@ -1254,10 +1235,6 @@ class DeepEPMoE(EPMoE):
             recipe=(1, 128, 128),
         )
         dispose_tensor(hidden_states_fp8[0])
-
-        debug_utils.dumper.dump(
-            "deepepmoe__gateup_output", gateup_output, layer_id=self.layer_id
-        )
 
         # Act
         down_input = torch.empty(
@@ -1289,13 +1266,6 @@ class DeepEPMoE(EPMoE):
         )
         del gateup_output
 
-        debug_utils.dumper.dump(
-            "deepepmoe__down_input", down_input, layer_id=self.layer_id
-        )
-        debug_utils.dumper.dump(
-            "deepepmoe__down_input_scale", down_input_scale, layer_id=self.layer_id
-        )
-
         # GroupGemm-1
         n = self.w2_weight.size(1)
         down_input_fp8 = (
@@ -1315,20 +1285,6 @@ class DeepEPMoE(EPMoE):
             expected_m,
             # NOTE HACK
             recipe=(1, 128, 128),
-        )
-        # debug_utils.dumper.dump(
-        #     "deepepmoe__w2_weight_fp8_a",
-        #     self.w2_weight_fp8[0].data,
-        #     layer_id=self.layer_id,
-        # )
-        # debug_utils.dumper.dump(
-        #     "deepepmoe__w2_weight_fp8_b",
-        #     self.w2_weight_fp8[1].data,
-        #     layer_id=self.layer_id,
-        # )
-
-        debug_utils.dumper.dump(
-            "deepepmoe__down_output", down_output, layer_id=self.layer_id
         )
 
         return down_output
