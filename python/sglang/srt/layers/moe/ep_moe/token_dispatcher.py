@@ -501,7 +501,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_idx,
-            use_fp8=get_bool_env_var("SGLANG_HACK_DEEPEP_DISPATCH_LL_FP8", "true"),
+            use_fp8=True,
         )
         return (
             hidden_states,
