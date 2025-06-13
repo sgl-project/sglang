@@ -264,5 +264,5 @@ int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches,
   return MlaSm100Type::Fmha::get_workspace_size(arguments);
 }
 
-// #endif
+#endif
 // clang-format on
