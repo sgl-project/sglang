@@ -1232,7 +1232,7 @@ class DeepEPMoE(EPMoE):
             down_input_scale,
             scale_block_size,
             masked_m,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_REQUIRE_UE8M0,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
         del gateup_output
 
@@ -1242,7 +1242,7 @@ class DeepEPMoE(EPMoE):
             down_input,
             (
                 down_input_scale
-                if deep_gemm_wrapper.DEEPGEMM_REQUIRE_UE8M0 else
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 else
                 get_col_major_tma_aligned_tensor(down_input_scale)
             ),
         )
