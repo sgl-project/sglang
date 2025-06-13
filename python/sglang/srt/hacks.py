@@ -64,61 +64,6 @@ from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 #
 
 
-def hack_requant_moe_weight_at_post_load_weights(that):
-    from sglang.srt.models.deepseek_v2 import DeepseekV2MLP
-
-    moe_layers = list(
-        range(
-            that.config.first_k_dense_replace,
-            that.config.num_hidden_layers,
-            that.config.moe_layer_freq,
-        )
-    )
-    for layer_id in trange(that.config.num_hidden_layers):
-        layer = that.model.layers[layer_id]
-        # print([(name, param.shape, param.dtype) for name, param in self_attn.named_parameters()])
-
-        for module in [
-            layer.self_attn.fused_qkv_a_proj_with_mqa,
-            layer.self_attn.q_b_proj,
-            layer.self_attn.kv_b_proj,
-            layer.self_attn.o_proj,
-        ]:
-            _requant_grouped_moe_weight_inplace(
-                that, module.weight, module.weight_scale_inv
-            )
-
-        if layer_id in moe_layers:
-            shared_experts = layer.mlp.shared_experts
-            for module in [
-                shared_experts.gate_up_proj,
-                shared_experts.down_proj,
-            ]:
-                _requant_grouped_moe_weight_inplace(
-                    that, module.weight, module.weight_scale_inv
-                )
-
-            experts = layer.mlp.experts
-            if isinstance(experts, DeepEPMoE):
-                for w in [
-                    experts.w13_weight_fp8,
-                    experts.w2_weight_fp8,
-                ]:
-                    _requant_grouped_moe_weight_inplace(that, w[0], w[1])
-            else:
-                print(
-                    "hack_requant_moe_weight_at_post_load_weights skip handling experts since not DeepEPMoE"
-                )
-        else:
-            mlp = layer.mlp
-            assert isinstance(mlp, DeepseekV2MLP)
-            for module in [
-                mlp.gate_up_proj,
-                mlp.down_proj,
-            ]:
-                _requant_grouped_moe_weight_inplace(
-                    that, module.weight, module.weight_scale_inv
-                )
 
 
 def _requant_grouped_moe_weight_inplace(that, weight, weight_scale_inv):
