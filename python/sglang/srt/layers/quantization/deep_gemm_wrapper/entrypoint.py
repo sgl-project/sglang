@@ -65,6 +65,7 @@ def gemm_nt_f8f8bf16(
 ):
     m, k = lhs[0].shape
     n, _ = rhs[0].shape
+    num_groups = 1
     kernel_type = DeepGemmKernelType.GEMM_NT_F8F8BF16
 
     with _with_deep_gemm_execution(m, n, k, num_groups, kernel_type):
