@@ -105,7 +105,6 @@ class GroupedGemmRunner(torch.nn.Module):
         weight_indices: Optional[torch.Tensor] = None,
         scale_b: Optional[torch.Tensor] = None,
         use_cuda_graph: bool = False,
-        max_groups: Optional[int] = None,
     ):
         """
         Prepares input tensors for fbgemm_grouped_gemm.
@@ -117,7 +116,6 @@ class GroupedGemmRunner(torch.nn.Module):
             weight_indices: Optional tensor of shape [G'], routing order
             scale_b: Optional tensor of shape [G]
             use_cuda_graph: Whether to pad to max_groups
-            max_groups: Max number of groups in cuda graph (for padding)
 
         Returns:
             b_fbgemm: [G_eff * N, K]
@@ -126,7 +124,12 @@ class GroupedGemmRunner(torch.nn.Module):
         """
         device = a.device
         dtype = b.dtype
-        G, N, K = b.shape
+        G, N, K_weight = b.shape
+        K_input = a.shape[1]
+
+        assert (
+            K_weight == K_input
+        ), f"Inconsistent expert weight shape: {b.shape}, expected last dim = {K_input}"
 
         m_sizes = seg_indptr[1:] - seg_indptr[:-1]  # [G]
         if weight_indices is not None:
@@ -144,12 +147,10 @@ class GroupedGemmRunner(torch.nn.Module):
             scale_b = scale_b[non_zero_mask]
 
         # Flattern B to format for FBGEMM [G_eff * N, K]
-        b_fbgemm = b.contiguous().view(-1, K)
+        b_fbgemm = b.contiguous().view(-1, K_input)
 
         if use_cuda_graph:
-            assert (
-                max_groups is not None
-            ), "Must specify max_groups for cuda graph capture"
+            max_groups = seg_indptr.numel() - 1  # fallback to original G
             pad_len = max_groups - m_sizes.shape[0]
             if pad_len > 0:
                 m_sizes = torch.cat(
@@ -205,8 +206,7 @@ class GroupedGemmRunner(torch.nn.Module):
                 seg_indptr=seg_indptr,
                 weight_indices=weight_indices,
                 scale_b=scale_b,
-                use_cuda_graph=self.use_cuda_graph,
-                max_groups=self.max_groups,  # 你可以在构造时设定最大组数
+                use_cuda_graph=True,
             )
 
             assert seg_indptr is not None, "FBGemm needs seg_indptr"
