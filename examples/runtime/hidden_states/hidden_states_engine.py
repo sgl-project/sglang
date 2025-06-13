@@ -29,6 +29,7 @@ def main():
         "temperature": 0.8,
         "top_p": 0.95,
         "max_new_tokens": 10,
+        "n": 2,  # ensure prefix cache will take effect
     }
 
     outputs = llm.generate(
