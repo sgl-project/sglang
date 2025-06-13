@@ -1,3 +1,10 @@
+import logging
+
+from sglang.srt.utils import get_device_sm, get_bool_env_var
+
+logger = logging.getLogger(__name__)
+
+
 def _compute_enable_deep_gemm():
     try:
         import deep_gemm
