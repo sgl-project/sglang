@@ -1,3 +1,4 @@
+import logging
 from contextlib import contextmanager
 from typing import Tuple
 
@@ -9,23 +10,22 @@ from sglang.srt.utils import get_device_sm, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
-ENABLE_JIT_DEEPGEMM = False
-try:
-    import deep_gemm
-    # TODO useful for warmup etc
-    # from deep_gemm import get_num_sms
-    # from deep_gemm.jit import build
-    # from deep_gemm.jit.compiler import get_nvcc_compiler
-    # from deep_gemm.jit_kernels.gemm import get_best_configs
-    # from deep_gemm.jit_kernels.runtime import FP8GemmRuntime, GemmType
+
+def _compute_enable_deep_gemm():
+    try:
+        import deep_gemm
+    except ImportError:
+        logger.warning("Failed to import deep_gemm, disable ENABLE_JIT_DEEPGEMM.")
+        return False
 
     sm_version = get_device_sm()
-    if sm_version >= 90:
-        if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
-            ENABLE_JIT_DEEPGEMM = True
-except ImportError:
-    logger.warning("Failed to import deep_gemm, disable ENABLE_JIT_DEEPGEMM.")
+    if sm_version < 90:
+        return False
 
+    return get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true")
+
+
+ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
 TODO_handle_no_deepgemm
 try:
@@ -44,8 +44,6 @@ except ImportError:
     )
 
     DEEPGEMM_REQUIRE_UE8M0 = False
-
-
 
 ENABLE_JIT_DEEPGEMM = TODO
 
