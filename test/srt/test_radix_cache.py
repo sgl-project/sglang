@@ -2,9 +2,6 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
-from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
-
 
 class MockReqToTokenPool:
     def __init__(self):
@@ -25,6 +22,8 @@ class MockKVAllocator:
 
 class RadixCacheTest(unittest.TestCase):
     def setUp(self):
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+
         self.token_pool = MockReqToTokenPool()
         self.kv_pool = MockKVAllocator()
         self.cache = RadixCache(

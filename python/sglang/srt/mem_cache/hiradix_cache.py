@@ -82,6 +82,9 @@ class HiRadixCache(RadixCache):
         return height
 
     def write_backup(self, node: TreeNode, write_back=False):
+        # Nothing to copy if the node is already evicted.
+        if node.value is None:
+            return 0
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
@@ -104,7 +107,15 @@ class HiRadixCache(RadixCache):
         return len(host_indices)
 
     def inc_hit_count(self, node: TreeNode):
-        if node.backuped or self.cache_controller.write_policy == "write_back":
+        # Skip if:
+        # - the node is already on host (backuped)
+        # - write-back policy is in use
+        # - the node has no live device data (evicted)
+        if (
+            node.backuped
+            or node.evicted
+            or self.cache_controller.write_policy == "write_back"
+        ):
             return
         node.hit_count += 1
         if node.hit_count >= self.write_through_threshold:
@@ -198,9 +209,15 @@ class HiRadixCache(RadixCache):
 
     def _evict_regular(self, node: TreeNode):
         # evict a node not initiated write to host
-        self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
-        self._delete_leaf(node)
+        self.cache_controller.mem_pool_device_allocator.free(node.value)
+
+        self.evictable_size_ -= num_evicted  # keep GPU counters in sync
+        node.value = None  # mark as evicted
+
+        # Remove the node only if it has no (even evicted) children
+        if len(node.children) == 0:
+            self._delete_leaf(node)
         return num_evicted
 
     def evict_host(self, num_tokens: int):
@@ -288,7 +305,15 @@ class HiRadixCache(RadixCache):
             len(prefix_indices) == 0 or prefix_indices.is_cuda
         ), "indices of device kV caches should be on GPU"
         if last_node.evicted:
+            # No host copy: fall back to recomputation
+            if not last_node.backuped:
+                # Climb to the nearest ancestor that *does* have live data.
+                while last_node.evicted and last_node != self.root_node:
+                    last_node = last_node.parent
+                return last_node, prefix_indices
+            # Host copy exists: try to pull it back
             loading_values = self.load_back(last_node, mem_quota)
+
             if loading_values is not None:
                 prefix_indices = (
                     loading_values

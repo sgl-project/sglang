@@ -395,6 +395,7 @@ class RadixCache(BasePrefixCache):
     def _insert_helper(self, node: TreeNode, key: List, value):
         now = time.monotonic()
         node.last_access_time = now
+
         if len(key) == 0:
             return 0
 
