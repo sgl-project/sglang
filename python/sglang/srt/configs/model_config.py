@@ -266,6 +266,7 @@ class ModelConfig:
             dtype=server_args.dtype,
             quantization=server_args.quantization,
             impl=server_args.impl,
+            modelopt_quant=server_args.modelopt_quant,
             **kwargs,
         )
 
