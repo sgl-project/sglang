@@ -1,6 +1,5 @@
 from typing import Callable, List, Optional, Tuple
 
-import einops
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
