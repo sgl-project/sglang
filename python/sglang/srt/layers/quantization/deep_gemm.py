@@ -364,14 +364,6 @@ def gemm_nt_f8f8bf16(
     _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, 1)
 
     with _log_jit_build(m, n, k, kernel_type):
-        # deep_gemm.gemm_fp8_fp8_bf16_nt(lhs, rhs, out)
-        # print(
-        #     f"hi call deep_gemm_fp8_gemm_nt "
-        #     f"{lhs[0].shape=} {lhs[0].dtype=} "
-        #     f"{lhs[1].shape=} {lhs[1].dtype=} "
-        #     f"{rhs[0].shape=} {rhs[0].dtype=} "
-        #     f"{rhs[1].shape=} {rhs[1].dtype=} "
-        # )
         deep_gemm_fp8_gemm_nt(
             lhs,
             rhs,
