@@ -47,9 +47,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base_layer, deep_gemm_wrapper
-from sglang.srt.layers.quantization.deep_gemm import (
-    update_deep_gemm_config,
-)
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils import is_sm100_supported
@@ -206,7 +203,7 @@ class ModelRunner:
 
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            update_deep_gemm_config(gpu_id, server_args)
+            deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
 
         # If it is a draft model, tp_group can be different
         self.initialize(min_per_gpu_memory)

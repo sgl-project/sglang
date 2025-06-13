@@ -1,6 +1,8 @@
 import torch
 from typing import Tuple
 
+from sglang.srt.server_args import ServerArgs
+
 # TODO from layer.py
 # try:
 #     from deep_gemm import fp8_m_grouped_gemm_nt_masked, m_grouped_fp8_gemm_nt_contiguous
@@ -45,4 +47,8 @@ def gemm_nt_f8f8bf16(
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
 ):
+    TODO
+
+# TODO improve?
+def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     TODO
