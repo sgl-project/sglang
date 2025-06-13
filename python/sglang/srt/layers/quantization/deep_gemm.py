@@ -8,6 +8,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 from tqdm.contrib.concurrent import thread_map
 
+from sglang.srt.layers.quantization.deep_gemm_wrapper import DeepGemmKernelType
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var, get_device_sm, get_int_env_var, is_cuda
 
@@ -279,8 +280,6 @@ def _maybe_compile_deep_gemm_one_type_all(
 ) -> None:
     global _INITIALIZATION_DICT
     global _BUILTIN_M_LIST
-
-    return
 
     query_key = (kernel_type, n, k, num_groups)
     if (
