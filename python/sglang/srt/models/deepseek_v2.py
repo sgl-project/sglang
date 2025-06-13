@@ -27,7 +27,6 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
-from sglang.srt import hacks
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     parallel_state,
@@ -1937,8 +1936,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
-        if get_bool_env_var("SGLANG_HACK_REQUANT_MOE_WEIGHT"):
-            hacks.hack_requant_moe_weight_at_post_load_weights(self)
+        self._requent_moe_weight_ue8m0()
+
+    def _requent_moe_weight_ue8m0(self):
+        TODO # hack_requant_moe_weight_at_post_load_weights
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 
