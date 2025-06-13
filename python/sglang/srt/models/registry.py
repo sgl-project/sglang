@@ -3,7 +3,6 @@
 import importlib
 import logging
 import pkgutil
-import traceback
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import AbstractSet, Dict, List, Optional, Tuple, Type, Union
@@ -85,7 +84,6 @@ def import_model_classes():
                 module = importlib.import_module(name)
             except Exception as e:
                 logger.warning(f"Ignore import error when loading {name}. " f"{e}")
-                traceback.print_exc()
                 continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass

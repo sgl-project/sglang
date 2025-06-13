@@ -291,7 +291,6 @@ def triton_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    raise Exception("why come to triton_w8a8_block_fp8_linear")
     assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]

@@ -1205,8 +1205,6 @@ class ModelRunner:
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         self.forward_pass_id += 1
 
-        debug_utils.dumper.forward_pass_id = self.forward_pass_id
-
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
             forward_batch,

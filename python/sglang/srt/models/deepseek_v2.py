@@ -383,7 +383,6 @@ class DeepseekV2MoE(nn.Module):
             topk_weights = torch.empty(
                 (0, self.top_k), dtype=torch.float32, device=hidden_states.device
             )
-
         if self.ep_size > 1:
             # TODO(ch-wan): allow users to set num_max_dispatch_tokens_per_rank value
             (
@@ -419,6 +418,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights=topk_weights,
                 forward_mode=forward_mode,
             )
+
         if shared_output is not None:
             x = shared_output
             x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
