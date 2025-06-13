@@ -1,6 +1,6 @@
 import logging
 
-from sglang.srt.utils import get_device_sm, get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, get_device_sm
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,7 @@ ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
 try:
     from deep_gemm import fp8_gemm_nt
+
     # They have not given a name to this breaking change
     DEEPGEMM_V202506 = True
 except ImportError:
