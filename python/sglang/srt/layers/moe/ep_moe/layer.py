@@ -5,6 +5,7 @@ import einops
 import torch
 from torch.nn import Module
 
+from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -919,8 +920,7 @@ class DeepEPMoE(EPMoE):
         )
         self.deepep_mode = deepep_mode
         if self.deepep_mode.enable_low_latency():
-            TODO_use_deep_gemm
-            assert use_deep_gemm, f"DeepEP {self.deepep_mode} mode requires deep_gemm"
+            assert deep_gemm_wrapper.ENABLE_DEEPGEMM, f"DeepEP {self.deepep_mode} mode requires deep_gemm"
         self.w13_weight_fp8 = (
             self.w13_weight,
             (
