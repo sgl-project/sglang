@@ -2557,7 +2557,7 @@ def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
-def get_moe_padding_size(model_config, load_config):
+def may_get_weight_block_size(model_config, load_config):
     from sglang.srt.model_loader.loader import _get_quantization_config
     from sglang.srt.model_loader.utils import get_model_architecture
 
@@ -2569,9 +2569,20 @@ def get_moe_padding_size(model_config, load_config):
     )
 
     if quant_config is not None and hasattr(quant_config, "weight_block_size"):
-        # See NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
-        weight_block_size = getattr(quant_config, "weight_block_size")
+        return getattr(quant_config, "weight_block_size")
+    return None
 
+
+def get_num_heads_padding_size(tp_size, weight_block_size):
+    pad_size = (
+        tp_size * 2 if tp_size % 2 == 1 and weight_block_size is not None else tp_size
+    )
+    return pad_size
+
+
+def get_moe_padding_size(weight_block_size):
+    if weight_block_size is not None:
+        # See NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
         assert (
             len(weight_block_size) == 2
         ), "Only len(weight_block_size) == 2 is supported"
@@ -2607,7 +2618,10 @@ def update_config(
         total_kv_heads = model_config.get_total_num_kv_heads()
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
-        num_key_value_heads = pad_vocab_size(total_kv_heads, tp_size)
+        weight_block_size = may_get_weight_block_size(model_config, load_config)
+        pad_size = get_num_heads_padding_size(tp_size, weight_block_size)
+        num_key_value_heads = pad_vocab_size(total_kv_heads, pad_size)
+
         model_config.num_key_value_heads = num_key_value_heads
         model_config.hf_config.num_key_value_heads = num_key_value_heads
         model_config.hf_text_config.num_key_value_heads = num_key_value_heads
@@ -2617,9 +2631,7 @@ def update_config(
         model_config.hf_config.num_attention_heads = num_attention_heads
         model_config.hf_text_config.num_attention_heads = num_attention_heads
 
-    intermediate_padding_size = tp_size * get_moe_padding_size(
-        model_config, load_config
-    )
+    intermediate_padding_size = tp_size * get_moe_padding_size(weight_block_size)
     model_config = update_intermediate_size(
         model_config, "moe_intermediate_size", intermediate_padding_size
     )
