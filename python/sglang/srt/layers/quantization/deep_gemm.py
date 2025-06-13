@@ -312,3 +312,26 @@ def _maybe_compile_deep_gemm_one_type_all(
         thread_map(compile_func, collected_configs, max_workers=_COMPILE_WORKERS)
 
 
+@contextmanager
+def _log_jit_build(M: int, N: int, K: int, kernel_type: DeepGemmKernelType):
+    if _IN_PRECOMPILE_STAGE:
+        yield
+        return
+
+    from deep_gemm.jit.runtime import RuntimeCache
+
+    origin_func = RuntimeCache.get
+
+    def __patched_func(self, *args, **kwargs):
+        ret = origin_func(self, *args, **kwargs)
+        if ret is None:
+            kernel_helper = _KERNEL_HELPER_DICT[kernel_type]
+            _compile_warning_2()
+            logger.warning(
+                f"DeepGEMM JIT Compiling for <{kernel_helper.name}> M={M}, N={N}, K={K}. Please wait."
+            )
+        return ret
+
+    RuntimeCache.get = __patched_func
+    yield
+    RuntimeCache.get = origin_func
