@@ -8,7 +8,6 @@ from sglang.srt.managers.expert_distribution import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     DeepEPMode,
-    get_bool_env_var,
     get_int_env_var,
     load_json_config,
 )
