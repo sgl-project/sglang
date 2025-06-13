@@ -99,11 +99,6 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     _DO_COMPILE_ALL = _IS_FIRST_RANK_ON_NODE or not _IN_PRECOMPILE_STAGE
 
 
-class DeepGemmKernelType(IntEnum):
-    GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
-    GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
-    GEMM_NT_F8F8BF16 = auto()
-
 
 @dataclass
 class DeepGemmKernelHelper:
