@@ -402,6 +402,40 @@ def block_quant_dequant(
     return (x_q_block.to(torch.float32) * x_scale_repeat).to(dtype)
 
 
+def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
+    assert isinstance(weight, torch.nn.Parameter)
+    assert isinstance(weight_scale_inv, torch.nn.Parameter)
+    weight.data, weight_scale_inv.data = _requant_weight_ue8m0(
+        weight, weight_scale_inv, weight_block_size
+    )
+
+
+def _requant_weight_ue8m0(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    weight_block_size: List[int],
+):
+    assert weight_block_size == [128, 128]
+
+    *_, n, k = weight.shape
+
+    weight_dequant = block_quant_dequant(
+        weight,
+        weight_scale_inv,
+        weight_block_size,
+        torch.bfloat16,
+    )
+
+    weight_dequant_flat = weight_dequant.view((-1, k))
+    out_w_flat, out_s_flat = per_block_cast_to_fp8(weight_dequant_flat)
+
+    out_w = out_w_flat.view(weight.shape)
+    out_s = out_s_flat.view(weight_scale_inv.shape)
+
+    out_s = _transform_scale(out_s, mn=out_w.shape[-2])
+
+    return out_w, out_s
+
 
 
 def channel_quant_to_tensor_quant(
