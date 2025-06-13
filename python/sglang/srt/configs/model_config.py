@@ -17,7 +17,7 @@ import logging
 import math
 import os
 from enum import Enum, IntEnum, auto
-from typing import List, Optional, Set, Union
+from typing import Dict, List, Optional, Set, Union
 
 import torch
 from transformers import PretrainedConfig
@@ -61,6 +61,7 @@ class ModelConfig:
         enable_multimodal: Optional[bool] = None,
         dtype: str = "auto",
         quantization: Optional[str] = None,
+        modelopt_quant: Optional[Union[str, Dict]] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
         hybrid_kvcache_ratio: Optional[float] = None,
