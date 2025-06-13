@@ -113,7 +113,8 @@ class DeepEPBuffer:
             num_rdma_bytes,
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
-            allow_mnnvl=get_bool_env_var("SGLANG_HACK_DEEPEP_ALLOW_MNNVL"),
+            # TODO can be false when unneeded
+            allow_mnnvl=True,
         )
         return cls._buffer
 
