@@ -1377,7 +1377,7 @@ class Scheduler(
             self.tree_cache.loading_check()
 
         # Get priority queue
-        prefix_computed = self.policy.calc_priority(self.waiting_queue)
+        self.policy.calc_priority(self.waiting_queue)
 
         # Prefill policy
         adder = PrefillAdder(
@@ -1391,7 +1391,7 @@ class Scheduler(
         )
 
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
+            self.chunked_req.init_next_prefill()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.lora_paths:
@@ -1421,14 +1421,9 @@ class Scheduler(
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     self.running_batch.batch_is_full = True
                     break
-
-            req.init_next_round_input(
-                None if prefix_computed else self.tree_cache,
-                self.enable_hierarchical_cache,
-            )
-
+            req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
-                req, self.chunked_req, self.enable_hierarchical_cache
+                req, (self.chunked_req is not None), self.enable_hierarchical_cache
             )
 
             if res != AddReqResult.CONTINUE:
