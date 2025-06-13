@@ -1188,10 +1188,6 @@ class DeepEPMoE(EPMoE):
         assert self.quant_method is not None
         assert self.activation == "silu"
 
-        if get_bool_env_var("SGLANG_HACK_DEEPEPMOE_EXTRA_NEWVER_QUANT_INPUT", "false"):
-            assert hidden_states_fp8.dtype == torch.bfloat16
-            hidden_states_fp8 = _modified_construct_masked_grouped_x(hidden_states_fp8)
-
         # GroupGemm-0
         num_groups, m, k = hidden_states_fp8[0].size()
         n = self.w13_weight.size(1)
@@ -1270,51 +1266,3 @@ def get_moe_impl_class():
     if global_server_args_dict["enable_ep_moe"]:
         return EPMoE
     return FusedMoE
-
-
-def ceil_to_ue8m0(x: torch.Tensor):
-    # TODO NOTE MODIFIED remove this assert
-    # assert x.view(-1).amax().item() > 0
-    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
-
-
-def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.dim() == 2 and x.size(1) % 128 == 0, f"{x.shape=}"
-    m, n = x.shape
-    x_view = x.view(m, -1, 128)
-    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-    sf = ceil_to_ue8m0(x_amax / 448.0)
-    return (x_view * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), sf
-
-
-def _modified_construct_masked_grouped_x(x):
-    num_groups, m, k = x.shape
-    assert k % 128 == 0
-
-    x_flat = einops.rearrange(
-        x, "num_group num_token hidden -> (num_group num_token) hidden"
-    )
-    out_w_flat, out_s_flat = per_token_cast_to_fp8(x_flat)
-
-    def _unflatten(x):
-        return einops.rearrange(
-            x,
-            "(num_group num_token) whatever_div_128 -> num_group num_token whatever_div_128",
-            num_group=num_groups,
-        )
-
-    return _unflatten(out_w_flat), _unflatten(out_s_flat)
-
-
-def ceil_div(x: int, y: int) -> int:
-    """
-    Perform ceiling division of two integers.
-
-    Args:
-        x: the dividend.
-        y: the divisor.
-
-    Returns:
-        The result of the ceiling division.
-    """
-    return (x + y - 1) // y
