@@ -11,6 +11,7 @@ from tqdm.contrib.concurrent import thread_map
 from sglang.srt.layers.quantization.deep_gemm_wrapper import DeepGemmKernelType
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var, get_device_sm, get_int_env_var, is_cuda
+from enum import IntEnum, auto
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,8 @@ if ENABLE_JIT_DEEPGEMM:
 os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", _USE_NVRTC_DEFAULT)
 
 
+
+
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     global _BUILTIN_M_LIST
     global _DO_COMPILE_ALL
@@ -76,6 +79,11 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     # Avoid loading symbols at the serving stages.
     _DO_COMPILE_ALL = _IS_FIRST_RANK_ON_NODE or not _IN_PRECOMPILE_STAGE
 
+
+class DeepGemmKernelType(IntEnum):
+    GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
+    GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
+    GEMM_NT_F8F8BF16 = auto()
 
 
 @dataclass
