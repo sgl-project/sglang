@@ -250,7 +250,7 @@ _KERNEL_HELPER_DICT: Dict[DeepGemmKernelType, DeepGemmKernelHelper] = {
 }
 
 
-def _maybe_compile_deep_gemm_one_type_all(
+def maybe_compile_deep_gemm_one_type_all(
     kernel_type: DeepGemmKernelType,
     n: int,
     k: int,
@@ -291,7 +291,7 @@ def _maybe_compile_deep_gemm_one_type_all(
 
 
 @contextmanager
-def _log_jit_build(M: int, N: int, K: int, kernel_type: DeepGemmKernelType):
+def log_jit_build(M: int, N: int, K: int, kernel_type: DeepGemmKernelType):
     if _IN_PRECOMPILE_STAGE:
         yield
         return

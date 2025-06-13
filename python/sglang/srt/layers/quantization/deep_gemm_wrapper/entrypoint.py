@@ -4,6 +4,7 @@ from typing import Tuple
 
 import torch
 
+from sglang.srt.layers.quantization.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.quantization.deep_gemm_wrapper.utils import DeepGemmKernelType
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_device_sm, get_bool_env_var
@@ -100,8 +101,8 @@ def gemm_nt_f8f8bf16(
 
 @contextmanager
 def _deep_gemm_execution_hook(m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType):
-    _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
-    with _log_jit_build(m, n, k, kernel_type):
+    compile_utils.maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
+    with compile_utils.log_jit_build(m, n, k, kernel_type):
         yield
 
 
