@@ -378,8 +378,6 @@ def block_quant_dequant(
     """
     block_n, block_k = block_size[0], block_size[1]
     *_, n, k = x_q_block.shape
-    assert n % block_n == 0
-    assert k % block_k == 0
 
     x_scale_repeat = einops.repeat(
         x_s,
@@ -387,6 +385,7 @@ def block_quant_dequant(
         block_n=block_n,
         block_k=block_k,
     )
+    x_scale_repeat = x_scale_repeat[..., :n, :k]
     return (x_q_block.to(torch.float32) * x_scale_repeat).to(dtype)
 
 
