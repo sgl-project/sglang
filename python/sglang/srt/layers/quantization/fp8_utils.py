@@ -432,8 +432,10 @@ def _requant_weight_ue8m0(
     out_w = out_w_flat.view(weight.shape)
     out_s = out_s_flat.view(weight_scale_inv.shape)
 
+    # TODO rename?
     # NOTE copy and modified from DeepGEMM
     def _transform_scale(sf, mn: int):
+        # TODO move import
         import deep_gemm.utils.layout
 
         sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
