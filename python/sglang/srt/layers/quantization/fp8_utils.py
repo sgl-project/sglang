@@ -258,7 +258,6 @@ def _check_ue8m0(name, x):
     assert torch.all(x == x_ceil), f"{name=} {x=} {x_ceil=}"
 
 
-
 def aiter_w8a8_block_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -454,7 +453,6 @@ def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(
         x_view.size(0), x_view.size(2)
     )
-
 
 
 # COPIED FROM DeepGEMM

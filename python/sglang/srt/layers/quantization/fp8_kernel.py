@@ -325,7 +325,6 @@ def sglang_per_token_group_quant_fp8(
     return x_q, x_s
 
 
-
 def sglang_per_token_quant_fp8(
     x: torch.Tensor,
     dtype: torch.dtype = fp8_dtype,

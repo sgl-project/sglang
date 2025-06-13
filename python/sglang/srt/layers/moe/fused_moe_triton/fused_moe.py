@@ -519,7 +519,6 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-
 @triton.jit
 def moe_align_block_size_stage1(
     topk_ids_ptr,
