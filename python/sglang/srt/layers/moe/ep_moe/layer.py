@@ -121,25 +121,41 @@ class GroupedGemmRunner(torch.nn.Module):
                 seg_indptr=seg_indptr,
                 weight_indices=weight_indices,
             )
-        elif self.use_fbgemm and weight_column_major:
-            b_fbgemm = b.contiguous().reshape(-1, b.shape[2])
-            assert seg_indptr is not None, "FBGemm needs seg_indptr"
+        elif self.use_fbgemm:
             m_sizes = seg_indptr[1:] - seg_indptr[:-1]
+            non_zero_mask = m_sizes > 0
+
+            filtered_b = b[non_zero_mask]
+            m_sizes = m_sizes[non_zero_mask]
+
+            assert seg_indptr is not None, "FBGemm needs seg_indptr"
             if use_fp8_w8a8:
                 # TODO: Currently fbgemm only supports rowwise fp8. We need to
-                # change it to blockwise fp8 to fully support the placement for
+                # change it to blockwise fp8 to fully support the replacement of
                 # quant.
                 assert scale_a is not None and scale_b is not None
-                c = fbgemm_grouped_gemm_fp8_rowwise(
-                    a.to(torch.float8_e4m3fn),
-                    b_fbgemm.to(torch.float8_e4m3fn),
-                    m_sizes,
-                    scale_a.to(torch.float32),
-                    scale_b.to(torch.float32),
-                    use_fast_accum=True,
+                c = grouped_gemm_triton(
+                    a,
+                    b,
+                    c,
+                    batch_size,
+                    weight_column_major,
+                    seg_indptr,
+                    weight_indices,
+                    use_fp8_w8a8,
+                    scale_a,
+                    scale_b,
+                    block_shape=block_shape,
+                    c_dtype=c_dtype,
+                    use_per_token_if_dynamic=self.use_per_token_if_dynamic,
                 )
             else:
-                c = fbgemm_grouped_gemm(a, b_fbgemm, m_sizes, use_fast_accum=True)
+                c = fbgemm_grouped_gemm(
+                    x=a.to(torch.bfloat16),
+                    w=filtered_b.reshape(-1, filtered_b.shape[2]).contiguous(),
+                    m_sizes=m_sizes,
+                    use_fast_accum=True,
+                )
         else:
             assert weight_column_major == True
             c = grouped_gemm_triton(
