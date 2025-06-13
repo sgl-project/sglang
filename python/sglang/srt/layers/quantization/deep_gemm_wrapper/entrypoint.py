@@ -40,7 +40,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
     kernel_type = DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
     _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
 
-    with _log_jit_build(expected_m, n, k, kernel_type):
+    with _with_deep_gemm_execution(expected_m, n, k, kernel_type):
         _grouped_gemm_nt_f8f8bf16_masked_raw(
             lhs, rhs, out, masked_m, expected_m
         )
@@ -58,7 +58,7 @@ def grouped_gemm_nt_f8f8bf16_contig(
     kernel_type = DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG
     _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
 
-    with _log_jit_build(m, n, k, kernel_type):
+    with _with_deep_gemm_execution(m, n, k, kernel_type):
         _grouped_gemm_nt_f8f8bf16_contig_raw(lhs, rhs, out, m_indices)
 
 
@@ -73,7 +73,7 @@ def gemm_nt_f8f8bf16(
     kernel_type = DeepGemmKernelType.GEMM_NT_F8F8BF16
     _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, 1)
 
-    with _log_jit_build(m, n, k, kernel_type):
+    with _with_deep_gemm_execution(m, n, k, kernel_type):
         _gemm_nt_f8f8bf16_raw(
             lhs,
             rhs,
@@ -81,6 +81,12 @@ def gemm_nt_f8f8bf16(
             # NOTE HACK
             recipe=(1, 128, 128),
         )
+
+
+@contextmanager
+def _with_deep_gemm_execution(m: int, n: int, k: int, kernel_type: DeepGemmKernelType):
+    with _log_jit_build(m, n, k, kernel_type):
+        yield
 
 
 # TODO improve?
