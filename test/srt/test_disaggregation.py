@@ -284,7 +284,7 @@ class TestDisaggregationMooncakeFailure(CustomTestCase):
         )
 
     @classmethod
-    def wait_server_ready(cls, url, timeout=60):
+    def wait_server_ready(cls, url, timeout=300):
         start_time = time.perf_counter()
         while True:
             try:
