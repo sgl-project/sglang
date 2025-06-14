@@ -45,7 +45,11 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    ScheduleBatch,
+    global_server_args_dict,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -164,11 +168,15 @@ class DecodePreallocQueue:
         self.bootstrap_port = bootstrap_port
 
         self.num_reserved_decode_tokens = int(
-            os.environ.get("SGLANG_NUM_RESERVED_DECODE_TOKENS", "512")
+            os.environ.get(
+                "SGLANG_NUM_RESERVED_DECODE_TOKENS",
+                global_server_args_dict["num_reserved_decode_tokens"],
+            )
         )
 
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
+        self.retracted_queue: List[Req] = []
         self.transfer_backend = transfer_backend
         self.kv_manager = self._init_kv_manager()
 
@@ -205,8 +213,16 @@ class DecodePreallocQueue:
         )
         return kv_manager
 
-    def add(self, req: Req) -> None:
+    def add(self, req: Req, is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
+        if self._check_if_req_exceed_kv_capacity(req):
+            return
+        
+        if is_retracted:
+            self.retracted_queue.append(req)
+        else:
+
+
         if req.bootstrap_host == FakeBootstrapHost:
             # Fake transfer for warmup reqs
             kv_receiver_class = get_kv_class(TransferBackend.FAKE, KVClassType.RECEIVER)
@@ -222,10 +238,57 @@ class DecodePreallocQueue:
         )
         self.queue.append(DecodeRequest(req=req, kv_receiver=kv_receiver))
 
-    def extend(self, reqs: List[Req]) -> None:
+    def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
+
+        if len(req.origin_input_ids) > self.max_total_num_tokens:
+            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
+            logger.error(message)
+            prepare_abort(req, message)
+            self.scheduler.stream_output([req], req.return_logprob)
+            return True
+        return False
+
+    def extend(self, reqs: List[Req], is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
         for req in reqs:
-            self.add(req)
+            self.add(req, is_retracted=is_retracted)
+
+    def resume_retracted_reqs(self) -> List[Req]:
+        # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
+
+        # allocate memory
+        resumed_reqs = []
+        indices_to_remove = set()
+        allocatable_tokens = self._allocatable_tokens(count_retracted=False)
+
+        for i, req in enumerate(self.retracted_queue):
+            if self.req_to_token_pool.available_size() <= 0:
+                break
+
+            required_tokens_for_request = (
+                len(req.origin_input_ids)
+                + len(req.output_ids)
+                + self.num_reserved_decode_tokens
+            )
+            if required_tokens_for_request > allocatable_tokens:
+                break
+
+            resumed_reqs.append(req)
+            indices_to_remove.add(i)
+            req.is_retracted = False
+            self._pre_alloc(req)
+            allocatable_tokens -= required_tokens_for_request
+
+            # load from cpu, release the cpu copy
+            req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+
+        self.retracted_queue = [
+            entry
+            for i, entry in enumerate(self.retracted_queue)
+            if i not in indices_to_remove
+        ]
+
+        return resumed_reqs
 
     def _update_handshake_waiters(self) -> None:
         if not self.queue:
@@ -262,8 +325,16 @@ class DecodePreallocQueue:
 
         preallocated_reqs = []
         indices_to_remove = set()
-        allocatable_tokens = self._allocatable_tokens()
 
+        # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
+        # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
+        retractable_tokens = sum(
+            len(r.origin_input_ids) + len(r.output_ids)
+            for r in self.scheduler.running_batch.reqs
+        )
+        allocatable_tokens = self._allocatable_tokens(
+            retractable_tokens=retractable_tokens, count_retracted=True
+        )
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
@@ -272,6 +343,7 @@ class DecodePreallocQueue:
                 )
                 indices_to_remove.add(i)
 
+        # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
             if i in indices_to_remove:
                 continue
@@ -285,10 +357,23 @@ class DecodePreallocQueue:
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
 
+            # Memory estimation: don't add if the projected memory cannot be met
+            # TODO: add new_token ratio
+            origin_input_len = len(decode_req.req.origin_input_ids)
             required_tokens_for_request = (
-                len(decode_req.req.origin_input_ids) + self.num_reserved_decode_tokens
+                origin_input_len + self.num_reserved_decode_tokens
             )
 
+            if (
+                max(
+                    required_tokens_for_request,
+                    origin_input_len
+                    + decode_req.req.sampling_params.max_new_tokens
+                    - retractable_tokens,
+                )
+                > allocatable_tokens
+            ):
+                break
             if required_tokens_for_request > allocatable_tokens:
                 break
 
@@ -321,15 +406,35 @@ class DecodePreallocQueue:
 
         return preallocated_reqs
 
-    def _allocatable_tokens(self) -> int:
-        allocatable_tokens = (
-            self.token_to_kv_pool_allocator.available_size()
-            - self.num_reserved_decode_tokens
+    def _allocatable_tokens(
+        self, retractable_tokens: Optional[int] = None, count_retracted: bool = True
+    ) -> int:
+        need_space_for_single_req = (
+            max(
+                [
+                    x.sampling_params.max_new_tokens
+                    + len(x.origin_input_ids)
+                    - retractable_tokens
+                    for x in self.scheduler.running_batch.reqs
+                ]
+            )
+            if retractable_tokens is not None
+            and len(self.scheduler.running_batch.reqs) > 0
+            else 0
+        )
+
+        available_size = self.token_to_kv_pool_allocator.available_size()
+
+        allocatable_tokens = available_size - max(
+            # preserve some space for future decode
+            self.num_reserved_decode_tokens
             * (
                 len(self.scheduler.running_batch.reqs)
                 + len(self.transfer_queue.queue)
                 + len(self.scheduler.waiting_queue)
-            )
+            ),
+            # make sure each request can finish if reach max_tokens with all other requests retracted
+            need_space_for_single_req,
         )
 
         # Note: if the last fake extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
@@ -342,13 +447,24 @@ class DecodePreallocQueue:
                 self.scheduler.last_batch.reqs
             )
 
+        if count_retracted:
+            allocatable_tokens -= sum(
+                [
+                    len(req.origin_input_ids)
+                    + len(req.output_ids)
+                    + self.num_reserved_decode_tokens
+                    for req in self.retracted_queue
+                ]
+            )
         return allocatable_tokens
 
     def _pre_alloc(self, req: Req) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool"""
         req_pool_indices = self.req_to_token_pool.alloc(1)
 
-        assert req_pool_indices is not None
+        assert (
+            req_pool_indices is not None
+        ), "req_pool_indices is full! There is a bug in memory estimation."
 
         req.req_pool_idx = req_pool_indices[0]
         if self.token_to_kv_pool_allocator.page_size == 1:
@@ -375,7 +491,10 @@ class DecodePreallocQueue:
                 ),
                 extend_num_tokens=num_tokens,
             )
-        assert kv_loc is not None
+
+        assert (
+            kv_loc is not None
+        ), "KV cache is full! There is a bug in memory estimation."
 
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
 
@@ -412,7 +531,7 @@ class DecodeTransferQueue:
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
 
-    def pop_transferred(self) -> List[DecodeRequest]:
+    def pop_transferred(self) -> List[Req]:
         if not self.queue:
             return []
 
@@ -716,6 +835,13 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
+        # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
+        resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
+        self.waiting_queue.extend(resumed_reqs)
+        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
+            # if there are still retracted requests, we do not allocate new requests
+            return
+
         req_conns = self.disagg_decode_prealloc_queue.pop_preallocated()
         self.disagg_decode_transfer_queue.extend(req_conns)
         alloc_reqs = (

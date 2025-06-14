@@ -72,33 +72,33 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 GLOBAL_SERVER_ARGS_KEYS = [
     "attention_backend",
-    "mm_attention_backend",
+    "chunked_prefill_size",
     "debug_tensor_dump_inject",
     "debug_tensor_dump_output_folder",
-    "chunked_prefill_size",
+    "deepep_config",
+    "deepep_mode",
     "device",
     "disable_chunked_prefix_cache",
     "disable_radix_cache",
+    "disable_shared_experts_fusion",
     "enable_dp_attention",
     "enable_two_batch_overlap",
     "enable_dp_lm_head",
     "enable_deepep_moe",
-    "deepep_mode",
     "enable_ep_moe",
-    "moe_dense_tp_size",
     "ep_dispatch_algorithm",
-    "deepep_config",
     "ep_num_redundant_experts",
     "enable_nan_detection",
     "flashinfer_mla_disable_ragged",
     "max_micro_batch_size",
-    "disable_shared_experts_fusion",
+    "mm_attention_backend",
+    "moe_dense_tp_size",
+    "num_reserved_decode_tokens",
     "sampling_backend",
     "speculative_accept_threshold_acc",
     "speculative_accept_threshold_single",
     "torchao_config",
     "triton_attention_reduce_in_fp32",
-    "num_reserved_decode_tokens",
 ]
 
 # Put some global args for easy access
@@ -1414,6 +1414,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
+            if server_args.disaggregation_mode == "decode":
+                req.offload_kv_cache(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
+                )
+
 
             if isinstance(self.tree_cache, ChunkCache):
                 # ChunkCache does not have eviction
@@ -1445,6 +1450,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.tree_cache.evict(residual_size)
 
             req.reset_for_retract()
+
+            if len(retracted_reqs) == 0:
+                # Corner case: only one request left
+                raise ValueError(
+                    "Failed to retract any request. No space left for only one request."
+                )
 
         self.filter_batch(keep_indices=sorted_indices)
 
@@ -1736,7 +1747,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def __str__(self):
         return (
             f"ScheduleBatch(forward_mode={self.forward_mode.name}, "
-            f"#req={(len(self.reqs))})"
         )
 
 

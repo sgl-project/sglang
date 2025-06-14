@@ -1116,12 +1116,12 @@ class Scheduler(
         else:
             self.waiting_queue.append(req)
 
-    def _extend_requests_to_queue(self, reqs: List[Req]):
+    def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.disagg_prefill_bootstrap_queue.extend(reqs)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # If this is a decode server, we put the request to the decode pending prealloc queue
-            self.disagg_decode_prealloc_queue.extend(reqs)
+            self.disagg_decode_prealloc_queue.extend(reqs, is_retracted=is_retracted)
         else:
             self.waiting_queue.extend(reqs)
 
@@ -1264,6 +1264,7 @@ class Scheduler(
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
+            msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         msg += (
             f"cuda graph: {can_run_cuda_graph}, "
@@ -1565,7 +1566,7 @@ class Scheduler(
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
-            self._extend_requests_to_queue(retracted_reqs)
+            self._extend_requests_to_queue(retracted_reqs, is_retracted=True)
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,

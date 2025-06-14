@@ -57,4 +57,5 @@ class TestRetractDecodeChunkCache(CustomTestCase):
 
 
 if __name__ == "__main__":
+    os.environ["SGLANG_TEST_RETRACT"] = "true"
     unittest.main()

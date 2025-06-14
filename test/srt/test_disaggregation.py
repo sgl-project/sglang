@@ -469,5 +469,148 @@ class TestDisaggregationMooncakeSpec(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.20)
 
 
+class TestPDAccuracyRetract(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        os.environ["SGLANG_TEST_RETRACT"] = "true"
+        cls.lb_grpc_port = 9888
+        cls.base_url = "http://127.0.0.1:30405"
+        cls.process = popen_launch_server(
+            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            pd_separated=True,
+            other_args=[
+                "--local",
+                "--lb-grpc-port",
+                cls.lb_grpc_port,
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        os.environ["SGLANG_TEST_RETRACT"] = "false"
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+
+        self.assertGreater(metrics["accuracy"], 0.24)
+        # Wait a little bit so that the memory check happens.
+        time.sleep(5)
+
+
+class TestPDRetractDecodeOOM(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.lb_grpc_port = 2837
+        cls.base_url = "http://127.0.0.1:21037"
+        cls.process = popen_launch_server(
+            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            pd_separated=True,
+            other_args=[
+                "--lb-grpc-port",
+                cls.lb_grpc_port,
+                "--quantization",
+                "fp8",
+                "--tp",
+                8,
+                "--num-p",
+                1,
+                "--num-d",
+                1,
+                "--mem-fraction-static",
+                0.37,  # tuned for H100
+                "--context-length",
+                400000,
+                "--disable-radix-cache",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                5,
+                "--speculative-eagle-topk",
+                8,
+                "--speculative-num-draft-tokens",
+                16,
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_long_decode1(self):
+        # The first request will consume most of the memory pool,
+        # so that the second request should not enter the transfer queue.
+        args = get_benchmark_args(
+            base_url="http://127.0.0.1:" + str(self.lb_grpc_port),
+            dataset_name="random",
+            dataset_path="",
+            tokenizer=self.tokenizer,
+            num_prompts=2,
+            random_input_len=302000,
+            random_output_len=8000,
+            random_range_ratio=1,
+            request_rate=float("inf"),
+            port=self.lb_grpc_port,
+            seed=42,
+            pd_separated=True,
+        )
+        res = run_benchmark(args)
+
+        assert res["completed"] == 2
+
+        # additional tests to against fluctuations
+        """
+        args = get_benchmark_args(
+            base_url="http://127.0.0.1:" + str(self.lb_grpc_port),
+            dataset_name="random",
+            dataset_path="",
+            tokenizer=self.tokenizer,
+            num_prompts=2,
+            random_input_len=301000,
+            random_output_len=8000,
+            random_range_ratio=1,
+            request_rate=float("inf"),
+            port=self.lb_grpc_port,
+            seed=42,
+            pd_separated=True,
+        )
+        res = run_benchmark(args)
+
+        assert res["completed"] == 2
+        """
+
+        args = get_benchmark_args(
+            base_url="http://127.0.0.1:" + str(self.lb_grpc_port),
+            dataset_name="random",
+            dataset_path="",
+            tokenizer=self.tokenizer,
+            num_prompts=2,
+            random_input_len=303000,
+            random_output_len=8000,
+            random_range_ratio=1,
+            request_rate=float("inf"),
+            port=self.lb_grpc_port,
+            seed=42,
+            pd_separated=True,
+        )
+        res = run_benchmark(args)
+
+        assert res["completed"] == 2
+
+
 if __name__ == "__main__":
     unittest.main()
