@@ -24,10 +24,8 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     CommonKVReceiver,
 )
-from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
-    group_concurrent_contiguous,
-)
+from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_local_ip_by_remote
 
@@ -350,7 +348,14 @@ class NixlKVManager(CommonKVManager):
 
 class NixlKVSender(BaseKVSender):
 
-    def __init__(self, mgr: NixlKVManager, bootstrap_addr: str, bootstrap_room: int):
+    def __init__(
+        self,
+        mgr: NixlKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: int,
+        dest_tp_ranks: List[int],
+        pp_rank: int,
+    ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
         self.aux_index = None
