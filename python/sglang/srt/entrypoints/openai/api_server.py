@@ -26,7 +26,7 @@ from typing import Dict
 
 import uvicorn
 import uvloop
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
@@ -55,20 +55,20 @@ class AppState:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    app.state.server_args.enable_metrics = True  # By default, we enable metrics
+
     server_args = app.state.server_args
 
     # Initialize engine
-    logger.info(
-        f"SGLang OpenAI server (PID: {os.getpid()}) is initializing with args: {server_args}"
-    )
+    logger.info(f"SGLang OpenAI server (PID: {os.getpid()}) is initializing...")
 
     tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
     app.state.tokenizer_manager = tokenizer_manager
     app.state.scheduler_info = scheduler_info
 
-    set_prometheus_multiproc_dir()
-    add_prometheus_middleware(app)
-    enable_func_timer()
+    if server_args.enable_metrics:
+        add_prometheus_middleware(app)
+        enable_func_timer()
 
     # Initialize engine state attribute to None for now
     app.state.engine = None
@@ -126,6 +126,55 @@ async def show_models():
             )
         )
     return ModelList(data=model_cards)
+
+
+@app.post("/v1/completions")
+async def openai_v1_completions(raw_request: Request):
+    pass
+
+
+@app.post("/v1/chat/completions")
+async def openai_v1_chat_completions(raw_request: Request):
+    pass
+
+
+@app.post("/v1/embeddings")
+async def openai_v1_embeddings(raw_request: Request):
+    pass
+
+
+@app.post("/v1/files")
+async def openai_v1_files(file: UploadFile = File(...), purpose: str = Form("batch")):
+    pass
+
+
+@app.delete("/v1/files/{file_id}")
+async def delete_file(file_id: str):
+    # https://platform.openai.com/docs/api-reference/files/delete
+    pass
+
+
+@app.get("/v1/batches/{batch_id}")
+async def retrieve_batch(batch_id: str):
+    pass
+
+
+@app.get("/v1/files/{file_id}")
+async def retrieve_file(file_id: str):
+    # https://platform.openai.com/docs/api-reference/files/retrieve
+    pass
+
+
+@app.get("/v1/files/{file_id}/content")
+async def retrieve_file_content(file_id: str):
+    # https://platform.openai.com/docs/api-reference/files/retrieve-contents
+    pass
+
+
+@app.post("/v1/score")
+async def v1_score_request(raw_request: Request):
+    """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
+    pass
 
 
 # Additional API endpoints will be implemented in separate serving_*.py modules
