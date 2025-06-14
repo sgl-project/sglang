@@ -28,12 +28,12 @@ from sglang.srt.disaggregation.base.conn import (
     KVArgs,
     KVPoll,
 )
-from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
-from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
+from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     group_concurrent_contiguous,
 )
+from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_free_port,

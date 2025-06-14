@@ -24,10 +24,8 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     CommonKVReceiver,
 )
-from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
-    group_concurrent_contiguous,
-)
+from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_local_ip_by_remote
 
