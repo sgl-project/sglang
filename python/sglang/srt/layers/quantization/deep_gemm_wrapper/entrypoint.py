@@ -116,11 +116,10 @@ def configure_deep_gemm_num_sms(num_sms):
             deep_gemm.set_num_sms(original_num_sms)
 
 
-def _sanity_check_input_scale(scale):
-    if _SANITY_CHECK_UE8M0:
-        _check_ue8m0(scale)
+def _sanity_check_input_scale(value):
+    if not _SANITY_CHECK_UE8M0:
+        return
 
-def _check_ue8m0(x):
     from sglang.srt.layers.quantization.fp8_utils import ceil_to_ue8m0
-    x_ceil = ceil_to_ue8m0(x)
-    assert torch.all(x == x_ceil), f"{x=} {x_ceil=}"
+    value_ceil = ceil_to_ue8m0(value)
+    assert torch.all(value == value_ceil), f"{value=} {value_ceil=}"
