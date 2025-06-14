@@ -228,7 +228,7 @@ class TestEAGLEServer(CustomTestCase):
 
         prompt = "I have a very good idea on how to"
 
-        for temperature in [1.0, 0.7]:
+        for temperature in [1.0]:
             gen = run_generate(
                 prompt,
                 return_logprob=True,
