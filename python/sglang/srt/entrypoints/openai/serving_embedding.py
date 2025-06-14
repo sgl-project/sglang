@@ -11,7 +11,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Embedding serving logic for OpenAI API"""
+"""
+Embedding serving logic for OpenAI API.
+
+This module implements the /v1/embeddings endpoint, providing OpenAI-compatible
+text and multimodal embedding generation capabilities.
+
+Key Features:
+- Full OpenAI embeddings API compatibility
+- Text embedding generation for single and batch inputs
+- Multimodal embedding support (text + image combinations)
+- Chat template integration for embedding-specific formatting
+- Batch processing for multiple inputs
+- Comprehensive input validation and error handling
+- Token usage tracking and reporting
+
+Supported Input Types:
+- Single string: Direct text input
+- List of strings: Batch text embedding
+- List of MultimodalEmbeddingInput: Text+image combinations
+- Token IDs: Pre-tokenized input sequences
+
+Processing Pipeline:
+1. Input validation and type detection
+2. Multimodal content processing (if applicable)
+3. Chat template application for embedding context
+4. Internal request generation
+5. Model inference for embedding generation
+6. Response formatting with usage statistics
+
+The implementation handles various input formats gracefully and provides
+detailed error messages for invalid inputs. Multimodal embeddings use
+padding for missing text content when needed.
+"""
 
 import logging
 from typing import Any, Dict, List, Union

@@ -11,7 +11,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Utility functions for OpenAI API server"""
+"""
+Utility functions for OpenAI API server.
+
+This module provides shared utility functions used across the OpenAI API implementation,
+including template processing, validation, error handling, and response formatting.
+
+Key Components:
+- Template Format Detection: Analyzes Jinja templates to determine content format
+- Content Processing: Handles multimodal content based on template requirements
+- Token Usage Calculation: Aggregates token usage across requests and responses
+- Error Response Generation: Creates standardized error responses
+- Logprobs Formatting: Converts internal logprobs to OpenAI format
+- Validation Helpers: Common validation functions for requests
+- Streaming Utilities: Helpers for streaming response formatting
+
+Template Format Detection:
+The module includes sophisticated logic to detect whether a chat template expects
+'string' or 'openai' content format by analyzing the Jinja template AST. This enables
+proper content processing for different model types (e.g., DeepSeek vs Llama).
+"""
 
 import json
 import logging

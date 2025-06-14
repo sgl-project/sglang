@@ -11,7 +11,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Pre-built validation rules for OpenAI API parameters"""
+"""
+Pre-built validation rules for OpenAI API parameters.
+
+This module provides comprehensive validation for all OpenAI API request parameters,
+ensuring requests meet both OpenAI standards and SGLang-specific requirements.
+
+Key Components:
+- ValidationRule: Encapsulates parameter validation logic
+- Parameter Validators: Specific validation functions for different parameter types
+- Request Type Handlers: Validation rule sets for different endpoint types
+- Common Validators: Shared validation logic across endpoints
+
+Validation Categories:
+- Basic Types: String, number, boolean validation
+- Ranges: Min/max validation for numeric parameters
+- Formats: Pattern matching for structured data
+- Content: Message and prompt content validation
+- Constraints: Cross-parameter dependency validation
+
+The validation system is designed to provide clear, actionable error messages
+that help users understand and fix request issues quickly.
+
+Usage:
+Validation rules are automatically applied based on request type. Each rule
+specifies the parameter name, validation function, and parameter accessor,
+allowing for flexible and comprehensive validation coverage.
+"""
 
 import logging
 import re

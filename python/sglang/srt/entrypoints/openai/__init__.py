@@ -11,13 +11,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""OpenAI-compatible API server module"""
+"""
+OpenAI-compatible API server module for SGLang.
 
-from .protocol import *
-from .serving_engine import OpenAIServingBase, RequestContext
-from .utils import *
+This module provides OpenAI-compatible API endpoints that allow existing OpenAI client
+applications to seamlessly work with SGLang models. The implementation includes:
 
-__all__ = [
-    "OpenAIServingBase",
-    "RequestContext",
-]
+Key Features:
+- Full OpenAI API compatibility for chat completions, text completions, and embeddings
+- Streaming support for real-time response generation
+- Batch processing capabilities for multiple requests
+- Function calling and tool use support
+- Multimodal input support (text, images, audio)
+- Advanced reasoning capabilities with separate reasoning content
+- Custom sampling parameters and constraints (regex, JSON schema, EBNF)
+- LoRA adapter support for fine-tuned models
+- Cache reporting and token usage tracking
+
+Supported Endpoints:
+- /v1/chat/completions - Chat-based completions with conversation history
+- /v1/completions - Text completions for single prompts
+- /v1/embeddings - Text/multimodal embeddings generation
+- /v1/models - Model listing and information
+
+The module is structured with separate handlers for each endpoint type, all inheriting
+from a common base class that provides shared functionality like request validation,
+error handling, and response formatting.
+
+Architecture:
+- OpenAIServingBase: Abstract base class for all endpoint handlers
+- ChatCompletionHandler: Handles chat completion requests
+- CompletionHandler: Handles text completion requests
+- EmbeddingHandler: Handles embedding requests
+- Protocol classes: Pydantic models for request/response validation
+- Utility functions: Shared helpers for formatting and validation
+"""

@@ -11,7 +11,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Completion serving logic for OpenAI API"""
+"""
+Text completion serving logic for OpenAI API.
+
+This module implements the /v1/completions endpoint, providing OpenAI-compatible
+text completion functionality for single prompts without conversation context.
+
+Key Features:
+- Full OpenAI text completions API compatibility
+- Streaming and non-streaming response modes
+- Echo support to include the prompt in the response
+- Custom completion templates for specialized use cases
+- Advanced sampling parameters and output constraints
+- Batch processing support for multiple prompts
+- LoRA adapter support for fine-tuned models
+- Token-level logprobs with configurable detail levels
+
+Processing Pipeline:
+1. Request validation and prompt preprocessing
+2. Completion template application if configured
+3. Sampling parameter configuration
+4. Internal request generation with SGLang extensions
+5. Model inference with optional streaming
+6. Response formatting with echo handling
+7. Logprobs processing and token usage calculation
+
+The implementation supports various prompt formats including strings, token IDs,
+and batched inputs, with automatic type detection and validation.
+"""
 
 import time
 from typing import Any, Dict, List, Union
