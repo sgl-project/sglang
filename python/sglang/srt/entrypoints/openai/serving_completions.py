@@ -58,10 +58,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionStreamResponse,
     ErrorResponse,
 )
-from sglang.srt.entrypoints.openai.serving_engine import (
-    OpenAIServingBase,
-    RequestContext,
-)
+from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase, RequestContext
 from sglang.srt.entrypoints.openai.utils import (
     aggregate_token_usage,
     build_base_sampling_params,

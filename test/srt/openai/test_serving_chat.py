@@ -30,7 +30,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import ChatCompletionHandler
-from sglang.srt.entrypoints.openai.serving_engine import RequestContext
 from sglang.srt.entrypoints.openai.utils import (
     build_base_sampling_params,
     create_error_response,

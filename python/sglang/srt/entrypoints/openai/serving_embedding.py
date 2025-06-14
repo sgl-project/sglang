@@ -59,10 +59,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     MultimodalEmbeddingInput,
     UsageInfo,
 )
-from sglang.srt.entrypoints.openai.serving_engine import (
-    OpenAIServingBase,
-    RequestContext,
-)
+from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase, RequestContext
 from sglang.srt.entrypoints.openai.utils import create_error_response
 from sglang.srt.managers.io_struct import EmbeddingReqInput
 

@@ -67,10 +67,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     TopLogprob,
     UsageInfo,
 )
-from sglang.srt.entrypoints.openai.serving_engine import (
-    OpenAIServingBase,
-    RequestContext,
-)
+from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase, RequestContext
 from sglang.srt.entrypoints.openai.utils import (
     _get_enable_thinking_from_request,
     aggregate_token_usage,

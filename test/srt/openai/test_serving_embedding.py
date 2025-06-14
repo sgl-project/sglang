@@ -25,7 +25,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_embedding import EmbeddingHandler
-from sglang.srt.entrypoints.openai.serving_engine import RequestContext
 from sglang.srt.managers.io_struct import EmbeddingReqInput
 
 
