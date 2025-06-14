@@ -223,6 +223,7 @@ class ServerArgs:
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: Optional[str] = None
     pdlb_url: Optional[str] = None
+    enable_remote_prefill: bool = False
 
     def __post_init__(self):
         # Expert parallelism
@@ -1466,6 +1467,11 @@ class ServerArgs:
             type=str,
             default=None,
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
+        )
+        parser.add_argument(
+            "--enable-remote-prefill",
+            action="store_true",
+            help="Enable remote prefill",
         )
 
         parser.add_argument(

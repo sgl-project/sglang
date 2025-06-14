@@ -7,13 +7,15 @@ import threading
 import warnings
 from collections import deque
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
+import numpy.typing as npt
 import requests
 import torch
 import torch.distributed as dist
 
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import get_ip, get_local_ip_by_remote
 
 if TYPE_CHECKING:
@@ -24,12 +26,24 @@ FakeBootstrapHost = "2.2.2.2"
 # env var for testing failure, convert to float explicitly
 FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 
+@dataclasses.dataclass
+class RemotePrefillReq:
+    rid: str
+    origin_input_text: str
+    origin_input_ids: Tuple[int]
+    sampling_params: SamplingParams
+    kv_indices: bytes
+    rank_ip: str
+    rank_port: int
+    engine_rank:int
+    aux_index: int
+    bootstrap_room: int
+    engine_id: str
 
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
     DECODE = "decode"
-
 
 def poll_and_all_reduce(pollers, gloo_group):
     # at a certain prob, the poll is failed to simulate failure

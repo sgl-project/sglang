@@ -20,11 +20,14 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections import deque
 from dataclasses import dataclass
+import hashlib
 from http import HTTPStatus
+import threading
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
@@ -47,7 +50,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator, KVCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 logger = logging.getLogger(__name__)
@@ -85,6 +88,7 @@ class DecodePreallocQueue:
         tp_size: int,
         bootstrap_port: int,
         transfer_backend: TransferBackend,
+        is_remote_prefill: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -104,6 +108,8 @@ class DecodePreallocQueue:
         self.num_reserved_decode_tokens = int(
             os.environ.get("SGLANG_NUM_RESERVED_DECODE_TOKENS", "512")
         )
+
+        self.is_remote_prefill = is_remote_prefill
 
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
@@ -140,6 +146,7 @@ class DecodePreallocQueue:
             DisaggregationMode.DECODE,
             self.scheduler.server_args,
             self.is_mla_backend,
+            self.is_remote_prefill,
         )
         return kv_manager
 
@@ -248,7 +255,7 @@ class DecodePreallocQueue:
             page_indices = kv_to_page_indices(
                 kv_indices, self.token_to_kv_pool_allocator.page_size
             )
-            decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
+            decode_req.kv_receiver.init(decode_req.req, page_indices, decode_req.metadata_buffer_index)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
 
@@ -335,6 +342,7 @@ class DecodeTransferQueue:
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
+        is_remote_prefill: bool = False
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
@@ -342,6 +350,7 @@ class DecodeTransferQueue:
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.tree_cache = tree_cache
+        self.is_remote_prefill = is_remote_prefill
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)

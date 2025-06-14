@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVArgs,
     KVPoll,
 )
+from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ class FakeKVReceiver(BaseKVReceiver):
             logger.info("FakeKVReceiver poll success")
             return KVPoll.Success
 
-    def init(self, kv_indices: list[int], aux_index: Optional[int] = None):
+    def init(self, req: Req, kv_indices: list[int], aux_index: Optional[int] = None):
         self.has_init = True
         logger.info(
             f"FakeKVReceiver init with kv_indices: {kv_indices}, aux_index: {aux_index}"
