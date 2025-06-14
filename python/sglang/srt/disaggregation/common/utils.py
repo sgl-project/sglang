@@ -1,4 +1,3 @@
-
 import threading
 from collections import deque
 from typing import List, Tuple
