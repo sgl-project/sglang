@@ -1,8 +1,8 @@
 import threading
-from typing import TYPE_CHECKING, Dict, List, Set, Tuple
+from typing import IO, TYPE_CHECKING, Dict, List, Set, Tuple
 
 import torch
-from sgl_kernel.radix_tree import RadixTreeCpp, TreeNodeCpp
+from sgl_kernel.radix_tree import IOHandle, RadixTreeCpp, TreeNodeCpp
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import (
@@ -56,12 +56,12 @@ class CacheOperation:
         self,
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
-        node_id: TreeNodeCpp,
+        handle: IOHandle,
         priority: Optional[int] = None,
     ):
         self.host_indices = host_indices
         self.device_indices = device_indices
-        self.node_ids = [node_id]
+        self.handles = [handle]
         self.data = None
 
         self.id = CacheOperation.counter
@@ -74,7 +74,7 @@ class CacheOperation:
         self.host_indices = torch.cat([self.host_indices, other.host_indices])
         self.device_indices = torch.cat([self.device_indices, other.device_indices])
         self.priority = min(self.priority, other.priority)
-        self.node_ids.extend(other.node_ids)
+        self.handles.extend(other.handles)
 
     def __lt__(self, other: "CacheOperation"):
         return self.priority < other.priority
@@ -109,11 +109,11 @@ class HiCacheController_v2:
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
 
-        self.write_queue = PriorityQueue[TreeNodeCpp]()
+        self.write_queue = PriorityQueue[CacheOperation]()
         self.load_queue = PriorityQueue[CacheOperation]()
 
-        self.ack_write_queue = Queue[TreeNodeCpp]()
-        self.ack_load_queue = Queue[TreeNodeCpp]()
+        self.ack_write_queue = Queue[IOHandle]()
+        self.ack_load_queue = Queue[IOHandle]()
 
         self.stop_event = threading.Event()
 
@@ -150,19 +150,18 @@ class HiCacheController_v2:
         self.write_thread.start()
         self.load_thread.start()
 
-    def write(self, node_id: TreeNodeCpp):
-        self.write_queue.put(node_id)
+    def write(
+        self, device_indices: torch.Tensor, host_indices: torch.Tensor, handle: IOHandle
+    ):
+        self.write_queue.put(CacheOperation(host_indices, device_indices, handle))
 
     def load(
-        self,
-        device_indices: torch.Tensor,
-        host_indices: torch.Tensor,
-        node_id: TreeNodeCpp,
+        self, device_indices: torch.Tensor, host_indices: torch.Tensor, handle: IOHandle
     ):
         """
         Load KV caches from host memory to device memory.
         """
-        self.load_queue.put(CacheOperation(host_indices, device_indices, node_id))
+        self.load_queue.put(CacheOperation(host_indices, device_indices, handle))
 
     def write_thread_func_direct(self):
         """
@@ -171,9 +170,7 @@ class HiCacheController_v2:
         torch.cuda.set_stream(self.write_stream)  # type: ignore
         while not self.stop_event.is_set():
             try:
-                node_id = self.write_queue.get(block=True, timeout=1)
-                device_indices, host_indices = self.tree.start_write_through(node_id)
-                operation = CacheOperation(host_indices, device_indices, node_id)
+                operation = self.write_queue.get(block=True, timeout=1)
                 if not self.oracle:
                     if self.page_size == 1:
                         self.mem_pool_host.transfer_all_layer_kernel(
@@ -191,7 +188,7 @@ class HiCacheController_v2:
                         self.write_stream.synchronize()
 
                 self.mem_pool_host.complete_io(operation.host_indices)
-                for node_id in operation.node_ids:
+                for node_id in operation.handles:
                     if node_id != 0:
                         self.ack_write_queue.put(node_id)
             except Empty:
@@ -247,7 +244,7 @@ class HiCacheController_v2:
                 self.layer_done_counter.increment()
 
             self.mem_pool_host.complete_io(batch_operation.host_indices)
-            for node_id in batch_operation.node_ids:
+            for node_id in batch_operation.handles:
                 if node_id != 0:
                     self.ack_load_queue.put(node_id)
 
@@ -346,9 +343,9 @@ class HiRadixCacheCpp(BasePrefixCache):
         )
 
         # record the nodes with ongoing write through
-        self.ongoing_write_through: Set[TreeNodeCpp] = set()
+        self.ongoing_write_through: Set[IOHandle] = set()
         # record the node segments with ongoing load back
-        self.ongoing_load_back: Dict[TreeNodeCpp, Tuple[TreeNodeCpp, TreeNodeCpp]] = {}
+        self.ongoing_load_back: Set[IOHandle] = set()
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if hicache_write_policy == "write_through" else 2
@@ -382,10 +379,10 @@ class HiRadixCacheCpp(BasePrefixCache):
         Returns:
             int: Number of device nodes that were already present in the tree before the insertion.
         """
-        ongoing_write_node, length = self.tree.insert(key, value)
-        self.ongoing_write_through.update(ongoing_write_node)
-        for node_id in ongoing_write_node:
-            self.cache_controller.write(node_id)
+        ongoing_write, length = self.tree.writing_through(key, value)
+        for io_handle, device_indices, host_indices in ongoing_write:
+            self.cache_controller.write(device_indices, host_indices, io_handle)
+
         return length
 
     def dec_lock_ref(self, node: TreeNodeCpp):
@@ -494,7 +491,7 @@ class HiRadixCacheCpp(BasePrefixCache):
         host_node: TreeNodeCpp,
         new_device_indices: torch.Tensor,
     ):
-        host_indices_vec = self.tree.load_onboard(
+        io_handle, host_indices_vec = self.tree.loading_onboard(
             device_node, host_node, new_device_indices
         )
         host_indices = self.merge_tensor(host_indices_vec)
@@ -502,7 +499,7 @@ class HiRadixCacheCpp(BasePrefixCache):
         self.cache_controller.load(
             device_indices=new_device_indices,
             host_indices=host_indices,
-            node_id=host_node,  # NOTE: node is actually an int id
+            handle=io_handle,  # NOTE: node is actually an int id
         )
 
     def ready_to_load_host(self):
@@ -525,7 +522,7 @@ class HiRadixCacheCpp(BasePrefixCache):
             )
         for _ in range(int(queue_size.item())):
             ack_id = self.cache_controller.ack_write_queue.get()
-            self.tree.commit_write_through(ack_id, True)
+            self.tree.commit_writing_through(ack_id, True)
             self.ongoing_write_through.remove(ack_id)
 
     def loading_check(self):
@@ -534,6 +531,5 @@ class HiRadixCacheCpp(BasePrefixCache):
                 ack_id = self.cache_controller.ack_load_queue.get_nowait()
             except Exception:
                 break
-            start_node, end_node = self.ongoing_load_back[ack_id]
-            self.tree.commit_load_onboard(start_node, end_node, True)
-            del self.ongoing_load_back[ack_id]
+            self.tree.commit_loading_onboard(ack_id, True)
+            self.ongoing_load_back.remove(ack_id)
