@@ -10,7 +10,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import requests
-import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
@@ -23,10 +22,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
     run_logprob_check,
 )
-
-torch_dtype = torch.float16
-prefill_tolerance = 5e-2
-decode_tolerance: float = 5e-2
 
 
 class TestEAGLEServer(CustomTestCase):
@@ -202,7 +197,11 @@ class TestEAGLEServer(CustomTestCase):
         """Test the output logprobs are close to the input logprobs if we run a prefill again."""
 
         def run_generate(
-            prompt, return_logprob=False, max_new_tokens=512, logprob_start_len=-1
+            prompt,
+            return_logprob=False,
+            max_new_tokens=512,
+            logprob_start_len=-1,
+            temperature=1.0,
         ):
 
             if isinstance(prompt, str):
@@ -215,45 +214,58 @@ class TestEAGLEServer(CustomTestCase):
                 json={
                     **prompt_kwargs,
                     "sampling_params": {
-                        "temperature": 1.0,
+                        "temperature": temperature,
                         "max_new_tokens": max_new_tokens,
                         "ignore_eos": True,
                     },
                     "return_logprob": return_logprob,
                     "return_text_in_logprobs": True,
                     "logprob_start_len": logprob_start_len,
+                    "temp_scaled_logprobs": True,
                 },
             )
             return response.json()
 
         prompt = "I have a very good idea on how to"
 
-        gen = run_generate(prompt, return_logprob=True, logprob_start_len=0)
-        output_logprobs = np.array(
-            [x[0] for x in gen["meta_info"]["output_token_logprobs"]]
-        )
-        num_prompts_tokens = gen["meta_info"]["prompt_tokens"]
+        for temperature in [1.0]:
+            gen = run_generate(
+                prompt,
+                return_logprob=True,
+                logprob_start_len=0,
+                temperature=temperature,
+            )
+            output_logprobs = np.array(
+                [x[0] for x in gen["meta_info"]["output_token_logprobs"]]
+            )
+            num_prompts_tokens = gen["meta_info"]["prompt_tokens"]
 
-        input_tokens = [x[1] for x in gen["meta_info"]["input_token_logprobs"]]
-        output_tokens = [x[1] for x in gen["meta_info"]["output_token_logprobs"]]
+            input_tokens = [x[1] for x in gen["meta_info"]["input_token_logprobs"]]
+            output_tokens = [x[1] for x in gen["meta_info"]["output_token_logprobs"]]
 
-        new_prompt = input_tokens + output_tokens
-        score = run_generate(
-            new_prompt, return_logprob=True, logprob_start_len=0, max_new_tokens=0
-        )
-        output_logprobs_score = np.array(
-            [
-                x[0]
-                for x in score["meta_info"]["input_token_logprobs"][num_prompts_tokens:]
-            ]
-        )
+            new_prompt = input_tokens + output_tokens
+            score = run_generate(
+                new_prompt,
+                return_logprob=True,
+                logprob_start_len=0,
+                max_new_tokens=0,
+                temperature=temperature,
+            )
+            output_logprobs_score = np.array(
+                [
+                    x[0]
+                    for x in score["meta_info"]["input_token_logprobs"][
+                        num_prompts_tokens:
+                    ]
+                ]
+            )
 
-        print(f"{output_logprobs[-10:]=}")
-        print(f"{output_logprobs_score[-10:]=}")
+            print(f"{output_logprobs[-10:]=}")
+            print(f"{output_logprobs_score[-10:]=}")
 
-        diff = np.abs(output_logprobs - output_logprobs_score)
-        max_diff = np.max(diff)
-        self.assertLess(max_diff, 0.25)
+            diff = np.abs(output_logprobs - output_logprobs_score)
+            max_diff = np.max(diff)
+            self.assertLess(max_diff, 0.255)
 
     def test_logprob_mixed(self):
         args = []
