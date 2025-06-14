@@ -27,6 +27,7 @@ RUN curl -fsSL -v -o miniforge.sh -O https://github.com/conda-forge/miniforge/re
 
 ENV PATH=/sgl-workspace/miniforge3/bin:/sgl-workspace/miniforge3/condabin:${PATH}
 ENV PIP_ROOT_USER_ACTION=ignore
+ENV CONDA_PREFIX=/sgl-workspace/miniforge3
 
 RUN pip install intel-openmp
 
