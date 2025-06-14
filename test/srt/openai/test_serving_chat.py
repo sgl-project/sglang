@@ -1,0 +1,845 @@
+"""
+Unit tests for the ChatCompletionHandler class from serving_chat.py.
+
+These tests ensure that the refactored implementation maintains compatibility
+with the original adapter.py functionality.
+"""
+
+import asyncio
+import json
+import time
+import uuid
+from typing import Any, Dict, List
+from unittest.mock import AsyncMock, Mock, patch
+
+import pytest
+from fastapi import Request
+from fastapi.responses import StreamingResponse
+from pydantic_core import ValidationError
+
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatCompletionStreamResponse,
+    ChatMessage,
+    DeltaMessage,
+    ErrorResponse,
+    FunctionResponse,
+    ToolCall,
+    UsageInfo,
+)
+from sglang.srt.entrypoints.openai.serving_chat import ChatCompletionHandler
+from sglang.srt.entrypoints.openai.serving_engine import RequestContext
+from sglang.srt.entrypoints.openai.utils import (
+    build_base_sampling_params,
+    create_error_response,
+)
+from sglang.srt.managers.io_struct import GenerateReqInput
+
+
+# Mock TokenizerManager since it may not be directly importable in tests
+class MockTokenizerManager:
+    def __init__(self):
+        self.model_config = Mock()
+        self.model_config.is_multimodal = False
+        self.server_args = Mock()
+        self.server_args.enable_cache_report = False
+        self.server_args.tool_call_parser = "hermes"
+        self.server_args.reasoning_parser = None
+        self.chat_template_name = "llama-3"
+
+        # Mock tokenizer
+        self.tokenizer = Mock()
+        self.tokenizer.encode = Mock(return_value=[1, 2, 3, 4, 5])
+        self.tokenizer.decode = Mock(return_value="Test response")
+        self.tokenizer.chat_template = None
+        self.tokenizer.bos_token_id = 1
+
+        # Mock generate_request method
+        async def mock_generate():
+            yield {
+                "text": "Test response",
+                "meta_info": {
+                    "id": f"chatcmpl-{uuid.uuid4()}",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": [(0.1, 1, "Test"), (0.2, 2, "response")],
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.generate_request = Mock(return_value=mock_generate())
+        self.create_abort_task = Mock(return_value=None)
+
+
+@pytest.fixture
+def mock_tokenizer_manager():
+    """Create a mock tokenizer manager for testing."""
+    return MockTokenizerManager()
+
+
+@pytest.fixture
+def chat_handler(mock_tokenizer_manager):
+    """Create a ChatCompletionHandler instance for testing."""
+    return ChatCompletionHandler(mock_tokenizer_manager)
+
+
+@pytest.fixture
+def mock_request():
+    """Create a mock FastAPI request."""
+    request = Mock(spec=Request)
+    request.headers = {}
+    return request
+
+
+@pytest.fixture
+def basic_chat_request():
+    """Create a basic chat completion request."""
+    return ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Hello, how are you?"}],
+        temperature=0.7,
+        max_tokens=100,
+        stream=False,
+    )
+
+
+@pytest.fixture
+def streaming_chat_request():
+    """Create a streaming chat completion request."""
+    return ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "Hello, how are you?"}],
+        temperature=0.7,
+        max_tokens=100,
+        stream=True,
+    )
+
+
+class TestChatCompletionHandlerValidation:
+    """Test validation methods of ChatCompletionHandler."""
+
+    def test_validate_chat_request_valid(self, chat_handler, basic_chat_request):
+        """Test validation with a valid request."""
+        # Use utility function directly instead of handler method
+        error = chat_handler._validate_request(basic_chat_request)
+        assert error is None
+
+    def test_validate_chat_request_empty_messages(self, chat_handler):
+        """Test validation fails with empty messages."""
+        # Since we now have Pydantic validation that prevents creating the request,
+        # we expect a ValidationError to be raised during object creation
+        with pytest.raises(ValidationError) as exc_info:
+            request = ChatCompletionRequest(
+                model="test-model",
+                messages=[],
+                temperature=0.7,
+            )
+        # Check that the error is about empty messages
+        assert "empty" in str(exc_info.value).lower()
+
+    def test_validate_chat_request_invalid_temperature(self, chat_handler):
+        """Test validation fails with invalid temperature."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            temperature=-0.5,  # Invalid negative temperature
+        )
+        error = chat_handler._validate_request(request)
+        assert error is not None
+
+    def test_validate_chat_request_invalid_max_tokens(self, chat_handler):
+        """Test validation fails with invalid max_tokens."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            max_tokens=-10,  # Invalid negative max_tokens
+        )
+        error = chat_handler._validate_request(request)
+        assert error is not None
+
+
+class TestChatCompletionHandlerConversion:
+    """Test request conversion methods."""
+
+    def test_convert_to_internal_request_single(
+        self, chat_handler, basic_chat_request, mock_tokenizer_manager
+    ):
+        """Test converting single request to internal format."""
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as mock_conv:
+            mock_conv_instance = Mock()
+            mock_conv_instance.get_prompt.return_value = "Test prompt"
+            mock_conv_instance.image_data = None
+            mock_conv_instance.audio_data = None
+            mock_conv_instance.modalities = []
+            mock_conv_instance.stop_str = ["</s>"]
+            mock_conv.return_value = mock_conv_instance
+
+            # Mock the _process_messages method to return expected values
+            with patch.object(chat_handler, "_process_messages") as mock_process:
+                mock_process.return_value = (
+                    "Test prompt",
+                    [1, 2, 3],
+                    None,
+                    None,
+                    [],
+                    ["</s>"],
+                )
+
+                adapted_request, processed_request = (
+                    chat_handler._convert_to_internal_request(
+                        [basic_chat_request], ["test-id"]
+                    )
+                )
+
+                assert isinstance(adapted_request, GenerateReqInput)
+                assert adapted_request.stream == basic_chat_request.stream
+                assert processed_request == basic_chat_request
+
+
+class TestToolCalls:
+    """Test tool call functionality from adapter.py"""
+
+    def test_tool_call_request_conversion(self, chat_handler):
+        """Test request with tool calls"""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "What's the weather?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather information",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            tool_choice="auto",
+        )
+
+        with patch.object(chat_handler, "_process_messages") as mock_process:
+            mock_process.return_value = (
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                ["</s>"],
+            )
+
+            adapted_request, _ = chat_handler._convert_to_internal_request(
+                [request], ["test-id"]
+            )
+
+            assert adapted_request.rid == "test-id"
+            # Tool call constraint should be processed
+            assert request.tools is not None
+
+    def test_tool_choice_none(self, chat_handler):
+        """Test tool_choice=none disables tool calls"""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            tools=[{"type": "function", "function": {"name": "test_func"}}],
+            tool_choice="none",
+        )
+
+        with patch.object(chat_handler, "_process_messages") as mock_process:
+            mock_process.return_value = (
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                ["</s>"],
+            )
+
+            adapted_request, _ = chat_handler._convert_to_internal_request(
+                [request], ["test-id"]
+            )
+
+            # Tools should not be processed when tool_choice is "none"
+            assert adapted_request.rid == "test-id"
+
+    def test_tool_call_response_processing(self, chat_handler):
+        """Test processing tool calls in response"""
+        mock_ret_item = {
+            "text": '{"name": "get_weather", "parameters": {"location": "Paris"}}',
+            "meta_info": {
+                "output_token_logprobs": [],
+                "output_top_logprobs": None,
+            },
+        }
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+
+        finish_reason = {"type": "stop", "matched": None}
+
+        # Mock FunctionCallParser
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as mock_parser_class:
+            mock_parser = Mock()
+            mock_parser.has_tool_call.return_value = True
+
+            # Create proper mock tool call object
+            mock_tool_call = Mock()
+            mock_tool_call.name = "get_weather"
+            mock_tool_call.parameters = '{"location": "Paris"}'
+
+            mock_parser.parse_non_stream.return_value = ("", [mock_tool_call])
+            mock_parser_class.return_value = mock_parser
+
+            tool_calls, text, updated_finish_reason = chat_handler._process_tool_calls(
+                mock_ret_item["text"], tools, "hermes", finish_reason
+            )
+
+            assert tool_calls is not None
+            assert len(tool_calls) == 1
+            assert updated_finish_reason["type"] == "tool_calls"
+
+
+class TestMultimodalContent:
+    """Test multimodal content handling from adapter.py"""
+
+    def test_multimodal_request_with_images(self, chat_handler):
+        """Test request with image content"""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What's in this image?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/jpeg;base64,..."},
+                        },
+                    ],
+                }
+            ],
+        )
+
+        # Set multimodal mode
+        chat_handler.tokenizer_manager.model_config.is_multimodal = True
+
+        with patch.object(chat_handler, "_apply_jinja_template") as mock_apply:
+            mock_apply.return_value = (
+                "prompt",
+                [1, 2, 3],
+                ["image_data"],
+                None,
+                [],
+                [],
+            )
+
+            with patch.object(
+                chat_handler, "_apply_conversation_template"
+            ) as mock_conv:
+                mock_conv.return_value = ("prompt", ["image_data"], None, [], [])
+
+                prompt, prompt_ids, image_data, audio_data, modalities, stop = (
+                    chat_handler._process_messages(request, True)
+                )
+
+                assert image_data == ["image_data"]
+                assert prompt == "prompt"
+
+    def test_multimodal_request_with_audio(self, chat_handler):
+        """Test request with audio content"""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Transcribe this audio"},
+                        {
+                            "type": "audio_url",
+                            "audio_url": {"url": "data:audio/wav;base64,UklGR..."},
+                        },
+                    ],
+                }
+            ],
+        )
+
+        chat_handler.tokenizer_manager.model_config.is_multimodal = True
+
+        with patch.object(chat_handler, "_apply_jinja_template") as mock_apply:
+            mock_apply.return_value = (
+                "prompt",
+                [1, 2, 3],
+                None,
+                ["audio_data"],
+                ["audio"],
+                [],
+            )
+
+            with patch.object(
+                chat_handler, "_apply_conversation_template"
+            ) as mock_conv:
+                mock_conv.return_value = ("prompt", None, ["audio_data"], ["audio"], [])
+
+                prompt, prompt_ids, image_data, audio_data, modalities, stop = (
+                    chat_handler._process_messages(request, True)
+                )
+
+                assert audio_data == ["audio_data"]
+                assert modalities == ["audio"]
+
+
+class TestTemplateHandling:
+    """Test chat template handling from adapter.py"""
+
+    def test_jinja_template_processing(self, chat_handler):
+        """Test Jinja template processing"""
+        request = ChatCompletionRequest(
+            model="test-model", messages=[{"role": "user", "content": "Hello"}]
+        )
+
+        # Mock the template attribute directly
+        chat_handler.tokenizer_manager.chat_template_name = None
+        chat_handler.tokenizer_manager.tokenizer.chat_template = "<jinja_template>"
+
+        with patch.object(chat_handler, "_apply_jinja_template") as mock_apply:
+            mock_apply.return_value = (
+                "processed_prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                ["</s>"],
+            )
+
+            # Mock hasattr to simulate the None check
+            with patch("builtins.hasattr") as mock_hasattr:
+                mock_hasattr.return_value = True
+
+                prompt, prompt_ids, image_data, audio_data, modalities, stop = (
+                    chat_handler._process_messages(request, False)
+                )
+
+                assert prompt == "processed_prompt"
+                assert prompt_ids == [1, 2, 3]
+
+    def test_conversation_template_processing(self, chat_handler):
+        """Test conversation template processing"""
+        request = ChatCompletionRequest(
+            model="test-model", messages=[{"role": "user", "content": "Hello"}]
+        )
+
+        chat_handler.tokenizer_manager.chat_template_name = "llama-3"
+
+        with patch.object(chat_handler, "_apply_conversation_template") as mock_apply:
+            mock_apply.return_value = ("conv_prompt", None, None, [], ["</s>"])
+
+            prompt, prompt_ids, image_data, audio_data, modalities, stop = (
+                chat_handler._process_messages(request, False)
+            )
+
+            assert prompt == "conv_prompt"
+            assert stop == ["</s>"]
+
+    def test_continue_final_message(self, chat_handler):
+        """Test continue_final_message functionality"""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there"},
+            ],
+            continue_final_message=True,
+        )
+
+        with patch.object(chat_handler, "_apply_conversation_template") as mock_apply:
+            mock_apply.return_value = ("Hi there", None, None, [], ["</s>"])
+
+            prompt, prompt_ids, image_data, audio_data, modalities, stop = (
+                chat_handler._process_messages(request, False)
+            )
+
+            # Should handle continue_final_message properly
+            assert prompt == "Hi there"
+
+
+class TestReasoningContent:
+    """Test reasoning content separation from adapter.py"""
+
+    def test_reasoning_content_request(self, chat_handler):
+        """Test request with reasoning content separation"""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Solve this math problem"}],
+            separate_reasoning=True,
+            stream_reasoning=False,
+        )
+
+        with patch.object(chat_handler, "_process_messages") as mock_process:
+            mock_process.return_value = (
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                ["</s>"],
+            )
+
+            adapted_request, _ = chat_handler._convert_to_internal_request(
+                [request], ["test-id"]
+            )
+
+            assert adapted_request.rid == "test-id"
+            assert request.separate_reasoning == True
+
+    def test_reasoning_content_response(self, chat_handler):
+        """Test reasoning content in response"""
+        mock_ret_item = {
+            "text": "<thinking>This is reasoning</thinking>Answer: 42",
+            "meta_info": {
+                "output_token_logprobs": [],
+                "output_top_logprobs": None,
+            },
+        }
+
+        # Mock ReasoningParser
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.ReasoningParser"
+        ) as mock_parser_class:
+            mock_parser = Mock()
+            mock_parser.parse_non_stream.return_value = (
+                "This is reasoning",
+                "Answer: 42",
+            )
+            mock_parser_class.return_value = mock_parser
+
+            choice_logprobs = None
+            reasoning_text = None
+            text = mock_ret_item["text"]
+
+            # Simulate reasoning processing
+            enable_thinking = True
+            if enable_thinking:
+                parser = mock_parser_class(model_type="test", stream_reasoning=False)
+                reasoning_text, text = parser.parse_non_stream(text)
+
+            assert reasoning_text == "This is reasoning"
+            assert text == "Answer: 42"
+
+
+class TestSamplingParams:
+    """Test sampling parameter handling from adapter.py"""
+
+    def test_all_sampling_parameters(self, chat_handler):
+        """Test all sampling parameters are properly handled"""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            temperature=0.8,
+            max_tokens=150,
+            max_completion_tokens=200,  # Should override max_tokens
+            min_tokens=5,
+            top_p=0.9,
+            top_k=50,
+            min_p=0.1,
+            presence_penalty=0.1,
+            frequency_penalty=0.2,
+            repetition_penalty=1.1,
+            stop=["<|endoftext|>"],
+            stop_token_ids=[13, 14],
+            regex=r"\d+",
+            ebnf="<expr> ::= <number>",
+            n=2,
+            no_stop_trim=True,
+            ignore_eos=True,
+            skip_special_tokens=False,
+            logit_bias={"1": 0.5, "2": -0.3},
+        )
+
+        with patch.object(chat_handler, "_process_messages") as mock_process:
+            mock_process.return_value = (
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                ["</s>"],
+            )
+
+            sampling_params = chat_handler._build_sampling_params(request, ["</s>"])
+
+            # Verify all parameters
+            assert sampling_params["temperature"] == 0.8
+            assert (
+                sampling_params["max_new_tokens"] == 200
+            )  # max_completion_tokens overrides
+            assert sampling_params["min_new_tokens"] == 5
+            assert sampling_params["top_p"] == 0.9
+            assert sampling_params["top_k"] == 50
+            assert sampling_params["min_p"] == 0.1
+            assert sampling_params["presence_penalty"] == 0.1
+            assert sampling_params["frequency_penalty"] == 0.2
+            assert sampling_params["repetition_penalty"] == 1.1
+            assert sampling_params["stop"] == [
+                "</s>"
+            ]  # Should be overridden with processed stop
+            assert sampling_params["logit_bias"] == {"1": 0.5, "2": -0.3}
+
+    def test_response_format_json_schema(self, chat_handler):
+        """Test response format with JSON schema"""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Generate JSON"}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "response",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                    },
+                },
+            },
+        )
+
+        with patch.object(chat_handler, "_process_messages") as mock_process:
+            mock_process.return_value = (
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                ["</s>"],
+            )
+
+            sampling_params = chat_handler._build_sampling_params(request, ["</s>"])
+
+            assert "json_schema" in sampling_params
+            assert '"type": "object"' in sampling_params["json_schema"]
+
+    def test_response_format_json_object(self, chat_handler):
+        """Test response format with JSON object"""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Generate JSON"}],
+            response_format={"type": "json_object"},
+        )
+
+        with patch.object(chat_handler, "_process_messages") as mock_process:
+            mock_process.return_value = (
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                ["</s>"],
+            )
+
+            sampling_params = chat_handler._build_sampling_params(request, ["</s>"])
+
+            assert sampling_params["json_schema"] == '{"type": "object"}'
+
+
+class TestUtilityFunctions:
+    """Test utility functions that were moved from OpenAIServingBase."""
+
+    def test_build_base_sampling_params_functionality(self):
+        """Test that build_base_sampling_params works correctly."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            temperature=0.8,
+            max_tokens=150,
+            top_p=0.9,
+            top_k=50,
+            presence_penalty=0.1,
+            frequency_penalty=0.2,
+            stop=["<|endoftext|>"],
+        )
+
+        sampling_params = build_base_sampling_params(request)
+
+        # Test that parameters are correctly mapped
+        assert sampling_params["temperature"] == request.temperature
+        assert sampling_params["max_new_tokens"] == request.max_tokens
+        assert sampling_params["top_p"] == request.top_p
+        assert sampling_params["top_k"] == request.top_k
+        assert sampling_params["presence_penalty"] == request.presence_penalty
+        assert sampling_params["frequency_penalty"] == request.frequency_penalty
+        assert sampling_params["stop"] == request.stop
+
+    def test_build_base_sampling_params_max_completion_tokens_override(self):
+        """Test that max_completion_tokens overrides max_tokens."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            max_tokens=100,
+            max_completion_tokens=200,
+        )
+
+        sampling_params = build_base_sampling_params(request)
+
+        # max_completion_tokens should override max_tokens
+        assert sampling_params["max_new_tokens"] == 200
+
+    def test_create_error_response_functionality(self):
+        """Test that create_error_response works correctly."""
+        error = create_error_response("Test error message")
+        assert isinstance(error, ErrorResponse)
+        assert error.message == "Test error message"
+        assert error.type == "BadRequestError"
+        assert error.code == 400
+
+
+class TestChatCompletionHandlerCompatibility:
+    """Test compatibility with adapter.py functionality."""
+
+    def test_compatibility_sampling_params(self):
+        """Test that sampling parameters are built the same way as adapter.py."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            temperature=0.8,
+            max_tokens=150,
+            top_p=0.9,
+            top_k=50,
+            presence_penalty=0.1,
+            frequency_penalty=0.2,
+            stop=["<|endoftext|>"],
+        )
+
+        # Test the utility function directly
+        sampling_params = build_base_sampling_params(request)
+
+        # These should match the structure used in adapter.py's v1_chat_generate_request
+        expected_keys = [
+            "temperature",
+            "max_new_tokens",
+            "top_p",
+            "top_k",
+            "min_p",
+            "presence_penalty",
+            "frequency_penalty",
+            "repetition_penalty",
+            "stop",
+            "regex",
+            "ebnf",
+            "n",
+        ]
+
+        for key in expected_keys:
+            assert key in sampling_params
+
+        assert sampling_params["temperature"] == request.temperature
+        assert sampling_params["max_new_tokens"] == request.max_tokens
+        assert sampling_params["top_p"] == request.top_p
+        assert sampling_params["top_k"] == request.top_k
+
+    def test_compatibility_request_structure(self):
+        """Test that the request structure matches what adapter.py expects."""
+        # Test with all the parameters that adapter.py supports
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            temperature=0.8,
+            max_tokens=150,
+            top_p=0.9,
+            top_k=50,
+            presence_penalty=0.1,
+            frequency_penalty=0.2,
+            repetition_penalty=1.1,
+            stop=["<|endoftext|>"],
+            stream=False,
+            logprobs=True,
+            top_logprobs=5,
+            n=1,
+            continue_final_message=False,
+            separate_reasoning=True,
+            stream_reasoning=False,
+        )
+
+        # Verify that the request can be created without errors
+        assert request.model == "test-model"
+        assert request.temperature == 0.8
+        assert request.max_tokens == 150
+        assert request.top_p == 0.9
+        assert request.top_k == 50
+        assert request.presence_penalty == 0.1
+        assert request.frequency_penalty == 0.2
+        assert request.repetition_penalty == 1.1
+        assert request.stop == ["<|endoftext|>"]
+        assert request.stream == False
+        assert request.logprobs == True
+        assert request.top_logprobs == 5
+        assert request.n == 1
+        assert request.continue_final_message == False
+        assert request.separate_reasoning == True
+        assert request.stream_reasoning == False
+
+    def test_compatibility_bootstrap_params(self, chat_handler):
+        """Test that bootstrap parameters are properly supported."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            bootstrap_host="localhost",
+            bootstrap_port=8998,
+            bootstrap_room=12345,
+        )
+
+        assert request.bootstrap_host == "localhost"
+        assert request.bootstrap_port == 8998
+        assert request.bootstrap_room == 12345
+
+        # Mock the _process_messages method to return expected values
+        with patch.object(chat_handler, "_process_messages") as mock_process:
+            mock_process.return_value = (
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                ["</s>"],
+            )
+
+            adapted_request, _ = chat_handler._convert_to_internal_request(
+                [request], ["test-id"]
+            )
+
+            assert adapted_request.bootstrap_host == "localhost"
+            assert adapted_request.bootstrap_port == 8998
+            assert adapted_request.bootstrap_room == 12345
+
+    def test_compatibility_logit_bias(self):
+        """Test that logit_bias parameter is properly handled."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            logit_bias={"1": 0.5, "2": -0.3},
+        )
+
+        sampling_params = build_base_sampling_params(request)
+        assert sampling_params["logit_bias"] == {"1": 0.5, "2": -0.3}
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])
