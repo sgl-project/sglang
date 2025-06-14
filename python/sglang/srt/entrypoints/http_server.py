@@ -23,6 +23,7 @@ import json
 import logging
 import multiprocessing as multiprocessing
 import os
+import platform
 import threading
 import time
 from http import HTTPStatus
@@ -37,10 +38,17 @@ import numpy as np
 import orjson
 import requests
 import uvicorn
-import uvloop
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+
+# Conditionally import uvloop and set event loop policy
+if platform.system() != "Windows":
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+else:
+    # Ensure asyncio uses the default policy on Windows
+    pass # No specific action needed to use the default policy
 
 from sglang.srt.disaggregation.utils import (
     FakeBootstrapHost,
@@ -100,7 +108,6 @@ from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
 # Store global states
@@ -787,6 +794,8 @@ def launch_server(
         # Update logging configs
         set_uvicorn_logging_configs()
         app.server_args = server_args
+        # Determine loop type based on OS
+        loop_type = "uvloop" if platform.system() != "Windows" else "asyncio"
         # Listen for HTTP requests
         uvicorn.run(
             app,
@@ -794,7 +803,7 @@ def launch_server(
             port=server_args.port,
             log_level=server_args.log_level_http or server_args.log_level,
             timeout_keep_alive=5,
-            loop="uvloop",
+            loop=loop_type,
         )
     finally:
         warmup_thread.join()
