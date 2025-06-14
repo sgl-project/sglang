@@ -1431,6 +1431,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_nextn=is_nextn
         )
 
         if self.is_layer_sparse:
