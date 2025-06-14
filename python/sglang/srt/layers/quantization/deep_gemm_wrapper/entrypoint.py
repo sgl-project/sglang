@@ -11,6 +11,7 @@ from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ if ENABLE_JIT_DEEPGEMM:
             m_grouped_gemm_fp8_fp8_bf16_nt_masked as _grouped_gemm_nt_f8f8bf16_masked_raw,
         )
 
+_SANITY_CHECK_UE8M0 = get_bool_env_var("SGLANG_W8A8_DEEPGEMM_SANITY_CHECK_UE8M0")
 
 def grouped_gemm_nt_f8f8bf16_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
@@ -47,6 +49,9 @@ def grouped_gemm_nt_f8f8bf16_masked(
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
+
+    _sanity_check_input_scale(lhs[1])
+    _sanity_check_input_scale(rhs[1])
 
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
@@ -66,6 +71,9 @@ def grouped_gemm_nt_f8f8bf16_contig(
     num_groups, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG
 
+    _sanity_check_input_scale(lhs[1])
+    _sanity_check_input_scale(rhs[1])
+
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         _grouped_gemm_nt_f8f8bf16_contig_raw(lhs, rhs, out, m_indices)
 
@@ -79,6 +87,9 @@ def gemm_nt_f8f8bf16(
     n, _ = rhs[0].shape
     num_groups = 1
     kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
+
+    _sanity_check_input_scale(lhs[1])
+    _sanity_check_input_scale(rhs[1])
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         _gemm_nt_f8f8bf16_raw(
@@ -103,3 +114,13 @@ def configure_deep_gemm_num_sms(num_sms):
             yield
         finally:
             deep_gemm.set_num_sms(original_num_sms)
+
+
+def _sanity_check_input_scale(scale):
+    if _SANITY_CHECK_UE8M0:
+        _check_ue8m0(scale)
+
+def _check_ue8m0(x):
+    from sglang.srt.layers.quantization.fp8_utils import ceil_to_ue8m0
+    x_ceil = ceil_to_ue8m0(x)
+    assert torch.all(x == x_ceil), f"{x=} {x_ceil=}"
