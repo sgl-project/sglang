@@ -301,7 +301,7 @@ class EAGLEWorker(TpModelWorker):
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
             return logits_output, next_token_ids, bid, 0, False
-        elif batch.forward_mode.is_decode() or batch.global_num_tokens is not None:
+        else:
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
@@ -323,14 +323,6 @@ class EAGLEWorker(TpModelWorker):
                 sum(verify_output.accept_length_per_req_cpu),
                 can_run_cuda_graph,
             )
-        else:
-            model_worker_batch = batch.get_model_worker_batch()
-            model_worker_batch.spec_num_draft_tokens = 1
-            logits_output, next_token_ids, _ = (
-                self.target_worker.forward_batch_generation(model_worker_batch)
-            )
-
-            return logits_output, next_token_ids, model_worker_batch.bid, 0, False
 
     def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         local_need_forward = (
