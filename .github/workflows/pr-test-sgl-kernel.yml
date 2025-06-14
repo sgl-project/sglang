@@ -62,8 +62,7 @@ jobs:
           chmod +x ./build.sh
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
 
-      - name: Upload artifacts (only for CUDA 12.4)
-        if: ${{ matrix.cuda-version == '12.4' }}
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
