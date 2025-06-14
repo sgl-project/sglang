@@ -47,6 +47,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("mscclpp_allreduce(int context, Tensor inp, Tensor! out, int nthreads, int nblocks) -> ()");
   m.impl("mscclpp_allreduce", torch::kCUDA, &mscclpp_allreduce);
+
+  m.def("all_to_all(int fa, Tensor! out, Tensor inp, Tensor plan_meta, int _reg_buffer) -> ()");
+  m.impl("all_to_all", torch::kCUDA, &all_to_all);
+
+  m.def(
+      "all_to_all_plan(int fa, Tensor out, Tensor inp, Tensor output_split_sizes, "
+      "Tensor input_split_sizes, int chunk_size, Tensor output_split_offsets, Tensor input_split_offsets, "
+      "Tensor !plan_meta) -> ()");
+  m.impl("all_to_all_plan", torch::kCUDA, &all_to_all_plan);
   /*
    * From csrc/attention
    */
