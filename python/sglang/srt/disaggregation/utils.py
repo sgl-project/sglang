@@ -13,13 +13,12 @@ import numpy as np
 import requests
 import torch
 import torch.distributed as dist
-
-from sglang.srt.utils import get_ip, get_local_ip_by_remote
+from sglang.srt.utils import get_ip
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
-FakeBootstrapHost = "2.2.2.2"
+FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 
 # env var for testing failure, convert to float explicitly
 FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
@@ -77,6 +76,7 @@ class TransferBackend(Enum):
 
 
 class KVClassType(Enum):
+    KVARGS = "kvargs"
     MANAGER = "manager"
     SENDER = "sender"
     RECEIVER = "receiver"
@@ -93,8 +93,10 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
             MooncakeKVReceiver,
             MooncakeKVSender,
         )
+        from sglang.srt.disaggregation.base import KVArgs
 
         class_mapping = {
+            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: MooncakeKVManager,
             KVClassType.SENDER: MooncakeKVSender,
             KVClassType.RECEIVER: (MooncakeKVReceiver),
@@ -108,8 +110,10 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
             NixlKVReceiver,
             NixlKVSender,
         )
+        from sglang.srt.disaggregation.base import KVArgs
 
         class_mapping = {
+            KVClassType.KVARGS: KVArgs,
             KVClassType.MANAGER: NixlKVManager,
             KVClassType.SENDER: NixlKVSender,
             KVClassType.RECEIVER: (NixlKVReceiver),
@@ -118,8 +122,10 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
         return class_mapping.get(class_type)
     if transfer_backend == TransferBackend.FAKE:
         from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
-
+        from sglang.srt.disaggregation.base import KVArgs
+        
         class_mapping = {
+            KVClassType.KVARGS: KVArgs,
             KVClassType.SENDER: FakeKVSender,
             KVClassType.RECEIVER: (FakeKVReceiver),
         }

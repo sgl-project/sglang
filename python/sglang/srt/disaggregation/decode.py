@@ -34,7 +34,7 @@ from torch.distributed import ProcessGroup
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
-    FakeBootstrapHost,
+    FAKE_BOOTSTRAP_HOST,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -207,7 +207,7 @@ class DecodePreallocQueue:
 
     def add(self, req: Req) -> None:
         """Add a request to the pending queue."""
-        if req.bootstrap_host == FakeBootstrapHost:
+        if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
             # Fake transfer for warmup reqs
             kv_receiver_class = get_kv_class(TransferBackend.FAKE, KVClassType.RECEIVER)
         else:
