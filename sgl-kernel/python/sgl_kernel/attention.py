@@ -58,6 +58,7 @@ def cutlass_mla_decode(
     seq_lens: torch.Tensor,
     page_table: torch.Tensor,
     workspace: torch.Tensor,
+    sm_scale: float,
     num_kv_splits: int = 1,
 ) -> torch.Tensor:
     assert q_nope.ndim == 3, f"q_nope must be a 3D tensor, but got {q_nope.ndim}"
@@ -118,6 +119,7 @@ def cutlass_mla_decode(
         seq_lens,
         page_table,
         workspace,
+        sm_scale,
         num_kv_splits,
     )
     return out[:, :H].contiguous()
