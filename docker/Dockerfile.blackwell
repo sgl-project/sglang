@@ -20,13 +20,13 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
 
 RUN pip3 install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128 --break-system-packages
 
-RUN pip3 install https://github.com/sgl-project/whl/releases/download/v0.1.7/sgl_kernel-0.1.7+cu128-cp39-abi3-manylinux2014_x86_64.whl --break-system-packages \
+RUN pip3 install https://github.com/sgl-project/whl/releases/download/v0.1.8.post1/sgl_kernel-0.1.8.post1+cu128-cp39-abi3-manylinux2014_x86_64.whl --break-system-packages \
     && pip3 install setuptools==75.0.0 wheel scikit-build-core --break-system-packages
 
 RUN git clone --depth=1 https://github.com/sgl-project/sglang.git \
     && cd sglang && pip3 install -e "python[blackwell]" --break-system-packages
 
-RUN pip3 install nvidia-nccl-cu12==2.26.2.post1 --force-reinstall --no-deps --break-system-packages
+RUN pip3 install nvidia-nccl-cu12==2.27.3 --force-reinstall --no-deps --break-system-packages
 
 RUN pip3 install flashinfer_python==0.2.6.post1 --break-system-packages
 
