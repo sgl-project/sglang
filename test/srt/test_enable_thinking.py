@@ -199,17 +199,21 @@ class TestEnableThinkingWithStructuredOutputs(CustomTestCase):
             ],
         )
 
-        cls.json_schema = json.dumps(
-            {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "pattern": "^[\\w]+$"},
-                    "population": {"type": "integer"},
+        cls.response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "foo",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "pattern": "^[\\w]+$"},
+                        "population": {"type": "integer"},
+                    },
+                    "required": ["name", "population"],
+                    "additionalProperties": False,
                 },
-                "required": ["name", "population"],
-                "additionalProperties": False,
-            }
-        )
+            },
+        }
 
     @classmethod
     def tearDownClass(cls):
@@ -235,7 +239,7 @@ class TestEnableThinkingWithStructuredOutputs(CustomTestCase):
                 "temperature": 0,
                 "separate_reasoning": True,
                 "chat_template_kwargs": {"enable_thinking": True},
-                "response_format": self.json_schema,
+                "response_format": self.response_format,
             },
         )
 
@@ -245,16 +249,20 @@ class TestEnableThinkingWithStructuredOutputs(CustomTestCase):
         self.assertIn("choices", data)
         self.assertTrue(len(data["choices"]) > 0)
         self.assertIn("message", data["choices"][0])
-        self.assertIn("reasoning_content", data["choices"][0]["message"])
-        self.assertIsNotNone(data["choices"][0]["message"]["reasoning_content"])
+        message = data["choices"][0]["message"]
 
+        self.assertIn("reasoning_content", message)
+        self.assertIsNotNone(message["reasoning_content"])
+
+        self.assertIn("content", message)
         try:
-            json_object = json.loads(data["text"])
-        except (TypeError, json.decoder.JSONDecodeError):
-            raise
+            json_output = json.loads(message["content"])
+        except json.JSONDecodeError as e:
+            self.fail(f"Response is not valid JSON. Error: {e}. Response: {data}")
 
-        self.assertIsInstance(json_object["name"], str)
-        self.assertIsInstance(json_object["population"], int)
+        self.assertIsInstance(json_output, dict)
+        self.assertIsInstance(json_output["name"], str)
+        self.assertIsInstance(json_output["population"], int)
 
     def test_structured_outputs_without_reasoning(self):
         """Test non-streaming structured outputs with 'enable_thinking': False. Reasoning content should be empty and JSON should be valid."""
@@ -276,7 +284,7 @@ class TestEnableThinkingWithStructuredOutputs(CustomTestCase):
                 "temperature": 0,
                 "separate_reasoning": True,
                 "chat_template_kwargs": {"enable_thinking": False},
-                "response_format": self.json_schema,
+                "response_format": self.response_format,
             },
         )
 
@@ -286,17 +294,20 @@ class TestEnableThinkingWithStructuredOutputs(CustomTestCase):
         self.assertIn("choices", data)
         self.assertTrue(len(data["choices"]) > 0)
         self.assertIn("message", data["choices"][0])
+        message = data["choices"][0]["message"]
 
-        if "reasoning_content" in data["choices"][0]["message"]:
-            self.assertIsNone(data["choices"][0]["message"]["reasoning_content"])
+        if "reasoning_content" in message:
+            self.assertIsNone(message["reasoning_content"])
 
+        self.assertIn("content", message)
         try:
-            json_object = json.loads(data["text"])
-        except (TypeError, json.decoder.JSONDecodeError):
-            raise
+            json_output = json.loads(message["content"])
+        except json.JSONDecodeError as e:
+            self.fail(f"Response is not valid JSON. Error: {e}. Response: {data}")
 
-        self.assertIsInstance(json_object["name"], str)
-        self.assertIsInstance(json_object["population"], int)
+        self.assertIsInstance(json_output, dict)
+        self.assertIsInstance(json_output["name"], str)
+        self.assertIsInstance(json_output["population"], int)
 
 
 if __name__ == "__main__":
