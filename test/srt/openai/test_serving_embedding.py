@@ -456,7 +456,9 @@ class TestEdgeCases:
         assert request_without_id.rid is None
 
         # Should generate ID during handling
-        with patch.object(embedding_handler, "_handle_request") as mock_handle:
+        with patch.object(
+            embedding_handler, "_handle_non_streaming_request"
+        ) as mock_handle:
             mock_handle.return_value = EmbeddingResponse(
                 data=[],
                 model="test-model",
@@ -478,7 +480,9 @@ class TestEdgeCases:
             model="test-model", input="Test", rid="custom-id"
         )
 
-        with patch.object(embedding_handler, "_handle_request") as mock_handle:
+        with patch.object(
+            embedding_handler, "_handle_non_streaming_request"
+        ) as mock_handle:
             mock_handle.return_value = EmbeddingResponse(
                 data=[],
                 model="test-model",

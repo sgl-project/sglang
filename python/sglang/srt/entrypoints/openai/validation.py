@@ -13,6 +13,7 @@
 # ==============================================================================
 """Pre-built validation rules for OpenAI API parameters"""
 
+import logging
 import re
 from typing import Any, Callable, List, Optional, Union
 
@@ -24,6 +25,8 @@ from sglang.srt.entrypoints.openai.protocol import (
     EmbeddingRequest,
     OpenAIServingRequest,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ValidationRule:
@@ -399,6 +402,12 @@ def get_validation_rules(request: OpenAIServingRequest) -> List[ValidationRule]:
     if isinstance(request, ChatCompletionRequest):
         return get_common_validation_rules() + get_chat_specific_validation_rules()
     elif isinstance(request, CompletionRequest):
+        # Echo + logprobs warning
+        if request.echo and request.logprobs:
+            logger.warning(
+                "Echo is not compatible with logprobs. "
+                "To compute logprobs of input prompt, please use the native /generate API."
+            )
         return (
             get_common_validation_rules() + get_completion_specific_validation_rules()
         )

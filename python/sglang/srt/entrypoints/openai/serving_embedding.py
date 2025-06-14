@@ -14,10 +14,9 @@
 """Embedding serving logic for OpenAI API"""
 
 import logging
-import uuid
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Union
 
-from fastapi import Request
+from fastapi.responses import StreamingResponse
 
 from sglang.srt.conversation import generate_embedding_convs
 from sglang.srt.entrypoints.openai.protocol import (
@@ -34,49 +33,10 @@ from sglang.srt.entrypoints.openai.serving_engine import (
 )
 from sglang.srt.entrypoints.openai.utils import create_error_response
 from sglang.srt.managers.io_struct import EmbeddingReqInput
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-
-logger = logging.getLogger(__name__)
 
 
 class EmbeddingHandler(OpenAIServingBase):
     """Handler for embedding requests"""
-
-    def __init__(self, tokenizer_manager: TokenizerManager):
-        super().__init__(tokenizer_manager)
-
-    async def handle_request(
-        self, request: EmbeddingRequest, raw_request: Request
-    ) -> Union[EmbeddingResponse, ErrorResponse]:
-        """Handle an embedding request"""
-        try:
-            # Validate request
-            error = self._validate_request(request)
-            if error:
-                return error
-
-            # Create request context
-            ctx = RequestContext(
-                raw_request=raw_request,
-                openai_request=request,
-                request_id=request.rid or f"embd-{uuid.uuid4()}",
-            )
-
-            # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
-                [request], [ctx.request_id]
-            )
-
-            # Handle the request
-            return await self._handle_request(adapted_request, processed_request, ctx)
-
-        except Exception as e:
-            logger.error(f"Error in embedding: {e}")
-            return create_error_response(
-                message=f"Internal server error: {str(e)}",
-                err_type="InternalServerError",
-                status_code=500,
-            )
 
     def _convert_to_internal_request(
         self,
@@ -186,7 +146,17 @@ class EmbeddingHandler(OpenAIServingBase):
             all_requests[0] if len(all_requests) == 1 else all_requests
         )
 
-    async def _handle_request(
+    async def _handle_streaming_request(
+        self,
+        adapted_request: EmbeddingReqInput,
+        request: EmbeddingRequest,
+        ctx: RequestContext,
+    ) -> StreamingResponse:
+        """Handle streaming embedding request (not supported)"""
+        # Embeddings don't support streaming
+        raise NotImplementedError("Embedding requests do not support streaming")
+
+    async def _handle_non_streaming_request(
         self,
         adapted_request: EmbeddingReqInput,
         request: EmbeddingRequest,

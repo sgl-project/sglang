@@ -13,13 +13,9 @@
 # ==============================================================================
 """Completion serving logic for OpenAI API"""
 
-import json
-import logging
 import time
-import uuid
 from typing import Any, Dict, List, Union
 
-from fastapi import Request
 from fastapi.responses import StreamingResponse
 
 from sglang.srt.code_completion_parser import (
@@ -49,62 +45,10 @@ from sglang.srt.entrypoints.openai.utils import (
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-
-logger = logging.getLogger(__name__)
 
 
 class CompletionHandler(OpenAIServingBase):
     """Handler for completion requests"""
-
-    def __init__(self, tokenizer_manager: TokenizerManager):
-        super().__init__(tokenizer_manager)
-
-    async def handle_request(
-        self, request: CompletionRequest, raw_request: Request
-    ) -> Union[CompletionResponse, StreamingResponse, ErrorResponse]:
-        """Handle a completion request"""
-        try:
-            # Echo + logprobs warning
-            if request.echo and request.logprobs:
-                logger.warning(
-                    "Echo is not compatible with logprobs. "
-                    "To compute logprobs of input prompt, please use the native /generate API."
-                )
-
-            # Validate request
-            error = self._validate_request(request)
-            if error:
-                return error
-
-            # Create request context
-            ctx = RequestContext(
-                raw_request=raw_request,
-                openai_request=request,
-                request_id=f"cmpl-{uuid.uuid4()}",
-            )
-
-            # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
-                [request], [ctx.request_id]
-            )
-
-            if request.stream:
-                return await self._handle_streaming_request(
-                    adapted_request, processed_request, ctx
-                )
-            else:
-                return await self._handle_non_streaming_request(
-                    adapted_request, processed_request, ctx
-                )
-
-        except Exception as e:
-            logger.error(f"Error in completion: {e}")
-            return create_error_response(
-                message=f"Internal server error: {str(e)}",
-                err_type="InternalServerError",
-                status_code=500,
-            )
 
     def _convert_to_internal_request(
         self,

@@ -12,20 +12,29 @@
 # limitations under the License.
 # ==============================================================================
 
+import logging
 import time
+import uuid
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import Request
+from fastapi.responses import StreamingResponse
 
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    EmbeddingRequest,
     ErrorResponse,
     OpenAIServingRequest,
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.utils import create_error_response
 from sglang.srt.entrypoints.openai.validation import get_validation_rules
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+logger = logging.getLogger(__name__)
 
 
 class RequestContext:
@@ -63,11 +72,90 @@ class OpenAIServingBase(ABC):
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
 
-    @abstractmethod
     async def handle_request(
         self, request: OpenAIServingRequest, raw_request: Request
-    ) -> Any:
-        """Handle the specific request type"""
+    ) -> Union[Any, StreamingResponse, ErrorResponse]:
+        """Handle the specific request type with common pattern"""
+        try:
+            # Validate request
+            error = self._validate_request(request)
+            if error:
+                return error
+
+            # Create request context
+            ctx = RequestContext(
+                raw_request=raw_request,
+                openai_request=request,
+                request_id=self._generate_request_id(request),
+            )
+
+            # Convert to internal format
+            adapted_request, processed_request = self._convert_to_internal_request(
+                [request], [ctx.request_id]
+            )
+
+            # Check if this handler supports streaming
+            if hasattr(request, "stream") and request.stream:
+                return await self._handle_streaming_request(
+                    adapted_request, processed_request, ctx
+                )
+            else:
+                return await self._handle_non_streaming_request(
+                    adapted_request, processed_request, ctx
+                )
+
+        except Exception as e:
+            logger.error(f"Error in request: {e}")
+            return create_error_response(
+                message=f"Internal server error: {str(e)}",
+                err_type="InternalServerError",
+                status_code=500,
+            )
+
+    def _generate_request_id(self, request: OpenAIServingRequest) -> str:
+        """Generate request ID based on request type"""
+        # Default implementation - can be overridden
+        if rid := getattr(request, "rid", None):
+            return rid
+
+        # Determine prefix based on request type
+        prefix_mapping = {
+            ChatCompletionRequest: "chatcmpl",
+            CompletionRequest: "cmpl",
+            EmbeddingRequest: "embd",
+        }
+        prefix = prefix_mapping.get(type(request), "req")
+        return f"{prefix}-{uuid.uuid4()}"
+
+    @abstractmethod
+    def _convert_to_internal_request(
+        self,
+        all_requests: List[OpenAIServingRequest],
+        request_ids: List[str],
+    ) -> tuple[
+        GenerateReqInput, Union[OpenAIServingRequest, List[OpenAIServingRequest]]
+    ]:
+        """Convert OpenAI request to internal format"""
+        pass
+
+    @abstractmethod
+    async def _handle_streaming_request(
+        self,
+        adapted_request: GenerateReqInput,
+        request: OpenAIServingRequest,
+        ctx: RequestContext,
+    ) -> StreamingResponse:
+        """Handle streaming request"""
+        pass
+
+    @abstractmethod
+    async def _handle_non_streaming_request(
+        self,
+        adapted_request: GenerateReqInput,
+        request: OpenAIServingRequest,
+        ctx: RequestContext,
+    ) -> Union[Any, ErrorResponse]:
+        """Handle non-streaming request"""
         pass
 
     def _validate_request(

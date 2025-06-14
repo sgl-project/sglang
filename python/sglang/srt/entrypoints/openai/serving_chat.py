@@ -72,48 +72,6 @@ _cached_template_format = None
 class ChatCompletionHandler(OpenAIServingBase):
     """Handler for chat completion requests"""
 
-    def __init__(self, tokenizer_manager: TokenizerManager):
-        super().__init__(tokenizer_manager)
-
-    async def handle_request(
-        self, request: ChatCompletionRequest, raw_request: Request
-    ) -> Union[ChatCompletionResponse, StreamingResponse, ErrorResponse]:
-        """Handle a chat completion request"""
-        try:
-            # Validate request
-            error = self._validate_request(request)
-            if error:
-                return error
-
-            # Create request context
-            ctx = RequestContext(
-                raw_request=raw_request,
-                openai_request=request,
-                request_id=request.rid or f"chatcmpl-{uuid.uuid4()}",
-            )
-
-            # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
-                [request], [ctx.request_id]
-            )
-
-            if request.stream:
-                return await self._handle_streaming_request(
-                    adapted_request, processed_request, ctx
-                )
-            else:
-                return await self._handle_non_streaming_request(
-                    adapted_request, processed_request, ctx
-                )
-
-        except Exception as e:
-            logger.error(f"Error in chat completion: {e}")
-            return create_error_response(
-                message=f"Internal server error: {str(e)}",
-                err_type="InternalServerError",
-                status_code=500,
-            )
-
     def _convert_to_internal_request(
         self,
         all_requests: List[ChatCompletionRequest],

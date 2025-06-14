@@ -1003,9 +1003,7 @@ class TestEdgeCases:
 
         mock_raw_request = Mock()
 
-        with patch(
-            "sglang.srt.entrypoints.openai.serving_completions.logger"
-        ) as mock_logger:
+        with patch("sglang.srt.entrypoints.openai.validation.logger") as mock_logger:
             # Call handle_request which contains the warning logic
             await completion_handler.handle_request(request, mock_raw_request)
             # Should log warning about echo + logprobs incompatibility
