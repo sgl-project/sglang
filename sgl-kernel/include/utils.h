@@ -346,3 +346,13 @@ inline torch::Tensor pad_tensor(const torch::Tensor& tensor, int64_t alignment =
   }
   return tensor_padded;
 }
+
+__device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
+  unsigned mask = 0xffff;
+
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 4));
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 2));
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 1));
+  return val;
+}
