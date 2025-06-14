@@ -677,7 +677,12 @@ class MooncakeKVManager(BaseKVManager):
 class MooncakeKVSender(BaseKVSender):
 
     def __init__(
-        self, mgr: MooncakeKVManager, bootstrap_addr: str, bootstrap_room: int, dest_tp_ranks: List[int], pp_rank: int
+        self,
+        mgr: MooncakeKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: int,
+        dest_tp_ranks: List[int],
+        pp_rank: int,
     ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room

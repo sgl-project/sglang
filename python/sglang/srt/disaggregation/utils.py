@@ -13,6 +13,7 @@ import numpy as np
 import requests
 import torch
 import torch.distributed as dist
+
 from sglang.srt.utils import get_ip
 
 if TYPE_CHECKING:
@@ -87,13 +88,13 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
     from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
 
     if transfer_backend == TransferBackend.MOONCAKE:
+        from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.mooncake import (
             MooncakeKVBootstrapServer,
             MooncakeKVManager,
             MooncakeKVReceiver,
             MooncakeKVSender,
         )
-        from sglang.srt.disaggregation.base import KVArgs
 
         class_mapping = {
             KVClassType.KVARGS: KVArgs,
@@ -104,13 +105,13 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
         }
         return class_mapping.get(class_type)
     if transfer_backend == TransferBackend.NIXL:
+        from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.nixl import (
             NixlKVBootstrapServer,
             NixlKVManager,
             NixlKVReceiver,
             NixlKVSender,
         )
-        from sglang.srt.disaggregation.base import KVArgs
 
         class_mapping = {
             KVClassType.KVARGS: KVArgs,
@@ -121,9 +122,9 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
         }
         return class_mapping.get(class_type)
     if transfer_backend == TransferBackend.FAKE:
-        from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
         from sglang.srt.disaggregation.base import KVArgs
-        
+        from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
+
         class_mapping = {
             KVClassType.KVARGS: KVArgs,
             KVClassType.SENDER: FakeKVSender,

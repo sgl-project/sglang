@@ -33,8 +33,8 @@ from torch.distributed import ProcessGroup
 
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
     FAKE_BOOTSTRAP_HOST,
+    DisaggregationMode,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,

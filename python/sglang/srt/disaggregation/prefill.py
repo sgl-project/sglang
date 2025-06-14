@@ -36,15 +36,14 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    is_mla_backend,
     kv_to_page_indices,
     kv_to_page_num,
     poll_and_all_reduce,
     prepare_abort,
-    is_mla_backend,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -131,12 +130,15 @@ class PrefillBootstrapQueue:
             self.metadata_buffers.get_buf_infos()
         )
         # TODO(OSS): get_ib_device v.s. get_xai_ib_device
-        kv_args.ib_device =  self.scheduler.server_args.disaggregation_ib_device
+        kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
-        
+
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
-            kv_args, DisaggregationMode.PREFILL, self.scheduler.server_args, self.is_mla_backend
+            kv_args,
+            DisaggregationMode.PREFILL,
+            self.scheduler.server_args,
+            self.is_mla_backend,
         )
         return kv_manager
 
@@ -189,7 +191,7 @@ class PrefillBootstrapQueue:
         pop the reqs which has finished bootstrapping
 
         return_failed_reqs: For PP, on rank 0, also return the failed reqs to notify the next rank
-        rids_to_check: For PP, on rank > 0, check the rids from the previous rank has concensus with the current rank.
+        rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
 
         bootstrapped_reqs = []
@@ -456,11 +458,10 @@ class SchedulerDisaggregationPrefillMixin:
     ) -> List[Req]:
         """
         Poll the requests in the middle of transfer. If done, return the request.
-        rids_to_check: For PP, on rank > 0, check the rids from the previous rank has concensus with the current rank.
+        rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
-
 
         done_reqs = []
 
@@ -504,7 +505,6 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 assert False, f"Unexpected polling state {poll=}"
 
-
         # Stream requests which have finished transfer
         self.stream_output(
             done_reqs,
@@ -521,7 +521,6 @@ class SchedulerDisaggregationPrefillMixin:
         self.disagg_prefill_inflight_queue = undone_reqs
 
         return done_reqs
-
 
     def get_transferred_rids(self: Scheduler) -> List[str]:
         """

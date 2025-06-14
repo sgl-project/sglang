@@ -1,19 +1,16 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import numpy.typing as npt
 
-
 from sglang.srt.server_args import ServerArgs
-from typing import List
-
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.utils import DisaggregationMode
+
 
 class KVArgs:
     engine_rank: int
@@ -57,7 +54,12 @@ class BaseKVSender(ABC):
 
     @abstractmethod
     def __init__(
-        self, mgr: BaseKVManager, bootstrap_addr: str, bootstrap_room: int, dest_tp_ranks: List[int], pp_rank: int
+        self,
+        mgr: BaseKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: int,
+        dest_tp_ranks: List[int],
+        pp_rank: int,
     ): ...
 
     @abstractmethod

@@ -1116,7 +1116,9 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.disagg_prefill_bootstrap_queue.add(req, self.model_config.num_key_value_heads)
+            self.disagg_prefill_bootstrap_queue.add(
+                req, self.model_config.num_key_value_heads
+            )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
@@ -1124,7 +1126,9 @@ class Scheduler(
 
     def _extend_requests_to_queue(self, reqs: List[Req]):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.disagg_prefill_bootstrap_queue.extend(reqs, self.model_config.num_key_value_heads)
+            self.disagg_prefill_bootstrap_queue.extend(
+                reqs, self.model_config.num_key_value_heads
+            )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # If this is a decode server, we put the request to the decode pending prealloc queue
             self.disagg_decode_prealloc_queue.extend(reqs)
