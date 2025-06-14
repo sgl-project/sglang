@@ -103,7 +103,7 @@ class TestDisaggregationAccuracy(CustomTestCase):
         )
 
     @classmethod
-    def wait_server_ready(cls, url, timeout=300):
+    def wait_server_ready(cls, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH):
         start_time = time.perf_counter()
         while True:
             try:
@@ -284,7 +284,7 @@ class TestDisaggregationMooncakeFailure(CustomTestCase):
         )
 
     @classmethod
-    def wait_server_ready(cls, url, timeout=300):
+    def wait_server_ready(cls, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH):
         start_time = time.perf_counter()
         while True:
             try:
@@ -388,7 +388,7 @@ class TestDisaggregationMooncakeSpec(CustomTestCase):
         cls.wait_server_ready(cls.lb_url + "/health")
 
     @classmethod
-    def wait_server_ready(cls, url, timeout=300):
+    def wait_server_ready(cls, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH):
         start_time = time.perf_counter()
         while True:
             try:
@@ -442,7 +442,7 @@ class TestDisaggregationMooncakeSpec(CustomTestCase):
         )
 
     @classmethod
-    def wait_server_ready(cls, url, timeout=300):
+    def wait_server_ready(cls, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH):
         start_time = time.perf_counter()
         while True:
             try:
