@@ -88,13 +88,15 @@ from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
 
-# Global cache for template content format detection
-_cached_chat_template = None
-_cached_template_format = None
-
 
 class ChatCompletionHandler(OpenAIServingBase):
     """Handler for chat completion requests"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Instance-specific cache for template content format detection
+        self._cached_chat_template = None
+        self._cached_template_format = None
 
     def _convert_to_internal_request(
         self,
@@ -250,8 +252,6 @@ class ChatCompletionHandler(OpenAIServingBase):
         is_multimodal: bool,
     ) -> tuple[str, List[int], Optional[Any], Optional[Any], List[str], List[str]]:
         """Apply Jinja chat template"""
-        global _cached_chat_template, _cached_template_format
-
         openai_compatible_messages = []
         image_data = []
         audio_data = []
@@ -259,14 +259,16 @@ class ChatCompletionHandler(OpenAIServingBase):
 
         # Detect template content format
         current_template = self.tokenizer_manager.tokenizer.chat_template
-        if current_template != _cached_chat_template:
-            _cached_chat_template = current_template
-            _cached_template_format = detect_template_content_format(current_template)
+        if current_template != self._cached_chat_template:
+            self._cached_chat_template = current_template
+            self._cached_template_format = detect_template_content_format(
+                current_template
+            )
             logger.info(
-                f"Detected chat template content format: {_cached_template_format}"
+                f"Detected chat template content format: {self._cached_template_format}"
             )
 
-        template_content_format = _cached_template_format
+        template_content_format = self._cached_template_format
 
         for message in request.messages:
             if message.content is None:
