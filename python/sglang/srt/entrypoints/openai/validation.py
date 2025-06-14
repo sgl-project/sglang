@@ -20,6 +20,8 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
     CompletionRequest,
+    EmbeddingInput,
+    EmbeddingRequest,
     OpenAIServingRequest,
 )
 
@@ -284,6 +286,55 @@ def validate_presence_penalty(presence_penalty: float) -> Optional[str]:
     return None
 
 
+def validate_embedding_input(input: EmbeddingInput) -> Optional[str]:
+    """Validate that the input is not empty or whitespace only."""
+    if not input:
+        return "Input cannot be empty"
+
+    # Handle single string
+    if isinstance(input, str):
+        if not input.strip():
+            return "Input cannot be empty or whitespace only"
+        return None
+
+    # Handle list inputs
+    if isinstance(input, list):
+        if len(input) == 0:
+            return "Input cannot be empty"
+
+        # Check first element to determine type
+        first_item = input[0]
+
+        if isinstance(first_item, str):
+            # List of strings
+            for i, item in enumerate(input):
+                if not isinstance(item, str):
+                    return f"All items in input list must be strings"
+                if not item.strip():
+                    return f"Input at index {i} cannot be empty or whitespace only"
+        elif isinstance(first_item, int):
+            # List of integers (token IDs)
+            for i, item in enumerate(input):
+                if not isinstance(item, int):
+                    return f"All items in input list must be integers"
+                if item < 0:
+                    return f"Token ID at index {i} must be non-negative"
+        elif isinstance(first_item, list):
+            # List of lists (multiple token sequences)
+            for i, item in enumerate(input):
+                if not isinstance(item, list):
+                    return f"Input at index {i} must be a list"
+                if not item:
+                    return f"Input at index {i} cannot be empty"
+                if not all(isinstance(token, int) for token in item):
+                    return f"Input at index {i} must contain only integers"
+                if any(token < 0 for token in item):
+                    return f"Input at index {i} contains negative token IDs"
+        # Note: MultimodalEmbeddingInput validation would be handled by Pydantic
+
+    return None
+
+
 def get_common_validation_rules() -> List[ValidationRule]:
     """Get validation rules common to both chat and completion requests"""
     return [
@@ -332,6 +383,17 @@ def get_completion_specific_validation_rules() -> List[ValidationRule]:
     ]
 
 
+def get_embedding_specific_validation_rules() -> List[ValidationRule]:
+    """Get validation rules specific to embedding requests"""
+    return [
+        ValidationRule(
+            param_name="input",
+            validator_func=validate_embedding_input,
+            param_getter=lambda request: request.input,
+        ),
+    ]
+
+
 def get_validation_rules(request: OpenAIServingRequest) -> List[ValidationRule]:
     """Get all validation rules for the request"""
     if isinstance(request, ChatCompletionRequest):
@@ -340,5 +402,7 @@ def get_validation_rules(request: OpenAIServingRequest) -> List[ValidationRule]:
         return (
             get_common_validation_rules() + get_completion_specific_validation_rules()
         )
+    elif isinstance(request, EmbeddingRequest):
+        return get_embedding_specific_validation_rules()
     else:
         raise ValueError(f"Unsupported request type: {type(request)}")

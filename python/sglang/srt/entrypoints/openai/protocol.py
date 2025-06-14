@@ -487,12 +487,15 @@ class MultimodalEmbeddingInput(BaseModel):
     image: Optional[str] = None
 
 
+EmbeddingInput = Union[
+    List[int], List[List[int]], str, List[str], List[MultimodalEmbeddingInput]
+]
+
+
 class EmbeddingRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/embeddings/create
-    input: Union[
-        List[int], List[List[int]], str, List[str], List[MultimodalEmbeddingInput]
-    ]
+    input: EmbeddingInput
     model: str
     encoding_format: str = "float"
     dimensions: int = None
