@@ -15,7 +15,7 @@ if TYPE_CHECKING:
         A placeholder for the IOHandle class. Cannot be constructed elsewhere.
         """
 
-    class RadixTreeCpp():
+    class RadixTreeCpp:
         def __init__(
             self,
             disabled: bool,
@@ -33,25 +33,9 @@ if TYPE_CHECKING:
                 host_size (int): Size of the host memory tokens.
                 write_threshold (int): Threshold for writing through from GPU to CPU.
             """
-            super().__init__(
+            self.tree = radix_tree_cpp.RadixTree(
                 disabled, use_hicache, page_size, host_size, write_threshold
             )
-
-        def writing_through(
-            self, key: List[int], indices: torch.Tensor
-        ) -> Tuple[List[Tuple[IOHandle, torch.Tensor, torch.Tensor]], int]:
-            """
-            Inserts a key-value pair into the radix tree and perform write-through check.
-            Args:
-                key (List[int]): The key to insert.
-                indices (torch.Tensor): The value associated with the key.
-            Returns:
-                Tuple[List[Tuple[IOHandle, torch.Tensor, torch.Tensor]], int]:
-                    0. A list of (IOHandle, device indices, host indices) tuples.
-                       These IOhandles require write-through to the CPU in python side.
-                    1. The number of indices that are matched on device.
-            """
-            return super().writing_through(key, indices)
 
         def match_prefix(
             self, prefix: List[int]
@@ -67,7 +51,7 @@ if TYPE_CHECKING:
                     2. The last node of the prefix matched on the GPU.
                     3. The last node of the prefix matched on the CPU.
             """
-            return super().match_prefix(prefix)
+            return self.tree.match_prefix(prefix)
 
         def evict(self, num_tokens: int) -> List[torch.Tensor]:
             """
@@ -77,7 +61,7 @@ if TYPE_CHECKING:
             Returns:
                 List[torch.Tensor]: A list of indices that were evicted.
             """
-            return super().evict(num_tokens)
+            return self.tree.evict(num_tokens)
 
         def lock_ref(self, handle: TreeNodeCpp, lock: bool) -> None:
             """
@@ -87,7 +71,23 @@ if TYPE_CHECKING:
                 handle (TreeNodeCpp): The tree node to lock or unlock.
                 lock (bool): If True, locks the node; if False, unlocks it.
             """
-            return super().lock_ref(handle, lock)
+            return self.tree.lock_ref(handle, lock)
+
+        def writing_through(
+            self, key: List[int], indices: torch.Tensor
+        ) -> Tuple[List[Tuple[IOHandle, torch.Tensor, torch.Tensor]], int]:
+            """
+            Inserts a key-value pair into the radix tree and perform write-through check.
+            Args:
+                key (List[int]): The key to insert.
+                indices (torch.Tensor): The value associated with the key.
+            Returns:
+                Tuple[List[Tuple[IOHandle, torch.Tensor, torch.Tensor]], int]:
+                    0. A list of (IOHandle, device indices, host indices) tuples.
+                       These IOhandles require write-through to the CPU in python side.
+                    1. The number of indices that are matched on device.
+            """
+            return self.tree.writing_through(key, indices)
 
         def loading_onboard(
             self,
@@ -107,7 +107,7 @@ if TYPE_CHECKING:
                     0. An IOHandle that requires loading to the CPU in python side.
                     1. A list of host indices corresponding to the new device indices.
             """
-            return super().loading_onboard(device_node, host_node, new_device_indices)
+            return self.tree.loading_onboard(device_node, host_node, new_device_indices)
 
         def commit_writing_through(self, handle: IOHandle, success: bool) -> None:
             """
@@ -116,7 +116,7 @@ if TYPE_CHECKING:
                 handle (IOHandle): The IOHandle to commit.
                 success (bool): If True, commits the write-through; if False, just indicates failure.
             """
-            return super().commit_writing_through(handle, success)
+            return self.tree.commit_writing_through(handle, success)
 
         def commit_loading_onboard(self, handle: IOHandle, success: bool) -> None:
             """
@@ -125,7 +125,7 @@ if TYPE_CHECKING:
                 handle (IOHandle): The IOHandle to commit.
                 success (bool): If True, commits the load-onboard; if False, just indicates failure.
             """
-            return super().commit_loading_onboard(handle, success)
+            return self.tree.commit_loading_onboard(handle, success)
 
         def evictable_size(self) -> int:
             """
@@ -134,7 +134,7 @@ if TYPE_CHECKING:
             Returns:
                 int: The size of the evictable part.
             """
-            return super().evictable_size()
+            return self.tree.evictable_size()
 
         def protected_size(self) -> int:
             """
@@ -143,7 +143,7 @@ if TYPE_CHECKING:
             Returns:
                 int: The size of the protected part.
             """
-            return super().protected_size()
+            return self.tree.protected_size()
 
         def total_size(self) -> int:
             """
@@ -151,19 +151,19 @@ if TYPE_CHECKING:
             Returns:
                 int: The total size of the radix tree.
             """
-            return super().total_size()
+            return self.tree.total_size()
 
         def reset(self) -> None:
             """
             Resets the radix tree, clearing all nodes and indices.
             """
-            return super().reset()
+            return self.tree.reset()
 
         def debug_print(self) -> None:
             """
             Prints the internal state of the radix tree for debugging purposes.
             """
-            return super().debug_print()
+            return self.tree.debug_print()
 
 else:
     RadixTreeCpp = radix_tree_cpp.RadixTree

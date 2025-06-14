@@ -53,11 +53,13 @@ def test_radix_tree():
 
         # the indices should not be updated
         x, l = _call(tree.writing_through([1, 1, 1, 1], _indices([4, 5, 6, 7])))
-        assert l == 4 and len(x) == 1  # match length = 4 ; writing through first 4 in one node
+        assert (
+            l == 4 and len(x) == 1
+        )  # match length = 4 ; writing through first 4 in one node
 
         a, b, c, d = _call(tree.match_prefix([1, 1, 1, 2, 2]))
-        assert c == d # the same node on CPU and GPU (since no writing through yet)
-        assert b == 0 # no node on CPU yet
+        assert c == d  # the same node on CPU and GPU (since no writing through yet)
+        assert b == 0  # no node on CPU yet
         assert torch.equal(a[0], torch.tensor([0, 1, 2], dtype=torch.int64))
 
         # complete the writing through
@@ -70,7 +72,9 @@ def test_radix_tree():
 
         # run this to trigger host writing through
         x, l = _call(tree.writing_through([1, 1, 1, 1, 1], _indices([0, 1, 2, 3, 4])))
-        assert l == 5 and len(x) == 1  # match length = 5 ; writing through all in one node
+        assert (
+            l == 5 and len(x) == 1
+        )  # match length = 5 ; writing through all in one node
 
         # successfully writing through
         _call(tree.commit_writing_through(x[0][0], True))
@@ -87,18 +91,18 @@ def test_radix_tree():
 
         # now part of the node is both on GPU and CPU; while others on CPU only
         a, b, c, d = _call(tree.match_prefix([1, 1, 1, 1, 1]))
-        assert c != d # different node on CPU and GPU
-        assert b == 3 # length 5 - 2 = 2 remain on CPU
+        assert c != d  # different node on CPU and GPU
+        assert b == 3  # length 5 - 2 = 2 remain on CPU
         assert torch.equal(a[0], torch.tensor([5, 6], dtype=torch.int64))
 
         # now we can load the onboard node, with new device indice 7, 8, 9
         h, y = _call(tree.loading_onboard(c, d, _indices([7, 8, 9])))
-        assert len(y) == 1 # one node is being loaded
+        assert len(y) == 1  # one node is being loaded
 
         # split the node by calling another shorter match_prefix
         a, b, c, d = _call(tree.match_prefix([1, 1, 1, 1]))
-        assert c == d # the same node on CPU and GPU
-        assert b == 0 # no node on CPU yet (on loading will not be counted)
+        assert c == d  # the same node on CPU and GPU
+        assert b == 0  # no node on CPU yet (on loading will not be counted)
         assert torch.equal(a[0], torch.tensor([5, 6], dtype=torch.int64))
         assert torch.equal(a[1], torch.tensor([7, 8], dtype=torch.int64))
 

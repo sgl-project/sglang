@@ -31,65 +31,6 @@ RadixTree::RadixTree(bool disabled, bool use_hicache, int64_t page_size, int64_t
 
 RadixTree::~RadixTree() = default;
 
-std::tuple<std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>>, int64_t>
-RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
-  if (m_impl->disabled) return {};
-  _assert(_key.size() == std::size_t(value.size(0)), "Key and value must have the same size");
-  const auto key = token_slice{_key.data(), m_impl->align(_key.size())};
-
-  // the nodes that are potentially written through to the host
-  std::vector<TreeNode*> potential_write_nodes;
-
-  // walk the tree to find the right place to insert
-  const auto [host_node, host_prefix_length] = m_impl->tree_walk(key);
-
-  if (host_prefix_length != key.size()) {
-    const auto new_node = m_impl->create_device_node(
-        host_node,
-        {key.begin() + host_prefix_length, key.end()},
-        value.slice(/*dim=*/0, host_prefix_length, key.size()));
-    if (m_impl->need_write_through(new_node)) {
-      potential_write_nodes.push_back(new_node);
-    }
-  }
-
-  std::size_t offset = host_prefix_length;
-  const auto device_node = m_impl->walk_to_device(host_node, [&](TreeNode* n) {
-    m_impl->update_device(n, value.slice(/*dim=*/0, offset - n->length(), offset));
-    offset = offset - n->length();
-  });
-
-  std::size_t device_prefix_length = 0;
-  m_impl->walk_to_root(device_node, [&](TreeNode* n) {
-    device_prefix_length += n->length();
-    n->hit_count++;
-    if (m_impl->need_write_through(n)) {
-      potential_write_nodes.push_back(n);
-    }
-  });
-  _assert(device_prefix_length == offset, "Something goes wrong...");
-
-  std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>> result;
-  // don't write through if hicache is disabled (no host memory), fast path
-  if (!m_impl->use_hicache) return {std::move(result), static_cast<int64_t>(device_prefix_length)};
-
-  // reverse so that the nodes closer to the root are written back first
-  std::reverse(potential_write_nodes.begin(), potential_write_nodes.end());
-  const auto num_success = m_impl->try_write_through(potential_write_nodes);
-  _assert(num_success <= potential_write_nodes.size());
-
-  // fill the result with the tickets and indices
-  result.resize(num_success);
-  for (const auto i : c10::irange(num_success)) {
-    const auto node = potential_write_nodes[i];
-    const auto ticket = node->io_ticket();
-    _assert(ticket.has_value(), "Ticket should be valid for the node");
-    result[i] = {ticket.value(), node->device_indices(), node->host_indices()};
-  }
-
-  return {std::move(result), static_cast<int64_t>(device_prefix_length)};
-}
-
 std::tuple<std::vector<at::Tensor>, int64_t, NodeHandle, NodeHandle> RadixTree::match_prefix(const token_vec_t& _key) {
   if (m_impl->disabled) return {};
 
@@ -191,26 +132,63 @@ std::size_t RadixTree::Impl::try_write_through(const std::vector<TreeNode*>& nod
   return sizes.size();  // all nodes were successfully allocated
 }
 
-void RadixTree::lock_ref(NodeHandle node_id, bool increment) {
-  if (m_impl->disabled) return;
-  m_impl->lock_ref(node_id, increment);
-}
+std::tuple<std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>>, int64_t>
+RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
+  if (m_impl->disabled) return {};
+  _assert(_key.size() == std::size_t(value.size(0)), "Key and value must have the same size");
+  const auto key = token_slice{_key.data(), m_impl->align(_key.size())};
 
-int64_t RadixTree::evictable_size() const {
-  return static_cast<int64_t>(m_impl->evictable_size());
-}
+  // the nodes that are potentially written through to the host
+  std::vector<TreeNode*> potential_write_nodes;
 
-int64_t RadixTree::protected_size() const {
-  return static_cast<int64_t>(m_impl->protected_size());
-}
+  // walk the tree to find the right place to insert
+  const auto [host_node, host_prefix_length] = m_impl->tree_walk(key);
 
-int64_t RadixTree::total_size() const {
-  return static_cast<int64_t>(m_impl->total_size());
-}
+  if (host_prefix_length != key.size()) {
+    const auto new_node = m_impl->create_device_node(
+        host_node,
+        {key.begin() + host_prefix_length, key.end()},
+        value.slice(/*dim=*/0, host_prefix_length, key.size()));
+    if (m_impl->need_write_through(new_node)) {
+      potential_write_nodes.push_back(new_node);
+    }
+  }
 
-void RadixTree::commit_writing_through(IOTicket ticket, bool success) {
-  if (m_impl->disabled) return;
-  m_impl->complete_io_writing_through(ticket, success);
+  std::size_t offset = host_prefix_length;
+  const auto device_node = m_impl->walk_to_device(host_node, [&](TreeNode* n) {
+    m_impl->update_device(n, value.slice(/*dim=*/0, offset - n->length(), offset));
+    offset = offset - n->length();
+  });
+
+  std::size_t device_prefix_length = 0;
+  m_impl->walk_to_root(device_node, [&](TreeNode* n) {
+    device_prefix_length += n->length();
+    n->hit_count++;
+    if (m_impl->need_write_through(n)) {
+      potential_write_nodes.push_back(n);
+    }
+  });
+  _assert(device_prefix_length == offset, "Something goes wrong...");
+
+  std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>> result;
+  // don't write through if hicache is disabled (no host memory), fast path
+  if (!m_impl->use_hicache) return {std::move(result), static_cast<int64_t>(device_prefix_length)};
+
+  // reverse so that the nodes closer to the root are written back first
+  std::reverse(potential_write_nodes.begin(), potential_write_nodes.end());
+  const auto num_success = m_impl->try_write_through(potential_write_nodes);
+  _assert(num_success <= potential_write_nodes.size());
+
+  // fill the result with the tickets and indices
+  result.resize(num_success);
+  for (const auto i : c10::irange(num_success)) {
+    const auto node = potential_write_nodes[i];
+    const auto ticket = node->io_ticket();
+    _assert(ticket.has_value(), "Ticket should be valid for the node");
+    result[i] = {ticket.value(), node->device_indices(), node->host_indices()};
+  }
+
+  return {std::move(result), static_cast<int64_t>(device_prefix_length)};
 }
 
 std::tuple<IOTicket, std::vector<at::Tensor>>
@@ -243,6 +221,11 @@ RadixTree::loading_onboard(NodeHandle device_id, NodeHandle host_id, at::Tensor 
   return {ticket, std::move(indices)};
 }
 
+void RadixTree::commit_writing_through(IOTicket ticket, bool success) {
+  if (m_impl->disabled) return;
+  m_impl->complete_io_writing_through(ticket, success);
+}
+
 void RadixTree::commit_loading_onboard(IOTicket ticket, bool success) {
   if (m_impl->disabled) return;
   m_impl->complete_io_loading_onboard(ticket, success);
@@ -250,6 +233,23 @@ void RadixTree::commit_loading_onboard(IOTicket ticket, bool success) {
 
 void RadixTree::reset() {
   m_impl->reset();
+}
+
+void RadixTree::lock_ref(NodeHandle node_id, bool increment) {
+  if (m_impl->disabled) return;
+  m_impl->lock_ref(node_id, increment);
+}
+
+int64_t RadixTree::evictable_size() const {
+  return static_cast<int64_t>(m_impl->evictable_size());
+}
+
+int64_t RadixTree::protected_size() const {
+  return static_cast<int64_t>(m_impl->protected_size());
+}
+
+int64_t RadixTree::total_size() const {
+  return static_cast<int64_t>(m_impl->total_size());
 }
 
 }  // namespace radix_tree_v2
