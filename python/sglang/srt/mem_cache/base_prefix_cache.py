@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, List, NamedTuple
+from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional
 
 import torch
 
@@ -10,10 +10,21 @@ else:
 
 
 class MatchResult(NamedTuple):
+    """Result of a prefix match operation.
+
+    Attributes:
+        device_indices: Indices of the data on the device matched by the prefix.
+        last_device_node: The last node on the device that was matched.
+        last_host_node: The last node on the host that was matched.
+                        Note that if the prefix cache does not support host cache,
+                        this **must** be the same as `last_device_node`.
+        host_indices_length: Length of the indices on the host, if applicable.
+                             This is `None` if the prefix cache does not support host cache.
+    """
     device_indices: torch.Tensor
-    device_last_node: Any
-    host_indices: torch.Tensor
-    host_last_node: Any
+    last_device_node: Any
+    last_host_node: Any
+    host_indices_length: Optional[int] = None
 
 
 class BasePrefixCache(ABC):
@@ -35,15 +46,34 @@ class BasePrefixCache(ABC):
     def cache_finished_req(self, req: Req, **kwargs):
         pass
 
-    @abstractmethod
     def init_load_host(
         self,
         device_node: Any,
         host_node: Any,
         new_device_indices: torch.Tensor,
-        old_host_indices: torch.Tensor,
     ):
-        pass
+        """
+        Initial the load from host to device.
+        Caller should provide the device indices that will be loaded into.
+        The device node and host node should be returned from `match_prefix` call.
+        If the prefix cache does support host cache, this method should be overridden.
+
+        Args:
+            device_node: The node on the device where the data will be loaded.
+            host_node: The node on the host where the data is stored.
+            new_device_indices: Indices of the data to be loaded onto the device.
+        """
+        assert (
+            device_node == host_node and len(new_device_indices) == 0
+        ), "This Prefix Cache does not support host cache"
+
+    def ready_to_load_host(self):
+        """
+        This method is called after the prefill batch is prepared,
+        and all the initialized load from host operations will be executed after this call.
+        If the prefix cache does support host cache, this method should be overridden.
+        Otherwise, it is just a no-op.
+        """
 
     @abstractmethod
     def cache_unfinished_req(self, req: Req, **kwargs):

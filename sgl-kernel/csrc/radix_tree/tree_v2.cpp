@@ -35,7 +35,7 @@ RadixTree::~RadixTree() = default;
 
 std::tuple<std::vector<NodeHandle>, int64_t> RadixTree::insert(const token_vec_t& _key, at::Tensor value) {
   if (m_impl->disabled) return {};
-  _assert(_key.size() == value.size(0), "Key and value must have the same size");
+  _assert(_key.size() == std::size_t(value.size(0)), "Key and value must have the same size");
   const auto key = token_slice{_key.data(), m_impl->align(_key.size())};
 
   // the nodes that are potentially written through to the host
@@ -101,7 +101,6 @@ std::tuple<std::vector<at::Tensor>, int64_t, NodeHandle, NodeHandle> RadixTree::
 
   // collect all the device indices
   std::vector<at::Tensor> indices{};
-  std::size_t num_devices = 0;
   m_impl->walk_to_root(device_node, [&](TreeNode* n) { indices.push_back(n->device_indices()); });
   std::reverse(indices.begin(), indices.end());
 
@@ -207,17 +206,21 @@ void RadixTree::commit_write_through(NodeHandle node_id, bool success) {
   m_impl->lock_ref(node, /*increment=*/false);  // unlock the node
 }
 
-void RadixTree::update_device_indices(NodeHandle device_id, NodeHandle host_id, at::Tensor value) {
-  if (m_impl->disabled) return;
+std::vector<at::Tensor> RadixTree::update_device_indices(NodeHandle device_id, NodeHandle host_id, at::Tensor value) {
+  if (m_impl->disabled) return {};
   const auto device_node = m_impl->id2node(device_id);
   const auto host_node = m_impl->id2node(host_id);
   std::size_t offset = value.size(0);
+  std::vector<at::Tensor> indices;
   const auto device_node_new = m_impl->walk_to_device(host_node, [&](TreeNode* n) {
+    indices.push_back(n->host_indices());
     m_impl->update_device(n, value.slice(/*dim=*/0, offset - n->length(), offset));
     offset = offset - n->length();
   });
   _assert(offset == 0, "Offset should be zero after updating device indices");
   _assert(device_node == device_node_new, "Device node is not the same as the previously matched");
+  std::reverse(indices.begin(), indices.end());
+  return indices;
 }
 
 void RadixTree::reset() {

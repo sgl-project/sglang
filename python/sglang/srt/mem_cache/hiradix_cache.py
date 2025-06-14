@@ -2,7 +2,7 @@ import heapq
 import logging
 import threading
 import time
-from typing import List, Optional
+from typing import List
 
 import torch
 
@@ -246,8 +246,7 @@ class HiRadixCache(RadixCache):
         node: TreeNode,
         device_node: TreeNode,
         device_indices: torch.Tensor,
-        host_indices: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor:
         # todo: more loading policies
 
         last_hit_node = node
@@ -261,9 +260,8 @@ class HiRadixCache(RadixCache):
 
         ancester_node = node
         assert ancester_node == device_node, "Something wrong with device node"
-        assert sum(len(n.host_value) for n in nodes_to_load) == len(
-            host_indices
-        ), "Wrong old host indices as input"
+
+        host_indices = self.merge_tensor([n.host_value for n in nodes_to_load])
 
         # load it
         self.cache_controller.load(
@@ -289,30 +287,25 @@ class HiRadixCache(RadixCache):
         device_node: TreeNode,
         host_node: TreeNode,
         new_device_indices: torch.Tensor,
-        old_host_indices: torch.Tensor,
     ):
         if host_node.evicted:
-            loading_values = self.load_back(
-                host_node, device_node, new_device_indices, old_host_indices
+            loading_values = self.load_back(host_node, device_node, new_device_indices)
+            logger.debug(
+                f"loading back {len(loading_values)} tokens for node {host_node.id}"
             )
-            if loading_values is not None:
-                logger.debug(
-                    f"loading back {len(loading_values)} tokens for node {host_node.id}"
-                )
         else:
-            assert device_node == host_node
-            assert len(new_device_indices) == len(old_host_indices) == 0
+            assert device_node == host_node and len(new_device_indices) == 0
 
-    def ready_to_load_cache(self):
+    def ready_to_load_host(self):
         self.load_cache_event.set()
 
     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=self.empty_indices(self.device),
-                device_last_node=self.root_node,
-                host_indices=self.empty_indices(self.device),
-                host_last_node=self.root_node,
+                last_device_node=self.root_node,
+                last_host_node=self.root_node,
+                host_indices_length=0,
             )
 
         if self.page_size != 1:
@@ -327,9 +320,9 @@ class HiRadixCache(RadixCache):
 
         return MatchResult(
             device_indices=self.merge_tensor(values),
-            device_last_node=last_node_global,
-            host_indices=self.merge_tensor(host_values),
-            host_last_node=last_node,
+            last_device_node=last_node_global,
+            last_host_node=last_node,
+            host_indices_length=sum(len(v) for v in host_values),
         )
 
     def _match_prefix_helper(self, node: TreeNode, key: List[int]):

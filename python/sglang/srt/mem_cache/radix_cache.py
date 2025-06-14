@@ -23,7 +23,7 @@ import heapq
 import time
 from collections import defaultdict
 from functools import partial
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -33,7 +33,6 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 
@@ -149,9 +148,8 @@ class RadixCache(BasePrefixCache):
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=self.empty_indices(self.device),
-                device_last_node=self.root_node,
-                host_indices=self.empty_indices(self.device),
-                host_last_node=self.root_node,
+                last_device_node=self.root_node,
+                last_host_node=self.root_node,
             )
 
         if self.page_size != 1:
@@ -165,9 +163,8 @@ class RadixCache(BasePrefixCache):
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
         return MatchResult(
             device_indices=value,
-            device_last_node=last_node,
-            host_indices=self.empty_indices(self.device),
-            host_last_node=last_node,
+            last_device_node=last_node,
+            last_host_node=last_node,
         )
 
     def insert(self, key: List, value=None):

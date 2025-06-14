@@ -35,7 +35,7 @@ struct RadixTree {
   /// @brief Commit a transaction of write-through.
   void commit_write_through(NodeHandle node_id, bool success);
   /// @brief Update the device indices within a range of nodes.
-  void update_device_indices(NodeHandle device_node_id, NodeHandle host_node_id, at::Tensor indices);
+  std::vector<at::Tensor> update_device_indices(NodeHandle device_id, NodeHandle host_id, at::Tensor indices);
 
   /// @brief Clear and reset the tree.
   void reset();

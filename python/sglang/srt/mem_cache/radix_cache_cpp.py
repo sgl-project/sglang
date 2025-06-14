@@ -1,5 +1,4 @@
 import threading
-from hmac import new
 from typing import TYPE_CHECKING, List, Set
 
 import torch
@@ -110,8 +109,8 @@ class HiCacheController_v2:
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
 
-        self.write_queue = PriorityQueue()
-        self.load_queue = PriorityQueue()
+        self.write_queue = PriorityQueue[int]()
+        self.load_queue = PriorityQueue[CacheOperation]()
 
         self.ack_write_queue = Queue()
         self.ack_load_queue = Queue()
@@ -211,6 +210,8 @@ class HiCacheController_v2:
                 continue
             self.load_cache_event.clear()
 
+            # TODO(dark): optimize the batch merge operations
+            # reduce the number of torch.cat calls
             batch_operation = None
             while self.load_queue.qsize() > 0:
                 op = self.load_queue.get(block=True)
@@ -361,23 +362,15 @@ class HiRadixCacheCpp(BasePrefixCache):
     def reset(self):
         self.tree.reset()
 
-    def _match_prefix(self, keys: List[int]):
-        indices, device_count, node_gpu, node_cpu = self.tree.match_prefix(keys)
-        device_indices_vec = indices[:device_count]
-        host_indices_vec = indices[device_count:]
-        return (device_indices_vec, host_indices_vec, node_gpu, node_cpu)
-
     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
-        device_indices_vec, host_indices_vec, node_gpu, node_cpu = self._match_prefix(
-            key
+        device_indices_vec, host_indices_length, node_gpu, node_cpu = (
+            self.tree.match_prefix(key)
         )
-        device_indices = self.merge_tensor(device_indices_vec)
-        host_indices = self.merge_tensor(host_indices_vec)
         return MatchResult(
-            device_indices=device_indices,
-            host_indices=host_indices,
-            device_last_node=node_gpu,
-            host_last_node=node_cpu,
+            device_indices=self.merge_tensor(device_indices_vec),
+            last_device_node=node_gpu,
+            last_host_node=node_cpu,
+            host_indices_length=host_indices_length,
         )
 
     def insert(self, key: List[int], value: torch.Tensor) -> int:
@@ -440,17 +433,19 @@ class HiRadixCacheCpp(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # these should be page-aligned
+        # NOTE: our C++ implementation don't need token_ids and kv_indices to be page-aligned
+        # it will automatically align them, but the length of them should be equal
         old_prefix_len = len(req.prefix_indices)
         new_prefix_len = self.insert(token_ids, kv_indices)
 
+        # these 2 prefix_len should be page-aligned
         if old_prefix_len < new_prefix_len:
             self.token_to_kv_pool.free(kv_indices[old_prefix_len:new_prefix_len])
 
         # need to free the unaligned part, since it cannot be inserted into the radix tree
-        # Remark(dark): sglang PagedAllocator support unaligned free (which will automatically align it)
+        # NOTE: sglang PagedAllocator support unaligned free (which will automatically align it)
         if (
-            self.page_size != 1
+            self.page_size != 1  # unaligned tail only exists when page_size > 1
             and (unaligned_len := len(token_ids) % self.page_size) > 0
         ):
             self.token_to_kv_pool.free(kv_indices[len(token_ids) - unaligned_len :])
@@ -473,15 +468,16 @@ class HiRadixCacheCpp(BasePrefixCache):
         new_prefix_len = self.insert(token_ids, kv_indices)
 
         # TODO(dark): optimize the insert and match (e.g. merge into 1 function)
-        # this part is newly generated, but already exists in the pool
-        # we need to free the newly generated kv indices and reuse the pool
+
+        # KVCache between old & new is newly generated, but already exists in the pool
+        # we need to free the newly generated kv indices and reuse the indices in the pool
         if old_prefix_len < new_prefix_len:
             self.token_to_kv_pool.free(kv_indices[old_prefix_len:new_prefix_len])
 
-            # The prefix indices need to updated to reuse the old kv indices
-            new_indices_vec, _, new_last_node, _ = self._match_prefix(token_ids)
+            # The prefix indices need to updated to reuse the kv indices in the pool
+            new_indices_vec, _, new_last_node, _ = self.tree.match_prefix(token_ids)
             new_indices = self.merge_tensor(new_indices_vec)
-            assert new_prefix_len == len(new_indices)
+            assert new_prefix_len <= len(new_indices)
             self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, old_prefix_len:new_prefix_len
             ] = new_indices[old_prefix_len:new_prefix_len]
@@ -491,3 +487,18 @@ class HiRadixCacheCpp(BasePrefixCache):
 
             req.prefix_indices = new_indices
             req.last_node = new_last_node
+
+    def init_load_host(
+        self,
+        device_node: TreeNode,
+        host_node: TreeNode,
+        new_device_indices: torch.Tensor
+    ):
+        host_indices_vec = self.tree.update_device_indices(device_node, host_node, new_device_indices)
+        host_indices = self.merge_tensor(host_indices_vec)
+        assert len(host_indices) == len(new_device_indices)
+        self.cache_controller.load(
+            device_indices=new_device_indices,
+            host_indices=host_indices,
+            node_id=host_node # NOTE: node is actually an int id
+        )

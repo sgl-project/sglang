@@ -30,9 +30,8 @@ class ChunkCache(BasePrefixCache):
     def match_prefix(self, **unused_kwargs) -> MatchResult:
         return MatchResult(
             device_indices=self.empty_indices("cpu"),
-            device_last_node=None,
-            host_indices=self.empty_indices("cpu"),
-            host_last_node=None,
+            last_device_node=None,
+            last_host_node=None,
         )
 
     def cache_finished_req(self, req: Req):
@@ -53,17 +52,6 @@ class ChunkCache(BasePrefixCache):
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices
-
-    def init_load_host(
-        self,
-        device_node: Any,
-        host_node: Any,
-        new_device_indices: torch.Tensor,
-        old_host_indices: torch.Tensor,
-    ):
-        assert (
-            len(new_device_indices) == len(old_host_indices) == 0
-        ), "This should not be called for ChunkCache in any case, "
 
     def evict(self, num_tokens: int):
         pass

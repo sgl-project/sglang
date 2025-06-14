@@ -101,7 +101,7 @@ if TYPE_CHECKING:
             device_node: TreeNode,
             host_node: TreeNode,
             new_device_indices: torch.Tensor,
-        ):
+        ) -> List[torch.Tensor]:
             """
             Updates the device indices of a tree node within a range on the tree.
             Args:
@@ -109,6 +109,8 @@ if TYPE_CHECKING:
                 host_node (TreeNode): The tree node on the host, must be descendant of device_node.
                 new_device_indices (torch.Tensor): The new device indices to set.
                     The length of this tensor must be exactly host indices length.
+            Returns:
+                List[torch.Tensor]: A list of host indices corresponding to the new device indices.
             """
             return super().update_device_indices(
                 device_node, host_node, new_device_indices

@@ -1451,8 +1451,7 @@ class Scheduler(
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
 
-        if self.enable_hierarchical_cache:
-            self.tree_cache.ready_to_load_cache()
+        self.tree_cache.ready_to_load_host()
 
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
