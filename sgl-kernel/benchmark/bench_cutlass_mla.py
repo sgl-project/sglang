@@ -95,6 +95,7 @@ def benchmark(batch_size, seq_len, provider, block_size, num_kv_splits):
             seq_lens,
             block_table,
             workspace,
+            1.44,
             num_kv_splits,
         ),
         quantiles=quantiles,
