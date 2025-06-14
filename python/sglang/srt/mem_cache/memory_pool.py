@@ -267,7 +267,7 @@ class MHATokenToKVPool(KVCache):
 
         self.layer_transfer_counter = None
         self.device_module = torch.get_device_module(self.device)
-        self.alt_stream = self.device_module.Stream() if is_cuda else None
+        self.alt_stream = self.device_module.Stream() if _is_cuda else None
 
         k_size, v_size = self.get_kv_size_bytes()
         logger.info(
