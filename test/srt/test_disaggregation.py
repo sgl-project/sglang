@@ -103,7 +103,7 @@ class TestDisaggregationAccuracy(CustomTestCase):
         )
 
     @classmethod
-    def wait_server_ready(cls, url, timeout=60):
+    def wait_server_ready(cls, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH):
         start_time = time.perf_counter()
         while True:
             try:
@@ -284,7 +284,7 @@ class TestDisaggregationMooncakeFailure(CustomTestCase):
         )
 
     @classmethod
-    def wait_server_ready(cls, url, timeout=60):
+    def wait_server_ready(cls, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH):
         start_time = time.perf_counter()
         while True:
             try:
@@ -388,7 +388,7 @@ class TestDisaggregationMooncakeSpec(CustomTestCase):
         cls.wait_server_ready(cls.lb_url + "/health")
 
     @classmethod
-    def wait_server_ready(cls, url, timeout=60):
+    def wait_server_ready(cls, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH):
         start_time = time.perf_counter()
         while True:
             try:
@@ -440,22 +440,6 @@ class TestDisaggregationMooncakeSpec(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
         )
-
-    @classmethod
-    def wait_server_ready(cls, url, timeout=60):
-        start_time = time.perf_counter()
-        while True:
-            try:
-                response = requests.get(url)
-                if response.status_code == 200:
-                    print(f"Server {url} is ready")
-                    return
-            except Exception:
-                pass
-
-            if time.perf_counter() - start_time > timeout:
-                raise RuntimeError(f"Server {url} failed to start in {timeout}s")
-            time.sleep(1)
 
     @classmethod
     def tearDownClass(cls):
