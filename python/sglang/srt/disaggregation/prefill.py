@@ -76,7 +76,7 @@ class PrefillBootstrapQueue:
         scheduler: Scheduler,
         pp_rank: int,
         pp_size: int,
-        transfer_backend: str,
+        transfer_backend: TransferBackend,
     ):
         self.token_to_kv_pool = token_to_kv_pool
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
@@ -507,9 +507,7 @@ class SchedulerDisaggregationPrefillMixin:
         )
         for req in done_reqs:
             req: Req
-            self.disagg_prefill_bootstrap_queue.req_to_metadata_buffer_idx_allocator.free(
-                req.metadata_buffer_index
-            )
+            self.req_to_metadata_buffer_idx_allocator.free(req.metadata_buffer_index)
             req.metadata_buffer_index = -1
 
         self.disagg_prefill_inflight_queue = undone_reqs
