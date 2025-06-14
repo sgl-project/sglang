@@ -506,13 +506,7 @@ def _get_enable_thinking_from_request(request_obj):
     Returns:
         The boolean value of 'enable_thinking' if found and not True, otherwise True.
     """
-    if (
-        hasattr(request_obj, "chat_template_kwargs")
-        and request_obj.chat_template_kwargs
-        and request_obj.chat_template_kwargs.get("enable_thinking") is not None
-    ):
-        return request_obj.chat_template_kwargs.get("enable_thinking")
-    return True
+    return getattr(request_obj, "chat_template_kwargs", {}).get("enable_thinking", True)
 
 
 def create_streaming_chunk_data(chunk_data: str) -> str:
