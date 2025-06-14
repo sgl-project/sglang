@@ -71,7 +71,6 @@ class PrefillBootstrapQueue:
         bootstrap_port: int,
         gloo_group: ProcessGroup,
         max_total_num_tokens: int,
-        # TODO(OSS): [x] add server args
         decode_tp_size: int,
         decode_dp_size: int,
         scheduler: Scheduler,
@@ -102,7 +101,6 @@ class PrefillBootstrapQueue:
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> BaseKVManager:
-        # TODO(OSS): get kv args class
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
@@ -129,7 +127,6 @@ class PrefillBootstrapQueue:
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
-        # TODO(OSS): get_ib_device v.s. get_xai_ib_device
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
 
@@ -270,7 +267,6 @@ class SchedulerDisaggregationPrefillMixin:
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
-            # TODO(xai): pending -> bootstrap
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -289,7 +285,6 @@ class SchedulerDisaggregationPrefillMixin:
                 result = self.run_batch(batch)
                 self.process_batch_result_disagg_prefill(batch, result)
 
-            # TODO(xai): infight -> inflight
             if len(self.disagg_prefill_inflight_queue) > 0:
                 self.process_disagg_prefill_inflight_queue()
 
@@ -422,7 +417,6 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     logprob_pt += num_input_logprobs
                 self.send_kv_chunk(req, last_chunk=True)
-                # TODO(xai): remove time_stats dead code
 
                 if req.grammar is not None:
                     req.grammar.accept_token(next_token_id)
