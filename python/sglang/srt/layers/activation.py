@@ -28,9 +28,10 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import is_cuda, set_weight_attrs
+from sglang.srt.utils import cpu_has_amx_support, is_cuda, set_weight_attrs
 
 _is_cuda = is_cuda()
+_is_cpu_amx = cpu_has_amx_support()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
@@ -49,6 +50,15 @@ class SiluAndMul(CustomOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         silu_and_mul(x, out)
         return out
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        if _is_cpu_amx:
+            d = x.shape[-1] // 2
+            output_shape = x.shape[:-1] + (d,)
+            out = torch.ops.sgl_kernel.silu_and_mul_cpu(x)
+            return out
+        else:
+            return self.forward_native(x)
 
 
 class GeluAndMul(CustomOp):
@@ -165,8 +175,8 @@ def get_act_fn(
     return act_fn
 
 
-if not _is_cuda:
+if not (_is_cuda or _is_cpu_amx):
     logger.info(
-        "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
+        "sgl-kernel is not available on Non-NV platforms or Non-AMX CPUs. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul

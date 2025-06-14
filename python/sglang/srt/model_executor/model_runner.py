@@ -107,9 +107,11 @@ from sglang.srt.utils import (
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
     set_cuda_arch,
+    set_use_cpu,
 )
 
 _is_hip = is_hip()
+_is_cpu_amx = cpu_has_amx_support()
 
 # Use a small KV cache pool size for tests in CI
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
@@ -197,6 +199,7 @@ class ModelRunner:
                 "use_mla_backend": self.use_mla_backend,
             }
         )
+        set_use_cpu(global_server_args_dict["device"] == "cpu")
 
         # CPU offload
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
@@ -299,7 +302,7 @@ class ModelRunner:
         if (
             server_args.attention_backend == "intel_amx"
             and server_args.device == "cpu"
-            and not cpu_has_amx_support()
+            and not _is_cpu_amx
         ):
             logger.info(
                 "The current platform does not support Intel AMX, will fallback to torch_native backend."
