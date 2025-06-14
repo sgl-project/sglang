@@ -1372,10 +1372,7 @@ class Scheduler(
             self.running_batch.batch_is_full = True
             return None
 
-        if self.enable_hierarchical_cache:
-            # check for completion of hierarchical cache activities to release memory
-            self.tree_cache.writing_check()
-            self.tree_cache.loading_check()
+        self.tree_cache.check_host_cache()
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)

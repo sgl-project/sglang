@@ -125,7 +125,9 @@ if TYPE_CHECKING:
             """
             return super().commit_write_through(handle, success)
 
-        def commit_load_onboard(self, device_id: TreeNode, host_id: TreeNode, success: bool) -> None:
+        def commit_load_onboard(
+            self, device_id: TreeNode, host_id: TreeNode, success: bool
+        ) -> None:
             """
             Commits the load onboard process for tree nodes within a range on the tree.
             Args:

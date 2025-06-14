@@ -299,6 +299,10 @@ class HiRadixCache(RadixCache):
     def ready_to_load_host(self):
         self.load_cache_event.set()
 
+    def check_host_cache(self):
+        self.writing_check()
+        self.loading_check()
+
     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
         if self.disable or len(key) == 0:
             return MatchResult(

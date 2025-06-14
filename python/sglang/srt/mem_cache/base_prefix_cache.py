@@ -21,6 +21,7 @@ class MatchResult(NamedTuple):
         host_indices_length: Length of the indices on the host, if applicable.
                              This is `None` if the prefix cache does not support host cache.
     """
+
     device_indices: torch.Tensor
     last_device_node: Any
     last_host_node: Any
@@ -73,6 +74,13 @@ class BasePrefixCache(ABC):
         and all the initialized load from host operations will be executed after this call.
         If the prefix cache does support host cache, this method should be overridden.
         Otherwise, it is just a no-op.
+        """
+
+    def check_host_cache(self):
+        """
+        Check about host cache status and try to update available host memory status.
+        This will be called before the prefill batch is prepared.
+        Override this method if the prefix cache supports host cache.
         """
 
     @abstractmethod

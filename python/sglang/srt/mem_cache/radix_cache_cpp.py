@@ -1,8 +1,9 @@
 import threading
-from typing import TYPE_CHECKING, List, Set
+from typing import TYPE_CHECKING, Dict, List, Set, Tuple
 
 import torch
-from sgl_kernel.radix_tree import RadixTreeCpp, TreeNode
+from sgl_kernel.radix_tree import RadixTreeCpp
+from sgl_kernel.radix_tree import TreeNode as TreeNodeCpp
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import (
@@ -56,7 +57,7 @@ class CacheOperation:
         self,
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
-        node_id: int,
+        node_id: TreeNodeCpp,
         priority: Optional[int] = None,
     ):
         self.host_indices = host_indices
@@ -112,8 +113,8 @@ class HiCacheController_v2:
         self.write_queue = PriorityQueue[int]()
         self.load_queue = PriorityQueue[CacheOperation]()
 
-        self.ack_write_queue = Queue()
-        self.ack_load_queue = Queue()
+        self.ack_write_queue = Queue[TreeNodeCpp]()
+        self.ack_load_queue = Queue[TreeNodeCpp]()
 
         self.stop_event = threading.Event()
 
@@ -346,9 +347,9 @@ class HiRadixCacheCpp(BasePrefixCache):
         )
 
         # record the nodes with ongoing write through
-        self.ongoing_write_through: Set[TreeNode] = set()
+        self.ongoing_write_through: Set[TreeNodeCpp] = set()
         # record the node segments with ongoing load back
-        self.ongoing_load_back = {}
+        self.ongoing_load_back: Dict[int, Tuple[TreeNodeCpp, TreeNodeCpp]] = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if hicache_write_policy == "write_through" else 2
@@ -388,19 +389,19 @@ class HiRadixCacheCpp(BasePrefixCache):
             self.cache_controller.write(node_id)
         return length
 
-    def dec_lock_ref(self, node: TreeNode):
+    def dec_lock_ref(self, node: TreeNodeCpp):
         """
         Decrement the reference count of a node to root of the radix tree.
         Args:
-            node (TreeNodeCppHandle): The handle of the node to decrement the reference count for.
+            node (TreeNodeCpp): The handle of the node to decrement the reference count for.
         """
         self.tree.lock_ref(node, False)  # do not increment
 
-    def inc_lock_ref(self, node: TreeNode):
+    def inc_lock_ref(self, node: TreeNodeCpp):
         """
         Increment the reference count of from a node to root of the radix tree.
         Args:
-            node (TreeNodeCppHandle): The handle of the node to increment the reference count for.
+            node (TreeNodeCpp): The handle of the node to increment the reference count for.
         """
         self.tree.lock_ref(node, True)
 
@@ -490,15 +491,50 @@ class HiRadixCacheCpp(BasePrefixCache):
 
     def init_load_host(
         self,
-        device_node: TreeNode,
-        host_node: TreeNode,
-        new_device_indices: torch.Tensor
+        device_node: TreeNodeCpp,
+        host_node: TreeNodeCpp,
+        new_device_indices: torch.Tensor,
     ):
-        host_indices_vec = self.tree.update_device_indices(device_node, host_node, new_device_indices)
+        host_indices_vec = self.tree.load_onboard(
+            device_node, host_node, new_device_indices
+        )
         host_indices = self.merge_tensor(host_indices_vec)
         assert len(host_indices) == len(new_device_indices)
         self.cache_controller.load(
             device_indices=new_device_indices,
             host_indices=host_indices,
-            node_id=host_node # NOTE: node is actually an int id
+            node_id=host_node,  # NOTE: node is actually an int id
         )
+
+    def ready_to_load_host(self):
+        self.load_cache_event.set()
+
+    def check_host_cache(self):
+        self.writing_check()
+        self.loading_check()
+
+    def writing_check(self):
+        queue_size = torch.tensor(
+            self.cache_controller.ack_write_queue.qsize(), dtype=torch.int
+        )
+        if torch.distributed.get_world_size(group=self.tp_group) > 1:
+            # synchrnoize TP workers to make the same update to radix cache
+            torch.distributed.all_reduce(
+                queue_size,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+        for _ in range(int(queue_size.item())):
+            ack_id = self.cache_controller.ack_write_queue.get()
+            self.tree.commit_write_through(ack_id, True)
+            self.ongoing_write_through.remove(ack_id)
+
+    def loading_check(self):
+        while not self.cache_controller.ack_load_queue.empty():
+            try:
+                ack_id = self.cache_controller.ack_load_queue.get_nowait()
+            except Exception:
+                break
+            start_node, end_node = self.ongoing_load_back[ack_id]
+            self.tree.commit_load_onboard(start_node, end_node, True)
+            del self.ongoing_load_back[ack_id]
