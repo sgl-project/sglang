@@ -108,7 +108,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                     PAGE_SIZE,
                 )
                 workspace_size = cutlass_mla_get_workspace_size(
-                    max_seqlen_pad * PAGE_SIZE, bs
+                    max_seqlen_pad * PAGE_SIZE, bs, num_kv_splits=1
                 )
                 workspace = torch.empty(
                     workspace_size, device="cuda", dtype=torch.uint8
@@ -138,7 +138,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
             cuda_graph_kv_indices = block_kv_indices
 
         workspace_size = cutlass_mla_get_workspace_size(
-            cuda_graph_kv_indices.shape[1] * PAGE_SIZE, max_bs
+            cuda_graph_kv_indices.shape[1] * PAGE_SIZE, max_bs, num_kv_splits=1
         )
         self.cuda_graph_mla_workspace = torch.empty(
             workspace_size, device="cuda", dtype=torch.uint8
