@@ -1,10 +1,12 @@
 from typing import TYPE_CHECKING, Any, List, Tuple
-import torch
+
 import radix_tree_cpp
+import torch
 
 TreeNode = Any
 
 if TYPE_CHECKING:
+
     class RadixTreeCpp(radix_tree_cpp.RadixTree):
         def __init__(
             self,
@@ -23,8 +25,13 @@ if TYPE_CHECKING:
                 host_size (int): Size of the host memory tokens.
                 write_threshold (int): Threshold for writing through from GPU to CPU.
             """
-            super().__init__(disabled, use_hicache, page_size, host_size, write_threshold)
-        def insert(self, key: List[int], indices: torch.Tensor) -> Tuple[List[TreeNode], int]:
+            super().__init__(
+                disabled, use_hicache, page_size, host_size, write_threshold
+            )
+
+        def insert(
+            self, key: List[int], indices: torch.Tensor
+        ) -> Tuple[List[TreeNode], int]:
             """
             Inserts a key-value pair into the radix tree.
             Args:
@@ -36,7 +43,10 @@ if TYPE_CHECKING:
                     1. The number of indices that are matched on device.
             """
             return super().insert(key, indices)
-        def match_prefix(self, prefix: List[int]) -> Tuple[List[torch.Tensor], int, TreeNode, TreeNode]:
+
+        def match_prefix(
+            self, prefix: List[int]
+        ) -> Tuple[List[torch.Tensor], int, TreeNode, TreeNode]:
             """
             Matches a prefix in the radix tree.
             Args:
@@ -49,6 +59,7 @@ if TYPE_CHECKING:
                     3. The last node of the prefix matched on the CPU.
             """
             return super().match_prefix(prefix)
+
         def evict(self, num_tokens: int) -> List[torch.Tensor]:
             """
             Evicts a number of tokens from the radix tree.
@@ -58,6 +69,7 @@ if TYPE_CHECKING:
                 List[torch.Tensor]: A list of indices that were evicted.
             """
             return super().evict(num_tokens)
+
         def lock_ref(self, handle: TreeNode, lock: bool) -> None:
             """
             Locks or unlocks a reference to a tree node.
@@ -67,7 +79,10 @@ if TYPE_CHECKING:
                 lock (bool): If True, locks the node; if False, unlocks it.
             """
             return super().lock_ref(handle, lock)
-        def start_write_through(self, handle: TreeNode) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        def start_write_through(
+            self, handle: TreeNode
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
             """
             Starts the write-through process for a tree node.
             This will just change the inner state of the tree,
@@ -80,6 +95,7 @@ if TYPE_CHECKING:
                     1. Host indices of the node.
             """
             return super().start_write_through(handle)
+
         def commit_write_through(self, handle: TreeNode, success: bool) -> None:
             """
             Commits the write-through process for a tree node.
@@ -88,6 +104,7 @@ if TYPE_CHECKING:
                 success (bool): If True, commits the write-through; if False, just indicates failure.
             """
             return super().commit_write_through(handle, success)
+
         def evictable_size(self) -> int:
             """
             Returns the size of the evictable part of the radix tree.
@@ -96,6 +113,7 @@ if TYPE_CHECKING:
                 int: The size of the evictable part.
             """
             return super().evictable_size()
+
         def protected_size(self) -> int:
             """
             Returns the size of the protected part of the radix tree.
@@ -104,6 +122,7 @@ if TYPE_CHECKING:
                 int: The size of the protected part.
             """
             return super().protected_size()
+
         def total_size(self) -> int:
             """
             Returns the total size of the radix tree (including CPU nodes).
@@ -111,10 +130,12 @@ if TYPE_CHECKING:
                 int: The total size of the radix tree.
             """
             return super().total_size()
+
         def reset(self) -> None:
             """
             Resets the radix tree, clearing all nodes and indices.
             """
             return super().reset()
+
 else:
     RadixTreeCpp = radix_tree_cpp.RadixTree

@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MHATokenToKVPoolHost,
@@ -21,6 +22,20 @@ logger = logging.getLogger(__name__)
 
 
 class HiRadixCache(RadixCache):
+    def merge_tensor(self, l: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Merge a list of tensors into a single tensor.
+        Args:
+            l (List[torch.Tensor]): List of tensors to merge.
+        Returns:
+            torch.Tensor: Merged tensor.
+        """
+        if len(l) == 0:
+            return self.empty_indices(self.device)
+        elif len(l) == 1:
+            return l[0]
+        else:
+            return torch.cat(l)
 
     def __init__(
         self,
@@ -227,7 +242,11 @@ class HiRadixCache(RadixCache):
                 heapq.heappush(leaves, x.parent)
 
     def load_back(
-        self, node: TreeNode, mem_quota: Optional[int] = None
+        self,
+        node: TreeNode,
+        device_node: TreeNode,
+        device_indices: torch.Tensor,
+        host_indices: torch.Tensor,
     ) -> Optional[torch.Tensor]:
         # todo: more loading policies
 
@@ -239,37 +258,24 @@ class HiRadixCache(RadixCache):
             ), "No backup available on evicted nodes, should not happen"
             nodes_to_load.insert(0, node)
             node = node.parent
-        else:
-            ancester_node = node
 
-        # protect the ancestor nodes from eviction
-        delta = self.inc_lock_ref(ancester_node)
+        ancester_node = node
+        assert ancester_node == device_node, "Something wrong with device node"
+        assert sum(len(n.host_value) for n in nodes_to_load) == len(
+            host_indices
+        ), "Wrong old host indices as input"
 
-        # load it all or not at all
-        host_indices = torch.cat([n.host_value for n in nodes_to_load])
-        if len(host_indices) < self.load_back_threshold or (
-            len(host_indices) > mem_quota + delta if mem_quota is not None else False
-        ):
-            # skip loading back if the total size is too small or exceeding the memory quota
-            self.dec_lock_ref(ancester_node)
-            return None
-
-        device_indices = self.cache_controller.load(
-            host_indices=host_indices, node_id=last_hit_node.id
+        # load it
+        self.cache_controller.load(
+            host_indices=host_indices,
+            device_indices=device_indices,
+            node_id=last_hit_node.id,
         )
-        if device_indices is None:
-            self.evict(len(host_indices))
-            device_indices = self.cache_controller.load(
-                host_indices=host_indices, node_id=last_hit_node.id
-            )
-        self.dec_lock_ref(ancester_node)
-        if device_indices is None:
-            # no sufficient GPU memory to load back KV caches
-            return None
 
         self.ongoing_load_back[last_hit_node.id] = (ancester_node, last_hit_node)
         offset = 0
         for node in nodes_to_load:
+            assert node.host_value is not None, "Host value should be available here"
             node.value = device_indices[offset : offset + len(node.host_value)]
             offset += len(node.host_value)
             node.loading = True
@@ -278,66 +284,59 @@ class HiRadixCache(RadixCache):
 
         return device_indices
 
-    def init_load_back(
+    def init_load_host(
         self,
-        last_node: TreeNode,
-        prefix_indices: torch.Tensor,
-        mem_quota: Optional[int] = None,
+        device_node: TreeNode,
+        host_node: TreeNode,
+        new_device_indices: torch.Tensor,
+        old_host_indices: torch.Tensor,
     ):
-        assert (
-            len(prefix_indices) == 0 or prefix_indices.is_cuda
-        ), "indices of device kV caches should be on GPU"
-        if last_node.evicted:
-            loading_values = self.load_back(last_node, mem_quota)
+        if host_node.evicted:
+            loading_values = self.load_back(
+                host_node, device_node, new_device_indices, old_host_indices
+            )
             if loading_values is not None:
-                prefix_indices = (
-                    loading_values
-                    if len(prefix_indices) == 0
-                    else torch.cat([prefix_indices, loading_values])
-                )
                 logger.debug(
-                    f"loading back {len(loading_values)} tokens for node {last_node.id}"
+                    f"loading back {len(loading_values)} tokens for node {host_node.id}"
                 )
-
-            while last_node.evicted:
-                last_node = last_node.parent
-
-        return last_node, prefix_indices
+        else:
+            assert device_node == host_node
+            assert len(new_device_indices) == len(old_host_indices) == 0
 
     def ready_to_load_cache(self):
         self.load_cache_event.set()
 
-    def match_prefix(self, key: List[int], include_evicted=False, **kwargs):
-        empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
+    def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
         if self.disable or len(key) == 0:
-            if include_evicted:
-                return empty_value, self.root_node, self.root_node
-            else:
-                return empty_value, self.root_node
+            return MatchResult(
+                device_indices=self.empty_indices(self.device),
+                device_last_node=self.root_node,
+                host_indices=self.empty_indices(self.device),
+                host_last_node=self.root_node,
+            )
 
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
-        if value:
-            value = torch.cat(value)
-        else:
-            value = empty_value
+        values, host_values, last_node = self._match_prefix_helper(self.root_node, key)
 
         last_node_global = last_node
         while last_node.evicted:
             last_node = last_node.parent
 
-        if include_evicted:
-            return value, last_node, last_node_global
-        else:
-            return value, last_node
+        return MatchResult(
+            device_indices=self.merge_tensor(values),
+            device_last_node=last_node_global,
+            host_indices=self.merge_tensor(host_values),
+            host_last_node=last_node,
+        )
 
-    def _match_prefix_helper(self, node: TreeNode, key: List):
+    def _match_prefix_helper(self, node: TreeNode, key: List[int]):
         node.last_access_time = time.monotonic()
         child_key = self.get_child_key_fn(key)
-        value = []
+        values = []
+        host_values: List[torch.Tensor] = []
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
@@ -347,20 +346,26 @@ class HiRadixCache(RadixCache):
                 new_node = self._split_node(child.key, child, prefix_len)
                 self.inc_hit_count(new_node)
                 if not new_node.evicted:
-                    value.append(new_node.value)
+                    values.append(new_node.value)
+                else:
+                    assert new_node.host_value is not None
+                    host_values.append(new_node.host_value)
                 node = new_node
                 break
             else:
                 self.inc_hit_count(child)
                 if not child.evicted:
-                    value.append(child.value)
+                    values.append(child.value)
+                else:
+                    assert child.host_value is not None
+                    host_values.append(child.host_value)
                 node = child
                 key = key[prefix_len:]
 
                 if len(key):
                     child_key = self.get_child_key_fn(key)
 
-        return value, node
+        return values, host_values, node
 
     def _split_node(self, key, child: TreeNode, split_len: int):
         # child node split into new_node -> child

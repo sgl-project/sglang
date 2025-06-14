@@ -1,10 +1,19 @@
-from hmac import new
 import threading
+from hmac import new
+from typing import TYPE_CHECKING, List, Set
+
 import torch
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sgl_kernel.radix_tree import RadixTreeCpp, TreeNode
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MHATokenToKVPoolHost, MLATokenToKVPool, MLATokenToKVPoolHost, ReqToTokenPool, TokenToKVPoolAllocator
-from typing import TYPE_CHECKING, Any, List, Set, Tuple
+
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    MHATokenToKVPoolHost,
+    MLATokenToKVPool,
+    MLATokenToKVPoolHost,
+    ReqToTokenPool,
+    TokenToKVPoolAllocator,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -73,7 +82,6 @@ class CacheOperation:
 
 
 class HiCacheController_v2:
-
     def __init__(
         self,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
@@ -155,15 +163,13 @@ class HiCacheController_v2:
         """
         Load KV caches from host memory to device memory.
         """
-        self.load_queue.put(
-            CacheOperation(host_indices, device_indices, node_id)
-        )
+        self.load_queue.put(CacheOperation(host_indices, device_indices, node_id))
 
     def write_thread_func_direct(self):
         """
         Directly write through KV caches to host memory without buffering.
         """
-        torch.cuda.set_stream(self.write_stream) # type: ignore
+        torch.cuda.set_stream(self.write_stream)  # type: ignore
         while not self.stop_event.is_set():
             try:
                 node_id = self.write_queue.get(block=True, timeout=1)
@@ -198,7 +204,7 @@ class HiCacheController_v2:
         """
         Load KV caches from host memory to device memory layer by layer.
         """
-        torch.cuda.set_stream(self.load_stream) # type: ignore
+        torch.cuda.set_stream(self.load_stream)  # type: ignore
         while not self.stop_event.is_set():
             self.load_cache_event.wait(timeout=1)
             if not self.load_cache_event.is_set():
@@ -268,22 +274,23 @@ class HiCacheController_v2:
                 f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
             )
 
-def merge_tensor(l: List[torch.Tensor]) -> torch.Tensor:
-    """
-    Merge a list of tensors into a single tensor.
-    Args:
-        l (List[torch.Tensor]): List of tensors to merge.
-    Returns:
-        torch.Tensor: Merged tensor.
-    """
-    if len(l) == 0:
-        return torch.empty(0, dtype=torch.int64)
-    elif len(l) == 1:
-        return l[0]
-    else:
-        return torch.cat(l)
 
-class RadixCacheCpp(BasePrefixCache):
+class HiRadixCacheCpp(BasePrefixCache):
+    def merge_tensor(self, l: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Merge a list of tensors into a single tensor.
+        Args:
+            l (List[torch.Tensor]): List of tensors to merge.
+        Returns:
+            torch.Tensor: Merged tensor.
+        """
+        if len(l) == 0:
+            return self.empty_indices(self.device)
+        elif len(l) == 1:
+            return l[0]
+        else:
+            return torch.cat(l)
+
     def __init__(
         self,
         disable: bool,
@@ -297,6 +304,9 @@ class RadixCacheCpp(BasePrefixCache):
         hicache_write_policy: str,
         enable_kv_cache_events: bool,
     ):
+        assert (
+            enable_kv_cache_events is False
+        ), "HiRadixCache does not support kv cache events yet"
         self.kv_cache = token_to_kv_pool.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
@@ -351,11 +361,24 @@ class RadixCacheCpp(BasePrefixCache):
     def reset(self):
         self.tree.reset()
 
-    def match_prefix(self, keys: List[int]) -> Tuple[List[torch.Tensor], List[torch.Tensor], TreeNode, TreeNode]:
+    def _match_prefix(self, keys: List[int]):
         indices, device_count, node_gpu, node_cpu = self.tree.match_prefix(keys)
         device_indices_vec = indices[:device_count]
         host_indices_vec = indices[device_count:]
         return (device_indices_vec, host_indices_vec, node_gpu, node_cpu)
+
+    def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
+        device_indices_vec, host_indices_vec, node_gpu, node_cpu = self._match_prefix(
+            key
+        )
+        device_indices = self.merge_tensor(device_indices_vec)
+        host_indices = self.merge_tensor(host_indices_vec)
+        return MatchResult(
+            device_indices=device_indices,
+            host_indices=host_indices,
+            device_last_node=node_gpu,
+            host_last_node=node_cpu,
+        )
 
     def insert(self, key: List[int], value: torch.Tensor) -> int:
         """
@@ -378,7 +401,7 @@ class RadixCacheCpp(BasePrefixCache):
         Args:
             node (TreeNodeCppHandle): The handle of the node to decrement the reference count for.
         """
-        self.tree.lock_ref(node, False) # do not increment
+        self.tree.lock_ref(node, False)  # do not increment
 
     def inc_lock_ref(self, node: TreeNode):
         """
@@ -395,7 +418,7 @@ class RadixCacheCpp(BasePrefixCache):
 
     def evictable_size(self):
         return self.tree.evictable_size()
-    
+
     def protected_size(self):
         return self.tree.protected_size()
 
@@ -406,23 +429,30 @@ class RadixCacheCpp(BasePrefixCache):
         """Cache request when it finishes."""
         assert req.req_pool_idx is not None
         token_ids = (req.origin_input_ids + req.output_ids)[:-1]
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, : len(token_ids)]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(token_ids)
+        ]
 
         self.token_to_kv_pool.free(kv_indices)
         self.req_to_token_pool.free(req.req_pool_idx)
 
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, : len(token_ids)]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(token_ids)
+        ]
 
         # these should be page-aligned
         old_prefix_len = len(req.prefix_indices)
         new_prefix_len = self.insert(token_ids, kv_indices)
 
         if old_prefix_len < new_prefix_len:
-            self.token_to_kv_pool.free(kv_indices[old_prefix_len : new_prefix_len])
+            self.token_to_kv_pool.free(kv_indices[old_prefix_len:new_prefix_len])
 
         # need to free the unaligned part, since it cannot be inserted into the radix tree
         # Remark(dark): sglang PagedAllocator support unaligned free (which will automatically align it)
-        if self.page_size != 1 and (unaligned_len := len(token_ids) % self.page_size) > 0:
+        if (
+            self.page_size != 1
+            and (unaligned_len := len(token_ids) % self.page_size) > 0
+        ):
             self.token_to_kv_pool.free(kv_indices[len(token_ids) - unaligned_len :])
 
         # Remove req slot release the cache lock
@@ -434,7 +464,9 @@ class RadixCacheCpp(BasePrefixCache):
         assert req.req_pool_idx is not None
 
         token_ids = req.fill_ids
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, : len(token_ids)]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, : len(token_ids)
+        ]
 
         # these should be page-aligned
         old_prefix_len = len(req.prefix_indices)
@@ -444,15 +476,15 @@ class RadixCacheCpp(BasePrefixCache):
         # this part is newly generated, but already exists in the pool
         # we need to free the newly generated kv indices and reuse the pool
         if old_prefix_len < new_prefix_len:
-            self.token_to_kv_pool.free(kv_indices[old_prefix_len : new_prefix_len])
+            self.token_to_kv_pool.free(kv_indices[old_prefix_len:new_prefix_len])
 
             # The prefix indices need to updated to reuse the old kv indices
-            new_indices_vec, _, new_last_node, _ = self.match_prefix(token_ids)
-            new_indices = merge_tensor(new_indices_vec)
+            new_indices_vec, _, new_last_node, _ = self._match_prefix(token_ids)
+            new_indices = self.merge_tensor(new_indices_vec)
             assert new_prefix_len == len(new_indices)
             self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, old_prefix_len : new_prefix_len
-            ] = new_indices[old_prefix_len : new_prefix_len]
+                req.req_pool_idx, old_prefix_len:new_prefix_len
+            ] = new_indices[old_prefix_len:new_prefix_len]
 
             self.dec_lock_ref(req.last_node)
             self.inc_lock_ref(new_last_node)

@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, NamedTuple
+
 import torch
 
 if TYPE_CHECKING:
@@ -7,16 +8,19 @@ if TYPE_CHECKING:
 else:
     Req = Any  # Placeholder for Req type when not type checking
 
+
 class MatchResult(NamedTuple):
     device_indices: torch.Tensor
     device_last_node: Any
     host_indices: torch.Tensor
     host_last_node: Any
 
+
 class BasePrefixCache(ABC):
     """Cache can be indexed by either rid or key."""
 
-    def empty_indices(self, device: str | torch.device) -> torch.Tensor:
+    @staticmethod
+    def empty_indices(device: str | torch.device) -> torch.Tensor:
         return torch.empty((0,), dtype=torch.int64, device=device)
 
     @abstractmethod
@@ -29,6 +33,16 @@ class BasePrefixCache(ABC):
 
     @abstractmethod
     def cache_finished_req(self, req: Req, **kwargs):
+        pass
+
+    @abstractmethod
+    def init_load_host(
+        self,
+        device_node: Any,
+        host_node: Any,
+        new_device_indices: torch.Tensor,
+        old_host_indices: torch.Tensor,
+    ):
         pass
 
     @abstractmethod

@@ -197,6 +197,7 @@ class Scheduler(
     ):
         # Parse args
         self.server_args = server_args
+        self.page_size = server_args.page_size
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self.tp_size = server_args.tp_size
@@ -1381,6 +1382,7 @@ class Scheduler(
 
         # Prefill policy
         adder = PrefillAdder(
+            self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
@@ -1421,10 +1423,8 @@ class Scheduler(
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     self.running_batch.batch_is_full = True
                     break
-            req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(
-                req, (self.chunked_req is not None), self.enable_hierarchical_cache
-            )
+
+            res = adder.add_one_req(req, (self.chunked_req is not None))
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:

@@ -158,14 +158,9 @@ class SchedulePolicy:
             prefix_ids = r.adjust_max_prefix_ids()
 
             # NOTE: the prefix_indices must always be aligned with last_node
-            if self.enable_hierarchical_cache:
-                r.prefix_indices, r.last_node, r.last_node_global = (
-                    self.tree_cache.match_prefix(key=prefix_ids, include_evicted=True)
-                )
-            else:
-                r.prefix_indices, r.last_node = self.tree_cache.match_prefix(
-                    rid=r.rid, key=prefix_ids
-                )
+            r.prefix_indices, r.last_node, _, _ = self.tree_cache.match_prefix(
+                rid=r.rid, key=prefix_ids
+            )
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -175,7 +170,7 @@ class SchedulePolicy:
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
-                in_batch_matching_prefixes, _ = (
+                in_batch_matching_prefixes, _, _, _ = (
                     self.waiting_queue_radix_tree.match_prefix(
                         rid=r.rid, key=prefix_ids
                     )
@@ -268,6 +263,7 @@ class AddReqResult(Enum):
 class PrefillAdder:
     def __init__(
         self,
+        page_size: int,
         tree_cache: BasePrefixCache,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         running_batch: ScheduleBatch,
@@ -276,6 +272,7 @@ class PrefillAdder:
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
     ):
+        self.page_size = page_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
@@ -442,45 +439,68 @@ class PrefillAdder:
 
         return self.budget_state()
 
-    def add_one_req(
-        self, req: Req, has_chunked_req: bool, enable_hierarchical_cache: bool = False
-    ):
+    def add_one_req(self, req: Req, has_chunked_req: bool):
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+            req.init_next_round_input(self.tree_cache)
             return self.add_one_req_ignore_eos(req, has_chunked_req)
+
+        # just kind of inline from `init_next_round_input`
+        req.fill_ids = req.origin_input_ids + req.output_ids
+        req.prefix_indices, req.last_node, host_indices, last_host_node = (
+            self.tree_cache.match_prefix(rid=req.rid, key=req.adjust_max_prefix_ids())
+        )
+        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
 
         total_tokens = req.extend_input_len + min(
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
         )
-        input_tokens = (
-            -(-req.extend_input_len // self.tree_cache.page_size)
-            * self.tree_cache.page_size
-        )
+
+        # we can perform host -> device transfer so that the input length may be reduced
+        # still, we need to reserve device indices for the host indices
+        # so this is only used in estimation of `input_tokens`, rather than `total_tokens`
+        real_extend_len = req.extend_input_len - len(host_indices)
+
+        # need align a page up to avoid OOM, since allocation is page-aligned
+        input_tokens = -(-real_extend_len // self.page_size) * self.page_size
+        total_tokens = -(-total_tokens // self.page_size) * self.page_size
         prefix_len = len(req.prefix_indices)
 
+        # estimated tokens exceed the remaining tokens, so we cannot add this request
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
+        # input tokens exceed the remaining input tokens, so we cannot add this request
         if input_tokens > self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
-            if total_tokens > self.rem_total_tokens:
+            # self.rem_total_tokens may decrease during the lock acquisition
+            if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
-            if (
-                enable_hierarchical_cache
-                and req.last_node_global is not None
-                and req.last_node_global.evicted
-            ):
-                req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
-                    req.last_node_global, req.prefix_indices
+            assert len(host_indices) % self.page_size == 0, "Implementation error"
+
+            # we need to assign some memory for the host indices
+            if len(host_indices) > 0:
+                new_device_indices = self.token_to_kv_pool_allocator.alloc(
+                    len(host_indices)
                 )
-                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                input_tokens = (
-                    -(-req.extend_input_len // self.tree_cache.page_size)
-                    * self.tree_cache.page_size
+                assert new_device_indices is not None, "impossible to reach here"
+
+                # update the tree ache
+                self.tree_cache.init_load_host(
+                    device_node=req.last_node,
+                    host_node=last_host_node,
+                    new_device_indices=new_device_indices,
+                    old_host_indices=host_indices,
                 )
-                prefix_len = len(req.prefix_indices)
+                req.last_node = last_host_node
+                req.prefix_indices = torch.cat((req.prefix_indices, new_device_indices))
+
+            # always update the information and prefix_len
+            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+            input_tokens = -(-req.extend_input_len // self.page_size) * self.page_size
+            prefix_len = len(req.prefix_indices)
 
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill

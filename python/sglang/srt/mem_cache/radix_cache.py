@@ -49,7 +49,7 @@ class TreeNode:
         self.children = defaultdict(TreeNode)
         self.parent: TreeNode = None
         self.key: List[int] = []
-        self.value: torch.Tensor = []
+        self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
 
@@ -57,7 +57,7 @@ class TreeNode:
         # indicating the node is loading KV cache from host
         self.loading = False
         # store the host indices of KV cache
-        self.host_value = None
+        self.host_value: Optional[torch.Tensor] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -129,7 +129,7 @@ class RadixCache(BasePrefixCache):
     def reset(self):
         self.root_node = TreeNode()
         self.root_node.key = []
-        self.root_node.value = []
+        self.root_node.value = None
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
         self.protected_size_ = 0
@@ -500,11 +500,11 @@ class RadixCache(BasePrefixCache):
 
 
 if __name__ == "__main__":
-    tree = RadixCache(None, None, page_size=1, disable=False) # type: ignore
+    tree = RadixCache(None, None, page_size=1, disable=False)  # type: ignore
 
-    tree.insert("Hello") # type: ignore
-    tree.insert("Hello") # type: ignore
-    tree.insert("Hello_L.A.!") # type: ignore
+    tree.insert("Hello")  # type: ignore
+    tree.insert("Hello")  # type: ignore
+    tree.insert("Hello_L.A.!")  # type: ignore
     # tree.insert("Hello_world! Happy")
     # tree.insert("I love you!")
     tree.pretty_print()

@@ -54,6 +54,17 @@ class ChunkCache(BasePrefixCache):
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices
 
+    def init_load_host(
+        self,
+        device_node: Any,
+        host_node: Any,
+        new_device_indices: torch.Tensor,
+        old_host_indices: torch.Tensor,
+    ):
+        assert (
+            len(new_device_indices) == len(old_host_indices) == 0
+        ), "This should not be called for ChunkCache in any case, "
+
     def evict(self, num_tokens: int):
         pass
 
