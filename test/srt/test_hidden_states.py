@@ -23,6 +23,7 @@ class TestHiddenState(CustomTestCase):
             model_path=model_path,
             random_seed=42,
             skip_tokenizer_init=True,
+            enable_return_hidden_states=True,
         )
         outputs = engine.generate(
             input_ids=input_ids,
@@ -96,6 +97,7 @@ class TestHiddenState(CustomTestCase):
             model_path=model_path,
             random_seed=42,
             skip_tokenizer_init=True,
+            enable_return_hidden_states=True,
         )
         outputs_completion_first_round = engine.generate(
             input_ids=input_ids,

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum, auto
+from functools import total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -117,13 +118,14 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
 
+@total_ordering
 class CaptureHiddenMode(IntEnum):
     # Do not capture anything.
-    NULL = auto()
-    # Capture hidden states of all tokens.
-    FULL = auto()
+    NULL = 0
     # Capture a hidden state of the last token.
-    LAST = auto()
+    LAST = 1
+    # Capture hidden states of all tokens.
+    FULL = 2
 
     def need_capture(self):
         return self != CaptureHiddenMode.NULL
@@ -133,6 +135,9 @@ class CaptureHiddenMode(IntEnum):
 
     def is_last(self):
         return self == CaptureHiddenMode.LAST
+
+    def __lt__(self, other):
+        return self.value < other.value
 
 
 @dataclass

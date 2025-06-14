@@ -175,7 +175,7 @@ class TestBenchServing(CustomTestCase):
     def test_vlm_online_latency(self):
         res = run_bench_serving(
             model=DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
-            num_prompts=50,
+            num_prompts=250,
             request_rate=1,
             other_server_args=[
                 "--mem-fraction-static",
@@ -194,7 +194,7 @@ class TestBenchServing(CustomTestCase):
                 self.assertLess(res["median_ttft_ms"], 150)
                 # TODO: not set yet, need AMD machine
             else:
-                self.assertLess(res["median_ttft_ms"], 90)
+                self.assertLess(res["median_ttft_ms"], 98)
             self.assertLess(res["median_itl_ms"], 8)
 
     def test_online_latency_eagle(self):

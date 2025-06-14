@@ -223,7 +223,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi300-gpu-1, linux-mi325-gpu-1]
-        part: [0, 1]
+        part: [0, 1, 2, 3, 4, 5]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -240,7 +240,7 @@ jobs:
       - name: Run test
         timeout-minutes: 40
         run: |
-          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 6
 
   unit-test-backend-2-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
@@ -265,6 +265,30 @@ jobs:
         timeout-minutes: 40
         run: |
           bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-2-gpu-amd
+
+  unit-test-backend-4-gpu-amd:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+      github.event.pull_request.draft == false
+    strategy:
+      matrix:
+        runner: [linux-mi300-gpu-4]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start CI container
+        run: bash scripts/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 40
+        run: |
+          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-4-gpu-amd
 
   unit-test-backend-8-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&

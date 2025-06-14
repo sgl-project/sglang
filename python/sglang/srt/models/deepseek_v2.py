@@ -51,11 +51,11 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_tensor_quant_mla_fp8,
@@ -66,6 +66,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
     normalize_e4m3fn_to_e4m3fnuz,
+    requant_weight_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
@@ -109,10 +110,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8, merge_state_v2
-
-    from sglang.srt.layers.quantization.deep_gemm import (
-        grouped_gemm_nt_f8f8bf16_masked as deep_gemm_grouped_gemm_nt_f8f8bf16_masked,
-    )
 else:
     from vllm._custom_ops import awq_dequantize
 
@@ -460,22 +457,25 @@ class DeepseekV2MoE(nn.Module):
         hidden_states = state.hidden_states_mlp_input
 
         if router_logits is not None:
-            state.topk_weights_local, state.topk_idx_local = select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                top_k=self.top_k,
-                use_grouped_topk=True,
-                renormalize=self.renormalize,
-                topk_group=self.topk_group,
-                num_expert_group=self.num_expert_group,
-                num_fused_shared_experts=self.num_fused_shared_experts,
-                correction_bias=self.correction_bias,
-                routed_scaling_factor=self.routed_scaling_factor,
-                num_token_non_padded=state.forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                state.topk_weights_local, state.topk_idx_local = select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    top_k=self.top_k,
+                    use_grouped_topk=True,
+                    renormalize=self.renormalize,
+                    topk_group=self.topk_group,
+                    num_expert_group=self.num_expert_group,
+                    num_fused_shared_experts=self.num_fused_shared_experts,
+                    correction_bias=self.correction_bias,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    ),
+                )
         else:
             state.topk_idx_local = torch.full(
                 (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
@@ -977,7 +977,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_nope_out = q_nope.new_empty(
                 (self.num_local_heads, aligned_m, self.kv_lora_rank)
             )
-            deep_gemm_grouped_gemm_nt_f8f8bf16_masked(
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
                 (q_nope_val, q_nope_scale),
                 (self.w_kc, self.w_scale_k),
                 q_nope_out,
@@ -1010,7 +1010,11 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward_absorb_core(
         self, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
     ):
-        if self.attention_backend == "fa3" or self.attention_backend == "flashinfer":
+        if (
+            self.attention_backend == "fa3"
+            or self.attention_backend == "flashinfer"
+            or self.attention_backend == "cutlass_mla"
+        ):
             attn_output = self.attn_mqa(
                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
             )
@@ -1783,8 +1787,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 for name in weight_names:
                     if "kv_b_proj" in name:
                         layer_id = int(name.split(".")[2])
-                        # filter the nextn layer.
-                        if layer_id != self.config.num_hidden_layers:
+                        if layer_id < self.config.num_hidden_layers:
                             layer_ids.add(layer_id)
 
         for layer_id in layer_ids:
@@ -1844,7 +1847,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         and weight_block_size[1] == 128
                         and model_dtype == torch.bfloat16
                     ):
-                        if _ENABLE_JIT_DEEPGEMM and get_bool_env_var(
+                        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and get_bool_env_var(
                             "SGL_USE_DEEPGEMM_BMM", "false"
                         ):
                             block_scale = weight_scale
@@ -1928,6 +1931,62 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
+
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            self._weight_requant_ue8m0()
+
+    def _weight_requant_ue8m0(self):
+        weight_block_size = self.quant_config.weight_block_size
+
+        moe_layers = list(
+            range(
+                self.config.first_k_dense_replace,
+                self.config.num_hidden_layers,
+                self.config.moe_layer_freq,
+            )
+        )
+
+        for layer_id in range(self.config.num_hidden_layers):
+            layer = self.model.layers[layer_id]
+
+            for module in [
+                layer.self_attn.fused_qkv_a_proj_with_mqa,
+                layer.self_attn.q_b_proj,
+                layer.self_attn.kv_b_proj,
+                layer.self_attn.o_proj,
+            ]:
+                requant_weight_ue8m0_inplace(
+                    module.weight, module.weight_scale_inv, weight_block_size
+                )
+
+            if layer_id in moe_layers:
+                shared_experts = getattr(layer.mlp, "shared_experts", None)
+                if shared_experts is not None:
+                    for module in [
+                        shared_experts.gate_up_proj,
+                        shared_experts.down_proj,
+                    ]:
+                        requant_weight_ue8m0_inplace(
+                            module.weight, module.weight_scale_inv, weight_block_size
+                        )
+
+                experts = layer.mlp.experts
+                if isinstance(experts, DeepEPMoE):
+                    for w in [
+                        experts.w13_weight_fp8,
+                        experts.w2_weight_fp8,
+                    ]:
+                        requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
+            else:
+                mlp = layer.mlp
+                assert isinstance(mlp, DeepseekV2MLP)
+                for module in [
+                    mlp.gate_up_proj,
+                    mlp.down_proj,
+                ]:
+                    requant_weight_ue8m0_inplace(
+                        module.weight, module.weight_scale_inv, weight_block_size
+                    )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
 
