@@ -1734,6 +1734,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 logger,
                 f"{disable_reason} Shared experts fusion optimization is disabled.",
             )
+            return
 
         self.num_fused_shared_experts = self.config.n_shared_experts
 
