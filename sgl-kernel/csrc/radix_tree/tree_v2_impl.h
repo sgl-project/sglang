@@ -25,6 +25,9 @@ struct RadixTree::Impl {
         m_protected_size(0),
         m_cached_vec(),
         m_host_pool(page_size, host_size),
+        m_node_map(),
+        m_io_map(),
+        m_io_ticket_counter(0),
         disabled(disabled),
         use_hicache(use_hicache),
         page_size(page_size),
@@ -44,6 +47,9 @@ struct RadixTree::Impl {
     auto* parent = old_node->parent();
     // set up data structures
     TreeNode::split_prefix(new_node, old_node, prefix);
+    if (auto ticket = new_node->io_ticket()) {
+      register_io_ticket(new_node, *ticket);
+    }
     // set up parent-child relationship
     add_child(new_node, std::move(old_node_ptr));
     add_child(parent, std::move(new_node_ptr), it);
@@ -88,7 +94,7 @@ struct RadixTree::Impl {
 
   // node: [CPU + GPU] -> [CPU]
   void free_device(TreeNode* node) {
-    _assert(node->on_both() && node->ref_count == 0);
+    _assert(node->on_both() && node->ref_count == 0 && node->is_io_free());
     node->_unsafe_device_indices().reset();
     m_evictable_size -= node->length();
   }
@@ -101,26 +107,7 @@ struct RadixTree::Impl {
 
   // return number of nodes that are written through
   // this will make some nodes: [GPU] -> [CPU + GPU]
-  std::size_t try_write_through(const std::vector<TreeNode*>& nodes) {
-    if (!use_hicache) return 0;  // no write-through if hierarchical cache is not used
-    std::size_t remain_size = m_host_pool.available_size();
-    std::vector<std::size_t> sizes(nodes.size());
-
-    for (const auto i : c10::irange(nodes.size())) {
-      const auto node = nodes[i];
-      _assert(need_write_through(node), "Node does not need write-through");
-      if (const auto needed = node->length(); needed > remain_size) {
-        sizes[i] = needed - remain_size;
-        remain_size = 0;  // no more space left
-      } else {
-        sizes[i] = 0;
-        remain_size -= needed;
-      }
-    }
-
-    // best effort to reserve space for the host indices
-    return alloc_host(nodes, sizes);
-  }
+  std::size_t try_write_through(const std::vector<TreeNode*>& nodes);
 
   /// @return (last node on cpu, matched prefix length on cpu)
   std::pair<TreeNode*, std::size_t> tree_walk(token_slice key) {
@@ -177,7 +164,11 @@ struct RadixTree::Impl {
     // for non-hicache, every leaf device node is a leaf host node (since no backup on host)
     if (!use_hicache) return collect_leaves_host();
     std::vector<TreeNode*> leaves;
-    std::vector<TreeNode*> stack = {&m_root};
+    std::vector<TreeNode*> stack = {};
+    // because root is not on GPU, we start from its children
+    for (const auto& [_, child] : m_root) {
+      stack.push_back(child.get());
+    }
     while (!stack.empty()) {
       auto* node = stack.back();
       stack.pop_back();
@@ -278,12 +269,63 @@ struct RadixTree::Impl {
   }
 
   void reset() {
-    std::destroy_at(&m_root);    // destroy the root node
-    ::new (&m_root) TreeNode{};  // reinitialize the root node
+    _assert(m_root.ref_count == 1, "Root node must be protected during reset");
+    m_root.root_reset();
     m_evictable_size = 0;
     m_protected_size = 0;
     m_node_map.clear();
     m_host_pool.reset();  // clear the host memory pool
+    _assert(m_io_map.empty(), "IO must be completed before reset");
+    m_io_ticket_counter = 0;
+  }
+
+  [[nodiscard]]
+  IOTicket new_io_ticket(TreeNode* node) {
+    auto ticket = m_io_ticket_counter++;
+    auto [it, success] = m_io_map.try_emplace(ticket);
+    _assert(success, "IO ticket already exists, maybe unresolved IO?");
+    it->second.reserve(2);  // we expect to split at most once
+    it->second.push_back(node);
+    return ticket;
+  }
+
+  void register_io_ticket(TreeNode* node, IOTicket ticket) {
+    auto it = m_io_map.find(ticket);
+    _assert(it != m_io_map.end(), "IO ticket not found in the map");
+    it->second.push_back(node);
+  }
+
+  void complete_io_writing_through(IOTicket ticket, bool success) {
+    auto it = m_io_map.find(ticket);
+    _assert(it != m_io_map.end(), "IO ticket not found in the map");
+    if (success) {
+      for (const auto node : it->second) {
+        if (node->is_io_locked()) unlock(node);
+        node->hit_count = 0;
+        node->complete_device_to_host(ticket);
+      }
+    } else {
+      for (const auto node : it->second) {
+        if (node->is_io_locked()) unlock(node);
+        node->complete_device_to_host(ticket);
+        // free the host part of the node
+        // [CPU + GPU] -> [GPU]
+        m_host_pool.free(node->host_indices());
+        node->_unsafe_host_indices().reset();
+      }
+    }
+    m_io_map.erase(it);  // remove the ticket from the map
+  }
+
+  void complete_io_loading_onboard(IOTicket ticket, bool success) {
+    _assert(success, "We cannot handle IO loading failure in the current implementation");
+    auto it = m_io_map.find(ticket);
+    _assert(it != m_io_map.end(), "IO ticket not found in the map");
+    for (const auto node : it->second) {
+      if (node->is_io_locked()) unlock(node);
+      node->complete_host_to_device(ticket);
+    }
+    m_io_map.erase(it);  // remove the ticket from the map
   }
 
   void debug_print(std::ostream& os) const;
@@ -309,8 +351,6 @@ struct RadixTree::Impl {
     parent->add_child(it, std::move(child));
   }
 
-  std::size_t alloc_host(const std::vector<TreeNode*>& nodes, const std::vector<std::size_t>& needed_sizes);
-
   TreeNode m_root;               // root node of the tree
   std::size_t m_evictable_size;  // number of evictable tokens on GPU (lock ref = 0)
   std::size_t m_protected_size;  // number of protected tokens on GPU (lock ref > 0)
@@ -318,7 +358,10 @@ struct RadixTree::Impl {
   token_vec_t m_cached_vec;       // cached vector of tokens for the current operation
   HiCacheMemoryPool m_host_pool;  // memory pool for host tensor indices
 
-  std::unordered_map<std::size_t, TreeNode*> m_node_map;  // map of node keys to nodes
+  std::unordered_map<std::size_t, TreeNode*> m_node_map;          // map of node keys to nodes
+  std::unordered_map<IOTicket, std::vector<TreeNode*>> m_io_map;  // map of IO tickets to nodes
+
+  IOTicket m_io_ticket_counter;  // counter for IO tickets
 
  public:
   // some public constant configurations (without m_ prefix)

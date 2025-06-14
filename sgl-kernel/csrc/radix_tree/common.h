@@ -9,6 +9,7 @@ namespace radix_tree_v2 {
 using token_t = std::int32_t;
 using token_vec_t = std::vector<token_t>;
 using NodeHandle = std::intptr_t;
+using IOTicket = std::uint8_t;
 
 // so that this can be passed to the torch
 static_assert(std::is_same_v<NodeHandle, std::int64_t>);

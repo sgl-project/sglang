@@ -22,22 +22,24 @@ struct RadixTree {
   RadixTree& operator=(const RadixTree&) = delete;
   RadixTree& operator=(RadixTree&&) = delete;
 
-  /// @return (nodes that are locked and require write-through, prefix length matched on device)
-  std::tuple<std::vector<NodeHandle>, int64_t> insert(const token_vec_t& key, at::Tensor value);
   /// @return (device indices that are matched, host indices length, device node, host node)
   std::tuple<std::vector<at::Tensor>, int64_t, NodeHandle, NodeHandle> match_prefix(const token_vec_t& key);
   /// @return Device indices that need to be evicted (on python side).
   std::vector<at::Tensor> evict(int64_t num_tokens);
   /// @brief (Un-)Lock a node.
   void lock_ref(NodeHandle node_id, bool increment /* increment or decrement */);
-  /// @brief Start a new transaction and return (device, host) indices.
-  std::tuple<at::Tensor, at::Tensor> start_write_through(NodeHandle node_id);
-  /// @brief Commit a transaction of write-through.
-  void commit_write_through(NodeHandle node_id, bool success);
+
+  /// @brief Update new key-value pair and try to perform write-through.
+  std::tuple<std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>>, int64_t>
+  writing_through(const token_vec_t& key, at::Tensor value);
   /// @brief Load to device from host within a range of nodes.
-  std::vector<at::Tensor> load_onboard(NodeHandle device_id, NodeHandle host_id, at::Tensor indices);
+  std::tuple<IOTicket, std::vector<at::Tensor>>
+  loading_onboard(NodeHandle device_id, NodeHandle host_id, at::Tensor indices);
+
+  /// @brief Commit a transaction of write-through.
+  void commit_writing_through(IOTicket ticket, bool success);
   /// @brief Commit a transaction of load onboard.
-  void commit_load_onboard(NodeHandle device_id, NodeHandle host_id, bool success);
+  void commit_loading_onboard(IOTicket ticket, bool success);
 
   /// @brief Clear and reset the tree.
   void reset();
