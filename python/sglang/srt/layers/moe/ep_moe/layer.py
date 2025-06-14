@@ -1231,6 +1231,7 @@ class DeepEPMoE(EPMoE):
             down_input_scale,
             scale_block_size,
             masked_m,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
         del gateup_output
 
@@ -1238,7 +1239,13 @@ class DeepEPMoE(EPMoE):
         n = self.w2_weight.size(1)
         down_input_fp8 = (
             down_input,
-            deep_gemm_wrapper.get_col_major_tma_aligned_tensor(down_input_scale),
+            (
+                down_input_scale
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                else deep_gemm_wrapper.get_col_major_tma_aligned_tensor(
+                    down_input_scale
+                )
+            ),
         )
         down_output = torch.empty(
             (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16

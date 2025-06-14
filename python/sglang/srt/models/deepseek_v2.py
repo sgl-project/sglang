@@ -51,7 +51,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization import deep_gemm_wrapper
@@ -1932,7 +1932,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
-        if False:  # TODO (pr-chain)
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             self._weight_requant_ue8m0()
 
     def _weight_requant_ue8m0(self):
