@@ -4,6 +4,7 @@ from typing import List, Optional
 import torch
 import triton
 
+from sglang.math_utils import ceil_div
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import dispose_tensor, is_cuda
 
@@ -14,11 +15,6 @@ if _is_cuda:
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8 as per_token_group_quant_fp8,
     )
-
-    try:
-        from deep_gemm import ceil_div
-    except ImportError:
-        logger.error(f"Failed to import ceil_div from deep_gemm.")
 
 import triton.language as tl
 
