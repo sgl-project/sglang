@@ -105,6 +105,7 @@ from sglang.srt.utils import (
     is_no_spec_infer_or_topk_one,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
+    print_warning_once,
     set_cpu_offload_max_bytes,
     set_cuda_arch,
 )
