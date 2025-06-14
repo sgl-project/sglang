@@ -58,8 +58,8 @@ def cutlass_mla_decode(
     seq_lens: torch.Tensor,
     page_table: torch.Tensor,
     workspace: torch.Tensor,
-    sm_scale: float,  # Set to 1 to avoid cuda_graph issue by default.
-    num_kv_splits: int = 1,
+    sm_scale: float,
+    num_kv_splits: int = 1,  # Set to 1 to avoid cuda_graph issue by default.
 ) -> torch.Tensor:
     assert q_nope.ndim == 3, f"q_nope must be a 3D tensor, but got {q_nope.ndim}"
     assert q_pe.ndim == 3, f"q_pe must be a 3D tensor, but got {q_pe.ndim}"
