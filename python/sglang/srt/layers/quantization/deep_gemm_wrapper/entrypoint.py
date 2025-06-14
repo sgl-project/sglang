@@ -38,6 +38,7 @@ if ENABLE_JIT_DEEPGEMM:
 
 _SANITY_CHECK_UE8M0 = get_bool_env_var("SGLANG_W8A8_DEEPGEMM_SANITY_CHECK_UE8M0")
 
+
 def grouped_gemm_nt_f8f8bf16_masked(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -121,5 +122,6 @@ def _sanity_check_input_scale(value):
         return
 
     from sglang.srt.layers.quantization.fp8_utils import ceil_to_ue8m0
+
     value_ceil = ceil_to_ue8m0(value)
     assert torch.all(value == value_ceil), f"{value=} {value_ceil=}"

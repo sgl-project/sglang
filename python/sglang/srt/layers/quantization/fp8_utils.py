@@ -249,7 +249,6 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     return output.to(dtype=output_dtype).view(*output_shape)
 
 
-
 def aiter_w8a8_block_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
