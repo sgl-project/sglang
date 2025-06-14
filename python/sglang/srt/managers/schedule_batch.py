@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.multimodal import gpu_tensor_hash
+from sglang.srt.managers.env_vars import CLIP_MAX_NEW_TOKENS_ESTIMATION
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
@@ -621,6 +622,16 @@ class Req:
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
+
+        max_new_tokens = (
+            self.sampling_params.max_new_tokens
+            if self.sampling_params.max_new_tokens is not None
+            else 0
+        )
+        self.prefill_need_tokens: int = len(self.origin_input_ids) + min(
+            max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
+        )
+
         self.metadata_buffer_index: int = -1
 
     @property
@@ -1540,6 +1551,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_to_token_pool.write(
             (self.req_pool_indices, locs), self.out_cache_loc.to(torch.int32)
         )
+
+    def rem_total_tokens_offset(self, new_token_ratio: float, enable_mixed: bool):
+        rem_total_token_offset = 0
+        if enable_mixed:
+            rem_total_token_offset += len(self.reqs)
+        rem_total_token_offset += sum(
+            [
+                min(
+                    (r.sampling_params.max_new_tokens - len(r.output_ids)),
+                    CLIP_MAX_NEW_TOKENS_ESTIMATION,
+                )
+                * new_token_ratio
+                for r in self.reqs
+            ]
+        )
+        return rem_total_token_offset
 
     def filter_batch(
         self,

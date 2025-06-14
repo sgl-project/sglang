@@ -115,6 +115,7 @@ from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
+    CustomReqError,
     dataclass_to_string_truncated,
     get_bool_env_var,
     get_zmq_socket,
@@ -687,11 +688,15 @@ class TokenizerManager:
                 # Check if this was an abort/error created by scheduler
                 if isinstance(out["meta_info"].get("finish_reason"), dict):
                     finish_reason = out["meta_info"]["finish_reason"]
-                    if (
-                        finish_reason.get("type") == "abort"
-                        and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
+                    finish_type = finish_reason.get("type")
+                    finish_code = finish_reason.get("status_code")
+                    if finish_type == "abort" and (
+                        finish_code == HTTPStatus.BAD_REQUEST
+                        or finish_code == HTTPStatus.FORBIDDEN
                     ):
-                        raise ValueError(finish_reason["message"])
+                        raise CustomReqError(
+                            code=finish_code, message=finish_reason["message"]
+                        )
 
                 yield out
                 break
