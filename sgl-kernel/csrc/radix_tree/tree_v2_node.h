@@ -241,6 +241,17 @@ struct TreeNode {
     return m_io_status == IOStatus::HostToDevice;
   }
 
+  void root_reset() {
+    _assert(is_root(), "Only root node can be reset");
+    _assert(m_io_status == IOStatus::None, "IO operation in progress, cannot reset root node");
+    _assert(this->m_tokens.empty(), "Root node tokens should be empty on reset");
+    _assert(
+        !this->m_device_indices.defined() && !this->m_host_indices.defined(),
+        "Root node indices should be always be empty and never assigned");
+    m_children.clear();
+    this->access();
+  }
+
  public:
   std::size_t ref_count;
   std::size_t hit_count;

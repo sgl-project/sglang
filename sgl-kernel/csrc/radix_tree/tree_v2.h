@@ -49,6 +49,9 @@ struct RadixTree {
   /// @return How many size are used on device.
   int64_t total_size() const;
 
+  /// @brief Print debug information of the tree.
+  void debug_print() const;
+
  private:
   struct Impl;
   std::unique_ptr<Impl> m_impl;

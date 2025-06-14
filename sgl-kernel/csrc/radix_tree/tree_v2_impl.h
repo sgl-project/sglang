@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <iosfwd>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -284,6 +285,8 @@ struct RadixTree::Impl {
     m_node_map.clear();
     m_host_pool.reset();  // clear the host memory pool
   }
+
+  void debug_print(std::ostream& os) const;
 
  private:
   // some auxiliary functions

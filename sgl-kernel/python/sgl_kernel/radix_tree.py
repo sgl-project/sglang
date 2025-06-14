@@ -172,6 +172,12 @@ if TYPE_CHECKING:
             """
             return super().reset()
 
+        def debug_print(self) -> None:
+            """
+            Prints the internal state of the radix tree for debugging purposes.
+            """
+            return super().debug_print()
+
 else:
     RadixTreeCpp = radix_tree_cpp.RadixTree
     TreeNode = Any
