@@ -1960,14 +1960,15 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
 
             if layer_id in moe_layers:
-                shared_experts = layer.mlp.shared_experts
-                for module in [
-                    shared_experts.gate_up_proj,
-                    shared_experts.down_proj,
-                ]:
-                    requant_weight_ue8m0_inplace(
-                        module.weight, module.weight_scale_inv, weight_block_size
-                    )
+                shared_experts = getattr(layer.mlp, "shared_experts", None)
+                if shared_experts is not None:
+                    for module in [
+                        shared_experts.gate_up_proj,
+                        shared_experts.down_proj,
+                    ]:
+                        requant_weight_ue8m0_inplace(
+                            module.weight, module.weight_scale_inv, weight_block_size
+                        )
 
                 experts = layer.mlp.experts
                 if isinstance(experts, DeepEPMoE):
