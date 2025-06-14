@@ -38,6 +38,7 @@ from sglang.srt.utils import (
     add_prometheus_middleware,
     get_bool_env_var,
     kill_process_tree,
+    set_prometheus_multiproc_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,8 @@ async def lifespan(app: FastAPI):
     app.state.tokenizer_manager = tokenizer_manager
     app.state.scheduler_info = scheduler_info
 
-    # add_prometheus_middleware(app)
+    set_prometheus_multiproc_dir()
+    add_prometheus_middleware(app)
     enable_func_timer()
 
     # Initialize engine state attribute to None for now
