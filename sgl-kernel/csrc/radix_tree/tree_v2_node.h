@@ -54,7 +54,6 @@ struct token_slice {
  * Every node is a host node, which means either it is on the host or on the device (or both).
  * A device node stands for a node that is on the device, and it may have a backup on the host.
  * A host node stands for a node that is on the host, and it may be on device as well.
- * Note that the `host_indices` and `indices` shouldn't be both defined at the same time.
  */
 struct TreeNode {
  public:
