@@ -3,9 +3,12 @@ from typing import TYPE_CHECKING, Any, List, Tuple
 import radix_tree_cpp
 import torch
 
-TreeNode = Any
-
 if TYPE_CHECKING:
+
+    class TreeNodeCpp:
+        """
+        A placeholder for the TreeNode class. Cannot be constructed elsewhere.
+        """
 
     class RadixTreeCpp(radix_tree_cpp.RadixTree):
         def __init__(
@@ -171,3 +174,4 @@ if TYPE_CHECKING:
 
 else:
     RadixTreeCpp = radix_tree_cpp.RadixTree
+    TreeNode = Any

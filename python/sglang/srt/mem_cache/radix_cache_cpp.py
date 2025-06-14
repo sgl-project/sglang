@@ -2,8 +2,7 @@ import threading
 from typing import TYPE_CHECKING, Dict, List, Set, Tuple
 
 import torch
-from sgl_kernel.radix_tree import RadixTreeCpp
-from sgl_kernel.radix_tree import TreeNode as TreeNodeCpp
+from sgl_kernel.radix_tree import RadixTreeCpp, TreeNodeCpp
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import (
@@ -110,7 +109,7 @@ class HiCacheController_v2:
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
 
-        self.write_queue = PriorityQueue[int]()
+        self.write_queue = PriorityQueue[TreeNodeCpp]()
         self.load_queue = PriorityQueue[CacheOperation]()
 
         self.ack_write_queue = Queue[TreeNodeCpp]()
@@ -151,14 +150,14 @@ class HiCacheController_v2:
         self.write_thread.start()
         self.load_thread.start()
 
-    def write(self, node_id: int):
+    def write(self, node_id: TreeNodeCpp):
         self.write_queue.put(node_id)
 
     def load(
         self,
         device_indices: torch.Tensor,
         host_indices: torch.Tensor,
-        node_id: int,
+        node_id: TreeNodeCpp,
     ):
         """
         Load KV caches from host memory to device memory.
@@ -349,7 +348,7 @@ class HiRadixCacheCpp(BasePrefixCache):
         # record the nodes with ongoing write through
         self.ongoing_write_through: Set[TreeNodeCpp] = set()
         # record the node segments with ongoing load back
-        self.ongoing_load_back: Dict[int, Tuple[TreeNodeCpp, TreeNodeCpp]] = {}
+        self.ongoing_load_back: Dict[TreeNodeCpp, Tuple[TreeNodeCpp, TreeNodeCpp]] = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if hicache_write_policy == "write_through" else 2
