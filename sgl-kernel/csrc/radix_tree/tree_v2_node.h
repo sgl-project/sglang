@@ -68,7 +68,7 @@ struct TreeNode {
   TreeNode()
       : ref_count(0),
         hit_count(0),
-        is_writting_through(false),
+        m_io_status(IOStatus::None),
         m_tokens(),
         m_device_indices(),
         m_host_indices(),
@@ -206,12 +206,53 @@ struct TreeNode {
     return m_host_indices;
   }
 
+  void start_host_to_device() {
+    _assert(this->on_both(), "Node must be on both host and device before copying");
+    _assert(m_io_status == IOStatus::None, "IO operation already in progress");
+    m_io_status = IOStatus::HostToDevice;
+  }
+
+  void start_device_to_host() {
+    _assert(this->on_both(), "Node must be on both host and device before copying");
+    _assert(m_io_status == IOStatus::None, "IO operation already in progress");
+    m_io_status = IOStatus::DeviceToHost;
+  }
+
+  void complete_host_to_device() {
+    _assert(this->on_both() && this->ref_count > 0, "Node must be on both and protected when host -> device");
+    _assert(m_io_status == IOStatus::HostToDevice, "Wrong IO operation status (should be host -> device)");
+    m_io_status = IOStatus::None;
+  }
+
+  void complete_device_to_host() {
+    _assert(this->on_both() && this->ref_count > 0, "Node must be on both and protected when device -> host");
+    _assert(m_io_status == IOStatus::DeviceToHost, "Wrong IO operation status (should be device -> host)");
+    m_io_status = IOStatus::None;
+  }
+
+  bool is_io_free() const {
+    return m_io_status == IOStatus::None;
+  }
+
+  bool is_io_device_to_host() const {
+    return m_io_status == IOStatus::DeviceToHost;
+  }
+
+  bool is_io_host_to_device() const {
+    return m_io_status == IOStatus::HostToDevice;
+  }
+
  public:
   std::size_t ref_count;
   std::size_t hit_count;
-  bool is_writting_through;  // used to prevent concurrent writes
 
  private:
+  enum class IOStatus {
+    None,
+    HostToDevice,
+    DeviceToHost,
+  } m_io_status;
+
   token_vec_t m_tokens;
   at::Tensor m_device_indices;
   at::Tensor m_host_indices;  // indices of host value, if applicable

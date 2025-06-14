@@ -96,14 +96,14 @@ if TYPE_CHECKING:
             """
             return super().start_write_through(handle)
 
-        def update_device_indices(
+        def load_onboard(
             self,
             device_node: TreeNode,
             host_node: TreeNode,
             new_device_indices: torch.Tensor,
         ) -> List[torch.Tensor]:
             """
-            Updates the device indices of a tree node within a range on the tree.
+            Updates the device indices of tree nodes within a range on the tree.
             Args:
                 device_node (TreeNode): The tree node on the device.
                 host_node (TreeNode): The tree node on the host, must be descendant of device_node.
@@ -124,6 +124,16 @@ if TYPE_CHECKING:
                 success (bool): If True, commits the write-through; if False, just indicates failure.
             """
             return super().commit_write_through(handle, success)
+
+        def commit_load_onboard(self, device_id: TreeNode, host_id: TreeNode, success: bool) -> None:
+            """
+            Commits the load onboard process for tree nodes within a range on the tree.
+            Args:
+                device_id (TreeNode): The tree node on the device.
+                host_id (TreeNode): The tree node on the host, must be descendant of device_id.
+                success (bool): If True, commits the load onboard; if False, just indicates failure.
+            """
+            return super().commit_load_onboard(device_id, host_id, success)
 
         def evictable_size(self) -> int:
             """

@@ -34,8 +34,10 @@ struct RadixTree {
   std::tuple<at::Tensor, at::Tensor> start_write_through(NodeHandle node_id);
   /// @brief Commit a transaction of write-through.
   void commit_write_through(NodeHandle node_id, bool success);
-  /// @brief Update the device indices within a range of nodes.
-  std::vector<at::Tensor> update_device_indices(NodeHandle device_id, NodeHandle host_id, at::Tensor indices);
+  /// @brief Load to device from host within a range of nodes.
+  std::vector<at::Tensor> load_onboard(NodeHandle device_id, NodeHandle host_id, at::Tensor indices);
+  /// @brief Commit a transaction of load onboard.
+  void commit_load_onboard(NodeHandle device_id, NodeHandle host_id, bool success);
 
   /// @brief Clear and reset the tree.
   void reset();

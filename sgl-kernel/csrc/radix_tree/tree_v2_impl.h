@@ -114,7 +114,6 @@ struct RadixTree::Impl {
       } else {
         sizes[i] = 0;
         remain_size -= needed;
-        node->is_writting_through = true;
       }
     }
 
@@ -236,6 +235,14 @@ struct RadixTree::Impl {
 
   void lock_ref(NodeHandle node_ptr, bool increment) {
     return lock_ref(id2node(node_ptr), increment);
+  }
+
+  void lock(TreeNode* node) {
+    return lock_ref(node, /*increment=*/true);
+  }
+
+  void unlock(TreeNode* node) {
+    return lock_ref(node, /*increment=*/false);
   }
 
   std::size_t total_size() {
