@@ -66,6 +66,8 @@ class ForwardMode(IntEnum):
     TARGET_VERIFY = auto()
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
+    NAIVE_DRAFT_EXTEND = auto()
+    NAIVE_TARGET_VERIFY = auto()
 
     # A dummy first batch to start the pipeline for overlap scheduler.
     # It is now used for triggering the sampling_info_done event for the first prefill batch.
@@ -80,6 +82,7 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.MIXED
             or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.NAIVE_DRAFT_EXTEND
         )
 
     def is_decode(self):
@@ -95,13 +98,16 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.TARGET_VERIFY
 
     def is_draft_extend(self):
-        return self == ForwardMode.DRAFT_EXTEND
+        return (
+            self == ForwardMode.DRAFT_EXTEND or self == ForwardMode.NAIVE_DRAFT_EXTEND
+        )
 
     def is_extend_or_draft_extend_or_mixed(self):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.MIXED
+            or self == ForwardMode.NAIVE_DRAFT_EXTEND
         )
 
     def is_cuda_graph(self):
@@ -116,6 +122,12 @@ class ForwardMode(IntEnum):
 
     def is_decode_or_idle(self):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
+
+    def is_naive_draft(self):
+        return self == ForwardMode.NAIVE_DRAFT_EXTEND
+
+    def is_naive_verify(self):
+        return self == ForwardMode.NAIVE_TARGET_VERIFY
 
 
 @total_ordering
@@ -251,6 +263,7 @@ class ForwardBatch:
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
+    naive_skip_attn_backend_init: bool = False
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded

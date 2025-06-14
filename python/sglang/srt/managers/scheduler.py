@@ -319,7 +319,18 @@ class Scheduler(
         )
 
         # Launch a draft worker for speculative decoding
-        if self.spec_algorithm.is_eagle():
+        if self.spec_algorithm.is_naive_eagle():
+            from sglang.srt.speculative.naive_eagle import NaiveEagleWorker
+
+            self.draft_worker = NaiveEagleWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
+        elif self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
             self.draft_worker = EAGLEWorker(
@@ -1302,7 +1313,10 @@ class Scheduler(
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
-            raise ValueError(msg)
+            if not self.spec_algorithm.is_naive_eagle():
+                raise ValueError(
+                    msg
+                )  # FIXME: Naive spec may lead to memory leak, pass it here anyway.
 
         if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
             msg = (

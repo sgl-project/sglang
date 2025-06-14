@@ -719,6 +719,7 @@ class EAGLEWorker(TpModelWorker):
         accept_length_backup = batch.spec_info.accept_length
         return_logprob_backup = batch.return_logprob
 
+        batch.forward_mode = ForwardMode.DRAFT_EXTEND
         # Prepare metadata
         batch.spec_info.prepare_extend_after_decode(
             batch,
