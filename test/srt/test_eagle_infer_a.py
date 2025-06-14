@@ -129,7 +129,7 @@ class TestEAGLEEngine(CustomTestCase):
             output["meta_info"]["completion_tokens"]
             / output["meta_info"]["e2e_latency"]
         )
-        print(f"{acc_length=}")
+        print(f"{acc_length=:.4f}, {speed=}")
 
         if engine.server_args.model_path == DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST:
             self.assertGreater(acc_length, 3.6)
