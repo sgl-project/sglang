@@ -24,18 +24,18 @@ struct RadixTree {
 
   /// @return (nodes that are locked and require write-through, prefix length matched on device)
   std::tuple<std::vector<NodeHandle>, int64_t> insert(const token_vec_t& key, at::Tensor value);
-  /// @return (device indices that are matched, device node, host node)
+  /// @return (device indices that are matched, host indices length, device node, host node)
   std::tuple<std::vector<at::Tensor>, int64_t, NodeHandle, NodeHandle> match_prefix(const token_vec_t& key);
   /// @return Device indices that need to be evicted (on python side).
   std::vector<at::Tensor> evict(int64_t num_tokens);
   /// @brief (Un-)Lock a node.
   void lock_ref(NodeHandle node_id, bool increment /* increment or decrement */);
-
   /// @brief Start a new transaction and return (device, host) indices.
   std::tuple<at::Tensor, at::Tensor> start_write_through(NodeHandle node_id);
-
-  /// @brief Commit a transaction and return the device index.
+  /// @brief Commit a transaction of write-through.
   void commit_write_through(NodeHandle node_id, bool success);
+  /// @brief Update the device indices within a range of nodes.
+  void update_device_indices(NodeHandle device_node_id, NodeHandle host_node_id, at::Tensor indices);
 
   /// @brief Clear and reset the tree.
   void reset();

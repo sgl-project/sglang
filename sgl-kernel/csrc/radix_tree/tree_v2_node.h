@@ -72,7 +72,7 @@ struct TreeNode {
         m_tokens(),
         m_device_indices(),
         m_host_indices(),
-        m_parent(this),
+        m_parent(),
         m_children(),
         m_last_access_time(std::chrono::steady_clock::now()),
         node_id(_counter++) {}
@@ -82,7 +82,7 @@ struct TreeNode {
   }
 
   bool is_root() const {
-    return m_parent == this;
+    return m_parent == nullptr;
   }
 
   timestamp_t time() const {

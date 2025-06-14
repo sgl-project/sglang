@@ -53,8 +53,8 @@ if TYPE_CHECKING:
                 prefix (List[int]): The prefix to match.
             Returns:
                 Tuple[List[torch.Tensor], TreeNode, TreeNode]:
-                    0. A list of indices that is matched by the prefix.
-                    1. Number of indices that reside on the GPU.
+                    0. A list of indices that is matched by the prefix on the GPU.
+                    1. Sum length of the indices matched on the CPU.
                     2. The last node of the prefix matched on the GPU.
                     3. The last node of the prefix matched on the CPU.
             """
@@ -95,6 +95,24 @@ if TYPE_CHECKING:
                     1. Host indices of the node.
             """
             return super().start_write_through(handle)
+
+        def update_device_indices(
+            self,
+            device_node: TreeNode,
+            host_node: TreeNode,
+            new_device_indices: torch.Tensor,
+        ):
+            """
+            Updates the device indices of a tree node within a range on the tree.
+            Args:
+                device_node (TreeNode): The tree node on the device.
+                host_node (TreeNode): The tree node on the host, must be descendant of device_node.
+                new_device_indices (torch.Tensor): The new device indices to set.
+                    The length of this tensor must be exactly host indices length.
+            """
+            return super().update_device_indices(
+                device_node, host_node, new_device_indices
+            )
 
         def commit_write_through(self, handle: TreeNode, success: bool) -> None:
             """

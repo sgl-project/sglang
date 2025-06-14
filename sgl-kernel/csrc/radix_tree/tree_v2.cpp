@@ -33,8 +33,9 @@ RadixTree::RadixTree(bool disabled, bool use_hicache, int64_t page_size, int64_t
 
 RadixTree::~RadixTree() = default;
 
-std::tuple<std::vector<NodeHandle>, int64_t> RadixTree::insert(const token_vec_t& _key, const at::Tensor value) {
+std::tuple<std::vector<NodeHandle>, int64_t> RadixTree::insert(const token_vec_t& _key, at::Tensor value) {
   if (m_impl->disabled) return {};
+  _assert(_key.size() == value.size(0), "Key and value must have the same size");
   const auto key = token_slice{_key.data(), m_impl->align(_key.size())};
 
   // the nodes that are potentially written through to the host
@@ -87,26 +88,24 @@ std::tuple<std::vector<NodeHandle>, int64_t> RadixTree::insert(const token_vec_t
 }
 
 std::tuple<std::vector<at::Tensor>, int64_t, NodeHandle, NodeHandle> RadixTree::match_prefix(const token_vec_t& _key) {
-  if (m_impl->disabled) return {{}, 0, 0, 0};
+  if (m_impl->disabled) return {};
 
   const auto key = token_slice{_key.data(), m_impl->align(_key.size())};
   const auto [host_node, _] = m_impl->tree_walk(key);
 
   // walk up to the first non-evicted node
-  std::vector<at::Tensor> indices{};
+  std::size_t host_length = 0;
   const auto device_node = m_impl->walk_to_device(host_node, [&](TreeNode* n) {
-    indices.push_back(n->host_indices());  // the last few indices are on the host
+    host_length += n->length();  // accumulate the length of the host indices
   });
 
   // collect all the device indices
+  std::vector<at::Tensor> indices{};
   std::size_t num_devices = 0;
-  m_impl->walk_to_root(device_node, [&](TreeNode* n) {
-    ++num_devices;
-    indices.push_back(n->device_indices());
-  });
+  m_impl->walk_to_root(device_node, [&](TreeNode* n) { indices.push_back(n->device_indices()); });
   std::reverse(indices.begin(), indices.end());
 
-  return {std::move(indices), static_cast<int64_t>(num_devices), node2id(device_node), node2id(host_node)};
+  return {std::move(indices), static_cast<int64_t>(host_length), node2id(device_node), node2id(host_node)};
 }
 
 std::vector<at::Tensor> RadixTree::evict(int64_t _num_tokens) {
@@ -192,14 +191,14 @@ int64_t RadixTree::total_size() const {
 std::tuple<at::Tensor, at::Tensor> RadixTree::start_write_through(NodeHandle node_id) {
   if (m_impl->disabled) return {};
   auto node = m_impl->id2node(node_id);
-  // the node must be 1. writting through 2. on both device and host 3. locked (ref_count > 0)
+  // the node must be 1. writing through 2. on both device and host 3. locked (ref_count > 0)
   _assert(node->is_writting_through && node->on_both() && node->ref_count > 0, "Not a valid node for write through");
   return {node->device_indices(), node->host_indices()};
 }
 
 void RadixTree::commit_write_through(NodeHandle node_id, bool success) {
   if (m_impl->disabled) return;
-  // the node must be 1. writting through 2. on both device and host 3. locked (ref_count > 0)
+  // the node must be 1. writing through 2. on both device and host 3. locked (ref_count > 0)
   auto node = m_impl->id2node(node_id);
   _assert(node->is_writting_through && node->on_both() && node->ref_count > 0, "Not a valid node for write through");
   node->is_writting_through = false;
@@ -208,26 +207,24 @@ void RadixTree::commit_write_through(NodeHandle node_id, bool success) {
   m_impl->lock_ref(node, /*increment=*/false);  // unlock the node
 }
 
+void RadixTree::update_device_indices(NodeHandle device_id, NodeHandle host_id, at::Tensor value) {
+  if (m_impl->disabled) return;
+  const auto device_node = m_impl->id2node(device_id);
+  const auto host_node = m_impl->id2node(host_id);
+  std::size_t offset = value.size(0);
+  const auto device_node_new = m_impl->walk_to_device(host_node, [&](TreeNode* n) {
+    m_impl->update_device(n, value.slice(/*dim=*/0, offset - n->length(), offset));
+    offset = offset - n->length();
+  });
+  _assert(offset == 0, "Offset should be zero after updating device indices");
+  _assert(device_node == device_node_new, "Device node is not the same as the previously matched");
+}
+
 void RadixTree::reset() {
   m_impl->reset();
 }
 
 }  // namespace radix_tree_v2
-
-// TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
-//   using namespace radix_tree_v2;
-//   m.class_<RadixTree>("RadixTree")
-//       .def(torch::init<bool, bool, int64_t, int64_t, int64_t>())
-//       .def("insert", &RadixTree::insert)
-//       .def("match_prefix", &RadixTree::match_prefix)
-//       .def("evict", &RadixTree::evict)
-//       .def("lock_ref", &RadixTree::lock_ref)
-//       .def("evictable_size", &RadixTree::evictable_size)
-//       .def("protected_size", &RadixTree::protected_size)
-//       .def("total_size", &RadixTree::total_size)
-//       .def("start_write_through", &RadixTree::start_write_through)
-//       .def("commit_write_through", &RadixTree::commit_write_through);
-// }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   using namespace radix_tree_v2;
@@ -243,5 +240,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("total_size", &RadixTree::total_size)
       .def("start_write_through", &RadixTree::start_write_through)
       .def("commit_write_through", &RadixTree::commit_write_through)
+      .def("update_device_indices", &RadixTree::update_device_indices)
       .def("reset", &RadixTree::reset);
 }
