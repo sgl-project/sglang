@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import logging
+import pickle
 import queue
 import socket
 import struct
@@ -25,9 +27,11 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
 )
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, RemotePrefillReq
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_local_ip_by_remote
+from sglang.srt.utils import get_local_ip_by_remote, broadcast_pyobj
+
+from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
@@ -113,8 +117,10 @@ class NixlKVManager(CommonKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        is_remote_prefill: Optional[bool] = False,
     ):
-        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        super().__init__(args, disaggregation_mode, server_args,
+                         is_mla_backend, is_remote_prefill)
         try:
             from nixl._api import nixl_agent
         except ImportError as e:
@@ -126,6 +132,64 @@ class NixlKVManager(CommonKVManager):
         self.agent = nixl_agent(str(uuid.uuid4()))
         self.server_socket = zmq.Context().socket(zmq.PULL)
         self.register_buffer_to_engine()
+
+        if self.is_remote_prefill:
+            from os import environ
+            import etcd3
+            import json
+            import base64
+            import hashlib
+
+            etcd_endpoint = environ.get("ETCD_ENDPOINT", "127.0.0.1:2379")
+            self.model_name_hash = hashlib.sha256(server_args.served_model_name.encode('utf-8')) \
+                .hexdigest()[:8]
+            self.etcd_client = etcd3.client(host=etcd_endpoint.split(":")[0],
+                                            port=int(etcd_endpoint.split(":")[1]))
+            # register to etcd
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self.request_status = {}
+                self.transfer_infos: Dict[int, TransferInfo] = {}
+                self.peer_names: Dict[str, str] = {}
+            elif self.disaggregation_mode == DisaggregationMode.DECODE:
+                self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
+                    TransferStatus
+                )
+                # broadcast engine_id to all ranks only in decode
+                engine_id = None
+                if self.engine_rank == 0:
+                    engine_id = hashlib.sha256(uuid.uuid4().bytes).hexdigest()[:8]
+                    broadcast_pyobj([engine_id], self.engine_rank, None, 0, False)
+                    logger.debug(f"Rank {self.engine_rank} broadcasted engine_id: {engine_id}")
+                else:
+                    engine_id = broadcast_pyobj([], self.engine_rank, None, 0, False)[0]
+                    logger.debug(f"Rank {self.engine_rank} received engine_id: {engine_id}")
+                self.engine_id = engine_id
+
+                agent_metadata = base64.b64encode(self.agent.get_agent_metadata()).decode('ascii')
+                if self.engine_rank == 0:
+                    self.etcd_client.put(
+                        f"/decode/{self.model_name_hash}/{self.engine_id}",
+                        json.dumps({
+                            "tp_size": self.tp_size,
+                            "dp_size": self.dp_size,
+                        })
+                    )
+                self.etcd_client.put(
+                    f"/decode/{self.model_name_hash}/{self.engine_id}/{self.engine_rank}",
+                    json.dumps({
+                        "agent_metadata": agent_metadata,
+                        "agent_name": self.agent.name,
+                        "kv_data_ptrs": self.kv_args.kv_data_ptrs,
+                        "aux_data_ptrs": self.kv_args.aux_data_ptrs,
+                        "gpu_id": self.kv_args.gpu_id,
+                    })
+                )
+                logger.debug(f"Register key: /decode/{self.model_name_hash}/{self.engine_id}/{self.engine_rank} to ETCD")
+            else:
+                raise ValueError(
+                    f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
+                )
+            return
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.request_status: Dict[int, KVPoll] = {}
@@ -447,10 +511,75 @@ class NixlKVReceiver(CommonKVReceiver):
         data_parallel_rank: Optional[int] = None,
     ):
         self.started_transfer = False
-        self.conclude_state = None
+        self.is_remote_prefill = mgr.is_remote_prefill
+        if self.is_remote_prefill:
+            # if remote prefill, don't get boostrap info from prefill server
+
+            self.kv_mgr = mgr
+            self.bootstrap_room = bootstrap_room
+            self.send_to_queue_loop = asyncio.new_event_loop()
+            self._start_send_to_queue_thread(self.send_to_queue_loop)
+            return
         super().__init__(mgr, bootstrap_addr, bootstrap_room, data_parallel_rank)
 
-    def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
+    def _start_send_to_queue_thread(self, event_loop):
+        """Start a thread to send requests to the queue."""
+        if self.kv_mgr.engine_rank != 0:
+            return
+
+        def start_async_loop(loop):
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+
+        threading.Thread(target=start_async_loop, args=(event_loop,)).start()
+
+    def _send_to_queue(self, req: Req, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+        if self.kv_mgr.engine_rank != 0:
+            logger.debug(f"rank {self.kv_mgr.engine_rank} start to transfer")
+            self.started_transfer = True
+            return
+
+        queue_name = f"{self.kv_mgr.model_name_hash}"
+        kv_indices = base64.b64encode(kv_indices.tobytes()).decode("ascii")
+
+        remote_prefill_req = RemotePrefillReq(
+            rid=req.rid,
+            origin_input_text="",
+            origin_input_ids=req.origin_input_ids,
+            sampling_params=req.sampling_params,
+            kv_indices=kv_indices,
+            rank_ip=self.kv_mgr.rank_ip,
+            rank_port=self.kv_mgr.rank_port,
+            engine_rank=self.kv_mgr.engine_rank,
+            aux_index=aux_index,
+            bootstrap_room=self.bootstrap_room,
+            engine_id=self.kv_mgr.engine_id
+        )
+
+        remote_prefill_req_data = pickle.dumps(remote_prefill_req)
+
+        async def send_to_nats():
+            import nats
+            from os import environ
+
+            logger.debug(f"Send request and kv indices to queue: {queue_name} with len: {len(remote_prefill_req_data)} and boostrap room: {req.bootstrap_room}")
+            nats_endpoint = environ.get("NATS_ENDPOINT", "nats://127.0.0.1:4222")
+            nats_client = await nats.connect(nats_endpoint)
+
+            await nats_client.publish(
+                queue_name,
+                remote_prefill_req_data
+            )
+
+        asyncio.run_coroutine_threadsafe(send_to_nats(), self.send_to_queue_loop)
+        logger.debug(f"Send request to queue succeed!")
+        self.started_transfer = True
+
+    def init(self, req: Req, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+        if self.is_remote_prefill:
+            self._send_to_queue(req, kv_indices, aux_index)
+            return
+
         for bootstrap_info in self.bootstrap_infos:
             self.prefill_server_url = (
                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"

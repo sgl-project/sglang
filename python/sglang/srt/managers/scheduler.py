@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import os
+import random
 import signal
 import sys
 import threading
@@ -24,6 +25,7 @@ from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass
 from pathlib import Path
+import hashlib
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -55,6 +57,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    RemotePrefillReq,
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -489,6 +492,7 @@ class Scheduler(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
+                (RemotePrefillReq, self.handle_remote_prefill_req),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
@@ -656,6 +660,10 @@ class Scheduler(
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
+        self.is_remote_prefill = self.server_args.enable_remote_prefill
+        self.model_name_hash = hashlib.sha256(self.server_args.served_model_name.encode('utf-8')) \
+                .hexdigest()[:8]
+        self.remote_prefill_reqs = []
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
@@ -679,6 +687,7 @@ class Scheduler(
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 tree_cache=self.tree_cache,
+                is_remote_prefill=self.is_remote_prefill,
             )
 
             # The decode requests pending for pre-allocation
@@ -705,12 +714,15 @@ class Scheduler(
                 prefill_pp_size=self.server_args.disaggregation_prefill_pp,
                 num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
+                is_remote_prefill=self.is_remote_prefill,
             )
 
             # Metric for pre-allocation
             self.num_tokens_pre_allocated = 0
 
-        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+        elif (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+        ):
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
@@ -744,9 +756,22 @@ class Scheduler(
                 pp_rank=self.pp_rank,
                 pp_size=self.pp_size,
                 transfer_backend=self.transfer_backend,
+                is_remote_prefill=self.is_remote_prefill,
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+
+        if self.is_remote_prefill:
+            from os import environ
+            import etcd3
+            import nats
+
+            # connect to etcd
+            etcd_endpoint = environ.get("ETCD_ENDPOINT", "127.0.0.1:2379")
+            self.etcd_client = etcd3.client(host=etcd_endpoint.split(":")[0],
+                                        port=int(etcd_endpoint.split(":")[1]))
+            self.remote_agent_map = {}
+            self.nats_endpoint = environ.get("NATS_ENDPOINT", "nats://127.0.0.1:4222")
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -967,6 +992,9 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+
+                while len(self.remote_prefill_reqs) > 0:
+                    recv_reqs.append(self.remote_prefill_reqs.pop(-1))
             else:
                 recv_reqs = None
         else:
@@ -1062,6 +1090,9 @@ class Scheduler(
             if recv_req.bootstrap_port is None:
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
+
+            if recv_req.bootstrap_room is None and self.is_remote_prefill:
+                recv_req.bootstrap_room = random.randint(0, 2**63 - 1)
 
             req = Req(
                 recv_req.rid,
