@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 class MooncakeTransferEngine:
 
-    def __init__(self, hostname: str, gpu_id: int, ib_device: Optional[str] = None):
+    def __init__(self, hostname: str, ib_device: Optional[str] = None):
         try:
             from mooncake.engine import TransferEngine
         except ImportError as e:
@@ -20,7 +20,6 @@ class MooncakeTransferEngine:
 
         self.engine = TransferEngine()
         self.hostname = hostname
-        self.gpu_id = gpu_id
         self.ib_device = ib_device
 
         self.initialize(
