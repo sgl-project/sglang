@@ -35,6 +35,7 @@ This ensures consistent behavior across all endpoints while allowing
 endpoint-specific customization.
 """
 
+import json
 import logging
 import time
 import uuid
@@ -52,7 +53,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     OpenAIServingRequest,
     UsageInfo,
 )
-from sglang.srt.entrypoints.openai.utils import create_error_response
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
@@ -102,7 +102,7 @@ class OpenAIServingBase(ABC):
             # Validate request
             error_msg = self._validate_request(request)
             if error_msg:
-                return create_error_response(error_msg)
+                return self.create_error_response(error_msg)
 
             # Create request context
             ctx = RequestContext(
@@ -128,7 +128,7 @@ class OpenAIServingBase(ABC):
 
         except Exception as e:
             logger.error(f"Error in request: {e}")
-            return create_error_response(
+            return self.create_error_response(
                 message=f"Internal server error: {str(e)}",
                 err_type="InternalServerError",
                 status_code=500,
@@ -170,7 +170,7 @@ class OpenAIServingBase(ABC):
 
         Override this method in child classes that support streaming requests.
         """
-        return create_error_response(
+        return self.create_error_response(
             message=f"{self.__class__.__name__} does not support streaming requests",
             err_type="NotImplementedError",
             status_code=501,
@@ -186,7 +186,7 @@ class OpenAIServingBase(ABC):
 
         Override this method in child classes that support non-streaming requests.
         """
-        return create_error_response(
+        return self.create_error_response(
             message=f"{self.__class__.__name__} does not support non-streaming requests",
             err_type="NotImplementedError",
             status_code=501,
@@ -222,3 +222,29 @@ class OpenAIServingBase(ABC):
             total_tokens=total_prompt_tokens + total_completion_tokens,
             prompt_tokens_details=prompt_tokens_details,
         )
+
+    def create_error_response(
+        self,
+        message: str,
+        err_type: str = "BadRequestError",
+        status_code: int = 400,
+        param: Optional[str] = None,
+    ) -> ErrorResponse:
+        """Create an error response"""
+        return ErrorResponse(
+            object="error",
+            message=message,
+            type=err_type,
+            param=param,
+            code=status_code,
+        )
+
+    def create_streaming_error_response(
+        self,
+        message: str,
+        err_type: str = "BadRequestError",
+        status_code: int = 400,
+    ) -> str:
+        """Create a streaming error response"""
+        error = self.create_error_response(message, err_type, status_code)
+        return json.dumps({"error": error.model_dump()})

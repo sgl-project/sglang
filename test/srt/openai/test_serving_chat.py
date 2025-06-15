@@ -30,10 +30,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import ChatCompletionHandler
-from sglang.srt.entrypoints.openai.utils import (
-    build_base_sampling_params,
-    create_error_response,
-)
+from sglang.srt.entrypoints.openai.utils import build_base_sampling_params
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 
@@ -658,9 +655,9 @@ class TestUtilityFunctions:
         # max_completion_tokens should override max_tokens
         assert sampling_params["max_new_tokens"] == 200
 
-    def test_create_error_response_functionality(self):
+    def test_create_error_response_functionality(self, chat_handler):
         """Test that create_error_response works correctly."""
-        error = create_error_response("Test error message")
+        error = chat_handler.create_error_response("Test error message")
         assert isinstance(error, ErrorResponse)
         assert error.message == "Test error message"
         assert error.type == "BadRequestError"

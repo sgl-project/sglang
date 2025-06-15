@@ -14,11 +14,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
 )
 from sglang.srt.entrypoints.openai.serving_completions import CompletionHandler
-from sglang.srt.entrypoints.openai.utils import (
-    build_base_sampling_params,
-    create_error_response,
-    create_streaming_error_response,
-)
+from sglang.srt.entrypoints.openai.utils import build_base_sampling_params
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
@@ -154,17 +150,19 @@ class TestUtilityFunctions:
         assert sampling_params["min_new_tokens"] == 5
         assert sampling_params["logit_bias"] == {"1": 0.5}
 
-    def test_create_error_response_functionality(self):
+    def test_create_error_response_functionality(self, completion_handler):
         """Test that create_error_response works correctly."""
-        error = create_error_response("Test error message")
+        error = completion_handler.create_error_response("Test error message")
         assert isinstance(error, ErrorResponse)
         assert error.message == "Test error message"
         assert error.type == "BadRequestError"
         assert error.code == 400
 
-    def test_create_streaming_error_response_functionality(self):
+    def test_create_streaming_error_response_functionality(self, completion_handler):
         """Test that create_streaming_error_response works correctly."""
-        error_json = create_streaming_error_response("Test streaming error")
+        error_json = completion_handler.create_streaming_error_response(
+            "Test streaming error"
+        )
         # Should return JSON string with error structure
         import json
 

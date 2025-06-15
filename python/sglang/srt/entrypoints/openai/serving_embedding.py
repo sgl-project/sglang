@@ -57,7 +57,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase, RequestContext
-from sglang.srt.entrypoints.openai.utils import create_error_response
 from sglang.srt.managers.io_struct import EmbeddingReqInput
 
 
@@ -232,7 +231,7 @@ class EmbeddingHandler(OpenAIServingBase):
                 adapted_request, ctx.raw_request
             ).__anext__()
         except ValueError as e:
-            return create_error_response(str(e))
+            return self.create_error_response(str(e))
 
         if not isinstance(ret, list):
             ret = [ret]

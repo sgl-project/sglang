@@ -62,10 +62,6 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase, Reques
 from sglang.srt.entrypoints.openai.utils import (
     aggregate_token_usage,
     build_base_sampling_params,
-    create_error_response,
-    create_stream_done,
-    create_streaming_chunk_data,
-    create_streaming_error_response,
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -307,7 +303,7 @@ class CompletionHandler(OpenAIServingBase):
                     stream_buffers[index] = stream_buffer
                     n_prev_tokens[index] = n_prev_token
 
-                    yield create_streaming_chunk_data(chunk.model_dump_json())
+                    yield f"data: {chunk.model_dump_json()}\n\n"
 
                 # Handle final usage chunk
                 if request.stream_options and request.stream_options.include_usage:
@@ -324,13 +320,13 @@ class CompletionHandler(OpenAIServingBase):
                     final_usage_data = final_usage_chunk.model_dump_json(
                         exclude_none=True
                     )
-                    yield create_streaming_chunk_data(final_usage_data)
+                    yield f"data: {final_usage_data}\n\n"
 
             except Exception as e:
-                error = create_streaming_error_response(str(e))
+                error = self.create_streaming_error_response(str(e))
                 yield f"data: {error}\n\n"
 
-            yield create_stream_done()
+            yield "data: [DONE]\n\n"
 
         return StreamingResponse(
             generate_stream_resp(),
@@ -351,7 +347,7 @@ class CompletionHandler(OpenAIServingBase):
             )
             ret = await generator.__anext__()
         except ValueError as e:
-            return create_error_response(str(e))
+            return self.create_error_response(str(e))
 
         if not isinstance(ret, list):
             ret = [ret]

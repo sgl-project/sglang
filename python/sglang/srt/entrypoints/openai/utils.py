@@ -32,7 +32,6 @@ The module includes sophisticated logic to detect whether a chat template expect
 proper content processing for different model types (e.g., DeepSeek vs Llama).
 """
 
-import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
@@ -42,7 +41,6 @@ import transformers.utils.chat_template_utils as hf_chat_utils
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
-    ErrorResponse,
     LogProbs,
     OpenAIServingRequest,
     UsageInfo,
@@ -269,32 +267,6 @@ def aggregate_token_usage(
     )
 
 
-def create_error_response(
-    message: str,
-    err_type: str = "BadRequestError",
-    status_code: int = 400,
-    param: Optional[str] = None,
-) -> ErrorResponse:
-    """Create an error response"""
-    return ErrorResponse(
-        object="error",
-        message=message,
-        type=err_type,
-        param=param,
-        code=status_code,
-    )
-
-
-def create_streaming_error_response(
-    message: str,
-    err_type: str = "BadRequestError",
-    status_code: int = 400,
-) -> str:
-    """Create a streaming error response"""
-    error = create_error_response(message, err_type, status_code)
-    return json.dumps({"error": error.model_dump()})
-
-
 def build_base_sampling_params(request: OpenAIServingRequest) -> Dict[str, Any]:
     """Build common sampling parameters shared by both chat and completion requests"""
     params = {}
@@ -401,13 +373,3 @@ def _get_enable_thinking_from_request(request_obj):
         The boolean value of 'enable_thinking' if found and not True, otherwise True.
     """
     return getattr(request_obj, "chat_template_kwargs", {}).get("enable_thinking", True)
-
-
-def create_streaming_chunk_data(chunk_data: str) -> str:
-    """Create a streaming response chunk in the proper format"""
-    return f"data: {chunk_data}\n\n"
-
-
-def create_stream_done() -> str:
-    """Create the final [DONE] message for streaming responses"""
-    return "data: [DONE]\n\n"

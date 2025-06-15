@@ -73,10 +73,6 @@ from sglang.srt.entrypoints.openai.utils import (
     _get_enable_thinking_from_request,
     aggregate_token_usage,
     build_base_sampling_params,
-    create_error_response,
-    create_stream_done,
-    create_streaming_chunk_data,
-    create_streaming_error_response,
     detect_template_content_format,
     process_content_for_template_format,
     to_openai_style_logprobs,
@@ -514,7 +510,7 @@ class ChatCompletionHandler(OpenAIServingBase):
                             choices=[choice_data],
                             model=request.model,
                         )
-                        yield create_streaming_chunk_data(chunk.model_dump_json())
+                        yield f"data: {chunk.model_dump_json()}\n\n"
 
                     # Process content delta
                     delta = text[len(stream_buffer) :]
@@ -542,7 +538,7 @@ class ChatCompletionHandler(OpenAIServingBase):
                                 choices=[choice_data],
                                 model=request.model,
                             )
-                            yield create_streaming_chunk_data(chunk.model_dump_json())
+                            yield f"data: {chunk.model_dump_json()}\n\n"
 
                         if not delta or len(delta) == 0:
                             stream_buffers[index] = new_stream_buffer
@@ -589,7 +585,7 @@ class ChatCompletionHandler(OpenAIServingBase):
                                 choices=[choice_data],
                                 model=request.model,
                             )
-                            yield create_streaming_chunk_data(chunk.model_dump_json())
+                            yield f"data: {chunk.model_dump_json()}\n\n"
 
                     stream_buffers[index] = new_stream_buffer
                     is_firsts[index] = is_first
@@ -616,13 +612,13 @@ class ChatCompletionHandler(OpenAIServingBase):
                     model=request.model,
                     usage=usage,
                 )
-                yield create_streaming_chunk_data(final_chunk.model_dump_json())
+                yield f"data: {final_chunk.model_dump_json()}\n\n"
 
             except Exception as e:
-                error = create_streaming_error_response(str(e))
-                yield create_streaming_chunk_data(error)
+                error = self.create_streaming_error_response(str(e))
+                yield f"data: {error}\n\n"
 
-            yield create_stream_done()
+            yield "data: [DONE]\n\n"
 
         return StreamingResponse(
             generate_stream_resp(),
@@ -642,7 +638,7 @@ class ChatCompletionHandler(OpenAIServingBase):
                 adapted_request, ctx.raw_request
             ).__anext__()
         except ValueError as e:
-            return create_error_response(str(e))
+            return self.create_error_response(str(e))
 
         if not isinstance(ret, list):
             ret = [ret]
@@ -690,7 +686,7 @@ class ChatCompletionHandler(OpenAIServingBase):
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
-                    return create_error_response(
+                    return self.create_error_response(
                         "Failed to parse reasoning content",
                         err_type="InternalServerError",
                         status_code=500,
