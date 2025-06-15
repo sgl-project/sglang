@@ -28,12 +28,14 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import is_cuda, set_weight_attrs
+from sglang.srt.utils import is_cuda, is_hip, set_weight_attrs
 
 _is_cuda = is_cuda()
-
-if _is_cuda:
+_is_hip = is_hip()
+if _is_cuda or _is_hip:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+if _is_hip:
+    from sgl_kernel import gelu_quick
 
 logger = logging.getLogger(__name__)
 
@@ -88,8 +90,12 @@ class QuickGELU(CustomOp):
         return x * torch.sigmoid(1.702 * x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO(zhyncs): Implement the CUDA kernel for QuickGELU in sgl-kernel
         return self.forward_native(x)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        gelu_quick(x, out)
+        return out
 
 
 class ScaledActivation(nn.Module):
@@ -165,7 +171,7 @@ def get_act_fn(
     return act_fn
 
 
-if not _is_cuda:
+if not (_is_cuda or _is_hip):
     logger.info(
         "sgl-kernel is not available on Non-NV platforms. Fallback to other kernel libraries."
     )
