@@ -464,11 +464,9 @@ class FlashMLAMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
-
         if topk > 1:
             raise ValueError(
-                f"Currently FlashMLA only supports topk=1 for speculative decoding"
+                "Currently FlashMLA only supports topk=1 for speculative decoding"
             )
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
