@@ -132,12 +132,13 @@ class LoRAMemoryPool:
             for buffer_id in range(self.max_loras_per_batch):
                 # Prioritize empty slots
                 if self.buffer_id_to_uid[buffer_id] == "":
-                    return buffer_id, ""
+                    return buffer_id
 
             for buffer_id in range(self.max_loras_per_batch):
                 # Evict unneeded lora
                 if self.buffer_id_to_uid[buffer_id] not in cur_uids:
-                    return buffer_id, self.buffer_id_to_uid[buffer_id]
+                    self.uid_to_buffer_id.pop(self.buffer_id_to_uid[buffer_id])
+                    return buffer_id
 
             raise ValueError(
                 "No available buffer slots found. Please ensure the number of active loras is less than max_loras_per_batch."
@@ -145,9 +146,7 @@ class LoRAMemoryPool:
 
         for uid in cur_uids:
             if uid not in self.uid_to_buffer_id:
-                buffer_id, evicted_lora_uid = get_available_buffer_slot()
-                if evicted_lora_uid != "":
-                    self.uid_to_buffer_id.pop(evicted_lora_uid)
+                buffer_id = get_available_buffer_slot()
                 self.load_lora_weight_to_buffer(
                     uid, buffer_id, lora_adapters.get(uid, None)
                 )
