@@ -198,6 +198,21 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
     return out
 
 
+def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
+        raise ValueError("The pointers must be multiple of 16 bytes.")
+    if out is not None:
+        _check_shape(input, out)
+    else:
+        out = torch.empty(
+            input.shape[:-1] + (input.shape[-1] // 2,),
+            device=input.device,
+            dtype=input.dtype,
+        )
+    torch.ops.sgl_kernel.gelu_and_mul.default(out, input)
+    return out
+
+
 if torch.version.hip is not None:
 
     def gelu_quick(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
@@ -220,28 +235,6 @@ if torch.version.hip is not None:
 
         torch.ops.sgl_kernel.gelu_quick(out, input)
         return out
-
-
-def gelu_quick(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
-    """
-    Quick-GELU:  y = x * sigmoid(1.702 * x)
-
-    The CUDA/HIP kernel uses 128-bit (16-byte) vector loads & stores,
-    so the last-dimension byte length must be a multiple of 16 bytes.
-    """
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
-        raise ValueError(
-            f"The last dimension ({input.shape[-1]}) x itemsize "
-            f"({input.dtype.itemsize}) must be a multiple of 16 bytes."
-        )
-
-    if out is not None:
-        assert input.shape == out.shape, f"{input.shape} != {out.shape}"
-    else:
-        out = torch.empty_like(input)
-
-    torch.ops.sgl_kernel.gelu_quick(out, input)
-    return out
 
 
 def apply_rope_with_cos_sin_cache_inplace(
