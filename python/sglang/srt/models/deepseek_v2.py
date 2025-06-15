@@ -51,11 +51,11 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_tensor_quant_mla_fp8,
@@ -110,10 +110,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8, merge_state_v2
-
-    from sglang.srt.layers.quantization.deep_gemm import (
-        grouped_gemm_nt_f8f8bf16_masked as deep_gemm_grouped_gemm_nt_f8f8bf16_masked,
-    )
 else:
     from vllm._custom_ops import awq_dequantize
 
@@ -981,7 +977,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_nope_out = q_nope.new_empty(
                 (self.num_local_heads, aligned_m, self.kv_lora_rank)
             )
-            deep_gemm_grouped_gemm_nt_f8f8bf16_masked(
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
                 (q_nope_val, q_nope_scale),
                 (self.w_kc, self.w_scale_k),
                 q_nope_out,
@@ -1037,7 +1033,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             attn_bmm_output = attn_output.new_empty(
                 (self.num_local_heads, aligned_m, self.v_head_dim)
             )
-            deep_gemm_grouped_gemm_nt_f8f8bf16_masked(
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
                 (attn_output_val, attn_output_scale),
                 (self.w_vc, self.w_scale_v),
                 attn_bmm_output,
@@ -1713,53 +1709,35 @@ class DeepseekV2ForCausalLM(nn.Module):
     def determine_num_fused_shared_experts(
         self, architecture: str = "DeepseekV3ForCausalLM"
     ):
-        self.num_fused_shared_experts = (
-            0
-            if global_server_args_dict["disable_shared_experts_fusion"]
-            else self.config.n_shared_experts
-        )
-        if self.num_fused_shared_experts > 0:
-            # Only Deepseek V3/R1 can use shared experts fusion optimization now.
-            if (
-                not _is_cuda
-                or self.config.architectures[0] != architecture
-                or self.config.n_routed_experts != 256
-            ):
-                self.num_fused_shared_experts = 0
-                global_server_args_dict["disable_shared_experts_fusion"] = True
-                log_info_on_rank0(
-                    logger,
-                    "Only Deepseek V3/R1 on NV-platform can use shared experts fusion optimization. Shared experts fusion optimization is disabled.",
-                )
-            elif (
-                global_server_args_dict["enable_deepep_moe"]
-                or global_server_args_dict["enable_ep_moe"]
-            ):
-                self.num_fused_shared_experts = 0
-                global_server_args_dict["disable_shared_experts_fusion"] = True
-                log_info_on_rank0(
-                    logger,
-                    "Deepseek V3/R1 can not use shared experts fusion optimization when in deepep_moe or ep_moe mode. Shared experts fusion optimization is disabled.",
-                )
-        elif self.num_fused_shared_experts == 0:
-            if (
-                _is_cuda
-                and torch.cuda.get_device_capability("cuda") >= (9, 0)
-                and self.config.architectures[0] == architecture
-                and self.config.n_routed_experts == 256
-                and (
-                    not (
-                        global_server_args_dict["enable_deepep_moe"]
-                        or global_server_args_dict["enable_ep_moe"]
-                    )
-                )
-            ):
-                self.num_fused_shared_experts = self.config.n_shared_experts
-                global_server_args_dict["disable_shared_experts_fusion"] = False
-                log_info_on_rank0(
-                    logger,
-                    "Deepseek V3/R1 with fp8/fp4 can use shared experts fusion optimization when SM version >=90. Shared experts fusion optimization is enabled.",
-                )
+        self.num_fused_shared_experts = 0
+        if global_server_args_dict["disable_shared_experts_fusion"]:
+            return
+
+        # Only Deepseek V3/R1 can use shared experts fusion optimization now.
+        disable_reason = None
+        if (
+            not _is_cuda
+            or torch.cuda.get_device_capability("cuda") < (9, 0)
+            or self.config.architectures[0] != architecture
+            or self.config.n_routed_experts != 256
+            or self.config.n_shared_experts != 1
+        ):
+            disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 90 can use shared experts fusion optimization."
+        elif (
+            global_server_args_dict["enable_deepep_moe"]
+            or global_server_args_dict["enable_ep_moe"]
+        ):
+            disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization when in deepep_moe or ep_moe mode."
+
+        if disable_reason is not None:
+            global_server_args_dict["disable_shared_experts_fusion"] = True
+            log_info_on_rank0(
+                logger,
+                f"{disable_reason} Shared experts fusion optimization is disabled.",
+            )
+            return
+
+        self.num_fused_shared_experts = self.config.n_shared_experts
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -1851,7 +1829,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         and weight_block_size[1] == 128
                         and model_dtype == torch.bfloat16
                     ):
-                        if _ENABLE_JIT_DEEPGEMM and get_bool_env_var(
+                        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and get_bool_env_var(
                             "SGL_USE_DEEPGEMM_BMM", "false"
                         ):
                             block_scale = weight_scale
@@ -1936,7 +1914,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
-        if False:  # TODO (pr-chain)
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             self._weight_requant_ue8m0()
 
     def _weight_requant_ue8m0(self):
@@ -1964,14 +1942,15 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
 
             if layer_id in moe_layers:
-                shared_experts = layer.mlp.shared_experts
-                for module in [
-                    shared_experts.gate_up_proj,
-                    shared_experts.down_proj,
-                ]:
-                    requant_weight_ue8m0_inplace(
-                        module.weight, module.weight_scale_inv, weight_block_size
-                    )
+                shared_experts = getattr(layer.mlp, "shared_experts", None)
+                if shared_experts is not None:
+                    for module in [
+                        shared_experts.gate_up_proj,
+                        shared_experts.down_proj,
+                    ]:
+                        requant_weight_ue8m0_inplace(
+                            module.weight, module.weight_scale_inv, weight_block_size
+                        )
 
                 experts = layer.mlp.experts
                 if isinstance(experts, DeepEPMoE):
@@ -2011,101 +1990,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        if self.num_fused_shared_experts > 0:
-            assert self.num_fused_shared_experts == 1
-            weights_list = list(weights)
-            weights_dict = dict(weights_list)
-            if self.quant_config is not None:
-                if self.quant_config.get_name() == "w8a8_int8":
-                    suffix_list = [
-                        "down_proj.weight",
-                        "down_proj.weight_scale",
-                        "gate_proj.weight",
-                        "gate_proj.weight_scale",
-                        "up_proj.weight",
-                        "up_proj.weight_scale",
-                    ]
-                elif (
-                    self.quant_config.get_name() == "fp8"
-                    or self.quant_config.get_name() == "blockwise_int8"
-                ):
-                    suffix_list = [
-                        "down_proj.weight",
-                        "down_proj.weight_scale_inv",
-                        "gate_proj.weight",
-                        "gate_proj.weight_scale_inv",
-                        "up_proj.weight",
-                        "up_proj.weight_scale_inv",
-                    ]
-                elif self.quant_config.get_name() == "awq":
-                    suffix_list = [
-                        "down_proj.qweight",
-                        "down_proj.qzeros",
-                        "down_proj.scales",
-                        "gate_proj.qweight",
-                        "gate_proj.qzeros",
-                        "gate_proj.scales",
-                        "up_proj.qweight",
-                        "up_proj.qzeros",
-                        "up_proj.scales",
-                    ]
-                elif self.quant_config.get_name() == "modelopt_fp4":
-                    suffix_list = [
-                        "down_proj.weight",
-                        "down_proj.weight_scale",
-                        "down_proj.weight_scale_2",
-                        "down_proj.input_scale",
-                        "gate_proj.weight",
-                        "gate_proj.weight_scale",
-                        "gate_proj.weight_scale_2",
-                        "gate_proj.input_scale",
-                        "up_proj.weight",
-                        "up_proj.weight_scale",
-                        "up_proj.weight_scale_2",
-                        "up_proj.input_scale",
-                    ]
-                else:
-                    raise ValueError(
-                        f"Unsupported shared expert fusion for quantization: {self.quant_config.get_name()}."
-                    )
-            else:
-                suffix_list = [
-                    "down_proj.weight",
-                    "gate_proj.weight",
-                    "up_proj.weight",
-                ]
-            names_to_remove = []
-
-            moe_layers = (
-                range(
-                    self.config.first_k_dense_replace,
-                    self.config.num_hidden_layers,
-                    self.config.moe_layer_freq,
-                )
-                if not is_nextn
-                else [nextn_layer_id]
-            )
-
-            for moe_layer in tqdm(
-                moe_layers,
-                desc=f"Cloning {self.num_fused_shared_experts} "
-                "shared expert into MoE",
-            ):
-                for suffix in suffix_list:
-                    shared_expert_weight_name = (
-                        f"model.layers.{moe_layer}.mlp.shared_experts.{suffix}"
-                    )
-                    weights_list.append(
-                        (
-                            f"model.layers.{moe_layer}."
-                            f"mlp.experts."
-                            f"{self.config.n_routed_experts + 0}"
-                            f".{suffix}",
-                            weights_dict[shared_expert_weight_name],
-                        )
-                    )
-                    names_to_remove += [shared_expert_weight_name]
-            weights = [w for w in weights_list if w[0] not in names_to_remove]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -2131,9 +2015,19 @@ class DeepseekV2ForCausalLM(nn.Module):
                 "hnorm",
             ]
 
+        if self.num_fused_shared_experts > 0:
+            assert self.num_fused_shared_experts == 1
+            logger.info("Shared experts fusion optimization enabled.")
+
         params_dict = dict(self.named_parameters())
         weight_names = []
         for name, loaded_weight in weights:
+            if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+                name = name.replace(
+                    "mlp.shared_experts",
+                    f"mlp.experts.{self.config.n_routed_experts}",
+                )
+
             weight_names.append(name)
 
             if not is_nextn:
