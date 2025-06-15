@@ -61,6 +61,7 @@ class _LayerModeComputationContext:
     layer_id: int
     is_layer_sparse: bool
     is_previous_layer_sparse: Optional[bool]
+    is_nextn: Optional[bool]
 
     def previous_layer(self):
         assert self.is_previous_layer_sparse is not None
@@ -69,6 +70,7 @@ class _LayerModeComputationContext:
             is_layer_sparse=self.is_previous_layer_sparse,
             is_previous_layer_sparse=None,
             num_layers=self.num_layers,
+            is_nextn=self.is_nextn
         )
 
 
@@ -103,7 +105,7 @@ class LayerScatterModes:
         if context.is_layer_sparse:
             return (
                 ScatterMode.SCATTERED
-                if global_server_args_dict["enable_deepep_moe"]
+                if global_server_args_dict["enable_deepep_moe"] and not context.is_nextn
                 else ScatterMode.FULL
             )
         else:
