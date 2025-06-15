@@ -1,5 +1,5 @@
 """
-Unit tests for the ChatCompletionHandler class from serving_chat.py.
+Unit tests for the OpenAIServingChat class from serving_chat.py.
 
 These tests ensure that the refactored implementation maintains compatibility
 with the original adapter.py functionality.
@@ -12,7 +12,7 @@ import pytest
 from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse
-from sglang.srt.entrypoints.openai.serving_chat import ChatCompletionHandler
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 
@@ -62,8 +62,8 @@ def mock_tokenizer_manager():
 
 @pytest.fixture
 def chat_handler(mock_tokenizer_manager):
-    """Create a ChatCompletionHandler instance for testing."""
-    return ChatCompletionHandler(mock_tokenizer_manager)
+    """Create a OpenAIServingChat instance for testing."""
+    return OpenAIServingChat(mock_tokenizer_manager)
 
 
 @pytest.fixture
@@ -98,7 +98,7 @@ def streaming_chat_request():
     )
 
 
-class TestChatCompletionHandlerConversion:
+class TestOpenAIServingChatConversion:
     """Test request conversion methods."""
 
     def test_convert_to_internal_request_single(
@@ -603,7 +603,7 @@ class TestUtilityFunctions:
         assert error.code == 400
 
 
-class TestChatCompletionHandlerCompatibility:
+class TestOpenAIServingChatCompatibility:
     """Test compatibility with adapter.py functionality."""
 
     def test_compatibility_request_structure(self):

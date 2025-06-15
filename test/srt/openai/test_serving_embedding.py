@@ -1,5 +1,5 @@
 """
-Unit tests for the EmbeddingHandler class from serving_embedding.py.
+Unit tests for the OpenAIServingEmbedding class from serving_embedding.py.
 
 These tests ensure that the embedding serving implementation maintains compatibility
 with the original adapter.py functionality and follows OpenAI API specifications.
@@ -24,7 +24,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     MultimodalEmbeddingInput,
     UsageInfo,
 )
-from sglang.srt.entrypoints.openai.serving_embedding import EmbeddingHandler
+from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.managers.io_struct import EmbeddingReqInput
 
 
@@ -65,8 +65,8 @@ def mock_tokenizer_manager():
 
 @pytest.fixture
 def embedding_handler(mock_tokenizer_manager):
-    """Create an EmbeddingHandler instance for testing."""
-    return EmbeddingHandler(mock_tokenizer_manager)
+    """Create an OpenAIServingEmbedding instance for testing."""
+    return OpenAIServingEmbedding(mock_tokenizer_manager)
 
 
 @pytest.fixture
@@ -120,7 +120,7 @@ def token_ids_embedding_request():
     )
 
 
-class TestEmbeddingHandlerConversion:
+class TestOpenAIServingEmbeddingConversion:
     """Test request conversion methods."""
 
     def test_convert_single_string_request(
@@ -264,8 +264,8 @@ class TestEmbeddingResponseBuilding:
 
 
 @pytest.mark.asyncio
-class TestEmbeddingHandlerAsyncMethods:
-    """Test async methods of EmbeddingHandler."""
+class TestOpenAIServingEmbeddingAsyncMethods:
+    """Test async methods of OpenAIServingEmbedding."""
 
     async def test_handle_request_success(
         self, embedding_handler, basic_embedding_request, mock_request

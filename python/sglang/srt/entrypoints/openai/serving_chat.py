@@ -83,7 +83,7 @@ from sglang.utils import convert_json_schema_to_str
 logger = logging.getLogger(__name__)
 
 
-class ChatCompletionHandler(OpenAIServingBase):
+class OpenAIServingChat(OpenAIServingBase):
     """Handler for chat completion requests"""
 
     def __init__(self, *args, **kwargs):

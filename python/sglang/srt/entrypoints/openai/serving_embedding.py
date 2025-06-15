@@ -62,7 +62,7 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.managers.io_struct import EmbeddingReqInput
 
 
-class EmbeddingHandler(OpenAIServingBase):
+class OpenAIServingEmbedding(OpenAIServingBase):
     """Handler for embedding requests"""
 
     def _request_id_prefix(self) -> str:

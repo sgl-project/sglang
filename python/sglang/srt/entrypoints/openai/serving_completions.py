@@ -67,7 +67,7 @@ from sglang.srt.entrypoints.openai.utils import (
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 
-class CompletionHandler(OpenAIServingBase):
+class OpenAIServingCompletion(OpenAIServingBase):
     """Handler for completion requests"""
 
     def _request_id_prefix(self) -> str:

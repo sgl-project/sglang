@@ -40,9 +40,9 @@ error handling, and response formatting.
 
 Architecture:
 - OpenAIServingBase: Abstract base class for all endpoint handlers
-- ChatCompletionHandler: Handles chat completion requests
-- CompletionHandler: Handles text completion requests
-- EmbeddingHandler: Handles embedding requests
+- OpenAIServingChat: Handles chat completion requests
+- OpenAIServingCompletion: Handles text completion requests
+- OpenAIServingEmbedding: Handles embedding requests
 - Protocol classes: Pydantic models for request/response validation
 - Utility functions: Shared helpers for formatting and validation
 """

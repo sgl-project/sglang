@@ -13,7 +13,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionStreamResponse,
     ErrorResponse,
 )
-from sglang.srt.entrypoints.openai.serving_completions import CompletionHandler
+from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
@@ -47,7 +47,7 @@ def mock_tokenizer_manager():
 @pytest.fixture
 def completion_handler(mock_tokenizer_manager):
     """Create a completion handler instance"""
-    return CompletionHandler(mock_tokenizer_manager)
+    return OpenAIServingCompletion(mock_tokenizer_manager)
 
 
 class TestUtilityFunctions:
