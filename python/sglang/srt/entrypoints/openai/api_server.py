@@ -221,6 +221,7 @@ def _wait_and_warmup(
 
     # Send a warmup request
     request_name = "/generate" if model_info["is_generation"] else "/encode"
+    # TODO: Replace with OpenAI API
     max_new_tokens = 8 if model_info["is_generation"] else 1
     json_data = {
         "sampling_params": {
