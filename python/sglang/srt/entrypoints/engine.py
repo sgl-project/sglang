@@ -38,7 +38,7 @@ import torch
 import uvloop
 
 from sglang.srt.code_completion_parser import load_completion_template_for_openai_api
-from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.entrypoints.engine_base import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
