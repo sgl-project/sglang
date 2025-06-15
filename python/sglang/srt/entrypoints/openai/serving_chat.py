@@ -1,45 +1,3 @@
-# Copyright 2023-2024 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""
-Chat completions serving logic for OpenAI API.
-
-This module implements the /v1/chat/completions endpoint, providing full OpenAI
-compatibility for chat-based interactions with conversation history support.
-
-Key Features:
-- Full OpenAI chat completions API compatibility
-- Streaming and non-streaming response modes
-- Multimodal support (text, images, audio)
-- Function calling and tool use
-- Advanced reasoning with separate reasoning content
-- Chat template processing for different model types
-- Custom sampling parameters and output constraints
-- LoRA adapter support
-
-Processing Pipeline:
-1. Request validation and preprocessing
-2. Message processing and chat template application
-3. Tool/function call setup if applicable
-4. Internal request generation with SGLang extensions
-5. Model inference with streaming or batch processing
-6. Response formatting and postprocessing
-7. Tool call parsing and reasoning extraction
-
-The implementation handles both string-based and structured content formats,
-automatically detecting the appropriate format based on the model's chat template.
-"""
-
 import base64
 import json
 import logging
@@ -66,7 +24,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     LogProbs,
     ToolCall,
     TopLogprob,
-    UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.utils import (

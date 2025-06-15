@@ -1,39 +1,3 @@
-# Copyright 2023-2024 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""
-Base serving engine for OpenAI API endpoints.
-
-This module provides the foundational classes and request handling patterns
-used by all OpenAI API endpoint implementations. It establishes a common
-architecture for request processing, validation, and response generation.
-
-Key Components:
-- OpenAIServingBase: Abstract base class for all endpoint handlers
-- Common request handling patterns with proper error handling
-- Validation integration for request parameters
-- Streaming and non-streaming response support
-
-Architecture Pattern:
-All endpoint handlers inherit from OpenAIServingBase and implement:
-1. _convert_to_internal_request: Transform OpenAI request to SGLang format
-2. _handle_streaming_request: Process streaming requests
-3. _handle_non_streaming_request: Process non-streaming requests
-
-This ensures consistent behavior across all endpoints while allowing
-endpoint-specific customization.
-"""
-
 import json
 import logging
 import uuid

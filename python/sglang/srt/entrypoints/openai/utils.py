@@ -1,49 +1,10 @@
-# Copyright 2023-2024 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""
-Utility functions for OpenAI API server.
-
-This module provides shared utility functions used across the OpenAI API implementation,
-including template processing, validation, error handling, and response formatting.
-
-Key Components:
-- Template Format Detection: Analyzes Jinja templates to determine content format
-- Content Processing: Handles multimodal content based on template requirements
-- Token Usage Calculation: Aggregates token usage across requests and responses
-- Error Response Generation: Creates standardized error responses
-- Logprobs Formatting: Converts internal logprobs to OpenAI format
-- Validation Helpers: Common validation functions for requests
-- Streaming Utilities: Helpers for streaming response formatting
-
-Template Format Detection:
-The module includes sophisticated logic to detect whether a chat template expects
-'string' or 'openai' content format by analyzing the Jinja template AST. This enables
-proper content processing for different model types (e.g., DeepSeek vs Llama).
-"""
-
 import logging
 from typing import Any, Dict, List, Optional
 
 import jinja2.nodes
 import transformers.utils.chat_template_utils as hf_chat_utils
 
-from sglang.srt.entrypoints.openai.protocol import (
-    ChatCompletionRequest,
-    LogProbs,
-    OpenAIServingRequest,
-    UsageInfo,
-)
+from sglang.srt.entrypoints.openai.protocol import LogProbs, UsageInfo
 
 logger = logging.getLogger(__name__)
 
