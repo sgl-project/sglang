@@ -221,16 +221,13 @@ class MultimodalDataItem:
 
     def set_pad_value(self):
         """
-        Set the pad value after first hashing the data
+        Set the pad value after first hashing the data.
         """
-
-        def data_hash(data) -> int:
-            hash_bytes = hashlib.sha256(data).digest()[:8]
-            return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
         def tensor_hash(tensor_list) -> int:
             """
-            hash a tensor or a tensor list
+            Hash a tensor or a list of tensors.
+            It prioritizes using the GPU if available, and falls back to the CPU on failure.
             """
             tensor = tensor_list
             if isinstance(tensor_list, list):
@@ -240,46 +237,41 @@ class MultimodalDataItem:
                     for x in tensor_list
                 ]
                 tensor = torch.concat(tensor_list)
-            if tensor.is_cuda:
-                return gpu_tensor_hash(tensor)
-            tensor = tensor.detach().contiguous()
 
-            if tensor.dtype == torch.bfloat16:
-                # memoryview() doesn't support PyTorch's BFloat16 dtype
-                tensor = tensor.float()
+            # Define a CPU fallback hash function
+            def cpu_hash(t: torch.Tensor) -> int:
+                if t.dtype == torch.bfloat16:
+                    t = t.float()
+                # Ensure tensor is on CPU
+                hash_bytes = hashlib.sha256(t.cpu().numpy().tobytes()).digest()[:8]
+                return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
-            assert isinstance(tensor, torch.Tensor)
-            if tensor.is_cuda:
-                # TODO: improve this
-                tensor_cpu = tensor.cpu()
+            # Prioritize GPU hash
+            if torch.cuda.is_available():
+                try:
+                    gpu_tensor = tensor.to("cuda", non_blocking=True)
+                    if gpu_tensor.dtype == torch.bfloat16:
+                        gpu_tensor = gpu_tensor.float()
+                    return gpu_tensor_hash(gpu_tensor)
+                except Exception as e:
+                    import logging
+                    logging.warning(f"GPU tensor hashing failed: {e}. Falling back to CPU hash.")
+                    return cpu_hash(tensor)
             else:
-                tensor_cpu = tensor
-
-            mv = memoryview(tensor_cpu.numpy())
-            return data_hash(mv.tobytes())
+                # If no CUDA device is available, use CPU hash directly
+                return cpu_hash(tensor)
 
         def hash_feature(f):
-            if isinstance(f, list):
-                if isinstance(f[0], torch.Tensor):
-                    return tensor_hash(f)
-                return data_hash(tuple(flatten_nested_list(f)))
-            elif isinstance(f, np.ndarray):
-                arr = np.ascontiguousarray(f)
-                arr_bytes = arr.tobytes()
-                return data_hash(arr_bytes)
-            elif isinstance(f, torch.Tensor):
-                return tensor_hash([f])
-            return data_hash(f)
+            return tensor_hash(f)
 
-        if self.precomputed_features is not None:
-            self.hash = hash_feature(self.precomputed_features)
+        if self.is_image():
+            self.hash = hash_feature(self.pixel_values)
+            self.pad_value = self.hash % (2**31 - 1)
         elif self.is_audio():
             self.hash = hash_feature(self.audio_features)
+            self.pad_value = self.hash % (2**31 - 1)
         else:
-            self.hash = hash_feature(self.pixel_values)
-
-        assert self.hash is not None
-        self.pad_value = self.hash % (1 << 30)
+            raise ValueError(f"Unknown modality: {self.modality}")
 
     def is_audio(self):
         return (self.modality == Modality.AUDIO) and (
