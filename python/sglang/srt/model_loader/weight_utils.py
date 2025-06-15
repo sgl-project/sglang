@@ -204,8 +204,8 @@ def get_quant_config(
 
         if model_config.quantization == "bitsandbytes":
             config["adapter_name_or_path"] = model_name_or_path
-        elif model_config.quantization == "modelopt":
-            if config["producer"]["name"] == "modelopt":
+        elif model_config.quantization == "modelopt_fp8":
+            if config["producer"]["name"] == "modelopt_fp8":
                 return quant_cls.from_config(config)
             else:
                 raise ValueError(
