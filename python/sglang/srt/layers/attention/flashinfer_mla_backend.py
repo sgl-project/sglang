@@ -15,7 +15,6 @@ from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
-import triton
 
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
@@ -29,10 +28,11 @@ from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -108,8 +108,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
+        fmha_backend = "auto"
+        if is_sm100_supported():
+            fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD"
+            self.workspace_buffer, "NHD", backend=fmha_backend
         )
 
         if not self.skip_prefill:
@@ -752,7 +755,7 @@ class FlashInferMLAMultiStepDraftBackend:
 
         if topk > 1:
             raise ValueError(
-                f"Currently Flashinfer MLA only supports topk=1 for speculative decoding"
+                "Currently Flashinfer MLA only supports topk=1 for speculative decoding"
             )
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
@@ -786,6 +789,7 @@ class FlashInferMLAMultiStepDraftBackend:
 
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+        self.page_size = model_runner.server_args.page_size
 
     def common_template(
         self,
@@ -806,14 +810,13 @@ class FlashInferMLAMultiStepDraftBackend:
             kv_indices_buffer,
             self.kv_indptr,
             forward_batch.positions,
-            num_seqs,
-            self.topk,
             self.pool_len,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
-            triton.next_power_of_2(num_seqs),
-            triton.next_power_of_2(self.speculative_num_steps),
-            triton.next_power_of_2(bs),
+            next_power_of_2(num_seqs),
+            next_power_of_2(self.speculative_num_steps),
+            next_power_of_2(bs),
+            self.page_size,
         )
 
         assert forward_batch.spec_info is not None
@@ -916,19 +919,18 @@ def fast_mla_decode_plan(
     self._page_size = page_size
     self._sm_scale = sm_scale
 
-    with self.device as device:
-        try:
-            # Standard version with just the required arguments (no use_profiler)
-            self._cached_module.plan.default(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                qo_indptr_cpu,
-                kv_indptr_cpu,
-                kv_len_arr_cpu,
-                num_heads,
-                head_dim_ckv,
-                causal,
-            )
-        except Exception as e:
-            raise RuntimeError(f"Error in alternate MLA plan: {e}")
+    try:
+        # Standard version with just the required arguments (no use_profiler)
+        self._cached_module.plan.default(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._pin_memory_int_workspace_buffer,
+            qo_indptr_cpu,
+            kv_indptr_cpu,
+            kv_len_arr_cpu,
+            num_heads,
+            head_dim_ckv,
+            causal,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Error in alternate MLA plan: {e}")

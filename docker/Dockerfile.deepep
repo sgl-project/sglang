@@ -1,4 +1,5 @@
-FROM lmsysorg/sglang:latest
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
 
 # CMake
 RUN apt-get update \
@@ -39,7 +40,7 @@ RUN dpkg -i gdrcopy_*.deb
 ENV GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/
 
 # IBGDA dependency
-RUN ln -s /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
+RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
 RUN apt-get install -y libfabric-dev
 
 # DeepEP
@@ -54,6 +55,9 @@ RUN tar -xf nvshmem_src_3.2.5-1.txz \
 
 WORKDIR /sgl-workspace/nvshmem
 RUN git apply /sgl-workspace/DeepEP/third-party/nvshmem.patch
+
+RUN sed -i '1i#include <unistd.h>' /sgl-workspace/nvshmem/examples/moe_shuffle.cu && \
+    cat /sgl-workspace/nvshmem/examples/moe_shuffle.cu
 
 WORKDIR /sgl-workspace/nvshmem
 ENV CUDA_HOME=/usr/local/cuda
@@ -71,7 +75,7 @@ RUN NVSHMEM_SHMEM_SUPPORT=0 \
 
 WORKDIR /sgl-workspace/DeepEP
 ENV NVSHMEM_DIR=/sgl-workspace/nvshmem/install
-RUN NVSHMEM_DIR=/sgl-workspace/nvshmem/install pip install .
+RUN NVSHMEM_DIR=/sgl-workspace/nvshmem/install pip install --break-system-packages .
 
 # Set workspace
 WORKDIR /sgl-workspace
