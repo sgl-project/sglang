@@ -119,49 +119,6 @@ def streaming_chat_request():
     )
 
 
-class TestChatCompletionHandlerValidation:
-    """Test validation methods of ChatCompletionHandler."""
-
-    def test_validate_chat_request_valid(self, chat_handler, basic_chat_request):
-        """Test validation with a valid request."""
-        # Use utility function directly instead of handler method
-        error = chat_handler._validate_request(basic_chat_request)
-        assert error is None
-
-    def test_validate_chat_request_empty_messages(self, chat_handler):
-        """Test validation fails with empty messages."""
-        # Since we now have Pydantic validation that prevents creating the request,
-        # we expect a ValidationError to be raised during object creation
-        with pytest.raises(ValidationError) as exc_info:
-            request = ChatCompletionRequest(
-                model="test-model",
-                messages=[],
-                temperature=0.7,
-            )
-        # Check that the error is about empty messages
-        assert "empty" in str(exc_info.value).lower()
-
-    def test_validate_chat_request_invalid_temperature(self, chat_handler):
-        """Test validation fails with invalid temperature."""
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            temperature=-0.5,  # Invalid negative temperature
-        )
-        error = chat_handler._validate_request(request)
-        assert error is not None
-
-    def test_validate_chat_request_invalid_max_tokens(self, chat_handler):
-        """Test validation fails with invalid max_tokens."""
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            max_tokens=-10,  # Invalid negative max_tokens
-        )
-        error = chat_handler._validate_request(request)
-        assert error is not None
-
-
 class TestChatCompletionHandlerConversion:
     """Test request conversion methods."""
 

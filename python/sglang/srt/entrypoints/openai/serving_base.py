@@ -53,7 +53,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.utils import create_error_response
-from sglang.srt.entrypoints.openai.validation import get_validation_rules
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
@@ -101,9 +100,9 @@ class OpenAIServingBase(ABC):
         """Handle the specific request type with common pattern"""
         try:
             # Validate request
-            error = self._validate_request(request)
-            if error:
-                return error
+            error_msg = self._validate_request(request)
+            if error_msg:
+                return create_error_response(error_msg)
 
             # Create request context
             ctx = RequestContext(
@@ -181,17 +180,10 @@ class OpenAIServingBase(ABC):
         """Handle non-streaming request"""
         pass
 
-    def _validate_request(
-        self, request: OpenAIServingRequest
-    ) -> Optional[ErrorResponse]:
+    @abstractmethod
+    def _validate_request(self, request: OpenAIServingRequest) -> Optional[str]:
         """Validate request"""
-        validation_rules = get_validation_rules(request)
-        for rule in validation_rules:
-            param_value = rule.param_getter(request)
-            error_msg = rule.validator_func(param_value)
-            if error_msg:
-                return create_error_response(error_msg, param=rule.param_name)
-        return None
+        pass
 
     def _calculate_streaming_usage_base(
         self,

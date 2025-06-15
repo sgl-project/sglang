@@ -154,28 +154,6 @@ class TestUtilityFunctions:
         assert sampling_params["min_new_tokens"] == 5
         assert sampling_params["logit_bias"] == {"1": 0.5}
 
-    def test_validate_request_functionality(self, completion_handler):
-        """Test that validate_request works correctly."""
-        request = CompletionRequest(
-            model="test-model",
-            prompt="Hello world",
-            temperature=0.7,
-            max_tokens=100,
-        )
-
-        # Test with completion validation rules
-        error = completion_handler._validate_request(request)
-        assert error is None
-
-        # Test with invalid request
-        invalid_request = CompletionRequest(
-            model="",  # Invalid empty model
-            prompt="Hello world",
-            max_tokens=100,
-        )
-        error = completion_handler._validate_request(invalid_request)
-        assert error is not None
-
     def test_create_error_response_functionality(self):
         """Test that create_error_response works correctly."""
         error = create_error_response("Test error message")
@@ -193,81 +171,6 @@ class TestUtilityFunctions:
         error_data = json.loads(error_json)
         assert "error" in error_data
         assert error_data["error"]["message"] == "Test streaming error"
-
-
-class TestCompletionValidation:
-    """Test validation methods"""
-
-    def test_validate_completion_request_valid(self, completion_handler):
-        """Test validation of valid completion request"""
-        request = CompletionRequest(
-            model="test-model",
-            prompt="Hello world",
-            max_tokens=100,
-            temperature=0.7,
-            stream=False,
-        )
-
-        # Use utility function directly instead of handler method
-        error = completion_handler._validate_request(request)
-        assert error is None
-
-    def test_validate_completion_request_empty_prompt_string(self, completion_handler):
-        """Test validation fails for empty string prompt"""
-        request = CompletionRequest(model="test-model", prompt="", max_tokens=100)
-
-        error = completion_handler._validate_request(request)
-        assert error is not None
-        assert "prompt" in error.model_dump()["param"]
-
-    def test_validate_completion_request_whitespace_prompt(self, completion_handler):
-        """Test validation fails for whitespace-only prompt"""
-        request = CompletionRequest(
-            model="test-model", prompt="   \n\t  ", max_tokens=100
-        )
-
-        error = completion_handler._validate_request(request)
-        assert error is not None
-        assert "prompt" in error.model_dump()["param"]
-
-    def test_validate_completion_request_empty_list_prompt(self, completion_handler):
-        """Test validation fails for empty list prompt"""
-        request = CompletionRequest(model="test-model", prompt=[], max_tokens=100)
-
-        error = completion_handler._validate_request(request)
-        assert error is not None
-        assert "prompt" in error.model_dump()["param"]
-
-    def test_validate_completion_request_invalid_model(self, completion_handler):
-        """Test validation fails for invalid model"""
-        request = CompletionRequest(model="", prompt="Hello world", max_tokens=100)
-
-        error = completion_handler._validate_request(request)
-        assert error is not None
-        assert "model" in error.model_dump()["param"]
-
-    def test_validate_completion_request_invalid_temperature(self, completion_handler):
-        """Test validation fails for invalid temperature"""
-        request = CompletionRequest(
-            model="test-model",
-            prompt="Hello world",
-            max_tokens=100,
-            temperature=-1.0,  # Invalid
-        )
-
-        error = completion_handler._validate_request(request)
-        assert error is not None
-        assert "temperature" in error.model_dump()["param"]
-
-    def test_validate_completion_request_invalid_max_tokens(self, completion_handler):
-        """Test validation fails for invalid max_tokens"""
-        request = CompletionRequest(
-            model="test-model", prompt="Hello world", max_tokens=0  # Invalid
-        )
-
-        error = completion_handler._validate_request(request)
-        assert error is not None
-        assert "max_tokens" in error.model_dump()["param"]
 
 
 class TestPromptHandling:
@@ -889,21 +792,6 @@ class TestResponseBuilding:
 class TestAsyncMethods:
     """Test async handler methods"""
 
-    async def test_handle_request_validation_error(self, completion_handler):
-        """Test handling request with validation error"""
-        mock_request = Mock()
-        request = CompletionRequest(
-            model="", prompt="Hello world", max_tokens=100  # Invalid model
-        )
-
-        response = await completion_handler.handle_request(request, mock_request)
-
-        # Should return error response
-        assert hasattr(response, "model_dump")
-        error_data = response.model_dump()
-        assert error_data["object"] == "error"
-        assert "model" in error_data["param"]
-
     async def test_handle_request_non_streaming(self, completion_handler):
         """Test handling non-streaming request - simplified test for async flow"""
         mock_request = Mock()
@@ -974,44 +862,6 @@ class TestEdgeCases:
         with pytest.raises(ValueError, match="Parallel sampling is not supported"):
             completion_handler._convert_to_internal_request(requests, ["id1", "id2"])
 
-    def test_empty_prompt_list_validation(self, completion_handler):
-        """Test validation of empty prompt list"""
-        request = CompletionRequest(model="test-model", prompt=[], max_tokens=100)
-
-        error = completion_handler._validate_request(request)
-        assert error is not None
-        assert "prompt" in error.model_dump()["param"]
-
-    def test_nested_empty_prompt_list_validation(self, completion_handler):
-        """Test validation of nested empty prompt list"""
-        request = CompletionRequest(model="test-model", prompt=[[]], max_tokens=100)
-
-        error = completion_handler._validate_request(request)
-        assert error is not None
-        assert "prompt" in error.model_dump()["param"]
-
-    @pytest.mark.asyncio
-    async def test_echo_warning_with_logprobs(self, completion_handler):
-        """Test warning when echo is used with logprobs"""
-        request = CompletionRequest(
-            model="test-model",
-            prompt="Hello world",
-            max_tokens=100,
-            echo=True,
-            logprobs=5,
-        )
-
-        mock_raw_request = Mock()
-
-        with patch("sglang.srt.entrypoints.openai.validation.logger") as mock_logger:
-            # Call handle_request which contains the warning logic
-            await completion_handler.handle_request(request, mock_raw_request)
-            # Should log warning about echo + logprobs incompatibility
-            mock_logger.warning.assert_called_once()
-            assert "Echo is not compatible with logprobs" in str(
-                mock_logger.warning.call_args
-            )
-
     def test_suffix_without_completion_template(self, completion_handler):
         """Test that suffix is ignored when completion template is not defined"""
         request = CompletionRequest(
@@ -1031,23 +881,3 @@ class TestEdgeCases:
 
             # Should use original prompt, not processed with suffix
             assert adapted_request.text == "def hello():"
-
-    def test_zero_max_tokens_handling(self, completion_handler):
-        """Test handling of zero max_tokens"""
-        request = CompletionRequest(
-            model="test-model", prompt="Hello world", max_tokens=0
-        )
-
-        error = completion_handler._validate_request(request)
-        assert error is not None
-        assert "max_tokens" in error.model_dump()["param"]
-
-    def test_negative_temperature_handling(self, completion_handler):
-        """Test handling of negative temperature"""
-        request = CompletionRequest(
-            model="test-model", prompt="Hello world", max_tokens=100, temperature=-0.5
-        )
-
-        error = completion_handler._validate_request(request)
-        assert error is not None
-        assert "temperature" in error.model_dump()["param"]

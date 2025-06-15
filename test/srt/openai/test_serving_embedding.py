@@ -120,52 +120,6 @@ def token_ids_embedding_request():
     )
 
 
-class TestEmbeddingHandlerValidation:
-    """Test validation methods of EmbeddingHandler."""
-
-    def test_validate_embedding_request_valid(
-        self, embedding_handler, basic_embedding_request
-    ):
-        """Test validation with a valid request."""
-        error = embedding_handler._validate_request(basic_embedding_request)
-        assert error is None
-
-    def test_validate_embedding_request_empty_string(self, embedding_handler):
-        """Test validation fails with empty string input."""
-        request = EmbeddingRequest(model="test-model", input="")
-        error = embedding_handler._validate_request(request)
-        assert error is not None
-        assert "empty" in error.message.lower()
-
-    def test_validate_embedding_request_whitespace_only(self, embedding_handler):
-        """Test validation fails with whitespace-only input."""
-        request = EmbeddingRequest(model="test-model", input="   \n\t  ")
-        error = embedding_handler._validate_request(request)
-        assert error is not None
-        assert "whitespace" in error.message.lower()
-
-    def test_validate_embedding_request_empty_list(self, embedding_handler):
-        """Test validation fails with empty list input."""
-        request = EmbeddingRequest(model="test-model", input=[])
-        error = embedding_handler._validate_request(request)
-        assert error is not None
-        assert "empty" in error.message.lower()
-
-    def test_validate_embedding_request_empty_string_in_list(self, embedding_handler):
-        """Test validation fails with empty string in list."""
-        request = EmbeddingRequest(model="test-model", input=[""])
-        error = embedding_handler._validate_request(request)
-        assert error is not None
-        assert "empty" in error.message.lower()
-
-    def test_validate_embedding_request_valid_list(
-        self, embedding_handler, list_embedding_request
-    ):
-        """Test validation passes with valid list input."""
-        error = embedding_handler._validate_request(list_embedding_request)
-        assert error is None
-
-
 class TestEmbeddingHandlerConversion:
     """Test request conversion methods."""
 

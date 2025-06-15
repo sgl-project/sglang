@@ -83,7 +83,6 @@ from sglang.srt.entrypoints.openai.utils import (
 )
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.utils import convert_json_schema_to_str
 
@@ -98,6 +97,38 @@ class ChatCompletionHandler(OpenAIServingBase):
         # Instance-specific cache for template content format detection
         self._cached_chat_template = None
         self._cached_template_format = None
+
+    def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
+        """Validate chat messages format and content"""
+        if not (messages := request.messages):
+            return "Messages cannot be empty"
+
+        # Check for alternating user/assistant pattern (optional validation)
+        roles = [msg.role for msg in messages]
+
+        # First message should typically be from user or system
+        if roles[0] not in ["user", "system"]:
+            return "First message should be from 'user' or 'system'"
+
+        # Check for consecutive assistant messages (which might indicate an error)
+        for i in range(1, len(roles)):
+            if roles[i] == "assistant" and roles[i - 1] == "assistant":
+                # This is actually allowed in some cases, so just warn
+                pass
+
+        # Validate message content
+        for i, msg in enumerate(messages):
+            if msg.role == "user":
+                if not msg.content:
+                    return f"User message at index {i} has no content"
+            elif msg.role == "assistant":
+                # Assistant messages can have no content if they have tool_calls
+                if not msg.content and not getattr(msg, "tool_calls", None):
+                    return (
+                        f"Assistant message at index {i} has no content or tool calls"
+                    )
+
+        return None
 
     def _convert_to_internal_request(
         self,

@@ -35,21 +35,18 @@ proper content processing for different model types (e.g., DeepSeek vs Llama).
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import jinja2.nodes
 import transformers.utils.chat_template_utils as hf_chat_utils
 
 from sglang.srt.entrypoints.openai.protocol import (
-    ChatCompletionMessageParam,
     ChatCompletionRequest,
-    CompletionRequest,
     ErrorResponse,
     LogProbs,
     OpenAIServingRequest,
     UsageInfo,
 )
-from sglang.srt.entrypoints.openai.validation import ValidationRule
 
 logger = logging.getLogger(__name__)
 

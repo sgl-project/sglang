@@ -41,7 +41,7 @@ and batched inputs, with automatic type detection and validation.
 """
 
 import time
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi.responses import StreamingResponse
 
@@ -73,6 +73,47 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 
 class CompletionHandler(OpenAIServingBase):
     """Handler for completion requests"""
+
+    def _validate_request(self, request: CompletionRequest) -> Optional[str]:
+        """Validate completion prompt format and content"""
+        if not (prompt := request.prompt):
+            return "Prompt cannot be None"
+
+        if isinstance(prompt, str):
+            if not prompt.strip():
+                return "Prompt cannot be empty or whitespace only"
+        elif isinstance(prompt, list):
+            if not prompt:
+                return "Prompt list cannot be empty"
+
+            # Check if it's a list of strings
+            if all(isinstance(item, str) for item in prompt):
+                for i, item in enumerate(prompt):
+                    if not item.strip():
+                        return f"Prompt at index {i} cannot be empty or whitespace only"
+
+            # Check if it's a list of token IDs (integers)
+            elif all(isinstance(item, int) for item in prompt):
+                if any(item < 0 for item in prompt):
+                    return "Token IDs must be non-negative"
+
+            # Check if it's a list of lists (multiple token sequences)
+            elif all(isinstance(item, list) for item in prompt):
+                for i, item in enumerate(prompt):
+                    if not item:
+                        return f"Token sequence at index {i} cannot be empty"
+                    if not all(isinstance(token, int) for token in item):
+                        return f"Token sequence at index {i} must contain only integers"
+                    if any(token < 0 for token in item):
+                        return (
+                            f"Token sequence at index {i} contains negative token IDs"
+                        )
+            else:
+                return "Prompt must be string, list of strings, list of integers, or list of integer lists"
+        else:
+            return "Prompt must be string or list"
+
+        return None
 
     def _convert_to_internal_request(
         self,

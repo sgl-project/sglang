@@ -46,7 +46,7 @@ padding for missing text content when needed.
 """
 
 import logging
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi.responses import StreamingResponse
 
@@ -66,6 +66,54 @@ from sglang.srt.managers.io_struct import EmbeddingReqInput
 
 class EmbeddingHandler(OpenAIServingBase):
     """Handler for embedding requests"""
+
+    def _validate_request(self, request: EmbeddingRequest) -> Optional[str]:
+        """Validate that the input is not empty or whitespace only."""
+        if not (input := request.input):
+            return "Input cannot be empty"
+
+        # Handle single string
+        if isinstance(input, str):
+            if not input.strip():
+                return "Input cannot be empty or whitespace only"
+            return None
+
+        # Handle list inputs
+        if isinstance(input, list):
+            if len(input) == 0:
+                return "Input cannot be empty"
+
+            # Check first element to determine type
+            first_item = input[0]
+
+            if isinstance(first_item, str):
+                # List of strings
+                for i, item in enumerate(input):
+                    if not isinstance(item, str):
+                        return f"All items in input list must be strings"
+                    if not item.strip():
+                        return f"Input at index {i} cannot be empty or whitespace only"
+            elif isinstance(first_item, int):
+                # List of integers (token IDs)
+                for i, item in enumerate(input):
+                    if not isinstance(item, int):
+                        return f"All items in input list must be integers"
+                    if item < 0:
+                        return f"Token ID at index {i} must be non-negative"
+            elif isinstance(first_item, list):
+                # List of lists (multiple token sequences)
+                for i, item in enumerate(input):
+                    if not isinstance(item, list):
+                        return f"Input at index {i} must be a list"
+                    if not item:
+                        return f"Input at index {i} cannot be empty"
+                    if not all(isinstance(token, int) for token in item):
+                        return f"Input at index {i} must contain only integers"
+                    if any(token < 0 for token in item):
+                        return f"Input at index {i} contains negative token IDs"
+            # Note: MultimodalEmbeddingInput validation would be handled by Pydantic
+
+        return None
 
     def _convert_to_internal_request(
         self,
