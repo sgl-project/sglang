@@ -51,6 +51,34 @@ __device__ __forceinline__ T from_f32(float f32) {
 #endif
 }
 
+template <typename T, T (*Activation)(const T&)>
+__global__ void act_only_kernel(T* __restrict__ out, const T* __restrict__ input, const int d) {
+  constexpr uint32_t vec_size = kBytesToLoad / sizeof(T);
+  const int64_t token_idx = blockIdx.x;
+  const int64_t thread_idx = threadIdx.x;
+  const int64_t stride = blockDim.x;
+  const int64_t offset = token_idx * d;
+
+#pragma unroll 1
+  for (uint32_t idx = thread_idx; idx < d / vec_size; idx += stride) {
+    flashinfer::vec_t<T, vec_size> x_vec, y_vec, out_vec;
+    x_vec.cast_load(input + offset + idx * vec_size);
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      out_vec[i] = Activation(x_vec[i]);
+    }
+    out_vec.cast_store(out + token_idx * d + idx * vec_size);
+  }
+
+  const int64_t remaining_offset = d - d % (stride * vec_size);
+  // process the remaining elements
+#pragma unroll 1
+  for (int64_t idx = thread_idx; idx < d % (stride * vec_size); idx += stride) {
+    T x = input[offset + remaining_offset + idx];
+    out[token_idx * d + remaining_offset + idx] = Activation(x);
+  }
+}
+
 }  // namespace detail
 
 template <typename T>
@@ -147,7 +175,7 @@ void gelu_quick(at::Tensor& out, const at::Tensor& input) {
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     dim3 block(std::min(d / vec_size, 1024U));
-    flashinfer::activation::act_only_kernel<c_type, gelu_quick_kernel>
+    detail::act_only_kernel<c_type, gelu_quick_kernel>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
 
     return true;
