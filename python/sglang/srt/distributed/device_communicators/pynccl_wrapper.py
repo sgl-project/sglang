@@ -95,7 +95,8 @@ class ncclDataTypeEnum:
     ncclFloat64 = 8
     ncclDouble = 8
     ncclBfloat16 = 9
-    ncclNumTypes = 10
+    ncclFloat8e4m3 = 10
+    ncclNumTypes = 11
 
     @classmethod
     def from_torch(cls, dtype: torch.dtype) -> int:
@@ -115,6 +116,8 @@ class ncclDataTypeEnum:
             return cls.ncclFloat64
         if dtype == torch.bfloat16:
             return cls.ncclBfloat16
+        if dtype == torch.float8_e4m3fn:
+            return cls.ncclFloat8e4m3
         raise ValueError(f"Unsupported dtype: {dtype}")
 
 
