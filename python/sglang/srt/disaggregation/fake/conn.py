@@ -17,7 +17,14 @@ logger = logging.getLogger(__name__)
 
 # For warmup reqs, we don't kv transfer, we use the fake sender and receiver
 class FakeKVSender(BaseKVSender):
-    def __init__(self, mgr: BaseKVManager, bootstrap_addr: str, bootstrap_room: int):
+    def __init__(
+        self,
+        mgr: BaseKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: int,
+        dest_tp_ranks: List[int],
+        pp_rank: int,
+    ):
         self.has_sent = False
 
     def poll(self) -> KVPoll:
