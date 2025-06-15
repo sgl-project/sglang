@@ -33,7 +33,6 @@ proper content processing for different model types (e.g., DeepSeek vs Llama).
 """
 
 import logging
-import re
 from typing import Any, Dict, List, Optional
 
 import jinja2.nodes
@@ -307,25 +306,6 @@ def build_base_sampling_params(request: OpenAIServingRequest) -> Dict[str, Any]:
     return params
 
 
-def sanitize_model_name(model: str) -> str:
-    """Sanitize model name for safe usage
-
-    Args:
-        model: Model name to sanitize
-
-    Returns:
-        Sanitized model name
-    """
-    # Remove potentially dangerous characters
-    sanitized = re.sub(r'[<>:"|?*]', "", model)
-
-    # Limit length
-    if len(sanitized) > 256:
-        sanitized = sanitized[:256]
-
-    return sanitized.strip()
-
-
 def to_openai_style_logprobs(
     input_token_logprobs=None,
     output_token_logprobs=None,
@@ -361,15 +341,3 @@ def to_openai_style_logprobs(
         append_top_logprobs(output_top_logprobs)
 
     return ret_logprobs
-
-
-def _get_enable_thinking_from_request(request_obj):
-    """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
-
-    Args:
-        request_obj: The request object (or an item from a list of requests).
-
-    Returns:
-        The boolean value of 'enable_thinking' if found and not True, otherwise True.
-    """
-    return getattr(request_obj, "chat_template_kwargs", {}).get("enable_thinking", True)

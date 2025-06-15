@@ -70,7 +70,6 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.utils import (
-    _get_enable_thinking_from_request,
     aggregate_token_usage,
     build_base_sampling_params,
     detect_template_content_format,
@@ -520,7 +519,9 @@ class ChatCompletionHandler(OpenAIServingBase):
                     new_stream_buffer = stream_buffer + delta
 
                     # Handle reasoning content
-                    enable_thinking = _get_enable_thinking_from_request(request)
+                    enable_thinking = getattr(request, "chat_template_kwargs", {}).get(
+                        "enable_thinking", True
+                    )
                     if (
                         self.tokenizer_manager.server_args.reasoning_parser
                         and request.separate_reasoning
@@ -680,7 +681,9 @@ class ChatCompletionHandler(OpenAIServingBase):
 
             # Handle reasoning content
             reasoning_text = None
-            enable_thinking = _get_enable_thinking_from_request(request)
+            enable_thinking = getattr(request, "chat_template_kwargs", {}).get(
+                "enable_thinking", True
+            )
             if reasoning_parser and request.separate_reasoning and enable_thinking:
                 try:
                     parser = ReasoningParser(
