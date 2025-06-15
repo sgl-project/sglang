@@ -289,7 +289,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 # Handle final usage chunk
                 if request.stream_options and request.stream_options.include_usage:
                     usage = self._calculate_streaming_usage_base(
-                        prompt_tokens, completion_tokens, cached_tokens, request
+                        prompt_tokens, completion_tokens, cached_tokens, request.n
                     )
                     final_usage_chunk = CompletionStreamResponse(
                         id=content["meta_info"]["id"],
