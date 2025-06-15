@@ -2108,7 +2108,8 @@ class Scheduler(
             # In this case, we change the input_ids to be only one token to make this prefill cheap.
             if req.rid.startswith(recv_req.rid):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
-                req.grammar.cancel()
+                if req.grammar:
+                    req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
 
         # Delete requests in the running batch
