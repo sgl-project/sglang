@@ -28,9 +28,13 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import is_cuda, set_weight_attrs
+from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
+
+if _is_npu:
+    import torch_npu
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
@@ -50,6 +54,9 @@ class SiluAndMul(CustomOp):
         silu_and_mul(x, out)
         return out
 
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch_npu.npu_swiglu(x)
+        return out
 
 class GeluAndMul(CustomOp):
     def __init__(self, approximate="tanh"):

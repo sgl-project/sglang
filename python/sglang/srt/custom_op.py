@@ -1,9 +1,10 @@
 from torch import nn
 
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 
 class CustomOp(nn.Module):
@@ -70,10 +71,15 @@ class CustomOp(nn.Module):
     def forward_cpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
+    def forward_npu(self, *args, **kwargs):
+        raise NotImplementedError
+
     def dispatch_forward(self):
         if _is_cuda:
             return self.forward_cuda
         elif _is_hip:
             return self.forward_hip
+        elif _is_npu:
+            return self.forward_npu
         else:
             return self.forward_native
