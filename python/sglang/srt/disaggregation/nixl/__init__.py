@@ -1,1 +1,1 @@
-from .conn import NixlKVBootstrapServer, NixlKVManager, NixlKVReceiver, NixlKVSender
+from sglang.srt.disaggregation.nixl.conn import NixlKVBootstrapServer, NixlKVManager, NixlKVReceiver, NixlKVSender
