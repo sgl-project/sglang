@@ -400,55 +400,6 @@ class TestCompatibilityWithAdapter:
 class TestEdgeCases:
     """Test edge cases and error conditions."""
 
-    def test_request_id_generation(
-        self, embedding_handler, basic_embedding_request, mock_request
-    ):
-        """Test that request IDs are properly generated when not provided."""
-        # Request without rid
-        request_without_id = EmbeddingRequest(model="test-model", input="Test")
-        assert request_without_id.rid is None
-
-        # Should generate ID during handling
-        with patch.object(
-            embedding_handler, "_handle_non_streaming_request"
-        ) as mock_handle:
-            mock_handle.return_value = EmbeddingResponse(
-                data=[],
-                model="test-model",
-                usage=UsageInfo(prompt_tokens=0, total_tokens=0),
-            )
-
-            asyncio.run(
-                embedding_handler.handle_request(request_without_id, mock_request)
-            )
-
-            # Check that context was created with generated ID
-            args, kwargs = mock_handle.call_args
-            ctx = args[2]  # Third argument is context
-            assert ctx.request_id.startswith("embd-")
-
-    def test_request_id_preservation(self, embedding_handler, mock_request):
-        """Test that provided request IDs are preserved."""
-        request_with_id = EmbeddingRequest(
-            model="test-model", input="Test", rid="custom-id"
-        )
-
-        with patch.object(
-            embedding_handler, "_handle_non_streaming_request"
-        ) as mock_handle:
-            mock_handle.return_value = EmbeddingResponse(
-                data=[],
-                model="test-model",
-                usage=UsageInfo(prompt_tokens=0, total_tokens=0),
-            )
-
-            asyncio.run(embedding_handler.handle_request(request_with_id, mock_request))
-
-            # Check that custom ID was preserved
-            args, kwargs = mock_handle.call_args
-            ctx = args[2]  # Third argument is context
-            assert ctx.request_id == "custom-id"
-
     def test_multimodal_batch_not_implemented(self, embedding_handler):
         """Test that multimodal batch requests raise NotImplementedError."""
         request1 = EmbeddingRequest(

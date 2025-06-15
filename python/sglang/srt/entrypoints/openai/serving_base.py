@@ -19,7 +19,6 @@ used by all OpenAI API endpoint implementations. It establishes a common
 architecture for request processing, validation, and response generation.
 
 Key Components:
-- RequestContext: Tracks request state and metadata throughout processing
 - OpenAIServingBase: Abstract base class for all endpoint handlers
 - Common request handling patterns with proper error handling
 - Validation integration for request parameters
@@ -37,7 +36,6 @@ endpoint-specific customization.
 
 import json
 import logging
-import time
 import uuid
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Union
@@ -54,34 +52,6 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
-
-
-class RequestContext:
-    """Context object for tracking request state throughout the pipeline"""
-
-    def __init__(
-        self,
-        raw_request: Request,
-        openai_request: OpenAIServingRequest,
-        request_id: str,
-    ):
-        self.raw_request = raw_request
-        self.openai_request = openai_request
-        self.request_id = request_id
-        self.start_time = time.time()
-        self.metadata: Dict[str, Any] = {}
-
-    def elapsed_time(self) -> float:
-        """Get elapsed time since request started"""
-        return time.time() - self.start_time
-
-    def add_metadata(self, key: str, value: Any) -> None:
-        """Add metadata to the request context"""
-        self.metadata[key] = value
-
-    def get_metadata(self, key: str, default: Any = None) -> Any:
-        """Get metadata from the request context"""
-        return self.metadata.get(key, default)
 
 
 # Base class for specific endpoint handlers
@@ -101,26 +71,19 @@ class OpenAIServingBase(ABC):
             if error_msg:
                 return self.create_error_response(error_msg)
 
-            # Create request context
-            ctx = RequestContext(
-                raw_request=raw_request,
-                openai_request=request,
-                request_id=self._generate_request_id_base(request),
-            )
-
             # Convert to internal format
             adapted_request, processed_request = self._convert_to_internal_request(
-                [request], [ctx.request_id]
+                [request], [self._generate_request_id_base(request)]
             )
 
-            # Check if this handler supports streaming
+            # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
                 return await self._handle_streaming_request(
-                    adapted_request, processed_request, ctx
+                    adapted_request, processed_request, raw_request
                 )
             else:
                 return await self._handle_non_streaming_request(
-                    adapted_request, processed_request, ctx
+                    adapted_request, processed_request, raw_request
                 )
 
         except Exception as e:
@@ -158,7 +121,7 @@ class OpenAIServingBase(ABC):
         self,
         adapted_request: GenerateReqInput,
         request: OpenAIServingRequest,
-        ctx: RequestContext,
+        raw_request: Request,
     ) -> StreamingResponse:
         """Handle streaming request
 
@@ -174,7 +137,7 @@ class OpenAIServingBase(ABC):
         self,
         adapted_request: GenerateReqInput,
         request: OpenAIServingRequest,
-        ctx: RequestContext,
+        raw_request: Request,
     ) -> Union[Any, ErrorResponse]:
         """Handle non-streaming request
 

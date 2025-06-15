@@ -68,7 +68,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     TopLogprob,
     UsageInfo,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase, RequestContext
+from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.utils import (
     _get_enable_thinking_from_request,
     aggregate_token_usage,
@@ -447,7 +447,7 @@ class ChatCompletionHandler(OpenAIServingBase):
         self,
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
-        ctx: RequestContext,
+        raw_request: Request,
     ) -> StreamingResponse:
         """Handle streaming chat completion request"""
 
@@ -464,7 +464,7 @@ class ChatCompletionHandler(OpenAIServingBase):
 
             try:
                 async for content in self.tokenizer_manager.generate_request(
-                    adapted_request, ctx.raw_request
+                    adapted_request, raw_request
                 ):
                     index = content.get("index", 0)
                     text = content["text"]
@@ -633,12 +633,12 @@ class ChatCompletionHandler(OpenAIServingBase):
         self,
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
-        ctx: RequestContext,
+        raw_request: Request,
     ) -> Union[ChatCompletionResponse, ErrorResponse]:
         """Handle non-streaming chat completion request"""
         try:
             ret = await self.tokenizer_manager.generate_request(
-                adapted_request, ctx.raw_request
+                adapted_request, raw_request
             ).__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))

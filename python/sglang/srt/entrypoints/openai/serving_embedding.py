@@ -47,6 +47,8 @@ padding for missing text content when needed.
 
 from typing import Any, Dict, List, Optional, Union
 
+from fastapi import Request
+
 from sglang.srt.conversation import generate_embedding_convs
 from sglang.srt.entrypoints.openai.protocol import (
     EmbeddingObject,
@@ -56,7 +58,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     MultimodalEmbeddingInput,
     UsageInfo,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase, RequestContext
+from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.managers.io_struct import EmbeddingReqInput
 
 
@@ -226,12 +228,12 @@ class EmbeddingHandler(OpenAIServingBase):
         self,
         adapted_request: EmbeddingReqInput,
         request: EmbeddingRequest,
-        ctx: RequestContext,
+        raw_request: Request,
     ) -> Union[EmbeddingResponse, ErrorResponse]:
         """Handle the embedding request"""
         try:
             ret = await self.tokenizer_manager.generate_request(
-                adapted_request, ctx.raw_request
+                adapted_request, raw_request
             ).__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))

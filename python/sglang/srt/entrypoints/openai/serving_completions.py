@@ -43,6 +43,7 @@ and batched inputs, with automatic type detection and validation.
 import time
 from typing import Any, Dict, List, Optional, Union
 
+from fastapi import Request
 from fastapi.responses import StreamingResponse
 
 from sglang.srt.code_completion_parser import (
@@ -58,7 +59,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionStreamResponse,
     ErrorResponse,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase, RequestContext
+from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.utils import (
     aggregate_token_usage,
     build_base_sampling_params,
@@ -218,7 +219,7 @@ class CompletionHandler(OpenAIServingBase):
         self,
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
-        ctx: RequestContext,
+        raw_request: Request,
     ) -> StreamingResponse:
         """Handle streaming completion request"""
         created = int(time.time())
@@ -232,7 +233,7 @@ class CompletionHandler(OpenAIServingBase):
 
             try:
                 async for content in self.tokenizer_manager.generate_request(
-                    adapted_request, ctx.raw_request
+                    adapted_request, raw_request
                 ):
                     index = content.get("index", 0)
 
@@ -341,12 +342,12 @@ class CompletionHandler(OpenAIServingBase):
         self,
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
-        ctx: RequestContext,
+        raw_request: Request,
     ) -> Union[CompletionResponse, ErrorResponse]:
         """Handle non-streaming completion request"""
         try:
             generator = self.tokenizer_manager.generate_request(
-                adapted_request, ctx.raw_request
+                adapted_request, raw_request
             )
             ret = await generator.__anext__()
         except ValueError as e:
