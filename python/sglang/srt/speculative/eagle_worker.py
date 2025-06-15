@@ -533,8 +533,9 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch
             )
         else:
-            # Initialize attention backend
-            self.draft_attn_backend.init_forward_metadata(forward_batch)
+            if not forward_batch.forward_mode.is_idle():
+                # Initialize attention backend
+                self.draft_attn_backend.init_forward_metadata(forward_batch)
             forward_batch = ForwardBatch.init_new(
                 model_worker_batch, self.draft_model_runner
             )
@@ -874,7 +875,10 @@ class EAGLEWorker(TpModelWorker):
             )
             forward_batch.spec_info.hidden_states = logits_output.hidden_states
         else:
-            self.draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+            if not forward_batch.forward_mode.is_idle():
+                self.draft_model_runner.attn_backend.init_forward_metadata(
+                    forward_batch
+                )
             logits_output = self.draft_model_runner.model.forward(
                 forward_batch.input_ids, forward_batch.positions, forward_batch
             )
