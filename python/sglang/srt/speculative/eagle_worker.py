@@ -8,13 +8,16 @@ import torch
 from huggingface_hub import snapshot_download
 
 from sglang.srt.distributed import GroupCoordinator, patch_tensor_parallel_group
-from sglang.srt.layers.dp_attention import get_attention_dp_size, get_attention_tp_size
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     get_last_loc,
     global_server_args_dict,
+)
+from sglang.srt.distributed import (
+    get_tp_group,
+    get_tensor_model_parallel_world_size,
 )
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
@@ -332,23 +335,16 @@ class EAGLEWorker(TpModelWorker):
         if not self.server_args.enable_dp_attention:
             return local_need_forward, True
 
-        local_info = torch.tensor(
+        global_need_forward = torch.tensor(
             [
                 (local_need_forward),
             ],
             dtype=torch.int64,
         )
-        global_info = torch.empty(
-            (get_attention_dp_size(), get_attention_tp_size(), 1),
-            dtype=torch.int64,
-        )
-        torch.distributed.all_gather_into_tensor(
-            global_info.flatten(),
-            local_info,
-            group=self.target_worker.get_tp_group().cpu_group,
-        )
-        need_forward = global_info[:, :, 0].any().item()
-        can_run_draft_extend_cuda_graph = global_info[:, :, 0].all().item()
+        torch.distributed.all_reduce(global_need_forward, group=get_tp_group().cpu_group)
+        global_need_forward_cnt = global_need_forward[0].item()
+        need_forward = global_need_forward_cnt > 0
+        can_run_draft_extend_cuda_graph = (global_need_forward_cnt == get_tensor_model_parallel_world_size())
         return need_forward, can_run_draft_extend_cuda_graph
 
     def forward_target_extend(
