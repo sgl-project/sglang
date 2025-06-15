@@ -48,7 +48,7 @@ class FakeKVSender(BaseKVSender):
 
     def send(
         self,
-        kv_indices: npt.NDArray[np.int64],
+        kv_indices: npt.NDArray[np.int32],
     ):
         self.has_sent = True
         logger.info(f"FakeKVSender send with kv_indices: {kv_indices}")
