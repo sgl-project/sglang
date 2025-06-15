@@ -22,7 +22,11 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import HostKVCache, TokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import (
+    DiskKVCache,
+    HostKVCache,
+    TokenToKVPoolAllocator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +74,10 @@ class CacheOperation:
 
     def merge(self, other: "CacheOperation") -> None:
         # multiple operations can be merged into a single operation for batch processing
-        self.host_indices = torch.cat([self.host_indices, other.host_indices])
-        self.device_indices = torch.cat([self.device_indices, other.device_indices])
+        if self.host_indices is not None and other.host_indices is not None:
+            self.host_indices = torch.cat([self.host_indices, other.host_indices])
+        if self.device_indices is not None and other.device_indices is not None:
+            self.device_indices = torch.cat([self.device_indices, other.device_indices])
         self.priority = min(self.priority, other.priority)
         self.node_ids.extend(other.node_ids)
 
@@ -199,7 +205,7 @@ class HiCacheController:
         self.write_thread.start()
         self.load_thread.start()
 
-    def reset(self):
+    def stop(self):
         self.stop_event.set()
         self.write_thread.join()
         self.load_thread.join()
@@ -222,9 +228,15 @@ class HiCacheController:
         self.load_thread = threading.Thread(
             target=self.load_thread_func_layer_by_layer, daemon=True
         )
+
+    def start(self):
         self.stop_event.clear()
         self.write_thread.start()
         self.load_thread.start()
+
+    def reset(self):
+        self.stop()
+        self.start()
 
     def write(
         self,
@@ -256,11 +268,12 @@ class HiCacheController:
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
             return None
+        device_indices_cpu = device_indices.cpu()
         self.mem_pool_host.protect_load(host_indices)
         # to ensure the device indices are ready before accessed by another CUDA stream
         torch.cuda.current_stream().synchronize()
         self.load_queue.put(
-            CacheOperation(host_indices, device_indices, node_id, priority)
+            CacheOperation(host_indices, device_indices_cpu, node_id, priority)
         )
         return device_indices
 
@@ -518,3 +531,284 @@ class HiCacheController:
             raise ValueError(
                 f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
             )
+
+
+class CacheOperationDisk(CacheOperation):
+    def __init__(
+        self,
+        disk_indices: torch.Tensor,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        node_id: int,
+        priority: Optional[int] = None,
+    ):
+        super().__init__(host_indices, device_indices, node_id, priority)
+        self.disk_indices = disk_indices
+
+    def merge(self, other: "CacheOperation") -> None:
+        if self.disk_indices is not None and other.disk_indices is not None:
+            self.disk_indices = torch.cat([self.disk_indices, other.disk_indices])
+        super().merge(other)
+
+
+class HiCacheControllerDisk(HiCacheController):
+
+    def __init__(
+        self,
+        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        mem_pool_host: HostKVCache,
+        mem_pool_disk: DiskKVCache,
+        page_size: int,
+        load_cache_event: threading.Event = None,
+        load_cache_event_disk2device: threading.Event = None,
+        load_cache_event_disk2host: threading.Event = None,
+        write_policy: str = "write_through_selective",
+    ):
+        super().__init__(
+            token_to_kv_pool_allocator,
+            mem_pool_host,
+            page_size,
+            load_cache_event,
+            write_policy,
+        )
+
+        self.mem_pool_disk = mem_pool_disk
+        self.load_cache_event_disk2device = load_cache_event_disk2device
+        self.load_cache_event_disk2host = load_cache_event_disk2host
+        self.layer_done_counter_disk2device = LayerDoneCounter(
+            self.mem_pool_device.layer_num
+        )
+        self.mem_pool_device.register_layer_transfer_counter_disk2device(
+            self.layer_done_counter_disk2device
+        )
+
+        self.write_queue_device2disk = PriorityQueue()
+        self.load_queue_disk2host = PriorityQueue()
+        self.load_queue_disk2device = PriorityQueue()
+
+        self.ack_write_queue_device2disk = Queue()
+        self.ack_load_queue_disk2host = Queue()
+        self.ack_load_queue_disk2device = Queue()
+
+        self.write_stream_device2disk = torch.cuda.Stream()
+        self.load_stream_disk2device = torch.cuda.Stream()
+
+        self.write_thread_device2disk = threading.Thread(
+            target=self.write_thread_func_direct_device2disk,
+            daemon=True,
+        )
+
+        self.load_thread_disk2host = threading.Thread(
+            target=self.load_thread_func_direct_disk2host, daemon=True
+        )
+        self.load_thread_disk2device = threading.Thread(
+            target=self.load_thread_func_layer_by_layer_disk2device, daemon=True
+        )
+
+        self.write_thread_device2disk.start()
+        self.load_thread_disk2host.start()
+        self.load_thread_disk2device.start()
+
+    def stop(self):
+        super().stop()
+
+        self.write_thread_device2disk.join()
+        self.load_thread_disk2host.join()
+        self.load_thread_disk2device.join()
+
+        self.write_queue_device2disk.queue.clear()
+        self.load_queue_disk2host.queue.clear()
+        self.load_queue_disk2device.queue.clear()
+        self.ack_write_queue_device2disk.queue.clear()
+        self.ack_load_queue_disk2host.queue.clear()
+        self.ack_load_queue_disk2device.queue.clear()
+
+        self.write_thread_device2disk = threading.Thread(
+            target=self.write_thread_func_direct_device2disk,
+            daemon=True,
+        )
+        self.load_thread_disk2host = threading.Thread(
+            target=self.load_thread_func_direct_disk2host, daemon=True
+        )
+        self.load_thread_disk2device = threading.Thread(
+            target=self.load_thread_func_layer_by_layer_disk2device, daemon=True
+        )
+
+    def start(self):
+        super().start()
+        self.write_thread_device2disk.start()
+        self.load_thread_disk2host.start()
+        self.load_thread_disk2device.start()
+
+    def reset(self):
+        self.stop()
+        self.start()
+
+    def write_device2disk(
+        self,
+        device_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = 0,
+    ) -> Optional[torch.Tensor]:
+        """
+        Back up KV caches from device memory to disk.
+        """
+        disk_indices = self.mem_pool_disk.alloc(len(device_indices))
+        if disk_indices is None:
+            return None
+
+        self.write_queue_device2disk.put(
+            CacheOperationDisk(
+                disk_indices=disk_indices,
+                host_indices=None,
+                device_indices=device_indices,
+                node_id=node_id,
+                priority=priority,
+            )
+        )
+
+        return disk_indices
+
+    def load_disk2host(
+        self,
+        disk_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = 0,
+    ):
+        """
+        Load KV caches from host memory to device memory.
+        """
+        host_indices = self.mem_pool_host.alloc(len(disk_indices))
+        if host_indices is None:
+            return None
+        self.mem_pool_host.protect_write(host_indices)
+        self.load_queue_disk2host.put(
+            CacheOperationDisk(
+                disk_indices=disk_indices,
+                host_indices=host_indices,
+                device_indices=None,
+                node_id=node_id,
+                priority=priority,
+            )
+        )
+        return host_indices
+
+    def load_disk2device(
+        self,
+        disk_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = 0,
+    ):
+        """
+        Load KV caches from disk to device memory.
+        """
+        device_indices = self.mem_pool_device_allocator.alloc(len(disk_indices))
+        if device_indices is None:
+            return None
+        device_indices_cpu = device_indices.cpu()
+        torch.cuda.current_stream().synchronize()
+        self.load_queue_disk2device.put(
+            CacheOperationDisk(
+                disk_indices=disk_indices,
+                host_indices=None,
+                device_indices=device_indices_cpu,
+                node_id=node_id,
+                priority=priority,
+            )
+        )
+        return device_indices
+
+    def write_thread_func_direct_device2disk(self):
+        """
+        Directly write through KV caches to disk without buffering.
+        """
+        torch.cuda.set_stream(self.write_stream_device2disk)
+        while not self.stop_event.is_set():
+            try:
+                operation = self.write_queue_device2disk.get(block=True, timeout=1)
+
+                while self.write_queue_device2disk.qsize() > 0:
+                    op = self.write_queue_device2disk.get(block=True)
+                    operation.merge(op)
+
+                self.mem_pool_disk.write_page_all_layers(
+                    operation.disk_indices,
+                    operation.device_indices,
+                    self.mem_pool_device,
+                )
+                self.write_stream_device2disk.synchronize()
+                for node_id in operation.node_ids:
+                    if node_id != 0:
+                        self.ack_write_queue_device2disk.put(node_id)
+            except Empty:
+                continue
+            except Exception as e:
+                logger.error(e)
+
+    def load_thread_func_direct_disk2host(self):
+        """
+        Load KV caches from disk to host memory.
+        """
+        while not self.stop_event.is_set():
+            self.load_cache_event_disk2host.wait(timeout=1)
+            if not self.load_cache_event_disk2host.is_set():
+                continue
+            self.load_cache_event_disk2host.clear()
+
+            batch_operation = None
+            while self.load_queue_disk2host.qsize() > 0:
+                op = self.load_queue_disk2host.get(block=True)
+                if batch_operation is None:
+                    batch_operation = op
+                else:
+                    batch_operation.merge(op)
+            if batch_operation is None:
+                continue
+
+            batch_operation.data = self.mem_pool_disk.get_flat_data(
+                batch_operation.disk_indices
+            )
+
+            for node_id in batch_operation.node_ids:
+                if node_id != 0:
+                    self.ack_load_queue_disk2host.put(node_id)
+
+    def load_thread_func_layer_by_layer_disk2device(self):
+        """
+        Load KV caches from disk to device memory layer by layer.
+        """
+        torch.cuda.set_stream(self.load_stream_disk2device)
+        while not self.stop_event.is_set():
+            self.load_cache_event_disk2device.wait(timeout=1)
+            if not self.load_cache_event_disk2device.is_set():
+                continue
+            self.load_cache_event_disk2device.clear()
+
+            batch_operation = None
+            while self.load_queue_disk2device.qsize() > 0:
+                op = self.load_queue_disk2device.get(block=True)
+                if batch_operation is None:
+                    batch_operation = op
+                else:
+                    batch_operation.merge(op)
+            if batch_operation is None:
+                continue
+
+            self.layer_done_counter_disk2device.reset()
+            for i in range(self.mem_pool_disk.layer_num):
+                self.mem_pool_disk.load_page_per_layer(
+                    batch_operation.disk_indices,
+                    batch_operation.device_indices,
+                    self.mem_pool_device,
+                    i,
+                )
+                self.load_stream_disk2device.synchronize()
+                self.layer_done_counter_disk2device.increment()
+
+            for node_id in batch_operation.node_ids:
+                if node_id != 0:
+                    self.ack_load_queue_disk2device.put(node_id)
+
+    def evict_disk(self, disk_indices: torch.Tensor) -> int:
+        self.mem_pool_disk.free(disk_indices)
+        return len(disk_indices)
