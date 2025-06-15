@@ -7,8 +7,6 @@ from sglang.srt.layers.activation import GeluAndMul, QuickGELU
 from sglang.srt.utils import is_hip
 from sglang.test.test_utils import CustomTestCase
 
-_is_hip = is_hip()
-
 
 class TestGeluAndMul(CustomTestCase):
     DTYPES = [torch.half, torch.bfloat16]
@@ -76,10 +74,7 @@ class TestQuickGELU(CustomTestCase):
 
         with torch.inference_mode():
             ref = layer.forward_native(x)  # x * sigmoid(1.702 * x), fp32 math
-            if _is_hip:
-                out = layer.forward_hip(x)  # 128-bit vectorised kernel from sgl-kernel
-            else:
-                out = layer.forward_cuda(x)
+            out = layer.forward_cuda(x)
 
         tol = 1e-2 if dtype is torch.bfloat16 else 1e-3
         self.assertTrue(
