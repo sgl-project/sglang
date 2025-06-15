@@ -89,6 +89,8 @@ class HiRadixCache(RadixCache):
             assert hicache_write_policy in ["write_through_selective", "write_through"]
             self.mooncake_l3_kv_pool = MooncakeStore(
                 self.token_to_kv_pool_host.get_flat_data(list(range(0,self.page_size))).shape,
+                self.token_to_kv_pool_host.dtype,
+                1 if isinstance(self.token_to_kv_pool_host, MLATokenToKVPoolHost) else 2
             )
             self.mooncake_l3_load_cache_event = threading.Event()
             self.l3_ongoing_load_back = {}
