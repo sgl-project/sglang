@@ -1306,7 +1306,6 @@ class Scheduler(
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
-            self.tree_cache.cache_controller.mooncake_l3_stop_event.set()
         else:
             # Run decode
             if not self.running_batch.is_empty():
@@ -1314,7 +1313,6 @@ class Scheduler(
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
                 ret = None
-            self.tree_cache.cache_controller.mooncake_l3_stop_event.clear()
 
         # Handle DP attention
         if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
@@ -1813,7 +1811,7 @@ class Scheduler(
                         self.enable_hierarchical_cache,
                     )
                     req.waiting_status = WaitingStatus.LOADING
-                    self.tree_cache.l3_load_back(req, req.last_node_global)
+                    self.tree_cache.mooncake_load_back(req, req.last_node_global)
             time.sleep(0.001)
 
 

@@ -23,8 +23,9 @@ DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 1024  # 1.0 GiB
 
 logger = logging.getLogger(__name__)
 
+# TODO:(huangtingwei9988) Safetensors serialization performance is poor,
+#  this optimization is not completed
 def tensor_to_bytes(tensor):
-    tensor = tensor.to("cpu")
     length = int(np.prod(tensor.shape).item())
     bytes_per_item = 2 # for bfloat16, other will change accordingly
     total_bytes = length * bytes_per_item
@@ -33,8 +34,13 @@ def tensor_to_bytes(tensor):
     data = np.ctypeslib.as_array(new_ptr, (total_bytes,))  # no internal copy
     return data.tobytes()
 
-def bytes_to_tensor(data_bytes, tensor_shape):
-    return torch.frombuffer(data_bytes, dtype=torch.bfloat16).reshape(tensor_shape)
+def bytes_to_tensor(
+    data_bytes: bytes,
+    tensor_shape: torch.Size,
+    dtype: torch.dtype
+):
+    return torch.frombuffer(data_bytes, dtype=dtype).reshape(tensor_shape)
+
 
 def safetensors_bytes_to_tensor(data: bytes):
     loaded_tensors = safetensors_load(data)
@@ -96,7 +102,9 @@ class MooncakeStore:
 
     def __init__(
         self,
-        page_tensor_shape
+        page_tensor_shape: torch.Size,
+        dtype: torch.dtype,
+        seq_dim: int
     ):
         try:
             from mooncake.store import MooncakeDistributedStore
@@ -121,7 +129,11 @@ class MooncakeStore:
             logger.info("Connect to Mooncake store successfully.")
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
+
             self.page_tensor_shape = page_tensor_shape
+            self.dtype = dtype
+            self.seq_dim = seq_dim
+
 
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
@@ -200,12 +212,22 @@ class MooncakeStore:
 
         return self._get_batch_impl(keys)
 
-    def is_exist(self,
-                 key: str
+    def is_exist(
+        self,
+        key: str
     ) -> bool:
         if key is not None:
             return self.store.is_exist(key) == 1
         return False
+
+    def is_batch_exist(
+        self,
+        keys: List[str]
+    ):
+        for key in keys:
+            if key is None :
+                return None
+        return self.store.is_batch_exist(keys)
 
     def _put_batch_impl(
         self,
@@ -247,7 +269,9 @@ class MooncakeStore:
 
         if batch_data:
             if len(batch_data) > 0:
-                return [bytes_to_tensor(data, self.page_tensor_shape) for data in batch_data]
+                tensor_list = [bytes_to_tensor(data,
+                                    self.page_tensor_shape, self.dtype) for data in batch_data]
+                return torch.concat(tensor_list, dim=self.seq_dim)
         return None
 
     def _get_impl(
@@ -262,6 +286,6 @@ class MooncakeStore:
             raise TypeError("Mooncake Store Get Type Error.") from err
 
         if data:
-            return bytes_to_tensor(data, self.page_tensor_shape)
+            return bytes_to_tensor(data, self.page_tensor_shape, self.dtype)
 
         return None
