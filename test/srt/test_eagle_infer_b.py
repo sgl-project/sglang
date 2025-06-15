@@ -468,6 +468,8 @@ class TestEAGLEServerPageSize(TestEAGLEServer):
                 8,
                 "--page-size",
                 4,
+                "--attention-backend",
+                "flashinfer,",
             ],
         )
 
@@ -499,6 +501,8 @@ class TestEAGLEServerPageSizeTopk(TestEAGLEServer):
                 8,
                 "--page-size",
                 4,
+                "--attention-backend",
+                "flashinfer,",
             ],
         )
 
