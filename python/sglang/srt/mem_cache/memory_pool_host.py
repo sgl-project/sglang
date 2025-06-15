@@ -7,12 +7,7 @@ from functools import wraps
 import psutil
 import torch
 
-from sglang.srt.mem_cache.memory_pool import (
-    GB,
-    KVCache,
-    MHATokenToKVPool,
-    MLATokenToKVPool,
-)
+from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.utils import debug_timing
 
 logger = logging.getLogger(__name__)
