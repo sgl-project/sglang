@@ -221,22 +221,20 @@ class DecodePreallocQueue:
         if is_retracted:
             self.retracted_queue.append(req)
         else:
-
-
-        if req.bootstrap_host == FakeBootstrapHost:
-            # Fake transfer for warmup reqs
-            kv_receiver_class = get_kv_class(TransferBackend.FAKE, KVClassType.RECEIVER)
-        else:
-            kv_receiver_class = get_kv_class(
-                self.transfer_backend, KVClassType.RECEIVER
+            if req.bootstrap_host == FakeBootstrapHost:
+                # Fake transfer for warmup reqs
+                kv_receiver_class = get_kv_class(TransferBackend.FAKE, KVClassType.RECEIVER)
+            else:
+                kv_receiver_class = get_kv_class(
+                    self.transfer_backend, KVClassType.RECEIVER
+                )
+            kv_receiver = kv_receiver_class(
+                mgr=self.kv_manager,
+                bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
+                bootstrap_room=req.bootstrap_room,
+                data_parallel_rank=req.data_parallel_rank,
             )
-        kv_receiver = kv_receiver_class(
-            mgr=self.kv_manager,
-            bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
-            bootstrap_room=req.bootstrap_room,
-            data_parallel_rank=req.data_parallel_rank,
-        )
-        self.queue.append(DecodeRequest(req=req, kv_receiver=kv_receiver))
+            self.queue.append(DecodeRequest(req=req, kv_receiver=kv_receiver))
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
 
