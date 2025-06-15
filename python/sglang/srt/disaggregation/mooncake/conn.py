@@ -132,6 +132,7 @@ class MooncakeKVManager(BaseKVManager):
         self.kv_args = args
         self.engine = MooncakeTransferEngine(
             hostname=get_local_ip_by_remote(),
+            gpu_id=self.kv_args.gpu_id,
             ib_device=self.kv_args.ib_device,
         )
         self.is_mla_backend = is_mla_backend

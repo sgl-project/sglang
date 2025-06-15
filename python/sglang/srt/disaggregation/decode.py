@@ -180,7 +180,6 @@ class DecodePreallocQueue:
         self.max_total_num_tokens = max_total_num_tokens
         self.prefill_pp_size = prefill_pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
-        print(f"num_reserved_decode_tokens: {self.num_reserved_decode_tokens}")
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
