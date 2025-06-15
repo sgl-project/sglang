@@ -789,7 +789,6 @@ class FlashInferMLAMultiStepDraftBackend:
 
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
-        self.page_size = model_runner.server_args.page_size
 
     def common_template(
         self,
