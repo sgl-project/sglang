@@ -164,6 +164,23 @@ register_chat_template(
     )
 )
 
+# Reference: https://huggingface.co/Qwen/Qwen3-32B?chat_template=default
+# Reference: https://modelscope.cn/models/Qwen/Qwen3-32B/file/view/master/tokenizer_config.json?status=1
+register_chat_template(
+    ChatTemplate(
+        name="qwen3",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": ("<|im_start|>system\n", "<|im_end|>\n"),
+            "user": ("<|im_start|>user\n", "<|im_end|>\n"),
+            "assistant": ("<|im_start|>assistant\n", "<|im_end|>\n"),
+        },
+        style=ChatTemplateStyle.PLAIN,
+        stop_str=("<|im_end|>",),
+    )
+)
+
+
 # Reference: https://github.com/lm-sys/FastChat/blob/main/docs/vicuna_weights_version.md#prompt-template
 register_chat_template(
     ChatTemplate(
@@ -553,6 +570,8 @@ def match_chat_ml(model_path: str):
         r"llava", model_path, re.IGNORECASE
     ):
         return "qwen"
+    if re.search(r"qwen3.*", model_path, re.IGNORECASE):
+        return "qwen3"
     if re.search(
         r"llava-v1\.6-34b|llava-v1\.6-yi-34b|llava-next-video-34b|llava-onevision-qwen2",
         model_path,
