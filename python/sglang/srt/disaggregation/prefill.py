@@ -25,6 +25,7 @@ from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
+import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
@@ -575,6 +576,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.req_to_token_pool.req_to_token[req.req_pool_idx, start_idx:end_idx]
             .cpu()
             .numpy()
+            .astype(np.int64)
         )
         req.start_send_idx = end_idx
         if last_chunk:
