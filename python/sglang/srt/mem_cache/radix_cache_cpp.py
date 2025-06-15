@@ -1,5 +1,5 @@
 import threading
-from typing import IO, TYPE_CHECKING, Dict, List, Set, Tuple
+from typing import TYPE_CHECKING, List, Set
 
 import torch
 from sgl_kernel.radix_tree import IOHandle, RadixTreeCpp, TreeNodeCpp
