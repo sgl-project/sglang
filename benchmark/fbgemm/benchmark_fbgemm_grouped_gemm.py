@@ -3,12 +3,14 @@ import argparse
 
 import torch
 import triton
-from fbgemm_grouped_gemm import grouped_gemm as fbgemm_grouped_gemm
-from fbgemm_grouped_gemm import (
-    grouped_gemm_fp8_rowwise as fbgemm_grouped_gemm_fp8_rowwise,
-)
 from transformers import AutoConfig
 
+from sglang.srt.layers.moe.ep_moe.fbgemm_grouped_gemm import (
+    grouped_gemm as fbgemm_grouped_gemm,
+)
+from sglang.srt.layers.moe.ep_moe.fbgemm_grouped_gemm import (
+    grouped_gemm_fp8_rowwise as fbgemm_grouped_gemm_fp8_rowwise,
+)
 from sglang.srt.layers.moe.ep_moe.kernels import (
     grouped_gemm_triton as sglang_grouped_gemm,
 )

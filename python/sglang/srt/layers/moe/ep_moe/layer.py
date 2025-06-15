@@ -11,6 +11,12 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.moe.ep_moe.fbgemm_grouped_gemm import (
+    grouped_gemm as fbgemm_grouped_gemm,
+)
+from sglang.srt.layers.moe.ep_moe.fbgemm_grouped_gemm import (
+    grouped_gemm_fp8_rowwise as fbgemm_grouped_gemm_fp8_rowwise,
+)
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
@@ -18,7 +24,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     grouped_gemm_triton,
     post_reorder_triton_kernel,
     pre_reorder_triton_kernel,
-    run_moe_ep_preproess,
+    run_moe_ep_preprocess,
     silu_and_mul_masked_post_quant_fwd,
     silu_and_mul_triton_kernel,
     tma_align_input_scale,
@@ -58,19 +64,21 @@ logger = logging.getLogger(__name__)
 
 
 class GroupedGemmRunner(torch.nn.Module):
-    flashinfer_gemm_warpper = None
+    flashinfer_gemm_wrapper = None
 
     def __init__(
         self,
         device,
         use_flashinfer: bool = False,
+        use_fbgemm: bool = False,
         use_per_token_if_dynamic: bool = True,
     ):
         super().__init__()
         self.device = device
         self.use_flashinfer = use_flashinfer
+        self.use_fbgemm = use_fbgemm
         self.use_per_token_if_dynamic = use_per_token_if_dynamic
-        if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_warpper is None:
+        if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_wrapper is None:
             GroupedGemmRunner._init_flashinfer_wrapper(device)
 
     @classmethod
@@ -80,7 +88,74 @@ class GroupedGemmRunner(torch.nn.Module):
         workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.int8, device=device
         )
-        cls.flashinfer_gemm_warpper = SegmentGEMMWrapper(workspace_buffer)
+        cls.flashinfer_gemm_wrapper = SegmentGEMMWrapper(workspace_buffer)
+
+    def prepare_fbgemm_inputs(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        seg_indptr: torch.Tensor,
+        weight_indices: Optional[torch.Tensor] = None,
+        scale_b: Optional[torch.Tensor] = None,
+        use_cuda_graph: bool = False,
+    ):
+        """
+        Prepares input tensors for fbgemm_grouped_gemm.
+
+        Args:
+            a: Input tensor of shape [M, K]
+            b: Expert weights of shape [G, N, K]
+            seg_indptr: Tensor of shape [G+1], row index pointer
+            weight_indices: Optional tensor of shape [G'], routing order
+            scale_b: Optional tensor of shape [G]
+            use_cuda_graph: Whether to pad to max_groups
+
+        Returns:
+            b_fbgemm: [G_eff * N, K]
+            m_sizes: [G_eff]
+            scale_b: [G_eff] or None
+        """
+        device = a.device
+        dtype = b.dtype
+        G, N, K_weight = b.shape
+        K_input = a.shape[1]
+
+        assert (
+            K_weight == K_input
+        ), f"Inconsistent expert weight shape: {b.shape}, expected last dim = {K_input}"
+
+        m_sizes = seg_indptr[1:] - seg_indptr[:-1]  # [G]
+        if weight_indices is not None:
+            weight_indices = weight_indices.to(torch.int64)
+            m_sizes = m_sizes[weight_indices]
+            b = b.index_select(0, weight_indices)
+            if scale_b is not None:
+                scale_b = scale_b.index_select(0, weight_indices)
+
+        # Filter m_size == 0  group
+        non_zero_mask = m_sizes > 0
+        b = b[non_zero_mask]
+        m_sizes = m_sizes[non_zero_mask]
+        if scale_b is not None:
+            scale_b = scale_b[non_zero_mask]
+
+        # Flattern B to format for FBGEMM [G_eff * N, K]
+        b_fbgemm = b.contiguous().view(-1, K_input)
+
+        if use_cuda_graph:
+            max_groups = seg_indptr.numel() - 1  # fallback to original G
+            pad_len = max_groups - m_sizes.shape[0]
+            if pad_len > 0:
+                m_sizes = torch.cat(
+                    [m_sizes, torch.zeros(pad_len, dtype=m_sizes.dtype, device=device)]
+                )
+                if scale_b is not None:
+                    scale_b = torch.cat(
+                        [
+                            scale_b,
+                            torch.ones(pad_len, dtype=scale_b.dtype, device=device),
+                        ]
+                    )
+        return b_fbgemm, m_sizes, scale_b
 
     # c = a * b
     def forward(
@@ -101,8 +176,8 @@ class GroupedGemmRunner(torch.nn.Module):
         if self.use_flashinfer:
             # TODO: flashinfer
             assert False
-            assert GroupedGemmRunner.flashinfer_gemm_warpper is not None
-            c = GroupedGemmRunner.flashinfer_gemm_warpper.run(
+            assert GroupedGemmRunner.flashinfer_gemm_wrapper is not None
+            c = GroupedGemmRunner.flashinfer_gemm_wrapper.run(
                 x=a,
                 weights=b,
                 batch_size=batch_size,
@@ -110,6 +185,51 @@ class GroupedGemmRunner(torch.nn.Module):
                 seg_indptr=seg_indptr,
                 weight_indices=weight_indices,
             )
+        elif self.use_fbgemm:
+            # m_sizes = seg_indptr[1:] - seg_indptr[:-1]
+            # non_zero_mask = m_sizes > 0
+
+            # filtered_b = b[non_zero_mask]
+            # m_sizes = m_sizes[non_zero_mask]
+
+            b_fbgemm, m_sizes, scale_b = self.prepare_fbgemm_inputs(
+                a=a,
+                b=b,
+                seg_indptr=seg_indptr,
+                weight_indices=weight_indices,
+                scale_b=scale_b,
+                use_cuda_graph=True,
+            )
+
+            assert seg_indptr is not None, "FBGemm needs seg_indptr"
+            if use_fp8_w8a8:
+                # TODO: Currently fbgemm only supports rowwise fp8. We need to
+                # change it to blockwise fp8 to fully support the replacement of
+                # quant.
+                assert scale_a is not None and scale_b is not None
+                c = grouped_gemm_triton(
+                    a,
+                    b,
+                    c,
+                    batch_size,
+                    weight_column_major,
+                    seg_indptr,
+                    weight_indices,
+                    use_fp8_w8a8,
+                    scale_a,
+                    scale_b,
+                    block_shape=block_shape,
+                    c_dtype=c_dtype,
+                    use_per_token_if_dynamic=self.use_per_token_if_dynamic,
+                )
+            else:
+                c = fbgemm_grouped_gemm(
+                    a.to(torch.bfloat16),
+                    # w=filtered_b.reshape(-1, filtered_b.shape[2]).contiguous(),
+                    b_fbgemm.to(torch.bfloat16),
+                    m_sizes=m_sizes,
+                    use_fast_accum=True,
+                )
         else:
             assert weight_column_major == True
             c = grouped_gemm_triton(
@@ -235,6 +355,7 @@ class EPMoE(torch.nn.Module):
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device,
                 use_flashinfer=False,  # TODO: use flashinfer
+                use_fbgemm=True,
                 use_per_token_if_dynamic=self.use_per_token_if_dynamic,
             )
 
@@ -254,7 +375,7 @@ class EPMoE(torch.nn.Module):
             ),
         )
 
-        reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
+        reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preprocess(
             topk_ids, self.num_experts
         )
 
@@ -965,7 +1086,9 @@ class DeepEPMoE(EPMoE):
         assert self.activation == "silu"
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
-                hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
+                hidden_states.device,
+                use_flashinfer=False,
+                use_fbgemm=False,  # TODO: use flashinfer
             )
 
         if self.activation_scheme == "dynamic" and not self.use_block_quant:
