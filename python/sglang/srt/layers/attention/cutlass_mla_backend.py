@@ -281,6 +281,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
             page_table=self.forward_metadata.block_kv_indices,
             workspace=self.forward_metadata.workspace,
             sm_scale=layer.scaling,
+            num_kv_splits=1,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
