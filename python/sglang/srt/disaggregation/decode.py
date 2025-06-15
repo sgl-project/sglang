@@ -158,6 +158,7 @@ class DecodePreallocQueue:
         bootstrap_port: int,
         max_total_num_tokens: int,
         prefill_pp_size: int,
+        num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
     ):
         self.req_to_token_pool = req_to_token_pool
@@ -178,9 +179,7 @@ class DecodePreallocQueue:
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
         self.prefill_pp_size = prefill_pp_size
-        self.num_reserved_decode_tokens = int(
-            os.environ.get("SGLANG_NUM_RESERVED_DECODE_TOKENS", "512")
-        )
+        self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
@@ -404,7 +403,6 @@ class DecodePreallocQueue:
                 ]
                 .cpu()
                 .numpy()
-                .astype(np.int64)
             )
 
             decode_req.metadata_buffer_index = (
