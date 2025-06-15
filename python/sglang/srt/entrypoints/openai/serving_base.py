@@ -1,0 +1,224 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""
+Base serving engine for OpenAI API endpoints.
+
+This module provides the foundational classes and request handling patterns
+used by all OpenAI API endpoint implementations. It establishes a common
+architecture for request processing, validation, and response generation.
+
+Key Components:
+- RequestContext: Tracks request state and metadata throughout processing
+- OpenAIServingBase: Abstract base class for all endpoint handlers
+- Common request handling patterns with proper error handling
+- Validation integration for request parameters
+- Streaming and non-streaming response support
+
+Architecture Pattern:
+All endpoint handlers inherit from OpenAIServingBase and implement:
+1. _convert_to_internal_request: Transform OpenAI request to SGLang format
+2. _handle_streaming_request: Process streaming requests
+3. _handle_non_streaming_request: Process non-streaming requests
+
+This ensures consistent behavior across all endpoints while allowing
+endpoint-specific customization.
+"""
+
+import logging
+import time
+import uuid
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional, Union
+
+from fastapi import Request
+from fastapi.responses import StreamingResponse
+
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    EmbeddingRequest,
+    ErrorResponse,
+    OpenAIServingRequest,
+    UsageInfo,
+)
+from sglang.srt.entrypoints.openai.utils import create_error_response
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+logger = logging.getLogger(__name__)
+
+
+class RequestContext:
+    """Context object for tracking request state throughout the pipeline"""
+
+    def __init__(
+        self,
+        raw_request: Request,
+        openai_request: OpenAIServingRequest,
+        request_id: str,
+    ):
+        self.raw_request = raw_request
+        self.openai_request = openai_request
+        self.request_id = request_id
+        self.start_time = time.time()
+        self.metadata: Dict[str, Any] = {}
+
+    def elapsed_time(self) -> float:
+        """Get elapsed time since request started"""
+        return time.time() - self.start_time
+
+    def add_metadata(self, key: str, value: Any) -> None:
+        """Add metadata to the request context"""
+        self.metadata[key] = value
+
+    def get_metadata(self, key: str, default: Any = None) -> Any:
+        """Get metadata from the request context"""
+        return self.metadata.get(key, default)
+
+
+# Base class for specific endpoint handlers
+class OpenAIServingBase(ABC):
+    """Abstract base class for OpenAI endpoint handlers"""
+
+    def __init__(self, tokenizer_manager: TokenizerManager):
+        self.tokenizer_manager = tokenizer_manager
+
+    async def handle_request(
+        self, request: OpenAIServingRequest, raw_request: Request
+    ) -> Union[Any, StreamingResponse, ErrorResponse]:
+        """Handle the specific request type with common pattern"""
+        try:
+            # Validate request
+            error_msg = self._validate_request(request)
+            if error_msg:
+                return create_error_response(error_msg)
+
+            # Create request context
+            ctx = RequestContext(
+                raw_request=raw_request,
+                openai_request=request,
+                request_id=self._generate_request_id(request),
+            )
+
+            # Convert to internal format
+            adapted_request, processed_request = self._convert_to_internal_request(
+                [request], [ctx.request_id]
+            )
+
+            # Check if this handler supports streaming
+            if hasattr(request, "stream") and request.stream:
+                return await self._handle_streaming_request(
+                    adapted_request, processed_request, ctx
+                )
+            else:
+                return await self._handle_non_streaming_request(
+                    adapted_request, processed_request, ctx
+                )
+
+        except Exception as e:
+            logger.error(f"Error in request: {e}")
+            return create_error_response(
+                message=f"Internal server error: {str(e)}",
+                err_type="InternalServerError",
+                status_code=500,
+            )
+
+    def _generate_request_id(self, request: OpenAIServingRequest) -> str:
+        """Generate request ID based on request type"""
+        # Default implementation - can be overridden
+        if rid := getattr(request, "rid", None):
+            return rid
+
+        # Determine prefix based on request type
+        prefix_mapping = {
+            ChatCompletionRequest: "chatcmpl",
+            CompletionRequest: "cmpl",
+            EmbeddingRequest: "embd",
+        }
+        prefix = prefix_mapping.get(type(request), "req")
+        return f"{prefix}-{uuid.uuid4()}"
+
+    @abstractmethod
+    def _convert_to_internal_request(
+        self,
+        all_requests: List[OpenAIServingRequest],
+        request_ids: List[str],
+    ) -> tuple[
+        GenerateReqInput, Union[OpenAIServingRequest, List[OpenAIServingRequest]]
+    ]:
+        """Convert OpenAI request to internal format"""
+        pass
+
+    async def _handle_streaming_request(
+        self,
+        adapted_request: GenerateReqInput,
+        request: OpenAIServingRequest,
+        ctx: RequestContext,
+    ) -> StreamingResponse:
+        """Handle streaming request
+
+        Override this method in child classes that support streaming requests.
+        """
+        return create_error_response(
+            message=f"{self.__class__.__name__} does not support streaming requests",
+            err_type="NotImplementedError",
+            status_code=501,
+        )
+
+    async def _handle_non_streaming_request(
+        self,
+        adapted_request: GenerateReqInput,
+        request: OpenAIServingRequest,
+        ctx: RequestContext,
+    ) -> Union[Any, ErrorResponse]:
+        """Handle non-streaming request
+
+        Override this method in child classes that support non-streaming requests.
+        """
+        return create_error_response(
+            message=f"{self.__class__.__name__} does not support non-streaming requests",
+            err_type="NotImplementedError",
+            status_code=501,
+        )
+
+    def _validate_request(self, request: OpenAIServingRequest) -> Optional[str]:
+        """Validate request"""
+        pass
+
+    def _calculate_streaming_usage_base(
+        self,
+        prompt_tokens: Dict[int, int],
+        completion_tokens: Dict[int, int],
+        cached_tokens: Dict[int, int],
+        n_choices: int,
+    ) -> UsageInfo:
+        """Calculate usage information for streaming responses (common logic)"""
+        total_prompt_tokens = sum(
+            tokens for i, tokens in prompt_tokens.items() if i % n_choices == 0
+        )
+        total_completion_tokens = sum(tokens for tokens in completion_tokens.values())
+
+        cache_report = self.tokenizer_manager.server_args.enable_cache_report
+        prompt_tokens_details = None
+        if cache_report:
+            cached_tokens_sum = sum(tokens for tokens in cached_tokens.values())
+            if cached_tokens_sum > 0:
+                prompt_tokens_details = {"cached_tokens": cached_tokens_sum}
+
+        return UsageInfo(
+            prompt_tokens=total_prompt_tokens,
+            completion_tokens=total_completion_tokens,
+            total_tokens=total_prompt_tokens + total_completion_tokens,
+            prompt_tokens_details=prompt_tokens_details,
+        )
