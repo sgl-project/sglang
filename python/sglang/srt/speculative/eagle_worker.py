@@ -783,6 +783,7 @@ class EAGLEWorker(TpModelWorker):
                     self.speculative_num_steps,
                 )
             else:
+                batch = batch.copy()
                 batch.prepare_for_idle()
                 batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
@@ -790,7 +791,6 @@ class EAGLEWorker(TpModelWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
-                batch.forward_mode = ForwardMode.IDLE
   
         batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
