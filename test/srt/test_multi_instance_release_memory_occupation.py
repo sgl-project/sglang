@@ -14,7 +14,7 @@ from transformers import AutoModelForCausalLM
 from sglang.srt.entrypoints.engine import Engine as SglangEngine
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase, find_available_port
 
-# TODO: Remove this line when PR is ready, we need this to bypass internet issue during development
+
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693"
 MOCK_UPDATED_MODEL_NAME_FOR_TEST = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B/48d6d0fc4e02fb1269b36940650a1b7233035cbb"
 
@@ -83,7 +83,6 @@ def _run_sglang_subprocess(
     try:
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(master_port)
-        # dist.init_process_group(backend="gloo", rank=rank, world_size=dp_size * tp_size)
         dist.init_process_group(rank=rank, device_id=torch.device(f"cuda:{rank}"), world_size=dp_size * tp_size)
         torch.cuda.set_device(rank)
 
@@ -209,7 +208,6 @@ class EngineWrapper():
             os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
             self._engine = SglangEngine(**engine_kwargs)
 
-        print("ATOL ATOL calling barrier")
         dist.barrier(group=self._device_mesh_cpu.get_group())
 
 
