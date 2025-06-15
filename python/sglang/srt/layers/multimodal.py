@@ -55,14 +55,15 @@ def gpu_tensor_hash(tensor: torch.Tensor) -> int:
 
     intermediate_hashes = torch.empty(n, dtype=torch.int64, device=tensor.device)
 
-    hash_kernel[grid](
-        tensor,
-        intermediate_hashes,
-        n,
-        BLOCK_SIZE=BLOCK_SIZE,
-        PRIME=PRIME_1,
-        XCONST=PRIME_2,
-    )
+    with torch.cuda.device(tensor.device):
+        hash_kernel[grid](
+            tensor,
+            intermediate_hashes,
+            n,
+            BLOCK_SIZE=BLOCK_SIZE,
+            PRIME=PRIME_1,
+            XCONST=PRIME_2,
+        )
 
     # TODO: threads can't be synced on triton kernel
     final_hash = intermediate_hashes.sum().item()
