@@ -63,6 +63,9 @@ from sglang.srt.managers.io_struct import EmbeddingReqInput
 class EmbeddingHandler(OpenAIServingBase):
     """Handler for embedding requests"""
 
+    def _request_id_prefix(self) -> str:
+        return "embd-"
+
     def _validate_request(self, request: EmbeddingRequest) -> Optional[str]:
         """Validate that the input is not empty or whitespace only."""
         if not (input := request.input):

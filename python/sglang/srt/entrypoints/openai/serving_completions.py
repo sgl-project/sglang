@@ -70,6 +70,9 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 class CompletionHandler(OpenAIServingBase):
     """Handler for completion requests"""
 
+    def _request_id_prefix(self) -> str:
+        return "cmpl-"
+
     def _validate_request(self, request: CompletionRequest) -> Optional[str]:
         """Validate completion prompt format and content"""
         if not (prompt := request.prompt):

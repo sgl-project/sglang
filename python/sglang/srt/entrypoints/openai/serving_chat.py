@@ -94,6 +94,9 @@ class ChatCompletionHandler(OpenAIServingBase):
         self._cached_chat_template = None
         self._cached_template_format = None
 
+    def _request_id_prefix(self) -> str:
+        return "chatcmpl-"
+
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate chat messages format and content"""
         if not (messages := request.messages):

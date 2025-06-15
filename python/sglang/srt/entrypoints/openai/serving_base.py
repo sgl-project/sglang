@@ -46,9 +46,6 @@ from fastapi import Request
 from fastapi.responses import StreamingResponse
 
 from sglang.srt.entrypoints.openai.protocol import (
-    ChatCompletionRequest,
-    CompletionRequest,
-    EmbeddingRequest,
     ErrorResponse,
     OpenAIServingRequest,
     UsageInfo,
@@ -108,7 +105,7 @@ class OpenAIServingBase(ABC):
             ctx = RequestContext(
                 raw_request=raw_request,
                 openai_request=request,
-                request_id=self._generate_request_id(request),
+                request_id=self._generate_request_id_base(request),
             )
 
             # Convert to internal format
@@ -134,20 +131,17 @@ class OpenAIServingBase(ABC):
                 status_code=500,
             )
 
-    def _generate_request_id(self, request: OpenAIServingRequest) -> str:
+    @abstractmethod
+    def _request_id_prefix(self) -> str:
         """Generate request ID based on request type"""
-        # Default implementation - can be overridden
+        pass
+
+    def _generate_request_id_base(self, request: OpenAIServingRequest) -> str:
+        """Generate request ID based on request type"""
         if rid := getattr(request, "rid", None):
             return rid
 
-        # Determine prefix based on request type
-        prefix_mapping = {
-            ChatCompletionRequest: "chatcmpl",
-            CompletionRequest: "cmpl",
-            EmbeddingRequest: "embd",
-        }
-        prefix = prefix_mapping.get(type(request), "req")
-        return f"{prefix}-{uuid.uuid4()}"
+        return f"{self._request_id_prefix()}{uuid.uuid4().hex}"
 
     @abstractmethod
     def _convert_to_internal_request(
