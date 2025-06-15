@@ -37,7 +37,7 @@ class TestMultiInstanceReleaseMemoryOccupation(CustomTestCase):
     def setUpClass(cls):
         multiprocessing.set_start_method("spawn")
 
-    def launch_multi_instance_engines(self):
+    def test_multi_instance_release_memory_occupation(self):
         master_port = find_available_port(23456)
 
         dp_size = MODEL_INFO["dp_size"]
@@ -68,9 +68,6 @@ class TestMultiInstanceReleaseMemoryOccupation(CustomTestCase):
             )
         for p in processes:
             p.join()
-
-    def test_multi_instance_release_memory_occupation(self):
-        self.launch_multi_instance_engines()
 
 
 def _run_sglang_subprocess(
