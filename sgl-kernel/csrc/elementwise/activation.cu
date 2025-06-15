@@ -28,61 +28,58 @@
 #include "act_and_mul_internal.cuh"
 #endif
 
-// [flashinfer
-// activation(https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/csrc/activation.cu#L44)
+// Adapted from flashinfer activation
+// https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/csrc/activation.cu#L44
+
+namespace detail {
+
+template <typename T>
+__device__ __forceinline__ float to_f32(const T& x) {
+#if USE_ROCM
+  return castToFloat(x);
+#else
+  return static_cast<float>(x);
+#endif
+}
+
+template <typename T>
+__device__ __forceinline__ T from_f32(float f32) {
+#if USE_ROCM
+  return castFromFloat<T>(f32);
+#else
+  return static_cast<T>(f32);
+#endif
+}
+
+}  // namespace detail
 
 template <typename T>
 __device__ __forceinline__ T silu(const T& x) {
-#if USE_ROCM
-  float f32_val = castToFloat(x);
-  return castFromFloat<T>(f32_val / (1.0f + expf(-f32_val)));
-#else
-  float f32_val = static_cast<float>(x);
-  return static_cast<T>(f32_val / (1.0f + expf(-f32_val)));
-#endif
+  float f32_val = detail::to_f32(x);
+  return detail::from_f32<T>(f32_val / (1.0f + expf(-f32_val)));
 }
 
 template <typename T>
 __device__ __forceinline__ T gelu(const T& x) {
   constexpr float kAlpha = M_SQRT1_2;
-#if USE_ROCM
-  float f32_val = castToFloat(x);
-  return castFromFloat<T>(f32_val * (0.5f * (1.0f + erf(f32_val * kAlpha))));
-#else
-  float f32_val = static_cast<float>(x);
-  return static_cast<T>(f32_val * (0.5f * (1.0f + erf(f32_val * kAlpha))));
-#endif
+  float f32_val = detail::to_f32(x);
+  return detail::from_f32<T>(f32_val * (0.5f * (1.0f + erf(f32_val * kAlpha))));
 }
 
 // gelu_quick(x) = x * torch.sigmoid(1.702 * x)
 template <typename T>
 __device__ __forceinline__ T gelu_quick_kernel(const T& x) {
-#if USE_ROCM
-  float f32_val = castToFloat(x);
-  return castFromFloat<T>(f32_val / (1.0f + expf(-f32_val * 1.702f)));
-#else
-  float f32_val = static_cast<float>(x);
-  return static_cast<T>(f32_val / (1.0f + expf(-f32_val * 1.702f)));
-#endif
+  float f32_val = detail::to_f32(x);
+  return detail::from_f32<T>(f32_val / (1.0f + expf(-f32_val * 1.702f)));
 }
 
 template <typename T>
 __device__ __forceinline__ T gelu_tanh(const T& x) {
   constexpr float kAlpha = 0.044715f;
   constexpr float kBeta = 0.7978845608028654f;
-#if USE_ROCM
-  const float f32_val = castToFloat(x);
-#else
-  const float f32_val = static_cast<float>(x);
-#endif
-
+  float f32_val = detail::to_f32(x);
   const float cdf = 0.5f * (1.0f + tanhf((kBeta * (f32_val + kAlpha * f32_val * f32_val * f32_val))));
-
-#if USE_ROCM
-  return castFromFloat<T>(f32_val * cdf);
-#else
-  return static_cast<T>(f32_val * cdf);
-#endif
+  return detail::from_f32<T>(f32_val * cdf);
 }
 
 void silu_and_mul(at::Tensor& out, at::Tensor& input) {
