@@ -47,6 +47,10 @@ class BasePrefixCache(ABC):
     def cache_finished_req(self, req: Req, **kwargs):
         pass
 
+    @abstractmethod
+    def cache_unfinished_req(self, req: Req, **kwargs):
+        pass
+
     def init_load_host(
         self,
         device_node: Any,
@@ -82,10 +86,6 @@ class BasePrefixCache(ABC):
         This will be called before the prefill batch is prepared.
         Override this method if the prefix cache supports host cache.
         """
-
-    @abstractmethod
-    def cache_unfinished_req(self, req: Req, **kwargs):
-        pass
 
     @abstractmethod
     def evict(self, num_tokens: int):
