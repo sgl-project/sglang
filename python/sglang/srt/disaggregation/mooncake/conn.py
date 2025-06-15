@@ -28,12 +28,12 @@ from sglang.srt.disaggregation.base.conn import (
     KVArgs,
     KVPoll,
 )
-from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
-from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
+from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     group_concurrent_contiguous,
 )
+from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     get_free_port,
@@ -677,7 +677,12 @@ class MooncakeKVManager(BaseKVManager):
 class MooncakeKVSender(BaseKVSender):
 
     def __init__(
-        self, mgr: MooncakeKVManager, bootstrap_addr: str, bootstrap_room: int
+        self,
+        mgr: MooncakeKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: int,
+        dest_tp_ranks: List[int],
+        pp_rank: int,
     ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
