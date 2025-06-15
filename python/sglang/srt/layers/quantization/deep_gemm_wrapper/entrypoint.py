@@ -36,7 +36,7 @@ if ENABLE_JIT_DEEPGEMM:
             m_grouped_gemm_fp8_fp8_bf16_nt_masked as _grouped_gemm_nt_f8f8bf16_masked_raw,
         )
 
-_SANITY_CHECK_UE8M0 = get_bool_env_var("SGLANG_W8A8_DEEPGEMM_SANITY_CHECK_UE8M0")
+_SANITY_CHECK = get_bool_env_var("SGLANG_W8A8_DEEPGEMM_SANITY_CHECK")
 
 
 def grouped_gemm_nt_f8f8bf16_masked(
@@ -51,8 +51,8 @@ def grouped_gemm_nt_f8f8bf16_masked(
     _, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
 
-    _sanity_check_input_scale(lhs[1])
-    _sanity_check_input_scale(rhs[1])
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
 
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
@@ -73,8 +73,8 @@ def grouped_gemm_nt_f8f8bf16_contig(
     num_groups, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG
 
-    _sanity_check_input_scale(lhs[1])
-    _sanity_check_input_scale(rhs[1])
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         _grouped_gemm_nt_f8f8bf16_contig_raw(lhs, rhs, out, m_indices)
@@ -90,8 +90,8 @@ def gemm_nt_f8f8bf16(
     num_groups = 1
     kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
 
-    _sanity_check_input_scale(lhs[1])
-    _sanity_check_input_scale(rhs[1])
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         _gemm_nt_f8f8bf16_raw(
@@ -118,11 +118,13 @@ def configure_deep_gemm_num_sms(num_sms):
             deep_gemm.set_num_sms(original_num_sms)
 
 
-def _sanity_check_input_scale(value):
-    if not _SANITY_CHECK_UE8M0:
+def _sanity_check_input(x_fp8: Tuple[torch.Tensor, torch.Tensor]):
+    if not _SANITY_CHECK:
         return
+
+    x, x_scale = x_fp8
 
     from sglang.srt.layers.quantization.fp8_utils import ceil_to_ue8m0
 
-    value_ceil = ceil_to_ue8m0(value)
-    assert torch.all(value == value_ceil), f"{value=} {value_ceil=}"
+    x_scale_ceil = ceil_to_ue8m0(x_scale)
+    assert torch.all(x_scale == x_scale_ceil), f"{x_scale=} {x_scale_ceil=}"
