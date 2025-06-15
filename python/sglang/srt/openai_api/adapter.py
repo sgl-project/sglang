@@ -1038,12 +1038,12 @@ def v1_chat_generate_request(
                 request.skip_special_tokens = False
                 if not isinstance(request.tool_choice, str):
                     tools = [
-                        item.function.model_dump()
+                        item.model_dump()
                         for item in request.tools
                         if item.function.name == request.tool_choice.function.name
                     ]
                 else:
-                    tools = [item.function.model_dump() for item in request.tools]
+                    tools = [item.model_dump() for item in request.tools]
 
                 tool_call_parser = tokenizer_manager.server_args.tool_call_parser
                 parser = FunctionCallParser(request.tools, tool_call_parser)
@@ -1077,8 +1077,7 @@ def v1_chat_generate_request(
                     if message.content is None:
                         message.content = ""
                     msg_dict = message.model_dump()
-
-                    # Process content based on detected template format
+  
                     processed_msg = process_content_for_template_format(
                         msg_dict,
                         template_content_format,
@@ -1086,9 +1085,36 @@ def v1_chat_generate_request(
                         audio_data,
                         modalities,
                     )
-                    openai_compatible_messages.append(processed_msg)
-
-                # Handle assistant prefix for continue_final_message
+    
+                    if (
+                        "tool_calls" in processed_msg
+                        and isinstance(processed_msg.get("tool_calls"), list)
+                    ):
+                        for call in processed_msg["tool_calls"]:
+                            try:
+                                if (
+                                    "arguments" in call["function"]
+                                    and isinstance(call["function"]["arguments"], str)
+                                ):
+                                    call["function"]["arguments"] = json.loads(
+                                        call["function"]["arguments"]
+                                    )
+                            except json.JSONDecodeError as e:
+                                # Log a warning or error if JSON parsing fails for arguments
+                                logger.warning(f"Failed to parse tool call arguments as JSON: {e}")
+                                # Decide whether to continue or raise the exception based on desired behavior
+                                continue # Or raise e if strict parsing is required
+                    if isinstance(processed_msg.get("content"), list):
+                        for chunk in processed_msg["content"]:
+                            if isinstance(chunk, dict) and chunk.get("type") == "text":
+                                new_msg = processed_msg.copy()
+                                new_msg["content"] = chunk["text"]
+                                new_msg = {
+                                    k: v for k, v in new_msg.items() if v is not None
+                                }
+                                openai_compatible_messages.append(new_msg)
+                    else:
+                        openai_compatible_messages.append(processed_msg)
                 if (
                     openai_compatible_messages
                     and openai_compatible_messages[-1]["role"] == "assistant"
