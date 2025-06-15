@@ -25,6 +25,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
+
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -51,7 +53,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
+from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class, EPMoE
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization import deep_gemm_wrapper
@@ -1971,12 +1973,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                         )
 
                 experts = layer.mlp.experts
-                if isinstance(experts, DeepEPMoE):
-                    for w in [
-                        experts.w13_weight_fp8,
-                        experts.w2_weight_fp8,
-                    ]:
-                        requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
+                for w in [
+                    experts.w13_weight_fp8,
+                    experts.w2_weight_fp8,
+                ]:
+                    requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
             else:
                 mlp = layer.mlp
                 assert isinstance(mlp, DeepseekV2MLP)
