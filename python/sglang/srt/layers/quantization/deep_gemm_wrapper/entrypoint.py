@@ -52,7 +52,12 @@ def grouped_gemm_nt_f8f8bf16_masked(
         expected_m, n, k, num_groups, kernel_type
     ):
         _grouped_gemm_nt_f8f8bf16_masked_raw(
-            lhs, rhs, out, masked_m, expected_m, recipe=recipe
+            lhs,
+            rhs,
+            out,
+            masked_m,
+            expected_m,
+            **({"recipe": recipe} if DEEPGEMM_V202506 else {})
         )
 
 

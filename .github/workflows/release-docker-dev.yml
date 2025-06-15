@@ -32,5 +32,5 @@ jobs:
 
       - name: Build and Push Dev Image
         run: |
-          docker build . -f docker/Dockerfile.dev -t lmsysorg/sglang:dev --no-cache
+          docker buildx build --output type=image,compression=zstd . -f docker/Dockerfile.dev -t lmsysorg/sglang:dev --no-cache
           docker push lmsysorg/sglang:dev

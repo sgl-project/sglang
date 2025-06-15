@@ -1415,6 +1415,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req = self.reqs[idx]
             retracted_reqs.append(req)
 
+            if server_args.disaggregation_mode == "decode":
+                req.offload_kv_cache(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
+                )
+
             if isinstance(self.tree_cache, ChunkCache):
                 # ChunkCache does not have eviction
                 token_indices = self.req_to_token_pool.req_to_token[
@@ -1445,6 +1450,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.tree_cache.evict(residual_size)
 
             req.reset_for_retract()
+
+            if len(retracted_reqs) == 0:
+                # Corner case: only one request left
+                raise ValueError(
+                    "Failed to retract any request. No space left for only one request."
+                )
 
         self.filter_batch(keep_indices=sorted_indices)
 

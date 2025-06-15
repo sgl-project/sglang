@@ -22,7 +22,8 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import HostKVCache, TokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
 
