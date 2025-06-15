@@ -530,6 +530,11 @@ class Scheduler(
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
+                    use_disk=server_args.hicache_use_disk,
+                    disk_path=server_args.hicache_disk_path,
+                    disk_ratio=server_args.hicache_disk_ratio,
+                    disk_size=server_args.hicache_disk_size,
+                    disk_rank=self.tp_rank,
                 )
             else:
                 self.tree_cache = RadixCache(

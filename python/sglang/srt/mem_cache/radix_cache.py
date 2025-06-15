@@ -56,8 +56,13 @@ class TreeNode:
         self.hit_count = 0
         # indicating the node is loading KV cache from host
         self.loading = False
+        # indicating the node is loading KV cache from disk
+        self.loading_disk2host = False
+        self.loading_disk2device = False
         # store the host indices of KV cache
         self.host_value = None
+        # store the disk indices of KV cache
+        self.disk_value = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -69,6 +74,10 @@ class TreeNode:
     @property
     def backuped(self):
         return self.host_value is not None
+
+    @property
+    def backuped_disk(self):
+        return self.disk_value is not None
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time

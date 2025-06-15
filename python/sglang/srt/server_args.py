@@ -206,6 +206,10 @@ class ServerArgs:
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
+    hicache_use_disk: bool = False
+    hicache_disk_path: str = "/tmp/sglang_hicache_disk_path"
+    hicache_disk_ratio: float = 4.0
+    hicache_disk_size: int = 0
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
@@ -1320,6 +1324,29 @@ class ServerArgs:
             choices=["write_back", "write_through", "write_through_selective"],
             default=ServerArgs.hicache_write_policy,
             help="The write policy of hierarchical cache.",
+        )
+        parser.add_argument(
+            "--hicache-use-disk",
+            action="store_true",
+            help="Hierarchical cache enable disk",
+        )
+        parser.add_argument(
+            "--hicache-disk-path",
+            type=str,
+            default=ServerArgs.hicache_disk_path,
+            help="The path of the disk KV cache pool",
+        )
+        parser.add_argument(
+            "--hicache-disk-ratio",
+            type=float,
+            default=ServerArgs.hicache_disk_ratio,
+            help="The ratio of the size of disk KV cache pool to the size of device pool.",
+        )
+        parser.add_argument(
+            "--hicache-disk-size",
+            type=int,
+            default=ServerArgs.hicache_disk_size,
+            help="The size of disk KV cache pool in gigabytes, which will override the hicache_disk_ratio if set.",
         )
         parser.add_argument(
             "--enable-deepep-moe",
