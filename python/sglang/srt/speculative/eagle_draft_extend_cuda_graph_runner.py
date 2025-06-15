@@ -39,6 +39,9 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.dp_size = model_runner.server_args.dp_size
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.topk = model_runner.server_args.speculative_eagle_topk
+        self.enable_profile_cuda_graph = (
+            model_runner.server_args.enable_profile_cuda_graph
+        )
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         self.padded_static_len = -1
 
@@ -83,8 +86,8 @@ class EAGLEDraftExtendCudaGraphRunner:
 
             self.seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
-            self.accept_length = (
-                torch.ones((self.max_bs,), dtype=torch.int32) * self.num_tokens_per_bs
+            self.accept_length = torch.full(
+                (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
             )
 
         # Capture

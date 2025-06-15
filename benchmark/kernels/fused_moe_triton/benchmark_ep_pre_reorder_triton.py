@@ -48,6 +48,7 @@ def benchmark_pre_reorder(batch_size, topk, model_config):
             topk,
             hidden_size,
             block_size,
+            use_per_token_if_dynamic=True,
         )
 
     for _ in range(10):
