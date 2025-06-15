@@ -1291,6 +1291,15 @@ def get_hpu_memory_capacity():
         )
 
 
+def get_npu_memory_capacity():
+    try:
+        import torch_npu
+
+        return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+    except ImportError as e:
+        raise ImportError("torch_npu is required when run on npu device.")
+
+
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
@@ -1298,6 +1307,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_amdgpu_memory_capacity()
     elif device == "hpu":
         gpu_mem = get_hpu_memory_capacity()
+    elif device == "npu":
+        gpu_mem = get_npu_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -1423,6 +1434,11 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "xpu"
         return "xpu:{}".format(device_id)
 
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        if device_id == None:
+            return "npu"
+        return "npu:{}".format(device_id)
+
     if is_habana_available():
         try:
             import habana_frameworks.torch.hpu
@@ -1497,15 +1513,35 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     return major, minor
 
 
+def get_npu_compiler_config():
+    config = {
+        "frozen_parameter": True,
+        "tiling_schedule_optimize": True,
+        "topology_sorting_strategy": "StableRDFS",
+    }
+    return config
+
+
 def get_compiler_backend() -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
 
     if hasattr(torch, "npu") and torch.npu.is_available():
-        import torchair
+        try:
+            import torchair
+            import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
+            from torchair.configs.compiler_config import CompilerConfig
+        except ImportError as e:
+            raise ImportError(
+                "NPU detected, but torchair package is not installed. "
+                "Please install torchair for torch.compile support on NPU."
+            )
+        compiler_config = CompilerConfig()
+        predefined_config = get_npu_compiler_config()
+        for k, v in predefined_config.items():
+            setattr(compiler_config.experimental_config, k, v)
 
-        config = torchair.CompilerConfig()
-        npu_backend = torchair.get_npu_backend(compiler_config=config)
+        npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
         return npu_backend
 
     return "inductor"
