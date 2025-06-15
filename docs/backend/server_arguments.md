@@ -107,7 +107,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--download-dir` | Model download directory for huggingface. | None |
 | `--base-gpu-id` | The base GPU ID to start allocating GPUs from. Useful when running multiple instances on the same machine. | 0 |
 | `--gpu-id-step` | The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,.... | 1 |
-
+| `--sleep-on-idle` | Reduce CPU usage when sglang is idle. | False |
 
 ## Logging
 
