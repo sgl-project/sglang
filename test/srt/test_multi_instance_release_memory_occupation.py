@@ -21,8 +21,8 @@ MOCK_UPDATED_MODEL_NAME_FOR_TEST = "/shared/public/elr-models/meta-llama/Meta-Ll
 MODEL_INFO = dict(
     model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     mem_fraction_static=0.7,
-    dp_size=1,
-    tp_size=4
+    dp_size=2,
+    tp_size=2
 )
 
 
