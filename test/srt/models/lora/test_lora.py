@@ -104,7 +104,6 @@ class TestLoRA(CustomTestCase):
                     lora_paths=[lora_adapter_paths[0], lora_adapter_paths[1]],
                     max_loras_per_batch=len(lora_adapter_paths) + 1,
                     lora_backend=backend,
-                    disable_radix_cache=True,
                     sleep_on_idle=True,  # Eliminate non-determinism by forcing all requests to be processed in one batch.
                     attention_backend="torch_native",
                 )
