@@ -87,9 +87,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gelu_and_mul(Tensor! out, Tensor input, int cuda_stream) -> ()");
   m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
 
-  m.def("gelu_quick(Tensor! out, Tensor input) -> ()");
-  m.impl("gelu_quick", torch::kCUDA, &gelu_quick);
-
   m.def(
       "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
       "Tensor pos_ids, bool interleave, int cuda_stream) -> ()");
