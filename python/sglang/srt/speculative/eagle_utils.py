@@ -242,7 +242,7 @@ class EagleVerifyInput:
 
         if batch.forward_mode.is_idle():
             return
-        
+
         batch.input_ids = self.draft_token
 
         if page_size == 1:

@@ -7,17 +7,18 @@ from typing import List, Optional, Tuple
 import torch
 from huggingface_hub import snapshot_download
 
-from sglang.srt.distributed import GroupCoordinator, patch_tensor_parallel_group
+from sglang.srt.distributed import (
+    GroupCoordinator,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+    patch_tensor_parallel_group,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     get_last_loc,
     global_server_args_dict,
-)
-from sglang.srt.distributed import (
-    get_tp_group,
-    get_tensor_model_parallel_world_size,
 )
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
@@ -307,7 +308,9 @@ class EAGLEWorker(TpModelWorker):
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
         # TODO(ch-wan): remove asserts
-        if batch.forward_mode.is_decode() or (batch.forward_mode.is_idle() and not batch.is_extend_in_batch):
+        if batch.forward_mode.is_decode() or (
+            batch.forward_mode.is_idle() and not batch.is_extend_in_batch
+        ):
             assert not (batch.forward_mode.is_extend() or batch.is_extend_in_batch)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
@@ -355,10 +358,14 @@ class EAGLEWorker(TpModelWorker):
             ],
             dtype=torch.int64,
         )
-        torch.distributed.all_reduce(global_need_forward, group=get_tp_group().cpu_group)
+        torch.distributed.all_reduce(
+            global_need_forward, group=get_tp_group().cpu_group
+        )
         global_need_forward_cnt = global_need_forward[0].item()
         need_forward = global_need_forward_cnt > 0
-        can_run_draft_extend_cuda_graph = (global_need_forward_cnt == get_tensor_model_parallel_world_size())
+        can_run_draft_extend_cuda_graph = (
+            global_need_forward_cnt == get_tensor_model_parallel_world_size()
+        )
         return need_forward, can_run_draft_extend_cuda_graph
 
     def forward_target_extend(
@@ -637,7 +644,11 @@ class EAGLEWorker(TpModelWorker):
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         spec_info.prepare_for_verify(batch, self.page_size)
         batch.return_hidden_states = False
-        batch.forward_mode = ForwardMode.TARGET_VERIFY if not batch.forward_mode.is_idle() else ForwardMode.IDLE
+        batch.forward_mode = (
+            ForwardMode.TARGET_VERIFY
+            if not batch.forward_mode.is_idle()
+            else ForwardMode.IDLE
+        )
         batch.spec_info = spec_info
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=spec_info.seq_lens_cpu
@@ -700,7 +711,9 @@ class EAGLEWorker(TpModelWorker):
             self.add_logprob_values(batch, res, logits_output)
 
         # Prepare the batch for the next draft forwards.
-        batch.forward_mode = ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
+        batch.forward_mode = (
+            ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
+        )
         batch.spec_info = res.draft_input
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
@@ -871,7 +884,9 @@ class EAGLEWorker(TpModelWorker):
 
         # Restore backup.
         # This is because `seq_lens` can be modified in `prepare_extend_after_decode`
-        batch.forward_mode = ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE
+        batch.forward_mode = (
+            ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE
+        )
         batch.seq_lens = seq_lens_backup
         batch.req_pool_indices = req_pool_indices_backup
         batch.spec_info.accept_length = accept_length_backup
