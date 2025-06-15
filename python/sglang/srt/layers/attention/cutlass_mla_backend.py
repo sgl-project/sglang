@@ -281,6 +281,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             page_table=self.forward_metadata.block_kv_indices,
             workspace=self.forward_metadata.workspace,
+            sm_scale=layer.scaling,
             num_kv_splits=1,
         )
 
