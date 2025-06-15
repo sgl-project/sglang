@@ -124,6 +124,9 @@ def _sanity_check_input(x_fp8: Tuple[torch.Tensor, torch.Tensor]):
 
     x, x_scale = x_fp8
 
+    if x_scale.dtype == torch.int:
+        return
+
     from sglang.srt.layers.quantization.fp8_utils import ceil_to_ue8m0
 
     x_scale_ceil = ceil_to_ue8m0(x_scale)
