@@ -11,11 +11,13 @@ import numpy as np
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
-    MHATokenToKVPoolHost,
     MLATokenToKVPool,
-    MLATokenToKVPoolHost,
     ReqToTokenPool,
     TokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.memory_pool_host import (
+    MHATokenToKVPoolHost,
+    MLATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 from sglang.srt.mem_cache.mooncake_store import MooncakeStore

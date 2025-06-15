@@ -6,7 +6,7 @@ import triton  # Added import
 import triton.testing  # Added import
 from transformers import AutoConfig
 
-from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts
+from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 
 
@@ -125,7 +125,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
     problem_sizes2 = torch.empty((E, 3), dtype=torch.int32, device="cuda")
 
     # --- Lambdas for Benchmarking ---
-    cutlass_lambda = lambda: cutlass_fused_experts(
+    cutlass_lambda = lambda: cutlass_fused_experts_fp8(
         x,
         w1.transpose(1, 2),  # Transposed
         w2.transpose(1, 2),  # Transposed
@@ -193,7 +193,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
         print("Running correctness check...")
         with torch.no_grad():
             # Run CUTLASS version (requires transposed weights)
-            y_cutlass = cutlass_fused_experts(
+            y_cutlass = cutlass_fused_experts_fp8(
                 x,
                 w1.transpose(1, 2),  # Transposed
                 w2.transpose(1, 2),  # Transposed

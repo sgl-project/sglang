@@ -22,7 +22,8 @@ from typing import List, Optional, Union
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import HostKVCache, TokenToKVPoolAllocator, MLATokenToKVPoolHost
+from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.mem_cache.mooncake_store import MooncakeStore
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
@@ -404,7 +405,7 @@ class HiCacheController:
         priority: Optional[int] = None,
         l3_keys: Optional[List] = None,
         node_id: int = 0,
-    ):
+    ) -> Optional[torch.Tensor]:
         """
         Back up KV caches from device memory to host memory.
         """

@@ -11,8 +11,17 @@ python3 -m sglang.launch_server \
   --port 30000 \
 ```
 
-## Supporting Matrixs
+## Supported models
 
+Below the supported models are summarized in a table.
+
+If you are unsure if a specific architecture is implemented, you can search for it via GitHub. For example, to search for `Qwen3ForCausalLM`, use the expression:
+
+```
+repo:sgl-project/sglang path:/^python\/sglang\/srt\/models\// Qwen3ForCausalLM
+```
+
+in the GitHub search bar.
 
 | Model Family (Variants)             | Example HuggingFace Identifier                     | Description                                                                            |
 |-------------------------------------|--------------------------------------------------|----------------------------------------------------------------------------------------|

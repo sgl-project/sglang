@@ -277,6 +277,13 @@ class Gemma3Attention(nn.Module):
         k = k.permute(0, 2, 1, 3)
 
         attn_output = self.attn(q, k, v, forward_batch=forward_batch)
+
+        # Compatible with triton backend which returns [1, s, h, head_dim]
+        if attn_output.dim() == 4 and attn_output.shape[0] == 1:
+            attn_output = attn_output.squeeze(0)
+            attn_output = attn_output.flatten(-2, -1)
+        # [s, h * head_dim]
+
         output, _ = self.o_proj(attn_output)
         return output
 
