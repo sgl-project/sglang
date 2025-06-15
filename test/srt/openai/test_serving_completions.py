@@ -14,7 +14,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
 )
 from sglang.srt.entrypoints.openai.serving_completions import CompletionHandler
-from sglang.srt.entrypoints.openai.utils import build_base_sampling_params
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
@@ -53,102 +52,6 @@ def completion_handler(mock_tokenizer_manager):
 
 class TestUtilityFunctions:
     """Test utility functions that were moved from OpenAIServingBase."""
-
-    def test_build_base_sampling_params_functionality(self):
-        """Test that build_base_sampling_params works correctly."""
-        request = CompletionRequest(
-            model="test-model",
-            prompt="Hello world",
-            temperature=0.8,
-            max_tokens=150,
-            top_p=0.9,
-            top_k=50,
-            presence_penalty=0.1,
-            frequency_penalty=0.2,
-            stop=["<|endoftext|>"],
-        )
-
-        sampling_params = build_base_sampling_params(request)
-
-        # Test that parameters are correctly mapped
-        assert sampling_params["temperature"] == request.temperature
-        assert sampling_params["max_new_tokens"] == request.max_tokens
-        assert sampling_params["top_p"] == request.top_p
-        assert sampling_params["top_k"] == request.top_k
-        assert sampling_params["presence_penalty"] == request.presence_penalty
-        assert sampling_params["frequency_penalty"] == request.frequency_penalty
-        assert sampling_params["stop"] == request.stop
-
-    def test_build_base_sampling_params_logit_bias(self):
-        """Test that logit_bias parameter is properly handled."""
-        request = CompletionRequest(
-            model="test-model",
-            prompt="Hello world",
-            logit_bias={"1": 0.5, "2": -0.3},
-        )
-
-        sampling_params = build_base_sampling_params(request)
-        assert sampling_params["logit_bias"] == {"1": 0.5, "2": -0.3}
-
-    def test_build_base_sampling_params_all_parameters(self):
-        """Test that all sampling parameters from adapter.py are handled."""
-        request = CompletionRequest(
-            model="test-model",
-            prompt="Hello world",
-            temperature=0.8,
-            max_tokens=150,
-            min_tokens=5,
-            top_p=0.9,
-            top_k=50,
-            min_p=0.1,
-            presence_penalty=0.1,
-            frequency_penalty=0.2,
-            repetition_penalty=1.1,
-            stop=["<|endoftext|>"],
-            stop_token_ids=[13, 14],
-            regex=r"\d+",
-            json_schema='{"type": "object"}',
-            ebnf="<expr> ::= <number>",
-            n=2,
-            no_stop_trim=True,
-            ignore_eos=True,
-            skip_special_tokens=False,
-            logit_bias={"1": 0.5},
-        )
-
-        sampling_params = build_base_sampling_params(request)
-
-        # Verify all parameters are present
-        expected_keys = {
-            "temperature",
-            "max_new_tokens",
-            "min_new_tokens",
-            "stop",
-            "stop_token_ids",
-            "top_p",
-            "top_k",
-            "min_p",
-            "presence_penalty",
-            "frequency_penalty",
-            "repetition_penalty",
-            "regex",
-            "json_schema",
-            "ebnf",
-            "n",
-            "no_stop_trim",
-            "ignore_eos",
-            "skip_special_tokens",
-            "logit_bias",
-        }
-
-        for key in expected_keys:
-            assert key in sampling_params, f"Missing parameter: {key}"
-
-        # Verify values
-        assert sampling_params["temperature"] == 0.8
-        assert sampling_params["max_new_tokens"] == 150
-        assert sampling_params["min_new_tokens"] == 5
-        assert sampling_params["logit_bias"] == {"1": 0.5}
 
     def test_create_error_response_functionality(self, completion_handler):
         """Test that create_error_response works correctly."""
@@ -411,54 +314,6 @@ class TestCompletionRequestConversion:
 
 class TestCompatibilityWithAdapter:
     """Test compatibility with adapter.py functionality"""
-
-    def test_sampling_params_structure_matches_adapter(self):
-        """Test that sampling params structure matches adapter.py exactly"""
-        request = CompletionRequest(
-            model="test-model",
-            prompt="Hello world",
-            max_tokens=100,
-            temperature=0.7,
-            top_p=0.9,
-            top_k=50,
-            min_p=0.1,
-            presence_penalty=0.5,
-            frequency_penalty=0.3,
-            repetition_penalty=1.1,
-            stop=["STOP"],
-            stop_token_ids=[13],
-            n=2,
-            ignore_eos=True,
-            skip_special_tokens=False,
-        )
-
-        # Test the utility function directly
-        sampling_params = build_base_sampling_params(request)
-
-        # Check all parameters from adapter.py v1_generate_request
-        expected_params = {
-            "temperature",
-            "max_new_tokens",
-            "min_new_tokens",
-            "stop",
-            "stop_token_ids",
-            "top_p",
-            "top_k",
-            "min_p",
-            "presence_penalty",
-            "frequency_penalty",
-            "repetition_penalty",
-            "regex",
-            "json_schema",
-            "ebnf",
-            "n",
-            "no_stop_trim",
-            "ignore_eos",
-            "skip_special_tokens",
-        }
-
-        actual_params = set(sampling_params.keys())
-        assert expected_params.issubset(actual_params)
 
     def test_bootstrap_parameters_support(self, completion_handler):
         """Test that bootstrap parameters are supported"""

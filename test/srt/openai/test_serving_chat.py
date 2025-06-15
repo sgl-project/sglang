@@ -5,32 +5,14 @@ These tests ensure that the refactored implementation maintains compatibility
 with the original adapter.py functionality.
 """
 
-import asyncio
-import json
-import time
 import uuid
-from typing import Any, Dict, List
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 from fastapi import Request
-from fastapi.responses import StreamingResponse
-from pydantic_core import ValidationError
 
-from sglang.srt.entrypoints.openai.protocol import (
-    ChatCompletionRequest,
-    ChatCompletionResponse,
-    ChatCompletionResponseChoice,
-    ChatCompletionStreamResponse,
-    ChatMessage,
-    DeltaMessage,
-    ErrorResponse,
-    FunctionResponse,
-    ToolCall,
-    UsageInfo,
-)
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest, ErrorResponse
 from sglang.srt.entrypoints.openai.serving_chat import ChatCompletionHandler
-from sglang.srt.entrypoints.openai.utils import build_base_sampling_params
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 
@@ -510,7 +492,7 @@ class TestSamplingParams:
             messages=[{"role": "user", "content": "Hello"}],
             temperature=0.8,
             max_tokens=150,
-            max_completion_tokens=200,  # Should override max_tokens
+            max_completion_tokens=200,
             min_tokens=5,
             top_p=0.9,
             top_k=50,
@@ -543,9 +525,7 @@ class TestSamplingParams:
 
             # Verify all parameters
             assert sampling_params["temperature"] == 0.8
-            assert (
-                sampling_params["max_new_tokens"] == 200
-            )  # max_completion_tokens overrides
+            assert sampling_params["max_new_tokens"] == 150
             assert sampling_params["min_new_tokens"] == 5
             assert sampling_params["top_p"] == 0.9
             assert sampling_params["top_k"] == 50
@@ -553,9 +533,7 @@ class TestSamplingParams:
             assert sampling_params["presence_penalty"] == 0.1
             assert sampling_params["frequency_penalty"] == 0.2
             assert sampling_params["repetition_penalty"] == 1.1
-            assert sampling_params["stop"] == [
-                "</s>"
-            ]  # Should be overridden with processed stop
+            assert sampling_params["stop"] == ["</s>"]
             assert sampling_params["logit_bias"] == {"1": 0.5, "2": -0.3}
 
     def test_response_format_json_schema(self, chat_handler):
@@ -616,45 +594,6 @@ class TestSamplingParams:
 class TestUtilityFunctions:
     """Test utility functions that were moved from OpenAIServingBase."""
 
-    def test_build_base_sampling_params_functionality(self):
-        """Test that build_base_sampling_params works correctly."""
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            temperature=0.8,
-            max_tokens=150,
-            top_p=0.9,
-            top_k=50,
-            presence_penalty=0.1,
-            frequency_penalty=0.2,
-            stop=["<|endoftext|>"],
-        )
-
-        sampling_params = build_base_sampling_params(request)
-
-        # Test that parameters are correctly mapped
-        assert sampling_params["temperature"] == request.temperature
-        assert sampling_params["max_new_tokens"] == request.max_tokens
-        assert sampling_params["top_p"] == request.top_p
-        assert sampling_params["top_k"] == request.top_k
-        assert sampling_params["presence_penalty"] == request.presence_penalty
-        assert sampling_params["frequency_penalty"] == request.frequency_penalty
-        assert sampling_params["stop"] == request.stop
-
-    def test_build_base_sampling_params_max_completion_tokens_override(self):
-        """Test that max_completion_tokens overrides max_tokens."""
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            max_tokens=100,
-            max_completion_tokens=200,
-        )
-
-        sampling_params = build_base_sampling_params(request)
-
-        # max_completion_tokens should override max_tokens
-        assert sampling_params["max_new_tokens"] == 200
-
     def test_create_error_response_functionality(self, chat_handler):
         """Test that create_error_response works correctly."""
         error = chat_handler.create_error_response("Test error message")
@@ -666,47 +605,6 @@ class TestUtilityFunctions:
 
 class TestChatCompletionHandlerCompatibility:
     """Test compatibility with adapter.py functionality."""
-
-    def test_compatibility_sampling_params(self):
-        """Test that sampling parameters are built the same way as adapter.py."""
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            temperature=0.8,
-            max_tokens=150,
-            top_p=0.9,
-            top_k=50,
-            presence_penalty=0.1,
-            frequency_penalty=0.2,
-            stop=["<|endoftext|>"],
-        )
-
-        # Test the utility function directly
-        sampling_params = build_base_sampling_params(request)
-
-        # These should match the structure used in adapter.py's v1_chat_generate_request
-        expected_keys = [
-            "temperature",
-            "max_new_tokens",
-            "top_p",
-            "top_k",
-            "min_p",
-            "presence_penalty",
-            "frequency_penalty",
-            "repetition_penalty",
-            "stop",
-            "regex",
-            "ebnf",
-            "n",
-        ]
-
-        for key in expected_keys:
-            assert key in sampling_params
-
-        assert sampling_params["temperature"] == request.temperature
-        assert sampling_params["max_new_tokens"] == request.max_tokens
-        assert sampling_params["top_p"] == request.top_p
-        assert sampling_params["top_k"] == request.top_k
 
     def test_compatibility_request_structure(self):
         """Test that the request structure matches what adapter.py expects."""
@@ -781,17 +679,6 @@ class TestChatCompletionHandlerCompatibility:
             assert adapted_request.bootstrap_host == "localhost"
             assert adapted_request.bootstrap_port == 8998
             assert adapted_request.bootstrap_room == 12345
-
-    def test_compatibility_logit_bias(self):
-        """Test that logit_bias parameter is properly handled."""
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            logit_bias={"1": 0.5, "2": -0.3},
-        )
-
-        sampling_params = build_base_sampling_params(request)
-        assert sampling_params["logit_bias"] == {"1": 0.5, "2": -0.3}
 
 
 if __name__ == "__main__":

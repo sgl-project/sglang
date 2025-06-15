@@ -71,7 +71,6 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.utils import (
     aggregate_token_usage,
-    build_base_sampling_params,
     detect_template_content_format,
     process_content_for_template_format,
     to_openai_style_logprobs,
@@ -226,7 +225,7 @@ class ChatCompletionHandler(OpenAIServingBase):
         str, Union[str, List[int]], Optional[Any], Optional[Any], List[str], List[str]
     ]:
         """Process chat messages and apply chat template"""
-        tool_call_constraint = None
+        tool_call_constraint = None  # TODO: how to pass this to the sampling params?
         prompt = ""
         prompt_ids = []
 
@@ -410,13 +409,28 @@ class ChatCompletionHandler(OpenAIServingBase):
         self, request: ChatCompletionRequest, stop: List[str]
     ) -> Dict[str, Any]:
         """Build sampling parameters for the request"""
-        # Start with common parameters
-        sampling_params = build_base_sampling_params(request)
 
-        # Override stop with processed stop sequences
-        sampling_params["stop"] = stop
+        sampling_params = {
+            "temperature": request.temperature,
+            "max_new_tokens": request.max_tokens or request.max_completion_tokens,
+            "min_new_tokens": request.min_tokens,
+            "stop": stop,
+            "stop_token_ids": request.stop_token_ids,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
+            "min_p": request.min_p,
+            "presence_penalty": request.presence_penalty,
+            "frequency_penalty": request.frequency_penalty,
+            "repetition_penalty": request.repetition_penalty,
+            "regex": request.regex,
+            "ebnf": request.ebnf,
+            "n": request.n,
+            "no_stop_trim": request.no_stop_trim,
+            "ignore_eos": request.ignore_eos,
+            "skip_special_tokens": request.skip_special_tokens,
+            "logit_bias": request.logit_bias,
+        }
 
-        # Handle response format
         if request.response_format and request.response_format.type == "json_schema":
             sampling_params["json_schema"] = convert_json_schema_to_str(
                 request.response_format.json_schema.schema_
@@ -430,16 +444,25 @@ class ChatCompletionHandler(OpenAIServingBase):
                 request.response_format.model_dump(by_alias=True)
             )
 
-        # Handle tool call constraints
-        if hasattr(self, "_tool_call_constraint") and self._tool_call_constraint:
-            constraint_type, constraint_value = self._tool_call_constraint
-            if constraint_type == "structural_tag":
-                sampling_params[constraint_type] = convert_json_schema_to_str(
-                    constraint_value.model_dump(by_alias=True)
-                )
-            else:
-                sampling_params[constraint_type] = constraint_value
+        # TODO: how to handle tool call constraint?
+        # Check if there are already existing output constraints
+        # has_existing_constraints = (
+        #     sampling_params.get("regex")
+        #     or sampling_params.get("ebnf")
+        #     or sampling_params.get("structural_tag")
+        #     or sampling_params.get("json_schema")
+        # )
 
+        # if tool_call_constraint and has_existing_constraints:
+        #     logger.warning("Constrained decoding is not compatible with tool calls.")
+        # elif tool_call_constraint:
+        #     constraint_type, constraint_value = tool_call_constraint
+        #     if constraint_type == "structural_tag":
+        #         sampling_params[constraint_type] = convert_json_schema_to_str(
+        #             constraint_value.model_dump(by_alias=True)
+        #         )
+        #     else:
+        #         sampling_params[constraint_type] = constraint_value
         return sampling_params
 
     async def _handle_streaming_request(

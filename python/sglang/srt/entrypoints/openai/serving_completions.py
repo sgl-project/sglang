@@ -62,7 +62,6 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.utils import (
     aggregate_token_usage,
-    build_base_sampling_params,
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -208,7 +207,27 @@ class CompletionHandler(OpenAIServingBase):
     def _build_sampling_params(self, request: CompletionRequest) -> Dict[str, Any]:
         """Build sampling parameters for the request"""
         # Start with common parameters
-        sampling_params = build_base_sampling_params(request)
+        sampling_params = {
+            "temperature": request.temperature,
+            "max_new_tokens": request.max_tokens,
+            "min_new_tokens": request.min_tokens,
+            "stop": request.stop,
+            "stop_token_ids": request.stop_token_ids,
+            "top_p": request.top_p,
+            "top_k": request.top_k,
+            "min_p": request.min_p,
+            "presence_penalty": request.presence_penalty,
+            "frequency_penalty": request.frequency_penalty,
+            "repetition_penalty": request.repetition_penalty,
+            "regex": request.regex,
+            "json_schema": request.json_schema,
+            "ebnf": request.ebnf,
+            "n": request.n,
+            "no_stop_trim": request.no_stop_trim,
+            "ignore_eos": request.ignore_eos,
+            "skip_special_tokens": request.skip_special_tokens,
+            "logit_bias": request.logit_bias,
+        }
 
         # No additional completion-specific parameters needed currently
         # (json_schema is already handled in base method)

@@ -266,46 +266,6 @@ def aggregate_token_usage(
     )
 
 
-def build_base_sampling_params(request: OpenAIServingRequest) -> Dict[str, Any]:
-    """Build common sampling parameters shared by both chat and completion requests"""
-    params = {}
-
-    # Define parameter mappings (request_attr -> param_name)
-    direct_mappings = {
-        "temperature": "temperature",
-        "max_tokens": "max_new_tokens",
-        "min_tokens": "min_new_tokens",
-        "stop": "stop",
-        "stop_token_ids": "stop_token_ids",
-        "top_p": "top_p",
-        "top_k": "top_k",
-        "min_p": "min_p",
-        "presence_penalty": "presence_penalty",
-        "frequency_penalty": "frequency_penalty",
-        "repetition_penalty": "repetition_penalty",
-        "regex": "regex",
-        "ebnf": "ebnf",
-        "n": "n",
-        "no_stop_trim": "no_stop_trim",
-        "ignore_eos": "ignore_eos",
-        "logit_bias": "logit_bias",
-        "skip_special_tokens": "skip_special_tokens",
-        "json_schema": "json_schema",
-    }
-
-    # Apply direct mappings
-    for request_attr, param_name in direct_mappings.items():
-        if hasattr(request, request_attr):
-            params[param_name] = getattr(request, request_attr)
-
-    # Handle special cases
-    # max_completion_tokens overrides max_tokens for chat requests
-    if isinstance(request, ChatCompletionRequest) and request.max_completion_tokens:
-        params["max_new_tokens"] = request.max_completion_tokens
-
-    return params
-
-
 def to_openai_style_logprobs(
     input_token_logprobs=None,
     output_token_logprobs=None,
