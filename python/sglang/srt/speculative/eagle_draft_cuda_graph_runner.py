@@ -311,6 +311,7 @@ class EAGLEDraftCudaGraphRunner:
         self.model_runner.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
             forward_batch, bs
         )
+
         # Replay
         self.graphs[bs].replay()
         out = self.output_buffers[bs]

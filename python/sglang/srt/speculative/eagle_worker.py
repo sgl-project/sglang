@@ -295,16 +295,9 @@ class EAGLEWorker(TpModelWorker):
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
 
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            logits_output, next_token_ids, bid, seq_lens_cpu = (
-                self.forward_target_extend(batch)
-            )
-            with self.draft_tp_context(self.draft_model_runner.tp_group):
-                self.forward_draft_extend(
-                    batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
-                )
-            return logits_output, next_token_ids, bid, 0, False
-        else:
+        # TODO(ch-wan): remove asserts
+        if batch.forward_mode.is_decode() or (batch.forward_mode.is_idle() and not batch.is_extend_in_batch):
+            assert not (batch.forward_mode.is_extend() or batch.is_extend_in_batch)
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
@@ -326,6 +319,16 @@ class EAGLEWorker(TpModelWorker):
                 sum(verify_output.accept_length_per_req_cpu),
                 can_run_cuda_graph,
             )
+        else:  # batch.forward_mode.is_extend() or batch.is_extend_in_batch
+            assert batch.forward_mode.is_extend() or batch.is_extend_in_batch
+            logits_output, next_token_ids, bid, seq_lens_cpu = (
+                self.forward_target_extend(batch)
+            )
+            with self.draft_tp_context(self.draft_model_runner.tp_group):
+                self.forward_draft_extend(
+                    batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
+                )
+            return logits_output, next_token_ids, bid, 0, False
 
     def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         local_need_forward = (
@@ -489,9 +492,8 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch
             )
         else:
-            if not batch.forward_mode.is_idle():
-                # Initialize attention backend
-                self.draft_attn_backend.init_forward_metadata(forward_batch)
+            # Initialize attention backend
+            self.draft_attn_backend.init_forward_metadata(forward_batch)
             forward_batch = ForwardBatch.init_new(
                 model_worker_batch, self.draft_model_runner
             )
@@ -573,14 +575,13 @@ class EAGLEWorker(TpModelWorker):
 
             # Set inputs
             forward_batch.input_ids = input_ids
-            if not forward_batch.forward_mode.is_idle():
-                out_cache_loc = out_cache_loc.view(forward_batch.batch_size, -1)
-                forward_batch.out_cache_loc = out_cache_loc[
-                    :, self.topk * i : self.topk * (i + 1)
-                ].flatten()
-                forward_batch.positions.add_(1)
-                forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
-                spec_info.hidden_states = hidden_states
+            out_cache_loc = out_cache_loc.view(forward_batch.batch_size, self.topk * self.speculative_num_steps)
+            forward_batch.out_cache_loc = out_cache_loc[
+                :, self.topk * i : self.topk * (i + 1)
+            ].flatten()
+            forward_batch.positions.add_(1)
+            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+            spec_info.hidden_states = hidden_states
 
             # Run forward
             logits_output = self.draft_model_runner.model.forward(
@@ -596,10 +597,9 @@ class EAGLEWorker(TpModelWorker):
         return score_list, token_list, parents_list
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
-        if not batch.forward_mode.is_idle():
-            spec_info.prepare_for_verify(batch, self.page_size)
-            batch.return_hidden_states = False
-            batch.forward_mode = ForwardMode.TARGET_VERIFY
+        spec_info.prepare_for_verify(batch, self.page_size)
+        batch.return_hidden_states = False
+        batch.forward_mode = ForwardMode.TARGET_VERIFY if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         batch.spec_info = spec_info
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=spec_info.seq_lens_cpu
@@ -643,46 +643,23 @@ class EAGLEWorker(TpModelWorker):
 
         self._detect_nan_if_needed(logits_output)
         spec_info.hidden_states = logits_output.hidden_states
+        res: EagleVerifyOutput = spec_info.verify(
+            batch,
+            logits_output,
+            self.token_to_kv_pool_allocator,
+            self.page_size,
+            vocab_mask,
+        )
 
-        if batch.forward_mode.is_idle():
-            draft_input = EagleDraftInput.create_idle_input(
-                device=self.device,
-                hidden_size=self.model_config.hidden_size,
-                topk=self.topk,
-                capture_hidden_mode=CaptureHiddenMode.LAST,
-            )
-            res = EagleVerifyOutput(
-                draft_input=draft_input,
-                logits_output=logits_output,
-                verified_id=torch.empty(0, dtype=torch.long, device=self.device),
-                accept_length_per_req_cpu=[],
-                accepted_indices=torch.full(
-                    (0, spec_info.spec_steps + 1),
-                    -1,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-            )
-        else:
-            res: EagleVerifyOutput = spec_info.verify(
-                batch,
-                logits_output,
-                self.token_to_kv_pool_allocator,
-                self.page_size,
-                vocab_mask,
-            )
+        # Post process based on verified outputs.
+        # Pick indices that we care (accepted)
+        logits_output.next_token_logits = logits_output.next_token_logits[
+            res.accepted_indices
+        ]
+        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
-            # Post process based on verified outputs.
-            # Pick indices that we care (accepted)
-            logits_output.next_token_logits = logits_output.next_token_logits[
-                res.accepted_indices
-            ]
-            logits_output.hidden_states = logits_output.hidden_states[
-                res.accepted_indices
-            ]
-
-            # Prepare the batch for the next draft forwards.
-            batch.forward_mode = ForwardMode.DECODE
+        # Prepare the batch for the next draft forwards.
+        batch.forward_mode = ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
 
         batch.spec_info = res.draft_input
 
@@ -791,25 +768,21 @@ class EAGLEWorker(TpModelWorker):
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch, can_run_draft_extend_cuda_graph: bool
     ):
+        # Backup fields that will be modified in-place
+        seq_lens_backup = batch.seq_lens.clone()
+        req_pool_indices_backup = batch.req_pool_indices
+        accept_length_backup = batch.spec_info.accept_length
+        return_logprob_backup = batch.return_logprob
 
-        is_idle = batch.forward_mode.is_idle()
-        origin_batch = None
-        if not is_idle:
+        input_is_idle = batch.forward_mode.is_idle()
+        if not input_is_idle:
             if batch.spec_info.verified_id is not None:
-                # Backup fields that will be modified in-place
-                seq_lens_backup = batch.seq_lens.clone()
-                req_pool_indices_backup = batch.req_pool_indices
-                accept_length_backup = batch.spec_info.accept_length
-                return_logprob_backup = batch.return_logprob
-
                 # Prepare metadata
                 batch.spec_info.prepare_extend_after_decode(
                     batch,
                     self.speculative_num_steps,
                 )
             else:
-                origin_batch = batch
-                batch = origin_batch.copy()
                 batch.prepare_for_idle()
                 batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
@@ -818,6 +791,7 @@ class EAGLEWorker(TpModelWorker):
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
                 batch.forward_mode = ForwardMode.IDLE
+  
         batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.spec_num_draft_tokens = self.speculative_num_draft_tokens
@@ -829,6 +803,7 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
         else:
             forward_batch.seq_lens_sum = batch.seq_lens.sum().item()
+
         # Run
         can_cuda_graph = (
             can_run_draft_extend_cuda_graph
@@ -845,10 +820,7 @@ class EAGLEWorker(TpModelWorker):
             )
             forward_batch.spec_info.hidden_states = logits_output.hidden_states
         else:
-            if not is_idle and batch.spec_info.verified_id is not None:
-                self.draft_model_runner.attn_backend.init_forward_metadata(
-                    forward_batch
-                )
+            self.draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
             logits_output = self.draft_model_runner.model.forward(
                 forward_batch.input_ids, forward_batch.positions, forward_batch
             )
@@ -856,16 +828,13 @@ class EAGLEWorker(TpModelWorker):
 
         self._detect_nan_if_needed(logits_output)
 
-        if origin_batch is not None:
-            batch = origin_batch
-        elif not is_idle:
-            # Restore backup.
-            # This is because `seq_lens` can be modified in `prepare_extend_after_decode`
-            batch.forward_mode = ForwardMode.DECODE
-            batch.seq_lens = seq_lens_backup
-            batch.req_pool_indices = req_pool_indices_backup
-            batch.spec_info.accept_length = accept_length_backup
-            batch.return_logprob = return_logprob_backup
+        # Restore backup.
+        # This is because `seq_lens` can be modified in `prepare_extend_after_decode`
+        batch.forward_mode = ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE
+        batch.seq_lens = seq_lens_backup
+        batch.req_pool_indices = req_pool_indices_backup
+        batch.spec_info.accept_length = accept_length_backup
+        batch.return_logprob = return_logprob_backup
 
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput

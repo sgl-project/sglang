@@ -243,6 +243,10 @@ class EagleVerifyInput:
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
+
+        if batch.forward_mode.is_idle():
+            return
+        
         batch.input_ids = self.draft_token
 
         if page_size == 1:
@@ -328,6 +332,25 @@ class EagleVerifyInput:
         tokens. I.e., logits_output.next_token_logits only contains
         accepted token logits.
         """
+        if batch.forward_mode.is_idle():
+            return EagleVerifyOutput(
+                draft_input=EagleDraftInput.create_idle_input(
+                    device=batch.device,
+                    hidden_size=batch.model_config.hidden_size,
+                    topk=self.topk,
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                ),
+                logits_output=logits_output,
+                verified_id=torch.empty(0, dtype=torch.long, device=batch.device),
+                accept_length_per_req_cpu=[],
+                accepted_indices=torch.full(
+                    (0, self.spec_steps + 1),
+                    -1,
+                    dtype=torch.int32,
+                    device=batch.device,
+                ),
+            )
+
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
