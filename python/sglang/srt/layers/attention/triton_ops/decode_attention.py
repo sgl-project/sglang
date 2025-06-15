@@ -708,7 +708,7 @@ def decode_attention_fwd(
             num_kv_splits,
             max_kv_splits,
             sm_scale,
-            logit_cap,
+            logit_cap=logit_cap,
         )
     else:
         # GQA/MQA/MLA
@@ -724,5 +724,5 @@ def decode_attention_fwd(
             num_kv_splits,
             max_kv_splits,
             sm_scale,
-            logit_cap,
+            logit_cap=logit_cap,
         )

@@ -141,15 +141,12 @@ class KVCache(abc.ABC):
     ) -> None:
         raise NotImplementedError()
 
-    @abc.abstractmethod
     def get_flat_data(self, indices):
         raise NotImplementedError()
 
-    @abc.abstractmethod
     def transfer(self, indices, flat_data):
         raise NotImplementedError()
 
-    @abc.abstractmethod
     def transfer_per_layer(self, indices, flat_data, layer_id):
         raise NotImplementedError()
 
