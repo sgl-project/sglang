@@ -798,7 +798,9 @@ class GetWeightsByNameReqOutput:
 
 @dataclass
 class ReleaseMemoryOccupationReqInput:
-    pass
+    # Optional tags to identify the memory region, which is primarily used for RLHF
+    # Currently we only support `weights` and `kv_cache`
+    tags: Optional[List[str]] = None
 
 
 @dataclass
@@ -808,7 +810,9 @@ class ReleaseMemoryOccupationReqOutput:
 
 @dataclass
 class ResumeMemoryOccupationReqInput:
-    pass
+    # Optional tags to identify the memory region, which is primarily used for RLHF
+    # Currently we only support `weights` and `kv_cache`
+    tags: Optional[List[str]] = None
 
 
 @dataclass

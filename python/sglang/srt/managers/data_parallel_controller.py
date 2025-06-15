@@ -32,7 +32,9 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.torch_memory_saver_adapter import (
+    configure_subprocess as tms_configure_subprocess,
+)
 from sglang.srt.utils import bind_port, configure_logger, get_zmq_socket
 from sglang.utils import get_exception_traceback
 
@@ -177,10 +179,6 @@ class DataParallelController:
         if not server_args.enable_dp_attention:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
 
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
-        )
-
         scheduler_pipe_readers = []
 
         nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
@@ -233,7 +231,7 @@ class DataParallelController:
                         writer,
                     ),
                 )
-                with memory_saver_adapter.configure_subprocess():
+                with tms_configure_subprocess(enable=server_args.enable_memory_saver):
                     proc.start()
                 self.scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
