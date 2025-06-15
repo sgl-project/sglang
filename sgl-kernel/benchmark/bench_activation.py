@@ -1,8 +1,5 @@
-#!/usr/bin/env python3
-#
 # Benchmarks SGLang kernels versus vLLM across
 # (kernel, dtype, batch_size, seq_len, dim) and prints speed-up.
-
 import argparse
 import itertools
 import re
@@ -76,7 +73,7 @@ default_dims = [2**i for i in range(7, 15)]  # 128...16384
         x_vals=[],
         line_arg="provider",
         line_vals=["vllm", "sglang", "speedup"],
-        line_names=["vLLM", "SGL Kernel", "Speed-up (×)"],
+        line_names=["vLLM", "SGL Kernel", "Speed-up (x)"],
         styles=[("blue", "-"), ("green", "-"), ("red", "--")],
         ylabel="µs (median)  or  × (speed-up)",
         plot_name="activation-performance",
