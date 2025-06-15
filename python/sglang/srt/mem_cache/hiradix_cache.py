@@ -316,16 +316,14 @@ class HiRadixCache(RadixCache):
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
-        values, host_values, last_node = self._match_prefix_helper(self.root_node, key)
-
-        last_node_global = last_node
-        while last_node.evicted:
-            last_node = last_node.parent
+        values, host_values, last_host_node, last_device_node = (
+            self._match_prefix_helper(self.root_node, key)
+        )
 
         return MatchResult(
             device_indices=self.merge_tensor(values),
-            last_device_node=last_node_global,
-            last_host_node=last_node,
+            last_device_node=last_device_node,
+            last_host_node=last_host_node,
             host_indices_length=sum(len(v) for v in host_values),
         )
 
@@ -334,6 +332,7 @@ class HiRadixCache(RadixCache):
         child_key = self.get_child_key_fn(key)
         values = []
         host_values: List[torch.Tensor] = []
+        device_node = node
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
@@ -344,6 +343,7 @@ class HiRadixCache(RadixCache):
                 self.inc_hit_count(new_node)
                 if not new_node.evicted:
                     values.append(new_node.value)
+                    device_node = new_node
                 else:
                     assert new_node.host_value is not None
                     host_values.append(new_node.host_value)
@@ -353,6 +353,7 @@ class HiRadixCache(RadixCache):
                 self.inc_hit_count(child)
                 if not child.evicted:
                     values.append(child.value)
+                    device_node = child
                 else:
                     assert child.host_value is not None
                     host_values.append(child.host_value)
@@ -362,7 +363,7 @@ class HiRadixCache(RadixCache):
                 if len(key):
                     child_key = self.get_child_key_fn(key)
 
-        return values, host_values, node
+        return values, host_values, node, device_node
 
     def _split_node(self, key, child: TreeNode, split_len: int):
         # child node split into new_node -> child

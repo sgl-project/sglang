@@ -484,13 +484,16 @@ class PrefillAdder:
             assert host_indices_length % self.page_size == 0, "Implementation error"
 
             # we need to assign some memory for the host indices
-            if host_indices_length > 0:
-                new_device_indices = self.token_to_kv_pool_allocator.alloc(
-                    host_indices_length
+            if (
+                host_indices_length > 0
+                and (
+                    new_device_indices := self.token_to_kv_pool_allocator.alloc(
+                        host_indices_length
+                    )
                 )
-                assert new_device_indices is not None, "impossible to reach here"
-
-                # update the tree ache
+                is not None
+            ):
+                # update the tree cache
                 self.tree_cache.init_load_host(
                     device_node=req.last_node,
                     host_node=last_host_node,
