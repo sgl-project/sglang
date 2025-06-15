@@ -8,7 +8,7 @@ try:
     import torch_memory_saver
 
     # Use the global singleton instance
-    _memory_saver = torch_memory_saver.memory_saver
+    _memory_saver = torch_memory_saver.torch_memory_saver
     import_error = None
 except ImportError as e:
     import_error = e
