@@ -488,16 +488,35 @@ class HiCacheController:
         while not self.mooncake_l3_stop_event.is_set():
             try:
                 operation = self.mooncake_l3_write_queue.get(block=True, timeout=0.001)
+
                 keys = operation.mooncake_keys
-                mooncake_exist_keys = self.mooncake_l3_kv_pool.is_batch_exist(keys)
-                for i in range(len(keys)):
+                key_len = len(keys)
+                fragment_keys = keys
+                start_index = 0
+
+                if self.l3_fragment_load:
+                    if key_len % self.tp_size == 0:
+                        start_index = key_len // self.tp_size * self.tp_rank
+                        end_index = key_len // self.tp_size * (self.tp_rank + 1)
+                    else:
+                        start_index = (key_len // self.tp_size + 1) * self.tp_rank
+                        end_index = min((key_len // self.tp_size + 1) * (self.tp_rank + 1), key_len)
+
+                    fragment_keys = keys[start_index: end_index]
+
+                mooncake_exist_keys = self.mooncake_l3_kv_pool.is_batch_exist(fragment_keys)
+
+                non_exist_keys = []
+                non_exist_value = []
+                for i in range(len(fragment_keys)):
+                    # Other sglang instances may have already written to it,
+                    # so only the cache that does not exist is written.
                     if not mooncake_exist_keys[keys[i]]:
-                        if self.page_size == 1:
-                            value = self.mem_pool_host.get_flat_data(operation.host_indices[i])
-                        else:
-                            value = self.mem_pool_host.get_flat_data(
-                                operation.host_indices[i * self.page_size: (i + 1) * self.page_size])
-                        self.mooncake_l3_kv_pool.put(keys[i], value)
+                        non_exist_keys.append(fragment_keys[i])
+                        non_exist_value.append(self.mem_pool_host.get_flat_data(
+                            operation.host_indices[
+                            (start_index + i) * self.page_size: (start_index + i + 1) * self.page_size]))
+                self.mooncake_l3_kv_pool.batch_put(non_exist_keys, non_exist_value)
             except Empty:
                 continue
             except Exception as e:
