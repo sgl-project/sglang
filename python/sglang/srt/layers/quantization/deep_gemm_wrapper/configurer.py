@@ -25,7 +25,7 @@ try:
     from deep_gemm import fp8_gemm_nt
 
     # They have not given a name to this breaking change
-    DEEPGEMM_V202506 = ENABLE_JIT_DEEPGEMM
+    DEEPGEMM_V202506 = True
 except ImportError:
     DEEPGEMM_V202506 = False
 
