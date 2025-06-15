@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import vTensor
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.distributed import (
@@ -17,6 +18,8 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
+from sglang.srt.distributed.utils import StatelessProcessGroup
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -51,6 +54,8 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "ModelOptFp4LinearMethod",
     "IPEXAWQLinearMethod",
 ]
+
+vtensor_pynccl = None
 
 
 def adjust_marlin_shard(param, shard_size, shard_offset):
@@ -111,6 +116,7 @@ class LinearMethodBase(QuantizeMethodBase):
         input_size: int,
         output_size: int,
         params_dtype: torch.dtype,
+        vtensor_weight: Optional[torch.Tensor] = None,
         **extra_weight_attrs,
     ):
         """Create weights for a linear layer.
@@ -151,16 +157,24 @@ class UnquantizedLinearMethod(LinearMethodBase):
         input_size: int,
         output_size: int,
         params_dtype: torch.dtype,
+        vtensor_weight: Optional[torch.Tensor] = None,
         **extra_weight_attrs,
     ):
-        weight = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
+        if vtensor_weight is None:
+            weight = Parameter(
+                torch.empty(
+                    sum(output_partition_sizes),
+                    input_size_per_partition,
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
+        else:
+            weight = Parameter(
+                vtensor_weight,
+                requires_grad=False,
+            )
+
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
@@ -1163,6 +1177,8 @@ class RowParallelLinear(LinearBase):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
+        vtensor_enable: bool = False,
+        layer_id: int = -1,
     ):
         super().__init__(
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
@@ -1180,6 +1196,27 @@ class RowParallelLinear(LinearBase):
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
+        self.vtensor = None
+        self.layer_id = layer_id
+        if vtensor_enable and "o_proj" in prefix:
+            assert tp_size == 1, "FlowMLA does not support DP+TP currently"
+            device_index = torch.cuda.current_device()
+            # o_proj sharding should only be applied within a single machine, not across distributed nodes.
+            self.world_size = min(get_tensor_model_parallel_world_size(), 8)
+            # TODO: only support float8_e4m3 weight
+            weight_dtype = (
+                torch.float8_e4m3fn
+                if quant_config is not None
+                and quant_config.is_checkpoint_fp8_serialized
+                else self.params_dtype
+            )
+            self.vtensor = vTensor.tensor(
+                (sum([self.output_size]), self.input_size),
+                weight_dtype,
+                device_index,
+                self.world_size,
+                self.layer_id % 2,
+            )
 
         self.quant_method.create_weights(
             layer=self,
@@ -1188,6 +1225,9 @@ class RowParallelLinear(LinearBase):
             input_size=self.input_size,
             output_size=self.output_size,
             params_dtype=self.params_dtype,
+            vtensor_weight=(
+                self.vtensor.to_torch_tensor() if self.vtensor is not None else None
+            ),
             weight_loader=(
                 self.weight_loader_v2
                 if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
@@ -1211,6 +1251,50 @@ class RowParallelLinear(LinearBase):
             )
         else:
             self.register_parameter("bias", None)
+        global vtensor_pynccl
+        if vtensor_pynccl is None and vtensor_enable:
+            device_index = torch.cuda.current_device()
+            shard_rank = device_index
+            # TODO more robust
+            import socket
+
+            master_ip_address = socket.gethostbyname(socket.gethostname())
+            from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+            master_port = global_server_args_dict["vtensor_port"]
+            self.world_size = min(get_tensor_model_parallel_world_size(), 8)
+            pg = StatelessProcessGroup.create(
+                host=master_ip_address,
+                port=master_port,
+                rank=shard_rank,
+                world_size=self.world_size,
+            )
+            vtensor_pynccl = PyNcclCommunicator(pg, device=torch.cuda.current_device())
+            vtensor_pynccl.disabled = False
+            if quant_config is not None and quant_config.is_checkpoint_fp8_serialized:
+                ncclver_str = vtensor_pynccl.nccl.ncclGetVersion()
+                major, minor, patch = ncclver_str.split(".")
+                assert (int(major) == 2 and int(minor) >= 24) or int(
+                    major
+                ) > 2, f"Enabling vtensor for FP8 weights requires NCCL version 2.24 or higher (current version: {ncclver_str})"
+        # weight tensor
+        self.weight_data = None
+        self.param_shape = None
+        self.input_buffer = None
+        self.event_fwd = None
+        self.event_pre = None
+        # record params.shape and slice in this rank
+        if vtensor_enable and "o_proj" in prefix:
+            self.weight_data = self.vtensor.to_torch_tensor()
+            self.param_shape = self.vtensor.to_torch_tensor().shape
+            device_index = torch.cuda.current_device()
+            self.input_buffer = self.vtensor.split_tensor(
+                (self.weight_data.numel() // self.world_size,),
+                self.weight_data.dtype,
+                device_index,
+            )
+            self.event_fwd = torch.cuda.Event()
+            self.event_pre = torch.cuda.Event()
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         input_dim = getattr(param, "input_dim", None)
@@ -1270,7 +1354,22 @@ class RowParallelLinear(LinearBase):
             # It does not support additional parameters.
             param.load_row_parallel_weight(loaded_weight)
 
+    def prefetch_all_gather(self, prefetch_stream: torch.cuda.Stream):
+        assert self.event_pre is not None
+        assert self.event_fwd is not None
+        assert self.weight_data is not None
+        if self.layer_id > 2:
+            self.event_fwd.wait(stream=prefetch_stream)
+        global vtensor_pynccl
+        vtensor_pynccl.all_gather(
+            self.weight_data, self.input_buffer, stream=prefetch_stream
+        )
+        self.event_pre.record(stream=prefetch_stream)
+
     def forward(self, input_):
+        if self.weight_data is not None:
+            self.event_pre.wait()
+
         if self.input_is_parallel:
             input_parallel = input_
         else:
