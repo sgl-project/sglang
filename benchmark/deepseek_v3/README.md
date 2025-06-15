@@ -143,6 +143,35 @@ docker run --gpus all \
 
 > **Note that the launch command here does not enable Data Parallelism Attention or `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).
 
+### Example: Serving with 32 L40S with resizing fp8 quantization block to 64x64
+
+Using script [resize_deepseek_block.py](https://github.com/sgl-project/sglang/blob/main/scripts/resize_deepseek_block.py) to resize DeepSeek V3/R1 model quantization block size from 128x128 to 64x64 to support `TP32`, which is essential for running on L40S/L20 GPUs.
+
+```bash
+python3 resize_block_size.py deepseek-ai/DeepSeek-R1/
+```
+
+The resized checkpoint will be saved in `deepseek-ai/DeepSeek-R1-Block64x64/`. Assuming that master node IP is `MASTER_IP` and port=5000, we can have following commands to launch the server:
+
+```bash
+#master
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-R1-Block64x64/ --tp 32 \
+	--dist-init-addr MASTER_IP:5000 --nnodes 4 --node-rank 0 --trust-remote \
+	--enable-torch-compile --torch-compile-max-bs 32
+#cluster
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-R1-Block64x64/ --tp 32 \
+	--dist-init-addr MASTER_IP:5000 --nnodes 4 --node-rank 1 --trust-remote \
+	--enable-torch-compile --torch-compile-max-bs 32
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-R1-Block64x64/ --tp 32 \
+	--dist-init-addr MASTER_IP:5000 --nnodes 4 --node-rank 2 --trust-remote \
+	--enable-torch-compile --torch-compile-max-bs 32
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-R1-Block64x64/ --tp 32 \
+	--dist-init-addr MASTER_IP:5000 --nnodes 4 --node-rank 3 --trust-remote \
+	--enable-torch-compile --torch-compile-max-bs 32
+```
+
+If you have 32 L20 GPUs, the usage is similar to the aforementioned L40S. The benchmarking method is the same as describted in the  [16 x A100](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-16-a100a800-with-int8-quantization) example.
+
 ### Example: Serving with four A100\*8 nodes
 
 To serve DeepSeek-V3 with A100 GPUs, we need to convert the [FP8 model checkpoints](https://huggingface.co/deepseek-ai/DeepSeek-V3) to BF16 with [script](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/fp8_cast_bf16.py) mentioned [here](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/fp8_cast_bf16.py) first.
