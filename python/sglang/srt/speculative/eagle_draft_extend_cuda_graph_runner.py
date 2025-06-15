@@ -21,9 +21,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, fast_topk
+from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
+
+if is_cuda():
+    from sgl_kernel import copy_cuda_graph_replay_inputs
 
 
 class EAGLEDraftExtendCudaGraphRunner:
@@ -66,7 +70,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         # Graph inputs
         with torch.device("cuda"):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
+            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
             self.out_cache_loc = torch.ones((self.max_num_token,), dtype=torch.int64)
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
 
@@ -84,7 +88,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                     dtype=self.model_runner.dtype,
                 )
 
-            self.seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
+            self.seq_lens = torch.ones((self.max_bs,), dtype=torch.int64)
             self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             self.accept_length = (
                 torch.ones((self.max_bs,), dtype=torch.int32) * self.num_tokens_per_bs
@@ -212,14 +216,36 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.out_cache_loc.zero_()
 
         # Common inputs
-        self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
-        self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        self.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens)
-        self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
-        self.positions[:num_tokens].copy_(forward_batch.positions)
-        self.hidden_states[:num_tokens].copy_(forward_batch.spec_info.hidden_states)
-        self.accept_length[:raw_bs].copy_(forward_batch.spec_info.accept_length)
-        self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+        # self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
+        # self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        # self.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens)
+        # self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
+        # self.positions[:num_tokens].copy_(forward_batch.positions)
+        # self.hidden_states[:num_tokens].copy_(forward_batch.spec_info.hidden_states)
+        # self.accept_length[:raw_bs].copy_(forward_batch.spec_info.accept_length)
+        # self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+
+        copy_cuda_graph_replay_inputs(
+            self.input_ids,
+            self.seq_lens,
+            self.extend_seq_lens,
+            self.out_cache_loc,
+            self.positions,
+            self.req_pool_indices,
+            self.accept_length,
+            self.hidden_states,
+            forward_batch.input_ids,
+            forward_batch.seq_lens,
+            forward_batch.extend_seq_lens,
+            forward_batch.out_cache_loc,
+            forward_batch.positions,
+            forward_batch.req_pool_indices,
+            forward_batch.spec_info.accept_length,
+            forward_batch.spec_info.hidden_states,
+            num_tokens,
+            raw_bs,
+            self.hidden_states.shape[1],
+        )
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:

@@ -99,3 +99,47 @@ def segment_packbits(
         y,
         torch.cuda.current_stream().cuda_stream,
     )
+
+
+def copy_cuda_graph_replay_inputs(
+    input_ids_dst: torch.Tensor,  # mutable
+    seq_lens_dst: torch.Tensor,  # mutable
+    extend_seq_lens_dst: torch.Tensor,  # mutable
+    out_cache_loc_dst: torch.Tensor,  # mutable
+    positions_dst: torch.Tensor,  # mutable
+    req_pool_indices_dst: torch.Tensor,  # mutable
+    accept_length_dst: torch.Tensor,  # mutable
+    hidden_states_dst: torch.Tensor,  # mutable
+    input_ids_src: torch.Tensor,
+    seq_lens_src: torch.Tensor,
+    extend_seq_lens_src: torch.Tensor,
+    out_cache_loc_src: torch.Tensor,
+    positions_src: torch.Tensor,
+    req_pool_indices_src: torch.Tensor,
+    accept_length_src: torch.Tensor,
+    hidden_states_src: torch.Tensor,
+    num_tokens: int,
+    raw_bs: int,
+    hidden_size: int,
+) -> None:
+    torch.ops.sgl_kernel.copy_cuda_graph_replay_inputs.default(
+        input_ids_dst,
+        seq_lens_dst,
+        extend_seq_lens_dst,
+        out_cache_loc_dst,
+        positions_dst,
+        req_pool_indices_dst,
+        accept_length_dst,
+        hidden_states_dst,
+        input_ids_src,
+        seq_lens_src,
+        extend_seq_lens_src,
+        out_cache_loc_src,
+        positions_src,
+        req_pool_indices_src,
+        accept_length_src,
+        hidden_states_src,
+        num_tokens,
+        raw_bs,
+        hidden_size,
+    )

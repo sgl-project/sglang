@@ -426,7 +426,7 @@ class EagleVerifyInput:
             req.spec_verify_ct += 1
 
         if has_finished:
-            accept_length = (accept_index != -1).sum(dim=1) - 1
+            accept_length = (accept_index != -1).sum(dim=1, dtype=torch.int32) - 1
 
         # Free the KV cache for unaccepted tokens
         accept_index = accept_index[accept_index != -1]

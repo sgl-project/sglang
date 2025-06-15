@@ -361,6 +361,27 @@ void build_tree_kernel_efficient(
 void segment_packbits(
     at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr, at::Tensor y, int64_t cuda_stream);
 
+void copy_cuda_graph_replay_inputs(
+    at::Tensor input_ids_dst,
+    at::Tensor seq_lens_dst,
+    at::Tensor extend_seq_lens_dst,
+    at::Tensor out_cache_loc_dst,
+    at::Tensor positions_dst,
+    at::Tensor req_pool_indices_dst,
+    at::Tensor accept_length_dst,
+    at::Tensor hidden_states_dst,
+    at::Tensor input_ids_src,
+    at::Tensor seq_lens_src,
+    at::Tensor extend_seq_lens_src,
+    at::Tensor out_cache_loc_src,
+    at::Tensor positions_src,
+    at::Tensor req_pool_indices_src,
+    at::Tensor accept_length_src,
+    at::Tensor hidden_states_src,
+    int64_t num_tokens,
+    int64_t raw_bs,
+    int64_t hidden_size);
+
 /*
  * From FlashInfer
  */
