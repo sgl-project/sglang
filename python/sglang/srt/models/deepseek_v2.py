@@ -360,22 +360,23 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             shared_output = self._forward_shared_experts(hidden_states)
-            topk_weights, topk_idx = select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                top_k=self.top_k,
-                use_grouped_topk=True,
-                renormalize=self.renormalize,
-                topk_group=self.topk_group,
-                num_expert_group=self.num_expert_group,
-                num_fused_shared_experts=self.num_fused_shared_experts,
-                correction_bias=self.correction_bias,
-                routed_scaling_factor=self.routed_scaling_factor,
-                num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(self.layer_id):
+                topk_weights, topk_idx = select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    top_k=self.top_k,
+                    use_grouped_topk=True,
+                    renormalize=self.renormalize,
+                    topk_group=self.topk_group,
+                    num_expert_group=self.num_expert_group,
+                    num_fused_shared_experts=self.num_fused_shared_experts,
+                    correction_bias=self.correction_bias,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                    num_token_non_padded=forward_batch.num_token_non_padded,
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    ),
+                )
         else:
             topk_idx = torch.full(
                 (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
@@ -1646,11 +1647,10 @@ class DeepseekV2Model(nn.Module):
             else total_num_layers
         )
         for i in range(normal_num_layers):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual, zero_allocator
-                )
+            layer = self.layers[i]
+            hidden_states, residual = layer(
+                positions, hidden_states, forward_batch, residual, zero_allocator
+            )
 
         if normal_num_layers != total_num_layers:
             hidden_states, residual = model_forward_maybe_tbo(
