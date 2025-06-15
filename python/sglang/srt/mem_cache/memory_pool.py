@@ -182,6 +182,9 @@ class TokenToKVPoolAllocator:
     def available_size(self):
         return len(self.free_slots)
 
+    def debug_print(self) -> str:
+        return ""
+
     def get_kvcache(self):
         return self._kvcache
 
