@@ -61,7 +61,6 @@ class _LayerModeComputationContext:
     layer_id: int
     is_layer_sparse: bool
     is_previous_layer_sparse: Optional[bool]
-    is_nextn: Optional[bool]
 
     def previous_layer(self):
         assert self.is_previous_layer_sparse is not None
@@ -70,7 +69,6 @@ class _LayerModeComputationContext:
             is_layer_sparse=self.is_previous_layer_sparse,
             is_previous_layer_sparse=None,
             num_layers=self.num_layers,
-            is_nextn=self.is_nextn
         )
 
 
@@ -105,7 +103,7 @@ class LayerScatterModes:
         if context.is_layer_sparse:
             return (
                 ScatterMode.SCATTERED
-                if global_server_args_dict["enable_deepep_moe"] and not context.is_nextn
+                if global_server_args_dict["enable_deepep_moe"]
                 else ScatterMode.FULL
             )
         else:
@@ -146,6 +144,7 @@ class LayerCommunicator:
         layer_scatter_modes: LayerScatterModes,
         input_layernorm: torch.nn.Module,
         post_attention_layernorm: torch.nn.Module,
+        is_nextn: bool = False
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -164,6 +163,7 @@ class LayerCommunicator:
                 hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
                 residual_output_mode=self.layer_scatter_modes.middle_residual_mode,
                 context=self._context,
+                is_nextn=is_nextn
             )
         )
         self._communicate_summable_tensor_pair_fn = (
@@ -312,6 +312,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         hidden_states_output_mode: ScatterMode,
         residual_output_mode: ScatterMode,
         context: CommunicateContext,
+        is_nextn: bool = False
     ):
 
         if (
@@ -320,7 +321,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             and context.is_same_group_size(residual_input_mode, residual_output_mode)
             and context.attn_tp_size == 1
-        ):
+        ) or is_nextn:
             return CommunicateWithAllReduceAndLayerNormFn._simple
 
         if (
