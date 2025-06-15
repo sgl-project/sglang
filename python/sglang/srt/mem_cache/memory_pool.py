@@ -61,9 +61,8 @@ class ReqToTokenPool:
         device: str,
         enable_memory_saver: bool,
     ):
-        from sglang.srt.torch_memory_saver_adapter import torch_memory_saver_adapter
 
-        memory_saver_adapter = torch_memory_saver_adapter(enable_memory_saver)
+        memory_saver_adapter = TorchMemorySaverAdapter(enable_memory_saver)
 
         self.size = size
         self.max_context_len = max_context_len
@@ -124,9 +123,7 @@ class KVCache(abc.ABC):
         self.layer_num = layer_num
         self.start_layer = start_layer or 0
         self.end_layer = end_layer or layer_num - 1
-        from sglang.srt.torch_memory_saver_adapter import torch_memory_saver_adapter
-
-        self.memory_saver_adapter = torch_memory_saver_adapter(enable_memory_saver)
+        self.memory_saver_adapter = TorchMemorySaverAdapter(enable_memory_saver)
 
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:

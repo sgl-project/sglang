@@ -694,7 +694,6 @@ def _launch_subprocesses(
                     ),
                 )
 
-                # Preload Torch Memory Saver cpp to make sure all subprocesses can use torch memory saver
                 with tms_configure_subprocess(enable=server_args.enable_memory_saver):
                     proc.start()
                 scheduler_procs.append(proc)

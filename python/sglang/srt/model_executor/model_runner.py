@@ -217,9 +217,8 @@ class ModelRunner:
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
-        from sglang.srt.torch_memory_saver_adapter import torch_memory_saver_adapter
 
-        self.memory_saver_adapter = torch_memory_saver_adapter(
+        self.memory_saver_adapter = TorchMemorySaverAdapter(
             self.server_args.enable_memory_saver
         )
 

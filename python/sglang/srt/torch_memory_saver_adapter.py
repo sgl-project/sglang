@@ -2,12 +2,11 @@ import logging
 import threading
 import time
 from abc import ABC
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 try:
     import torch_memory_saver
 
-    # Use the global singleton instance
     _memory_saver = torch_memory_saver.torch_memory_saver
     import_error = None
 except ImportError as e:
@@ -33,12 +32,6 @@ def configure_subprocess(enable: bool):
 
     with torch_memory_saver.configure_subprocess():
         yield
-
-
-@contextmanager
-def _noop_context():
-    """Noop context manager"""
-    yield
 
 
 class TorchMemorySaverAdapter:
@@ -70,7 +63,7 @@ class TorchMemorySaverAdapter:
         else:
             # Use noop context manager when disabled
             logger.debug(f"memory saver disabled, using noop context for tag: {tag}")
-            return _noop_context()
+            return nullcontext()
 
     def pause(self, tag: str):
         """Pause memory for specific tag"""
@@ -88,31 +81,9 @@ class TorchMemorySaverAdapter:
         else:
             logger.debug(f"memory saver disabled, noop resume for tag: {tag}")
 
-    def pause_weights(self):
-        """Convenience method to pause weights memory"""
-        self.pause("weights")
-
-    def resume_weights(self):
-        """Convenience method to resume weights memory"""
-        self.resume("weights")
-
-    def pause_kv_cache(self):
-        """Convenience method to pause kv_cache memory"""
-        self.pause("kv_cache")
-
-    def resume_kv_cache(self):
-        """Convenience method to resume kv_cache memory"""
-        self.resume("kv_cache")
-
     @property
     def enabled(self):
         """Check if memory saver is enabled (both user setting and library availability)"""
         return (
             self._user_enabled and _memory_saver is not None and _memory_saver.enabled
         )
-
-
-# Factory function for backward compatibility
-def torch_memory_saver_adapter(enabled: bool = True):
-    """Create a TorchMemorySaverAdapter instance with specified enabled state"""
-    return TorchMemorySaverAdapter(enabled=enabled)

@@ -420,11 +420,7 @@ class Scheduler(
         t = threading.Thread(target=self.watchdog_thread, daemon=True)
         t.start()
         self.parent_process = psutil.Process().parent()
-
-        # Init memory saver
-        from sglang.srt.torch_memory_saver_adapter import torch_memory_saver_adapter
-
-        self.memory_saver_adapter = torch_memory_saver_adapter(
+        self.memory_saver_adapter = TorchMemorySaverAdapter(
             server_args.enable_memory_saver
         )
 
@@ -1169,7 +1165,7 @@ class Scheduler(
         else:
             f += f"#queue-req: {len(self.waiting_queue)}"
 
-        # logger.info(f)
+        logger.info(f)
 
         if self.enable_metrics:
             cache_hit_rate = adder.log_hit_tokens / (
@@ -1236,7 +1232,7 @@ class Scheduler(
             f"#queue-req: {len(self.waiting_queue)}"
         )
 
-        # logger.info(msg)
+        logger.info(msg)
         if self.enable_metrics:
             self.stats.num_running_reqs = num_running_reqs
             self.stats.num_used_tokens = num_used
@@ -2127,7 +2123,6 @@ class Scheduler(
         import subprocess
 
         if tags is None:
-            # for backward compatibility, default to release both weights and kv cache
             tags = ["weights", "kv_cache"]
 
         # LIFO order: pause kv_cache first, then weights
@@ -2161,7 +2156,6 @@ class Scheduler(
             torch.cuda.synchronize()
             time.sleep(3)
 
-        torch.distributed.barrier(self.tp_cpu_group)
         return ResumeMemoryOccupationReqOutput()
 
     def slow_down(self, recv_req: SlowDownReqInput):
