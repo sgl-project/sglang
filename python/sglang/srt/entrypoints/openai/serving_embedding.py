@@ -45,10 +45,7 @@ detailed error messages for invalid inputs. Multimodal embeddings use
 padding for missing text content when needed.
 """
 
-import logging
 from typing import Any, Dict, List, Optional, Union
-
-from fastapi.responses import StreamingResponse
 
 from sglang.srt.conversation import generate_embedding_convs
 from sglang.srt.entrypoints.openai.protocol import (
@@ -222,16 +219,6 @@ class EmbeddingHandler(OpenAIServingBase):
         return adapted_request, (
             all_requests[0] if len(all_requests) == 1 else all_requests
         )
-
-    async def _handle_streaming_request(
-        self,
-        adapted_request: EmbeddingReqInput,
-        request: EmbeddingRequest,
-        ctx: RequestContext,
-    ) -> StreamingResponse:
-        """Handle streaming embedding request (not supported)"""
-        # Embeddings don't support streaming
-        raise NotImplementedError("Embedding requests do not support streaming")
 
     async def _handle_non_streaming_request(
         self,

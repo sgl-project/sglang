@@ -160,27 +160,38 @@ class OpenAIServingBase(ABC):
         """Convert OpenAI request to internal format"""
         pass
 
-    @abstractmethod
     async def _handle_streaming_request(
         self,
         adapted_request: GenerateReqInput,
         request: OpenAIServingRequest,
         ctx: RequestContext,
     ) -> StreamingResponse:
-        """Handle streaming request"""
-        pass
+        """Handle streaming request
 
-    @abstractmethod
+        Override this method in child classes that support streaming requests.
+        """
+        return create_error_response(
+            message=f"{self.__class__.__name__} does not support streaming requests",
+            err_type="NotImplementedError",
+            status_code=501,
+        )
+
     async def _handle_non_streaming_request(
         self,
         adapted_request: GenerateReqInput,
         request: OpenAIServingRequest,
         ctx: RequestContext,
     ) -> Union[Any, ErrorResponse]:
-        """Handle non-streaming request"""
-        pass
+        """Handle non-streaming request
 
-    @abstractmethod
+        Override this method in child classes that support non-streaming requests.
+        """
+        return create_error_response(
+            message=f"{self.__class__.__name__} does not support non-streaming requests",
+            err_type="NotImplementedError",
+            status_code=501,
+        )
+
     def _validate_request(self, request: OpenAIServingRequest) -> Optional[str]:
         """Validate request"""
         pass
