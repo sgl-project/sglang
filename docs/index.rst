@@ -47,6 +47,7 @@ The core features include:
    supported_models/embedding_models.md
    supported_models/reward_models.md
    supported_models/support_new_models.md
+   supported_models/transformers_fallback.md
 
 .. toctree::
    :maxdepth: 1

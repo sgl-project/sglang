@@ -10,6 +10,10 @@ docker exec ci_sglang pip install -e "python[dev_hip]"
 docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
 docker exec -w /human-eval ci_sglang pip install -e .
 
+# For lmms_evals evaluating MMMU
+docker exec -w / ci_sglang git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+docker exec -w /lmms-eval ci_sglang pip install -e .
+
 docker exec -w / ci_sglang mkdir -p /dummy-grok
 mkdir -p dummy-grok && wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json -O dummy-grok/config.json
 docker cp ./dummy-grok ci_sglang:/

@@ -16,6 +16,7 @@
 from typing import Any, Dict, List, Optional, Union
 
 _SAMPLING_EPS = 1e-6
+TOP_K_ALL = 1 << 30
 
 
 class SamplingParams:
@@ -84,7 +85,7 @@ class SamplingParams:
             self.temperature = 1.0
             self.top_k = 1
         if self.top_k == -1:
-            self.top_k = 1 << 30  # whole vocabulary
+            self.top_k = TOP_K_ALL  # whole vocabulary
 
     def verify(self):
         if self.temperature < 0.0:
