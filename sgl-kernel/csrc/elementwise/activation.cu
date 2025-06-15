@@ -136,6 +136,7 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
   });
 }
 
+#if USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input) {
   int d = input.size(-1);
   int64_t num_tokens = input.numel() / input.size(-1);
@@ -153,3 +154,4 @@ void gelu_quick(at::Tensor& out, const at::Tensor& input) {
     return true;
   });
 }
+#endif
