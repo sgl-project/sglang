@@ -59,6 +59,9 @@ class TreeNode:
         # store the host indices of KV cache
         self.host_value = None
 
+        # L3 cache keys
+        self.l3_keys = []
+
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
@@ -68,7 +71,15 @@ class TreeNode:
 
     @property
     def backuped(self):
+        return self.host_value is not None or len(self.l3_keys) > 0
+
+    @property
+    def l2_backuped(self):
         return self.host_value is not None
+
+    @property
+    def l3_backuped(self):
+        return len(self.l3_keys) > 0
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
