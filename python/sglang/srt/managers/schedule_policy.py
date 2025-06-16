@@ -27,14 +27,6 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
-# Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
-# This can prevent the server from being too conservative.
-# Note that this only clips the estimation in the scheduler but does not change the stop
-# condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
-CLIP_MAX_NEW_TOKENS_ESTIMATION = int(
-    os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
-)
-
 # Threshold for in-batch prefix cache.
 # If a request has a matched prefix length (against existing cache) less than this value,
 # the scheduler runs the in-batch prefix caching check for this request.
@@ -134,7 +126,8 @@ class SchedulePolicy:
         """
         try:
             policy_enum = CacheAwarePolicy(policy)
-            if tree_cache.disable:
+            # TODO(dark): fix this buggy `getattr` logic
+            if getattr(tree_cache, "disable", True):
                 # If tree_cache is disabled, using CacheAgnosticPolicy policy
                 return CacheAgnosticPolicy.FCFS
             return policy_enum
@@ -293,14 +286,8 @@ class PrefillAdder:
 
         if running_batch is not None:
             self.rem_total_token_offset += sum(
-                [
-                    min(
-                        (r.sampling_params.max_new_tokens - len(r.output_ids)),
-                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
-                    )
-                    * self.new_token_ratio
-                    for r in running_batch.reqs
-                ]
+                r.estimated_max_new_tokens(ratio=self.new_token_ratio)
+                for r in running_batch.reqs
             )
 
     @property
@@ -343,6 +330,7 @@ class PrefillAdder:
         self.log_input_tokens += extend_input_len
 
     def add_chunked_req(self, req: Req):
+        assert self.rem_chunk_tokens is not None, "Chunked prefill is disabled"
         truncated = req.extend_input_len > self.rem_chunk_tokens
         req.extend_input_len = min(req.extend_input_len, self.rem_chunk_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
@@ -350,11 +338,7 @@ class PrefillAdder:
         self._prefill_one_req(
             0,  # do not add chunked prefix length to hit tokens
             req.extend_input_len,
-            (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
-                if not truncated
-                else 0
-            ),
+            (req.estimated_max_new_tokens() if not truncated else 0),
         )
 
         # Return if chunked prefill not finished
@@ -420,9 +404,7 @@ class PrefillAdder:
             # Non-chunked prefill
             self.can_run_list.append(req)
             self._prefill_one_req(
-                0,
-                req.extend_input_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION),
+                0, req.extend_input_len, req.estimated_max_new_tokens()
             )
         else:
             if self.rem_chunk_tokens == 0:
@@ -452,9 +434,8 @@ class PrefillAdder:
         )
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
 
-        total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
-        )
+        estimated_max_new_tokens = req.estimated_max_new_tokens()
+        total_tokens = req.extend_input_len + estimated_max_new_tokens
 
         # if None, we assume no host indices
         host_indices_length = host_indices_length or 0
@@ -515,10 +496,7 @@ class PrefillAdder:
                 self._prefill_one_req(
                     prefix_len,
                     input_tokens,
-                    min(
-                        req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
-                    ),
+                    estimated_max_new_tokens,
                 )
             else:
                 # Make sure at least one page is available

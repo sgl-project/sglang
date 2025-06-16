@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -69,6 +71,14 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
+
+# Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
+# This can prevent the server from being too conservative.
+# Note that this only clips the estimation in the scheduler but does not change the stop
+# condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
+CLIP_MAX_NEW_TOKENS_ESTIMATION = int(
+    os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
+)
 
 # Put some global args for easy access
 global_server_args_dict = {
@@ -612,6 +622,22 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
+
+    def estimated_max_new_tokens(self, ratio: float = 1.0) -> int:
+        """Estimate the maximum number of new tokens that can be generated."""
+        # TODO(dark): may be this should be page aligned estimated.
+        param = self.sampling_params
+        return (
+            param.max_new_tokens - len(self.output_ids)
+            if param.ignore_eos
+            else int(
+                min(
+                    param.max_new_tokens - len(self.output_ids),
+                    CLIP_MAX_NEW_TOKENS_ESTIMATION,
+                )
+                * ratio  # this ratio only applies to the estimation
+            )
+        )
 
     @property
     def seqlen(self):
