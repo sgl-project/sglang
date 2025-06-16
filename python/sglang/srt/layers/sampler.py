@@ -82,7 +82,7 @@ class Sampler(nn.Module):
                         logits[:] = torch.softmax(logits, dim=-1)
                         probs = logits
                         del logits
-                        
+
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                         probs = top_p_renorm_prob(probs, sampling_info.top_ps)
                         batch_next_token_ids = min_p_sampling_from_probs(
@@ -104,15 +104,13 @@ class Sampler(nn.Module):
                     logits[:] = torch.softmax(logits, dim=-1)
                     probs = logits
                     del logits
-                    
-                    batch_next_token_ids = (
-                        top_k_top_p_min_p_sampling_from_probs_torch(
-                            probs,
-                            sampling_info.top_ks,
-                            sampling_info.top_ps,
-                            sampling_info.min_ps,
-                            sampling_info.need_min_p_sampling,
-                        )
+
+                    batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+                        probs,
+                        sampling_info.top_ks,
+                        sampling_info.top_ps,
+                        sampling_info.min_ps,
+                        sampling_info.need_min_p_sampling,
                     )
                 else:
                     raise ValueError(
@@ -125,14 +123,10 @@ class Sampler(nn.Module):
                     and not sampling_info.need_min_p_sampling
                 ):
                     probs = torch.softmax(logits, dim=-1)
-                    logprobs = torch.log(probs).clamp(
-                        min=torch.finfo(probs.dtype).min
-                    )
+                    logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
                 else:
                     # clamp to avoid -inf
-                    logprobs = torch.log(probs).clamp(
-                        min=torch.finfo(probs.dtype).min
-                    )
+                    logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
@@ -293,20 +287,16 @@ def top_k_top_p_sampling_from_logits_flashinfer(
     temperatures: torch.Tensor,
 ) -> torch.Tensor:
     """Use flashinfer's top_k_top_p_sampling_from_logits for faster sampling.
-    
+
     This function implements the optimized path:
     logits -> top_k_mask_logits -> softmax -> top_p_sampling_from_probs
     instead of:
     logits -> softmax -> top_k_renorm_probs -> top_p_sampling_from_probs
     """
     import flashinfer.sampling
-    
+
     batch_next_token_ids = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-        logits,
-        top_ks,
-        top_ps,
-        filter_apply_order="joint",
-        deterministic=True
+        logits, top_ks, top_ps, filter_apply_order="joint", deterministic=True
     )
-    
+
     return batch_next_token_ids
