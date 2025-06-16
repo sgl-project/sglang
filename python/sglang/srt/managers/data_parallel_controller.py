@@ -288,6 +288,17 @@ class DataParallelController:
                         worker.send_pyobj(recv_req)
 
 
+def propagation_quit_signal(parent_process):
+    def sigquit_handler(signum, frame):
+        logger.error(
+            "Received sigquit from a child process. It usually means the child failed. "
+            "This sigquit will be passed to the parent process."
+        )
+        parent_process.send_signal(signal.SIGQUIT)
+
+    signal.signal(signal.SIGQUIT, sigquit_handler)
+
+
 def run_data_parallel_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -296,6 +307,7 @@ def run_data_parallel_controller_process(
     setproctitle.setproctitle("sglang::data_parallel_controller")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
+    propagation_quit_signal(parent_process)
 
     try:
         controller = DataParallelController(server_args, port_args)
