@@ -306,13 +306,10 @@ class EAGLEWorker(TpModelWorker):
                 self.verify(batch, spec_info)
             )
 
-            need_forward, can_run_draft_extend_cuda_graph = (
-                self.check_forward_draft_extend_after_decode(batch)
-            )
-            if need_forward:
+            if self.check_forward_draft_extend_after_decode(batch):
                 with self.draft_tp_context(self.draft_model_runner.tp_group):
                     self.forward_draft_extend_after_decode(
-                        batch, can_run_draft_extend_cuda_graph
+                        batch,
                     )
             return (
                 logits_output,
@@ -351,10 +348,7 @@ class EAGLEWorker(TpModelWorker):
         )
         global_need_forward_cnt = global_need_forward[0].item()
         need_forward = global_need_forward_cnt > 0
-        can_run_draft_extend_cuda_graph = (
-            global_need_forward_cnt == get_tensor_model_parallel_world_size()
-        )
-        return need_forward, can_run_draft_extend_cuda_graph
+        return need_forward
 
     def forward_target_extend(
         self, batch: ScheduleBatch
@@ -781,9 +775,7 @@ class EAGLEWorker(TpModelWorker):
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
-    def forward_draft_extend_after_decode(
-        self, batch: ScheduleBatch, can_run_draft_extend_cuda_graph: bool
-    ):
+    def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
         req_pool_indices_backup = batch.req_pool_indices
@@ -822,8 +814,7 @@ class EAGLEWorker(TpModelWorker):
 
         # Run
         can_cuda_graph = (
-            can_run_draft_extend_cuda_graph
-            and self.cuda_graph_runner_for_draft_extend
+            self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
         if can_cuda_graph:
