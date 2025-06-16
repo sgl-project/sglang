@@ -1,13 +1,12 @@
 import itertools
 import os
 import unittest
+from typing import List, Tuple
 
-from typing import Tuple, List
 import torch
+from deep_gemm import fp8_gemm_nt
 
 from sglang.test.test_utils import CustomTestCase
-
-from deep_gemm import fp8_gemm_nt
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
 
@@ -26,20 +25,24 @@ def per_token_group_quant_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
     m, n = x.shape
     x_view = x.view(m, -1, 128)
     x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
-    sf = (x_amax / 448.0)
+    sf = x_amax / 448.0
     return (x_view * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn).view(m, n), sf
 
 
 def per_block_quant_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
-    x_padded = torch.zeros((align(m, 128), align(n, 128)), dtype=x.dtype, device=x.device)
+    x_padded = torch.zeros(
+        (align(m, 128), align(n, 128)), dtype=x.dtype, device=x.device
+    )
     x_padded[:m, :n] = x
     x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
     x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
-    sf = (x_amax / 448.0)
+    sf = x_amax / 448.0
     x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
-    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(x_view.size(0), x_view.size(2))
+    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(
+        x_view.size(0), x_view.size(2)
+    )
 
 
 def ceil_to_ue8m0(x: torch.Tensor):
@@ -59,13 +62,17 @@ def per_token_group_quant_mxfp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Te
 def per_block_quant_mxfp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
-    x_padded = torch.zeros((align(m, 128), align(n, 128)), dtype=x.dtype, device=x.device)
+    x_padded = torch.zeros(
+        (align(m, 128), align(n, 128)), dtype=x.dtype, device=x.device
+    )
     x_padded[:m, :n] = x
     x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
     x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
     sf = ceil_to_ue8m0(x_amax / 448.0)
     x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
-    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(x_view.size(0), x_view.size(2))
+    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(
+        x_view.size(0), x_view.size(2)
+    )
 
 
 # For test
@@ -239,6 +246,7 @@ class TestDeepGemmBlackwell(CustomTestCase):
                 seed=params[4],
             ):
                 self._test_deep_gemm_blackwell(*params)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
