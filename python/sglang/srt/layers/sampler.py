@@ -78,7 +78,6 @@ class Sampler(nn.Module):
             if True:  # Keep this redundant check to simplify some internal code sync
                 if global_server_args_dict["sampling_backend"] == "flashinfer":
                     if sampling_info.need_min_p_sampling:
-                        # For min_p sampling, we still need to use the old path
                         logits.div_(sampling_info.temperatures)
                         logits[:] = torch.softmax(logits, dim=-1)
                         probs = logits
@@ -121,7 +120,6 @@ class Sampler(nn.Module):
                     )
 
             if return_logprob:
-                # For optimized path, we need to compute logprobs separately
                 if (
                     global_server_args_dict["sampling_backend"] == "flashinfer"
                     and not sampling_info.need_min_p_sampling

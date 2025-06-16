@@ -119,14 +119,12 @@ async def async_request_trt_llm(
     assert api_url.endswith("generate_stream")
 
     async with _create_bench_client_session() as session:
-        # Build sampling parameters
         extra_body = request_func_input.extra_request_body
         sampling_params = {
             "temperature": extra_body.get("temperature", 0.000001),
             "top_p": extra_body.get("top_p", 1.0),
         }
         
-        # Add top_k if specified
         if "top_k" in extra_body:
             sampling_params["top_k"] = extra_body["top_k"]
 
@@ -202,16 +200,13 @@ async def async_request_openai_completions(
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
-        # Build sampling parameters
         sampling_params = {
             "temperature": getattr(args, 'temperature', 0.0),
         }
         
-        # Add top_p if specified
         if hasattr(args, 'top_p') and args.top_p is not None:
             sampling_params["top_p"] = args.top_p
-            
-        # Add top_k if specified  
+        
         if hasattr(args, 'top_k') and args.top_k is not None:
             sampling_params["top_k"] = args.top_k
 
@@ -297,17 +292,14 @@ async def async_request_truss(
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
-        # Build sampling parameters
         extra_body = request_func_input.extra_request_body
         sampling_params = {
             "temperature": extra_body.get("temperature", 0.0),
         }
         
-        # Add top_p if specified
         if "top_p" in extra_body:
             sampling_params["top_p"] = extra_body["top_p"]
             
-        # Add top_k if specified  
         if "top_k" in extra_body:
             sampling_params["top_k"] = extra_body["top_k"]
 
@@ -388,18 +380,15 @@ async def async_request_sglang_generate(
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
-        # Build sampling parameters
         sampling_params = {
             "temperature": request_func_input.extra_request_body.get("temperature", 0.0),
             "max_new_tokens": request_func_input.output_len,
             "ignore_eos": not args.disable_ignore_eos,
         }
         
-        # Add top_p if specified
         if "top_p" in request_func_input.extra_request_body:
             sampling_params["top_p"] = request_func_input.extra_request_body["top_p"]
             
-        # Add top_k if specified
         if "top_k" in request_func_input.extra_request_body:
             sampling_params["top_k"] = request_func_input.extra_request_body["top_k"]
 
@@ -1556,7 +1545,6 @@ def run_benchmark(args_: argparse.Namespace):
     if args.extra_request_body:
         extra_request_body = json.loads(args.extra_request_body)
     
-    # Add sampling parameters to extra_request_body if they are specified
     sampling_params = {}
     if hasattr(args, 'temperature') and args.temperature is not None:
         sampling_params["temperature"] = args.temperature
@@ -1565,7 +1553,6 @@ def run_benchmark(args_: argparse.Namespace):
     if hasattr(args, 'top_k') and args.top_k is not None:
         sampling_params["top_k"] = args.top_k
     
-    # Merge sampling params into extra_request_body (extra_request_body takes precedence)
     if sampling_params:
         for key, value in sampling_params.items():
             if key not in extra_request_body:
