@@ -67,6 +67,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+    V1RerankReqInput,
     VertexGenerateReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -79,6 +80,7 @@ from sglang.srt.openai_api.adapter import (
     v1_delete_file,
     v1_embeddings,
     v1_files_create,
+    v1_rerank,
     v1_retrieve_batch,
     v1_retrieve_file,
     v1_retrieve_file_content,
@@ -323,6 +325,15 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
+        return ret
+    except ValueError as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/v1/rerank", methods=["POST", "PUT"])
+async def v1_rerank_request(obj: V1RerankReqInput, raw_request: Request):
+    try:
+        ret = await v1_rerank(_global_state.tokenizer_manager, obj, raw_request)
         return ret
     except ValueError as e:
         return _create_error_response(e)
