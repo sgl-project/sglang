@@ -33,7 +33,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
@@ -241,11 +240,7 @@ class EPMoE(torch.nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        if (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and _ENABLE_JIT_DEEPGEMM
-            and self.use_fp8_w8a8
-        ):
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
             return self.forward_deepgemm(hidden_states, router_logits)
         else:
             return self.forward_normal(hidden_states, router_logits)
