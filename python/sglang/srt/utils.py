@@ -2340,3 +2340,28 @@ class LazyValue:
             self._value = self._creator()
             self._creator = None
         return self._value
+
+
+class AiterTopKRoutingBuffers:
+    MAX_NUM_TOKENS: int = 4096 * 128
+
+    def __init__(self, top_k: int, n_routed_experts: int, n_shared_experts: int):
+        self.non_shared_topk_ids = torch.empty(
+            (AiterTopKRoutingBuffers.MAX_NUM_TOKENS, top_k),
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        self.non_shared_topk_weights = torch.empty(
+            (AiterTopKRoutingBuffers.MAX_NUM_TOKENS, top_k),
+            dtype=torch.float32,
+            device="cuda",
+        )
+
+    def register_in_layer(self, layer: nn.Module):
+        layer.register_buffer(
+            "non_shared_topk_ids", self.non_shared_topk_ids, persistent=False
+        )
+        layer.register_buffer(
+            "non_shared_topk_weights", self.non_shared_topk_weights, persistent=False
+        )

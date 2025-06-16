@@ -81,8 +81,9 @@ _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT")
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_hip:
-    from aiter import ActivationType, QuantType
+    from aiter import ActivationType, QuantType, biased_grouped_topk
     from aiter.fused_moe_bf16_asm import asm_moe, ck_moe_2stages
+    from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
 if not _is_cuda:
@@ -950,19 +951,40 @@ class Fp8MoEMethod:
         from sglang.srt.layers.moe.topk import select_experts
 
         # Expert selection
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
+        if (
+            _use_aiter
+            and correction_bias is not None
+            and hasattr(layer, "non_shared_topk_weights")
+            and hasattr(layer, "non_shared_topk_ids")
+        ):
+            token = x.shape[0]
+            biased_grouped_topk(
+                router_logits,
+                correction_bias,
+                layer.non_shared_topk_weights[:token],
+                layer.non_shared_topk_ids[:token],
+                num_expert_group,
+                topk_group,
+                renormalize,
+            )
+
+            topk_ids = layer.non_shared_topk_ids[:token]
+            topk_weights = layer.non_shared_topk_weights[:token]
+
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                num_fused_shared_experts=num_fused_shared_experts,
+                custom_routing_function=custom_routing_function,
+                correction_bias=correction_bias,
+                routed_scaling_factor=routed_scaling_factor,
+            )
 
         if _is_hip:
             ret = self.maybe_apply_hip_fused_experts(
@@ -1062,19 +1084,35 @@ class Fp8MoEMethod:
         if _use_aiter:
             assert not no_combine, f"{no_combine=} is not supported."
             if self.block_quant:
-                # TODO(_use_aiter): FP8 block_quant only supports 'silu' for the time-being.
-                assert (
-                    activation == "silu"
-                ), f"_use_aiter: FP8 bloack_quant {activation=} will be supported later, unset _use_aiter"
-                return asm_moe(
+                ## TODO(_use_aiter): FP8 block_quant only supports 'silu' for the time-being.
+                # assert (
+                #    activation == "silu"
+                # ), f"_use_aiter: FP8 bloack_quant {activation=} will be supported later, unset _use_aiter"
+                # return asm_moe(
+                #    x,
+                #    layer.w13_weight,
+                #    layer.w2_weight,
+                #    topk_weights,
+                #    topk_ids,
+                #    layer.w13_weight_scale_inv,
+                #    layer.w2_weight_scale_inv,
+                #    block_shape=tuple(self.quant_config.weight_block_size),
+                #    expert_mask=None,
+                # )
+                return fused_moe(
                     x,
                     layer.w13_weight,
                     layer.w2_weight,
                     topk_weights,
                     topk_ids,
-                    layer.w13_weight_scale_inv,
-                    layer.w2_weight_scale_inv,
-                    block_shape=tuple(self.quant_config.weight_block_size),
+                    w1_scale=layer.w13_weight_scale_inv,
+                    w2_scale=layer.w2_weight_scale_inv,
+                    quant_type=QuantType.per_128x128,
+                    activation=(
+                        ActivationType.Silu
+                        if activation == "silu"
+                        else ActivationType.Gelu
+                    ),
                     expert_mask=None,
                 )
             else:
