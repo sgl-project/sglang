@@ -23,7 +23,7 @@ from typing import List, Optional, Union
 import torch
 
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache, MLATokenToKVPoolHost
 from sglang.srt.mem_cache.mooncake_store import MooncakeStore
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
@@ -578,17 +578,16 @@ class HiCacheController:
 
                 # last rank need to pad
                 if (self.l3_fragment_load and
-                    self.tp_rank == self.tp_size - 1):
+                    self.tp_rank == self.tp_size - 1
+                    and key_len % self.tp_size != 0):
                     last_fragment_key_len = len(fragment_keys)
-                    fragment_key_len = key_len // self.tp_size
-                    if last_fragment_key_len != fragment_key_len:
-                        token_tensor_shape = self.mooncake_l3_kv_pool.page_tensor_shape
-                        fragment_keys_pad_size = key_len // self.tp_size + 1
-                        token_tensor_shape_pad = torch.Size([token_tensor_shape[0], fragment_keys_pad_size
-                                                             * self.page_size, token_tensor_shape[2], token_tensor_shape[3]])
-                        batch_data_pad = torch.zeros(token_tensor_shape_pad, dtype=batch_data.dtype)
-                        batch_data_pad[:, :last_fragment_key_len * self.page_size] = batch_data
-                        batch_data = batch_data_pad
+                    fragment_keys_pad_size = key_len // self.tp_size + 1
+                    token_tensor_shape = self.mooncake_l3_kv_pool.page_tensor_shape
+                    token_tensor_shape_pad = torch.Size([token_tensor_shape[0], fragment_keys_pad_size
+                                                         * self.page_size, token_tensor_shape[2], token_tensor_shape[3]])
+                    batch_data_pad = torch.zeros(token_tensor_shape_pad, dtype=batch_data.dtype)
+                    batch_data_pad[:, :last_fragment_key_len * self.page_size] = batch_data
+                    batch_data = batch_data_pad
 
                 batch_data = self._fragment_cache_all_gather(batch_data, key_len * self.page_size)
                 self.l3_cache_pool[operation.node_ids[0]] = (batch_data, key_len * self.page_size)
