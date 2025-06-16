@@ -549,7 +549,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             )
                             yield f"data: {chunk.model_dump_json()}\n\n"
 
-                        if not delta or len(delta) == 0:
+                        if not delta:
                             stream_buffers[index] = new_stream_buffer
                             is_firsts[index] = is_first
                             n_prev_tokens[index] = n_prev_token
