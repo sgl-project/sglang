@@ -3,6 +3,7 @@
 #include <c10/core/ScalarType.h>
 
 #include <cstddef>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -132,10 +133,28 @@ void RadixTree::Impl::debug_print(std::ostream& os) const {
     _check(false, "Not all nodes are visited " + id_list);
   }
 
+  static const auto kSGLANG_RADIX_CPP_DEBUG_LIMIT = [] {
+    const char* env = std::getenv("SGLANG_RADIX_CPP_DEBUG_LIMIT");
+    const std::size_t default_limit = 16;
+    if (env != nullptr) {
+      try {
+        return static_cast<std::size_t>(std::stoull(env));
+      } catch (const std::exception& e) {
+        std::cerr << "Invalid SGLANG_RADIX_CPP_DEBUG_LIMIT value: " << env  //
+                  << ". Using default value =" << default_limit << std::endl;
+      }
+    }
+    return default_limit;
+  }();
+
   for (const auto nid : visited_id) {
     const auto node = m_node_map.at(nid);
     // print key and indices
     const auto& key = node->_unsafe_tokens();
+    if (key.size() > kSGLANG_RADIX_CPP_DEBUG_LIMIT) {
+      os << "Node " << nid << ": key is too long (" << key.size() << " tokens), skipping..." << std::endl;
+      continue;
+    }
     os << "Node " << nid << ": key = [";
     for (const auto& i : c10::irange(key.size())) {
       os << key[i];

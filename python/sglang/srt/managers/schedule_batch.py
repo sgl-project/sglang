@@ -928,6 +928,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
         return req_pool_indices
 
+    def _raise_and_terminate(self, error_msg: str):
+        """Raise an error. This function will not return."""
+        logger.error(error_msg)
+        if self.tree_cache is not None:
+            try:
+                logger.error("Current tree cache status:")
+                self.tree_cache.pretty_print()
+            except Exception as e:
+                logger.error(f"Failed to pretty print tree cache: {e}")
+        raise RuntimeError(error_msg)
+
     def alloc_token_slots(self, num_tokens: int, backup_state: bool = False):
         if self.token_to_kv_pool_allocator.available_size() < num_tokens:
             if self.tree_cache is not None:
@@ -944,10 +955,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 f"Try to allocate {num_tokens} tokens.\n"
                 f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
             )
-            logger.error(error_msg)
-            if self.tree_cache is not None:
-                self.tree_cache.pretty_print()
-            raise RuntimeError(error_msg)
+            self._raise_and_terminate(error_msg)
 
         if backup_state:
             return out_cache_loc, state
@@ -987,8 +995,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
+            self._raise_and_terminate(error_msg)
 
         if backup_state:
             return out_cache_loc, state
@@ -1022,8 +1029,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 f"{self.token_to_kv_pool_allocator.available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
+            self._raise_and_terminate(error_msg)
 
         if backup_state:
             return out_cache_loc, state

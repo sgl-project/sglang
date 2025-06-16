@@ -108,8 +108,9 @@ class BasePrefixCache(ABC):
     def total_size(self):
         raise NotImplementedError()
 
+    @abstractmethod
     def pretty_print(self):
-        raise NotImplementedError()
+        pass
 
     def take_events(self):
         return []
