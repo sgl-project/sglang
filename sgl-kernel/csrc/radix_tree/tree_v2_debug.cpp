@@ -89,6 +89,7 @@ void RadixTree::Impl::debug_print(std::ostream& os) const {
   std::string indent_buffer;
   depth_map[root] = 0;
   std::vector<NodeHandle> visited_id;
+  std::size_t evictable_size_real = 0;
   while (!stack.empty()) {
     const auto [node, parent, key] = stack.back();
     stack.pop_back();
@@ -102,6 +103,14 @@ void RadixTree::Impl::debug_print(std::ostream& os) const {
     _check(m_node_map.count(nid) == 1, "Node is not in the map", nid);
     _check(m_node_map.at(nid) == node, "Node in the map is not the same as the one in the stack", nid);
     _check(!node->on_gpu() || parent->is_root() || parent->on_gpu(), "Node on GPU must have a GPU/root parent", nid);
+    if (!node->is_io_free()) {
+      _check(node->ref_count > 0, "Node is in IO state but not protected", nid);
+      _check(node->on_both(), "Node in IO state must be on both CPU and GPU", nid);
+    }
+
+    if (node->on_gpu() && node->ref_count == 0) {
+      evictable_size_real += node->length();
+    }
 
     const auto depth = (depth_map[node] = depth_map[parent] + 1);
     indent_buffer.resize(depth * 2, ' ');
@@ -113,6 +122,7 @@ void RadixTree::Impl::debug_print(std::ostream& os) const {
     }
   }
 
+  _check(evictable_size_real == evictable_size(), "Evictable size is wrong");
   _check(m_node_map.count(root->node_id) == 1, "Root node is not in the map");
   _check(m_node_map.at(root->node_id) == root, "Root node in the map is not correct");
 
