@@ -111,9 +111,13 @@ void cutlass_mla_decode(
     torch::Tensor const& seq_lens,
     torch::Tensor const& page_table,
     torch::Tensor const& workspace,
-    int64_t num_kv_splits = -1);
+    double sm_scale,
+    int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
 int64_t cutlass_mla_get_workspace_size(
-    int64_t max_seq_len, int64_t num_batches, int64_t sm_count = 0, int64_t num_kv_splits = -1);
+    int64_t max_seq_len,
+    int64_t num_batches,
+    int64_t sm_count = 0,
+    int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
 /*
  * From csrc/elementwise
  */
@@ -327,6 +331,7 @@ void tree_speculative_sampling_target_only(
     at::Tensor retrive_next_token,
     at::Tensor retrive_next_sibling,
     at::Tensor uniform_samples,
+    at::Tensor uniform_samples_for_final_sampling,
     at::Tensor target_probs,
     at::Tensor draft_probs,
     double threshold_single = 1,
@@ -359,7 +364,12 @@ void build_tree_kernel_efficient(
     int64_t draft_token_num);
 
 void segment_packbits(
-    at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr, at::Tensor y, int64_t cuda_stream);
+    at::Tensor x,
+    at::Tensor input_indptr,
+    at::Tensor output_indptr,
+    at::Tensor y,
+    int64_t batch_size,
+    int64_t cuda_stream = 0);
 
 /*
  * From FlashInfer

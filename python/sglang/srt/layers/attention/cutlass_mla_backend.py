@@ -11,8 +11,6 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 import triton
 
-from sglang.global_config import global_config
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -22,7 +20,6 @@ from sglang.srt.utils import is_cuda
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpecInfo
 
 _is_cuda = is_cuda()
@@ -108,7 +105,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                     PAGE_SIZE,
                 )
                 workspace_size = cutlass_mla_get_workspace_size(
-                    max_seqlen_pad * PAGE_SIZE, bs
+                    max_seqlen_pad * PAGE_SIZE, bs, num_kv_splits=1
                 )
                 workspace = torch.empty(
                     workspace_size, device="cuda", dtype=torch.uint8
@@ -138,7 +135,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
             cuda_graph_kv_indices = block_kv_indices
 
         workspace_size = cutlass_mla_get_workspace_size(
-            cuda_graph_kv_indices.shape[1] * PAGE_SIZE, max_bs
+            cuda_graph_kv_indices.shape[1] * PAGE_SIZE, max_bs, num_kv_splits=1
         )
         self.cuda_graph_mla_workspace = torch.empty(
             workspace_size, device="cuda", dtype=torch.uint8
@@ -280,6 +277,8 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             page_table=self.forward_metadata.block_kv_indices,
             workspace=self.forward_metadata.workspace,
+            sm_scale=layer.scaling,
+            num_kv_splits=1,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
