@@ -124,7 +124,9 @@ std::size_t RadixTree::Impl::try_write_through(const std::vector<TreeNode*>& nod
     // set the node as being written through
     const auto node = nodes[i];
     node->_unsafe_host_indices() = m_host_pool.alloc(node->length());
-    node->start_device_to_host(new_io_ticket(node), /*locked=*/true);
+    const auto [ticket, iterator] = this->new_io_ticket();
+    node->start_device_to_host(ticket, /*locked=*/true);
+    this->register_io_ticket(node, iterator);
     lock(node);
   }
 
@@ -196,9 +198,7 @@ RadixTree::loading_onboard(NodeHandle device_id, NodeHandle host_id, at::Tensor 
   _assert(device_id != host_id, "device and host must represent a range of indices");
 
   const auto old_host_node = m_impl->id2node(host_id);
-
-  // only the furthermost host node is locked, since it will lock all the parent nodes
-  const auto ticket = m_impl->new_io_ticket(old_host_node);
+  const auto [ticket, iterator] = m_impl->new_io_ticket();
 
   std::vector<at::Tensor> indices;
   std::size_t offset = value.size(0);
@@ -206,8 +206,10 @@ RadixTree::loading_onboard(NodeHandle device_id, NodeHandle host_id, at::Tensor 
     indices.push_back(n->host_indices());
     m_impl->update_device(n, value.slice(/*dim=*/0, offset - n->length(), offset));
     offset = offset - n->length();
-    bool locked = n == old_host_node;  // we only lock the furthermost host node
+    // we only lock the furthermost host node, since it will automatically lock all the parent nodes
+    bool locked = n == old_host_node;
     n->start_host_to_device(ticket, /*locked=*/locked);
+    m_impl->register_io_ticket(n, iterator);
   });
   // we can only lock node after it has device indices
   m_impl->lock(old_host_node);

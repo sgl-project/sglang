@@ -6,6 +6,7 @@
 #include <iosfwd>
 #include <memory>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "common.h"
@@ -282,19 +283,25 @@ struct RadixTree::Impl {
     m_node_map[m_root.node_id] = &m_root;  // re-add root to the map
   }
 
+  using IOiterator_t = std::unordered_map<IOTicket, std::vector<TreeNode*>>::iterator;
+
   [[nodiscard]]
-  IOTicket new_io_ticket(TreeNode* node) {
+  std::pair<IOTicket, IOiterator_t> new_io_ticket() {
     auto ticket = m_io_ticket_counter++;
     auto [it, success] = m_io_map.try_emplace(ticket);
     _assert(success, "IO ticket already exists, maybe unresolved IO?");
     it->second.reserve(2);  // we expect to split at most once
-    it->second.push_back(node);
-    return ticket;
+    return std::make_pair(ticket, it);
   }
 
   void register_io_ticket(TreeNode* node, IOTicket ticket) {
     auto it = m_io_map.find(ticket);
     _assert(it != m_io_map.end(), "IO ticket not found in the map");
+    it->second.push_back(node);
+  }
+
+  // this function aims at improving the performance of register IO ticket
+  void register_io_ticket(TreeNode* node, IOiterator_t it) {
     it->second.push_back(node);
   }
 

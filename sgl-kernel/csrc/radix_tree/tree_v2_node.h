@@ -252,8 +252,10 @@ struct TreeNode {
 
   std::optional<IOTicket> io_ticket() const {
     if (m_io_status == IOStatus::None) {
+      _assert(!m_io_locked.has_value(), "IO lock in wrong status");
       return std::nullopt;  // no IO operation in progress
     }
+    _assert(m_io_locked.has_value(), "IO lock in wrong status");
     return m_io_ticket;
   }
 
