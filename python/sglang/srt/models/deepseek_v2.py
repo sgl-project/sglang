@@ -71,6 +71,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -1920,6 +1921,10 @@ class DeepseekV2ForCausalLM(nn.Module):
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         ):
+            if isinstance(self.quant_config, ModelOptFp4Config):
+                logger.warning("Modelopt FP4 model doesn't support DeepGEMM.")
+                return
+
             self._weight_requant_ue8m0()
 
     def _weight_requant_ue8m0(self):
