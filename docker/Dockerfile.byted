@@ -1,0 +1,40 @@
+ARG base_version=v0.4.6.post2
+ARG cu=124
+FROM iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:community_${base_version}-cu${cu}_pure
+
+ARG sglang_version=0.4.6.post2+byted.0.0.2.202505261551
+ARG sgl_kernel_version=0.1.1+byted.0.0.2.202505261548
+ARG gdkv_sdk_version=0.0.1
+ARG eic_sdk_version=1.0
+RUN pip config set global.index-url https://mirrors.ivolces.com/pypi/simple/
+
+RUN http_proxy='' pip index versions sglang -i https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/
+
+# sglang 安装
+RUN http_proxy='' pip install "sglang[all]==${sglang_version}" --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
+
+# sgl-kernel安装
+RUN http_proxy='' pip install sgl_kernel==${sgl_kernel_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
+
+# gdkv sdk安装
+RUN http_proxy='' pip install hpkv==${gdkv_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
+
+# eic sdk安装
+RUN http_proxy='' pip install eic==${eic_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
+
+# examples 覆盖
+ARG branch=release_0.0.2
+RUN cd /tmp && git clone https://github.com/bytedance-iaas/sglang.git -b ${branch} && \
+    rm -rf /root/sglang/examples && \
+    mv /tmp/sglang/examples /root/sglang/examples && \
+    rm -rf /tmp/sglang
+
+# onion 安装
+RUN curl -fsSL https://mirrors.byted.org/extra-tools/ubuntu/GPG-KEY-system | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] http://mirrors.byted.org/extra-tools/ubuntu jammy main" > /etc/apt/sources.list.d/volctools.list && apt update && apt install -y onion-ai-data && \
+    rm -rf /etc/apt/sources.list.d/volctools.list
+
+# entrypoint
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT [ "/entrypoint.sh" ]
