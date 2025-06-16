@@ -51,6 +51,7 @@ def get_wave_kernel(
     max_kv_splits,
     input_dtype,
     output_dtype,
+    logit_cap,
 ):
     mha = (shape.num_query_heads // shape.num_kv_heads) == 1
 
@@ -77,6 +78,7 @@ def get_wave_kernel(
         input_dtype=input_dtype,
         output_dtype=output_dtype,
         mha=mha,
+        logit_cap=logit_cap,
     )
     hyperparams_0.update(get_default_scheduling_params())
     hyperparams_1.update(get_default_scheduling_params())
@@ -129,7 +131,7 @@ def decode_attention_wave(
     num_kv_splits,
     max_kv_splits,
     sm_scale,
-    logit_cap=0.0,
+    logit_cap,
 ):
     num_seqs, num_query_heads, head_size = q.shape
     total_tokens, num_kv_heads, _ = k_buffer.shape
@@ -149,7 +151,9 @@ def decode_attention_wave(
     k_buffer = view_trunc(k_buffer, (num_seqs, seq_len, num_kv_heads, head_size))
     v_buffer = view_trunc(v_buffer, (num_seqs, seq_len, num_kv_heads, head_size_kv))
 
-    phase_0, phase_1 = get_wave_kernel(shape, max_kv_splits, q.dtype, o.dtype)
+    phase_0, phase_1 = get_wave_kernel(
+        shape, max_kv_splits, q.dtype, o.dtype, logit_cap
+    )
 
     mb_qk = phase_0(
         q,
