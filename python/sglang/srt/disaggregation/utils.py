@@ -106,7 +106,6 @@ class MetadataBuffers:
         self.output_token_logprobs_idx = torch.zeros(
             (size, 16), dtype=torch.int32, device="cpu"
         )
-        # TODO: use cuda:0 if logits_only?
         self.output_top_logprobs_val = torch.zeros(
             (size, max_top_logprobs_num), dtype=torch.float32, device="cpu"
         )

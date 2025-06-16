@@ -692,7 +692,6 @@ class Scheduler(
                 )
                 self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
             else:
-                assert self.model_config.vocab_size > 64
                 self.disagg_metadata_buffers = MetadataBuffers(
                     self.max_running_requests,
                     max_top_logprobs_num=self.model_config.vocab_size,

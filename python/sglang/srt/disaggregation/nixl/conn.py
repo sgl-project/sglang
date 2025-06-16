@@ -297,7 +297,7 @@ class NixlKVManager(CommonKVManager):
                 str(req.room) + "_aux",
                 mem_type=mem_type,
             )
-            handles.append(kv_xfer_handle)
+            handles.append(aux_xfer_handle)
         return handles
 
     def update_transfer_status(self):
