@@ -130,6 +130,51 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
                 with self.subTest(model=model):
+                    process = None
+                    try:
+                        process = popen_launch_server_wrapper(
+                            self.base_url, model, is_fp8, is_tp2
+                        )
+
+                        args = SimpleNamespace(
+                            base_url=self.base_url,
+                            model=model,
+                            eval_name="mgsm_en",
+                            num_examples=None,
+                            num_threads=1024,
+                        )
+
+                        metrics = run_eval(args)
+                        print(
+                            f"{'=' * 42}\n{model} - metrics={metrics} score={metrics['score']}\n{'=' * 42}\n"
+                        )
+
+                        write_results_to_json(model, metrics, "w" if is_first else "a")
+                        is_first = False
+
+                        all_results.append((model, metrics["score"]))
+                    finally:
+                        if process:
+                            kill_process_tree(process.pid)
+
+        try:
+            with open("results.json", "r") as f:
+                print("\nFinal Results from results.json:")
+                print(json.dumps(json.load(f), indent=2))
+        except Exception as e:
+            print(f"Error reading results.json: {e}")
+
+        # Check all scores after collecting all results
+        check_model_scores(all_results)
+        warnings.filterwarnings(
+            "ignore", category=ResourceWarning, message="unclosed.*socket"
+        )
+        is_first = True
+        all_results = []
+
+        for model_group, is_fp8, is_tp2 in self.model_groups:
+            for model in model_group:
+                with self.subTest(model=model):
                     process = popen_launch_server_wrapper(
                         self.base_url, model, is_fp8, is_tp2
                     )
