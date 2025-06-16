@@ -327,6 +327,20 @@ class Engine(EngineBase):
         generator = self.tokenizer_manager.generate_request(obj, None)
         return await generator.__anext__()
 
+    def rerank(
+        self,
+        prompt: Union[List[List[str]]],
+    ) -> Dict:
+        """
+        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
+        Please refer to `EmbeddingReqInput` for the documentation.
+        """
+        obj = EmbeddingReqInput(text=prompt, is_cross_encoder_request=True)
+        loop = asyncio.get_event_loop()
+        generator = self.tokenizer_manager.generate_request(obj, None)
+        ret = loop.run_until_complete(generator.__anext__())
+        return ret
+
     def shutdown(self):
         """Shutdown the engine"""
         kill_process_tree(os.getpid(), include_parent=False)

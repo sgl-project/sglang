@@ -553,9 +553,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_V202506,
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_V202506,
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
         )
         return packed_recv_hidden, packed_recv_count, event, hook
