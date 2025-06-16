@@ -1,3 +1,4 @@
+import os
 import threading
 from typing import TYPE_CHECKING, List, Set
 
@@ -16,6 +17,8 @@ from sglang.srt.mem_cache.memory_pool import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+else:
+    Req = object
 
 import logging
 import threading
@@ -47,6 +50,38 @@ class LayerDoneCounter:
     def reset(self):
         with self.condition:
             self.counter = 0
+
+
+class DebugTree:
+    def __init__(self, tree: RadixTreeCpp):
+        self.tree = tree
+
+    # override getattr to proxy all attributes to the tree
+    def __getattr__(self, name):
+        if hasattr(self.tree, name):
+            func = getattr(self.tree, name)
+            if name.endswith("_size"):
+                return func
+
+            def wrapper(*args):
+                result = func(*args)
+                print("=" * 100)
+                logger.error(f"[DEBUG Tree]: Calling {name} method, {args=}")
+                logger.error(f"[DEBUG Tree]: {result=}")
+                import traceback
+
+                # print out recent 5 functions
+                stack = traceback.extract_stack()[-5:]
+                for frame in stack:
+                    logger.error(
+                        f"[DEBUG Tree]: {frame.filename}:{frame.lineno} in function <{frame.name}>"
+                    )
+                self.tree.debug_print()
+                print("=" * 100)
+                return result
+
+            return wrapper
+        raise AttributeError(f"{self.__class__.__name__} has no attribute '{name}'")
 
 
 class CacheOperation:
@@ -86,12 +121,10 @@ class HiCacheController_v2:
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         mem_pool_host: HostKVCache,
         page_size: int,
-        tree: RadixTreeCpp,
         load_cache_event: threading.Event,
         write_policy: str = "write_through_selective",
         oracle: bool = False,
     ):
-        self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         self.mem_pool_host = mem_pool_host
         self.write_policy = write_policy
@@ -128,7 +161,6 @@ class HiCacheController_v2:
         )
         self.write_thread.start()
         self.load_thread.start()
-        self.tree = tree
 
     def reset(self):
         self.stop_event.set()
@@ -248,29 +280,25 @@ class HiCacheController_v2:
                 if node_id != 0:
                     self.ack_load_queue.put(node_id)
 
-    def evict_device(
-        self, device_indices: torch.Tensor, host_indices: torch.Tensor
-    ) -> int:
-        if self.mem_pool_host.is_synced(host_indices):
-            self.mem_pool_device_allocator.free(device_indices)
-            self.mem_pool_host.update_backup(host_indices)
-            return len(device_indices)
-        else:
-            raise ValueError(
-                f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
-            )
 
-    def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
-        if not backup_only:
-            raise ValueError("Other eviction policies are not supported yet.")
-
-        if self.mem_pool_host.is_backup(host_indices):
-            self.mem_pool_host.free(host_indices)
-            return len(host_indices)
-        else:
-            raise ValueError(
-                f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
-            )
+def make_tree(
+    disable: bool,
+    use_hicache: bool,
+    page_size: int,
+    host_size: int,
+    write_through_threshold: int,
+):
+    tree = RadixTreeCpp(
+        disable,
+        use_hicache,
+        page_size,
+        host_size,
+        write_through_threshold,
+    )
+    if os.environ.get("SGLANG_DEBUG_HIRADIX_CPP") == "1":
+        return DebugTree(tree)  # for debugging purposes
+    else:
+        return tree
 
 
 class HiRadixCacheCpp(BasePrefixCache):
@@ -306,41 +334,6 @@ class HiRadixCacheCpp(BasePrefixCache):
             enable_kv_cache_events is False
         ), "HiRadixCache does not support kv cache events yet"
         self.kv_cache = token_to_kv_pool.get_kvcache()
-        if isinstance(self.kv_cache, MHATokenToKVPool):
-            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
-                self.kv_cache,
-                hicache_ratio,
-                hicache_size,
-                page_size,
-            )
-        elif isinstance(self.kv_cache, MLATokenToKVPool):
-            self.token_to_kv_pool_host = MLATokenToKVPoolHost(
-                self.kv_cache,
-                hicache_ratio,
-                hicache_size,
-                page_size,
-            )
-        else:
-            raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
-
-        self.tp_group = tp_cache_group
-
-        self.load_cache_event = threading.Event()
-        self.tree = RadixTreeCpp(
-            disable,
-            use_hicache,
-            page_size,
-            self.token_to_kv_pool_host.size,
-            self.write_through_threshold,
-        )
-        self.cache_controller = HiCacheController_v2(
-            token_to_kv_pool,
-            self.token_to_kv_pool_host,
-            page_size,
-            load_cache_event=self.load_cache_event,
-            write_policy=hicache_write_policy,
-            tree=self.tree,
-        )
 
         # record the nodes with ongoing write through
         self.ongoing_write_through: Set[IOHandle] = set()
@@ -355,6 +348,53 @@ class HiRadixCacheCpp(BasePrefixCache):
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_token_pool = req_to_token_pool
         self.page_size = page_size
+
+        self.tp_group = tp_cache_group
+        self.load_cache_event = threading.Event()
+
+        if not use_hicache:
+            # TODO(dark): pass the second argument as `std::optional`
+            self.tree = make_tree(
+                disable=disable,
+                use_hicache=use_hicache,
+                page_size=page_size,
+                host_size=0,  # no host cache, this should be removed in the future
+                write_through_threshold=self.write_through_threshold,
+            )
+            self.cache_controller = None
+            return  # early return if hicache is not used
+
+        if isinstance(self.kv_cache, MHATokenToKVPool):
+            token_to_kv_pool_host = MHATokenToKVPoolHost(
+                self.kv_cache,
+                hicache_ratio,
+                hicache_size,
+                page_size,
+            )
+        elif isinstance(self.kv_cache, MLATokenToKVPool):
+            token_to_kv_pool_host = MLATokenToKVPoolHost(
+                self.kv_cache,
+                hicache_ratio,
+                hicache_size,
+                page_size,
+            )
+        else:
+            raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
+
+        self.cache_controller = HiCacheController_v2(
+            token_to_kv_pool,
+            token_to_kv_pool_host,
+            page_size,
+            load_cache_event=self.load_cache_event,
+            write_policy=hicache_write_policy,
+        )
+        self.tree = make_tree(
+            disable=disable,
+            use_hicache=use_hicache,
+            page_size=page_size,
+            host_size=token_to_kv_pool_host.size,
+            write_through_threshold=self.write_through_threshold,
+        )
 
     def reset(self):
         self.tree.reset()
@@ -380,9 +420,12 @@ class HiRadixCacheCpp(BasePrefixCache):
             int: Number of device indices that were already present in the tree before the insertion.
         """
         ongoing_write, length = self.tree.writing_through(key, value)
+        if self.cache_controller is None:
+            assert len(ongoing_write) == 0, "Implementation error"
+            return length
+
         for io_handle, device_indices, host_indices in ongoing_write:
             self.cache_controller.write(device_indices, host_indices, io_handle)
-
         return length
 
     def dec_lock_ref(self, node: TreeNodeCpp):
@@ -440,9 +483,8 @@ class HiRadixCacheCpp(BasePrefixCache):
 
         # need to free the unaligned part, since it cannot be inserted into the radix tree
         # NOTE: sglang PagedAllocator support unaligned free (which will automatically align it)
-        if (
-            self.page_size != 1  # unaligned tail only exists when page_size > 1
-            and (unaligned_len := seq_len % self.page_size) > 0
+        if self.page_size != 1 and (  # unaligned tail only exists when page_size > 1
+            (unaligned_len := seq_len % self.page_size) > 0
         ):
             self.token_to_kv_pool.free(kv_indices[seq_len - unaligned_len :])
 
@@ -474,24 +516,25 @@ class HiRadixCacheCpp(BasePrefixCache):
         if old_prefix_len < new_prefix_len:
             self.token_to_kv_pool.free(kv_indices[old_prefix_len:new_prefix_len])
 
-            # The prefix indices need to updated to reuse the kv indices in the pool
-            new_indices_vec, _, new_last_node, _ = self.tree.match_prefix(token_ids)
-            new_indices = self.merge_tensor(new_indices_vec)
-            assert new_prefix_len <= len(new_indices)
+        # The prefix indices need to updated to reuse the kv indices in the pool
+        new_indices_vec, _, new_last_node, _ = self.tree.match_prefix(token_ids)
+        new_indices = self.merge_tensor(new_indices_vec)
+        assert new_prefix_len <= len(new_indices)
 
-            # these part are reused from the pool
-            reused_indices = new_indices[old_prefix_len:new_prefix_len]
+        # these part are reused from the pool
+        reused_indices = new_indices[old_prefix_len:new_prefix_len]
 
-            self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, old_prefix_len:new_prefix_len
-            ] = reused_indices
+        self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, old_prefix_len:new_prefix_len
+        ] = reused_indices
 
+        if req.last_node != new_last_node:
             self.dec_lock_ref(req.last_node)
             self.inc_lock_ref(new_last_node)
 
-            # NOTE: prefix indices must match with last node
-            req.prefix_indices = new_indices
-            req.last_node = new_last_node
+        # NOTE: prefix indices must match with last node
+        req.prefix_indices = new_indices
+        req.last_node = new_last_node
 
     def init_load_host(
         self,
@@ -499,6 +542,10 @@ class HiRadixCacheCpp(BasePrefixCache):
         host_node: TreeNodeCpp,
         new_device_indices: torch.Tensor,
     ):
+        if self.cache_controller is None:
+            assert device_node == host_node, "Implementation error"
+            return  # no host cache, nothing to load
+
         io_handle, host_indices_vec = self.tree.loading_onboard(
             device_node, host_node, new_device_indices
         )
@@ -518,6 +565,8 @@ class HiRadixCacheCpp(BasePrefixCache):
         self.loading_check()
 
     def writing_check(self):
+        if self.cache_controller is None:
+            return  # no host cache, nothing to check
         queue_size = torch.tensor(
             self.cache_controller.ack_write_queue.qsize(), dtype=torch.int
         )
@@ -534,6 +583,8 @@ class HiRadixCacheCpp(BasePrefixCache):
             self.ongoing_write_through.remove(ack_id)
 
     def loading_check(self):
+        if self.cache_controller is None:
+            return  # no host cache, nothing to check
         while not self.cache_controller.ack_load_queue.empty():
             try:
                 ack_id = self.cache_controller.ack_load_queue.get_nowait()

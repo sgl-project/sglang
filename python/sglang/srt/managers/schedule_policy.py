@@ -521,7 +521,7 @@ class PrefillAdder:
                 )
             else:
                 # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens - self.tree_cache.page_size + 1
+                trunc_len = self.rem_chunk_tokens - self.page_size + 1
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
