@@ -161,23 +161,28 @@ class HiCacheController_v2:
         self.write_thread.start()
         self.load_thread.start()
 
-    def reset(self):
+    def reset(self, _cleanup_callback):
         self.stop_event.set()
         self.write_thread.join()
         self.load_thread.join()
 
-        self.write_queue.queue.clear()
-        self.load_queue.queue.clear()
-        self.ack_write_queue.queue.clear()
-        self.ack_load_queue.queue.clear()
+        # call this before resetting the queues to ensure no operations are left
+        _cleanup_callback()
 
+        assert (
+            self.write_queue.empty()
+            and self.load_queue.empty()
+            and self.ack_write_queue.empty()
+            and self.ack_load_queue.empty()
+        ), "Queues should be empty after clean up"
+
+        self.stop_event.clear()
         self.write_thread = threading.Thread(
             target=self.write_thread_func_direct, daemon=True
         )
         self.load_thread = threading.Thread(
             target=self.load_thread_func_layer_by_layer, daemon=True
         )
-        self.stop_event.clear()
         self.write_thread.start()
         self.load_thread.start()
 
@@ -199,23 +204,38 @@ class HiCacheController_v2:
         Directly write through KV caches to host memory without buffering.
         """
         torch.cuda.set_stream(self.write_stream)  # type: ignore
+
+        def _write_to_host(operation: CacheOperation):
+            if not self.oracle:
+                length = len(operation.host_indices)
+                assert (
+                    length == len(operation.device_indices)
+                    and length > 0
+                    and length % self.page_size == 0
+                )
+                self.mem_pool_host.write_page_all_layers(
+                    operation.host_indices,
+                    operation.device_indices,
+                    self.mem_pool_device,
+                )
+                self.write_stream.synchronize()
+            self.mem_pool_host.complete_io(operation.host_indices)
+            for handle in operation.handles:
+                self.ack_write_queue.put(handle)
+
         while not self.stop_event.is_set():
             try:
                 operation = self.write_queue.get(block=True, timeout=1)
-                if not self.oracle:
-                    self.mem_pool_host.write_page_all_layers(
-                        operation.host_indices,
-                        operation.device_indices,
-                        self.mem_pool_device,
-                    )
-                    self.write_stream.synchronize()
-                self.mem_pool_host.complete_io(operation.host_indices)
-                for handle in operation.handles:
-                    self.ack_write_queue.put(handle)
+                _write_to_host(operation)
             except Empty:
                 continue
             except Exception as e:
                 logger.error(e)
+
+        # ensure all remaining write operations are processed
+        while not self.write_queue.empty():
+            operation = self.write_queue.get(block=False)
+            _write_to_host(operation)
 
     def load_thread_func_layer_by_layer(self):
         """
@@ -255,6 +275,11 @@ class HiCacheController_v2:
             self.mem_pool_host.complete_io(batch_operation.host_indices)
             for handle in batch_operation.handles:
                 self.ack_load_queue.put(handle)
+
+        # this only happens when prefilling, but reset can't be called when prefilling
+        assert (
+            self.load_queue.empty()
+        ), "Load queue should be empty when stopping the load thread"
 
 
 def make_tree(
@@ -303,7 +328,8 @@ class HiRadixCacheCpp(BasePrefixCache):
         hicache_ratio: float,
         hicache_size: int,
         hicache_write_policy: str,
-        enable_kv_cache_events: bool,
+        enable_kv_cache_events: bool = False,
+        hicache_oracle: bool = False,
     ):
         self.disable = disable
 
@@ -340,12 +366,14 @@ class HiRadixCacheCpp(BasePrefixCache):
             self.cache_controller = None
             return  # early return if hicache is not used
 
+        pin_memory = not hicache_oracle
         if isinstance(self.kv_cache, MHATokenToKVPool):
             token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
                 hicache_ratio,
                 hicache_size,
                 page_size,
+                pin_memory=pin_memory,
             )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -353,6 +381,7 @@ class HiRadixCacheCpp(BasePrefixCache):
                 hicache_ratio,
                 hicache_size,
                 page_size,
+                pin_memory=pin_memory,
             )
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
@@ -363,6 +392,7 @@ class HiRadixCacheCpp(BasePrefixCache):
             page_size,
             load_cache_event=self.load_cache_event,
             write_policy=hicache_write_policy,
+            oracle=hicache_oracle,
         )
         self.tree = make_tree(
             disabled=disable,
@@ -373,6 +403,9 @@ class HiRadixCacheCpp(BasePrefixCache):
         )
 
     def reset(self):
+        if self.cache_controller is not None:
+            # need to clear the acks before resetting the cache controller
+            self.cache_controller.reset(lambda: self.check_host_cache())
         self.tree.reset()
 
     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
@@ -533,6 +566,7 @@ class HiRadixCacheCpp(BasePrefixCache):
         self.ongoing_load_back.add(io_handle)
 
     def ready_to_load_host(self):
+        torch.cuda.current_stream().synchronize()
         self.load_cache_event.set()
 
     def check_host_cache(self):
