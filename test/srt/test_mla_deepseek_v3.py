@@ -1,11 +1,10 @@
 import unittest
 from types import SimpleNamespace
 
-import pytest
 import requests
 import torch
 
-from sglang.srt.utils import is_cuda, kill_process_tree
+from sglang.srt.utils import is_cuda, is_hip, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -50,6 +49,7 @@ class TestMLADeepseekV3(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
+@unittest.skipIf(is_hip(), "FA is not available.")
 class TestMLADeepseekV3Fa3Fp8Kvcache(CustomTestCase):
     @classmethod
     def setUpClass(cls):
