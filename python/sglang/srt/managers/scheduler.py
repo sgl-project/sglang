@@ -1195,7 +1195,7 @@ class Scheduler(
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_input_throughput = self.num_prefill_tokens / gap_latency
-        self.num_prefill_tokens = adder.log_input_tokens
+        self.num_prefill_tokens = adder.log_input_tokens  # Update prefill token count with adder's logged input tokens
 
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool_allocator.available_size()
