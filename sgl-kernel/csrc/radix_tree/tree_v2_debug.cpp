@@ -100,6 +100,8 @@ void RadixTree::Impl::debug_print(std::ostream& os) const {
     _check(depth_map.count(node) == 0, "Node is visited twice", nid);
     _check(m_node_map.count(nid) == 1, "Node is not in the map", nid);
     _check(m_node_map.at(nid) == node, "Node in the map is not the same as the one in the stack", nid);
+    _check(!node->on_gpu() || parent->is_root() || parent->on_gpu(), "Node on GPU must have a GPU/root parent", nid);
+
     const auto depth = (depth_map[node] = depth_map[parent] + 1);
     indent_buffer.resize(depth * 2, ' ');
     os << indent_buffer;
@@ -110,11 +112,15 @@ void RadixTree::Impl::debug_print(std::ostream& os) const {
     }
   }
 
+  _check(m_node_map.count(root->node_id) == 1, "Root node is not in the map");
+  _check(m_node_map.at(root->node_id) == root, "Root node in the map is not correct");
+
   std::sort(visited_id.begin(), visited_id.end());
-  if (visited_id.size() != m_node_map.size()) {
+  if (visited_id.size() != m_node_map.size() - 1) {
     // Some error in the tree, not all nodes are visited
     std::string id_list;
     id_list += "(visited: ";
+    id_list += std::to_string(root->node_id) + " ";
     for (const auto& id : visited_id) {
       id_list += std::to_string(id) + " ";
     }

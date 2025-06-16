@@ -35,6 +35,7 @@ struct RadixTree::Impl {
     _assert(page_size > 0, "Page size must be greater than zero");
     m_root.ref_count = 1;  // root node is always protected
     m_cached_vec.reserve(page_size);
+    m_node_map[m_root.node_id] = &m_root;  // add root to the map
   }
 
   TreeNode* split_node(node_iterator_t it, std::size_t prefix) {
@@ -204,7 +205,7 @@ struct RadixTree::Impl {
   }
 
   void lock_ref(TreeNode* node, bool increment) {
-    _assert(node != nullptr, "Cannot lock reference on a null node");
+    if (node->is_root()) return;  // skip root node
     _assert(node->on_gpu(), "Cannot lock reference on an evicted node");
     if (increment)
       walk_to_root(node, [this](TreeNode* n) {
@@ -277,6 +278,7 @@ struct RadixTree::Impl {
     m_host_pool.reset();  // clear the host memory pool
     _assert(m_io_map.empty(), "IO must be completed before reset");
     m_io_ticket_counter = 0;
+    m_node_map[m_root.node_id] = &m_root;  // re-add root to the map
   }
 
   [[nodiscard]]
