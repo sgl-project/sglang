@@ -2,9 +2,6 @@ from __future__ import annotations
 
 """
 Support attention backend for FlashMLA.
-
-#TODO
-Enable speculative sampling in FlashMLA
 """
 
 from dataclasses import dataclass
