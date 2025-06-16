@@ -87,11 +87,6 @@ class EAGLEWorker(TpModelWorker):
         # It will be captured later.
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
-        # Share the allocator with a target worker.
-        # Draft and target worker own their own KV cache pools.
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
 
         # Load hot token ids
         if self.speculative_algorithm.is_eagle3():
@@ -108,7 +103,7 @@ class EAGLEWorker(TpModelWorker):
         else:
             self.hot_token_id = None
 
-        # Init draft worker
+        # Init draft worker, which initializes target worker's memory pool
         with empty_context():
             super().__init__(
                 server_args=server_args,
@@ -118,9 +113,9 @@ class EAGLEWorker(TpModelWorker):
                 dp_rank=dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                target_worker=self.target_worker,
             )
+        self.token_to_kv_pool_allocator = self.model_runner.token_to_kv_pool_allocator
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
 
