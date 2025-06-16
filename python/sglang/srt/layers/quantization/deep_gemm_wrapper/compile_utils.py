@@ -8,7 +8,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from tqdm.contrib.concurrent import thread_map
 
 from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
-    DEEPGEMM_V202506,
+    DEEPGEMM_BLACKWELL,
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
@@ -16,13 +16,11 @@ from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
 logger = logging.getLogger(__name__)
 
-try:
+if ENABLE_JIT_DEEPGEMM and not DEEPGEMM_BLACKWELL:
     from deep_gemm import get_num_sms
     from deep_gemm.jit import build
     from deep_gemm.jit_kernels.gemm import get_best_configs
     from deep_gemm.jit_kernels.runtime import FP8GemmRuntime, GemmType
-except ImportError:
-    pass
 
 
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
@@ -313,7 +311,8 @@ def _log_jit_build(M: int, N: int, K: int, kernel_type: DeepGemmKernelType):
         ret = origin_func(self, *args, **kwargs)
         if ret is None:
             kernel_helper = _KERNEL_HELPER_DICT[kernel_type]
-            _compile_warning_2()
+            if not DEEPGEMM_BLACKWELL:
+                _compile_warning_2()
             logger.warning(
                 f"DeepGEMM JIT Compiling for <{kernel_helper.name}> M={M}, N={N}, K={K}. Please wait."
             )
@@ -329,10 +328,8 @@ def deep_gemm_execution_hook(
     m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
 ):
     # not supported yet
-    if DEEPGEMM_V202506:
-        yield
-        return
+    if not DEEPGEMM_BLACKWELL:
+        _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
 
-    _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
     with _log_jit_build(m, n, k, kernel_type):
         yield
