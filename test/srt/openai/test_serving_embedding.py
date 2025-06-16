@@ -12,6 +12,7 @@ import uuid
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock, Mock, patch
 
+from fastapi.responses import ORJSONResponse
 import pytest
 from fastapi import Request
 from pydantic_core import ValidationError
@@ -273,8 +274,8 @@ class TestOpenAIServingEmbeddingAsyncMethods:
 
         response = await serving_embedding.handle_request(invalid_request, mock_request)
 
-        assert isinstance(response, ErrorResponse)
-        assert "empty" in response.message.lower()
+        assert isinstance(response, ORJSONResponse)
+        assert response.status_code == 400
 
     async def test_handle_request_generation_error(
         self, serving_embedding, basic_embedding_request, mock_request
@@ -294,8 +295,8 @@ class TestOpenAIServingEmbeddingAsyncMethods:
             basic_embedding_request, mock_request
         )
 
-        assert isinstance(response, ErrorResponse)
-        assert "Generation failed" in response.message
+        assert isinstance(response, ORJSONResponse)
+        assert response.status_code == 400
 
     async def test_handle_request_internal_error(
         self, serving_embedding, basic_embedding_request, mock_request
@@ -311,6 +312,5 @@ class TestOpenAIServingEmbeddingAsyncMethods:
                 basic_embedding_request, mock_request
             )
 
-            assert isinstance(response, ErrorResponse)
-            assert "Internal server error" in response.message
-            assert response.code == 500
+            assert isinstance(response, ORJSONResponse)
+            assert response.status_code == 500

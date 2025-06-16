@@ -125,6 +125,7 @@ class TestOpenAIServingChatConversion:
                     None,
                     [],
                     ["</s>"],
+                    None,  # tool_call_constraint
                 )
 
                 adapted_request, processed_request = (
@@ -170,6 +171,7 @@ class TestToolCalls:
                 None,
                 [],
                 ["</s>"],
+                None,  # tool_call_constraint
             )
 
             adapted_request, _ = serving_chat._convert_to_internal_request(
@@ -197,6 +199,7 @@ class TestToolCalls:
                 None,
                 [],
                 ["</s>"],
+                None,  # tool_call_constraint
             )
 
             adapted_request, _ = serving_chat._convert_to_internal_request(
@@ -294,7 +297,7 @@ class TestMultimodalContent:
             ) as mock_conv:
                 mock_conv.return_value = ("prompt", ["image_data"], None, [], [])
 
-                prompt, prompt_ids, image_data, audio_data, modalities, stop = (
+                prompt, prompt_ids, image_data, audio_data, modalities, stop, tool_call_constraint = (
                     serving_chat._process_messages(request, True)
                 )
 
@@ -336,7 +339,7 @@ class TestMultimodalContent:
             ) as mock_conv:
                 mock_conv.return_value = ("prompt", None, ["audio_data"], ["audio"], [])
 
-                prompt, prompt_ids, image_data, audio_data, modalities, stop = (
+                prompt, prompt_ids, image_data, audio_data, modalities, stop, tool_call_constraint = (
                     serving_chat._process_messages(request, True)
                 )
 
@@ -371,7 +374,7 @@ class TestTemplateHandling:
             with patch("builtins.hasattr") as mock_hasattr:
                 mock_hasattr.return_value = True
 
-                prompt, prompt_ids, image_data, audio_data, modalities, stop = (
+                prompt, prompt_ids, image_data, audio_data, modalities, stop, tool_call_constraint = (
                     serving_chat._process_messages(request, False)
                 )
 
@@ -389,7 +392,7 @@ class TestTemplateHandling:
         with patch.object(serving_chat, "_apply_conversation_template") as mock_apply:
             mock_apply.return_value = ("conv_prompt", None, None, [], ["</s>"])
 
-            prompt, prompt_ids, image_data, audio_data, modalities, stop = (
+            prompt, prompt_ids, image_data, audio_data, modalities, stop, tool_call_constraint = (
                 serving_chat._process_messages(request, False)
             )
 
@@ -410,7 +413,7 @@ class TestTemplateHandling:
         with patch.object(serving_chat, "_apply_conversation_template") as mock_apply:
             mock_apply.return_value = ("Hi there", None, None, [], ["</s>"])
 
-            prompt, prompt_ids, image_data, audio_data, modalities, stop = (
+            prompt, prompt_ids, image_data, audio_data, modalities, stop, tool_call_constraint = (
                 serving_chat._process_messages(request, False)
             )
 
@@ -438,6 +441,7 @@ class TestReasoningContent:
                 None,
                 [],
                 ["</s>"],
+                None,  # tool_call_constraint
             )
 
             adapted_request, _ = serving_chat._convert_to_internal_request(
@@ -519,9 +523,10 @@ class TestSamplingParams:
                 None,
                 [],
                 ["</s>"],
+                None,  # tool_call_constraint
             )
 
-            sampling_params = serving_chat._build_sampling_params(request, ["</s>"])
+            sampling_params = serving_chat._build_sampling_params(request, ["</s>"], None)
 
             # Verify all parameters
             assert sampling_params["temperature"] == 0.8
@@ -561,9 +566,10 @@ class TestSamplingParams:
                 None,
                 [],
                 ["</s>"],
+                None,  # tool_call_constraint
             )
 
-            sampling_params = serving_chat._build_sampling_params(request, ["</s>"])
+            sampling_params = serving_chat._build_sampling_params(request, ["</s>"], None)
 
             assert "json_schema" in sampling_params
             assert '"type": "object"' in sampling_params["json_schema"]
@@ -584,8 +590,9 @@ class TestSamplingParams:
                 None,
                 [],
                 ["</s>"],
+                None,  # tool_call_constraint
             )
 
-            sampling_params = serving_chat._build_sampling_params(request, ["</s>"])
+            sampling_params = serving_chat._build_sampling_params(request, ["</s>"], None)
 
             assert sampling_params["json_schema"] == '{"type": "object"}'

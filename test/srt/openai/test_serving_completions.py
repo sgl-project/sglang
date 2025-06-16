@@ -91,7 +91,7 @@ class TestPromptHandling:
             return_value=True,
         ):
             with patch(
-                "sglang.srt.entrypoints.openai.serving_completions.generate_completion_prompt",
+                "sglang.srt.entrypoints.openai.serving_completions.generate_completion_prompt_from_request",
                 return_value="processed_prompt",
             ):
                 adapted_request, _ = serving_completion._convert_to_internal_request(
