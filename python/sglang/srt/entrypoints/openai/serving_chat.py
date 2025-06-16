@@ -447,7 +447,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     adapted_request, raw_request
                 ):
                     index = content.get("index", 0)
-                    text = content["text"]
 
                     is_first = is_firsts.get(index, True)
                     stream_buffer = stream_buffers.get(index, "")
@@ -496,7 +495,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
                     # Process content delta
-                    delta = text[len(stream_buffer) :]
+                    delta = content["text"][len(stream_buffer) :]
                     new_stream_buffer = stream_buffer + delta
 
                     # Handle reasoning content
