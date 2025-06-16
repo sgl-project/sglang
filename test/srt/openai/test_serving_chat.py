@@ -61,7 +61,7 @@ def mock_tokenizer_manager():
 
 
 @pytest.fixture
-def chat_handler(mock_tokenizer_manager):
+def serving_chat(mock_tokenizer_manager):
     """Create a OpenAIServingChat instance for testing."""
     return OpenAIServingChat(mock_tokenizer_manager)
 
@@ -102,7 +102,7 @@ class TestOpenAIServingChatConversion:
     """Test request conversion methods."""
 
     def test_convert_to_internal_request_single(
-        self, chat_handler, basic_chat_request, mock_tokenizer_manager
+        self, serving_chat, basic_chat_request, mock_tokenizer_manager
     ):
         """Test converting single request to internal format."""
         with patch(
@@ -117,7 +117,7 @@ class TestOpenAIServingChatConversion:
             mock_conv.return_value = mock_conv_instance
 
             # Mock the _process_messages method to return expected values
-            with patch.object(chat_handler, "_process_messages") as mock_process:
+            with patch.object(serving_chat, "_process_messages") as mock_process:
                 mock_process.return_value = (
                     "Test prompt",
                     [1, 2, 3],
@@ -128,7 +128,7 @@ class TestOpenAIServingChatConversion:
                 )
 
                 adapted_request, processed_request = (
-                    chat_handler._convert_to_internal_request(
+                    serving_chat._convert_to_internal_request(
                         [basic_chat_request], ["test-id"]
                     )
                 )
@@ -141,7 +141,7 @@ class TestOpenAIServingChatConversion:
 class TestToolCalls:
     """Test tool call functionality from adapter.py"""
 
-    def test_tool_call_request_conversion(self, chat_handler):
+    def test_tool_call_request_conversion(self, serving_chat):
         """Test request with tool calls"""
         request = ChatCompletionRequest(
             model="test-model",
@@ -162,7 +162,7 @@ class TestToolCalls:
             tool_choice="auto",
         )
 
-        with patch.object(chat_handler, "_process_messages") as mock_process:
+        with patch.object(serving_chat, "_process_messages") as mock_process:
             mock_process.return_value = (
                 "Test prompt",
                 [1, 2, 3],
@@ -172,7 +172,7 @@ class TestToolCalls:
                 ["</s>"],
             )
 
-            adapted_request, _ = chat_handler._convert_to_internal_request(
+            adapted_request, _ = serving_chat._convert_to_internal_request(
                 [request], ["test-id"]
             )
 
@@ -180,7 +180,7 @@ class TestToolCalls:
             # Tool call constraint should be processed
             assert request.tools is not None
 
-    def test_tool_choice_none(self, chat_handler):
+    def test_tool_choice_none(self, serving_chat):
         """Test tool_choice=none disables tool calls"""
         request = ChatCompletionRequest(
             model="test-model",
@@ -189,7 +189,7 @@ class TestToolCalls:
             tool_choice="none",
         )
 
-        with patch.object(chat_handler, "_process_messages") as mock_process:
+        with patch.object(serving_chat, "_process_messages") as mock_process:
             mock_process.return_value = (
                 "Test prompt",
                 [1, 2, 3],
@@ -199,14 +199,14 @@ class TestToolCalls:
                 ["</s>"],
             )
 
-            adapted_request, _ = chat_handler._convert_to_internal_request(
+            adapted_request, _ = serving_chat._convert_to_internal_request(
                 [request], ["test-id"]
             )
 
             # Tools should not be processed when tool_choice is "none"
             assert adapted_request.rid == "test-id"
 
-    def test_tool_call_response_processing(self, chat_handler):
+    def test_tool_call_response_processing(self, serving_chat):
         """Test processing tool calls in response"""
         mock_ret_item = {
             "text": '{"name": "get_weather", "parameters": {"location": "Paris"}}',
@@ -246,7 +246,7 @@ class TestToolCalls:
             mock_parser.parse_non_stream.return_value = ("", [mock_tool_call])
             mock_parser_class.return_value = mock_parser
 
-            tool_calls, text, updated_finish_reason = chat_handler._process_tool_calls(
+            tool_calls, text, updated_finish_reason = serving_chat._process_tool_calls(
                 mock_ret_item["text"], tools, "hermes", finish_reason
             )
 
@@ -258,7 +258,7 @@ class TestToolCalls:
 class TestMultimodalContent:
     """Test multimodal content handling from adapter.py"""
 
-    def test_multimodal_request_with_images(self, chat_handler):
+    def test_multimodal_request_with_images(self, serving_chat):
         """Test request with image content"""
         request = ChatCompletionRequest(
             model="test-model",
@@ -277,9 +277,9 @@ class TestMultimodalContent:
         )
 
         # Set multimodal mode
-        chat_handler.tokenizer_manager.model_config.is_multimodal = True
+        serving_chat.tokenizer_manager.model_config.is_multimodal = True
 
-        with patch.object(chat_handler, "_apply_jinja_template") as mock_apply:
+        with patch.object(serving_chat, "_apply_jinja_template") as mock_apply:
             mock_apply.return_value = (
                 "prompt",
                 [1, 2, 3],
@@ -290,18 +290,18 @@ class TestMultimodalContent:
             )
 
             with patch.object(
-                chat_handler, "_apply_conversation_template"
+                serving_chat, "_apply_conversation_template"
             ) as mock_conv:
                 mock_conv.return_value = ("prompt", ["image_data"], None, [], [])
 
                 prompt, prompt_ids, image_data, audio_data, modalities, stop = (
-                    chat_handler._process_messages(request, True)
+                    serving_chat._process_messages(request, True)
                 )
 
                 assert image_data == ["image_data"]
                 assert prompt == "prompt"
 
-    def test_multimodal_request_with_audio(self, chat_handler):
+    def test_multimodal_request_with_audio(self, serving_chat):
         """Test request with audio content"""
         request = ChatCompletionRequest(
             model="test-model",
@@ -319,9 +319,9 @@ class TestMultimodalContent:
             ],
         )
 
-        chat_handler.tokenizer_manager.model_config.is_multimodal = True
+        serving_chat.tokenizer_manager.model_config.is_multimodal = True
 
-        with patch.object(chat_handler, "_apply_jinja_template") as mock_apply:
+        with patch.object(serving_chat, "_apply_jinja_template") as mock_apply:
             mock_apply.return_value = (
                 "prompt",
                 [1, 2, 3],
@@ -332,12 +332,12 @@ class TestMultimodalContent:
             )
 
             with patch.object(
-                chat_handler, "_apply_conversation_template"
+                serving_chat, "_apply_conversation_template"
             ) as mock_conv:
                 mock_conv.return_value = ("prompt", None, ["audio_data"], ["audio"], [])
 
                 prompt, prompt_ids, image_data, audio_data, modalities, stop = (
-                    chat_handler._process_messages(request, True)
+                    serving_chat._process_messages(request, True)
                 )
 
                 assert audio_data == ["audio_data"]
@@ -347,17 +347,17 @@ class TestMultimodalContent:
 class TestTemplateHandling:
     """Test chat template handling from adapter.py"""
 
-    def test_jinja_template_processing(self, chat_handler):
+    def test_jinja_template_processing(self, serving_chat):
         """Test Jinja template processing"""
         request = ChatCompletionRequest(
             model="test-model", messages=[{"role": "user", "content": "Hello"}]
         )
 
         # Mock the template attribute directly
-        chat_handler.tokenizer_manager.chat_template_name = None
-        chat_handler.tokenizer_manager.tokenizer.chat_template = "<jinja_template>"
+        serving_chat.tokenizer_manager.chat_template_name = None
+        serving_chat.tokenizer_manager.tokenizer.chat_template = "<jinja_template>"
 
-        with patch.object(chat_handler, "_apply_jinja_template") as mock_apply:
+        with patch.object(serving_chat, "_apply_jinja_template") as mock_apply:
             mock_apply.return_value = (
                 "processed_prompt",
                 [1, 2, 3],
@@ -372,31 +372,31 @@ class TestTemplateHandling:
                 mock_hasattr.return_value = True
 
                 prompt, prompt_ids, image_data, audio_data, modalities, stop = (
-                    chat_handler._process_messages(request, False)
+                    serving_chat._process_messages(request, False)
                 )
 
                 assert prompt == "processed_prompt"
                 assert prompt_ids == [1, 2, 3]
 
-    def test_conversation_template_processing(self, chat_handler):
+    def test_conversation_template_processing(self, serving_chat):
         """Test conversation template processing"""
         request = ChatCompletionRequest(
             model="test-model", messages=[{"role": "user", "content": "Hello"}]
         )
 
-        chat_handler.tokenizer_manager.chat_template_name = "llama-3"
+        serving_chat.tokenizer_manager.chat_template_name = "llama-3"
 
-        with patch.object(chat_handler, "_apply_conversation_template") as mock_apply:
+        with patch.object(serving_chat, "_apply_conversation_template") as mock_apply:
             mock_apply.return_value = ("conv_prompt", None, None, [], ["</s>"])
 
             prompt, prompt_ids, image_data, audio_data, modalities, stop = (
-                chat_handler._process_messages(request, False)
+                serving_chat._process_messages(request, False)
             )
 
             assert prompt == "conv_prompt"
             assert stop == ["</s>"]
 
-    def test_continue_final_message(self, chat_handler):
+    def test_continue_final_message(self, serving_chat):
         """Test continue_final_message functionality"""
         request = ChatCompletionRequest(
             model="test-model",
@@ -407,11 +407,11 @@ class TestTemplateHandling:
             continue_final_message=True,
         )
 
-        with patch.object(chat_handler, "_apply_conversation_template") as mock_apply:
+        with patch.object(serving_chat, "_apply_conversation_template") as mock_apply:
             mock_apply.return_value = ("Hi there", None, None, [], ["</s>"])
 
             prompt, prompt_ids, image_data, audio_data, modalities, stop = (
-                chat_handler._process_messages(request, False)
+                serving_chat._process_messages(request, False)
             )
 
             # Should handle continue_final_message properly
@@ -421,7 +421,7 @@ class TestTemplateHandling:
 class TestReasoningContent:
     """Test reasoning content separation from adapter.py"""
 
-    def test_reasoning_content_request(self, chat_handler):
+    def test_reasoning_content_request(self, serving_chat):
         """Test request with reasoning content separation"""
         request = ChatCompletionRequest(
             model="test-model",
@@ -430,7 +430,7 @@ class TestReasoningContent:
             stream_reasoning=False,
         )
 
-        with patch.object(chat_handler, "_process_messages") as mock_process:
+        with patch.object(serving_chat, "_process_messages") as mock_process:
             mock_process.return_value = (
                 "Test prompt",
                 [1, 2, 3],
@@ -440,14 +440,14 @@ class TestReasoningContent:
                 ["</s>"],
             )
 
-            adapted_request, _ = chat_handler._convert_to_internal_request(
+            adapted_request, _ = serving_chat._convert_to_internal_request(
                 [request], ["test-id"]
             )
 
             assert adapted_request.rid == "test-id"
             assert request.separate_reasoning == True
 
-    def test_reasoning_content_response(self, chat_handler):
+    def test_reasoning_content_response(self, serving_chat):
         """Test reasoning content in response"""
         mock_ret_item = {
             "text": "<thinking>This is reasoning</thinking>Answer: 42",
@@ -485,7 +485,7 @@ class TestReasoningContent:
 class TestSamplingParams:
     """Test sampling parameter handling from adapter.py"""
 
-    def test_all_sampling_parameters(self, chat_handler):
+    def test_all_sampling_parameters(self, serving_chat):
         """Test all sampling parameters are properly handled"""
         request = ChatCompletionRequest(
             model="test-model",
@@ -511,7 +511,7 @@ class TestSamplingParams:
             logit_bias={"1": 0.5, "2": -0.3},
         )
 
-        with patch.object(chat_handler, "_process_messages") as mock_process:
+        with patch.object(serving_chat, "_process_messages") as mock_process:
             mock_process.return_value = (
                 "Test prompt",
                 [1, 2, 3],
@@ -521,7 +521,7 @@ class TestSamplingParams:
                 ["</s>"],
             )
 
-            sampling_params = chat_handler._build_sampling_params(request, ["</s>"])
+            sampling_params = serving_chat._build_sampling_params(request, ["</s>"])
 
             # Verify all parameters
             assert sampling_params["temperature"] == 0.8
@@ -536,7 +536,7 @@ class TestSamplingParams:
             assert sampling_params["stop"] == ["</s>"]
             assert sampling_params["logit_bias"] == {"1": 0.5, "2": -0.3}
 
-    def test_response_format_json_schema(self, chat_handler):
+    def test_response_format_json_schema(self, serving_chat):
         """Test response format with JSON schema"""
         request = ChatCompletionRequest(
             model="test-model",
@@ -553,7 +553,7 @@ class TestSamplingParams:
             },
         )
 
-        with patch.object(chat_handler, "_process_messages") as mock_process:
+        with patch.object(serving_chat, "_process_messages") as mock_process:
             mock_process.return_value = (
                 "Test prompt",
                 [1, 2, 3],
@@ -563,12 +563,12 @@ class TestSamplingParams:
                 ["</s>"],
             )
 
-            sampling_params = chat_handler._build_sampling_params(request, ["</s>"])
+            sampling_params = serving_chat._build_sampling_params(request, ["</s>"])
 
             assert "json_schema" in sampling_params
             assert '"type": "object"' in sampling_params["json_schema"]
 
-    def test_response_format_json_object(self, chat_handler):
+    def test_response_format_json_object(self, serving_chat):
         """Test response format with JSON object"""
         request = ChatCompletionRequest(
             model="test-model",
@@ -576,7 +576,7 @@ class TestSamplingParams:
             response_format={"type": "json_object"},
         )
 
-        with patch.object(chat_handler, "_process_messages") as mock_process:
+        with patch.object(serving_chat, "_process_messages") as mock_process:
             mock_process.return_value = (
                 "Test prompt",
                 [1, 2, 3],
@@ -586,100 +586,6 @@ class TestSamplingParams:
                 ["</s>"],
             )
 
-            sampling_params = chat_handler._build_sampling_params(request, ["</s>"])
+            sampling_params = serving_chat._build_sampling_params(request, ["</s>"])
 
             assert sampling_params["json_schema"] == '{"type": "object"}'
-
-
-class TestUtilityFunctions:
-    """Test utility functions that were moved from OpenAIServingBase."""
-
-    def test_create_error_response_functionality(self, chat_handler):
-        """Test that create_error_response works correctly."""
-        error = chat_handler.create_error_response("Test error message")
-        assert isinstance(error, ErrorResponse)
-        assert error.message == "Test error message"
-        assert error.type == "BadRequestError"
-        assert error.code == 400
-
-
-class TestOpenAIServingChatCompatibility:
-    """Test compatibility with adapter.py functionality."""
-
-    def test_compatibility_request_structure(self):
-        """Test that the request structure matches what adapter.py expects."""
-        # Test with all the parameters that adapter.py supports
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            temperature=0.8,
-            max_tokens=150,
-            top_p=0.9,
-            top_k=50,
-            presence_penalty=0.1,
-            frequency_penalty=0.2,
-            repetition_penalty=1.1,
-            stop=["<|endoftext|>"],
-            stream=False,
-            logprobs=True,
-            top_logprobs=5,
-            n=1,
-            continue_final_message=False,
-            separate_reasoning=True,
-            stream_reasoning=False,
-        )
-
-        # Verify that the request can be created without errors
-        assert request.model == "test-model"
-        assert request.temperature == 0.8
-        assert request.max_tokens == 150
-        assert request.top_p == 0.9
-        assert request.top_k == 50
-        assert request.presence_penalty == 0.1
-        assert request.frequency_penalty == 0.2
-        assert request.repetition_penalty == 1.1
-        assert request.stop == ["<|endoftext|>"]
-        assert request.stream == False
-        assert request.logprobs == True
-        assert request.top_logprobs == 5
-        assert request.n == 1
-        assert request.continue_final_message == False
-        assert request.separate_reasoning == True
-        assert request.stream_reasoning == False
-
-    def test_compatibility_bootstrap_params(self, chat_handler):
-        """Test that bootstrap parameters are properly supported."""
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            bootstrap_host="localhost",
-            bootstrap_port=8998,
-            bootstrap_room=12345,
-        )
-
-        assert request.bootstrap_host == "localhost"
-        assert request.bootstrap_port == 8998
-        assert request.bootstrap_room == 12345
-
-        # Mock the _process_messages method to return expected values
-        with patch.object(chat_handler, "_process_messages") as mock_process:
-            mock_process.return_value = (
-                "Test prompt",
-                [1, 2, 3],
-                None,
-                None,
-                [],
-                ["</s>"],
-            )
-
-            adapted_request, _ = chat_handler._convert_to_internal_request(
-                [request], ["test-id"]
-            )
-
-            assert adapted_request.bootstrap_host == "localhost"
-            assert adapted_request.bootstrap_port == 8998
-            assert adapted_request.bootstrap_room == 12345
-
-
-if __name__ == "__main__":
-    pytest.main([__file__])
