@@ -105,14 +105,19 @@ void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void cutlass_mla_decode(
     torch::Tensor const& out,
-    torch::Tensor const& q_nope_and_q_pe,
+    torch::Tensor const& q_nope,
+    torch::Tensor const& q_pe,
     torch::Tensor const& kv_c_and_k_pe_cache,
     torch::Tensor const& seq_lens,
     torch::Tensor const& page_table,
     torch::Tensor const& workspace,
-    int64_t num_kv_splits = -1);
+    double sm_scale,
+    int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
 int64_t cutlass_mla_get_workspace_size(
-    int64_t max_seq_len, int64_t num_batches, int64_t sm_count = 0, int64_t num_kv_splits = -1);
+    int64_t max_seq_len,
+    int64_t num_batches,
+    int64_t sm_count = 0,
+    int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
 /*
  * From csrc/elementwise
  */
@@ -174,7 +179,8 @@ void sgl_per_token_group_quant_fp8(
     int64_t group_size,
     double eps,
     double fp8_min,
-    double fp8_max);
+    double fp8_max,
+    bool scale_ue8m0);
 void sgl_per_token_group_quant_int8(
     at::Tensor input,
     at::Tensor output_q,
@@ -265,6 +271,14 @@ void ep_moe_pre_reorder(
     int64_t end_expert_id,
     int64_t topk,
     bool use_per_token_if_dynamic);
+
+void ep_moe_silu_and_mul(
+    torch::Tensor gateup_output,
+    torch::Tensor down_input,
+    torch::Tensor reorder_topk_ids,
+    torch::Tensor scales,
+    int64_t start_expert_id,
+    int64_t end_expert_id);
 
 void ep_moe_post_reorder(
     torch::Tensor down_output,
