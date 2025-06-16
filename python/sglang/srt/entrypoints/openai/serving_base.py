@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Union
 
 from fastapi import Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
@@ -150,15 +150,16 @@ class OpenAIServingBase(ABC):
         err_type: str = "BadRequestError",
         status_code: int = 400,
         param: Optional[str] = None,
-    ) -> ErrorResponse:
+    ) -> ORJSONResponse:
         """Create an error response"""
-        return ErrorResponse(
+        error = ErrorResponse(
             object="error",
             message=message,
             type=err_type,
             param=param,
             code=status_code,
         )
+        return ORJSONResponse(content=error.model_dump(), status_code=status_code)
 
     def create_streaming_error_response(
         self,
@@ -167,5 +168,11 @@ class OpenAIServingBase(ABC):
         status_code: int = 400,
     ) -> str:
         """Create a streaming error response"""
-        error = self.create_error_response(message, err_type, status_code)
+        error = ErrorResponse(
+            object="error",
+            message=message,
+            type=err_type,
+            param=None,
+            code=status_code,
+        )
         return json.dumps({"error": error.model_dump()})
