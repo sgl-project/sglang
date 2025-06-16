@@ -50,10 +50,11 @@ def get_wave_kernel(
     shape: paged_decode_attention_shape,
     max_kv_splits,
     input_dtype,
+    output_dtype,
 ):
     mha = (shape.num_query_heads // shape.num_kv_heads) == 1
 
-        # Get the kernels (either compile or load from cache).
+    # Get the kernels (either compile or load from cache).
     if mha:
         mfma_variant = (
             GenericDot(along_dim=MMAOperand.M, k_vec_size=4, k_mult=1),
@@ -74,6 +75,7 @@ def get_wave_kernel(
         mfma_variant,
         max_kv_splits,
         input_dtype=input_dtype,
+        output_dtype=output_dtype,
         mha=mha,
     )
     hyperparams_0.update(get_default_scheduling_params())
@@ -147,7 +149,7 @@ def decode_attention_wave(
     k_buffer = view_trunc(k_buffer, (num_seqs, seq_len, num_kv_heads, head_size))
     v_buffer = view_trunc(v_buffer, (num_seqs, seq_len, num_kv_heads, head_size_kv))
 
-    phase_0, phase_1 = get_wave_kernel(shape, max_kv_splits, q.dtype)
+    phase_0, phase_1 = get_wave_kernel(shape, max_kv_splits, q.dtype, o.dtype)
 
     mb_qk = phase_0(
         q,
