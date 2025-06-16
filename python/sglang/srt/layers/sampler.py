@@ -90,7 +90,6 @@ class Sampler(nn.Module):
                             probs, sampling_info.min_ps
                         )
                     else:
-                        # Use the optimized flashinfer path for top_k + top_p
                         logits.div_(sampling_info.temperatures)
                         batch_next_token_ids = (
                             top_k_top_p_sampling_from_logits_flashinfer(
@@ -127,8 +126,10 @@ class Sampler(nn.Module):
                     global_server_args_dict["sampling_backend"] == "flashinfer"
                     and not sampling_info.need_min_p_sampling
                 ):
-                    # Compute logprobs from original logits
-                    logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+                    probs = torch.softmax(logits, dim=-1)
+                    logprobs = torch.log(probs).clamp(
+                        min=torch.finfo(probs.dtype).min
+                    )
                 else:
                     # clamp to avoid -inf
                     logprobs = torch.log(probs).clamp(
@@ -302,7 +303,6 @@ def top_k_top_p_sampling_from_logits_flashinfer(
     """
     import flashinfer.sampling
     
-    # Use flashinfer's optimized top_k_top_p_sampling_from_logits
     batch_next_token_ids = flashinfer.sampling.top_k_top_p_sampling_from_logits(
         logits,
         top_ks,
