@@ -187,9 +187,8 @@ class EAGLEDraftCudaGraphRunner:
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
         if bs != raw_bs:
-            self.seq_lens.fill_(1)
+            self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
-            self.positions.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
 
@@ -211,15 +210,15 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.req_pool_indices = self.req_pool_indices[:bs]
             forward_batch.positions = self.positions[:num_tokens]
 
-        # Special handle for seq_len_cpu used when flashinfer mla is used
         if forward_batch.seq_lens_cpu is not None and bs != raw_bs:
-            self.seq_lens_cpu.fill_(1)
+            self.seq_lens_cpu.fill_(self.seq_len_fill_value)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
             forward_batch.seq_lens_cpu = self.seq_lens_cpu[:bs]
 
         self.model_runner.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
             forward_batch, bs
         )
+        # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
 
         # Replay
         self.graphs[bs].replay()
