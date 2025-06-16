@@ -14,8 +14,6 @@ import torch
 import triton
 from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
-from sglang.global_config import global_config
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -24,7 +22,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpecInfo
 
 
@@ -330,7 +327,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return 1024
+        return 1
 
     def forward_decode(
         self,
