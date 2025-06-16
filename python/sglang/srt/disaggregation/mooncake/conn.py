@@ -39,8 +39,7 @@ from sglang.srt.utils import (
     get_free_port,
     get_int_env_var,
     get_ip,
-    get_local_ip_by_nic,
-    get_local_ip_by_remote,
+    get_local_ip_auto,
 )
 
 logger = logging.getLogger(__name__)
@@ -131,12 +130,7 @@ class MooncakeKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
-        interface = os.environ.get("SGLANG_DISAGGREGATION_LOCAL_IP_NIC", None)
-        self.local_ip = (
-            get_local_ip_by_nic(interface)
-            if interface is not None
-            else get_local_ip_by_remote()
-        )
+        self.local_ip = get_local_ip_auto()
         self.engine = MooncakeTransferEngine(
             hostname=self.local_ip,
             gpu_id=self.kv_args.gpu_id,

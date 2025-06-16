@@ -63,7 +63,6 @@ from typing import (
     Union,
 )
 
-import netifaces
 import numpy as np
 import psutil
 import requests
@@ -2106,7 +2105,23 @@ def get_free_port():
             return s.getsockname()[1]
 
 
+def get_local_ip_auto() -> str:
+    interface = os.environ.get("SGLANG_DISAGGREGATION_LOCAL_IP_NIC", None)
+    return (
+        get_local_ip_by_nic(interface)
+        if interface is not None
+        else get_local_ip_by_remote()
+    )
+
+
 def get_local_ip_by_nic(interface: str) -> str:
+    try:
+        import netifaces
+    except ImportError as e:
+        raise ImportError(
+            "Environment variable SGLANG_DISAGGREGATION_LOCAL_IP_NIC requires package netifaces, please install it through 'pip install netifaces'"
+        ) from e
+
     try:
         addresses = netifaces.ifaddresses(interface)
         if netifaces.AF_INET in addresses:
@@ -2119,10 +2134,13 @@ def get_local_ip_by_nic(interface: str) -> str:
                 ip = addr_info.get("addr")
                 if ip and not ip.startswith("fe80::") and ip != "::1":
                     return ip.split("%")[0]
-    except Exception:
+    except (ValueError, OSError) as e:
         raise ValueError(
             "Can not get local ip from NIC. Please verify whether SGLANG_DISAGGREGATION_LOCAL_IP_NIC is set correctly."
         )
+
+    # Fallback
+    return get_local_ip_by_remote()
 
 
 def get_local_ip_by_remote() -> str:
