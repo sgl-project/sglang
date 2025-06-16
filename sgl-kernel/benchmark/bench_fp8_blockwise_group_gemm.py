@@ -53,9 +53,7 @@ def construct_contiguous_grouped(
     torch.Tensor,
 ]:
     alignment = get_m_alignment_for_contiguous_layout()
-    group_ms = [
-        int(expected_m_per_group) for _ in range(num_groups)
-    ]
+    group_ms = [int(expected_m_per_group) for _ in range(num_groups)]
     m = sum([ceil_div(x, alignment) * alignment for x in group_ms])
 
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
@@ -149,8 +147,7 @@ def bench_cutlass(
 
     # TODO(@TianQiLin666666): Unique group_ms in all bench function
     group_ms = [
-        alignment
-        * ceil_div(int(expected_m_per_group), alignment)
+        alignment * ceil_div(int(expected_m_per_group), alignment)
         for _ in range(num_groups)
     ]
     for g in range(num_groups):
@@ -296,7 +293,30 @@ def main():
     parser.add_argument("--num-warmup", type=int, default=3)
     parser.add_argument("--num-run", type=int, default=10)
     shape_args = [
+        # Prefill, DeepSeek-R1, gateup, chunk_size = 4096, TP = 8
         ShapeArg(expected_m_per_group=128, n=512, k=7168, num_groups=256),
+        # Prefill, DeepSeek-R1, down, chunk_size = 4096, TP = 8
+        ShapeArg(expected_m_per_group=128, n=7168, k=256, num_groups=256),
+        # Prefill, DeepSeek-R1, gateup, chunk_size = 8192, TP = 8
+        ShapeArg(expected_m_per_group=256, n=512, k=7168, num_groups=256),
+        # Prefill, DeepSeek-R1, down, chunk_size = 8192, TP = 8
+        ShapeArg(expected_m_per_group=256, n=7168, k=256, num_groups=256),
+        # Prefill, DeepSeek-R1, gateup, chunk_size = 8192, TP = 16
+        ShapeArg(expected_m_per_group=256, n=256, k=7168, num_groups=256),
+        # Prefill, DeepSeek-R1, down, chunk_size = 8192, TP = 16
+        ShapeArg(expected_m_per_group=256, n=7168, k=128, num_groups=256),
+        # Prefill, DeepSeek-R1, gateup, chunk_size = 16384, TP = 16
+        ShapeArg(expected_m_per_group=512, n=256, k=7168, num_groups=256),
+        # Prefill, DeepSeek-R1, down, chunk_size = 16384, TP = 16
+        ShapeArg(expected_m_per_group=512, n=7168, k=128, num_groups=256),
+        # Decode, DeepSeek-R1, gateup, bs = 32, TP = 8
+        ShapeArg(expected_m_per_group=1, n=512, k=7168, num_groups=256),
+        # Decode, DeepSeek-R1, down, bs = 32, TP = 8
+        ShapeArg(expected_m_per_group=1, n=7168, k=256, num_groups=256),
+        # Decode, DeepSeek-R1, gateup, bs = 64, TP = 16
+        ShapeArg(expected_m_per_group=2, n=256, k=7168, num_groups=256),
+        # Decode, DeepSeek-R1, down, bs = 64, TP = 16
+        ShapeArg(expected_m_per_group=2, n=7168, k=128, num_groups=256),
     ]
     args = parser.parse_args()
     benchmark_one_shape(shape_args, args.num_warmup, args.num_run)
