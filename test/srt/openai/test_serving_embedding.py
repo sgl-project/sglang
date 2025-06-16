@@ -12,9 +12,9 @@ import uuid
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock, Mock, patch
 
-from fastapi.responses import ORJSONResponse
 import pytest
 from fastapi import Request
+from fastapi.responses import ORJSONResponse
 from pydantic_core import ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
