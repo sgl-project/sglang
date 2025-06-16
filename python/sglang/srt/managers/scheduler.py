@@ -179,6 +179,27 @@ class EmbeddingBatchResult:
     bid: int
 
 
+class IdleSleeper:
+    """
+    In setups which have long inactivity periods it is desirable to reduce
+    system power consumption when sglang does nothing. This would lead not only
+    to power savings, but also to more CPU thermal headroom when a request
+    eventually comes. This is important in cases when multiple GPUs are connected
+    as each GPU would otherwise pin one thread at 100% CPU usage.
+
+    The simplest solution is to use zmq.Poller on all sockets that may receive
+    data that needs handling immediately.
+    """
+
+    def __init__(self, sockets):
+        self.poller = zmq.Poller()
+        for s in sockets:
+            self.poller.register(s, zmq.POLLIN)
+
+    def maybe_sleep(self):
+        self.poller.poll(1000)
+
+
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerDisaggregationDecodeMixin,
@@ -228,6 +249,8 @@ class Scheduler(
 
         # Init inter-process communication
         context = zmq.Context(2)
+        self.idle_sleeper = None
+
         if self.pp_rank == 0 and self.attn_tp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -250,6 +273,13 @@ class Scheduler(
             self.recv_from_rpc = get_zmq_socket(
                 context, zmq.DEALER, port_args.rpc_ipc_name, False
             )
+            if self.server_args.sleep_on_idle:
+                self.idle_sleeper = IdleSleeper(
+                    [
+                        self.recv_from_tokenizer,
+                        self.recv_from_rpc,
+                    ]
+                )
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
@@ -478,6 +508,10 @@ class Scheduler(
         )
         self.init_disaggregation()
 
+    def maybe_sleep_on_idle(self):
+        if self.idle_sleeper is not None:
+            self.idle_sleeper.maybe_sleep()
+
     def init_tokenizer(self):
         server_args = self.server_args
 
@@ -585,7 +619,7 @@ class Scheduler(
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
             buffer_size = (self.req_to_token_pool.size) * 2
-            req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
             self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
@@ -593,7 +627,8 @@ class Scheduler(
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
                 gloo_group=self.attn_tp_cpu_group,
-                req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
+                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+                tp_rank=self.tp_rank,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 tree_cache=self.tree_cache,
@@ -608,7 +643,7 @@ class Scheduler(
                     if self.draft_worker is None
                     else self.draft_worker.model_runner.token_to_kv_pool
                 ),
-                req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
+                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 transfer_queue=self.disagg_decode_transfer_queue,
@@ -616,7 +651,12 @@ class Scheduler(
                 gloo_group=self.attn_tp_cpu_group,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
+                dp_size=self.server_args.dp_size,
+                gpu_id=self.gpu_id,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                max_total_num_tokens=self.max_total_num_tokens,
+                prefill_pp_size=self.server_args.disaggregation_prefill_pp,
+                num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
 
@@ -626,7 +666,7 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
-            req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
             self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
@@ -638,14 +678,20 @@ class Scheduler(
                     if self.draft_worker is None
                     else self.draft_worker.model_runner.token_to_kv_pool
                 ),
-                req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
+                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
+                gpu_id=self.gpu_id,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 gloo_group=self.attn_tp_cpu_group,
-                transfer_backend=self.transfer_backend,
+                max_total_num_tokens=self.max_total_num_tokens,
+                decode_tp_size=self.server_args.disaggregation_decode_tp,
+                decode_dp_size=self.server_args.disaggregation_decode_dp,
                 scheduler=self,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                transfer_backend=self.transfer_backend,
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
@@ -667,6 +713,7 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
+                self.maybe_sleep_on_idle()
 
             self.last_batch = batch
 
@@ -711,6 +758,7 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
+                self.maybe_sleep_on_idle()
 
             self.last_batch = batch
 
@@ -816,6 +864,7 @@ class Scheduler(
             if server_is_idle:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
+                self.maybe_sleep_on_idle()
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
@@ -1073,18 +1122,22 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.disagg_prefill_bootstrap_queue.add(req)
+            self.disagg_prefill_bootstrap_queue.add(
+                req, self.model_config.num_key_value_heads
+            )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
             self.waiting_queue.append(req)
 
-    def _extend_requests_to_queue(self, reqs: List[Req]):
+    def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.disagg_prefill_bootstrap_queue.extend(reqs)
+            self.disagg_prefill_bootstrap_queue.extend(
+                reqs, self.model_config.num_key_value_heads
+            )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # If this is a decode server, we put the request to the decode pending prealloc queue
-            self.disagg_decode_prealloc_queue.extend(reqs)
+            self.disagg_decode_prealloc_queue.extend(reqs, is_retracted)
         else:
             self.waiting_queue.extend(reqs)
 
@@ -1156,15 +1209,15 @@ class Scheduler(
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-            f"#running-req: {running_bs}, "
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
             f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)}, "
-            f += f"time: {gap_latency:.2f} "
+            f += f"input throughput (token/s): {self.last_input_throughput:.2f} "
         else:
+            f += f"#running-req: {running_bs}, "
             f += f"#queue-req: {len(self.waiting_queue)}"
 
         logger.info(f)
@@ -1227,6 +1280,7 @@ class Scheduler(
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
+            msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         msg += (
             f"cuda graph: {can_run_cuda_graph}, "
@@ -1528,7 +1582,7 @@ class Scheduler(
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
-            self._extend_requests_to_queue(retracted_reqs)
+            self._extend_requests_to_queue(retracted_reqs, is_retracted=True)
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
@@ -2055,7 +2109,8 @@ class Scheduler(
             # In this case, we change the input_ids to be only one token to make this prefill cheap.
             if req.rid.startswith(recv_req.rid):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
-                req.grammar.cancel()
+                if req.grammar:
+                    req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
 
         # Delete requests in the running batch
