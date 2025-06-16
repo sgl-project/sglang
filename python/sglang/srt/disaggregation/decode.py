@@ -45,11 +45,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    ScheduleBatch,
-    global_server_args_dict,
-)
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
@@ -158,6 +154,7 @@ class DecodePreallocQueue:
         bootstrap_port: int,
         max_total_num_tokens: int,
         prefill_pp_size: int,
+        num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
     ):
         self.req_to_token_pool = req_to_token_pool
@@ -178,9 +175,7 @@ class DecodePreallocQueue:
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
         self.prefill_pp_size = prefill_pp_size
-        self.num_reserved_decode_tokens = int(
-            os.environ.get("SGLANG_NUM_RESERVED_DECODE_TOKENS", "512")
-        )
+        self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
@@ -249,6 +244,7 @@ class DecodePreallocQueue:
                 mgr=self.kv_manager,
                 bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
                 bootstrap_room=req.bootstrap_room,
+                data_parallel_rank=req.data_parallel_rank,
             )
 
             self.queue.append(
@@ -404,7 +400,6 @@ class DecodePreallocQueue:
                 ]
                 .cpu()
                 .numpy()
-                .astype(np.int64)
             )
 
             decode_req.metadata_buffer_index = (
@@ -638,15 +633,6 @@ class DecodeTransferQueue:
 
 class SchedulerDisaggregationDecodeMixin:
 
-    def _prepare_idle_batch_and_run(self, batch, delay_process=False):
-        batch, _ = self.prepare_dp_attn_batch(batch)
-        result = None
-        if batch:
-            result = self.run_batch(batch)
-            if not delay_process:
-                self.process_batch_result(batch, result)
-        return batch, result
-
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
@@ -774,6 +760,15 @@ class SchedulerDisaggregationDecodeMixin:
 
             self.last_batch = batch
             self.last_batch_in_queue = last_batch_in_queue
+
+    def _prepare_idle_batch_and_run(self, batch, delay_process=False):
+        batch, _ = self.prepare_dp_attn_batch(batch)
+        result = None
+        if batch:
+            result = self.run_batch(batch)
+            if not delay_process:
+                self.process_batch_result(batch, result)
+        return batch, result
 
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,

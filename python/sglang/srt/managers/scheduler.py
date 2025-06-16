@@ -656,6 +656,7 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
                 prefill_pp_size=self.server_args.disaggregation_prefill_pp,
+                num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
 
@@ -2108,7 +2109,8 @@ class Scheduler(
             # In this case, we change the input_ids to be only one token to make this prefill cheap.
             if req.rid.startswith(recv_req.rid):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
-                req.grammar.cancel()
+                if req.grammar:
+                    req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
 
         # Delete requests in the running batch

@@ -59,7 +59,7 @@ class KVTransferError(Exception):
 @dataclasses.dataclass
 class TransferKVChunk:
     room: int
-    prefill_kv_indices: npt.NDArray[np.int64]
+    prefill_kv_indices: npt.NDArray[np.int32]
     index_slice: slice
     is_last: bool
     prefill_aux_index: Optional[int]
@@ -72,7 +72,7 @@ class TransferInfo:
     endpoint: str
     dst_port: int
     mooncake_session_id: str
-    dst_kv_indices: npt.NDArray[np.int64]
+    dst_kv_indices: npt.NDArray[np.int32]
     dst_aux_index: int
     required_dst_info_num: int
     is_dummy: bool
@@ -81,10 +81,10 @@ class TransferInfo:
     def from_zmq(cls, msg: List[bytes]):
         if msg[4] == b"" and msg[5] == b"":
             is_dummy = True
-            dst_kv_indices = np.array([], dtype=np.int64)
+            dst_kv_indices = np.array([], dtype=np.int32)
             dst_aux_index = None
         else:
-            dst_kv_indices = np.frombuffer(msg[4], dtype=np.int64)
+            dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
             dst_aux_index = int(msg[5].decode("ascii"))
             is_dummy = False
         return cls(
@@ -233,9 +233,9 @@ class MooncakeKVManager(BaseKVManager):
     def send_kvcache(
         self,
         mooncake_session_id: str,
-        prefill_kv_indices: npt.NDArray[np.int64],
+        prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: list[int],
-        dst_kv_indices: npt.NDArray[np.int64],
+        dst_kv_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
         # Group by indices
@@ -545,7 +545,7 @@ class MooncakeKVManager(BaseKVManager):
     def add_transfer_request(
         self,
         bootstrap_room: int,
-        kv_indices: npt.NDArray[np.int64],
+        kv_indices: npt.NDArray[np.int32],
         index_slice: slice,
         is_last: bool,
         aux_index: Optional[int] = None,
@@ -701,7 +701,7 @@ class MooncakeKVSender(BaseKVSender):
 
     def send(
         self,
-        kv_indices: npt.NDArray[np.int64],
+        kv_indices: npt.NDArray[np.int32],
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
@@ -971,7 +971,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
-    def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+    def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
         for bootstrap_info in self.bootstrap_infos:
             self.prefill_server_url = (
                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
