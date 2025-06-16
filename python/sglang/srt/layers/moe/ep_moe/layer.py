@@ -1231,7 +1231,7 @@ class DeepEPMoE(EPMoE):
             gateup_output,
             masked_m,
             expected_m,
-            recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_V202506 else None,
+            recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_BLACKWELL else None,
         )
         dispose_tensor(hidden_states_fp8[0])
 
@@ -1286,7 +1286,7 @@ class DeepEPMoE(EPMoE):
             down_output,
             masked_m,
             expected_m,
-            recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_V202506 else None,
+            recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_BLACKWELL else None,
         )
 
         return down_output
