@@ -466,7 +466,6 @@ class Engine(EngineBase):
         )
 
     def release_memory_occupation(self, tags: Optional[List[str]] = None):
-        """Pause GPU Memory occupation temporarily for Model Weights and KV Cache."""
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
@@ -474,7 +473,6 @@ class Engine(EngineBase):
         )
 
     def resume_memory_occupation(self, tags: Optional[List[str]] = None):
-        """Resume GPU Memory occupation for Model Weights and KV Cache."""
         obj = ResumeMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(

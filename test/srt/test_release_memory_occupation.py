@@ -108,7 +108,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         engine.shutdown()
 
     def test_multi_stage_release_and_resume(self):
-        # With multi-stage release and resume, we can set the memory fraction to 0.95 without concern of OOM
+        # With multi-stage release and resume, we can set the memory fraction to 0.9 without concern of OOM
         # Use TP2 to test multi-process environment (similar to GRPO's Ray workers)
         model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         engine = sgl.Engine(

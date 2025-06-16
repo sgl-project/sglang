@@ -2179,7 +2179,6 @@ class Scheduler(
         if tags is None:
             tags = ["weights", "kv_cache"]
 
-        # LIFO order: pause kv_cache first, then weights
         if "kv_cache" in tags:
             self.memory_saver_adapter.pause("kv_cache")
             self.flush_cache()
