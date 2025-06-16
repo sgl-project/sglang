@@ -1141,6 +1141,7 @@ def fill_gateup_input_triton_kernel(
     src_ptr = input_ptr + src_idx * hidden_size
     scale_src_ptr = scale_ptr + src_idx * scale_size
 
+    vec = tl.arange(0, BLOCK_SIZE)
     for idx in range(topk):
         expert_id = tl.load(topk_ids_ptr + idx)
         if expert_id >= start_expert_id and expert_id <= end_expert_id:
@@ -1149,13 +1150,13 @@ def fill_gateup_input_triton_kernel(
             dst_idx = dst_idx - start_expert_id * m_max
             dst_ptr = gateup_input_ptr + dst_idx * hidden_size
             for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
-                offset = start_offset + tl.arange(0, BLOCK_SIZE)
+                offset = start_offset + vec
                 mask = offset < hidden_size
                 in_data = tl.load(src_ptr + offset, mask=mask)
                 tl.store(dst_ptr + offset, in_data, mask=mask)
             scale_dst_ptr = gateup_input_scale_ptr + dst_idx * scale_size
             for start_offset in tl.range(0, scale_size, BLOCK_SIZE):
-                offset = start_offset + tl.arange(0, BLOCK_SIZE)
+                offset = start_offset + vec
                 mask = offset < scale_size
                 in_scale = tl.load(scale_src_ptr + offset, mask=mask)
                 tl.store(scale_dst_ptr + offset, in_scale, mask=mask)
