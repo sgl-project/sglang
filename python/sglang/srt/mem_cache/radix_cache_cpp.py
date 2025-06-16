@@ -66,14 +66,14 @@ class DebugTree:
             def wrapper(*args):
                 result = func(*args)
                 print("=" * 100)
-                logger.error(f"[DEBUG Tree]: Calling {name} method, {args=}")
-                logger.error(f"[DEBUG Tree]: {result=}")
+                logger.info(f"[DEBUG Tree]: Calling {name} method, {args=}")
+                logger.info(f"[DEBUG Tree]: {result=}")
                 import traceback
 
                 # print out recent 5 functions
                 stack = traceback.extract_stack()[-5:]
                 for frame in stack:
-                    logger.error(
+                    logger.info(
                         f"[DEBUG Tree]: {frame.filename}:{frame.lineno} in function <{frame.name}>"
                     )
                 self.tree.debug_print()
@@ -330,6 +330,8 @@ class HiRadixCacheCpp(BasePrefixCache):
         hicache_write_policy: str,
         enable_kv_cache_events: bool,
     ):
+        self.disable = disable
+
         assert (
             enable_kv_cache_events is False
         ), "HiRadixCache does not support kv cache events yet"
@@ -462,19 +464,16 @@ class HiRadixCacheCpp(BasePrefixCache):
         """Cache request when it finishes."""
         assert req.req_pool_idx is not None
         token_ids = (req.origin_input_ids + req.output_ids)[:-1]
-        seq_len = len(token_ids)
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :seq_len]
+        overall_len = len(token_ids) # prefill + decode
+        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :overall_len]
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
-        old_prefix_len = len(req.prefix_indices)
+        old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
         new_prefix_len = self.insert(token_ids, kv_indices)
 
-        assert (
-            (old_prefix_len % self.page_size) == (new_prefix_len % self.page_size) == 0
-        ) and old_prefix_len <= new_prefix_len, "Prefix lengths should always be page-aligned, otherwise it will cause errors"
-
         # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
+        assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
 
         # KVCache between old & new is newly generated, but already exists in the pool
         # we need to free this newly generated kv indices
@@ -482,11 +481,11 @@ class HiRadixCacheCpp(BasePrefixCache):
             self.token_to_kv_pool.free(kv_indices[old_prefix_len:new_prefix_len])
 
         # need to free the unaligned part, since it cannot be inserted into the radix tree
-        # NOTE: sglang PagedAllocator support unaligned free (which will automatically align it)
         if self.page_size != 1 and (  # unaligned tail only exists when page_size > 1
-            (unaligned_len := seq_len % self.page_size) > 0
+            (unaligned_len := overall_len % self.page_size) > 0
         ):
-            self.token_to_kv_pool.free(kv_indices[seq_len - unaligned_len :])
+            # NOTE: sglang PagedAllocator support unaligned free (which will automatically align it)
+            self.token_to_kv_pool.free(kv_indices[overall_len - unaligned_len :])
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
@@ -496,44 +495,44 @@ class HiRadixCacheCpp(BasePrefixCache):
         """Cache request when it is unfinished."""
         assert req.req_pool_idx is not None
         token_ids = req.fill_ids
-        seq_len = len(token_ids)
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :seq_len]
+        prefill_len = len(token_ids) # prefill only (maybe chunked)
+        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :prefill_len]
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
-        old_prefix_len = len(req.prefix_indices)
+        old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
         new_prefix_len = self.insert(token_ids, kv_indices)
 
-        assert (
-            (old_prefix_len % self.page_size) == (new_prefix_len % self.page_size) == 0
-        ) and old_prefix_len <= new_prefix_len, "Prefix lengths should always be page-aligned, otherwise it will cause errors"
-
         # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
-        # TODO(dark): optimize the insert and match (e.g. merge into 1 function)
+        assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
 
-        # KVCache between old & new is newly generated, but already exists in the pool
-        # we need to free this newly generated kv indices and reuse the indices in the pool
-        if old_prefix_len < new_prefix_len:
-            self.token_to_kv_pool.free(kv_indices[old_prefix_len:new_prefix_len])
-
+        # TODO(dark): optimize the `insert` and `match` (e.g. merge into 1 function)
         # The prefix indices need to updated to reuse the kv indices in the pool
         new_indices_vec, _, new_last_node, _ = self.tree.match_prefix(token_ids)
         new_indices = self.merge_tensor(new_indices_vec)
         assert new_prefix_len <= len(new_indices)
 
-        # these part are reused from the pool
-        reused_indices = new_indices[old_prefix_len:new_prefix_len]
-
-        self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, old_prefix_len:new_prefix_len
-        ] = reused_indices
+        # KVCache between old & new is newly generated, but already exists in the pool
+        # we need to free this newly generated kv indices and reuse the indices in the pool
+        if old_prefix_len < new_prefix_len:
+            self.token_to_kv_pool.free(kv_indices[old_prefix_len:new_prefix_len])
+            reused_indices = new_indices[old_prefix_len:new_prefix_len]
+            self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, old_prefix_len:new_prefix_len
+            ] = reused_indices
 
         if req.last_node != new_last_node:
             self.dec_lock_ref(req.last_node)
             self.inc_lock_ref(new_last_node)
 
-        # NOTE: prefix indices must match with last node
-        req.prefix_indices = new_indices
+        # NOTE: there might be unaligned tail, so we may need to append it
+        assert len(new_indices) <= prefill_len < len(new_indices) + self.page_size
+        if self.page_size != 1 and len(new_indices) < prefill_len:
+            req.prefix_indices = torch.cat(
+                [new_indices, kv_indices[len(new_indices) :]]
+            )
+        else:
+            req.prefix_indices = new_indices
         req.last_node = new_last_node
 
     def init_load_host(
