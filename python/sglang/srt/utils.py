@@ -2611,6 +2611,8 @@ def update_config(
     model_config: ModelConfig, load_config: LoadConfig, tp_size: int
 ) -> ModelConfig:
     # Support the case where the num_attention_heads is not divisible by the TP size.
+    weight_block_size = may_get_weight_block_size(model_config, load_config)
+
     if model_config.num_attention_heads % tp_size != 0:
         query_heads_per_kv = (
             model_config.num_attention_heads // model_config.get_total_num_kv_heads()
@@ -2618,7 +2620,6 @@ def update_config(
         total_kv_heads = model_config.get_total_num_kv_heads()
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
-        weight_block_size = may_get_weight_block_size(model_config, load_config)
         pad_size = get_num_heads_padding_size(tp_size, weight_block_size)
         num_key_value_heads = pad_vocab_size(total_kv_heads, pad_size)
 
