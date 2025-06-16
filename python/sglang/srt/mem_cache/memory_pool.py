@@ -185,7 +185,7 @@ class TokenToKVPoolAllocator:
     def get_kvcache(self):
         return self._kvcache
 
-    def alloc(self, need_size: int):
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > len(self.free_slots):
             return None
 

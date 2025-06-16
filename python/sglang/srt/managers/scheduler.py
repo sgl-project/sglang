@@ -129,6 +129,7 @@ from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.radix_cache_cpp import HiRadixCacheCpp
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -218,6 +219,7 @@ class Scheduler(
     ):
         # Parse args
         self.server_args = server_args
+        self.page_size = server_args.page_size
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
         self.tp_size = server_args.tp_size
@@ -555,7 +557,20 @@ class Scheduler(
                 page_size=self.page_size,
             )
         else:
-            if self.enable_hierarchical_cache:
+            if os.environ.get("SGLANG_EXPERIMENTAL_HIRADIX_CACHE") == "1":
+                self.tree_cache = HiRadixCacheCpp(
+                    disable=False,
+                    use_hicache=self.enable_hierarchical_cache,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool=self.token_to_kv_pool_allocator,
+                    tp_cache_group=self.tp_cpu_group,
+                    page_size=self.page_size,
+                    hicache_ratio=server_args.hicache_ratio,
+                    hicache_size=server_args.hicache_size,
+                    hicache_write_policy=server_args.hicache_write_policy,
+                    enable_kv_cache_events=False,
+                )
+            elif self.enable_hierarchical_cache:
                 self.tree_cache = HiRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -1426,16 +1441,14 @@ class Scheduler(
             self.running_batch.batch_is_full = True
             return None
 
-        if self.enable_hierarchical_cache:
-            # check for completion of hierarchical cache activities to release memory
-            self.tree_cache.writing_check()
-            self.tree_cache.loading_check()
+        self.tree_cache.check_host_cache()
 
         # Get priority queue
-        prefix_computed = self.policy.calc_priority(self.waiting_queue)
+        self.policy.calc_priority(self.waiting_queue)
 
         # Prefill policy
         adder = PrefillAdder(
+            self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
@@ -1446,7 +1459,7 @@ class Scheduler(
         )
 
         if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
+            self.chunked_req.init_next_prefill()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.lora_paths:
@@ -1477,14 +1490,7 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
                     break
 
-            req.init_next_round_input(
-                None if prefix_computed else self.tree_cache,
-                self.enable_hierarchical_cache,
-            )
-
-            res = adder.add_one_req(
-                req, self.chunked_req, self.enable_hierarchical_cache
-            )
+            res = adder.add_one_req(req, (self.chunked_req is not None))
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -1511,8 +1517,7 @@ class Scheduler(
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
 
-        if self.enable_hierarchical_cache:
-            self.tree_cache.ready_to_load_cache()
+        self.tree_cache.ready_to_load_host()
 
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None

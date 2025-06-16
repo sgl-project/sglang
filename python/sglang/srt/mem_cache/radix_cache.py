@@ -23,7 +23,7 @@ import heapq
 import time
 from collections import defaultdict
 from functools import partial
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -33,8 +33,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStored,
     KVCacheEvent,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 
 if TYPE_CHECKING:
@@ -47,9 +46,9 @@ class TreeNode:
 
     def __init__(self, id: Optional[int] = None):
         self.children = defaultdict(TreeNode)
-        self.parent = None
-        self.key = None
-        self.value = None
+        self.parent: TreeNode = None
+        self.key: List[int] = []
+        self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
 
@@ -57,7 +56,7 @@ class TreeNode:
         # indicating the node is loading KV cache from host
         self.loading = False
         # store the host indices of KV cache
-        self.host_value = None
+        self.host_value: Optional[torch.Tensor] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -135,7 +134,7 @@ class RadixCache(BasePrefixCache):
         self.protected_size_ = 0
         self._record_all_cleared_event()
 
-    def match_prefix(self, key: List[int], **kwargs) -> Tuple[torch.Tensor, int]:
+    def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
         """Find the matching prefix from the radix tree.
         Args:
             key: A list of token IDs to find a matching prefix.
@@ -147,13 +146,10 @@ class RadixCache(BasePrefixCache):
             than the last node's value.
         """
         if self.disable or len(key) == 0:
-            return (
-                torch.empty(
-                    (0,),
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                self.root_node,
+            return MatchResult(
+                device_indices=self.empty_indices(self.device),
+                last_device_node=self.root_node,
+                last_host_node=self.root_node,
             )
 
         if self.page_size != 1:
@@ -165,7 +161,11 @@ class RadixCache(BasePrefixCache):
             value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
-        return value, last_node
+        return MatchResult(
+            device_indices=value,
+            last_device_node=last_node,
+            last_host_node=last_node,
+        )
 
     def insert(self, key: List, value=None):
         if self.disable:
@@ -235,7 +235,7 @@ class RadixCache(BasePrefixCache):
         )
 
         # The prefix indices could be updated, reuse it
-        new_indices, new_last_node = self.match_prefix(page_aligned_token_ids)
+        new_indices, new_last_node, _, _ = self.match_prefix(page_aligned_token_ids)
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(len(req.prefix_indices), len(new_indices))),
             new_indices[len(req.prefix_indices) :],
@@ -292,6 +292,7 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 0:
+                assert node.value is not None
                 self.evictable_size_ -= len(node.value)
                 self.protected_size_ += len(node.value)
                 delta -= len(node.value)
@@ -306,6 +307,7 @@ class RadixCache(BasePrefixCache):
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 1:
+                assert node.value is not None
                 self.evictable_size_ += len(node.value)
                 self.protected_size_ -= len(node.value)
                 delta += len(node.value)
@@ -521,11 +523,11 @@ class RadixCache(BasePrefixCache):
 
 
 if __name__ == "__main__":
-    tree = RadixCache(None, None, page_size=1, disable=False)
+    tree = RadixCache(None, None, page_size=1, disable=False)  # type: ignore
 
-    tree.insert("Hello")
-    tree.insert("Hello")
-    tree.insert("Hello_L.A.!")
+    tree.insert("Hello")  # type: ignore
+    tree.insert("Hello")  # type: ignore
+    tree.insert("Hello_L.A.!")  # type: ignore
     # tree.insert("Hello_world! Happy")
     # tree.insert("I love you!")
     tree.pretty_print()
