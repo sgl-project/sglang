@@ -21,9 +21,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.dp_attention import dp_gather_weight
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -130,23 +128,14 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.model = DeepseekModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-
-        if global_server_args_dict["enable_dp_attention"]:
-            self.lm_head = ReplicatedLinear(
-                config.hidden_size,
-                config.vocab_size,
-                bias=False,
-                prefix=add_prefix("model.shared_head.head", prefix),
-            )
-            self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
-        else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("model.shared_head.head", prefix),
-            )
-            self.logits_processor = LogitsProcessor(config)
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("model.shared_head.head", prefix),
+            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+        )
+        self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
     def forward(
@@ -162,23 +151,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)
-
-    def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        self.model.embed_tokens.weight = embed
-        if global_server_args_dict["enable_dp_attention"]:
-            global_head_data, local_head_data = (
-                torch.empty_like(self.lm_head.weight.data),
-                head.data,
-            )
-            use_attn_tp_group = global_server_args_dict["enable_dp_lm_head"]
-            dp_gather_weight(global_head_data, local_head_data, use_attn_tp_group)
-            self.lm_head.weight.data = global_head_data
-        else:
-            del self.lm_head.weight
-            self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
 
 
 EntryClass = [DeepseekV3ForCausalLMNextN]

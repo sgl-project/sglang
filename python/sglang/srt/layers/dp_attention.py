@@ -301,40 +301,6 @@ def dp_scatter(
         )
 
 
-def dp_gather_weight(
-    global_tokens: torch.Tensor,
-    local_tokens: torch.Tensor,
-    use_attn_tp_group: bool,
-):
-    global_tokens.fill_(0)
-    assert local_tokens.is_contiguous()
-    assert global_tokens.is_contiguous()
-
-    if use_attn_tp_group:
-        if get_attention_tp_size() > 1:
-            attn_tp_all_gather(
-                list(global_tokens.tensor_split(get_attention_tp_size())),
-                local_tokens,
-            )
-        else:
-            global_tokens[:] = local_tokens
-    else:
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between global_tokens and local_tokens not allowed"
-        local_num_tokens = torch.tensor(
-            local_tokens.shape[0], device=local_tokens.device, dtype=torch.int64
-        )
-        start_pos = (
-            get_attention_dp_rank() * get_attention_tp_size() + get_attention_tp_rank()
-        ) * local_num_tokens
-        memcpy_triton(
-            global_tokens, local_tokens, 0, start_pos, local_num_tokens, False
-        )
-
-        global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
-
-
 def attn_tp_reduce_scatter(
     output: torch.Tensor,
     input_list: List[torch.Tensor],
