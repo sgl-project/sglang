@@ -8,10 +8,14 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_npu = is_npu()
+
+if _is_npu:
+    import torch_npu
 
 if _is_cuda:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
@@ -146,6 +150,23 @@ class RotaryEmbedding(CustomOp):
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
+
+    def forward_npu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """A PyTorch-npu implementation of forward()."""
+        default_rotary_mode = 'half'
+        if self.is_neox_style:
+            default_rotary_mode = 'half'
+        else:
+            default_rotary_mode = 'interleave'
+        mrope_section = [0, 0, 0]
+        query_out, key_out = torch_npu.npu_mrope(positions, query, key, self.cos_sin_cache, self.head_size, mrope_section=mrope_section, rotary_mode=rotary_mode)
+        return query_out, key_out
 
     def forward_cuda(
         self,
