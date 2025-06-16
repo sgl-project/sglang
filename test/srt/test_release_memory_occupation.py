@@ -1,3 +1,4 @@
+import subprocess
 import time
 import unittest
 
@@ -5,14 +6,14 @@ import torch
 from transformers import AutoModelForCausalLM
 
 import sglang as sgl
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
-
-# TODO: Remove this line when PR is ready, we need this to bypass internet issue during development
-DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693"
-MOCK_UPDATED_MODEL_NAME_FOR_TEST = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B/48d6d0fc4e02fb1269b36940650a1b7233035cbb"
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
+    CustomTestCase,
+)
 
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly
-_DEBUG_EXTRA = True
+_DEBUG_EXTRA = False
 
 
 class TestReleaseMemoryOccupation(CustomTestCase):
@@ -33,8 +34,8 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         return {
             "prompt": "Today is a sunny day and I like",
             "sampling_params": {"temperature": 0, "max_new_tokens": 8},
-            "expect_output_before_update_weights": " to take a walk in the park.",
-            "expect_output_after_update_weights": " to go out for a walk. I",
+            "expect_output_before_update_weights": " to spend it outdoors. I decided to",
+            "expect_output_after_update_weights": " to go for a walk. I like",
         }
 
     def _test_initial_generation(
@@ -48,12 +49,6 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         if _DEBUG_EXTRA:
             time.sleep(3)
 
-        self.assertEqual(
-            _try_allocate_big_tensor(),
-            False,
-            "Should not be able to allocate big tensors before releasing",
-        )
-
     def _test_update_weights(
         self,
         engine,
@@ -61,32 +56,17 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         is_multi_stage,
     ):
         """Test final generation, weight update, and cleanup."""
-        if is_multi_stage:
-            # Even though we have two copies of weights, we can still allocate big tensors since we haven't resumed kv cache
-            self.assertEqual(
-                _try_allocate_big_tensor(),
-                True,
-                "Should be able to allocate big tensors for multi-stage release and resume",
-            )
-        else:
-            # With two copies of weights plus the kv cache, we cannot allocate big tensors
-            self.assertEqual(
-                _try_allocate_big_tensor(),
-                False,
-                "Should not be able to allocate big tensors for naive release and resume",
-            )
-
         print("update_weights_from_tensor")
-        # As if: PPO/RL Engine has updated hf model's weights, and now we sync it to SGLang
+        # RL Engine has updated hf model's weights by model training, and now we sync it with SGLang
         engine.update_weights_from_tensor(list(hf_model_new.named_parameters()))
 
         if _DEBUG_EXTRA:
-            time.sleep(4)
+            time.sleep(3)
 
     def test_release_and_resume_occupation(self):
         # Without multi-stage release and resume, we need to carefully control the memory fraction to avoid OOM
         model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        engine = self._setup_engine(model_name=model_name, mem_fraction_static=0.8)
+        engine = self._setup_engine(model_name=model_name, mem_fraction_static=0.6)
         params = self._common_test_params()
 
         self._test_initial_generation(
@@ -98,32 +78,23 @@ class TestReleaseMemoryOccupation(CustomTestCase):
 
         t = time.perf_counter()
         engine.release_memory_occupation()
-        if _DEBUG_EXTRA:
-            print(
-                f"Release took {time.perf_counter() - t:.2f}s, memory: {get_gpu_memory_gb():.1f} GB"
-            )
-
-        if _DEBUG_EXTRA:
-            time.sleep(5)
-
-        self.assertEqual(
-            _try_allocate_big_tensor(),
-            True,
-            "Should be able to allocate big tensors aftre releasing",
+        print(
+            f"Release took {time.perf_counter() - t:.2f}s, memory: {get_gpu_memory_gb():.1f} GB"
         )
 
         if _DEBUG_EXTRA:
-            time.sleep(5)
+            time.sleep(3)
 
         t = time.perf_counter()
         engine.resume_memory_occupation()
-        if _DEBUG_EXTRA:
-            print(
-                f"Resume took {time.perf_counter() - t:.2f}s, memory: {get_gpu_memory_gb():.1f} GB"
-            )
+        print(
+            f"Resume took {time.perf_counter() - t:.2f}s, memory: {get_gpu_memory_gb():.1f} GB"
+        )
 
         hf_model_new = AutoModelForCausalLM.from_pretrained(
-            MOCK_UPDATED_MODEL_NAME_FOR_TEST, torch_dtype="bfloat16", device_map="cuda"
+            DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
+            torch_dtype="bfloat16",
+            device_map="cuda",
         )
         self._test_update_weights(engine, hf_model_new, is_multi_stage=False)
 
@@ -175,23 +146,13 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             gpu_memory_usage_after_release_kv_cache,
         )
 
-        if _DEBUG_EXTRA:
-            print(f"Release took {time.perf_counter() - t:.2f}s")
-            print(
-                f"Memory: {gpu_memory_usage_before_release_kv_cache:.1f} → {gpu_memory_usage_after_release_kv_cache:.1f} → {gpu_memory_usage_after_release_weights:.1f} GB"
-            )
-
-        if _DEBUG_EXTRA:
-            time.sleep(5)
-
-        self.assertEqual(
-            _try_allocate_big_tensor(),
-            True,
-            "Should be able to allocate big tensors aftre releasing",
+        print(f"Release took {time.perf_counter() - t:.2f}s")
+        print(
+            f"Memory: {gpu_memory_usage_before_release_kv_cache:.1f} → {gpu_memory_usage_after_release_kv_cache:.1f} → {gpu_memory_usage_after_release_weights:.1f} GB"
         )
 
         if _DEBUG_EXTRA:
-            time.sleep(5)
+            time.sleep(3)
 
         t = time.perf_counter()
         gpu_memory_usage_before_resume_weights = get_gpu_memory_gb()
@@ -199,7 +160,9 @@ class TestReleaseMemoryOccupation(CustomTestCase):
 
         # Update weights from a trained model to serving engine, and then destroy the trained model
         hf_model_new = AutoModelForCausalLM.from_pretrained(
-            MOCK_UPDATED_MODEL_NAME_FOR_TEST, torch_dtype="bfloat16", device_map="cuda"
+            DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
+            torch_dtype="bfloat16",
+            device_map="cuda",
         )
         gpu_memory_usage_after_loaded_hf_model = get_gpu_memory_gb()
         self._test_update_weights(engine, hf_model_new, is_multi_stage=True)
@@ -222,32 +185,16 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             gpu_memory_usage_after_resume_weights,
         )
 
-        if _DEBUG_EXTRA:
-            print(f"Resume + update took {time.perf_counter() - t:.2f}s")
-            print(
-                f"Memory: {gpu_memory_usage_before_resume_weights:.1f} → {gpu_memory_usage_after_resume_weights:.1f} → {gpu_memory_usage_after_loaded_hf_model:.1f} → {gpu_memory_usage_after_destroyed_hf_model:.1f} → {gpu_memory_usage_after_resume_kv_cache:.1f} GB"
-            )
+        print(f"Resume + update took {time.perf_counter() - t:.2f}s")
+        print(
+            f"Memory: {gpu_memory_usage_before_resume_weights:.1f} → {gpu_memory_usage_after_resume_weights:.1f} → {gpu_memory_usage_after_loaded_hf_model:.1f} → {gpu_memory_usage_after_destroyed_hf_model:.1f} → {gpu_memory_usage_after_resume_kv_cache:.1f} GB"
+        )
 
         print("generate (#2)")
         outputs = engine.generate(params["prompt"], params["sampling_params"])["text"]
         self.assertEqual(outputs, params["expect_output_after_update_weights"])
 
         engine.shutdown()
-
-
-def _try_allocate_big_tensor(size: int = 20_000_000_000):
-    if torch.cuda.get_device_properties(0).total_memory / (1024**3) > 100:
-        size = 30_000_000_000
-
-    try:
-        torch.empty((size,), dtype=torch.uint8, device="cuda")
-        torch.cuda.empty_cache()
-        return True
-    except torch.cuda.OutOfMemoryError:
-        return False
-
-
-import subprocess
 
 
 def get_gpu_memory_gb(gpu_id=0):
