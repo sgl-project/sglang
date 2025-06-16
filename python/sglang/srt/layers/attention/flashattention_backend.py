@@ -1807,7 +1807,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
-        return 0
+        return 1
 
     def _init_local_attn_metadata(self, metadata: FlashAttentionMetadata, device):
         """Centralized utility to initialize local_attn_metadata if chunked attention is enabled."""
