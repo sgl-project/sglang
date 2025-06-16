@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
+    DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST,
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -623,7 +624,7 @@ class Test11(CustomTestCase):
 class Test12(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -636,6 +637,7 @@ class Test12(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "normal",
+                "--disable-cuda-graph",
             ],
         )
 
@@ -673,7 +675,7 @@ class Test12(CustomTestCase):
 class Test13(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -689,6 +691,7 @@ class Test13(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "normal",
+                "--disable-cuda-graph",
             ],
         )
 
@@ -726,7 +729,7 @@ class Test13(CustomTestCase):
 class Test14(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -742,6 +745,7 @@ class Test14(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "normal",
+                "--disable-cuda-graph",
             ],
         )
 
@@ -779,7 +783,7 @@ class Test14(CustomTestCase):
 class Test15(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -794,6 +798,7 @@ class Test15(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "normal",
+                "--disable-cuda-graph",
             ],
         )
 
@@ -831,7 +836,7 @@ class Test15(CustomTestCase):
 class Test16(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -849,6 +854,7 @@ class Test16(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "normal",
+                "--disable-cuda-graph",
             ],
         )
 
@@ -886,7 +892,7 @@ class Test16(CustomTestCase):
 class Test17(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -904,6 +910,7 @@ class Test17(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "normal",
+                "--disable-cuda-graph",
             ],
         )
 
@@ -941,7 +948,7 @@ class Test17(CustomTestCase):
 class Test18(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -955,6 +962,7 @@ class Test18(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "normal",
+                "--disable-cuda-graph",
             ],
         )
 
@@ -992,7 +1000,7 @@ class Test18(CustomTestCase):
 class Test19(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1009,6 +1017,7 @@ class Test19(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "normal",
+                "--disable-cuda-graph",
             ],
         )
 
@@ -1046,7 +1055,7 @@ class Test19(CustomTestCase):
 class Test20(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1063,6 +1072,7 @@ class Test20(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "normal",
+                "--disable-cuda-graph",
             ],
         )
 
@@ -1100,7 +1110,7 @@ class Test20(CustomTestCase):
 class Test21(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1116,6 +1126,7 @@ class Test21(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "normal",
+                "--disable-cuda-graph",
             ],
         )
 
@@ -1153,7 +1164,7 @@ class Test21(CustomTestCase):
 class Test22(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1172,6 +1183,7 @@ class Test22(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "normal",
+                "--disable-cuda-graph",
             ],
         )
 
@@ -1209,7 +1221,7 @@ class Test22(CustomTestCase):
 class Test23(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -1228,6 +1240,7 @@ class Test23(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "normal",
+                "--disable-cuda-graph",
             ],
         )
 
