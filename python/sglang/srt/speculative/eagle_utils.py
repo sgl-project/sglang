@@ -327,11 +327,11 @@ class EagleVerifyInput:
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=accept_length,  # mutable
-                candidates=candidates.to(torch.int32),
-                retrive_index=self.retrive_index.to(torch.int32),
-                retrive_next_token=self.retrive_next_token.to(torch.int32),
-                retrive_next_sibling=self.retrive_next_sibling.to(torch.int32),
-                target_predict=target_predict.to(torch.int32),
+                candidates=candidates,
+                retrive_index=self.retrive_index,
+                retrive_next_token=self.retrive_next_token,
+                retrive_next_sibling=self.retrive_next_sibling,
+                target_predict=target_predict,
             )
         else:
             # apply temperature and get target probs
@@ -370,12 +370,12 @@ class EagleVerifyInput:
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=accept_length,  # mutable
-                candidates=candidates.to(torch.int32),
-                retrive_index=self.retrive_index.to(torch.int32),
-                retrive_next_token=self.retrive_next_token.to(torch.int32),
-                retrive_next_sibling=self.retrive_next_sibling.to(torch.int32),
+                candidates=candidates,
+                retrive_index=self.retrive_index,
+                retrive_next_token=self.retrive_next_token,
+                retrive_next_sibling=self.retrive_next_sibling,
                 uniform_samples=coins,
-                # uniform_samples_for_final_sampling=coins_for_final_sampling,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
                 target_probs=target_probs,
                 draft_probs=draft_probs,
                 threshold_single=global_server_args_dict[
