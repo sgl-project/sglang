@@ -311,10 +311,13 @@ def dp_gather_weight(
     assert global_tokens.is_contiguous()
 
     if use_attn_tp_group:
-        attn_tp_all_gather(
-            list(global_tokens.tensor_split(get_attention_tp_size())),
-            local_tokens,
-        )
+        if get_attention_tp_size() > 1:
+            attn_tp_all_gather(
+                list(global_tokens.tensor_split(get_attention_tp_size())),
+                local_tokens,
+            )
+        else:
+            global_tokens[:] = local_tokens
     else:
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
