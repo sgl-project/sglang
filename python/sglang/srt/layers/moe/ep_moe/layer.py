@@ -241,7 +241,11 @@ class EPMoE(torch.nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
-        if use_deep_gemm and _ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
+        if (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and _ENABLE_JIT_DEEPGEMM
+            and self.use_fp8_w8a8
+        ):
             return self.forward_deepgemm(hidden_states, router_logits)
         else:
             return self.forward_normal(hidden_states, router_logits)
@@ -284,14 +288,14 @@ class EPMoE(torch.nn.Module):
         # GroupGemm-0
         gateup_input_fp8 = (
             gateup_input,
-            get_col_major_tma_aligned_tensor(gateup_input_scale),
+            deep_gemm_wrapper.get_col_major_tma_aligned_tensor(gateup_input_scale),
         )
         num_groups, m, k = gateup_input_fp8[0].size()
         n = self.w13_weight.size(1)
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
             gateup_input_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
         )
         del gateup_input
@@ -330,12 +334,12 @@ class EPMoE(torch.nn.Module):
         n = self.w2_weight.size(1)
         down_input_fp8 = (
             down_input,
-            get_col_major_tma_aligned_tensor(down_input_scale),
+            deep_gemm_wrapper.get_col_major_tma_aligned_tensor(down_input_scale),
         )
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        m_grouped_gemm_fp8_fp8_bf16_nt_masked(
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
             down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
         )
         del down_input
