@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import is_cuda, kill_process_tree
+from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
