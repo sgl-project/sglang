@@ -314,7 +314,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
             )
         except Exception:
-            # Handle different tools input format (e.g., Mistral)
+            #  This except branch will be triggered when the chosen model
+            #  has a different tools input format that is not compatible
+            #  with openAI's apply_chat_template tool_call format, like Mistral.
             tools = (
                 [t if "function" in t else {"function": t} for t in tools]
                 if tools
