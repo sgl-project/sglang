@@ -579,6 +579,7 @@ class Req:
                 self.output_token_ids_logprobs_idx
             ) = None
         self.hidden_states: List[List[float]] = []
+        self.hidden_states_tensor = None # TODO: use tensor instead of list when needed
 
         # Embedding (return values)
         self.embedding = None

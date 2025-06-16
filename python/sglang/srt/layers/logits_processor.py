@@ -331,7 +331,7 @@ class LogitsProcessor(nn.Module):
             full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
             dump_to_file(self.debug_tensor_dump_output_folder, "logits", full_logits)
 
-        hidden_states_to_store: Optional[torch.Tensor] = None
+        hidden_states_to_store: Optional[torch.Tensor] = hidden_states
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
