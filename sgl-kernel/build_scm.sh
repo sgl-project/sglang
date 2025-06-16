@@ -42,6 +42,8 @@ if [[ $BRANCH_NAME =~ ^release[\/_] ]]; then
        BRANCH_NAME=.${BRANCH_NAME}
    fi
    VERSION_SUFFIX=+byted${BRANCH_NAME}.${BUILD_TIME}
+elif [[ $BRANCH_NAME == ep_main ]]; then
+   VERSION_SUFFIX=+iaas.dev.${BUILD_TIME}
 else
    echo "not release branch"
    VERSION_SUFFIX=+byted.${BUILD_TIME}
