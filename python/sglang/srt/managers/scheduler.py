@@ -1395,7 +1395,7 @@ class Scheduler(
 
         # Handle DP attention
         if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
-            ret, _ = self.prepare_dp_attn_batch(ret)
+            ret = self.prepare_dp_attn_batch(ret)
 
         return ret
 
@@ -1808,6 +1808,7 @@ class Scheduler(
                 local_batch.global_num_tokens_for_logprob = (
                     global_num_tokens_for_logprob
                 )
+            local_batch.is_extend_in_batch = is_extend_in_batch
             local_batch.tbo_split_seq_index = tbo_split_seq_index
             local_batch.global_forward_mode = global_forward_mode
 
@@ -1815,7 +1816,7 @@ class Scheduler(
             if not disable_cuda_graph:
                 local_batch.can_run_dp_cuda_graph = can_cuda_graph
 
-        return local_batch, any(is_extend_in_batch)
+        return local_batch
 
     def get_idle_batch(self):
         idle_batch = ScheduleBatch.init_new(

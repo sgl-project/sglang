@@ -40,7 +40,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import (
     DeepEPMode,
     dispose_tensor,
@@ -937,9 +937,9 @@ class DeepEPMoE(EPMoE):
         masked_m: torch.Tensor,
         expected_m: int,
         num_recv_tokens_per_expert: List[int],
-        forward_mode: ForwardMode,
+        forward_batch: ForwardBatch,
     ):
-        resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
+        resolved_deepep_mode = self.deepep_mode.resolve(forward_batch.is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.normal:
             if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
                 return self.forward_deepgemm_contiguous(
