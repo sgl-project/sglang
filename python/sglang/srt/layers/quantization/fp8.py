@@ -1063,10 +1063,6 @@ class Fp8MoEMethod:
         if _use_aiter:
             assert not no_combine, f"{no_combine=} is not supported."
             if self.block_quant:
-                # TODO(_use_aiter): FP8 block_quant only supports 'silu' for the time-being.
-                assert (
-                    activation == "silu"
-                ), f"_use_aiter: FP8 bloack_quant {activation=} will be supported later, unset _use_aiter"
                 return fused_moe(
                     x,
                     layer.w13_weight,
