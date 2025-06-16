@@ -91,6 +91,7 @@ class Sampler(nn.Module):
                         )
                     else:
                         # Use the optimized flashinfer path for top_k + top_p
+                        logits.div_(sampling_info.temperatures)
                         batch_next_token_ids = (
                             top_k_top_p_sampling_from_logits_flashinfer(
                                 logits,
@@ -301,17 +302,13 @@ def top_k_top_p_sampling_from_logits_flashinfer(
     """
     import flashinfer.sampling
     
-    # Reshape logits to 2D if needed (flatten all dimensions except last)
-    if logits.dim() != 2:
-        logits = logits.view(-1, logits.shape[-1])
-    
-    logits.div_(temperatures)
-    
     # Use flashinfer's optimized top_k_top_p_sampling_from_logits
     batch_next_token_ids = flashinfer.sampling.top_k_top_p_sampling_from_logits(
         logits,
         top_ks,
         top_ps,
+        filter_apply_order="joint",
+        deterministic=True
     )
     
     return batch_next_token_ids

@@ -119,15 +119,25 @@ async def async_request_trt_llm(
     assert api_url.endswith("generate_stream")
 
     async with _create_bench_client_session() as session:
+        # Build sampling parameters
+        extra_body = request_func_input.extra_request_body
+        sampling_params = {
+            "temperature": extra_body.get("temperature", 0.000001),
+            "top_p": extra_body.get("top_p", 1.0),
+        }
+        
+        # Add top_k if specified
+        if "top_k" in extra_body:
+            sampling_params["top_k"] = extra_body["top_k"]
+
         payload = {
             "accumulate_tokens": True,
             "text_input": request_func_input.prompt,
-            "temperature": 0.000001,
-            "top_p": 1.0,
             "max_tokens": request_func_input.output_len,
             "stream": True,
             "min_length": request_func_input.output_len,
             "end_id": 1048576,
+            **sampling_params,
             **request_func_input.extra_request_body,
         }
         if args.disable_ignore_eos:
@@ -192,12 +202,25 @@ async def async_request_openai_completions(
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
+        # Build sampling parameters
+        sampling_params = {
+            "temperature": getattr(args, 'temperature', 0.0),
+        }
+        
+        # Add top_p if specified
+        if hasattr(args, 'top_p') and args.top_p is not None:
+            sampling_params["top_p"] = args.top_p
+            
+        # Add top_k if specified  
+        if hasattr(args, 'top_k') and args.top_k is not None:
+            sampling_params["top_k"] = args.top_k
+
         payload = {
             "model": request_func_input.model,
             "prompt": prompt,
-            "temperature": 0.0,
             "best_of": 1,
             "max_tokens": request_func_input.output_len,
+            **sampling_params,
             "stream": not args.disable_stream,
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
@@ -274,14 +297,28 @@ async def async_request_truss(
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
+        # Build sampling parameters
+        extra_body = request_func_input.extra_request_body
+        sampling_params = {
+            "temperature": extra_body.get("temperature", 0.0),
+        }
+        
+        # Add top_p if specified
+        if "top_p" in extra_body:
+            sampling_params["top_p"] = extra_body["top_p"]
+            
+        # Add top_k if specified  
+        if "top_k" in extra_body:
+            sampling_params["top_k"] = extra_body["top_k"]
+
         payload = {
             "model": request_func_input.model,
             "prompt": prompt,
-            "temperature": 0.0,
             "best_of": 1,
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
             "ignore_eos": not args.disable_ignore_eos,
+            **sampling_params,
             **request_func_input.extra_request_body,
         }
         headers = get_auth_headers()
@@ -351,13 +388,24 @@ async def async_request_sglang_generate(
     prompt = request_func_input.prompt
 
     async with _create_bench_client_session() as session:
+        # Build sampling parameters
+        sampling_params = {
+            "temperature": request_func_input.extra_request_body.get("temperature", 0.0),
+            "max_new_tokens": request_func_input.output_len,
+            "ignore_eos": not args.disable_ignore_eos,
+        }
+        
+        # Add top_p if specified
+        if "top_p" in request_func_input.extra_request_body:
+            sampling_params["top_p"] = request_func_input.extra_request_body["top_p"]
+            
+        # Add top_k if specified
+        if "top_k" in request_func_input.extra_request_body:
+            sampling_params["top_k"] = request_func_input.extra_request_body["top_k"]
+
         payload = {
             ("text" if isinstance(prompt, str) else "input_ids"): prompt,
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": request_func_input.output_len,
-                "ignore_eos": not args.disable_ignore_eos,
-            },
+            "sampling_params": sampling_params,
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
@@ -1507,6 +1555,21 @@ def run_benchmark(args_: argparse.Namespace):
     extra_request_body = {}
     if args.extra_request_body:
         extra_request_body = json.loads(args.extra_request_body)
+    
+    # Add sampling parameters to extra_request_body if they are specified
+    sampling_params = {}
+    if hasattr(args, 'temperature') and args.temperature is not None:
+        sampling_params["temperature"] = args.temperature
+    if hasattr(args, 'top_p') and args.top_p is not None:
+        sampling_params["top_p"] = args.top_p
+    if hasattr(args, 'top_k') and args.top_k is not None:
+        sampling_params["top_k"] = args.top_k
+    
+    # Merge sampling params into extra_request_body (extra_request_body takes precedence)
+    if sampling_params:
+        for key, value in sampling_params.items():
+            if key not in extra_request_body:
+                extra_request_body[key] = value
 
     if args.tokenize_prompt:
         assert (
@@ -1823,6 +1886,27 @@ if __name__ == "__main__":
         "--tokenize-prompt",
         action="store_true",
         help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately",
+    )
+
+    # Sampling parameters group
+    sampling_group = parser.add_argument_group("sampling parameters")
+    sampling_group.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Temperature sampling parameter. Default is 0.0 for greedy decoding.",
+    )
+    sampling_group.add_argument(
+        "--top-p",
+        type=float,
+        default=None,
+        help="Top-p sampling parameter. Only used for certain backends.",
+    )
+    sampling_group.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="Top-k sampling parameter. Only used for certain backends.",
     )
 
     group = parser.add_argument_group("generated-shared-prefix dataset arguments")
