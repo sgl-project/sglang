@@ -50,7 +50,6 @@ class TestMLADeepseekV3(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.62)
 
 
-@pytest.mark.skipif(not is_cuda(), reason="FA not available")
 class TestMLADeepseekV3Fa3Fp8Kvcache(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -60,11 +59,11 @@ class TestMLADeepseekV3Fa3Fp8Kvcache(CustomTestCase):
             "--trust-remote-code",
             "--chunked-prefill-size",
             "256",
-            "--attention-backend",
-            "fa3",
             "--kv-cache-dtype",
             "fp8_e4m3",
         ]
+        if is_cuda():
+            other_args.extend(["--attention-backend", "fa3"])
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
