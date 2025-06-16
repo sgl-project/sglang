@@ -6,8 +6,8 @@ import torch
 
 from sglang.srt.layers.quantization.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
+    DEEPGEMM_BLACKWELL,
     DEEPGEMM_SCALE_UE8M0,
-    DEEPGEMM_V202506,
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
 
-    if DEEPGEMM_V202506:
+    if DEEPGEMM_BLACKWELL:
         from deep_gemm import fp8_gemm_nt as _gemm_nt_f8f8bf16_raw
         from deep_gemm import (
             fp8_m_grouped_gemm_nt_masked as _grouped_gemm_nt_f8f8bf16_masked_raw,
@@ -57,7 +57,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
             out,
             masked_m,
             expected_m,
-            **({"recipe": recipe} if DEEPGEMM_V202506 else {})
+            **({"recipe": recipe} if DEEPGEMM_BLACKWELL else {})
         )
 
 
