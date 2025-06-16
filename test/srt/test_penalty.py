@@ -85,6 +85,7 @@ class TestPenalty(CustomTestCase):
             {"presence_penalty": 0.8, "min_new_tokens": 12},
             {"presence_penalty": -0.3, "frequency_penalty": 1.3, "min_new_tokens": 32},
             {"presence_penalty": 0.3, "frequency_penalty": -1.3, "min_new_tokens": 32},
+            {"frequency_penalty": None, "presence_penalty": None},
         ]
         random.shuffle(args * 5)
         with ThreadPoolExecutor(8) as executor:
