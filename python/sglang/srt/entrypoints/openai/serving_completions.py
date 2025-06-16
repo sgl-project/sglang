@@ -5,8 +5,7 @@ from fastapi import Request
 from fastapi.responses import StreamingResponse
 
 from sglang.srt.code_completion_parser import (
-    completion_template_name,
-    generate_completion_prompt,
+    generate_completion_prompt_from_request,
     is_completion_template_defined,
 )
 from sglang.srt.entrypoints.openai.protocol import (
@@ -101,10 +100,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             # Process prompt
             prompt = request.prompt
             if is_completion_template_defined():
-                if request.suffix:
-                    prompt = generate_completion_prompt(
-                        str(request.prompt), request.suffix, completion_template_name
-                    )
+                prompt = generate_completion_prompt_from_request(request)
+
             prompts.append(prompt)
 
             lora_paths.append(request.lora_path)
