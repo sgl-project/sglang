@@ -648,10 +648,11 @@ class CudaGraphRunner:
             self.num_token_non_padded.copy_(forward_batch.num_token_non_padded)
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
-                forward_mode=self.capture_forward_mode,
+                forward_mode=forward_batch.forward_mode,
                 bs=bs,
                 num_token_non_padded=len(forward_batch.input_ids),
             )
+
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
@@ -659,7 +660,7 @@ class CudaGraphRunner:
             self.seq_lens[:bs],
             forward_batch.seq_lens_sum + (bs - raw_bs),
             self.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
+            forward_batch.forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=self.seq_lens_cpu[:bs],
         )
