@@ -840,6 +840,7 @@ class ModelRunner:
         total_gpu_memory: int,
         max_num_reqs: Optional[int] = None,
         max_total_tokens: Optional[int] = None,
+        prefill_mem_fraction: Optional[float] = None,
     ):
         if self.server_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
@@ -987,11 +988,13 @@ class ModelRunner:
 
         if self.token_to_kv_pool_allocator is None:
             if self.page_size == 1:
+                prefill_size = int(self.max_total_num_tokens * prefill_mem_fraction)
                 self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                     self.max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
                     device=self.device,
                     kvcache=self.token_to_kv_pool,
+                    prefill_size=prefill_size,
                 )
             else:
                 self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(

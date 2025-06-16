@@ -483,7 +483,8 @@ class DecodePreallocQueue:
 
         if self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(
-                len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+                len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
+                is_prefill=True
             )
         else:
             num_tokens = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)

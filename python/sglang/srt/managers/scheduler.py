@@ -541,9 +541,15 @@ class Scheduler(
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
 
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            self.tp_worker.get_memory_pool()
-        )
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+                self.tp_worker.get_memory_pool()
+            )
+        else:
+            # For decode and overlap, we use the prefill size to allocate the memory pool
+            self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+                self.tp_worker.get_memory_pool(server_args.prefill_mem_fraction)
+            )
 
         if (
             server_args.chunked_prefill_size is not None

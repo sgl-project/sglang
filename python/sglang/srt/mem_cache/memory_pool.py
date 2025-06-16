@@ -163,13 +163,19 @@ class TokenToKVPoolAllocator:
         dtype: torch.dtype,
         device: str,
         kvcache: KVCache,
+        prefill_size: Optional[int] = None,
     ):
         self.size = size
         self.dtype = dtype
         self.device = device
         self.page_size = 1
+        self.prefill_size = prefill_size
+        self.use_separate_pools = prefill_size is not None and prefill_size > 0
 
         self.free_slots = None
+        self.prefill_free_slots = None
+        self.decode_free_slots = None
+
         self.is_not_in_free_group = True
         self.free_group = []
         self.clear()
@@ -185,22 +191,46 @@ class TokenToKVPoolAllocator:
     def get_kvcache(self):
         return self._kvcache
 
-    def alloc(self, need_size: int):
-        if need_size > len(self.free_slots):
-            return None
+    def alloc(self, need_size: int, is_prefill: bool = False):
+        if self.use_separate_pools:
+            slots = self.prefill_free_slots if is_prefill else self.decode_free_slots
+            if need_size > len(slots):
+                return None
 
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
+            select_index = slots[:need_size]
+            if is_prefill:
+                self.prefill_free_slots = self.prefill_free_slots[need_size:]
+            else:
+                self.decode_free_slots = self.decode_free_slots[need_size:]
+        else:
+            if need_size > len(self.free_slots):
+                return None
+            select_index = self.free_slots[:need_size]
+            self.free_slots = self.free_slots[need_size:]
         return select_index
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
-
-        if self.is_not_in_free_group:
-            self.free_slots = torch.cat((self.free_slots, free_index))
-        else:
+        
+        if not self.is_not_in_free_group:
             self.free_group.append(free_index)
+            return
+        
+        if self.use_separate_pools:
+            # Mask and separate prefill/decode indices
+            prefill_mask = free_index <= self.prefill_size
+            decode_mask = free_index > self.prefill_size
+
+            prefill_indices = free_index[prefill_mask]
+            decode_indices = free_index[decode_mask]
+            if prefill_indices.numel() > 0:
+                self.prefill_free_slots = torch.cat((self.prefill_free_slots, free_index))
+
+            if decode_indices.numel() > 0:
+                self.decode_free_slots = torch.cat((self.decode_free_slots, free_index))
+        else:
+            self.free_slots = torch.cat((self.free_slots, free_index))
 
     def free_group_begin(self):
         self.is_not_in_free_group = False
@@ -218,10 +248,21 @@ class TokenToKVPoolAllocator:
         self.free_slots = free_slots
 
     def clear(self):
-        # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.free_slots = torch.arange(
-            1, self.size + 1, dtype=torch.int64, device=self.device
-        )
+        if self.use_separate_pools:
+            self.prefill_free_slots = torch.arange(
+                1, self.prefill_size + 1, dtype=torch.int64, device=self.device
+            )
+            self.decode_free_slots = torch.arange(
+                self.prefill_size + 1,
+                self.size + 1,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        else:
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
+            self.free_slots = torch.arange(
+                1, self.size + 1, dtype=torch.int64, device=self.device
+            )
         self.is_not_in_free_group = True
         self.free_group = []
 

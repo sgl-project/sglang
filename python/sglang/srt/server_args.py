@@ -233,6 +233,7 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
+    prefill_mem_fraction: Optional[float] = None
 
     def __post_init__(self):
         # Expert parallelism
