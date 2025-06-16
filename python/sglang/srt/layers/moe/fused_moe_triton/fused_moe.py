@@ -12,6 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.math_utils import ceil_div
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -516,10 +517,6 @@ def fused_moe_kernel(
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
-
-
-def ceil_div(a, b):
-    return (a + b - 1) // b
 
 
 @triton.jit
