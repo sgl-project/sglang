@@ -2,13 +2,21 @@
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 
+#include <cstddef>
+#include <optional>
+
 #include "tree_v2.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   using namespace radix_tree_v2;
   namespace py = pybind11;
   py::class_<RadixTree>(m, "RadixTree")
-      .def(py::init<bool, bool, int64_t, int64_t, int64_t>())
+      .def(
+          py::init<bool, std::optional<std::size_t>, std::size_t, std::size_t>(),
+          py::arg("disabled"),
+          py::arg("host_size"),
+          py::arg("page_size"),
+          py::arg("write_through_threshold"))
       .def("match_prefix", &RadixTree::match_prefix)
       .def("evict", &RadixTree::evict)
       .def("lock_ref", &RadixTree::lock_ref)

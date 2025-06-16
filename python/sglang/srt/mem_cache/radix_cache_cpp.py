@@ -282,18 +282,17 @@ class HiCacheController_v2:
 
 
 def make_tree(
-    disable: bool,
+    disabled: bool,
     use_hicache: bool,
     page_size: int,
     host_size: int,
     write_through_threshold: int,
 ):
     tree = RadixTreeCpp(
-        disable,
-        use_hicache,
-        page_size,
-        host_size,
-        write_through_threshold,
+        disabled=disabled,
+        host_size=host_size if use_hicache else None,
+        page_size=page_size,
+        write_through_threshold=write_through_threshold,
     )
     if os.environ.get("SGLANG_DEBUG_HIRADIX_CPP") == "1":
         return DebugTree(tree)  # for debugging purposes
@@ -357,7 +356,7 @@ class HiRadixCacheCpp(BasePrefixCache):
         if not use_hicache:
             # TODO(dark): pass the second argument as `std::optional`
             self.tree = make_tree(
-                disable=disable,
+                disabled=disable,
                 use_hicache=use_hicache,
                 page_size=page_size,
                 host_size=0,  # no host cache, this should be removed in the future
@@ -391,7 +390,7 @@ class HiRadixCacheCpp(BasePrefixCache):
             write_policy=hicache_write_policy,
         )
         self.tree = make_tree(
-            disable=disable,
+            disabled=disable,
             use_hicache=use_hicache,
             page_size=page_size,
             host_size=token_to_kv_pool_host.size,
@@ -464,7 +463,7 @@ class HiRadixCacheCpp(BasePrefixCache):
         """Cache request when it finishes."""
         assert req.req_pool_idx is not None
         token_ids = (req.origin_input_ids + req.output_ids)[:-1]
-        overall_len = len(token_ids) # prefill + decode
+        overall_len = len(token_ids)  # prefill + decode
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :overall_len]
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
@@ -495,7 +494,7 @@ class HiRadixCacheCpp(BasePrefixCache):
         """Cache request when it is unfinished."""
         assert req.req_pool_idx is not None
         token_ids = req.fill_ids
-        prefill_len = len(token_ids) # prefill only (maybe chunked)
+        prefill_len = len(token_ids)  # prefill only (maybe chunked)
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :prefill_len]
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned

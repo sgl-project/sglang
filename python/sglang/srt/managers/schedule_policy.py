@@ -348,7 +348,7 @@ class PrefillAdder:
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
         self._prefill_one_req(
-            0, # do not add chunked prefix length to hit tokens
+            0,  # do not add chunked prefix length to hit tokens
             req.extend_input_len,
             (
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)

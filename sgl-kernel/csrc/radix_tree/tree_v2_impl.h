@@ -9,9 +9,9 @@
 #include <vector>
 
 #include "common.h"
-#include "memory_pool.h"
 #include "tree_v2.h"
 #include "tree_v2_node.h"
+#include "tree_v2_pool.h"
 
 namespace radix_tree_v2 {
 
@@ -33,6 +33,7 @@ struct RadixTree::Impl {
         page_size(page_size),
         threshold(threshold) {
     _assert(page_size > 0, "Page size must be greater than zero");
+    _assert(use_hicache == (host_size > 0), "Hierarchical cache is enabled iff host size > 0");
     m_root.ref_count = 1;  // root node is always protected
     m_cached_vec.reserve(page_size);
     m_node_map[m_root.node_id] = &m_root;  // add root to the map

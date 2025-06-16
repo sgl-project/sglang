@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, List, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import radix_tree_cpp
 import torch
@@ -19,22 +19,20 @@ if TYPE_CHECKING:
         def __init__(
             self,
             disabled: bool,
-            use_hicache: bool,
+            host_size: Optional[int],
             page_size: int,
-            host_size: int,
-            write_threshold: int,
+            write_through_threshold: int,
         ):
             """
             Initializes the RadixTreeCpp instance.
             Args:
                 disabled (bool): If True, the radix tree is disabled.
-                use_hicache (bool): If True, uses hierarchical cache.
+                host_size (Optional[int]): Size of the radix tree on the CPU. None means no CPU tree.
                 page_size (int): Size of the page for the radix tree.
-                host_size (int): Size of the host memory tokens.
-                write_threshold (int): Threshold for writing through from GPU to CPU.
+                write_through_threshold (int): Threshold for writing through from GPU to CPU.
             """
             self.tree = radix_tree_cpp.RadixTree(
-                disabled, use_hicache, page_size, host_size, write_threshold
+                disabled, host_size, page_size, write_through_threshold
             )
 
         def match_prefix(

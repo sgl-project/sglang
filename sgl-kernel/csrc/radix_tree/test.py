@@ -12,11 +12,10 @@ def _indices(l: List[int]):
 def test_radix_tree():
     print("Testing RadixTreeCpp...")
     tree = RadixTreeCpp(
-        False,
-        True,
-        1,
-        100,
-        1,
+        disabled=False,
+        host_size=100,
+        page_size=1,
+        write_through_threshold=1,
     )
 
     def _print():

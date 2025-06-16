@@ -7,7 +7,6 @@
 #include <c10/util/irange.h>
 
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <queue>
 #include <utility>
@@ -26,12 +25,13 @@ static NodeHandle node2id(TreeNode* node) {
 // compare function for the TreeNode pointers based on their time
 static constexpr auto cmp = [](TreeNode* lhs, TreeNode* rhs) { return lhs->time() < rhs->time(); };
 
-RadixTree::RadixTree(bool disabled, bool use_hicache, int64_t page_size, int64_t host_size, int64_t threshold)
-    : m_impl(std::make_unique<Impl>(disabled, use_hicache, page_size, host_size, threshold)) {}
+RadixTree::RadixTree(bool disabled, std::optional<std::size_t> host_size, std::size_t page_size, std::size_t threshold)
+    : m_impl(std::make_unique<Impl>(disabled, host_size.has_value(), page_size, host_size.value_or(0), threshold)) {}
 
 RadixTree::~RadixTree() = default;
 
-std::tuple<std::vector<at::Tensor>, int64_t, NodeHandle, NodeHandle> RadixTree::match_prefix(const token_vec_t& _key) {
+std::tuple<std::vector<at::Tensor>, std::size_t, NodeHandle, NodeHandle>
+RadixTree::match_prefix(const token_vec_t& _key) {
   if (m_impl->disabled) return {};
 
   const auto key = token_slice{_key.data(), m_impl->align(_key.size())};
@@ -48,11 +48,10 @@ std::tuple<std::vector<at::Tensor>, int64_t, NodeHandle, NodeHandle> RadixTree::
   m_impl->walk_to_root(device_node, [&](TreeNode* n) { indices.push_back(n->device_indices()); });
   std::reverse(indices.begin(), indices.end());
 
-  return {std::move(indices), static_cast<int64_t>(host_length), node2id(device_node), node2id(host_node)};
+  return {std::move(indices), host_length, node2id(device_node), node2id(host_node)};
 }
 
-std::vector<at::Tensor> RadixTree::evict(int64_t _num_tokens) {
-  const auto num_tokens = static_cast<std::size_t>(_num_tokens);
+std::vector<at::Tensor> RadixTree::evict(std::size_t num_tokens) {
   if (m_impl->disabled || num_tokens == 0) return {};
   auto heap = std::priority_queue{cmp, m_impl->collect_leaves_device()};
   std::vector<at::Tensor> evicted_values;
@@ -132,7 +131,7 @@ std::size_t RadixTree::Impl::try_write_through(const std::vector<TreeNode*>& nod
   return sizes.size();  // all nodes were successfully allocated
 }
 
-std::tuple<std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>>, int64_t>
+std::tuple<std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>>, std::size_t>
 RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
   if (m_impl->disabled) return {};
   _assert(_key.size() == std::size_t(value.size(0)), "Key and value must have the same size");
@@ -172,7 +171,7 @@ RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
 
   std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>> result;
   // don't write through if hicache is disabled (no host memory), fast path
-  if (!m_impl->use_hicache) return {std::move(result), static_cast<int64_t>(device_prefix_length)};
+  if (!m_impl->use_hicache) return {std::move(result), device_prefix_length};
 
   // reverse so that the nodes closer to the root are written back first
   std::reverse(potential_write_nodes.begin(), potential_write_nodes.end());
@@ -188,7 +187,7 @@ RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
     result[i] = {ticket.value(), node->device_indices(), node->host_indices()};
   }
 
-  return {std::move(result), static_cast<int64_t>(device_prefix_length)};
+  return {std::move(result), device_prefix_length};
 }
 
 std::tuple<IOTicket, std::vector<at::Tensor>>
@@ -240,16 +239,16 @@ void RadixTree::lock_ref(NodeHandle node_id, bool increment) {
   m_impl->lock_ref(node_id, increment);
 }
 
-int64_t RadixTree::evictable_size() const {
-  return static_cast<int64_t>(m_impl->evictable_size());
+std::size_t RadixTree::evictable_size() const {
+  return m_impl->evictable_size();
 }
 
-int64_t RadixTree::protected_size() const {
-  return static_cast<int64_t>(m_impl->protected_size());
+std::size_t RadixTree::protected_size() const {
+  return m_impl->protected_size();
 }
 
-int64_t RadixTree::total_size() const {
-  return static_cast<int64_t>(m_impl->total_size());
+std::size_t RadixTree::total_size() const {
+  return m_impl->total_size();
 }
 
 }  // namespace radix_tree_v2
