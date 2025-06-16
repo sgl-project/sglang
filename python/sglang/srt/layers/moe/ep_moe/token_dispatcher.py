@@ -542,38 +542,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_idx: torch.Tensor,
         use_fp8: bool = False,
     ):
-        """
-        # For H20, there will be an CUDA error: DeepEP/csrc/kernels/internode_ll.cu:337 'too many blocks in cooperative launch'.
-        # Please make sure to change DeepEP code in internode_ll.cu dispatch / combine as below first and then reinstall.
-        # More details refer: https://github.com/deepseek-ai/DeepEP/issues/15#issuecomment-2709715782
-
-        diff --git a/csrc/kernels/internode_ll.cu b/csrc/kernels/internode_ll.cu
-        index 76ae2e2..8ecd08f 100644
-        --- a/csrc/kernels/internode_ll.cu
-        +++ b/csrc/kernels/internode_ll.cu
-        @@ -310,8 +310,8 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
-                    int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
-                    void* workspace, cudaStream_t stream, int phases) {
-            constexpr int kNumMaxTopK = 9;
-        -    constexpr int kNumWarpsPerGroup = 10;
-        -    constexpr int kNumWarpGroups = 3;
-        +    constexpr int kNumWarpsPerGroup = 8;
-        +    constexpr int kNumWarpGroups = 4;
-            EP_STATIC_ASSERT(kNumMaxTopK + 1 <= kNumWarpGroups * kNumWarpsPerGroup, "Too many top-k selections");
-
-            const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
-        @@ -501,8 +501,8 @@ void combine(void* combined_x,
-                    int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
-                    int num_topk, int num_experts, int rank, int num_ranks,
-                    void* workspace, cudaStream_t stream, int phases) {
-        -    constexpr int kNumWarpsPerGroup = 10;
-        -    constexpr int kNumWarpGroups = 3;
-        +    constexpr int kNumWarpsPerGroup = 8;
-        +    constexpr int kNumWarpGroups = 4;
-            constexpr int kNumMaxTopk = 9;
-
-            const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
-        """
         buffer = self._get_buffer()
         packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
