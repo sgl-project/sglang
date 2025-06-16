@@ -371,6 +371,34 @@ void segment_packbits(
     int64_t batch_size,
     int64_t cuda_stream = 0);
 
+void copy_cuda_graph_replay_inputs(
+    at::Tensor seq_lens_dst,
+    at::Tensor seq_lens_src,
+    at::Tensor out_cache_loc_dst,
+    at::Tensor out_cache_loc_src,
+    at::Tensor positions_dst,
+    at::Tensor positions_src,
+    at::Tensor req_pool_indices_dst,
+    at::Tensor req_pool_indices_src,
+    c10::optional<at::Tensor> input_ids_dst,
+    c10::optional<at::Tensor> input_ids_src,
+    c10::optional<at::Tensor> extend_seq_lens_dst,
+    c10::optional<at::Tensor> extend_seq_lens_src,
+    c10::optional<at::Tensor> accept_length_dst,
+    c10::optional<at::Tensor> accept_length_src,
+    c10::optional<at::Tensor> hidden_states_dst,
+    c10::optional<at::Tensor> hidden_states_src,
+    c10::optional<at::Tensor> topk_p_dst,
+    c10::optional<at::Tensor> topk_p_src,
+    c10::optional<at::Tensor> topk_index_dst,
+    c10::optional<at::Tensor> topk_index_src,
+    int64_t num_tokens,
+    int64_t raw_bs,
+    int64_t num_hidden_states,
+    int64_t hidden_size,
+    int64_t num_speculative_steps,
+    int64_t speculative_topk);
+
 /*
  * From FlashInfer
  */
