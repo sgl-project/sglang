@@ -269,6 +269,20 @@ async def async_request_openai_chat_completions(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
+    """Makes a request to the OpenAI Chat Completions API.
+
+    Handles both streaming and non-streaming responses, including support
+    for image data in messages. Calculates and returns various performance
+    metrics.
+
+    Args:
+        request_func_input: Input parameters for the request.
+        pbar: Optional tqdm progress bar to update.
+
+    Returns:
+        RequestFuncOutput: Output of the request, including generated text,
+                           latency, TTFT, ITL, and success status.
+    """
     api_url = request_func_input.api_url
     assert api_url.endswith(
         "chat/completions"
@@ -793,6 +807,7 @@ def sample_mmmu_requests(
         num_requests: Number of requests to sample.
         tokenizer: Tokenizer to use for token counting.
         fixed_output_len: If provided, use this fixed output length for all requests.
+        apply_chat_template: Whether to apply the chat template to the prompt.
         random_sample: Whether to randomly sample or take the first N.
 
     Returns:
