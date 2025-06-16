@@ -43,6 +43,8 @@ class RouterArgs:
     max_payload_size: int = 4 * 1024 * 1024  # 4MB
     verbose: bool = False
     log_dir: Optional[str] = None
+    dp_awareness: bool = False
+    api_key: Optional[str] = None
     # Service discovery configuration
     service_discovery: bool = False
     selector: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -158,6 +160,17 @@ class RouterArgs:
             help="Directory to store log files. If not specified, logs are only output to console.",
         )
         parser.add_argument(
+            f"--{prefix}dp-awareness",
+            action="store_true",
+            help="Enable data parallelism aware schedule",
+        )
+        parser.add_argument(
+            f"--{prefix}api-key",
+            type=str,
+            default=None,
+            help="The api key used for the authorization with the worker.  Useful when the dp aware scheduling strategy is enaled.",
+        )
+        parser.add_argument(
             f"--{prefix}service-discovery",
             action="store_true",
             help="Enable Kubernetes service discovery",
@@ -225,6 +238,8 @@ class RouterArgs:
             max_payload_size=getattr(args, f"{prefix}max_payload_size"),
             verbose=getattr(args, f"{prefix}verbose", False),
             log_dir=getattr(args, f"{prefix}log_dir", None),
+            dp_awareness=getattr(args, f"{prefix}dp_awareness", False),
+            api_key=getattr(args, f"{prefix}api_key", None),
             service_discovery=getattr(args, f"{prefix}service_discovery", False),
             selector=cls._parse_selector(getattr(args, f"{prefix}selector", None)),
             service_discovery_port=getattr(args, f"{prefix}service_discovery_port"),
@@ -292,6 +307,8 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             max_payload_size=router_args.max_payload_size,
             verbose=router_args.verbose,
             log_dir=router_args.log_dir,
+            dp_awareness=router_args.dp_awareness,
+            api_key=router_args.api_key,
             service_discovery=router_args.service_discovery,
             selector=router_args.selector,
             service_discovery_port=router_args.service_discovery_port,
