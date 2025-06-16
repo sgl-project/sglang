@@ -12,7 +12,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.moe.ep_moe.kernels import (
-    deepgemm_post_reorder_triton_kernel,
     ep_gather,
     ep_scatter,
     gelu_and_mul_triton_kernel,
@@ -345,7 +344,7 @@ class EPMoE(torch.nn.Module):
         output = torch.empty(
             hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
         )
-        deepgemm_post_reorder_triton_kernel[(hidden_states_shape[0],)](
+        post_reorder_triton_kernel[(hidden_states_shape[0],)](
             down_output,
             output,
             src2dst,
@@ -355,7 +354,7 @@ class EPMoE(torch.nn.Module):
             self.end_expert_id,
             self.top_k,
             hidden_states_shape[1],
-            m_max,
+            m_max * self.start_expert_id,
             BLOCK_SIZE=512,
         )
         return output
@@ -571,6 +570,7 @@ class EPMoE(torch.nn.Module):
             self.end_expert_id,
             self.top_k,
             hidden_states_shape[1],
+            0,
             BLOCK_SIZE=512,
         )
         return output
