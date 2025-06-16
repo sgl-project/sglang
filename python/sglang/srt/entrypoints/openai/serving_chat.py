@@ -107,9 +107,15 @@ class OpenAIServingChat(OpenAIServingBase):
 
         for request in all_requests:
             # Process messages and apply chat template
-            prompt, prompt_ids, image_data, audio_data, modalities, stop, tool_call_constraint = (
-                self._process_messages(request, is_multimodal)
-            )
+            (
+                prompt,
+                prompt_ids,
+                image_data,
+                audio_data,
+                modalities,
+                stop,
+                tool_call_constraint,
+            ) = self._process_messages(request, is_multimodal)
 
             input_ids.append(prompt_ids)
             prompts.append(prompt)
@@ -119,7 +125,9 @@ class OpenAIServingChat(OpenAIServingBase):
             lora_paths.append(request.lora_path)
 
             # Build sampling parameters
-            sampling_params = self._build_sampling_params(request, stop, tool_call_constraint)
+            sampling_params = self._build_sampling_params(
+                request, stop, tool_call_constraint
+            )
             sampling_params_list.append(sampling_params)
 
             image_data_list.append(image_data)
@@ -179,7 +187,13 @@ class OpenAIServingChat(OpenAIServingBase):
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> tuple[
-        str, Union[str, List[int]], Optional[Any], Optional[Any], List[str], List[str], Optional[Any]
+        str,
+        Union[str, List[int]],
+        Optional[Any],
+        Optional[Any],
+        List[str],
+        List[str],
+        Optional[Any],
     ]:
         """Process chat messages and apply chat template"""
         tool_call_constraint = None
@@ -229,7 +243,15 @@ class OpenAIServingChat(OpenAIServingBase):
             modalities = []
             prompt = request.messages
 
-        return prompt, prompt_ids, image_data, audio_data, modalities, stop, tool_call_constraint
+        return (
+            prompt,
+            prompt_ids,
+            image_data,
+            audio_data,
+            modalities,
+            stop,
+            tool_call_constraint,
+        )
 
     def _apply_jinja_template(
         self,
@@ -365,7 +387,10 @@ class OpenAIServingChat(OpenAIServingBase):
         return prompt, image_data, audio_data, modalities, stop
 
     def _build_sampling_params(
-        self, request: ChatCompletionRequest, stop: List[str], tool_call_constraint: Optional[Any]
+        self,
+        request: ChatCompletionRequest,
+        stop: List[str],
+        tool_call_constraint: Optional[Any],
     ) -> Dict[str, Any]:
         """Build sampling parameters for the request"""
 
