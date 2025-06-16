@@ -228,13 +228,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("segment_packbits", torch::kCUDA, &segment_packbits);
 
   m.def(
-      "copy_cuda_graph_replay_inputs(Tensor! input_ids_dst, Tensor! seq_lens_dst, Tensor! extend_seq_lens_dst, Tensor! "
-      "out_cache_loc_dst, Tensor! positions_dst, Tensor! req_pool_indices_dst, Tensor! accept_length_dst, Tensor! "
-      "hidden_states_dst, Tensor input_ids_src, Tensor seq_lens_src, Tensor extend_seq_lens_src, Tensor "
-      "out_cache_loc_src, Tensor positions_src, Tensor req_pool_indices_src, Tensor accept_length_src, Tensor "
-      "hidden_states_src, int num_tokens, int raw_bs, int hidden_size) -> ()");
+      "copy_cuda_graph_replay_inputs(Tensor seq_lens_dst, Tensor seq_lens_src, Tensor out_cache_loc_dst, Tensor "
+      "out_cache_loc_src, Tensor positions_dst, Tensor positions_src, Tensor req_pool_indices_dst, Tensor "
+      "req_pool_indices_src, Tensor? input_ids_dst, Tensor? input_ids_src, Tensor? extend_seq_lens_dst, Tensor? "
+      "extend_seq_lens_src, Tensor? accept_length_dst, Tensor? accept_length_src, Tensor? hidden_states_dst, Tensor? "
+      "hidden_states_src, Tensor? topk_p_dst, Tensor? topk_p_src, Tensor? topk_index_dst, Tensor? topk_index_src, int "
+      "num_tokens, int raw_bs, int num_hidden_states, int hidden_size, int num_speculative_steps, int "
+      "speculative_topk) -> ()");
   m.impl("copy_cuda_graph_replay_inputs", torch::kCUDA, &copy_cuda_graph_replay_inputs);
-
   /*
    * From FlashInfer
    */

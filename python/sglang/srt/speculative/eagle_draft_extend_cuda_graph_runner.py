@@ -210,42 +210,43 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
-        if bs * self.num_tokens_per_bs != num_tokens:
-            self.seq_lens.fill_(1)
-            self.accept_length.fill_(1)
-            self.out_cache_loc.zero_()
-
-        # Common inputs
-        # self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
-        # self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        # self.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens)
-        # self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
-        # self.positions[:num_tokens].copy_(forward_batch.positions)
-        # self.hidden_states[:num_tokens].copy_(forward_batch.spec_info.hidden_states)
-        # self.accept_length[:raw_bs].copy_(forward_batch.spec_info.accept_length)
-        # self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-
-        copy_cuda_graph_replay_inputs(
-            self.input_ids,
-            self.seq_lens,
-            self.extend_seq_lens,
-            self.out_cache_loc,
-            self.positions,
-            self.req_pool_indices,
-            self.accept_length,
-            self.hidden_states,
-            forward_batch.input_ids,
-            forward_batch.seq_lens,
-            forward_batch.extend_seq_lens,
-            forward_batch.out_cache_loc,
-            forward_batch.positions,
-            forward_batch.req_pool_indices,
-            forward_batch.spec_info.accept_length,
-            forward_batch.spec_info.hidden_states,
-            num_tokens,
-            raw_bs,
-            self.hidden_states.shape[1],
-        )
+        # Copy common inputs to cuda graph buffer
+        if is_cuda():
+            copy_cuda_graph_replay_inputs(
+                input_ids_dst=self.input_ids,
+                input_ids_src=forward_batch.input_ids,
+                seq_lens_dst=self.seq_lens,
+                seq_lens_src=forward_batch.seq_lens,
+                extend_seq_lens_dst=self.extend_seq_lens,
+                extend_seq_lens_src=forward_batch.extend_seq_lens,
+                out_cache_loc_dst=self.out_cache_loc,
+                out_cache_loc_src=forward_batch.out_cache_loc,
+                positions_dst=self.positions,
+                positions_src=forward_batch.positions,
+                req_pool_indices_dst=self.req_pool_indices,
+                req_pool_indices_src=forward_batch.req_pool_indices,
+                accept_length_dst=self.accept_length,
+                accept_length_src=forward_batch.spec_info.accept_length,
+                hidden_states_dst=self.hidden_states,
+                hidden_states_src=forward_batch.spec_info.hidden_states,
+                num_tokens=num_tokens,
+                raw_bs=raw_bs,
+                num_hidden_states=num_tokens,
+                hidden_size=self.hidden_states.shape[1],
+            )
+        else:
+            if bs * self.num_tokens_per_bs != num_tokens:
+                self.seq_lens.fill_(1)
+                self.accept_length.fill_(1)
+                self.out_cache_loc.zero_()
+            self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
+            self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+            self.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens)
+            self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
+            self.positions[:num_tokens].copy_(forward_batch.positions)
+            self.hidden_states[:num_tokens].copy_(forward_batch.spec_info.hidden_states)
+            self.accept_length[:raw_bs].copy_(forward_batch.spec_info.accept_length)
+            self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:

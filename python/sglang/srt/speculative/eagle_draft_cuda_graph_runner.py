@@ -20,6 +20,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.speculative.eagle_utils import EagleDraftInput
+from sglang.srt.utils import is_cuda
+
+if is_cuda():
+    from sgl_kernel import copy_cuda_graph_replay_inputs
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -67,9 +71,9 @@ class EAGLEDraftCudaGraphRunner:
         # Graph inputs
         with torch.device("cuda"):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
+            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
             self.seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
             )
             self.out_cache_loc = torch.zeros(
                 (self.max_num_token * self.speculative_num_steps,), dtype=torch.int64
@@ -186,23 +190,46 @@ class EAGLEDraftCudaGraphRunner:
         # Pad
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
-        if bs != raw_bs:
-            self.seq_lens.fill_(1)
-            self.out_cache_loc.zero_()
-            self.positions.zero_()
-
         num_tokens = bs * self.num_tokens_per_bs
 
-        # Common inputs
-        self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-        self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        self.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
-            forward_batch.out_cache_loc
-        )
-        self.positions[:raw_num_token].copy_(forward_batch.positions)
-        self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
-        self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
-        self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        # Copy common inputs to cuda graph buffer
+        if is_cuda():
+            copy_cuda_graph_replay_inputs(
+                seq_lens_dst=self.seq_lens,
+                seq_lens_src=forward_batch.seq_lens,
+                out_cache_loc_dst=self.out_cache_loc,
+                out_cache_loc_src=forward_batch.out_cache_loc,
+                positions_dst=self.positions,
+                positions_src=forward_batch.positions,
+                req_pool_indices_dst=self.req_pool_indices,
+                req_pool_indices_src=forward_batch.req_pool_indices,
+                hidden_states_dst=self.hidden_states,
+                hidden_states_src=forward_batch.spec_info.hidden_states,
+                topk_p_dst=self.topk_p,
+                topk_p_src=forward_batch.spec_info.topk_p,
+                topk_index_dst=self.topk_index,
+                topk_index_src=forward_batch.spec_info.topk_index,
+                num_tokens=raw_num_token,
+                raw_bs=raw_bs,
+                num_hidden_states=raw_bs,
+                hidden_size=self.hidden_states.shape[1],
+                num_speculative_steps=self.speculative_num_steps,
+                speculative_topk=self.topk_p.shape[1],
+            )
+        else:
+            if bs != raw_bs:
+                self.seq_lens.fill_(1)
+                self.out_cache_loc.zero_()
+                self.positions.zero_()
+            self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+            self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+            self.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
+                forward_batch.out_cache_loc
+            )
+            self.positions[:raw_num_token].copy_(forward_batch.positions)
+            self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
+            self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
+            self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
 
         # Attention backend
         if bs != raw_bs:

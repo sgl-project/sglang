@@ -45,8 +45,12 @@ from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
     get_device_memory_capacity,
+    is_cuda,
     rank0_log,
 )
+
+if is_cuda():
+    from sgl_kernel import copy_cuda_graph_replay_inputs
 
 logger = logging.getLogger(__name__)
 
@@ -264,9 +268,9 @@ class CudaGraphRunner:
         # Graph inputs
         with torch.device("cuda"):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
+            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
             self.seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
             )
             self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
@@ -611,16 +615,32 @@ class CudaGraphRunner:
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
-        if bs != raw_bs:
-            self.seq_lens.fill_(1)
-            self.out_cache_loc.zero_()
 
-        # Common inputs
-        self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
-        self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-        self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
-        self.positions[:raw_num_token].copy_(forward_batch.positions)
+        # Copy common inputs to cuda graph buffer
+        if is_cuda():
+            copy_cuda_graph_replay_inputs(
+                input_ids_dst=self.input_ids,
+                input_ids_src=forward_batch.input_ids,
+                seq_lens_dst=self.seq_lens,
+                seq_lens_src=forward_batch.seq_lens,
+                out_cache_loc_dst=self.out_cache_loc,
+                out_cache_loc_src=forward_batch.out_cache_loc,
+                positions_dst=self.positions,
+                positions_src=forward_batch.positions,
+                req_pool_indices_dst=self.req_pool_indices,
+                req_pool_indices_src=forward_batch.req_pool_indices,
+                num_tokens=raw_num_token,
+                raw_bs=raw_bs,
+            )
+        else:
+            if bs != raw_bs:
+                self.seq_lens.fill_(1)
+                self.out_cache_loc.zero_()
+            self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+            self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+            self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+            self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
+            self.positions[:raw_num_token].copy_(forward_batch.positions)
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
