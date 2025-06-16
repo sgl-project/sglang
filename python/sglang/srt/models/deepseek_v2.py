@@ -275,6 +275,11 @@ class DeepseekV2MoE(nn.Module):
                 if global_server_args_dict["enable_deepep_moe"]
                 else {}
             ),
+            **(
+                dict(enable_ep_moe=True)
+                if global_server_args_dict["enable_flashinfer_ep_moe"]
+                else {}
+            ),
         )
 
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:

@@ -29,10 +29,16 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import get_bool_env_var, is_cuda
 
 if is_cuda():
     from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
+
+try:
+    from flashinfer import fp4_quantize as fp4_quantize
+    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
+except ImportError:
+    flashinfer_cutlass_fused_moe = None
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
@@ -521,6 +527,9 @@ class ModelOptNvFp4FusedMoEMethod:
                 " quantization. Please use Blackwell and"
                 " above."
             )
+        self.enable_flashinfer_moe = get_bool_env_var(
+            "SGLANG_FLASHINFER_MOE", default="True"
+        )
 
     def create_weights(
         self,
@@ -727,10 +736,15 @@ class ModelOptNvFp4FusedMoEMethod:
         layer.cutlass_moe_params = CutlassMoEParams(
             CutlassMoEType.BlockscaledFP4,
             device,
-            num_experts=layer.num_experts,
+            num_experts=layer.num_experts,  # global num experts
             intermediate_size_per_partition=layer.w2_weight.shape[2] * 2,  # n
             hidden_size=layer.w13_weight.shape[2] * 2,
         )  # k
+
+    @property
+    def load_up_proj_weight_first(self) -> bool:
+        # FlashInfer CUTLASS kernel assumes [Up, Gate] Proj as W13
+        return self.enable_flashinfer_moe
 
     def apply(
         self,
@@ -750,6 +764,10 @@ class ModelOptNvFp4FusedMoEMethod:
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
+        ep_rank: Optional[int] = None,
+        ep_size: Optional[int] = None,
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ) -> torch.Tensor:
 
         assert activation == "silu", "Only SiLU activation is supported."
@@ -770,6 +788,46 @@ class ModelOptNvFp4FusedMoEMethod:
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
         )
+
+        if self.enable_flashinfer_moe:
+            assert (
+                not apply_router_weight_on_input
+            ), "apply_router_weight_on_input is not supported for Flashinfer"
+            a1_gs = torch.min(layer.w13_input_scale_quant)
+            a2_gs = torch.min(layer.w2_input_scale_quant)
+            w1_blockscale = layer.w13_blockscale_swizzled
+            w2_blockscale = layer.w2_blockscale_swizzled
+            g1_alphas = layer.g1_alphas
+            g2_alphas = layer.g2_alphas
+
+            quant_scales = [
+                a1_gs,
+                w1_blockscale.view(torch.int32),
+                g1_alphas,
+                a2_gs,
+                w2_blockscale.view(torch.int32),
+                g2_alphas,
+            ]
+            # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
+            # and fp4 quantized weights loaded from the checkpoint
+            out_dtype = x.dtype
+            output = x if inplace else torch.zeros_like(x)
+            x, x_sf = fp4_quantize(x, a1_gs)
+            output = flashinfer_cutlass_fused_moe(
+                x,
+                topk_ids.to(torch.int),
+                topk_weights,
+                layer.w13_weight.view(torch.long),
+                layer.w2_weight.view(torch.long),
+                out_dtype,
+                quant_scales=quant_scales,
+                input_sf=x_sf,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+            )
+            return output[0]
 
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 

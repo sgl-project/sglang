@@ -60,6 +60,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_ENABLE_FLASHINFER_GEMM` | Use flashinfer kernels when running blockwise fp8 GEMM on Blackwell GPUs | `false` |
 | `SGLANG_SUPPORT_CUTLASS_BLOCK_FP8` | Use Cutlass kernels when running blockwise fp8 GEMM on Hopper or Blackwell GPUs | `false` |
 | `SGLANG_CUTLASS_MOE` | Use Cutlass FP8 MoE kernel on Blackwell GPUs | `false` |
+| `SGLANG_FLASHINFER_MOE` | Use Flashinfer NVFP4 MoE kernel on Blackwell GPUs, otherwise use cutlass kernel | `true` |
 
 
 ## Distributed Computing
