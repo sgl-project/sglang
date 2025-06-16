@@ -102,6 +102,7 @@ from sglang.srt.utils import (
     is_hip,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
+    use_cpu,
 )
 
 _is_hip = is_hip()
@@ -109,10 +110,11 @@ _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx = cpu_has_amx_support()
+_use_cpu = use_cpu()
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8, merge_state_v2
-elif _is_cpu_amx:
+elif _use_cpu and _is_cpu_amx:
     pass
 else:
     from vllm._custom_ops import awq_dequantize

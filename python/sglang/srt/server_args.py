@@ -34,6 +34,7 @@ from sglang.srt.utils import (
     is_remote_url,
     is_valid_ipv6_address,
     nullable_str,
+    set_use_cpu,
 )
 
 logger = logging.getLogger(__name__)
@@ -251,6 +252,7 @@ class ServerArgs:
 
         if self.device is None:
             self.device = get_device()
+        set_use_cpu(self.device == "cpu")
 
         if self.served_model_name is None:
             self.served_model_name = self.model_path

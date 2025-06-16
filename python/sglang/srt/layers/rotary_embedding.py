@@ -8,12 +8,13 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import cpu_has_amx_support, is_cuda, is_hip, is_npu
+from sglang.srt.utils import cpu_has_amx_support, is_cuda, is_hip, is_npu, use_cpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx = cpu_has_amx_support()
+_use_cpu = use_cpu()
 
 if _is_cuda:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
@@ -86,7 +87,10 @@ class RotaryEmbedding(CustomOp):
         if not _is_cuda:
             cache = cache.to(dtype)
 
-        if (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512]) and not _is_cpu_amx:
+        self._use_cpu = use_cpu()
+        if (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512]) and not (
+            self._use_cpu and _is_cpu_amx
+        ):
             from vllm._custom_ops import rotary_embedding
 
             self.vllm_rotary_embedding = rotary_embedding

@@ -169,7 +169,8 @@ def is_cpu() -> bool:
     )
 
 
-_USE_CPU = False
+# set _USE_CPU default as True, to bypass vllm import
+_USE_CPU = True
 
 
 def use_cpu():

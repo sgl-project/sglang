@@ -50,7 +50,7 @@ if _is_cuda or _is_hip:
     from sgl_kernel import topk_softmax
 
 
-def fused_topk_native(
+def fused_topk_torch_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     topk: int,
@@ -139,7 +139,7 @@ def _fused_topk_postprocess(
 
 # This is used by the Deepseek V2/V3/R1 series models
 @torch.compile(dynamic=True, backend=get_compiler_backend())
-def grouped_topk(
+def grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     topk: int,
@@ -308,7 +308,7 @@ def _biased_grouped_topk_postprocess(
     return topk_ids
 
 
-def biased_grouped_topk(
+def biased_grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -405,6 +405,10 @@ if _is_cpu and _use_cpu and _is_cpu_amx:
     biased_grouped_topk = biased_grouped_topk_cpu
     grouped_topk = grouped_topk_cpu
     fused_topk_native = fused_topk_cpu
+else:
+    biased_grouped_topk = biased_grouped_topk_gpu
+    grouped_topk = grouped_topk_gpu
+    fused_topk_native = fused_topk_torch_native
 
 
 def select_experts(

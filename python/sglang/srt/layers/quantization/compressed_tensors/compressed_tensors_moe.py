@@ -18,13 +18,14 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
-from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils import is_cuda, is_npu, set_weight_attrs, use_cpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu_amx = cpu_has_amx_support()
+_use_cpu = use_cpu()
 
-if not (_is_cuda or _is_npu or _is_cpu_amx):
+if not (_is_cuda or _is_npu or (_use_cpu and _is_cpu_amx)):
     from vllm import _custom_ops as vllm_ops
     from vllm._custom_ops import scaled_fp8_quant
 
