@@ -617,6 +617,8 @@ class Req:
         # start_send_idx = len(req.fill_ids)
         self.start_send_idx: int = 0
 
+        self.transferred_logits: Optional[torch.Tensor] = None
+
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.

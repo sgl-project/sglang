@@ -233,6 +233,7 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
+    skip_sample_on_prefill: bool = False
 
     def __post_init__(self):
         # Expert parallelism
@@ -1575,6 +1576,12 @@ class ServerArgs:
             type=str,
             default=None,
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
+        )
+        parser.add_argument(
+            "--skip-sample-on-prefill",
+            type=bool,
+            default=ServerArgs.skip_sample_on_prefill,
+            help="If true, the first sampling will be done in decode side instead of prefill side. Default is False.",
         )
 
     @classmethod

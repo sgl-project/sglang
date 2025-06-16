@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Set, Tuple, TypeAlias, Union
 import numpy as np
 import numpy.typing as npt
 import requests
+import torch
 import zmq
 from aiohttp import web
 
@@ -94,6 +95,7 @@ class NixlKVManager(CommonKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        skip_sample_on_prefill: bool = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         try:
@@ -106,6 +108,7 @@ class NixlKVManager(CommonKVManager):
             ) from e
         self.agent = nixl_agent(str(uuid.uuid4()))
         self.server_socket = zmq.Context().socket(zmq.PULL)
+        self.skip_sample_on_prefill = skip_sample_on_prefill
         self.register_buffer_to_engine()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -149,8 +152,13 @@ class NixlKVManager(CommonKVManager):
             self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
         ):
             aux_addrs.append((aux_data_ptr, aux_data_len, 0, ""))
-        self.aux_descs = self.agent.register_memory(aux_addrs, "DRAM", is_sorted=True)
+
+        aux_memory_location = "VRAM" if self.skip_sample_on_prefill else "DRAM"
+        self.aux_descs = self.agent.register_memory(
+            aux_addrs, aux_memory_location, is_sorted=True
+        )
         logger.debug(f"Register aux tensors, len(aux_addrs)= {len(aux_addrs)}")
+
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
 
@@ -217,6 +225,7 @@ class NixlKVManager(CommonKVManager):
         dst_aux_ptrs: list[int],
         dst_aux_index: int,
         notif: str,
+        mem_type: str = "DRAM",
     ):
         # Make descs
         aux_item_len = self.kv_args.aux_item_lens[0]
@@ -226,8 +235,9 @@ class NixlKVManager(CommonKVManager):
         decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index * aux_item_len
         src_addrs = [(prefill_aux_addr, aux_item_len, 0)]
         dst_addrs = [(decode_aux_addr, aux_item_len, 0)]
-        src_descs = self.agent.get_xfer_descs(src_addrs, "DRAM", is_sorted=True)
-        dst_descs = self.agent.get_xfer_descs(dst_addrs, "DRAM", is_sorted=True)
+
+        src_descs = self.agent.get_xfer_descs(src_addrs, mem_type, is_sorted=True)
+        dst_descs = self.agent.get_xfer_descs(dst_addrs, mem_type, is_sorted=True)
         # Transfer data
         xfer_handle = self.agent.initialize_xfer(
             "WRITE",
@@ -266,27 +276,28 @@ class NixlKVManager(CommonKVManager):
             chunked_dst_kv_indice = req.dst_kv_indices[index_slice]
             assert len(chunked_dst_kv_indice) == len(kv_indices)
 
-            notif = "_".join([str(req.room), "kv", str(chunk_id), str(int(is_last))])
-            kv_xfer_handle = self.send_kvcache(
+        notif = "_".join([str(req.room), "kv", str(chunk_id), str(int(is_last))])
+        kv_xfer_handle = self.send_kvcache(
+            peer_name,
+            kv_indices,
+            req.dst_kv_ptrs,
+            chunked_dst_kv_indice,
+            req.dst_gpu_id,
+            notif,
+        )
+        handles = [kv_xfer_handle]
+        # Only the last chunk we need to send the aux data.
+        if is_last:
+            mem_type = "VRAM" if self.skip_sample_on_prefill else "DRAM"
+            aux_xfer_handle = self.send_aux(
                 peer_name,
-                kv_indices,
-                req.dst_kv_ptrs,
-                chunked_dst_kv_indice,
-                req.dst_gpu_id,
-                notif,
+                aux_index,
+                req.dst_aux_ptrs,
+                req.dst_aux_index,
+                str(req.room) + "_aux",
+                mem_type=mem_type,
             )
             handles.append(kv_xfer_handle)
-            # Only the last chunk we need to send the aux data.
-            if is_last:
-                assert aux_index is not None
-                aux_xfer_handle = self.send_aux(
-                    peer_name,
-                    aux_index,
-                    req.dst_aux_ptrs,
-                    req.dst_aux_index,
-                    str(req.room) + "_aux",
-                )
-                handles.append(aux_xfer_handle)
         return handles
 
     def update_transfer_status(self):

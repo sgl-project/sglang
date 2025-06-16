@@ -99,6 +99,7 @@ class PrefillBootstrapQueue:
         self.max_total_num_tokens = max_total_num_tokens
         self.scheduler = scheduler
         self.transfer_backend = transfer_backend
+        self.skip_sample_on_prefill = scheduler.skip_sample_on_prefill
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> BaseKVManager:
@@ -137,6 +138,7 @@ class PrefillBootstrapQueue:
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
             self.is_mla_backend,
+            self.skip_sample_on_prefill,
         )
         return kv_manager
 
@@ -393,57 +395,86 @@ class SchedulerDisaggregationPrefillMixin:
                     logits_output.input_token_logprobs = tuple(
                         logits_output.input_token_logprobs.tolist()
                     )
-        for i, (req, next_token_id) in enumerate(
-            zip(batch.reqs, next_token_ids, strict=True)
-        ):
-            req: Req
-            if req.is_chunked <= 0:
-                # There is no output_ids for prefill
-                req.output_ids.append(next_token_id)
-                self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
-                self.disagg_prefill_inflight_queue.append(req)
-                if req.return_logprob:
-                    assert extend_logprob_start_len_per_req is not None
-                    assert extend_input_len_per_req is not None
-                    extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                    extend_input_len = extend_input_len_per_req[i]
-                    num_input_logprobs = extend_input_len - extend_logprob_start_len
-                    self.add_logprob_return_values(
-                        i,
-                        req,
-                        logprob_pt,
-                        next_token_ids,
-                        num_input_logprobs,
-                        logits_output,
-                    )
-                    logprob_pt += num_input_logprobs
-                self.send_kv_chunk(req, last_chunk=True)
-
-                if req.grammar is not None:
-                    req.grammar.accept_token(next_token_id)
-                    req.grammar.finished = req.finished()
-            else:
-                # being chunked reqs' prefill is not finished
-                req.is_chunked -= 1
-
-                if req.return_logprob:
-                    extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                    extend_input_len = extend_input_len_per_req[i]
-                    if extend_logprob_start_len < extend_input_len:
-                        # Update input logprobs.
+        if not self.skip_sample_on_prefill:
+            for i, (req, next_token_id) in enumerate(
+                zip(batch.reqs, next_token_ids, strict=True)
+            ):
+                req: Req
+                if req.is_chunked <= 0:
+                    # There is no output_ids for prefill
+                    req.output_ids.append(next_token_id)
+                    self.tree_cache.cache_unfinished_req(
+                        req
+                    )  # update the tree and lock
+                    self.disagg_prefill_inflight_queue.append(req)
+                    if req.return_logprob:
+                        assert extend_logprob_start_len_per_req is not None
+                        assert extend_input_len_per_req is not None
+                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+                        extend_input_len = extend_input_len_per_req[i]
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
-                        self.add_input_logprob_return_values(
+                        self.add_logprob_return_values(
                             i,
                             req,
-                            logits_output,
                             logprob_pt,
+                            next_token_ids,
                             num_input_logprobs,
-                            last_prefill_chunk=False,
+                            logits_output,
                         )
                         logprob_pt += num_input_logprobs
+                    self.send_kv_chunk(req, last_chunk=True)
 
-                if self.enable_overlap:
-                    self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
+                    if req.grammar is not None:
+                        req.grammar.accept_token(next_token_id)
+                        req.grammar.finished = req.finished()
+                else:
+                    # being chunked reqs' prefill is not finished
+                    req.is_chunked -= 1
+
+                    if req.return_logprob:
+                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+                        extend_input_len = extend_input_len_per_req[i]
+                        if extend_logprob_start_len < extend_input_len:
+                            # Update input logprobs.
+                            num_input_logprobs = (
+                                extend_input_len - extend_logprob_start_len
+                            )
+                            self.add_input_logprob_return_values(
+                                i,
+                                req,
+                                logits_output,
+                                logprob_pt,
+                                num_input_logprobs,
+                                last_prefill_chunk=False,
+                            )
+                            logprob_pt += num_input_logprobs
+
+                    if self.enable_overlap:
+                        self.send_kv_chunk(
+                            req, last_chunk=False, end_idx=req.tmp_end_idx
+                        )
+        else:
+            assert logits_output is not None
+            for index, req in enumerate(batch.reqs):
+                req: Req
+                if req.is_chunked <= 0:
+                    self.tree_cache.cache_unfinished_req(
+                        req
+                    )  # update the tree and lockAdd commentMore actions
+                    self.send_kv_chunk(
+                        req,
+                        logits_output=logits_output.next_token_logits[index],
+                        last_chunk=True,
+                    )
+                    self.disagg_prefill_inflight_queue.append(req)
+                else:
+                    # being chunked reqs' prefill is not finished
+                    req.is_chunked -= 1
+
+                    if self.enable_overlap:
+                        self.send_kv_chunk(
+                            req, end_idx=req.tmp_end_idx, last_chunk=False
+                        )
 
         # We need to remove the sync in the following function for overlap schedule.
         self.set_next_batch_sampling_info_done(batch)
@@ -556,6 +587,7 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        logits_output: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
@@ -578,8 +610,15 @@ class SchedulerDisaggregationPrefillMixin:
             .numpy()
         )
         req.start_send_idx = end_idx
-        if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
+
+        if last_chunk is True:
+            if self.skip_sample_on_prefill:
+                self.disagg_metadata_buffers.store_prefill_logits_output(
+                    req.metadata_buffer_index, logits_output
+                )
+            else:
+                self.disagg_metadata_buffers.set_buf(req)
+
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if len(page_indices) == 0:
             logger.info(

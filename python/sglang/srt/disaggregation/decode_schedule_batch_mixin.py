@@ -97,13 +97,19 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self: ScheduleBatch, server_args: ServerArgs, model_config: ModelConfig
     ):
         """Assign the buffered last input id to schedule batch"""
+
         self.output_ids = []
         for req in self.reqs:
-            self.output_ids.append(req.output_ids[-1])
+            if req.output_ids and len(req.output_ids) > 0:
+                self.output_ids.append(req.output_ids[-1])
+                if req.grammar is not None:
+                    req.grammar.accept_token(req.output_ids[-1])
+                    req.grammar.finished = req.finished()
+            else:
+                assert req.transferred_logits is not None
+
             self.tree_cache.cache_unfinished_req(req)
-            if req.grammar is not None:
-                req.grammar.accept_token(req.output_ids[-1])
-                req.grammar.finished = req.finished()
+
         self.output_ids = torch.tensor(self.output_ids, device=self.device)
 
         # Simulate the eagle run. We add mock data to hidden states for the

@@ -128,6 +128,7 @@ class MooncakeKVManager(BaseKVManager):
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
+        skip_sample_on_prefill: bool = False,
     ):
         self.kv_args = args
         self.engine = MooncakeTransferEngine(
@@ -150,6 +151,7 @@ class MooncakeKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self.rank_port = None
         self.server_socket = zmq.Context().socket(zmq.PULL)
+        self.skip_sample_on_prefill = skip_sample_on_prefill
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}

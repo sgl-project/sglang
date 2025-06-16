@@ -156,6 +156,7 @@ class DecodePreallocQueue:
         prefill_pp_size: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
+        skip_sample_on_prefill: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -181,6 +182,8 @@ class DecodePreallocQueue:
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.prefill_pp_size = prefill_pp_size
+        self.transfer_backend = transfer_backend
+        self.skip_sample_on_prefill = skip_sample_on_prefill
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> BaseKVManager:
@@ -220,6 +223,7 @@ class DecodePreallocQueue:
             DisaggregationMode.DECODE,
             self.scheduler.server_args,
             self.is_mla_backend,
+            self.skip_sample_on_prefill,
         )
         return kv_manager
 
@@ -532,6 +536,7 @@ class DecodeTransferQueue:
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
+        skip_sample_on_prefill: bool = False,
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
@@ -540,6 +545,7 @@ class DecodeTransferQueue:
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.tree_cache = tree_cache
+        self.skip_sample_on_prefill = skip_sample_on_prefill
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -586,26 +592,29 @@ class DecodeTransferQueue:
                     output_top_logprobs_val,
                     output_top_logprobs_idx,
                 ) = self.metadata_buffers.get_buf(idx)
+                if not self.skip_sample_on_prefill:
+                    decode_req.req.output_ids.append(output_id[0].item())
 
-                decode_req.req.output_ids.append(output_id[0].item())
+                    if decode_req.req.return_logprob:
+                        decode_req.req.output_token_logprobs_val.append(
+                            output_token_logprobs_val[0].item()
+                        )
+                        decode_req.req.output_token_logprobs_idx.append(
+                            output_token_logprobs_idx[0].item()
+                        )
+                        decode_req.req.output_top_logprobs_val.append(
+                            output_top_logprobs_val[
+                                : decode_req.req.top_logprobs_num
+                            ].tolist()
+                        )
+                        decode_req.req.output_top_logprobs_idx.append(
+                            output_top_logprobs_idx[
+                                : decode_req.req.top_logprobs_num
+                            ].tolist()
+                        )
+                else:
+                    decode_req.req.transferred_logits = output_top_logprobs_val.clone()
 
-                if decode_req.req.return_logprob:
-                    decode_req.req.output_token_logprobs_val.append(
-                        output_token_logprobs_val[0].item()
-                    )
-                    decode_req.req.output_token_logprobs_idx.append(
-                        output_token_logprobs_idx[0].item()
-                    )
-                    decode_req.req.output_top_logprobs_val.append(
-                        output_top_logprobs_val[
-                            : decode_req.req.top_logprobs_num
-                        ].tolist()
-                    )
-                    decode_req.req.output_top_logprobs_idx.append(
-                        output_top_logprobs_idx[
-                            : decode_req.req.top_logprobs_num
-                        ].tolist()
-                    )
                 if hasattr(decode_req.kv_receiver, "clear"):
                     decode_req.kv_receiver.clear()
                 transferred_reqs.append(decode_req.req)
@@ -653,6 +662,8 @@ class SchedulerDisaggregationDecodeMixin:
             if batch:
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
+                    if self.skip_sample_on_prefill:
+                        self.tp_worker.forward_batch_sampling(batch)
                     # Note: Logprobs should be handled on the prefill engine.
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
@@ -688,6 +699,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         while True:
             recv_reqs = self.recv_requests()
+
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
             self.process_decode_queue()
@@ -703,6 +715,8 @@ class SchedulerDisaggregationDecodeMixin:
             if batch:
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
+                    if self.skip_sample_on_prefill:
+                        self.tp_worker.forward_batch_sampling(batch)
                     # Note: Logprobs should be handled on the prefill engine.
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)

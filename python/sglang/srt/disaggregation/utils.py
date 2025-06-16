@@ -84,7 +84,17 @@ class ReqToMetadataIdxAllocator:
 
 
 class MetadataBuffers:
-    def __init__(self, size: int, max_top_logprobs_num: int = 128):
+    def __init__(
+        self, size: int, max_top_logprobs_num: int = 128, logits_only: bool = False
+    ):
+
+        self.logits_only = logits_only
+        if logits_only:
+            self.output_top_logprobs_val = torch.zeros(
+                (size, max_top_logprobs_num), dtype=torch.float32, device="cuda:0"
+            )
+            return
+
         # TODO: abort top_logprobs_num > 128 in PD
 
         # We transfer the metadata of first output token to decode
@@ -96,6 +106,7 @@ class MetadataBuffers:
         self.output_token_logprobs_idx = torch.zeros(
             (size, 16), dtype=torch.int32, device="cpu"
         )
+        # TODO: use cuda:0 if logits_only?
         self.output_top_logprobs_val = torch.zeros(
             (size, max_top_logprobs_num), dtype=torch.float32, device="cpu"
         )
@@ -104,36 +115,52 @@ class MetadataBuffers:
         )
 
     def get_buf_infos(self):
-        ptrs = [
-            self.output_ids.data_ptr(),
-            self.output_token_logprobs_val.data_ptr(),
-            self.output_token_logprobs_idx.data_ptr(),
-            self.output_top_logprobs_val.data_ptr(),
-            self.output_top_logprobs_idx.data_ptr(),
-        ]
-        data_lens = [
-            self.output_ids.nbytes,
-            self.output_token_logprobs_val.nbytes,
-            self.output_token_logprobs_idx.nbytes,
-            self.output_top_logprobs_val.nbytes,
-            self.output_top_logprobs_idx.nbytes,
-        ]
-        item_lens = [
-            self.output_ids[0].nbytes,
-            self.output_token_logprobs_val[0].nbytes,
-            self.output_token_logprobs_idx[0].nbytes,
-            self.output_top_logprobs_val[0].nbytes,
-            self.output_top_logprobs_idx[0].nbytes,
-        ]
+        ptrs = (
+            [
+                self.output_ids.data_ptr(),
+                self.output_token_logprobs_val.data_ptr(),
+                self.output_token_logprobs_idx.data_ptr(),
+                self.output_top_logprobs_val.data_ptr(),
+                self.output_top_logprobs_idx.data_ptr(),
+            ]
+            if not self.logits_only
+            else [self.output_top_logprobs_val.data_ptr()]
+        )
+        data_lens = (
+            [
+                self.output_ids.nbytes,
+                self.output_token_logprobs_val.nbytes,
+                self.output_token_logprobs_idx.nbytes,
+                self.output_top_logprobs_val.nbytes,
+                self.output_top_logprobs_idx.nbytes,
+            ]
+            if not self.logits_only
+            else [self.output_top_logprobs_val.nbytes]
+        )
+        item_lens = (
+            [
+                self.output_ids[0].nbytes,
+                self.output_token_logprobs_val[0].nbytes,
+                self.output_token_logprobs_idx[0].nbytes,
+                self.output_top_logprobs_val[0].nbytes,
+                self.output_top_logprobs_idx[0].nbytes,
+            ]
+            if not self.logits_only
+            else [self.output_top_logprobs_val[0].nbytes]
+        )
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
         return (
-            self.output_ids[idx],
-            self.output_token_logprobs_val[idx],
-            self.output_token_logprobs_idx[idx],
-            self.output_top_logprobs_val[idx],
-            self.output_top_logprobs_idx[idx],
+            (
+                self.output_ids[idx],
+                self.output_token_logprobs_val[idx],
+                self.output_token_logprobs_idx[idx],
+                self.output_top_logprobs_val[idx],
+                self.output_top_logprobs_idx[idx],
+            )
+            if not self.logits_only
+            else (None, None, None, self.output_top_logprobs_val[idx], None)
         )
 
     def set_buf(self, req: Req):
@@ -161,6 +188,10 @@ class MetadataBuffers:
                 ] = torch.tensor(
                     req.output_top_logprobs_idx[0], dtype=torch.int32, device="cpu"
                 )
+
+    def store_prefill_logits_output(self, idx: int, logits: torch.Tensor):
+        assert logits.shape == self.output_top_logprobs_val[idx].shape
+        self.output_top_logprobs_val[idx].copy_(logits)
 
 
 #########################

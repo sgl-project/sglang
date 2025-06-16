@@ -309,6 +309,17 @@ class Scheduler(
         else:
             TpWorkerClass = TpModelWorker
 
+        self.skip_sample_on_prefill = self.server_args.skip_sample_on_prefill
+        skip_sample = False
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and self.skip_sample_on_prefill
+        ):
+            skip_sample = True
+
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
             gpu_id=gpu_id,
@@ -316,6 +327,7 @@ class Scheduler(
             pp_rank=pp_rank,
             dp_rank=dp_rank,
             nccl_port=port_args.nccl_port,
+            skip_sample=skip_sample,
         )
 
         # Launch a draft worker for speculative decoding
@@ -503,9 +515,6 @@ class Scheduler(
             ]
         )
 
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
         self.init_disaggregation()
 
     def maybe_sleep_on_idle(self):
@@ -615,14 +624,23 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        if (
-            self.disaggregation_mode == DisaggregationMode.DECODE
-        ):  # *2 for the headroom.
-            buffer_size = (self.req_to_token_pool.size) * 2
-            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
-                buffer_size
-            )
-            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            if not self.skip_sample_on_prefill:
+                # *2 for the headroom.
+                buffer_size = (self.req_to_token_pool.size) * 2
+                self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+                    buffer_size
+                )
+                self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
+            else:
+                self.disagg_metadata_buffers = MetadataBuffers(
+                    self.max_running_requests,
+                    max_top_logprobs_num=self.model_config.vocab_size,
+                    logits_only=True,
+                )
+                self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+                    self.max_running_requests
+                )
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
@@ -632,6 +650,7 @@ class Scheduler(
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 tree_cache=self.tree_cache,
+                skip_sample_on_prefill=self.skip_sample_on_prefill,
             )
 
             # The decode requests pending for pre-allocation
@@ -658,18 +677,35 @@ class Scheduler(
                 prefill_pp_size=self.server_args.disaggregation_prefill_pp,
                 num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
+                skip_sample_on_prefill=self.skip_sample_on_prefill,
             )
 
             # Metric for pre-allocation
             self.num_tokens_pre_allocated = 0
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # *2 for the headroom.
-            buffer_size = self.max_running_requests * 2
-            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
-                buffer_size
-            )
-            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
+            if not self.skip_sample_on_prefill:
+                # *2 for the headroom.
+                buffer_size = self.max_running_requests * 2
+                self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+                    buffer_size
+                )
+                self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
+            else:
+                assert self.model_config.vocab_size > 64
+                self.disagg_metadata_buffers = MetadataBuffers(
+                    self.max_running_requests,
+                    max_top_logprobs_num=self.model_config.vocab_size,
+                    logits_only=True,
+                )
+                self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+                    self.max_running_requests
+                )
+
+            if not self.enable_overlap:
+                self.disagg_launch_done = threading.Event()
+            else:
+                self.disagg_launch_done = None
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),

@@ -1297,6 +1297,18 @@ class ModelRunner:
         )
         return next_token_ids
 
+    def forward_batch_sampling(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+    ) -> torch.Tensor:
+
+        self._preprocess_logits(logits_output, sampling_info)
+
+        next_token_ids = self.sampler(logits_output, sampling_info, False, [], [])
+
+        return next_token_ids
+
     @property
     def model_is_mrope(self) -> bool:
         """Detect if the model has "mrope" rope_scaling type.
