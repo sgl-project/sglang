@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils import require_gathered_buffer
 
 logger = logging.getLogger(__name__)
 
@@ -645,10 +646,7 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
-            prepare_dp_attn_flag = (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            )
+            prepare_gathered_buffer_flag = require_gathered_buffer(self.server_args)
 
             if batch:
                 # Generate fake extend output.
@@ -657,14 +655,14 @@ class SchedulerDisaggregationDecodeMixin:
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
-                    if prepare_dp_attn_flag:
+                    if prepare_gathered_buffer_flag:
                         self._prepare_idle_batch_and_run(None)
                 else:
-                    if prepare_dp_attn_flag:
-                        self.prepare_dp_attn_batch(batch)
+                    if prepare_gathered_buffer_flag:
+                        self.prepare_gathered_buffer_batch(batch)
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
-            elif prepare_dp_attn_flag:
+            elif prepare_gathered_buffer_flag:
                 batch, _ = self._prepare_idle_batch_and_run(None)
 
             if batch is None and (
@@ -695,10 +693,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.cur_batch = batch
             last_batch_in_queue = False
 
-            prepare_dp_attn_flag = (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            )
+            prepare_gathered_buffer_flag = require_gathered_buffer(self.server_args)
 
             if batch:
                 # Generate fake extend output.
@@ -707,7 +702,7 @@ class SchedulerDisaggregationDecodeMixin:
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
-                    if prepare_dp_attn_flag:
+                    if prepare_gathered_buffer_flag:
                         batch_, result = self._prepare_idle_batch_and_run(
                             None, delay_process=True
                         )
@@ -715,8 +710,8 @@ class SchedulerDisaggregationDecodeMixin:
                             result_queue.append((batch_.copy(), result))
                             last_batch_in_queue = True
                 else:
-                    if prepare_dp_attn_flag:
-                        self.prepare_dp_attn_batch(batch)
+                    if prepare_gathered_buffer_flag:
+                        self.prepare_gathered_buffer_batch(batch)
                     result = self.run_batch(batch)
                     result_queue.append((batch.copy(), result))
 
@@ -731,7 +726,7 @@ class SchedulerDisaggregationDecodeMixin:
                         self.set_next_batch_sampling_info_done(tmp_batch)
                     last_batch_in_queue = True
 
-            elif prepare_dp_attn_flag:
+            elif prepare_gathered_buffer_flag:
                 batch, result = self._prepare_idle_batch_and_run(
                     None, delay_process=True
                 )
