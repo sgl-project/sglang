@@ -483,9 +483,6 @@ class EAGLEWorker(TpModelWorker):
         else:
             # Initialize attention backend
             self.draft_attn_backend.init_forward_metadata(forward_batch)
-            forward_batch = ForwardBatch.init_new(
-                model_worker_batch, self.draft_model_runner
-            )
             # Run forward steps
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
 
