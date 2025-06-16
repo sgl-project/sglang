@@ -530,7 +530,9 @@ class GroupCoordinator:
         if world_size == 1:
             if output_tensor_list is not None:
                 output_tensor_list[0].copy_(input_)
-            return input_
+                return None
+            else:
+                return input_
 
         if output_tensor_list is not None:
             # TODO(ch-wan): support other backends
