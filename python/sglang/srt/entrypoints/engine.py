@@ -64,9 +64,7 @@ from sglang.srt.openai_api.adapter import (
     load_chat_template_for_openai_api,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.torch_memory_saver_adapter import (
-    configure_subprocess as tms_configure_subprocess,
-)
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
@@ -658,6 +656,9 @@ def _launch_subprocesses(
 
     scheduler_procs = []
     if server_args.dp_size == 1:
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.enable_memory_saver
+        )
         scheduler_pipe_readers = []
 
         nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
@@ -694,7 +695,7 @@ def _launch_subprocesses(
                     ),
                 )
 
-                with tms_configure_subprocess(enable=server_args.enable_memory_saver):
+                with memory_saver_adapter.configure_subprocess():
                     proc.start()
                 scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)

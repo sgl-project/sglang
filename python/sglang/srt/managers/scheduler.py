@@ -420,8 +420,8 @@ class Scheduler(
         t = threading.Thread(target=self.watchdog_thread, daemon=True)
         t.start()
         self.parent_process = psutil.Process().parent()
-        self.memory_saver_adapter = TorchMemorySaverAdapter(
-            server_args.enable_memory_saver
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.enable_memory_saver
         )
 
         # Init profiler

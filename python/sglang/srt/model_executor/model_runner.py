@@ -218,8 +218,8 @@ class ModelRunner:
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
 
-        self.memory_saver_adapter = TorchMemorySaverAdapter(
-            self.server_args.enable_memory_saver
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=self.server_args.enable_memory_saver
         )
 
         if not self.is_draft_worker:
