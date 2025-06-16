@@ -23,7 +23,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sglang.srt.utils import fast_topk, is_cuda, is_hip, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
 
 if is_cuda():
     from sgl_kernel import (
@@ -32,6 +32,7 @@ if is_cuda():
         tree_speculative_sampling_target_only,
         verify_tree_greedy,
     )
+    from sgl_kernel.top_k import fast_topk
 elif is_hip():
     from sgl_kernel import verify_tree_greedy
 
@@ -1003,16 +1004,6 @@ def select_top_k_tokens(
         )
 
     return input_ids, hidden_states, scores, tree_info
-
-
-def fast_topk_torch(values, topk, dim):
-    if topk == 1:
-        # Use max along the specified dimension to get both value and index
-        max_value, max_index = torch.max(values, dim=dim)
-        return max_value.unsqueeze(1), max_index.unsqueeze(1)
-    else:
-        # Use topk for efficiency with larger k values
-        return torch.topk(values, topk, dim=dim)
 
 
 def _generate_simulated_accept_index(
