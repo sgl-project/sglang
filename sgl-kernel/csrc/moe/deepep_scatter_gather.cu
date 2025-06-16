@@ -2,19 +2,16 @@
 #include <c10/util/BFloat16.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <ATen/Tensor.h>
+#include <torch/all.h>
 #include <cmath>
-
-int nextPowerOf2(const int& n) {
-    if (n == 0) return 0;
-    return static_cast<int>(pow(2, ceil(log2(n))));
-}
 
 __global__ void prefix_sum(
     int *g_odata,
     const int *g_idata,
     const int n
 ) {
-    extern __shared__ float temp[];
+    extern __shared__ int temp[];
     const int tid = threadIdx.x;
     int offset = 1;
 
@@ -71,12 +68,11 @@ __global__ void _fwd_kernel_ep_scatter_1_kernel(
     int local_expert_token_num = num_recv_tokens_per_expert[expert_id];
     int* m_indices_ptr =  m_indices + local_start_id;
 
-    for (uint32_t i = tid; i < local_expert_token_num; i += 32) {
+    for (uint32_t i = tid; i < local_expert_token_num; i += blockDim.x) {
         m_indices_ptr[i] = expert_id;
     }
 
 }
-
 
 template <typename RECV_X_TYPE>
 __global__ void _fwd_kernel_ep_scatter_2_kernel(
@@ -209,14 +205,14 @@ void fwd_ep_scatter(
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(); 
 
-    const int threadsPerBlock = num_experts / 2;  // Each thread handles 2 elements
+    TORCH_CHECK(num_experts % 2 == 0, "Number of experts must be even for this implementation.");
+
+    const int threadsPerBlock = num_experts / 2;
     prefix_sum<<<1, threadsPerBlock, 2 * threadsPerBlock * sizeof(int), stream>>>(
         static_cast<int*>(expert_start_loc.data_ptr()), 
         static_cast<int*>(num_recv_tokens_per_expert.data_ptr()), 
         num_experts
     );
-
-    cudaDeviceSynchronize();
 
     const int num_blocks1 = num_experts;
     const int num_threads1 = 32;
@@ -230,10 +226,9 @@ void fwd_ep_scatter(
         static_cast<int*>(m_indices.data_ptr())
     );
 
-    cudaDeviceSynchronize();
     
     auto kernel_2 = _fwd_kernel_ep_scatter_2_kernel<c10::Float8_e4m3fn>;
-    
+
     const int thread_per_group = 32;
     const int num_blocks2 = num_tokens;
     const int num_threads2 = num_topk * thread_per_group;
@@ -307,4 +302,5 @@ void fwd_ep_gather(
         hidden_size,
         num_topk
     );
+
 }
