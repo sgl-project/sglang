@@ -138,7 +138,6 @@ class HiCacheController_v2:
         if write_policy not in [
             "write_through",
             "write_through_selective",
-            "write_back",
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
 
@@ -204,25 +203,15 @@ class HiCacheController_v2:
             try:
                 operation = self.write_queue.get(block=True, timeout=1)
                 if not self.oracle:
-                    if self.page_size == 1:
-                        self.mem_pool_host.transfer_all_layer_kernel(
-                            self.mem_pool_device,
-                            operation.device_indices,
-                            operation.host_indices.to(self.mem_pool_device.device),
-                        )
-                        self.write_stream.synchronize()
-                    else:
-                        self.mem_pool_host.write_page_all_layers(
-                            operation.host_indices,
-                            operation.device_indices,
-                            self.mem_pool_device,
-                        )
-                        self.write_stream.synchronize()
-
+                    self.mem_pool_host.write_page_all_layers(
+                        operation.host_indices,
+                        operation.device_indices,
+                        self.mem_pool_device,
+                    )
+                    self.write_stream.synchronize()
                 self.mem_pool_host.complete_io(operation.host_indices)
-                for node_id in operation.handles:
-                    if node_id != 0:
-                        self.ack_write_queue.put(node_id)
+                for handle in operation.handles:
+                    self.ack_write_queue.put(handle)
             except Empty:
                 continue
             except Exception as e:
@@ -252,33 +241,20 @@ class HiCacheController_v2:
                 continue
 
             self.layer_done_counter.reset()
-            host_indices_device = batch_operation.host_indices.to(
-                self.mem_pool_device.device
-            )
             for i in range(self.mem_pool_host.layer_num):
                 if not self.oracle:
-                    if self.page_size == 1:
-                        self.mem_pool_device.transfer_per_layer_kernel(
-                            self.mem_pool_host,
-                            host_indices_device,
-                            batch_operation.device_indices,
-                            i,
-                        )
-                        self.load_stream.synchronize()
-                    else:
-                        self.mem_pool_host.load_page_per_layer(
-                            batch_operation.host_indices,
-                            batch_operation.device_indices,
-                            self.mem_pool_device,
-                            i,
-                        )
-                        self.load_stream.synchronize()
+                    self.mem_pool_host.load_page_per_layer(
+                        batch_operation.host_indices,
+                        batch_operation.device_indices,
+                        self.mem_pool_device,
+                        i,
+                    )
+                    self.load_stream.synchronize()
                 self.layer_done_counter.increment()
 
             self.mem_pool_host.complete_io(batch_operation.host_indices)
-            for node_id in batch_operation.handles:
-                if node_id != 0:
-                    self.ack_load_queue.put(node_id)
+            for handle in batch_operation.handles:
+                self.ack_load_queue.put(handle)
 
 
 def make_tree(
@@ -344,7 +320,6 @@ class HiRadixCacheCpp(BasePrefixCache):
         self.write_through_threshold = (
             1 if hicache_write_policy == "write_through" else 2
         )
-        self.load_back_threshold = 10
         self.device = token_to_kv_pool.device
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_token_pool = req_to_token_pool
@@ -427,6 +402,7 @@ class HiRadixCacheCpp(BasePrefixCache):
 
         for io_handle, device_indices, host_indices in ongoing_write:
             self.cache_controller.write(device_indices, host_indices, io_handle)
+            self.ongoing_write_through.add(io_handle)
         return length
 
     def dec_lock_ref(self, node: TreeNodeCpp):
@@ -554,6 +530,7 @@ class HiRadixCacheCpp(BasePrefixCache):
             host_indices=host_indices,
             handle=io_handle,  # NOTE: node is actually an int id
         )
+        self.ongoing_load_back.add(io_handle)
 
     def ready_to_load_host(self):
         self.load_cache_event.set()
@@ -590,3 +567,6 @@ class HiRadixCacheCpp(BasePrefixCache):
                 break
             self.tree.commit_loading_onboard(ack_id, True)
             self.ongoing_load_back.remove(ack_id)
+
+    def pretty_print(self):
+        return self.tree.debug_print()
