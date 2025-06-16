@@ -85,7 +85,7 @@ DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
 DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
 
-DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1000
+DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 
 
 def is_in_ci():

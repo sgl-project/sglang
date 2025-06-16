@@ -32,5 +32,5 @@ jobs:
 
       - name: Build and Push Blackwell Image
         run: |
-          docker build . -f docker/Dockerfile.blackwell -t lmsysorg/sglang:blackwell --no-cache
+          docker buildx build --output type=image,compression=zstd . -f docker/Dockerfile.blackwell -t lmsysorg/sglang:blackwell --no-cache
           docker push lmsysorg/sglang:blackwell

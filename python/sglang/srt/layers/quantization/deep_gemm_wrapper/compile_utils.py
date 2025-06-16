@@ -5,33 +5,24 @@ from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple
 
-import torch
 from tqdm.contrib.concurrent import thread_map
 
+from sglang.srt.layers.quantization.deep_gemm_wrapper.configurer import (
+    DEEPGEMM_V202506,
+    ENABLE_JIT_DEEPGEMM,
+)
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var, get_device_sm, get_int_env_var, is_cuda
+from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
 logger = logging.getLogger(__name__)
-_ENABLE_JIT_DEEPGEMM = False
 
 try:
-    import deep_gemm
     from deep_gemm import get_num_sms
     from deep_gemm.jit import build
-    from deep_gemm.jit.compiler import get_nvcc_compiler
     from deep_gemm.jit_kernels.gemm import get_best_configs
     from deep_gemm.jit_kernels.runtime import FP8GemmRuntime, GemmType
-
-    sm_version = get_device_sm()
-    if sm_version == 90:
-        if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
-            _ENABLE_JIT_DEEPGEMM = True
 except ImportError:
-    logger.warning("Failed to import deepgemm, disable _ENABLE_JIT_DEEPGEMM.")
-
-
-def get_enable_jit_deepgemm():
-    return _ENABLE_JIT_DEEPGEMM
+    pass
 
 
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
@@ -52,8 +43,10 @@ os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
 # NVRTC may have performance loss with some cases.
 # And NVCC JIT speed is also 9x faster in the ref commit
 _USE_NVRTC_DEFAULT = "0"
-if _ENABLE_JIT_DEEPGEMM:
+if ENABLE_JIT_DEEPGEMM:
     try:
+        from deep_gemm.jit.compiler import get_nvcc_compiler
+
         get_nvcc_compiler()
     except:
         logger.warning(
@@ -114,6 +107,7 @@ class DeepGemmKernelHelper:
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
 
 
+# TODO improve naming
 def _compile_warning_1():
     if not _IN_PRECOMPILE_STAGE and _IS_FIRST_RANK_ON_NODE:
         logger.warning(
@@ -127,6 +121,7 @@ def _compile_warning_1():
         )
 
 
+# TODO improve naming
 def _compile_warning_2():
     logger.warning(
         "Entering DeepGEMM JIT Single Kernel Compile session. "
@@ -238,6 +233,7 @@ def _compile_gemm_nt_f8f8bf16_one(
     _ = build("gemm_fp8_fp8_bf16_nt", code, FP8GemmRuntime, kwargs)
 
 
+# TODO further refactor warmup-related
 _KERNEL_HELPER_DICT: Dict[DeepGemmKernelType, DeepGemmKernelHelper] = {
     DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: DeepGemmKernelHelper(
         name="m_grouped_gemm_fp8_fp8_bf16_nt_masked",
@@ -270,7 +266,6 @@ def _maybe_compile_deep_gemm_one_type_all(
     num_groups: int,
     m_list: Optional[List[int]] = None,
 ) -> None:
-
     global _INITIALIZATION_DICT
     global _BUILTIN_M_LIST
 
@@ -304,56 +299,6 @@ def _maybe_compile_deep_gemm_one_type_all(
         thread_map(compile_func, collected_configs, max_workers=_COMPILE_WORKERS)
 
 
-def grouped_gemm_nt_f8f8bf16_masked(
-    lhs: Tuple[torch.Tensor, torch.Tensor],
-    rhs: Tuple[torch.Tensor, torch.Tensor],
-    out: torch.Tensor,
-    masked_m: torch.Tensor,
-    expected_m: int,
-):
-    num_groups, _, k = lhs[0].shape
-    _, n, _ = rhs[0].shape
-
-    kernel_type = DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
-    _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
-
-    with _log_jit_build(expected_m, n, k, kernel_type):
-        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-            lhs, rhs, out, masked_m, expected_m
-        )
-
-
-def grouped_gemm_nt_f8f8bf16_contig(
-    lhs: Tuple[torch.Tensor, torch.Tensor],
-    rhs: Tuple[torch.Tensor, torch.Tensor],
-    out: torch.Tensor,
-    m_indices: torch.Tensor,
-):
-    m, k = lhs[0].shape
-    num_groups, n, _ = rhs[0].shape
-
-    kernel_type = DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG
-    _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
-
-    with _log_jit_build(m, n, k, kernel_type):
-        deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(lhs, rhs, out, m_indices)
-
-
-def gemm_nt_f8f8bf16(
-    lhs: Tuple[torch.Tensor, torch.Tensor],
-    rhs: Tuple[torch.Tensor, torch.Tensor],
-    out: torch.Tensor,
-):
-    m, k = lhs[0].shape
-    n, _ = rhs[0].shape
-
-    kernel_type = DeepGemmKernelType.GEMM_NT_F8F8BF16
-    _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, 1)
-
-    with _log_jit_build(m, n, k, kernel_type):
-        deep_gemm.gemm_fp8_fp8_bf16_nt(lhs, rhs, out)
-
-
 @contextmanager
 def _log_jit_build(M: int, N: int, K: int, kernel_type: DeepGemmKernelType):
     if _IN_PRECOMPILE_STAGE:
@@ -380,13 +325,14 @@ def _log_jit_build(M: int, N: int, K: int, kernel_type: DeepGemmKernelType):
 
 
 @contextmanager
-def configure_deep_gemm_num_sms(num_sms):
-    if num_sms is None:
+def deep_gemm_execution_hook(
+    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+):
+    # not supported yet
+    if DEEPGEMM_V202506:
         yield
-    else:
-        original_num_sms = deep_gemm.get_num_sms()
-        deep_gemm.set_num_sms(num_sms)
-        try:
-            yield
-        finally:
-            deep_gemm.set_num_sms(original_num_sms)
+        return
+
+    _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
+    with _log_jit_build(m, n, k, kernel_type):
+        yield
