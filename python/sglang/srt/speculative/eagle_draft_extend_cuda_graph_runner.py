@@ -86,8 +86,8 @@ class EAGLEDraftExtendCudaGraphRunner:
 
             self.seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
-            self.accept_length = (
-                torch.ones((self.max_bs,), dtype=torch.int32) * self.num_tokens_per_bs
+            self.accept_length = torch.full(
+                (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
             )
 
         # Capture
