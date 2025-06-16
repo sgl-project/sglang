@@ -326,16 +326,18 @@ class OpenAIServingChat(OpenAIServingBase):
         """Apply conversation template"""
         conv = generate_chat_conv(request, self.tokenizer_manager.chat_template_name)
 
-        # Handle continue_final_message
+        # If we should continue the final assistant message, adjust the conversation.
         if (
             request.continue_final_message
             and request.messages
             and request.messages[-1].role == "assistant"
         ):
+            # Remove the auto-added blank assistant turn, if present.
             if conv.messages and conv.messages[-1][1] is None:
                 conv.messages.pop()
+            # Rebuild the prompt from the conversation.
             prompt = conv.get_prompt()
-            # Strip trailing stop tokens
+            # Strip trailing stop tokens or separators that indicate end-of-assistant.
             if isinstance(conv.stop_str, list):
                 for stop_token in conv.stop_str:
                     if prompt.endswith(stop_token):
