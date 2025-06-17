@@ -92,12 +92,7 @@ class MetadataBuffers:
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
         self.custom_mem_pool = custom_mem_pool
-
-        self.output_ids = None
-        self.output_token_logprobs_val = None
-        self.output_token_logprobs_idx = None
-        self.output_top_logprobs_val = None
-        self.output_top_logprobs_idx = None
+        device = "cuda" if self.custom_mem_pool else "cpu"
 
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -108,30 +103,18 @@ class MetadataBuffers:
 
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
-            self.output_ids = torch.zeros(
-                (size, 16),
-                dtype=torch.int32,
-                device="cuda" if self.custom_mem_pool else "cpu",
-            )
+            self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
             self.output_token_logprobs_val = torch.zeros(
-                (size, 16),
-                dtype=torch.float32,
-                device="cuda" if self.custom_mem_pool else "cpu",
+                (size, 16), dtype=torch.float32, device=device
             )
             self.output_token_logprobs_idx = torch.zeros(
-                (size, 16),
-                dtype=torch.int32,
-                device="cuda" if self.custom_mem_pool else "cpu",
+                (size, 16), dtype=torch.int32, device=device
             )
             self.output_top_logprobs_val = torch.zeros(
-                (size, max_top_logprobs_num),
-                dtype=torch.float32,
-                device="cuda" if self.custom_mem_pool else "cpu",
+                (size, max_top_logprobs_num), dtype=torch.float32, device=device
             )
             self.output_top_logprobs_idx = torch.zeros(
-                (size, max_top_logprobs_num),
-                dtype=torch.int32,
-                device="cuda" if self.custom_mem_pool else "cpu",
+                (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
 
     def get_buf_infos(self):
