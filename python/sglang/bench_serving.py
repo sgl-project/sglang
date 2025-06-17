@@ -597,8 +597,8 @@ class BenchmarkMetrics:
     concurrency: float
 
 
-# SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
-SHAREGPT_URL = "https://www.modelscope.cn/datasets/gliang1001/ShareGPT_V3_unfiltered_cleaned_split/resolve/master/ShareGPT_V3_unfiltered_cleaned_split.json"
+SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
+
 
 def download_and_cache_file(url: str, filename: Optional[str] = None):
     """Read and cache a file from a url."""
