@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
-from sgl_kernel import radix_tree_cpp # type: ignore
 import torch
+from sgl_kernel import radix_tree_cpp  # type: ignore
 
 if TYPE_CHECKING:
 

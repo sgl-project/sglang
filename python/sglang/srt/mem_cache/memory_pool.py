@@ -29,7 +29,7 @@ import logging
 import threading
 from enum import IntEnum
 from functools import wraps
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import numpy as np
 import psutil
@@ -37,13 +37,17 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import (
     debug_timing,
     get_compiler_backend,
     is_cuda,
     next_power_of_2,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.radix_attention import RadixAttention
+else:
+    RadixAttention = None
 
 logger = logging.getLogger(__name__)
 

@@ -82,7 +82,7 @@ class SchedulePolicy:
     def calc_priority(self, waiting_queue: List[Req]) -> bool:
         if self.policy == CacheAgnosticPolicy.FCFS:
             # A shortcut for FCFS
-            return
+            return False
 
         policy = self._determine_active_policy(waiting_queue)
 
