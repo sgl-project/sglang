@@ -20,16 +20,6 @@ ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT="v0.1.2"
 
-RUN if command -v rocminfo > /dev/null 2>&1; then \
-        GPU_ARCH=$(rocminfo | grep -m 1 'gfx' | awk '{print $2}'); \
-        if [ -z "$GPU_ARCH" ]; then \
-            GPU_ARCH="gfx942"; \
-        fi; \
-    else \
-        GPU_ARCH="gfx942"; \
-    fi && \
-    echo "export GPU_ARCH=$GPU_ARCH" >> /root/.bashrc
-
 RUN git clone ${SGL_REPO} \
     && cd sglang \
     && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \

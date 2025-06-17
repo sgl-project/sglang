@@ -51,12 +51,21 @@ cxx_flags = ["-O3"]
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
-amdgpu_target = os.environ.get("GPU_ARCH", None)
+default_target = "gfx942"
+amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)
 
-if amdgpu_target == None:
-    device_prop = torch.cuda.get_device_properties("cuda")
-    if device_prop != None:
-        amdgpu_target = device_prop.gcnArchName.split(":")[0]
+if torch.version.hip and torch.cuda.is_available():
+    try:
+        detected = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        amdgpu_target = detected
+        if amdgpu_target not in ["gfx942", "gfx950"]:
+            print(
+                f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
+            )
+    except Exception as e:
+        print(f"Warning: Failed to detect GPU properties: {e}")
+else:
+    print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
 if amdgpu_target not in ["gfx942", "gfx950"]:
     print(
