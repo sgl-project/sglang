@@ -246,6 +246,7 @@ class Scheduler(
                 self.dp_size,
             )
         )
+        self.prefill_mem_fraction = server_args.prefill_mem_fraction
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -540,16 +541,10 @@ class Scheduler(
 
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
-
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-                self.tp_worker.get_memory_pool()
-            )
-        else:
-            # For decode and overlap, we use the prefill size to allocate the memory pool
-            self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-                self.tp_worker.get_memory_pool(server_args.prefill_mem_fraction)
-            )
+        
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+            self.tp_worker.get_memory_pool()
+        )
 
         if (
             server_args.chunked_prefill_size is not None
@@ -1308,10 +1303,17 @@ class Scheduler(
         self._publish_kv_events()
 
     def check_memory(self):
-        available_size = (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
-        )
+        if self.prefill_mem_fraction and self.prefill_mem_fraction > 0:
+            available_size = (
+                self.token_to_kv_pool_allocator.available_size(is_prefill=True)
+                + self.token_to_kv_pool_allocator.available_size()
+                + self.tree_cache.evictable_size()
+            )
+        else:
+            available_size = (
+                self.token_to_kv_pool_allocator.available_size()
+                + self.tree_cache.evictable_size()
+            )
         protected_size = self.tree_cache.protected_size()
         memory_leak = available_size != (
             self.max_total_num_tokens

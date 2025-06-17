@@ -280,6 +280,7 @@ class ModelRunner:
             min_per_gpu_memory,
             server_args.max_running_requests,
             server_args.max_total_tokens,
+            server_args.prefill_mem_fraction,
         )
         if self.device == "cuda":
             self.init_cublas()
@@ -988,7 +989,7 @@ class ModelRunner:
 
         if self.token_to_kv_pool_allocator is None:
             if self.page_size == 1:
-                prefill_size = int(self.max_total_num_tokens * prefill_mem_fraction)
+                prefill_size = int(self.max_total_num_tokens * prefill_mem_fraction) if prefill_mem_fraction else None
                 self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                     self.max_total_num_tokens,
                     dtype=self.kv_cache_dtype,

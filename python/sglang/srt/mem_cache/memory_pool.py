@@ -182,7 +182,12 @@ class TokenToKVPoolAllocator:
 
         self._kvcache = kvcache
 
-    def available_size(self):
+    def available_size(self, is_prefill: bool = False):
+        if self.use_separate_pools:
+            if is_prefill:
+                return len(self.prefill_free_slots)
+            else:
+                return len(self.decode_free_slots)
         return len(self.free_slots)
 
     def debug_print(self) -> str:
