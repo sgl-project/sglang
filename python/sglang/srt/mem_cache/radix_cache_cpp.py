@@ -237,7 +237,7 @@ class HiCacheController_v2:
                 self.write_cancel_event.clear()
                 op_list: List[CacheOperation] = []
                 while not self.write_queue.empty():
-                    op_list.append(self.write_queue.get(block=False))
+                    op_list.append(self.write_queue.get_nowait())
                 self.ack_write_cancel_queue.put(op_list)
             try:
                 operation = self.write_queue.get(block=True, timeout=1)
@@ -249,7 +249,7 @@ class HiCacheController_v2:
 
         # ensure all remaining write operations are processed
         while not self.write_queue.empty():
-            operation = self.write_queue.get(block=False)
+            operation = self.write_queue.get_nowait()
             _write_to_host(operation)
 
     def load_thread_func_layer_by_layer(self):
@@ -268,10 +268,7 @@ class HiCacheController_v2:
             # and we don't care about the `get` order since they must be done
             # before a prefill request is processed
             batch_operation = CacheOperation.from_batch(
-                [
-                    self.load_queue.get(block=True)
-                    for _ in range(self.load_queue.qsize())
-                ]
+                [self.load_queue.get() for _ in range(self.load_queue.qsize())]
             )
             if batch_operation is None:
                 continue
@@ -610,7 +607,7 @@ class HiRadixCacheCpp(BasePrefixCache):
             )
         num_committed = int(queue_size.item())
         for _ in range(num_committed):
-            ack_id = self.cache_controller.ack_write_queue.get()
+            ack_id = self.cache_controller.ack_write_queue.get_nowait()
             self.tree.commit_writing_through(ack_id, True)
             self.ongoing_write_through.remove(ack_id)
         return num_committed
@@ -619,10 +616,7 @@ class HiRadixCacheCpp(BasePrefixCache):
         if self.cache_controller is None:
             return  # no host cache, nothing to check
         while not self.cache_controller.ack_load_queue.empty():
-            try:
-                ack_id = self.cache_controller.ack_load_queue.get_nowait()
-            except Exception:
-                break
+            ack_id = self.cache_controller.ack_load_queue.get_nowait()
             self.tree.commit_loading_onboard(ack_id, True)
             self.ongoing_load_back.remove(ack_id)
 
