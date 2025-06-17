@@ -4,25 +4,23 @@ import logging
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
+from sgl_kernel.fused_moe import fused_marlin_moe
 from torch.nn import Parameter
 
-from sgl_kernel.fused_moe import fused_marlin_moe
 from sglang.srt.layers.linear import (
     LinearBase,
     LinearMethodBase,
     UnquantizedLinearMethod,
-    set_weight_attrs
+    set_weight_attrs,
 )
+from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
+from sglang.srt.layers.quantization.awq import AWQConfig, is_layer_skipped_awq
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import is_cuda
-
-from sglang.srt.layers.quantization.awq import AWQConfig, is_layer_skipped_awq
-
-from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 
 _is_cuda = is_cuda()
 
@@ -51,7 +49,9 @@ except ImportError:
         uint4b8 = "uint4b8"
         uint8b128 = "uint8b128"
 
+
 logger = logging.getLogger(__name__)
+
 
 class AWQMarlinConfig(QuantizationConfig):
     """Config class for AWQ Marlin"""
@@ -387,6 +387,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
     ):
         # Delay the import to avoid circular dependency
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
         extra_weight_attrs.update(
             {
                 "is_transposed": True,

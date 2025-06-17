@@ -2,8 +2,8 @@ import functools
 from typing import Optional
 
 import torch
-
 from sgl_kernel.scalar_type import scalar_types
+
 
 def get_scalar_type(num_bits: int, has_zp: bool):
     if has_zp:
@@ -11,6 +11,7 @@ def get_scalar_type(num_bits: int, has_zp: bool):
         return scalar_types.uint4
     else:
         return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
+
 
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -62,8 +63,11 @@ def fused_marlin_moe(
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
     # Delay the import to avoid circular dependency
-    from sglang.srt.layers.moe.fused_moe_triton import try_get_optimal_moe_config, moe_align_block_size
-    
+    from sglang.srt.layers.moe.fused_moe_triton import (
+        moe_align_block_size,
+        try_get_optimal_moe_config,
+    )
+
     # Check constraints.
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     assert hidden_states.shape[1] == w1.shape[1] * 16, "Hidden size mismatch w1"
