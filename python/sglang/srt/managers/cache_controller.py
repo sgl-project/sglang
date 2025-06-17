@@ -555,8 +555,7 @@ class HiCacheController:
         return gathered_tensor[:, :unpadded_len]
 
     def mooncake_load_thread_func(self):
-        # while not self.mooncake_l3_stop_event.is_set():
-        while True:
+        while not self.mooncake_l3_stop_event.is_set():
             try:
                 operation = self.mooncake_load_queue.get(block=True, timeout=0.001)
                 keys = operation.mooncake_keys

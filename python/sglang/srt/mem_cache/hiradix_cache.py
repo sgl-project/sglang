@@ -108,8 +108,7 @@ class HiRadixCache(RadixCache):
             load_cache_event=self.load_cache_event,
             write_policy=hicache_write_policy,
             mooncake_l3_kv_pool=self.mooncake_l3_kv_pool,
-            mooncake_l3_load_cache_event=self.mooncake_l3_load_cache_event,
-            tp_group=tp_cache_group
+            mooncake_l3_load_cache_event=self.mooncake_l3_load_cache_event
         )
 
         # record the nodes with ongoing write through
@@ -141,9 +140,11 @@ class HiRadixCache(RadixCache):
     def write_backup(self, node: TreeNode, write_back=False, token_ids: Optional[List]=None):
         l3_keys = []
         if self.enable_mooncake_store_l3_cache:
-            prefix_block_key = "" if node.parent is None or node.parent.l3_keys is None else node.parent.l3_keys[-1]
+            # The KV cache of each rank in the MLA model is the same, so only one copy needs to be stored
+            local_rank = 0 if isinstance(self.kv_cache, MLATokenToKVPool) else torch.cuda.current_device()
+            prefix_block_key = "" if node.parent is None or len(node.parent.l3_keys) == 0 else node.parent.l3_keys[-1]
             l3_keys = get_node_l3_keys(token_ids, len(node.value), prefix_block_key,
-                                       torch.cuda.current_device(), self.page_size)
+                                       local_rank, self.page_size)
 
         host_indices = self.cache_controller.write(
             device_indices=node.value,
@@ -518,9 +519,10 @@ class HiRadixCache(RadixCache):
         if self.enable_mooncake_store_l3_cache:
             # try to get the cross instance shared kv cache
             if len(key) and (not node.evicted or node.backuped):
-                prefix_block_key = "" if node.parent is None or node.parent.l3_keys is None else node.parent.l3_keys[-1]
+                local_rank = 0 if isinstance(self.kv_cache, MLATokenToKVPool) else torch.cuda.current_device()
+                prefix_block_key = "" if node.parent is None or len(node.parent.l3_keys) == 0 else node.parent.l3_keys[-1]
                 l3_keys = get_node_l3_keys(total_key, len(key), prefix_block_key,
-                                           torch.cuda.current_device(), self.page_size)
+                                           local_rank, self.page_size)
                 mooncake_exist_keys = self.mooncake_l3_kv_pool.is_batch_exist(l3_keys)
                 l3_exist_keys = []
                 for l3_key in l3_keys:
