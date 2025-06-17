@@ -2136,7 +2136,7 @@ def get_local_ip_by_nic(interface: str) -> str:
                     return ip.split("%")[0]
     except (ValueError, OSError) as e:
         raise ValueError(
-            "Can not get local ip from NIC. Please verify whether SGLANG_DISAGGREGATION_LOCAL_IP_NIC is set correctly."
+            "Can not get local ip from NIC. Please verify whether SGLANG_LOCAL_IP_NIC is set correctly."
         )
 
     # Fallback
