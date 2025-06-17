@@ -20,7 +20,7 @@ import logging
 import os
 import random
 import tempfile
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Union
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -51,6 +51,7 @@ class ServerArgs:
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
     quantization: Optional[str] = None
+    modelopt_quant: Optional[Union[str, Dict]] = None
     quantization_param_path: Optional[str] = None
     context_length: Optional[int] = None
     device: Optional[str] = None
@@ -665,7 +666,7 @@ class ServerArgs:
                 "awq_marlin",
                 "bitsandbytes",
                 "gguf",
-                "modelopt",
+                "modelopt_fp8",  # TODO: set default for modelopt quantization,
                 "modelopt_fp4",
                 "w8a8_int8",
                 "w8a8_fp8",
