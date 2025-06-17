@@ -8,6 +8,7 @@ from sglang.srt.connector.base_connector import (
     BaseFileConnector,
     BaseKVConnector,
 )
+from sglang.srt.connector.file import FileConnector
 from sglang.srt.connector.redis import RedisConnector
 from sglang.srt.connector.s3 import S3Connector
 from sglang.srt.utils import parse_connector_type
@@ -20,12 +21,14 @@ class ConnectorType(str, enum.Enum):
     KV = "KV"
 
 
-def create_remote_connector(url, device="cpu") -> BaseConnector:
+def create_remote_connector(url, **kwargs) -> BaseConnector:
     connector_type = parse_connector_type(url)
     if connector_type == "redis":
         return RedisConnector(url)
     elif connector_type == "s3":
         return S3Connector(url)
+    elif connector_type == "file":
+        return FileConnector(url)
     else:
         raise ValueError(f"Invalid connector type: {url}")
 
