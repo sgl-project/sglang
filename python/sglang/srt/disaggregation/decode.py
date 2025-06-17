@@ -31,6 +31,7 @@ import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVPoll
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -54,6 +55,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
 
@@ -532,6 +534,7 @@ class DecodeTransferQueue:
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
+        server_args:ServerArgs,
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
@@ -540,6 +543,9 @@ class DecodeTransferQueue:
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.tree_cache = tree_cache
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -589,7 +595,7 @@ class DecodeTransferQueue:
                 ) = self.metadata_buffers.get_buf(idx)
 
                 decode_req.req.output_ids.append(output_id[0].item())
-                if True or config.use_mtp: # use config
+                if not self.spec_algorithm.is_none():
                     decode_req.req.hidden_states_tensor = output_hidden_states
                 if decode_req.req.return_logprob:
                     decode_req.req.output_token_logprobs_val.append(

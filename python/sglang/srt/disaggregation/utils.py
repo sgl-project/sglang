@@ -84,15 +84,15 @@ class ReqToMetadataIdxAllocator:
 
 
 class MetadataBuffers:
-    def __init__(self, size: int, max_top_logprobs_num: int = 128):
+    def __init__(self, size: int, hidden_size:int, dtype:torch.dtype, max_top_logprobs_num: int = 128):
         # TODO: abort top_logprobs_num > 128 in PD
 
         # We transfer the metadata of first output token to decode
         # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
         self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device="cpu")
         
-        # TODO: use Model config and pad to 64B
-        self.output_hidden_states = torch.zeros((size, 7168), dtype=torch.bfloat16, device="cpu")
+        # TODO: pad to 64B
+        self.output_hidden_states = torch.zeros((size, hidden_size), dtype=dtype, device="cpu")
         self.output_token_logprobs_val = torch.zeros(
             (size, 16), dtype=torch.float32, device="cpu"
         )
@@ -146,7 +146,7 @@ class MetadataBuffers:
     def set_buf(self, req: Req):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
-        if True or config.use_mtp: # use config
+        if req.hidden_states_tensor is not None:
             self.output_hidden_states[req.metadata_buffer_index].copy_(req.hidden_states_tensor)
         if req.return_logprob:
             if req.output_token_logprobs_val:  # not none or empty list

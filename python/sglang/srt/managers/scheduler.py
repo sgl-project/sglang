@@ -622,7 +622,11 @@ class Scheduler(
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
+            self.disagg_metadata_buffers = MetadataBuffers(
+                buffer_size, 
+                hidden_size = self.model_config.hf_text_config.hidden_size,
+                dtype = self.model_config.dtype
+            )
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
@@ -632,6 +636,7 @@ class Scheduler(
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 tree_cache=self.tree_cache,
+                server_args=self.server_args,
             )
 
             # The decode requests pending for pre-allocation
@@ -669,7 +674,11 @@ class Scheduler(
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
+            self.disagg_metadata_buffers = MetadataBuffers(
+                buffer_size,
+                hidden_size = self.model_config.hf_text_config.hidden_size,
+                dtype = self.model_config.dtype
+            )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
