@@ -1,59 +1,65 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
-import vllm.model_executor.layers.fused_moe  # noqa
-from sgl_kernel import fused_marlin_moe
 from torch.nn import Parameter
-from vllm import _custom_ops as ops
-from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.layer import (
-    FusedMoE,
-    FusedMoEMethodBase,
-    FusedMoeWeightScaleSupported,
-)
-from vllm.model_executor.layers.linear import (
+
+from sgl_kernel.fused_moe import fused_marlin_moe
+from sglang.srt.layers.linear import (
     LinearBase,
     LinearMethodBase,
     UnquantizedLinearMethod,
-    set_weight_attrs,
+    set_weight_attrs
 )
-from vllm.model_executor.layers.quantization.awq import AWQConfig, is_layer_skipped_awq
-from vllm.model_executor.layers.quantization.base_config import (
+from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from vllm.model_executor.layers.quantization.utils import replace_parameter
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    apply_awq_marlin_linear,
-    awq_to_marlin_zero_points,
-    check_marlin_supported,
-    check_marlin_supports_layer,
-    check_moe_marlin_supports_layer,
-    marlin_make_empty_g_idx,
-    marlin_make_workspace,
-    marlin_moe_permute_scales,
-    marlin_permute_scales,
-    moe_awq_to_marlin_zero_points,
-    verify_marlin_supported,
-    verify_marlin_supports_shape,
-)
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.model_executor.parameter import GroupQuantScaleParameter, PackedvLLMParameter
-from vllm.platforms import current_platform
-from vllm.scalar_type import scalar_types
+from sglang.srt.layers.quantization.utils import replace_parameter
+from sglang.srt.utils import is_cuda
 
-logger = init_logger(__name__)
+from sglang.srt.layers.quantization.awq import AWQConfig, is_layer_skipped_awq
 
+from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
+
+_is_cuda = is_cuda()
+
+try:
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        apply_awq_marlin_linear,
+        awq_to_marlin_zero_points,
+        check_marlin_supported,
+        check_marlin_supports_layer,
+        check_moe_marlin_supports_layer,
+        marlin_make_empty_g_idx,
+        marlin_make_workspace,
+        marlin_moe_permute_scales,
+        marlin_permute_scales,
+        moe_awq_to_marlin_zero_points,
+        verify_marlin_supported,
+        verify_marlin_supports_shape,
+    )
+    from vllm.scalar_type import scalar_types
+
+except ImportError:
+    FusedMoEMethodBase = QuantizeMethodBase
+
+    class scalar_types:
+        uint4b8 = "uint4b8"
+        uint8b128 = "uint8b128"
+
+logger = logging.getLogger(__name__)
 
 class AWQMarlinConfig(QuantizationConfig):
     """Config class for AWQ Marlin"""
 
     # num_bits -> type
     TYPE_MAP = {
-        4: scalar_types.uint4,
-        8: scalar_types.uint8,
+        4: scalar_types.uint4b8,
+        8: scalar_types.uint8b128,
     }
 
     def __init__(
@@ -156,6 +162,10 @@ class AWQMarlinConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
+        # Delay the import to avoid circular dependency
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
         if isinstance(layer, LinearBase) or (
             isinstance(layer, ParallelLMHead) and self.lm_head_quantized
         ):
@@ -193,7 +203,8 @@ class AWQMarlinConfig(QuantizationConfig):
         group_size = quant_config.get("group_size")
         zero_point = quant_config.get("zero_point")
 
-        if not current_platform.is_cuda():
+        # if not current_platform.is_cuda():
+        if not is_cuda():
             return False
 
         if quant_method != "awq":
@@ -374,6 +385,8 @@ class AWQMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        # Delay the import to avoid circular dependency
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
         extra_weight_attrs.update(
             {
                 "is_transposed": True,

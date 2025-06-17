@@ -10,7 +10,7 @@
 #include <iostream>
 
 #ifndef MARLIN_NAMESPACE_NAME
-#define MARLIN_NAMESPACE_NAME marlin
+#define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif
 
 namespace MARLIN_NAMESPACE_NAME {
@@ -91,7 +91,6 @@ template <int n>
 __device__ inline void cp_async_wait() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
 }
-
 #endif
 
 }  // namespace MARLIN_NAMESPACE_NAME

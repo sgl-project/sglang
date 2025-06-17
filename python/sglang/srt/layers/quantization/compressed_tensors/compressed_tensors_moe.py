@@ -9,7 +9,7 @@ from typing import Callable, List, Optional
 import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import ActivationOrdering, QuantizationStrategy
-from sgl_kernel import fused_marlin_moe
+from sgl_kernel.fused_moe import fused_marlin_moe
 
 from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
@@ -23,11 +23,9 @@ from sglang.srt.utils import is_cuda, set_weight_attrs
 
 _is_cuda = is_cuda()
 
-# if not _is_cuda:
-from vllm import _custom_ops as vllm_ops
-from vllm._custom_ops import scaled_fp8_quant
-
 try:
+    from vllm import _custom_ops as vllm_ops
+    from vllm._custom_ops import scaled_fp8_quant
     import vllm
 
     VLLM_AVAILABLE = True

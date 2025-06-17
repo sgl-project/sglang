@@ -205,3 +205,16 @@ def cutlass_fp4_group_mm(
         blockscale_offsets,
     )
     return c.to(dtype=out_dtype)
+
+def gptq_marlin_repack(
+    b_q_weight,
+    perm,
+    size_k, size_n,
+    num_bits,
+):
+    torch.ops.sgl_kernel.gptq_marlin_repack.default(
+        b_q_weight,
+        perm,
+        size_k, size_n,
+        num_bits,
+    )

@@ -2,21 +2,8 @@ import functools
 from typing import Optional
 
 import torch
-import vllm._custom_ops as ops
-from vllm.model_executor.layers.fused_moe.fused_moe import (
-    fused_topk,
-    moe_align_block_size,
-    try_get_optimal_moe_config,
-)
-from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
-    marlin_quantize,
-)
-from vllm.scalar_type import scalar_types
-from vllm.utils import direct_register_custom_op
 
-# from sglang.srt.layers.moe.topk import select_experts
-# from sgl_kernel import fused_marlin_moe
-
+from sgl_kernel.scalar_type import scalar_types
 
 def get_scalar_type(num_bits: int, has_zp: bool):
     if has_zp:
@@ -24,7 +11,6 @@ def get_scalar_type(num_bits: int, has_zp: bool):
         return scalar_types.uint4
     else:
         return scalar_types.uint4b8 if num_bits == 4 else scalar_types.uint8b128
-
 
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -75,6 +61,9 @@ def fused_marlin_moe(
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
+    # Delay the import to avoid circular dependency
+    from sglang.srt.layers.moe.fused_moe_triton import try_get_optimal_moe_config, moe_align_block_size
+    
     # Check constraints.
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     assert hidden_states.shape[1] == w1.shape[1] * 16, "Hidden size mismatch w1"
@@ -107,7 +96,7 @@ def fused_marlin_moe(
     if global_num_experts == -1:
         global_num_experts = E
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, block_size_m, global_num_experts, expert_map
+        topk_ids, block_size_m, global_num_experts
     )
 
     if workspace is None:

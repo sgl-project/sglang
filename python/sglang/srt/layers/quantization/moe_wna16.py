@@ -4,12 +4,7 @@ import logging
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    marlin_permute_scales,
-)
-from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
-    marlin_weights,
-)
+
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import get_tp_group
@@ -22,8 +17,15 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.utils import get_device_capability, set_weight_attrs
 
+try:
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        marlin_permute_scales,
+    )
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
+        marlin_weights,
+    )
+    
 logger = logging.getLogger(__name__)
-
 
 def get_weight_perm(num_bits: int):
     perm_list: List[int] = []
