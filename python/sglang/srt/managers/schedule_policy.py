@@ -349,6 +349,10 @@ class PrefillAdder:
         rem_tokens_ = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
         truncated = req.extend_input_len > rem_tokens_
         req.extend_input_len = min(req.extend_input_len, rem_tokens_)
+        if req.extend_input_len > self.token_to_kv_pool_allocator.available_size():
+            self.tree_cache.evict(
+                req.extend_input_len - self.token_to_kv_pool_allocator.available_size()
+            )
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
         self._prefill_one_req(

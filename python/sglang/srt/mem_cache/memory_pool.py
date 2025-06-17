@@ -1126,7 +1126,7 @@ class MLATokenToKVPoolHost(HostKVCache):
 class DiskKVCache(abc.ABC):
     def __init__(
         self,
-        device_pool: MHATokenToKVPool,
+        device_pool: KVCache,
         disk_path: str,
         disk_to_device_ratio: float,
         disk_size: int,

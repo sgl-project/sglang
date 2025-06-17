@@ -127,7 +127,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+from sglang.srt.mem_cache.hiradix_cache import HiRadixCache, HiRadixCacheDisk
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -522,7 +522,12 @@ class Scheduler(
             )
         else:
             if self.enable_hierarchical_cache:
-                self.tree_cache = HiRadixCache(
+                tree_class = (
+                    HiRadixCache
+                    if not server_args.hicache_use_disk
+                    else HiRadixCacheDisk
+                )
+                self.tree_cache = tree_class(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                     tp_cache_group=self.tp_cpu_group,
