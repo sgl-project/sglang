@@ -104,12 +104,19 @@ class CacheOperation:
         # default priority is the order of creation
         self.priority = priority if priority is not None else self.id
 
-    def merge(self, other: "CacheOperation") -> None:
-        # multiple operations can be merged into a single operation for batch processing
-        self.host_indices = torch.cat([self.host_indices, other.host_indices])
-        self.device_indices = torch.cat([self.device_indices, other.device_indices])
-        self.priority = min(self.priority, other.priority)
-        self.handles.extend(other.handles)
+    @staticmethod
+    def from_batch(batch: List["CacheOperation"]) -> Optional["CacheOperation"]:
+        if len(batch) == 0:
+            return None
+        if len(batch) == 1:
+            return batch[0]
+        host_indices = torch.cat([op.host_indices for op in batch])
+        device_indices = torch.cat([op.device_indices for op in batch])
+        handles = [handle for op in batch for handle in op.handles]
+        priority = min(op.priority for op in batch)
+        op = CacheOperation(host_indices, device_indices, handles[0], priority)
+        op.handles = handles
+        return op
 
     def __lt__(self, other: "CacheOperation"):
         return self.priority < other.priority
@@ -248,15 +255,15 @@ class HiCacheController_v2:
                 continue
             self.load_cache_event.clear()
 
-            # TODO(dark): optimize the batch merge operations
-            # reduce the number of torch.cat calls
-            batch_operation = None
-            while self.load_queue.qsize() > 0:
-                op = self.load_queue.get(block=True)
-                if batch_operation is None:
-                    batch_operation = op
-                else:
-                    batch_operation.merge(op)
+            # the load queue should be unchanged after this load_event is set
+            # and we don't care about the `get` order since they must be done
+            # before a prefill request is processed
+            batch_operation = CacheOperation.from_batch(
+                [
+                    self.load_queue.get(block=True)
+                    for _ in range(self.load_queue.qsize())
+                ]
+            )
             if batch_operation is None:
                 continue
 
@@ -355,7 +362,6 @@ class HiRadixCacheCpp(BasePrefixCache):
         self.load_cache_event = threading.Event()
 
         if not use_hicache:
-            # TODO(dark): pass the second argument as `std::optional`
             self.tree = make_tree(
                 disabled=disable,
                 use_hicache=use_hicache,
