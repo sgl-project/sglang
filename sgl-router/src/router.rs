@@ -4,9 +4,7 @@ use crate::tree::Tree;
 use ::metrics::{counter, gauge, histogram};
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
-use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::atomic::AtomicUsize;
@@ -588,50 +586,90 @@ impl Router {
         }))
     }
 
-    fn get_text_from_request(&self, body: &Bytes, route: &str) -> String {
-        // Convert body to JSON
-        let json: Value = match serde_json::from_slice(body) {
-            Ok(j) => j,
-            Err(_) => {
-                warn!("Failed to parse JSON from request body.");
-                return String::new();
-            }
-        };
+    // New method to route typed requests directly
+    pub async fn route_typed_request<
+        T: crate::openai_api_types::GenerationRequest + serde::Serialize + Clone,
+    >(
+        &self,
+        client: &reqwest::Client,
+        req: &HttpRequest,
+        typed_req: &T,
+        route: &str,
+    ) -> HttpResponse {
+        if self.is_prefill_decode() {
+            HttpResponse::InternalServerError()
+                .body("PD routing should use specialized typed handlers")
+        } else {
+            // Handle retries like the original implementation
+            let start = Instant::now();
+            const MAX_REQUEST_RETRIES: u32 = 3;
+            const MAX_TOTAL_RETRIES: u32 = 6;
+            let mut total_retries = 0;
 
-        match route {
-            "/generate" => {
-                // For /generate, always use the "text" field.
-                match json.get("text").and_then(Value::as_str) {
-                    Some(text) => text.to_string(),
-                    None => {
-                        warn!("No 'text' field found in request body for route /generate.");
-                        String::new()
+            while total_retries < MAX_TOTAL_RETRIES {
+                // Extract routing text directly from typed request
+                let text = typed_req.extract_text_for_routing();
+                let is_stream = typed_req.is_stream();
+
+                // Select worker based on text
+                let worker_url = self.select_generate_worker_from_text(&text);
+                let mut request_retries = 0;
+
+                // Try the same worker multiple times
+                while request_retries < MAX_REQUEST_RETRIES {
+                    if total_retries >= 1 {
+                        info!("Retrying request after {} failed attempts", total_retries);
+                        counter!("sgl_router_retries_total", "route" => route.to_string())
+                            .increment(1);
+                    }
+
+                    // Send typed request directly
+                    let response = self
+                        .send_typed_request(client, req, typed_req, route, &worker_url, is_stream)
+                        .await;
+
+                    if response.status().is_success() {
+                        let duration = start.elapsed();
+                        histogram!("sgl_router_generate_duration_seconds", "route" => route.to_string())
+                            .record(duration.as_secs_f64());
+                        return response;
+                    } else {
+                        // if the worker is healthy, it means the request is bad, so return the error response
+                        let health_response =
+                            self.send_request(client, &worker_url, "/health", req).await;
+                        if health_response.status().is_success() {
+                            counter!("sgl_router_request_errors_total", "route" => route.to_string())
+                                .increment(1);
+                            return response;
+                        }
+                    }
+
+                    warn!(
+                        "Generate request to {} failed (attempt {}/{})",
+                        worker_url,
+                        request_retries + 1,
+                        MAX_REQUEST_RETRIES
+                    );
+
+                    request_retries += 1;
+                    total_retries += 1;
+
+                    if request_retries == MAX_REQUEST_RETRIES {
+                        warn!("Removing failed worker: {}", worker_url);
+                        self.remove_worker(&worker_url);
+                        break;
                     }
                 }
             }
-            "/v1/chat/completions" | "/v1/completions" => {
-                // For these routes, try "messages", then "prompt", then "text".
-                if let Some(messages) = json.get("messages") {
-                    serde_json::to_string(messages).unwrap_or_default()
-                } else if let Some(prompt) = json.get("prompt").and_then(Value::as_str) {
-                    prompt.to_string()
-                } else {
-                    warn!("Failed to find 'messages', 'prompt' in request body.");
-                    String::new()
-                }
-            }
-            _ => {
-                warn!("Unknown route: {} - defaulting to fallback string", route);
-                String::new()
-            }
+
+            counter!("sgl_router_request_errors_total", "route" => route.to_string()).increment(1);
+            HttpResponse::InternalServerError().body("All retry attempts failed")
         }
     }
 
-    // TODO: return Result<String, String> instead of panicking
-    fn select_generate_worker(&self, body: &Bytes, route: &str) -> String {
-        let text = self.get_text_from_request(&body, route);
-
-        let worker_url = match self {
+    // Helper method to select worker from text
+    fn select_generate_worker_from_text(&self, text: &str) -> String {
+        match self {
             Router::RoundRobin {
                 worker_urls,
                 current_index,
@@ -661,8 +699,6 @@ impl Router {
                 balance_rel_threshold,
                 ..
             } => {
-                // TODO: delay scheduling if cache hit rate is high because it may cause imbalance. prioritize low hit rate ones
-
                 let tree = tree.lock().unwrap();
                 let mut running_queue = running_queue.lock().unwrap();
 
@@ -728,30 +764,32 @@ impl Router {
                 selected_url
             }
             Router::PrefillDecode { .. } => {
-                // For PD mode, we don't use select_generate_worker
-                // This should be handled by route_pd_request instead
+                // For PD mode, we don't use this method
                 return "PD_MODE_ERROR".to_string();
             }
-        };
-
-        worker_url
+        }
     }
 
-    async fn send_generate_request(
+    // Send typed request directly without conversion
+    async fn send_typed_request<T: serde::Serialize>(
         &self,
         client: &reqwest::Client,
         req: &HttpRequest,
-        body: &Bytes,
+        typed_req: &T,
         route: &str,
         worker_url: &str,
+        is_stream: bool,
     ) -> HttpResponse {
-        let is_stream = serde_json::from_slice::<serde_json::Value>(&body)
-            .map(|v| v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false))
-            .unwrap_or(false);
+        let start = Instant::now();
+
+        // Debug: Log what we're sending
+        if let Ok(json_str) = serde_json::to_string_pretty(typed_req) {
+            debug!("Sending request to {}: {}", route, json_str);
+        }
 
         let mut request_builder = client
             .post(format!("{}{}", worker_url, route))
-            .body(body.to_vec());
+            .json(typed_req); // Use json() directly with typed request
 
         // Copy all headers from original request
         for (name, value) in copy_request_headers(req) {
@@ -763,7 +801,10 @@ impl Router {
 
         let res = match request_builder.send().await {
             Ok(res) => res,
-            Err(_) => return HttpResponse::InternalServerError().finish(),
+            Err(e) => {
+                error!("Failed to send request to {}: {}", worker_url, e);
+                return HttpResponse::InternalServerError().body(format!("Request failed: {}", e));
+            }
         };
 
         let status = actix_web::http::StatusCode::from_u16(res.status().as_u16())
@@ -787,6 +828,12 @@ impl Router {
                     }
                 }
             }
+
+            // Record metrics
+            let duration = start.elapsed();
+            histogram!("sgl_router_generate_duration_seconds", "route" => route.to_string())
+                .record(duration.as_secs_f64());
+            counter!("sgl_router_requests_total", "route" => route.to_string()).increment(1);
 
             response
         } else if let Router::CacheAware { running_queue, .. } = self {
@@ -823,91 +870,8 @@ impl Router {
         }
     }
 
-    pub async fn route_generate_request(
-        &self,
-        client: &reqwest::Client,
-        req: &HttpRequest,
-        body: &Bytes,
-        route: &str,
-    ) -> HttpResponse {
-        // Note: PD routing is now handled in server.rs with typed requests
-        // This method only handles regular (non-PD) routing
-        if self.is_prefill_decode() {
-            // This should not be called for PD mode anymore
-            // PD requests go through route_pd_generate_typed or route_pd_chat_typed
-            HttpResponse::InternalServerError().body("PD routing should use typed handlers")
-        } else {
-            self.route_single_worker_request(client, req, body, route)
-                .await
-        }
-    }
-
     pub fn is_prefill_decode(&self) -> bool {
         matches!(self, Router::PrefillDecode { .. })
-    }
-
-    async fn route_single_worker_request(
-        &self,
-        client: &reqwest::Client,
-        req: &HttpRequest,
-        body: &Bytes,
-        route: &str,
-    ) -> HttpResponse {
-        let start = Instant::now();
-        const MAX_REQUEST_RETRIES: u32 = 3;
-        const MAX_TOTAL_RETRIES: u32 = 6;
-        let mut total_retries = 0;
-
-        while total_retries < MAX_TOTAL_RETRIES {
-            let worker_url = self.select_generate_worker(body, route);
-            let mut request_retries = 0;
-
-            // Try the same worker multiple times
-            while request_retries < MAX_REQUEST_RETRIES {
-                if total_retries >= 1 {
-                    info!("Retrying request after {} failed attempts", total_retries);
-                    counter!("sgl_router_retries_total", "route" => route.to_string()).increment(1);
-                }
-
-                let response = self
-                    .send_generate_request(client, req, body, route, &worker_url)
-                    .await;
-
-                if response.status().is_success() {
-                    let duration = start.elapsed();
-                    histogram!("sgl_router_generate_duration_seconds", "route" => route.to_string()).record(duration.as_secs_f64());
-                    return response;
-                } else {
-                    // if the worker is healthy, it means the request is bad, so return the error response
-                    let health_response =
-                        self.send_request(client, &worker_url, "/health", req).await;
-                    if health_response.status().is_success() {
-                        counter!("sgl_router_request_errors_total", "route" => route.to_string())
-                            .increment(1);
-                        return response;
-                    }
-                }
-
-                warn!(
-                    "Generate request to {} failed (attempt {}/{})",
-                    worker_url,
-                    request_retries + 1,
-                    MAX_REQUEST_RETRIES
-                );
-
-                request_retries += 1;
-                total_retries += 1;
-
-                if request_retries == MAX_REQUEST_RETRIES {
-                    warn!("Removing failed worker: {}", worker_url);
-                    self.remove_worker(&worker_url);
-                    break;
-                }
-            }
-        }
-
-        counter!("sgl_router_request_errors_total", "route" => route.to_string()).increment(1);
-        HttpResponse::InternalServerError().body("All retry attempts failed")
     }
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {

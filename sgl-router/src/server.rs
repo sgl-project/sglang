@@ -1,13 +1,13 @@
 use crate::logging::{self, LoggingConfig};
-use crate::pd_types::{ChatReqInput, GenerateReqInput};
+use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::prometheus::{self, PrometheusConfig};
+use crate::request_adapter::ToPdRequest;
 use crate::router::PolicyConfig;
 use crate::router::Router;
 use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
 use actix_web::{
     error, get, post, web, App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
-use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -132,103 +132,78 @@ async fn get_model_info(req: HttpRequest, data: web::Data<AppState>) -> impl Res
 #[post("/generate")]
 async fn generate(
     req: HttpRequest,
-    typed_req: web::Json<GenerateReqInput>,
-    data: web::Data<AppState>,
-) -> impl Responder {
-    // For PD mode, use typed request handling with proper JSON extraction
-    if data.router.is_prefill_decode() {
-        let typed_req = typed_req.into_inner();
+    body: web::Json<GenerateRequest>,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, Error> {
+    let client = &state.client;
+    let router = &state.router;
 
-        // Debug logging to understand the request structure
-        info!(
-            "PD generate request - batch_size: {:?}",
-            typed_req.get_batch_size()
-        );
-        if let Some(input_ids) = &typed_req.input_ids {
-            match input_ids {
-                crate::pd_types::SingleOrBatch::Single(ids) => {
-                    info!("Single request with {} tokens", ids.len());
-                }
-                crate::pd_types::SingleOrBatch::Batch(batch) => {
-                    info!("Batch request with {} sequences", batch.len());
-                }
-            }
-        }
+    // Use typed request directly for both PD and regular routing
+    if router.is_prefill_decode() {
+        // For PD mode, convert to PD request with bootstrap
+        let pd_request = body.into_inner().to_pd_request();
 
-        data.router
-            .route_pd_generate_typed(&data.client, &req, typed_req, "/generate")
-            .await
+        Ok(router
+            .route_pd_generate_typed(&client, &req, pd_request, "/generate")
+            .await)
     } else {
-        // Regular mode - convert back to bytes for compatibility
-        let body = match serde_json::to_vec(&typed_req.into_inner()) {
-            Ok(bytes) => Bytes::from(bytes),
-            Err(e) => {
-                return HttpResponse::InternalServerError()
-                    .body(format!("Failed to serialize request: {}", e))
-            }
-        };
-
-        data.router
-            .route_generate_request(&data.client, &req, &body, "/generate")
-            .await
+        // For regular mode, use typed request directly
+        let request = body.into_inner();
+        Ok(router
+            .route_typed_request(&client, &req, &request, "/generate")
+            .await)
     }
 }
 
 #[post("/v1/chat/completions")]
 async fn v1_chat_completions(
     req: HttpRequest,
-    typed_req: web::Json<ChatReqInput>,
-    data: web::Data<AppState>,
-) -> impl Responder {
-    // For PD mode, use typed request handling with proper JSON extraction
-    if data.router.is_prefill_decode() {
-        let typed_req = typed_req.into_inner();
+    body: web::Json<ChatCompletionRequest>,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, Error> {
+    let client = &state.client;
+    let router = &state.router;
 
-        data.router
-            .route_pd_chat_typed(&data.client, &req, typed_req, "/v1/chat/completions")
-            .await
+    // Use typed request directly for both PD and regular routing
+    if router.is_prefill_decode() {
+        // For PD mode, convert to PD request with bootstrap
+        let pd_request = body.into_inner().to_pd_request();
+
+        Ok(router
+            .route_pd_chat_typed(&client, &req, pd_request, "/v1/chat/completions")
+            .await)
     } else {
-        // Regular mode - convert back to bytes for compatibility
-        let body = match serde_json::to_vec(&typed_req.into_inner()) {
-            Ok(bytes) => Bytes::from(bytes),
-            Err(e) => {
-                return HttpResponse::InternalServerError()
-                    .body(format!("Failed to serialize request: {}", e))
-            }
-        };
-
-        data.router
-            .route_generate_request(&data.client, &req, &body, "/v1/chat/completions")
-            .await
+        // For regular mode, use typed request directly
+        let request = body.into_inner();
+        Ok(router
+            .route_typed_request(&client, &req, &request, "/v1/chat/completions")
+            .await)
     }
 }
 
 #[post("/v1/completions")]
 async fn v1_completions(
     req: HttpRequest,
-    typed_req: web::Json<GenerateReqInput>,
-    data: web::Data<AppState>,
-) -> impl Responder {
-    // For PD mode, use typed request handling with proper JSON extraction
-    if data.router.is_prefill_decode() {
-        let typed_req = typed_req.into_inner();
+    body: web::Json<CompletionRequest>,
+    state: web::Data<AppState>,
+) -> Result<HttpResponse, Error> {
+    let client = &state.client;
+    let router = &state.router;
 
-        data.router
-            .route_pd_generate_typed(&data.client, &req, typed_req, "/v1/completions")
-            .await
+    // Use typed request directly for both PD and regular routing
+    if router.is_prefill_decode() {
+        // For PD mode, convert to PD request with bootstrap
+        let pd_request = body.into_inner().to_pd_request();
+
+        Ok(router
+            .route_pd_generate_typed(&client, &req, pd_request, "/v1/completions")
+            .await)
     } else {
-        // Regular mode - convert back to bytes for compatibility
-        let body = match serde_json::to_vec(&typed_req.into_inner()) {
-            Ok(bytes) => Bytes::from(bytes),
-            Err(e) => {
-                return HttpResponse::InternalServerError()
-                    .body(format!("Failed to serialize request: {}", e))
-            }
-        };
-
-        data.router
-            .route_generate_request(&data.client, &req, &body, "/v1/completions")
-            .await
+        // For regular mode, use typed request directly
+        let request = body.into_inner();
+        Ok(router
+            .route_typed_request(&client, &req, &request, "/v1/completions")
+            .await)
     }
 }
 
@@ -417,9 +392,6 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
             .service(list_workers)
             .service(flush_cache)
             .service(get_loads)
-            // Note: /register endpoint for dynamic PD server registration not implemented yet
-            // This would require modifying PDRouter to support dynamic worker addition
-            // Default handler for unmatched routes.
             .default_service(web::route().to(sink_handler))
     })
     .bind_auto_h2c((config.host, config.port))?
