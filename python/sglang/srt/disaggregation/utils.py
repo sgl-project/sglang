@@ -6,6 +6,7 @@ import random
 import threading
 import warnings
 from collections import deque
+from contextlib import nullcontext
 from enum import Enum
 from typing import TYPE_CHECKING, List, Optional
 
@@ -92,50 +93,45 @@ class MetadataBuffers:
     ):
         self.custom_mem_pool = custom_mem_pool
 
-        if self.custom_mem_pool is not None:
-            self.output_ids = None
-            self.output_token_logprobs_val = None
-            self.output_token_logprobs_idx = None
-            self.output_top_logprobs_val = None
-            self.output_top_logprobs_idx = None
+        self.output_ids = None
+        self.output_token_logprobs_val = None
+        self.output_token_logprobs_idx = None
+        self.output_top_logprobs_val = None
+        self.output_top_logprobs_idx = None
 
-            with torch.cuda.use_mem_pool(self.custom_mem_pool):
-                # TODO: abort top_logprobs_num > 128 in PD
-
-                # We transfer the metadata of first output token to decode
-                # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
-                self.output_ids = torch.zeros(
-                    (size, 16), dtype=torch.int32, device="cuda"
-                )
-                self.output_token_logprobs_val = torch.zeros(
-                    (size, 16), dtype=torch.float32, device="cuda"
-                )
-                self.output_token_logprobs_idx = torch.zeros(
-                    (size, 16), dtype=torch.int32, device="cuda"
-                )
-                self.output_top_logprobs_val = torch.zeros(
-                    (size, max_top_logprobs_num), dtype=torch.float32, device="cuda"
-                )
-                self.output_top_logprobs_idx = torch.zeros(
-                    (size, max_top_logprobs_num), dtype=torch.int32, device="cuda"
-                )
-        else:
+        with (
+            torch.cuda.use_mem_pool(self.custom_mem_pool)
+            if self.custom_mem_pool
+            else nullcontext()
+        ):
             # TODO: abort top_logprobs_num > 128 in PD
 
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
-            self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device="cpu")
+            self.output_ids = torch.zeros(
+                (size, 16),
+                dtype=torch.int32,
+                device="cuda" if self.custom_mem_pool is not None else "cpu",
+            )
             self.output_token_logprobs_val = torch.zeros(
-                (size, 16), dtype=torch.float32, device="cpu"
+                (size, 16),
+                dtype=torch.float32,
+                device="cuda" if self.custom_mem_pool is not None else "cpu",
             )
             self.output_token_logprobs_idx = torch.zeros(
-                (size, 16), dtype=torch.int32, device="cpu"
+                (size, 16),
+                dtype=torch.int32,
+                device="cuda" if self.custom_mem_pool is not None else "cpu",
             )
             self.output_top_logprobs_val = torch.zeros(
-                (size, max_top_logprobs_num), dtype=torch.float32, device="cpu"
+                (size, max_top_logprobs_num),
+                dtype=torch.float32,
+                device="cuda" if self.custom_mem_pool is not None else "cpu",
             )
             self.output_top_logprobs_idx = torch.zeros(
-                (size, max_top_logprobs_num), dtype=torch.int32, device="cpu"
+                (size, max_top_logprobs_num),
+                dtype=torch.int32,
+                device="cuda" if self.custom_mem_pool is not None else "cpu",
             )
 
     def get_buf_infos(self):

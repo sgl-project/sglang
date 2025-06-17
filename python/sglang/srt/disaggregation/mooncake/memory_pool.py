@@ -7,7 +7,7 @@ import torch
 from torch.cuda.memory import CUDAPluggableAllocator
 
 
-class CustomAllocator:
+class MooncakeNVLinkAllocator:
     _instances: Dict[torch.device, CUDAPluggableAllocator] = {}
     _lock: Final = threading.Lock()
 
@@ -32,7 +32,6 @@ class CustomAllocator:
                 return so_path
         except (ImportError, FileNotFoundError, TypeError):
             raise ImportError(
-                "hook.so not found in mooncake package. "
                 "SGLANG_MOONCAKE_CUSTOM_MEM_POOL require mooncake-transfer-engine >= 0.3.3.post2."
             )
 
