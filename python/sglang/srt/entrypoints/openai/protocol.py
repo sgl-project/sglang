@@ -16,7 +16,7 @@
 import time
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field, model_serializer, root_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing_extensions import Literal
 
 
@@ -182,12 +182,18 @@ class CompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
-    return_hidden_states: Optional[bool] = False
 
     # For PD disaggregation
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
+
+    @field_validator("max_tokens")
+    @classmethod
+    def validate_max_tokens_positive(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("max_tokens must be positive")
+        return v
 
 
 class CompletionResponseChoice(BaseModel):
@@ -196,11 +202,6 @@ class CompletionResponseChoice(BaseModel):
     logprobs: Optional[LogProbs] = None
     finish_reason: Literal["stop", "length", "content_filter", "abort"]
     matched_stop: Union[None, int, str] = None
-    hidden_states: Optional[object] = None
-
-    @model_serializer
-    def _serialize(self):
-        return exclude_if_none(self, ["hidden_states"])
 
 
 class CompletionResponse(BaseModel):
@@ -218,11 +219,6 @@ class CompletionResponseStreamChoice(BaseModel):
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[Literal["stop", "length", "content_filter"]] = None
     matched_stop: Union[None, int, str] = None
-    hidden_states: Optional[object] = None
-
-    @model_serializer
-    def _serialize(self):
-        return exclude_if_none(self, ["hidden_states"])
 
 
 class CompletionStreamResponse(BaseModel):
@@ -381,14 +377,23 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
 
-    @root_validator(pre=True)
+    @model_validator(mode="before")
+    @classmethod
     def set_tool_choice_default(cls, values):
-        if values.get("tool_choice") is None:
-            if values.get("tools") is None:
-                values["tool_choice"] = "none"
-            else:
-                values["tool_choice"] = "auto"
+        if isinstance(values, dict):
+            if values.get("tool_choice") is None:
+                if values.get("tools") is None:
+                    values["tool_choice"] = "none"
+                else:
+                    values["tool_choice"] = "auto"
         return values
+
+    @field_validator("messages")
+    @classmethod
+    def validate_messages_not_empty(cls, v):
+        if not v:
+            raise ValueError("Messages cannot be empty")
+        return v
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -416,9 +421,6 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
 
-    # Hidden States
-    return_hidden_states: Optional[bool] = False
-
 
 class ChatMessage(BaseModel):
     role: Optional[str] = None
@@ -435,11 +437,6 @@ class ChatCompletionResponseChoice(BaseModel):
         "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
     ]
     matched_stop: Union[None, int, str] = None
-    hidden_states: Optional[object] = None
-
-    @model_serializer
-    def _serialize(self):
-        return exclude_if_none(self, ["hidden_states"])
 
 
 class ChatCompletionResponse(BaseModel):
@@ -456,11 +453,6 @@ class DeltaMessage(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
-    hidden_states: Optional[object] = None
-
-    @model_serializer
-    def _serialize(self):
-        return exclude_if_none(self, ["hidden_states"])
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
@@ -487,12 +479,15 @@ class MultimodalEmbeddingInput(BaseModel):
     image: Optional[str] = None
 
 
+EmbeddingInput = Union[
+    List[int], List[List[int]], str, List[str], List[MultimodalEmbeddingInput]
+]
+
+
 class EmbeddingRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/embeddings/create
-    input: Union[
-        List[int], List[List[int]], str, List[str], List[MultimodalEmbeddingInput]
-    ]
+    input: EmbeddingInput
     model: str
     encoding_format: str = "float"
     dimensions: int = None
@@ -539,13 +534,6 @@ class ScoringResponse(BaseModel):
     object: str = "scoring"
 
 
-class RerankResponse(BaseModel):
-    score: float
-    document: str
-    index: int
-    meta_info: Optional[dict] = None
-
-
-def exclude_if_none(obj, field_names: List[str]):
-    omit_if_none_fields = {k for k, v in obj.model_fields.items() if k in field_names}
-    return {k: v for k, v in obj if k not in omit_if_none_fields or v is not None}
+OpenAIServingRequest = Union[
+    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, ScoringRequest
+]
