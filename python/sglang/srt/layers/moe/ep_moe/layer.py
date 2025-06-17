@@ -3,6 +3,7 @@ from typing import Callable, List, Optional, Tuple
 
 import einops
 import torch
+import triton
 from sgl_kernel import silu_and_mul
 from torch.nn import Module
 
@@ -28,6 +29,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     post_reorder_triton_kernel,
     pre_reorder_triton_kernel,
     run_moe_ep_preprocess,
+    scatter_rows_kernel,
     silu_and_mul_masked_post_quant_fwd,
     silu_and_mul_triton_kernel,
     tma_align_input_scale,
@@ -86,17 +88,17 @@ def prepare_fbgemm_inputs_ep(
 ]:
     """
     Return:
-        b_fbgemm : [G_local*N , K]
-        m_sizes  : [G_local]
-        scale_b  : [G_local] / None
+        a_aligned : [M, K]
+        b_fbgemm  : [G_local*N , K]
+        m_sizes   : [G_local]
+        base
+        scale_b   : [G_local] / None
     """
     G_local, N, K_w = b.shape
     assert K_w == a.shape[1], "K dim mismatch in EP mode!"
 
     m_sizes = seg_indptr[1:] - seg_indptr[:-1]  # [G_local]
 
-    # a_aligned = a[base:]
-    # TODO(yuan-luo): Fix cuda graph capture by introducing a new kernel.
     base_tensor = get_base_gpu(seg_indptr)
     a_aligned = make_a_aligned(a, base_tensor)
 
@@ -176,13 +178,14 @@ class GroupedGemmRunner(torch.nn.Module):
                 seg_indptr=seg_indptr,
                 weight_indices=weight_indices,
                 scale_b=scale_b,
+                base=base,
             )
 
             if c is None:
                 assert c_dtype is not None
                 c = torch.empty(a.shape[0], b.shape[1], device=a.device, dtype=c_dtype)
             if m_sizes is None:
-                return torch.zeros_like(c)
+                return c
 
             if use_fp8_w8a8:
                 # TODO: Currently fbgemm only supports rowwise fp8. We need to
@@ -205,22 +208,16 @@ class GroupedGemmRunner(torch.nn.Module):
                     use_per_token_if_dynamic=self.use_per_token_if_dynamic,
                 )
             else:
-                if (
-                    a_aligned is None
-                    or m_sizes is None
-                    or base is None
-                    or m_sizes.sum().item() == 0
-                ):
-                    c.zero_()
-                else:
-                    c_local = fbgemm_grouped_gemm(
-                        a_aligned,
-                        b_fbgemm,
-                        m_sizes=m_sizes,
-                        use_fast_accum=True,
-                    )
-                    c.zero_()
-                    c[base : base + a_aligned.size(0)].copy_(c_local)
+                c_local = fbgemm_grouped_gemm(
+                    a_aligned,
+                    b_fbgemm,
+                    m_sizes=m_sizes,
+                    use_fast_accum=True,
+                )
+                c.zero_()
+                M, N = a.shape[0], c.shape[1]
+                grid = (triton.cdiv(M, 128),)
+                scatter_rows_kernel[grid](c_local, c, seg_indptr, M, N)
         else:
             assert weight_column_major == True
             c = grouped_gemm_triton(
