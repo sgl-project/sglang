@@ -207,6 +207,7 @@ class TestWaveAttention(unittest.TestCase):
             device="cuda",
         )
 
+        logit_cap = 0.0
         triton_decode_attention_fwd_grouped(
             q,
             k_buffer,
@@ -219,6 +220,7 @@ class TestWaveAttention(unittest.TestCase):
             num_kv_splits,
             max_kv_splits,
             sm_scale,
+            logit_cap,
         )
 
         attn_logits = torch.empty(
@@ -245,6 +247,7 @@ class TestWaveAttention(unittest.TestCase):
             num_kv_splits,
             max_kv_splits,
             sm_scale,
+            logit_cap,
         )
 
         cos_sim = torch.nn.functional.cosine_similarity(
