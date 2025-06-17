@@ -111,6 +111,7 @@ suites = {
         TestFile("test_embedding_openai_server.py", 141),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_function_call_parser.py", 10),
+        TestFile("test_fused_moe.py", 30),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_large_max_new_tokens.py", 41),
         TestFile("test_metrics.py", 32),
