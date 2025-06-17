@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import os
 import platform
 import sys
 from pathlib import Path
@@ -50,7 +51,13 @@ cxx_flags = ["-O3"]
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
-amdgpu_target = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
+amdgpu_target = os.environ.get("GPU_ARCH", None)
+
+if amdgpu_target == None:
+    device_prop = torch.cuda.get_device_properties("cuda")
+    if device_prop != None:
+        amdgpu_target = device_prop.gcnArchName.split(":")[0]
+
 if amdgpu_target not in ["gfx942", "gfx950"]:
     print(
         f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
