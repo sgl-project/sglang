@@ -29,14 +29,14 @@ logger = logging.getLogger(__name__)
 
 if is_cuda():
     from sgl_kernel import (
+        fast_topk,
         top_k_renorm_prob,
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
         verify_tree_greedy,
     )
-    from sgl_kernel.top_k import fast_topk
 elif is_hip():
-    from sgl_kernel import verify_tree_greedy
+    from sgl_kernel import fast_topk, verify_tree_greedy
 
 
 logger = logging.getLogger(__name__)
