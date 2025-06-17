@@ -11,7 +11,7 @@ from sglang.srt.layers.communicator import (
     ScatterMode,
 )
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
+from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
@@ -479,7 +479,9 @@ def _model_forward_tbo(
     )
     del inputs
 
-    with configure_deep_gemm_num_sms(operations_strategy.deep_gemm_num_sms):
+    with deep_gemm_wrapper.configure_deep_gemm_num_sms(
+        operations_strategy.deep_gemm_num_sms
+    ):
         outputs_arr = execute_overlapped_operations(
             inputs_arr=inputs_arr,
             operations_arr=[operations_strategy.operations] * 2,

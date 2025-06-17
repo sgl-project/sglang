@@ -15,6 +15,7 @@ echo "ARCH:  $ARCH"
 if [ ${ARCH} = "aarch64" ]; then
    LIBCUDA_ARCH="sbsa"
    BUILDER_NAME="pytorch/manylinuxaarch64-builder"
+   CMAKE_BUILD_PARALLEL_LEVEL=16
 else
    LIBCUDA_ARCH=${ARCH}
    BUILDER_NAME="pytorch/manylinux2_28-builder"
@@ -40,6 +41,7 @@ docker run --rm \
    tar -xzf cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH}.tar.gz
    mv cmake-\${CMAKE_VERSION_MAJOR}.\${CMAKE_VERSION_MINOR}-linux-${ARCH} /opt/cmake
    export PATH=/opt/cmake/bin:\$PATH
+   export LD_LIBRARY_PATH=/lib64:\$LD_LIBRARY_PATH
 
    # Debugging CMake
    echo \"PATH: \$PATH\"

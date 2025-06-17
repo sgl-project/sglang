@@ -28,7 +28,6 @@ from sglang.srt.utils import (
     configure_ipv6,
     get_device,
     get_device_memory_capacity,
-    is_cuda,
     is_flashinfer_available,
     is_hip,
     is_port_available,
@@ -91,6 +90,7 @@ class ServerArgs:
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
     gpu_id_step: int = 1
+    sleep_on_idle: bool = False
 
     # Logging
     log_level: str = "info"
@@ -214,6 +214,7 @@ class ServerArgs:
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
+    enable_return_hidden_states: bool = False
     warmups: Optional[str] = None
 
     # Debug tensor dumps
@@ -226,9 +227,15 @@ class ServerArgs:
     disaggregation_mode: str = "null"
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
+    disaggregation_decode_tp: Optional[int] = None
+    disaggregation_decode_dp: Optional[int] = None
+    disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
+
+    # For model weight update
+    custom_weight_loader: Optional[List[str]] = None
 
     def __post_init__(self):
         # Expert parallelism
@@ -253,50 +260,71 @@ class ServerArgs:
 
         gpu_mem = get_device_memory_capacity(self.device)
 
-        # Set mem fraction static, which depends on the tensor parallelism size
+        # Set mem fraction static
         if self.mem_fraction_static is None:
-            parallel_size = self.tp_size * self.pp_size
-            if gpu_mem is not None and gpu_mem <= 81920:
-                if parallel_size >= 16:
-                    self.mem_fraction_static = 0.79
-                elif parallel_size >= 8:
-                    self.mem_fraction_static = 0.81
-                elif parallel_size >= 4:
-                    self.mem_fraction_static = 0.85
-                elif parallel_size >= 2:
-                    self.mem_fraction_static = 0.87
+            if gpu_mem is not None:
+                # GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
+                # mem_fraction_static = (model weights + KV cache pool) / GPU memory capacity.
+
+                # We want mem_fraction_static to be as large as possible but still has enough room
+                # for activations and cuda graph buffers. We use the following heuristic to
+                # compute the needed size for activations and cuda graph buffers:
+                # - The size of the activation depends on the chunked_prefill_size and model size.
+                # - The size of cuda graph buffers depends on the cuda graph capture range and model size.
+                # For GPUs with more memory, we use a larger chunked_prefill_size and
+                # capture more cuda graphs, so they need to reserve more memory.
+                parallel_size = self.tp_size * self.pp_size
+
+                if gpu_mem < 20 * 1024:
+                    # T4, 4080. (chunked_prefill_size 2k, cuda_graph_max_bs 8)
+                    reserved_mem = (2.8 + parallel_size / 10) * 1024
+                elif gpu_mem < 35 * 1024:
+                    # A10, L40, 4090, 5090. (chunked_prefill_size 2k, cuda_graph_max_bs 8)
+                    reserved_mem = (2.8 + parallel_size / 10) * 1024
+                elif gpu_mem < 90 * 1024:
+                    # H100, A100. (chunked_prefill_size 8k, cuda_graph_max_bs 160)
+                    reserved_mem = (9.5 + parallel_size / 2) * 1024
+                elif gpu_mem < 100 * 1024:
+                    # H20. (chunked_prefill_size 8k, cuda_graph_max_bs 256)
+                    reserved_mem = (12 + parallel_size / 2) * 1024
+                elif gpu_mem < 160 * 1024:
+                    # H200. (chunked_prefill_size 8k, cuda_graph_max_bs 256)
+                    reserved_mem = (12 + parallel_size / 2) * 1024
                 else:
-                    self.mem_fraction_static = 0.88
+                    # B200, MI300. (chunked_prefill_size 16k, cuda_graph_max_bs 512)
+                    reserved_mem = 32 * 1024
+
+                if self.speculative_algorithm is not None:
+                    # draft model and larger cuda graph buffers
+                    reserved_mem += 2 * 1024
+                if self.enable_dp_attention:
+                    reserved_mem += 4 * 1024
+
+                self.mem_fraction_static = round((gpu_mem - reserved_mem) / gpu_mem, 3)
             else:
                 self.mem_fraction_static = 0.88
-            if gpu_mem is not None and gpu_mem > 180 * 1000 and is_cuda():
-                self.mem_fraction_static = 0.79
-            elif gpu_mem is not None and gpu_mem > 96 * 1024:
-                mem_fraction = self.mem_fraction_static
-                # 15 GB + additional 3GB for cuda graph
-                reserve_mem = 1024 * 18
-                # need reserve more memory for spec cuda graph
-                if self.speculative_algorithm is not None:
-                    reserve_mem = 1024 * 20
-                self.mem_fraction_static = min(
-                    mem_fraction + 48 * 1024 * (1 - mem_fraction) / gpu_mem,
-                    (gpu_mem - reserve_mem) / gpu_mem,
-                )
-            else:
-                if self.speculative_algorithm is not None:
-                    self.mem_fraction_static *= 0.95
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
-            if gpu_mem is not None and gpu_mem > 180_000:
-                self.chunked_prefill_size = 16384
-            elif gpu_mem is not None and gpu_mem < 25_000:
-                self.chunked_prefill_size = 2048
-            elif self.disaggregation_mode != "null":
-                self.chunked_prefill_size = 16384
+            if gpu_mem is not None:
+                if gpu_mem < 35 * 1024:  # A10, L40, 4090
+                    self.chunked_prefill_size = 2048
+                elif gpu_mem < 160 * 1024:  # H100, H200, A100, H20
+                    self.chunked_prefill_size = 8192
+                else:  # B200, MI300
+                    self.chunked_prefill_size = 16384
             else:
-                self.chunked_prefill_size = 8192
+                self.chunked_prefill_size = 4096
         assert self.chunked_prefill_size % self.page_size == 0
+
+        # Set cuda graph max batch size
+        if self.cuda_graph_max_bs is None:
+            # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
+            if gpu_mem is not None and gpu_mem < 35 * 1024:
+                if self.tp_size < 4:
+                    self.cuda_graph_max_bs = 8
+                else:
+                    self.cuda_graph_max_bs = 80
 
         assert self.moe_dense_tp_size in {
             1,
@@ -314,15 +342,6 @@ class ServerArgs:
                 "Cutlass MLA only supports a page_size of 128, change page_size to 128."
             )
             self.page_size = 128
-
-        # Set cuda graph max batch size
-        if self.cuda_graph_max_bs is None:
-            # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
-            if gpu_mem is not None and gpu_mem < 25_000:
-                if self.tp_size < 4:
-                    self.cuda_graph_max_bs = 8
-                else:
-                    self.cuda_graph_max_bs = 80
 
         # Set kernel backends for hpu device
         if self.device == "hpu":
@@ -492,12 +511,27 @@ class ServerArgs:
             self.triton_attention_num_kv_splits = 16
 
         # PD disaggregation
-        if self.disaggregation_mode == "prefill":
-            self.disable_cuda_graph = True
-            logger.warning("Cuda graph is disabled for prefill server")
-        elif self.disaggregation_mode == "decode":
+        if self.disaggregation_mode == "decode":
+            assert (
+                self.disaggregation_decode_tp is None
+            ), "Cannot set --disaggregation-decode-tp for the decode engine."
+            assert (
+                self.disaggregation_decode_dp is None
+            ), "Cannot set --disaggregation-decode-dp for the decode engine."
+
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
+        elif self.disaggregation_mode == "prefill":
+            if self.disaggregation_decode_tp is None:
+                self.disaggregation_decode_tp = self.tp_size
+            if self.disaggregation_decode_dp is None:
+                self.disaggregation_decode_dp = self.dp_size
+
+            self.disaggregation_prefill_pp = self.pp_size
+            self.validate_disagg_tp_size(self.tp_size, self.disaggregation_decode_tp)
+
+            self.disable_cuda_graph = True
+            logger.warning("Cuda graph is disabled for prefill server")
 
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
@@ -505,6 +539,17 @@ class ServerArgs:
         # Set env var before grammar backends init
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
+        )
+
+        if self.custom_weight_loader is None:
+            self.custom_weight_loader = []
+
+    def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
+        larger_tp = max(decode_tp, prefill_tp)
+        smaller_tp = min(decode_tp, prefill_tp)
+        assert larger_tp % smaller_tp == 0, (
+            "Different tp size is supported only when one tp is multiple of the other. "
+            f"decode_tp={decode_tp}, prefill_tp={prefill_tp}"
         )
 
     @staticmethod
@@ -523,10 +568,16 @@ class ServerArgs:
             help="The path of the tokenizer.",
         )
         parser.add_argument(
-            "--host", type=str, default=ServerArgs.host, help="The host of the server."
+            "--host",
+            type=str,
+            default=ServerArgs.host,
+            help="The host of the HTTP server.",
         )
         parser.add_argument(
-            "--port", type=int, default=ServerArgs.port, help="The port of the server."
+            "--port",
+            type=int,
+            default=ServerArgs.port,
+            help="The port of the HTTP server.",
         )
         parser.add_argument(
             "--tokenizer-mode",
@@ -681,6 +732,18 @@ class ServerArgs:
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
         )
+        parser.add_argument(
+            "--impl",
+            type=str,
+            default=ServerArgs.impl,
+            help="Which implementation of the model to use.\n\n"
+            '* "auto" will try to use the SGLang implementation if it exists '
+            "and fall back to the Transformers implementation if no SGLang "
+            "implementation is available.\n"
+            '* "sglang" will use the SGLang model implementation.\n'
+            '* "transformers" will use the Transformers model '
+            "implementation.\n",
+        )
 
         # Memory and scheduling
         parser.add_argument(
@@ -738,18 +801,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.page_size,
             help="The number of tokens in a page.",
-        )
-        parser.add_argument(
-            "--impl",
-            type=str,
-            default=ServerArgs.impl,
-            help="Which implementation of the model to use.\n\n"
-            '* "auto" will try to use the SGLang implementation if it exists '
-            "and fall back to the Transformers implementation if no SGLang "
-            "implementation is available.\n"
-            '* "sglang" will use the SGLang model implementation.\n'
-            '* "transformers" will use the Transformers model '
-            "implementation.\n",
         )
 
         # Other runtime options
@@ -825,6 +876,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.gpu_id_step,
             help="The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,...",
+        )
+        parser.add_argument(
+            "--sleep-on-idle",
+            action="store_true",
+            help="Reduce CPU usage when sglang is idle.",
         )
 
         # Logging
@@ -1430,6 +1486,11 @@ class ServerArgs:
             help="Adopt base image processor instead of fast image processor.",
         )
         parser.add_argument(
+            "--enable-return-hidden-states",
+            action="store_true",
+            help="Enable returning hidden states with responses.",
+        )
+        parser.add_argument(
             "--warmups",
             type=str,
             required=False,
@@ -1484,6 +1545,24 @@ class ServerArgs:
             help="Bootstrap server port on the prefill server. Default is 8998.",
         )
         parser.add_argument(
+            "--disaggregation-decode-tp",
+            type=int,
+            default=ServerArgs.disaggregation_decode_tp,
+            help="Decode tp size. If not set, it matches the tp size of the current engine. This is only set on the prefill server.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-dp",
+            type=int,
+            default=ServerArgs.disaggregation_decode_dp,
+            help="Decode dp size. If not set, it matches the dp size of the current engine. This is only set on the prefill server.",
+        )
+        parser.add_argument(
+            "--disaggregation-prefill-pp",
+            type=int,
+            default=ServerArgs.disaggregation_prefill_pp,
+            help="Prefill pp size. If not set, it is default to 1. This is only set on the decode server.",
+        )
+        parser.add_argument(
             "--disaggregation-ib-device",
             type=str,
             default=ServerArgs.disaggregation_ib_device,
@@ -1502,6 +1581,13 @@ class ServerArgs:
             type=str,
             default=None,
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
+        )
+        parser.add_argument(
+            "--custom-weight-loader",
+            type=str,
+            nargs="*",
+            default=None,
+            help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
         )
 
     @classmethod
