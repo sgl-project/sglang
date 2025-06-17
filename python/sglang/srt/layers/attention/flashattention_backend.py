@@ -1120,7 +1120,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
 
         Args:
@@ -1999,9 +1999,9 @@ class FlashAttentionMultiStepBackend:
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps):
-            self.attn_backends[i].init_cuda_graph_state(max_bs)
+            self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
