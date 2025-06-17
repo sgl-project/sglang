@@ -11,6 +11,13 @@ from sglang.srt.utils import is_hip
 from sglang.test.test_utils import CustomTestCase
 
 _is_hip = is_hip()
+if _is_hip:
+
+    def _is_gfx95_family(device_idx: int = 0) -> bool:
+        # Returns True if the selected ROCm device belongs to the gfx95-series
+        # like (gfx950, gfx951, ...).
+        gcn_arch = torch.cuda.get_device_properties(device_idx).gcnArchName
+        return any(tag in gcn_arch for tag in ("gfx95",))  # keep tuple for easy growth
 
 
 class TestFusedMOE(CustomTestCase):
@@ -117,7 +124,7 @@ class TestFusedMOE(CustomTestCase):
 
             # Handle HIP case: normalize float8 weights so fused kernel doesn't break
             # on ROCm.
-            if _is_hip:
+            if _is_hip and not _is_gfx95_family():
                 # Normalize to e4m3fnuz on HIP
                 w1, w1_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                     weight=w1,
