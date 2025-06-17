@@ -360,23 +360,22 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             shared_output = self._forward_shared_experts(hidden_states)
-            with get_global_expert_distribution_recorder().with_current_layer(self.layer_id):
-                topk_weights, topk_idx = select_experts(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    top_k=self.top_k,
-                    use_grouped_topk=True,
-                    renormalize=self.renormalize,
-                    topk_group=self.topk_group,
-                    num_expert_group=self.num_expert_group,
-                    num_fused_shared_experts=self.num_fused_shared_experts,
-                    correction_bias=self.correction_bias,
-                    routed_scaling_factor=self.routed_scaling_factor,
-                    num_token_non_padded=forward_batch.num_token_non_padded,
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
-                )
+            topk_weights, topk_idx = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                top_k=self.top_k,
+                use_grouped_topk=True,
+                renormalize=self.renormalize,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                correction_bias=self.correction_bias,
+                routed_scaling_factor=self.routed_scaling_factor,
+                num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
         else:
             topk_idx = torch.full(
                 (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
@@ -1465,7 +1464,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
-            is_nextn=self.is_nextn,
         )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
@@ -1505,6 +1503,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
+            # NOTE: this line resolves the degradation of MTP reception rate for non-zero DP ranks.
+            # See discussion here (https://github.com/sgl-project/sglang/pull/6081#discussion_r2147452251).
             hidden_states = hidden_states.clone()
 
         return hidden_states, residual
@@ -1647,10 +1647,11 @@ class DeepseekV2Model(nn.Module):
             else total_num_layers
         )
         for i in range(normal_num_layers):
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual, zero_allocator
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(i):
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions, hidden_states, forward_batch, residual, zero_allocator
+                )
 
         if normal_num_layers != total_num_layers:
             hidden_states, residual = model_forward_maybe_tbo(
