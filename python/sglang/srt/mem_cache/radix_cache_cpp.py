@@ -128,7 +128,6 @@ class HiCacheController_v2:
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         mem_pool_host: HostKVCache,
         page_size: int,
-        load_cache_event: threading.Event,
         write_policy: str = "write_through_selective",
         oracle: bool = False,
     ):
@@ -138,7 +137,8 @@ class HiCacheController_v2:
         self.oracle = oracle
         self.page_size = page_size
 
-        self.load_cache_event = load_cache_event
+        self.load_sync_event = torch.cuda.Event()
+        self.load_cache_event = threading.Event()
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
@@ -269,6 +269,7 @@ class HiCacheController_v2:
             if not self.load_cache_event.is_set():
                 continue
             self.load_cache_event.clear()
+            self.load_stream.wait_event(self.load_sync_event) # type: ignore
 
             # the load queue should be unchanged after this load_event is set
             # and we don't care about the `get` order since they must be done
@@ -377,8 +378,6 @@ class HiRadixCacheCpp(BasePrefixCache):
         self.page_size = page_size
 
         self.tp_group = tp_cache_group
-        self.load_cache_event = threading.Event()
-
         self.last_cancel_count = DEFAULT_CANCEL_COUNT
 
         if not use_hicache:
@@ -413,10 +412,9 @@ class HiRadixCacheCpp(BasePrefixCache):
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
 
         self.cache_controller = HiCacheController_v2(
-            token_to_kv_pool,
-            token_to_kv_pool_host,
-            page_size,
-            load_cache_event=self.load_cache_event,
+            token_to_kv_pool_allocator=token_to_kv_pool,
+            mem_pool_host=token_to_kv_pool_host,
+            page_size=page_size,
             write_policy=hicache_write_policy,
             oracle=hicache_oracle,
         )
@@ -595,8 +593,10 @@ class HiRadixCacheCpp(BasePrefixCache):
     def ready_to_load_host(self):
         # able to perform prefill here (means no OOM now), so we reset last cancel count
         self.last_cancel_count = DEFAULT_CANCEL_COUNT
-        torch.cuda.current_stream().synchronize()
-        self.load_cache_event.set()
+        if self.cache_controller is None:
+            return
+        self.cache_controller.load_sync_event.record(torch.cuda.current_stream())
+        self.cache_controller.load_cache_event.set()
 
     def check_host_cache(self):
         self.writing_check()
