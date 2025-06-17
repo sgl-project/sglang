@@ -779,7 +779,10 @@ class ModelRunner:
         ), "Default torch process group must be initialized"
         assert group_name != "", "Group name cannot be empty"
 
-        rank = rank_offset + self.tp_rank + self.dp_rank * self.tp_size
+        if self.server_args.enable_dp_attention:
+            rank = rank_offset + self.tp_rank
+        else:
+            rank = rank_offset + self.tp_rank + self.dp_rank * self.tp_size
 
         logger.info(
             f"init custom process group: master_address={master_address}, master_port={master_port}, "
@@ -793,6 +796,7 @@ class ModelRunner:
                 world_size=world_size,
                 rank=rank,
                 group_name=group_name,
+                device_id=self.gpu_id,
             )
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
