@@ -53,9 +53,15 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_hip:
     from vllm._custom_ops import scaled_fp8_quant
+
+if _use_aiter:
+    from aiter import ActivationType, QuantType
+    from aiter.fused_moe import fused_moe
+    from aiter.ops.shuffle import shuffle_weight
 
 logger = logging.getLogger(__name__)
 
@@ -873,6 +879,15 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                         w2_weight_scale, requires_grad=False
                     )
                     layer.w2_input_scale = None
+                if _use_aiter:
+                    layer.w13_weight = torch.nn.Parameter(
+                        shuffle_weight(layer.w13_weight.data, (16, 16)),
+                        requires_grad=False,
+                    )
+                    layer.w2_weight = torch.nn.Parameter(
+                        shuffle_weight(layer.w2_weight.data, (16, 16)),
+                        requires_grad=False,
+                    )
             return
 
     def apply(
@@ -944,18 +959,30 @@ class DeepEPMoE(EPMoE):
             assert (
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
-        self.w13_weight_fp8 = (
-            self.w13_weight,
-            (
-                self.w13_weight_scale_inv
-                if self.use_block_quant
-                else self.w13_weight_scale
-            ),
-        )
-        self.w2_weight_fp8 = (
-            self.w2_weight,
-            self.w2_weight_scale_inv if self.use_block_quant else self.w2_weight_scale,
-        )
+        if _use_aiter:
+            self.expert_mask = torch.zeros(
+                (self.num_experts_per_partition + 1),
+                device=torch.cuda.current_device(),
+                dtype=torch.int,
+            )
+            self.expert_mask[:-1] = 1
+        else:
+            self.w13_weight_fp8 = (
+                self.w13_weight,
+                (
+                    self.w13_weight_scale_inv
+                    if self.use_block_quant
+                    else self.w13_weight_scale
+                ),
+            )
+            self.w2_weight_fp8 = (
+                self.w2_weight,
+                (
+                    self.w2_weight_scale_inv
+                    if self.use_block_quant
+                    else self.w2_weight_scale
+                ),
+            )
 
     def forward(
         self,
@@ -969,6 +996,8 @@ class DeepEPMoE(EPMoE):
         num_recv_tokens_per_expert: List[int],
         forward_mode: ForwardMode,
     ):
+        if _use_aiter:
+            return self.forward_aiter(hidden_states, topk_idx, topk_weights)
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
             if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
@@ -1100,6 +1129,35 @@ class DeepEPMoE(EPMoE):
                 block_shape=self.block_shape,
             )
         return down_output
+
+    def forward_aiter(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+        # (idx == num_experts_per_partition) meaning not used in aiter fused_moe
+        topk_idx_copy = topk_idx.to(torch.int32)
+        topk_idx_copy[topk_idx_copy == -1] = self.num_experts_per_partition
+
+        return fused_moe(
+            hidden_states,
+            self.w13_weight,
+            self.w2_weight,
+            topk_weights,
+            topk_idx_copy,
+            w1_scale=self.w13_weight_scale_inv,
+            w2_scale=self.w2_weight_scale_inv,
+            quant_type=QuantType.per_128x128,
+            activation=(
+                ActivationType.Silu
+                if self.activation == "silu"
+                else ActivationType.Gelu
+            ),
+            expert_mask=self.expert_mask,
+        )
 
     def forward_deepgemm_contiguous(
         self,
