@@ -529,6 +529,10 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             if output_tensor_list is not None:
+                logger.warning(
+                    "Performing in-place all-gather with a group size of 1. "
+                    "This may be unnecessary; consider bypassing it for better efficiency."
+                )
                 output_tensor_list[0].copy_(input_)
                 return None
             else:
