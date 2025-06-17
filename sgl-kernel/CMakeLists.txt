@@ -159,6 +159,11 @@ if (ENABLE_BELOW_SM90)
         "-gencode=arch=compute_80,code=sm_80"
         "-gencode=arch=compute_89,code=sm_89"
     )
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_87,code=sm_87"
+        )
+    endif()
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0" OR SGL_KERNEL_ENABLE_SM100A)
@@ -180,7 +185,7 @@ else()
     )
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" OR SGL_KERNEL_ENABLE_SM90A)
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND SGL_KERNEL_ENABLE_SM90A)
     set(SGL_KERNEL_ENABLE_FA3 ON)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
@@ -329,6 +334,11 @@ if (SGL_KERNEL_ENABLE_FA3)
             "-gencode=arch=compute_80,code=sm_80"
             "-gencode=arch=compute_86,code=sm_86"
         )
+        if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+            list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS
+                "-gencode=arch=compute_87,code=sm_87"
+            )
+        endif()
         # SM8X Logic
         file(GLOB FA3_SM8X_GEN_SRCS
             "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim*_sm80.cu")
