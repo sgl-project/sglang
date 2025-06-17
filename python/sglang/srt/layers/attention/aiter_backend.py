@@ -53,7 +53,7 @@ class ForwardMetadata:
     qo_indptr: torch.Tensor
     kv_last_page_len: torch.Tensor
     max_q_len: int
-    max_kv_len: int
+    max_kv_len: Optional[int]
 
 
 global_workspace_buffer = None
@@ -239,7 +239,7 @@ class AiterAttnBackend(AttentionBackend):
             if self.use_mla:
                 draft_num = spec_info.draft_token_num
                 kv_lens = forward_batch.seq_lens + draft_num
-                kv_lens_sum = (forward_batch.seq_lens_sum + draft_num * bs,)
+                kv_lens_sum = forward_batch.seq_lens_sum + draft_num * bs
                 device = forward_batch.seq_lens.device
 
                 qo_indptr = torch.arange(
