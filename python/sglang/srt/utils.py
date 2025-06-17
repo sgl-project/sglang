@@ -160,7 +160,7 @@ def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
-def is_cpu() -> bool:
+def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (
         machine in ("x86_64", "amd64", "i386", "i686")
@@ -169,17 +169,8 @@ def is_cpu() -> bool:
     )
 
 
-# set _USE_CPU default as True, to bypass vllm import
-_USE_CPU = True
-
-
-def use_cpu():
-    return _USE_CPU
-
-
-def set_use_cpu(flag: bool):
-    global _USE_CPU
-    _USE_CPU = flag
+def is_cpu() -> bool:
+    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
 
 
 def is_flashinfer_available():

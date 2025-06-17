@@ -29,13 +29,19 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import cpu_has_amx_support, is_cuda, is_npu, set_weight_attrs, use_cpu
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_npu,
+    set_weight_attrs,
+)
 from sglang.utils import resolve_obj_by_qualname
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
-_is_cpu_amx = cpu_has_amx_support()
-_use_cpu = use_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
@@ -56,7 +62,7 @@ class SiluAndMul(CustomOp):
         return out
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        if _is_cpu_amx:
+        if _is_cpu_amx_available:
             d = x.shape[-1] // 2
             output_shape = x.shape[:-1] + (d,)
             out = torch.ops.sgl_kernel.silu_and_mul_cpu(x)
@@ -196,7 +202,7 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
         return nn.Identity()
 
 
-if not (_is_cuda or _is_npu or (_use_cpu and _is_cpu_amx)):
+if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
     logger.info(
         "sgl-kernel is not available on Non-NV platforms or Non-AMX CPUs. Fallback to other kernel libraries."
     )

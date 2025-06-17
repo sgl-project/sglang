@@ -8,13 +8,13 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import cpu_has_amx_support, is_cuda, is_hip, is_npu, use_cpu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
-_is_cpu_amx = cpu_has_amx_support()
-_use_cpu = use_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
@@ -87,10 +87,9 @@ class RotaryEmbedding(CustomOp):
         if not _is_cuda:
             cache = cache.to(dtype)
 
-        self._use_cpu = use_cpu()
-        if (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512]) and not (
-            self._use_cpu and _is_cpu_amx
-        ):
+        if (
+            not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512]
+        ) and not (_is_cpu and _is_cpu_amx_available):
             from vllm._custom_ops import rotary_embedding
 
             self.vllm_rotary_embedding = rotary_embedding
@@ -161,7 +160,7 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         positions = torch.add(positions, offsets) if offsets is not None else positions
-        if _is_cpu_amx:
+        if _is_cpu_amx_available:
             return torch.ops.sgl_kernel.rotary_embedding_cpu(
                 positions,
                 query,
@@ -730,7 +729,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         positions = torch.add(positions, offsets) if offsets is not None else positions
-        if _is_cpu_amx:
+        if _is_cpu_amx_available:
             return torch.ops.sgl_kernel.rotary_embedding_cpu(
                 positions, query, key, self.head_size, self.cos_sin_cache, False
             )

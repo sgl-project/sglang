@@ -34,13 +34,11 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
-    use_cpu,
 )
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_is_cpu_amx = cpu_has_amx_support()
-_use_cpu = use_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
 if _is_cuda:
@@ -401,7 +399,7 @@ def biased_grouped_topk_cpu(
     )
 
 
-if _is_cpu and _use_cpu and _is_cpu_amx:
+if _is_cpu and _is_cpu_amx_available:
     biased_grouped_topk = biased_grouped_topk_cpu
     grouped_topk = grouped_topk_cpu
     fused_topk_native = fused_topk_cpu

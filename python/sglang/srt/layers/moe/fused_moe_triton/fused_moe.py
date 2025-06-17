@@ -29,21 +29,21 @@ from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
     get_device_name,
+    is_cpu,
     is_cuda,
     is_hip,
     log_info_on_rank0,
     next_power_of_2,
-    use_cpu,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
-_is_cpu_amx = cpu_has_amx_support()
-_use_cpu = use_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
-elif _use_cpu and _is_cpu_amx:
+elif _is_cpu and _is_cpu_amx_available:
     pass
 else:
     from vllm import _custom_ops as vllm_ops
