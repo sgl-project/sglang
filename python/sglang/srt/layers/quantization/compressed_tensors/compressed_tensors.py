@@ -118,18 +118,6 @@ class CompressedTensorsConfig(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
-
-        # (DEBUG) yiakwy : remove
-        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-        from sglang.srt.models.deepseek_v2 import ReplicatedLinear
-
-        if isinstance(layer, ReplicatedLinear) and \
-            hasattr(layer, "prefix") and "fused_qkv_a_proj_with_mqa" in layer.prefix and \
-            hasattr(layer, "layer_id") and layer.layer_id == 52:
-            # from remote_pdb import set_trace
-            # set_trace()
-            pass
-
         # Check if the layer is skipped for quantization.
         # TODO (@robertgshaw2): support module names
         if should_ignore_layer(
@@ -645,17 +633,6 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
         the necessary parameters for the layer. See LinearMethodBase for param
         details
         """
-        
-        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-        from sglang.srt.models.deepseek_v2 import ReplicatedLinear
-
-        if isinstance(layer, ReplicatedLinear) and \
-            hasattr(layer, "prefix") and "fused_qkv_a_proj_with_mqa" in layer.prefix and \
-            hasattr(layer, "layer_id") and layer.layer_id == 52:
-            # from remote_pdb import set_trace
-            # set_trace()
-            pass
-
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.scheme.create_weights(
             layer=layer,

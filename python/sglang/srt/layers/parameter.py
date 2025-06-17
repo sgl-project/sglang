@@ -50,10 +50,6 @@ class BasevLLMParameter(Parameter):
         return self._weight_loader
 
     def _assert_and_load(self, loaded_weight: torch.Tensor):
-        if self.data.shape != loaded_weight.shape:
-            from remote_pdb import set_trace
-            set_trace()
-
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
 
