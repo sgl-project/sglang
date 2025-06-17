@@ -18,15 +18,10 @@
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
 import logging
-from dataclasses import dataclass
-from enum import Enum, auto
-from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
-from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_pp_group,
@@ -198,6 +193,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 top_k=self.top_k,
                 use_grouped_topk=False,
                 renormalize=self.renormalize,
+                num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -259,16 +255,20 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         router_logits = state.pop("router_logits")
         hidden_states = state.hidden_states_mlp_input
         if router_logits is not None:
-            state.topk_weights_local, state.topk_idx_local = select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                top_k=self.top_k,
-                use_grouped_topk=False,
-                renormalize=self.renormalize,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
+                state.topk_weights_local, state.topk_idx_local = select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    top_k=self.top_k,
+                    use_grouped_topk=False,
+                    renormalize=self.renormalize,
+                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    ),
+                )
         else:
             state.topk_idx_local = torch.full(
                 (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
@@ -811,6 +811,7 @@ class Qwen3MoeForCausalLM(nn.Module):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
+        # TODO mimic deepseek
         self.routed_experts_weights_of_layer = {
             layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
             for layer_id in range(self.start_layer, self.end_layer)
