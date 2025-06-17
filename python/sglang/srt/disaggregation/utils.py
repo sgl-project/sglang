@@ -111,27 +111,27 @@ class MetadataBuffers:
             self.output_ids = torch.zeros(
                 (size, 16),
                 dtype=torch.int32,
-                device="cuda" if self.custom_mem_pool is not None else "cpu",
+                device="cuda" if self.custom_mem_pool else "cpu",
             )
             self.output_token_logprobs_val = torch.zeros(
                 (size, 16),
                 dtype=torch.float32,
-                device="cuda" if self.custom_mem_pool is not None else "cpu",
+                device="cuda" if self.custom_mem_pool else "cpu",
             )
             self.output_token_logprobs_idx = torch.zeros(
                 (size, 16),
                 dtype=torch.int32,
-                device="cuda" if self.custom_mem_pool is not None else "cpu",
+                device="cuda" if self.custom_mem_pool else "cpu",
             )
             self.output_top_logprobs_val = torch.zeros(
                 (size, max_top_logprobs_num),
                 dtype=torch.float32,
-                device="cuda" if self.custom_mem_pool is not None else "cpu",
+                device="cuda" if self.custom_mem_pool else "cpu",
             )
             self.output_top_logprobs_idx = torch.zeros(
                 (size, max_top_logprobs_num),
                 dtype=torch.int32,
-                device="cuda" if self.custom_mem_pool is not None else "cpu",
+                device="cuda" if self.custom_mem_pool else "cpu",
             )
 
     def get_buf_infos(self):
