@@ -454,6 +454,10 @@ class SchedulerDisaggregationPrefillMixin:
                 req.metadata_buffer_index
             )
 
+        # Don't send the remote prefill request to detokenizer
+        if self.is_remote_prefill:
+            done_reqs = [req for req in done_reqs if not req.is_remote_prefill]
+
         # Stream requests which have finished transfer
         self.stream_output(
             done_reqs,
@@ -523,8 +527,6 @@ class SchedulerDisaggregationPrefillMixin:
         import numpy as np
         from .nixl.conn import NixlKVSender, TransferInfo
         import json
-        from os import environ
-        import etcd3
 
         req = Req(rid = remote_prefill_req.rid,
                 origin_input_text=remote_prefill_req.origin_input_text,
@@ -532,7 +534,8 @@ class SchedulerDisaggregationPrefillMixin:
                 sampling_params=remote_prefill_req.sampling_params,
                 bootstrap_room=remote_prefill_req.bootstrap_room,
                 bootstrap_host=remote_prefill_req.rank_ip,
-                bootstrap_port=remote_prefill_req.rank_port)
+                bootstrap_port=remote_prefill_req.rank_port,
+                is_remote_prefill=True)
 
         bootstrap_room = req.bootstrap_room
         engine_id = remote_prefill_req.engine_id

@@ -442,6 +442,7 @@ class Req:
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        is_remote_prefill: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -594,6 +595,7 @@ class Req:
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        self.is_remote_prefill = is_remote_prefill
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
