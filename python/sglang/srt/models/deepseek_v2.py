@@ -608,12 +608,21 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         # For tensor parallel attention
         if self.q_lora_rank is not None:
+
+            # DEBUG (yiakwy) : remove
+            # if layer_id == 52:
+            #     from remote_pdb import set_trace
+            #     set_trace()
+            #     pass
+
             self.fused_qkv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
                 self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
+                layer_id=layer_id,
+                fused_parameters=2,
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
@@ -1952,6 +1961,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
+
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
             weights_list = list(weights)
@@ -2004,6 +2014,16 @@ class DeepseekV2ForCausalLM(nn.Module):
                         "up_proj.weight_scale",
                         "up_proj.weight_scale_2",
                         "up_proj.input_scale",
+                    ]
+                elif self.quant_config.get_name() == "compressed_tensors": 
+                    # Note (yiakwy) see supported quantiztion methods in https://github.com/neuralmagic/compressed-tensors/blob/main/src/compressed_tensors/quantization/quant_scheme.py
+                    suffix_list = [
+                        "down_proj.weight",
+                        "down_proj.weight_scale",
+                        "gate_proj.weight",
+                        "gate_proj.weight_scale",
+                        "up_proj.weight",
+                        "up_proj.weight_scale",
                     ]
                 else:
                     raise ValueError(
