@@ -254,14 +254,6 @@ set(SOURCES
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
-set(SOURCES
-    "csrc/radix_tree/tree_v2.cpp"
-    "csrc/radix_tree/tree_v2_debug.cpp"
-    "csrc/radix_tree/tree_v2_binding.cpp"
-)
-
-Python_add_library(radix_tree_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
-
 target_compile_options(common_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
 target_include_directories(common_ops PRIVATE
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
@@ -288,10 +280,7 @@ set(MSCCLPP_USE_CUDA ON)
 set(MSCCLPP_BYPASS_GPU_CHECK ON)
 set(MSCCLPP_BUILD_TESTS OFF)
 add_subdirectory(${repo-mscclpp_SOURCE_DIR})
-
-find_library(TORCH_PYTHON_LIBRARY torch_python PATH "${TORCH_INSTALL_PREFIX}/lib")
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
-target_link_libraries(radix_tree_cpp PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY})
 
 target_compile_definitions(common_ops PRIVATE
     FLASHATTENTION_DISABLE_BACKWARD
@@ -300,7 +289,6 @@ target_compile_definitions(common_ops PRIVATE
 )
 
 install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
-install(TARGETS radix_tree_cpp LIBRARY DESTINATION sgl_kernel)
 
 # ============================ Optional Install ============================= #
 # set flash-attention sources file
@@ -402,3 +390,23 @@ install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
 
 install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
         DESTINATION "deep_gemm/include/cutlass")
+
+# radix_tree_cpp logic
+set(SOURCES
+    "csrc/radix_tree/tree_v2.cpp"
+    "csrc/radix_tree/tree_v2_debug.cpp"
+    "csrc/radix_tree/tree_v2_binding.cpp"
+)
+Python_add_library(radix_tree_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+set(RADIX_TREE_CPP_FLAGS
+    "-O3"
+    "-fPIC"
+    "-std=c++20" # need <span>
+    "-Wall"
+    "-Wextra"
+    "-Werror"
+)
+target_compile_options(radix_tree_cpp PRIVATE ${RADIX_TREE_CPP_FLAGS})
+find_library(TORCH_PYTHON_LIBRARY torch_python PATH "${TORCH_INSTALL_PREFIX}/lib")
+target_link_libraries(radix_tree_cpp PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY})
+install(TARGETS radix_tree_cpp LIBRARY DESTINATION sgl_kernel)

@@ -11,7 +11,7 @@ setup(
                 "tree_v2_debug.cpp",
                 "tree_v2_binding.cpp",
             ],  # your C++ file
-            extra_compile_args=["-O3", "-std=c++17"],
+            extra_compile_args=["-O3", "-std=c++20"],
         ),
     ],
     cmdclass={"build_ext": BuildExtension},

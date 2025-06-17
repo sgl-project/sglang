@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <unordered_map>
 
 #include "common.h"
@@ -24,33 +25,7 @@ struct std_vector_hash {
   }
 };
 
-struct token_slice {
- public:
-  token_slice(const token_vec_t& tokens) : m_data(tokens.data()), m_size(tokens.size()) {}
-  token_slice(const token_t* data, std::size_t size) : m_data(data), m_size(size) {}
-
-  std::array<token_slice, 2> split(std::size_t offset) const {
-    return {
-        token_slice{m_data, offset},
-        token_slice{m_data + offset, m_size - offset},
-    };
-  }
-
-  std::size_t size() const {
-    return m_size;
-  }
-
-  const token_t* begin() const {
-    return m_data;
-  }
-  const token_t* end() const {
-    return m_data + m_size;
-  }
-
- private:
-  const token_t* m_data;
-  std::size_t m_size;
-};
+using token_slice = std::span<const token_t>;
 
 /**
  * Every node is a host node, which means either it is on the host or on the device (or both).

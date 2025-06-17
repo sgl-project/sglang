@@ -138,7 +138,7 @@ struct RadixTree::Impl {
       }
 
       // we have matched the whole key, continue to the next node
-      key = key.split(prefix_length)[1];
+      key = key.subspan(prefix_length);
     }
 
     return {node, total_prefix_length};
@@ -344,7 +344,7 @@ struct RadixTree::Impl {
   // some auxiliary functions
   token_vec_t& get_key(token_slice tokens) {
     _assert(tokens.size() >= page_size, "Key should be at least page-sized");
-    tokens = tokens.split(page_size)[0];
+    tokens = tokens.subspan(0, page_size);
     m_cached_vec.assign(tokens.begin(), tokens.end());
     return m_cached_vec;
   }
