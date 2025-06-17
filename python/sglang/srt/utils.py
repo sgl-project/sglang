@@ -2106,7 +2106,7 @@ def get_free_port():
 
 
 def get_local_ip_auto() -> str:
-    interface = os.environ.get("SGLANG_DISAGGREGATION_LOCAL_IP_NIC", None)
+    interface = os.environ.get("SGLANG_LOCAL_IP_NIC", None)
     return (
         get_local_ip_by_nic(interface)
         if interface is not None
@@ -2119,7 +2119,7 @@ def get_local_ip_by_nic(interface: str) -> str:
         import netifaces
     except ImportError as e:
         raise ImportError(
-            "Environment variable SGLANG_DISAGGREGATION_LOCAL_IP_NIC requires package netifaces, please install it through 'pip install netifaces'"
+            "Environment variable SGLANG_LOCAL_IP_NIC requires package netifaces, please install it through 'pip install netifaces'"
         ) from e
 
     try:
