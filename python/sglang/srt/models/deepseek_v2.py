@@ -1932,6 +1932,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             self._weight_requant_ue8m0()
 
     def _weight_requant_ue8m0(self):
+        if self.config.architectures[0] == "DeepseekV3ForCausalLMNextN":
+            return
         weight_block_size = self.quant_config.weight_block_size
 
         moe_layers = list(
