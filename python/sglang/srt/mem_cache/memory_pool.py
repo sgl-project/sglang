@@ -272,6 +272,7 @@ class MHATokenToKVPool(KVCache):
                 MooncakeNVLinkAllocator,
             )
 
+            # TODO(shangming): abstract custom allocator class for more backends
             allocator = MooncakeNVLinkAllocator.get_allocator(self.device)
             self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
         else:
@@ -603,6 +604,7 @@ class MLATokenToKVPool(KVCache):
                 MooncakeNVLinkAllocator,
             )
 
+            # TODO(shangming): abstract custom allocator class for more backends
             allocator = MooncakeNVLinkAllocator.get_allocator(self.device)
             self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
         else:

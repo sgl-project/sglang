@@ -7,6 +7,7 @@ import torch
 from torch.cuda.memory import CUDAPluggableAllocator
 
 
+# TODO(shangming): move this class into mooncake's package for more general use cases
 class MooncakeNVLinkAllocator:
     _instances: Dict[torch.device, CUDAPluggableAllocator] = {}
     _lock: Final = threading.Lock()
