@@ -267,7 +267,18 @@ class Llama4ForConditionalGeneration(nn.Module):
         params_dict: dict,
         num_experts: int,
     ) -> bool:
-        """Handle expert weight loading. Returns True if handled."""
+        """Handle expert weight loading for MoE (Mixture of Experts) layers.
+
+        Args:
+            name: Parameter name from the checkpoint
+            loaded_weight: The weight tensor to be loaded
+            expert_params_mapping: Mapping of parameter names to expert configurations
+            params_dict: Dictionary of model parameters
+            num_experts: Total number of experts in the MoE layer
+
+        Returns:
+            bool: True if the parameter was handled (is an expert parameter), False otherwise
+        """
         if ".experts" not in name:
             return False
 
@@ -292,7 +303,17 @@ class Llama4ForConditionalGeneration(nn.Module):
         expert_params_mapping: list,
         params_dict: dict,
     ) -> bool:
-        """Handle other expert parameters through mapping."""
+        """Handle expert parameters that are not gate_up_proj or down_proj weights.
+
+        Args:
+            name: Parameter name from the checkpoint
+            loaded_weight: The weight tensor to be loaded
+            expert_params_mapping: List of tuples mapping checkpoint names to model parameters
+            params_dict: Dictionary of model parameters
+
+        Returns:
+            bool: True if parameter was found and handled, False otherwise
+        """
         for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
             if weight_name in name:
                 transformed_name = name.replace(weight_name, param_name)
@@ -339,7 +360,17 @@ class Llama4ForConditionalGeneration(nn.Module):
         params_dict: dict,
         num_experts: int,
     ) -> bool:
-        """Handle expert scale parameters."""
+        """Handle quantization scale parameters for expert weights.
+
+        Args:
+            name: Parameter name containing scale information
+            loaded_weight: Scale tensor to be loaded
+            params_dict: Dictionary of model parameters
+            num_experts: Total number of experts for broadcast operations
+
+        Returns:
+            bool: True (always handles scale parameters)
+        """
         import re
 
         # Check if this matches the expert parameter pattern: experts.{expert_id}.{param_name}
@@ -374,7 +405,17 @@ class Llama4ForConditionalGeneration(nn.Module):
         params_dict: dict,
         num_experts: int,
     ) -> bool:
-        """Handle expert weight parameters."""
+        """Handle actual weight tensors for expert layers (gate_up_proj and down_proj).
+
+        Args:
+            name: Parameter name (should contain gate_up_proj or down_proj)
+            loaded_weight: Weight tensor(s) to be loaded
+            params_dict: Dictionary of model parameters
+            num_experts: Total number of experts for tensor distribution
+
+        Returns:
+            bool: True (always handles weight parameters)
+        """
         # Transform name and get shard info
         transformed_name, _, shard_id_list = self._transform_expert_name(
             name, is_weight=True

@@ -160,7 +160,6 @@ def _initialize_model(
     quant_config = _get_quantization_config(
         model_config, load_config, packed_modules_mapping
     )
-    print(f"quant_config: {quant_config}")
     return model_class(
         config=model_config.hf_config,
         quant_config=quant_config,
