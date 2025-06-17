@@ -20,8 +20,11 @@ from sglang.srt.layers.moe.ep_moe.fbgemm_grouped_gemm import (
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
+    extract_base_kernel,
     gelu_and_mul_triton_kernel,
+    get_base_gpu,
     grouped_gemm_triton,
+    make_a_aligned,
     post_reorder_triton_kernel,
     pre_reorder_triton_kernel,
     run_moe_ep_preprocess,
@@ -73,25 +76,40 @@ def prepare_fbgemm_inputs_ep(
     *,
     weight_indices: Optional[torch.Tensor] = None,
     scale_b: Optional[torch.Tensor] = None,  # [G_local] / None
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    base: Optional[int] = None,
+) -> Tuple[
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    int,
+    Optional[torch.Tensor],
+]:
     """
     Return:
         b_fbgemm : [G_local*N , K]
         m_sizes  : [G_local]
         scale_b  : [G_local] / None
     """
-    device = a.device
     G_local, N, K_w = b.shape
     assert K_w == a.shape[1], "K dim mismatch in EP mode!"
 
     m_sizes = seg_indptr[1:] - seg_indptr[:-1]  # [G_local]
 
+    # a_aligned = a[base:]
+    # TODO(yuan-luo): Fix cuda graph capture by introducing a new kernel.
+    base_tensor = get_base_gpu(seg_indptr)
+    a_aligned = make_a_aligned(a, base_tensor)
+
+    assert (
+        b.ndim == 3 and b.shape[2] == a.shape[1]
+    ), f"b.shape = {b.shape}, expected [G_local, N, {a.shape[1]}]"
+    b_fbgemm = b.contiguous().view(-1, b.shape[-1])  # [G_local * N, K]
+
     if weight_indices is not None:
         if scale_b is not None:
             scale_b = scale_b.index_select(0, weight_indices)
 
-    b_fbgemm = b.reshape(-1, K_w).contiguous()  # [G_local*N, K]
-    return b_fbgemm, m_sizes, scale_b
+    return a_aligned, b_fbgemm, m_sizes, base, scale_b
 
 
 class GroupedGemmRunner(torch.nn.Module):
@@ -151,7 +169,8 @@ class GroupedGemmRunner(torch.nn.Module):
             )
         elif self.use_fbgemm:
             assert seg_indptr is not None, "FBGemm needs seg_indptr"
-            b_fbgemm, m_sizes, scale_b = prepare_fbgemm_inputs_ep(
+            base = (seg_indptr[0]).to(torch.int)
+            a_aligned, b_fbgemm, m_sizes, base, scale_b = prepare_fbgemm_inputs_ep(
                 a=a,
                 b=b,
                 seg_indptr=seg_indptr,
@@ -186,12 +205,22 @@ class GroupedGemmRunner(torch.nn.Module):
                     use_per_token_if_dynamic=self.use_per_token_if_dynamic,
                 )
             else:
-                c = fbgemm_grouped_gemm(
-                    a.to(torch.bfloat16),
-                    b_fbgemm.to(torch.bfloat16),
-                    m_sizes=m_sizes,
-                    use_fast_accum=True,
-                )
+                if (
+                    a_aligned is None
+                    or m_sizes is None
+                    or base is None
+                    or m_sizes.sum().item() == 0
+                ):
+                    c.zero_()
+                else:
+                    c_local = fbgemm_grouped_gemm(
+                        a_aligned,
+                        b_fbgemm,
+                        m_sizes=m_sizes,
+                        use_fast_accum=True,
+                    )
+                    c.zero_()
+                    c[base : base + a_aligned.size(0)].copy_(c_local)
         else:
             assert weight_column_major == True
             c = grouped_gemm_triton(

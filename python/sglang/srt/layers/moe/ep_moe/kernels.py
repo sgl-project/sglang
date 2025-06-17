@@ -1086,3 +1086,60 @@ def tma_align_input_scale(input_scale: torch.Tensor):
         BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
     return output.t()[:m]
+
+
+@triton.jit
+def extract_base_kernel(seg_ptr, output_ptr):
+    if tl.program_id(0) == 0:
+        tl.store(output_ptr + 0, tl.load(seg_ptr + 0))
+
+
+def get_base_gpu(seg_indptr: torch.Tensor) -> torch.Tensor:
+    base_tensor = torch.empty(1, dtype=seg_indptr.dtype, device=seg_indptr.device)
+
+    extract_base_kernel[(1,)](
+        seg_indptr,
+        base_tensor,
+    )
+    return base_tensor
+
+
+@triton.jit
+def slice_rows_kernel(
+    a_ptr,
+    out_ptr,
+    base_ptr,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr = 128,
+    BLOCK_K: tl.constexpr = 32,
+):
+    base = tl.load(base_ptr + 0)  # scalar int64
+    pid = tl.program_id(0)
+    row_start = pid * BLOCK_M
+
+    offs_m = row_start + tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    valid_m = offs_m < (M - base)
+
+    # pointers into a / out
+    a_ptrs = a_ptr + (offs_m + base)[:, None] * K + offs_k[None, :]
+    o_ptrs = out_ptr + offs_m[:, None] * K + offs_k[None, :]
+
+    for k_off in range(0, K, BLOCK_K):
+        a_tile = tl.load(a_ptrs, mask=valid_m[:, None])
+        tl.store(o_ptrs, a_tile, mask=valid_m[:, None])
+        a_ptrs += BLOCK_K
+        o_ptrs += BLOCK_K
+
+
+def make_a_aligned(a: torch.Tensor, base_tensor: torch.Tensor) -> torch.Tensor:
+    M, K = a.shape
+    # base_val = int(base_tensor.cpu())
+    base_val = base_tensor.to(torch.int)
+    out = torch.empty((M - base_val, K), dtype=a.dtype, device=a.device)
+
+    grid = (triton.cdiv(M - base_val, 128),)  # 128 = BLOCK_M
+    slice_rows_kernel[grid](a, out, base_tensor, M, K)
+    return out
