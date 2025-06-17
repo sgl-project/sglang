@@ -1139,10 +1139,18 @@ class TokenizerManager:
         while True:
             remain_num_req = len(self.rid_to_state)
 
-            if self.health_check_failed or get_bool_env_var("SGL_FORCE_SHUTDOWN"):
-                # if health check failed or no wait flag set, exit immediately
+            if self.health_check_failed:
+                # if health check failed, exit immediately
                 logger.error(
-                    "Signal SIGTERM received while health check failed or no wait flag set. Exiting... remaining number of requests: %d",
+                    "Signal SIGTERM received while health check failed. Exiting... remaining number of requests: %d",
+                    remain_num_req,
+                )
+                break
+
+            elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
+                # if force shutdown flag set, exit immediately
+                logger.error(
+                    "Signal SIGTERM received while force shutdown flag set. Force exiting... remaining number of requests: %d",
                     remain_num_req,
                 )
                 break
