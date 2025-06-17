@@ -1926,6 +1926,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and hasattr(self.quant_config, "weight_block_size")
+            and self.quant_config.weight_block_size is not None
         ):
             self._weight_requant_ue8m0()
 
@@ -2135,8 +2137,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                         ):
                             q_a_proj_weight = cached_a_proj[q_a_proj_name]
                             kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+                            cat_dim = 0
+                            if (
+                                self.quant_config.get_name() == "awq"
+                                or self.quant_config.get_name() == "moe_wna16"
+                            ):
+                                cat_dim = 1
                             fused_weight = torch.cat(
-                                [q_a_proj_weight, kv_a_proj_weight], dim=0
+                                [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
                             )
                             param_name = (
                                 name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
@@ -2158,12 +2166,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                             "k_scale" in name or "v_scale" in name
                         ) and name not in params_dict:
                             # modelopt attn kv scale is named differently
-                            if any(scale in name for scale in ["k_scale", "v_scale"]):
-                                name = name.replace("_proj", "attn_mqa")
-                            else:
-                                logger.warning(
-                                    f"Unknown scale found in checkpoint: {name}"
-                                )
+                            for scale in ["k_scale", "v_scale"]:
+                                if scale in name:
+                                    name = name.replace(f"{scale[0]}_proj", "attn_mqa")
                         param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
