@@ -1,6 +1,6 @@
 import os
 import threading
-from typing import TYPE_CHECKING, List, Set, Tuple
+from typing import TYPE_CHECKING, List, Set
 
 import torch
 from sgl_kernel.radix_tree import IOHandle, RadixTreeCpp, TreeNodeCpp
@@ -150,8 +150,8 @@ class HiCacheController_v2:
 
         self.write_queue = PriorityQueue[CacheOperation]()
         self.load_queue = PriorityQueue[CacheOperation]()
-        self.write_cancel_queue = Queue[int]()
-        self.ack_write_cancel_queue = Queue[Tuple[List[IOHandle], int]]()
+        self.write_cancel_event = threading.Event()
+        self.ack_write_cancel_queue = Queue[List[CacheOperation]]()
 
         self.ack_write_queue = Queue[IOHandle]()
         self.ack_load_queue = Queue[IOHandle]()
@@ -232,20 +232,13 @@ class HiCacheController_v2:
                 self.ack_write_queue.put(handle)
 
         while not self.stop_event.is_set():
-            if self.write_cancel_queue.qsize() > 0:
-                cancel_count = self.write_cancel_queue.get(block=False)
+            # try to cancel the write if the event is set
+            if self.write_cancel_event.is_set():
+                self.write_cancel_event.clear()
                 op_list: List[CacheOperation] = []
-                for _ in range(self.write_queue.qsize()):
+                while not self.write_queue.empty():
                     op_list.append(self.write_queue.get(block=False))
-                # cancel the last `cancel_count` operations
-                handle_list: List[IOHandle] = []
-                real_count = min(cancel_count, len(op_list))
-                for op in op_list[-cancel_count:]:
-                    handle_list.extend(op.handles)
-                op_list = op_list[:-cancel_count]
-                self.ack_write_cancel_queue.put((handle_list, real_count))
-                for op in op_list:
-                    self.write_queue.put(op)
+                self.ack_write_cancel_queue.put(op_list)
             try:
                 operation = self.write_queue.get(block=True, timeout=1)
                 _write_to_host(operation)
@@ -269,7 +262,7 @@ class HiCacheController_v2:
             if not self.load_cache_event.is_set():
                 continue
             self.load_cache_event.clear()
-            self.load_stream.wait_event(self.load_sync_event) # type: ignore
+            self.load_stream.wait_event(self.load_sync_event)  # type: ignore
 
             # the load queue should be unchanged after this load_event is set
             # and we don't care about the `get` order since they must be done
@@ -444,7 +437,7 @@ class HiRadixCacheCpp(BasePrefixCache):
             host_indices_length=host_indices_length,
         )
 
-    def insert(self, key: List[int], value: torch.Tensor) -> int:
+    def _insert(self, key: List[int], value: torch.Tensor) -> int:
         """
         Insert a key-value pair into the radix tree.
         Args:
@@ -503,7 +496,7 @@ class HiRadixCacheCpp(BasePrefixCache):
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        new_prefix_len = self.insert(token_ids, kv_indices)
+        new_prefix_len = self._insert(token_ids, kv_indices)
 
         # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
         assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
@@ -534,7 +527,7 @@ class HiRadixCacheCpp(BasePrefixCache):
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        new_prefix_len = self.insert(token_ids, kv_indices)
+        new_prefix_len = self._insert(token_ids, kv_indices)
 
         # NOTE: kv_indices[:old_prefix_len] == req.prefix_indices
         assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
@@ -645,8 +638,8 @@ class HiRadixCacheCpp(BasePrefixCache):
         ):
             return
 
-        last_cancel_count = self.last_cancel_count
-        if self.writing_check() >= last_cancel_count:
+        num_cancel = self.last_cancel_count
+        if self.writing_check() >= num_cancel:
             return
 
         # no ongoing write through, nothing to cancel (just check again)
@@ -655,22 +648,45 @@ class HiRadixCacheCpp(BasePrefixCache):
 
         # if we reach here, it means we are really stuck by the write through
         logger.warning(
-            f"Write through may get stuck, trying to cancel last {last_cancel_count} writes"
+            f"Write through may get stuck, trying to cancel last {num_cancel} writes"
         )
-        self.cache_controller.write_cancel_queue.put(last_cancel_count)
-        handles, count = self.cache_controller.ack_write_cancel_queue.get()
-        logger.warning(f"Cancelled {count} write through operations")
-        for handle in handles:
-            self.tree.commit_writing_through(handle, False)
-            self.ongoing_write_through.remove(handle)
-        self.writing_check()  # still ensure all writes are committed
 
-        # if we cannot cancel that many writes, there will be only a few left
-        # so we just wait for the queue result to be processed
-        if count < last_cancel_count:
-            while len(self.ongoing_write_through) > 0:
+        self._cancel_write_through()
+
+    def _cancel_write_through(self):
+        assert self.cache_controller is not None
+        self.cache_controller.write_cancel_event.set()
+        cancel_list = self.cache_controller.ack_write_cancel_queue.get()
+        cancel_count = min(len(cancel_list), self.last_cancel_count)
+        if torch.distributed.get_world_size(group=self.tp_group) > 1:
+            # synchrnoize TP workers to make the same update to radix cache
+            # we can only cancel the same amount of writes on all TP workers
+            cancel_tensor = torch.tensor(cancel_count, dtype=torch.int)
+            torch.distributed.all_reduce(
+                cancel_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            cancel_count = int(cancel_tensor.item())
+
+        # cancel the last `cancel_count` writes
+        for op in cancel_list[-cancel_count:]:
+            for handle in op.handles:
+                self.tree.commit_writing_through(handle, False)
+                self.ongoing_write_through.remove(handle)
+
+        # put back the rest of the writes to the queue
+        for op in cancel_list[:-cancel_count]:
+            self.cache_controller.write_queue.put(op)
+
+        if cancel_count == self.last_cancel_count:
+            # double the cancel count for next time
+            logger.warning(f"Canceled {cancel_count} writes successfully")
+            self.last_cancel_count *= 2
+        else:
+            # block until all writes are completed
+            for _ in range(len(self.ongoing_write_through)):
                 handle = self.cache_controller.ack_write_queue.get()
                 self.tree.commit_writing_through(handle, True)
-                self.ongoing_write_through.remove(handle)
-        else:
-            self.last_cancel_count = last_cancel_count * 2
+            self.ongoing_write_through.clear()
+            logger.warning("All write through are completed after cancel")
