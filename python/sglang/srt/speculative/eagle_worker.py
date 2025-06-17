@@ -307,17 +307,21 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
-        # TODO(ch-wan): remove asserts
-        if batch.forward_mode.is_decode() or (
-            batch.forward_mode.is_idle() and not batch.is_extend_in_batch
-        ):
-            assert not (batch.forward_mode.is_extend() or batch.is_extend_in_batch)
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            logits_output, next_token_ids, bid, seq_lens_cpu = (
+                self.forward_target_extend(batch)
+            )
+            with self.draft_tp_context(self.draft_model_runner.tp_group):
+                self.forward_draft_extend(
+                    batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
+                )
+            return logits_output, next_token_ids, bid, 0, False
+        else:
             with self.draft_tp_context(self.draft_model_runner.tp_group):
                 spec_info = self.draft(batch)
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
-
             need_forward, can_run_draft_extend_cuda_graph = (
                 self.check_forward_draft_extend_after_decode(batch)
             )
@@ -333,16 +337,6 @@ class EAGLEWorker(TpModelWorker):
                 sum(verify_output.accept_length_per_req_cpu),
                 can_run_cuda_graph,
             )
-        else:  # batch.forward_mode.is_extend() or batch.is_extend_in_batch
-            assert batch.forward_mode.is_extend() or batch.is_extend_in_batch
-            logits_output, next_token_ids, bid, seq_lens_cpu = (
-                self.forward_target_extend(batch)
-            )
-            with self.draft_tp_context(self.draft_model_runner.tp_group):
-                self.forward_draft_extend(
-                    batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
-                )
-            return logits_output, next_token_ids, bid, 0, False
 
     def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         local_need_forward = (

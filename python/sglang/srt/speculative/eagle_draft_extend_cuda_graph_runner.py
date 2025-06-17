@@ -231,7 +231,9 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         # Run and capture
         def run_once():
+            # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+
             # Backup two fields, which will be modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
