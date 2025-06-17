@@ -212,21 +212,19 @@ class LinearBase(torch.nn.Module):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        layer_id: int = None,
-        fused_parameters: int=0,
+        fused_parameters: int = 0,
     ):
         super().__init__()
 
+        # Debug context
         self.prefix = prefix
-        self.layer_id = layer_id
 
         # Keep input parameters
         self.input_size = input_size
         self.output_size = output_size
         self.skip_bias_add = skip_bias_add
-        # To create fused weight/input scalars with correct size, a fix to PR#5619
-        self.fused_parameters = None
-        self.fused_parameters= fused_parameters
+        # Fix to PR#5619, to create fused weight/input scalars with correct size
+        self.fused_parameters = fused_parameters
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
@@ -262,8 +260,7 @@ class ReplicatedLinear(LinearBase):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        layer_id : int = None,
-        fused_parameters : int = None,
+        fused_parameters: int = None,
     ):
         super().__init__(
             input_size,
@@ -271,8 +268,7 @@ class ReplicatedLinear(LinearBase):
             skip_bias_add,
             params_dtype,
             quant_config,
-            prefix=prefix, # DEBUG(yiakwy)
-            layer_id=layer_id, # DEBUG(yiakwy)
+            prefix=prefix,
             fused_parameters=fused_parameters,
         )
 
@@ -308,12 +304,6 @@ class ReplicatedLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        if param.size() != loaded_weight.size():
-            from remote_pdb import set_trace
-            set_trace()
-            print("ups")
-            raise Exception("loaded weight should have the same size with pre-allocaed parameters!")
-            pass
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
