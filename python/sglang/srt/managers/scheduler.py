@@ -478,6 +478,9 @@ class Scheduler(
         )
         self.init_disaggregation()
 
+        self.global_log_hit_tokens = 0
+        self.global_log_input_tokens = 0
+
     def init_tokenizer(self):
         server_args = self.server_args
 
@@ -1176,6 +1179,10 @@ class Scheduler(
             f += f"time: {gap_latency:.2f} "
         else:
             f += f"#queue-req: {len(self.waiting_queue)}"
+
+        self.global_log_hit_tokens += adder.log_hit_tokens
+        self.global_log_input_tokens += adder.log_input_tokens
+        f += f"\n    #cache_hit_rate: {self.global_log_hit_tokens/(self.global_log_hit_tokens+self.global_log_input_tokens)}"
 
         logger.info(f)
 
@@ -1899,6 +1906,10 @@ class Scheduler(
 
     def flush_cache(self):
         """Flush the memory pool and cache."""
+
+        self.global_log_hit_tokens = 0
+        self.global_log_input_tokens = 0
+
         if (
             len(self.waiting_queue) == 0
             and self.running_batch.is_empty()

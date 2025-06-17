@@ -286,13 +286,13 @@ class HiRadixCache(RadixCache):
             if x.lock_ref > 0:
                 continue
 
-                self._evict_host_helper(leaves, x)
+            num_evicted += self._evict_host_helper(leaves, x)
 
     def _collect_leaves_host(self) -> List[TreeNode]:
         return self._collect_leaves()
 
     def _evict_host_helper(self, leaves: List[TreeNode], x: TreeNode):
-        num_evicted += self.cache_controller.evict_host(x.host_value)
+        num_evicted = self.cache_controller.evict_host(x.host_value)
 
         for k, v in x.parent.children.items():
             if v == x:
@@ -301,6 +301,8 @@ class HiRadixCache(RadixCache):
 
         if len(x.parent.children) == 0 and x.parent.evicted:
             heapq.heappush(leaves, x.parent)
+
+        return num_evicted
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
@@ -911,10 +913,12 @@ class HiRadixCacheDisk(HiRadixCache):
     def _evict_host_helper(self, leaves: List[TreeNode], x: TreeNode):
         assert x.backuped and x.backuped_disk, "the node's value should be on disk"
 
-        self._evict_host_backuped_disk(x)
+        num_evicted = self._evict_host_backuped_disk(x)
 
         if self._is_host_leaf(x.parent):
             heapq.heappush(leaves, x.parent)
+
+        return num_evicted
 
     def _evict_host_backuped_disk(self, node: TreeNode):
         # evict a node's host that already written to disk
