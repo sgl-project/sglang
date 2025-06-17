@@ -216,6 +216,8 @@ class ServerArgs:
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
     warmups: Optional[str] = None
+    vtensor_enable: bool = False
+    vtensor_port: int = 10000
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -1496,6 +1498,17 @@ class ServerArgs:
             required=False,
             help="Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 "
             "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
+        )
+        parser.add_argument(
+            "--vtensor-enable",
+            action="store_true",
+            help="Enable FlowMLA & vtensor to optimize dp mla weights.",
+        )
+        parser.add_argument(
+            "--vtensor-port",
+            type=int,
+            default=10000,
+            help="Port used for vtensor communication. Default is 10000.",
         )
 
         # Debug tensor dumps
