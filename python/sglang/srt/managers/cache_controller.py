@@ -512,7 +512,7 @@ class HiCacheController:
                 for i in range(len(fragment_keys)):
                     # Other sglang instances may have already written to it,
                     # so only the cache that does not exist is written.
-                    if not mooncake_exist_keys[keys[i]]:
+                    if not mooncake_exist_keys[fragment_keys[i]]:
                         non_exist_keys.append(fragment_keys[i])
                         non_exist_value.append(self.mem_pool_host.get_flat_data(
                             operation.host_indices[
