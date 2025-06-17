@@ -221,6 +221,14 @@ impl Bootstrap for ChatReqInput {
     }
 
     fn get_batch_size(&self) -> Result<Option<usize>, String> {
+        // Check if 'n' parameter is present and > 1
+        if let Some(n_value) = self.other.get("n") {
+            if let Some(n) = n_value.as_u64() {
+                if n > 1 {
+                    return Ok(Some(n as usize));
+                }
+            }
+        }
         Ok(None)
     }
 

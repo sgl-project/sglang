@@ -371,14 +371,17 @@ impl GenerationRequest for ChatCompletionRequest {
 
 // ============= Generate API (/generate) =============
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GenerateRequest {
-    /// Text input - for compatibility with HuggingFace text-generation-inference
+    /// The prompt to generate from (OpenAI style)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub inputs: Option<String>,
+    pub prompt: Option<StringOrArray>,
 
-    /// Input IDs - for compatibility with sglang's format
-    /// Can be a single list of token IDs or multiple lists for batch requests
+    /// Text input - SGLang native format
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+
+    /// Input IDs for tokenized input
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_ids: Option<InputIds>,
 
@@ -477,17 +480,34 @@ impl GenerationRequest for GenerateRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        // First check if we have text input
-        if let Some(ref text) = self.inputs {
+        // Check fields in priority order: text, prompt, inputs
+        if let Some(ref text) = self.text {
             return text.clone();
         }
 
-        // If we have input_ids, we can't easily convert them to text for routing
-        // For now, return empty string - the router will use round-robin or random
-        if self.input_ids.is_some() {
-            return String::new();
+        if let Some(ref prompt) = self.prompt {
+            return match prompt {
+                StringOrArray::String(s) => s.clone(),
+                StringOrArray::Array(v) => v.join(" "),
+            };
         }
 
+        if let Some(ref input_ids) = self.input_ids {
+            return match input_ids {
+                InputIds::Single(ids) => ids
+                    .iter()
+                    .map(|&id| id.to_string())
+                    .collect::<Vec<String>>()
+                    .join(" "),
+                InputIds::Batch(batches) => batches
+                    .iter()
+                    .flat_map(|batch| batch.iter().map(|&id| id.to_string()))
+                    .collect::<Vec<String>>()
+                    .join(" "),
+            };
+        }
+
+        // No text input found
         String::new()
     }
 }

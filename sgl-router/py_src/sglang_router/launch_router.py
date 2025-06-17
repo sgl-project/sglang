@@ -32,11 +32,11 @@ class RouterArgs:
     port: int = 30000
 
     # PD-specific configuration
+    pd_disaggregated: bool = False  # Enable PD disaggregated mode
     prefill_urls: List[tuple] = dataclasses.field(
         default_factory=list
     )  # List of (url, bootstrap_port)
     decode_urls: List[str] = dataclasses.field(default_factory=list)
-    pd_policy: str = "cache_aware"  # For PD mode: "random", "po2", "cache_aware"
 
     # Routing policy
     policy: str = "cache_aware"
@@ -102,29 +102,29 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware", "prefill_decode"],
-            help="Load balancing policy to use",
+            choices=["random", "round_robin", "cache_aware", "power_of_two"],
+            help="Load balancing policy to use. Note: power_of_two is only available in PD disaggregated mode",
         )
 
         # PD-specific arguments
         parser.add_argument(
-            f"--{prefix}prefill-urls",
-            type=str,
-            nargs="+",
-            help="List of prefill server URLs with bootstrap ports (format: url:port:bootstrap_port or url:port)",
+            f"--{prefix}pd-disaggregated",
+            action="store_true",
+            help="Enable PD (Prefill-Decode) disaggregated mode",
         )
         parser.add_argument(
-            f"--{prefix}decode-urls",
-            type=str,
-            nargs="+",
-            help="List of decode server URLs (format: url:port)",
+            f"--{prefix}prefill",
+            nargs=2,
+            action="append",
+            metavar=("URL", "BOOTSTRAP_PORT"),
+            help="Prefill server URL and bootstrap port. Can be specified multiple times. BOOTSTRAP_PORT can be 'none' for no bootstrap port.",
         )
         parser.add_argument(
-            f"--{prefix}pd-policy",
-            type=str,
-            default=RouterArgs.pd_policy,
-            choices=["random", "po2", "cache_aware"],
-            help="PD selection policy (only used when policy=prefill_decode)",
+            f"--{prefix}decode",
+            nargs=1,
+            action="append",
+            metavar=("URL",),
+            help="Decode server URL. Can be specified multiple times.",
         )
         parser.add_argument(
             f"--{prefix}worker-startup-timeout-secs",
@@ -236,18 +236,16 @@ class RouterArgs:
         worker_urls = getattr(args, "worker_urls", [])
 
         # Parse PD URLs
-        prefill_urls = cls._parse_prefill_urls(
-            getattr(args, f"{prefix}prefill_urls", None)
-        )
-        decode_urls = getattr(args, f"{prefix}decode_urls", None) or []
+        prefill_urls = cls._parse_prefill_urls(getattr(args, f"{prefix}prefill", None))
+        decode_urls = cls._parse_decode_urls(getattr(args, f"{prefix}decode", None))
 
         return cls(
             worker_urls=worker_urls,
             host=args.host,
             port=args.port,
+            pd_disaggregated=getattr(args, f"{prefix}pd_disaggregated", False),
             prefill_urls=prefill_urls,
             decode_urls=decode_urls,
-            pd_policy=getattr(args, f"{prefix}pd_policy", "cache_aware"),
             policy=getattr(args, f"{prefix}policy"),
             worker_startup_timeout_secs=getattr(
                 args, f"{prefix}worker_startup_timeout_secs"
@@ -286,29 +284,44 @@ class RouterArgs:
         return selector
 
     @staticmethod
-    def _parse_prefill_urls(prefill_url_list):
-        """Parse prefill URLs with optional bootstrap ports.
+    def _parse_prefill_urls(prefill_list):
+        """Parse prefill URLs from --prefill arguments.
 
-        Format: url:port:bootstrap_port or url:port (bootstrap_port defaults to None)
-        Example: http://prefill1:8080:9000 or http://prefill1:8080
+        Format: --prefill URL BOOTSTRAP_PORT
+        Example: --prefill http://prefill1:8080 9000 --prefill http://prefill2:8080 none
         """
-        if not prefill_url_list:
+        if not prefill_list:
             return []
 
         prefill_urls = []
-        for url_str in prefill_url_list:
-            if url_str.count(":") >= 3:  # http://host:port:bootstrap_port
-                # Split from the right to handle http:// properly
-                parts = url_str.rsplit(":", 1)
-                url = parts[0]
-                bootstrap_port = int(parts[1]) if parts[1] else None
-            else:  # http://host:port (no bootstrap port)
-                url = url_str
+        for url, bootstrap_port_str in prefill_list:
+            # Handle 'none' as None
+            if bootstrap_port_str.lower() == "none":
                 bootstrap_port = None
+            else:
+                try:
+                    bootstrap_port = int(bootstrap_port_str)
+                except ValueError:
+                    raise ValueError(
+                        f"Invalid bootstrap port: {bootstrap_port_str}. Must be a number or 'none'"
+                    )
 
             prefill_urls.append((url, bootstrap_port))
 
         return prefill_urls
+
+    @staticmethod
+    def _parse_decode_urls(decode_list):
+        """Parse decode URLs from --decode arguments.
+
+        Format: --decode URL
+        Example: --decode http://decode1:8081 --decode http://decode2:8081
+        """
+        if not decode_list:
+            return []
+
+        # decode_list is a list of single-element lists due to nargs=1
+        return [url[0] for url in decode_list]
 
 
 def policy_from_str(policy_str: str) -> PolicyType:
@@ -317,7 +330,7 @@ def policy_from_str(policy_str: str) -> PolicyType:
         "random": PolicyType.Random,
         "round_robin": PolicyType.RoundRobin,
         "cache_aware": PolicyType.CacheAware,
-        "prefill_decode": PolicyType.PrefillDecode,
+        "power_of_two": PolicyType.PowerOfTwo,
     }
     return policy_map[policy_str]
 
@@ -341,70 +354,46 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
         else:
             router_args = args
 
-        # Check if this is PD mode
-        if router_args.policy == "prefill_decode":
+        # Validate configuration based on mode
+        if router_args.pd_disaggregated:
             # Validate PD configuration
             if not router_args.prefill_urls:
-                raise ValueError("PrefillDecode policy requires --prefill-urls")
+                raise ValueError("PD disaggregated mode requires --prefill")
             if not router_args.decode_urls:
-                raise ValueError("PrefillDecode policy requires --decode-urls")
+                raise ValueError("PD disaggregated mode requires --decode")
 
-            # Import the Rust module to use new_pd
-            from sglang_router_rs import Router as _Router
-
-            # Create PD router using the new_pd constructor
-            rust_router = _Router.new_pd(
-                prefill_urls=router_args.prefill_urls,
-                decode_urls=router_args.decode_urls,
-                policy=router_args.pd_policy,
-                host=router_args.host,
-                port=router_args.port,
-                cache_threshold=router_args.cache_threshold,
-                balance_abs_threshold=router_args.balance_abs_threshold,
-                balance_rel_threshold=router_args.balance_rel_threshold,
-                eviction_interval_secs=router_args.eviction_interval,
-                max_tree_size=router_args.max_tree_size,
-                worker_startup_timeout_secs=router_args.worker_startup_timeout_secs,
-                worker_startup_check_interval=router_args.worker_startup_check_interval,
-                verbose=router_args.verbose,
-                log_dir=router_args.log_dir,
-                prometheus_port=router_args.prometheus_port,
-                prometheus_host=router_args.prometheus_host,
-            )
-
-            # Create a wrapper that has the same interface
-            class PDRouterWrapper:
-                def __init__(self, rust_router):
-                    self._router = rust_router
-
-                def start(self):
-                    return self._router.start()
-
-            router = PDRouterWrapper(rust_router)
-        else:
-            # Regular router mode
-            router = Router(
-                worker_urls=router_args.worker_urls,
-                host=router_args.host,
-                port=router_args.port,
-                policy=policy_from_str(router_args.policy),
-                worker_startup_timeout_secs=router_args.worker_startup_timeout_secs,
-                worker_startup_check_interval=router_args.worker_startup_check_interval,
-                cache_threshold=router_args.cache_threshold,
-                balance_abs_threshold=router_args.balance_abs_threshold,
-                balance_rel_threshold=router_args.balance_rel_threshold,
-                eviction_interval_secs=router_args.eviction_interval,
-                max_tree_size=router_args.max_tree_size,
-                max_payload_size=router_args.max_payload_size,
-                verbose=router_args.verbose,
-                log_dir=router_args.log_dir,
-                service_discovery=router_args.service_discovery,
-                selector=router_args.selector,
-                service_discovery_port=router_args.service_discovery_port,
-                service_discovery_namespace=router_args.service_discovery_namespace,
-                prometheus_port=router_args.prometheus_port,
-                prometheus_host=router_args.prometheus_host,
-            )
+        # Create router with unified constructor
+        router = Router(
+            worker_urls=(
+                router_args.worker_urls if not router_args.pd_disaggregated else []
+            ),
+            host=router_args.host,
+            port=router_args.port,
+            policy=policy_from_str(router_args.policy),
+            worker_startup_timeout_secs=router_args.worker_startup_timeout_secs,
+            worker_startup_check_interval=router_args.worker_startup_check_interval,
+            cache_threshold=router_args.cache_threshold,
+            balance_abs_threshold=router_args.balance_abs_threshold,
+            balance_rel_threshold=router_args.balance_rel_threshold,
+            eviction_interval_secs=router_args.eviction_interval,
+            max_tree_size=router_args.max_tree_size,
+            max_payload_size=router_args.max_payload_size,
+            verbose=router_args.verbose,
+            log_dir=router_args.log_dir,
+            service_discovery=router_args.service_discovery,
+            selector=router_args.selector,
+            service_discovery_port=router_args.service_discovery_port,
+            service_discovery_namespace=router_args.service_discovery_namespace,
+            prometheus_port=router_args.prometheus_port,
+            prometheus_host=router_args.prometheus_host,
+            pd_disaggregated=router_args.pd_disaggregated,
+            prefill_urls=(
+                router_args.prefill_urls if router_args.pd_disaggregated else None
+            ),
+            decode_urls=(
+                router_args.decode_urls if router_args.pd_disaggregated else None
+            ),
+        )
 
         router.start()
         return router
@@ -432,8 +421,14 @@ This launcher enables starting a router with individual worker instances. It is 
 multi-node setups or when you want to start workers and router separately.
 
 Examples:
+  # Regular mode
   python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000
-  python -m sglang_router.launch_router --worker-urls http://worker1:8000 http://worker2:8000 --cache-threshold 0.7 --balance-abs-threshold 64 --balance-rel-threshold 1.2
+
+  # PD disaggregated mode
+  python -m sglang_router.launch_router --pd-disaggregated \\
+    --prefill http://prefill1:8000 9000 --prefill http://prefill2:8000 none \\
+    --decode http://decode1:8001 --decode http://decode2:8001 \\
+    --policy cache_aware
 
     """,
         formatter_class=CustomHelpFormatter,

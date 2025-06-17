@@ -15,6 +15,7 @@ class Router:
             - PolicyType.Random: Randomly select workers
             - PolicyType.RoundRobin: Distribute requests in round-robin fashion
             - PolicyType.CacheAware: Distribute requests based on cache state and load balance
+            - PolicyType.PowerOfTwo: Select best of two random workers based on load (PD mode only)
         host: Host address to bind the router server. Default: '127.0.0.1'
         port: Port number to bind the router server. Default: 3001
         worker_startup_timeout_secs: Timeout in seconds for worker startup. Default: 300
@@ -28,7 +29,7 @@ class Router:
             AND max_load > min_load * rel_threshold. Otherwise, use cache aware. Default: 1.0001
         eviction_interval_secs: Interval in seconds between cache eviction operations in cache-aware
             routing. Default: 60
-        max_payload_size: Maximum payload size in bytes. Default: 4MB
+        max_payload_size: Maximum payload size in bytes. Default: 256MB
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
         verbose: Enable verbose logging. Default: False
         log_dir: Directory to store log files. If None, logs are only output to console. Default: None
@@ -42,6 +43,9 @@ class Router:
             watches pods across all namespaces (requires cluster-wide permissions). Default: None
         prometheus_port: Port to expose Prometheus metrics. Default: None
         prometheus_host: Host address to bind the Prometheus metrics server. Default: None
+        pd_disaggregated: Enable PD (Prefill-Decode) disaggregated mode. Default: False
+        prefill_urls: List of (url, bootstrap_port) tuples for prefill servers (PD mode only)
+        decode_urls: List of URLs for decode servers (PD mode only)
     """
 
     def __init__(
@@ -57,7 +61,7 @@ class Router:
         balance_rel_threshold: float = 1.0001,
         eviction_interval_secs: int = 60,
         max_tree_size: int = 2**24,
-        max_payload_size: int = 4 * 1024 * 1024,  # 4MB
+        max_payload_size: int = 256 * 1024 * 1024,  # 256MB
         verbose: bool = False,
         log_dir: Optional[str] = None,
         service_discovery: bool = False,
@@ -66,6 +70,9 @@ class Router:
         service_discovery_namespace: Optional[str] = None,
         prometheus_port: Optional[int] = None,
         prometheus_host: Optional[str] = None,
+        pd_disaggregated: bool = False,
+        prefill_urls: Optional[List[tuple]] = None,
+        decode_urls: Optional[List[str]] = None,
     ):
         if selector is None:
             selector = {}
@@ -91,6 +98,9 @@ class Router:
             service_discovery_namespace=service_discovery_namespace,
             prometheus_port=prometheus_port,
             prometheus_host=prometheus_host,
+            pd_disaggregated=pd_disaggregated,
+            prefill_urls=prefill_urls,
+            decode_urls=decode_urls,
         )
 
     def start(self) -> None:
@@ -99,70 +109,3 @@ class Router:
         This method blocks until the server is shut down.
         """
         self._router.start()
-
-    @classmethod
-    def new_pd(
-        cls,
-        prefill_urls: List[tuple],  # List of (url, bootstrap_port)
-        decode_urls: List[str],
-        policy: str = "cache_aware",  # "random", "po2", "cache_aware"
-        host: str = "127.0.0.1",
-        port: int = 3001,
-        cache_threshold: float = 0.5,
-        balance_abs_threshold: int = 32,
-        balance_rel_threshold: float = 1.0001,
-        eviction_interval_secs: int = 60,
-        max_tree_size: int = 2**24,
-        worker_startup_timeout_secs: int = 300,
-        worker_startup_check_interval: int = 10,
-        verbose: bool = False,
-        log_dir: Optional[str] = None,
-        prometheus_port: Optional[int] = None,
-        prometheus_host: Optional[str] = None,
-    ) -> "Router":
-        """Create a new PrefillDecode router.
-
-        Args:
-            prefill_urls: List of (url, bootstrap_port) tuples for prefill servers
-            decode_urls: List of URLs for decode servers
-            policy: PD selection policy ("random", "po2", "cache_aware")
-            host: Host address to bind the router server
-            port: Port number to bind the router server
-            cache_threshold: Cache threshold for cache-aware policy
-            balance_abs_threshold: Absolute threshold for load balancing
-            balance_rel_threshold: Relative threshold for load balancing
-            eviction_interval_secs: Cache eviction interval
-            max_tree_size: Maximum tree size for cache-aware routing
-            worker_startup_timeout_secs: Timeout for worker startup
-            worker_startup_check_interval: Interval between startup checks
-            verbose: Enable verbose logging
-            log_dir: Directory for log files
-            prometheus_port: Port for Prometheus metrics
-            prometheus_host: Host for Prometheus metrics
-
-        Returns:
-            Router instance configured for PrefillDecode mode
-        """
-        rust_router = _Router.new_pd(
-            prefill_urls=prefill_urls,
-            decode_urls=decode_urls,
-            policy=policy,
-            host=host,
-            port=port,
-            cache_threshold=cache_threshold,
-            balance_abs_threshold=balance_abs_threshold,
-            balance_rel_threshold=balance_rel_threshold,
-            eviction_interval_secs=eviction_interval_secs,
-            max_tree_size=max_tree_size,
-            worker_startup_timeout_secs=worker_startup_timeout_secs,
-            worker_startup_check_interval=worker_startup_check_interval,
-            verbose=verbose,
-            log_dir=log_dir,
-            prometheus_port=prometheus_port,
-            prometheus_host=prometheus_host,
-        )
-
-        # Create a Router instance that wraps the Rust PD router
-        instance = cls.__new__(cls)
-        instance._router = rust_router
-        return instance

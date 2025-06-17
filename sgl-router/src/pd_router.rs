@@ -70,6 +70,7 @@ impl PDRouter {
     // - add_decode_server(url: String)
     // - remove_prefill_server(url: &str)
     // - remove_decode_server(url: &str)
+    // These methods will be used when service discovery is implemented for PD mode
 
     pub fn new(
         prefill_urls: Vec<(String, Option<u16>)>,

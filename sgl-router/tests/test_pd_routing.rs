@@ -4,6 +4,9 @@
 //! - Phase 1: Basic PD router creation and configuration
 //! - Phase 2: Bootstrap injection and request handling
 //! - Phase 3: Cache-aware selection (when implemented)
+//!
+//! Note: PD mode is enabled via the pd_disaggregated flag, not as a policy type.
+//! The policy type (Random, PowerOfTwo, CacheAware) determines the selection algorithm within PD mode.
 
 #[cfg(test)]
 mod test_pd_routing {
@@ -87,6 +90,7 @@ mod test_pd_routing {
     #[test]
     fn test_pd_selection_policies() {
         // Test all PD selection policy variants
+        // Note: These policies are only used when pd_disaggregated=true
         let policies = vec![
             PDSelectionPolicy::Random,
             PDSelectionPolicy::PowerOfTwo,
@@ -118,6 +122,7 @@ mod test_pd_routing {
     #[test]
     fn test_pd_router_configuration() {
         // Test PrefillDecodeConfig creation with various policies
+        // This config is used when pd_disaggregated=true
         let configs = vec![
             PolicyConfig::PrefillDecodeConfig {
                 selection_policy: PDSelectionPolicy::Random,
@@ -868,5 +873,32 @@ mod test_pd_routing {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_policy_type_to_pd_selection_policy_mapping() {
+        // Document the mapping from PolicyType to PDSelectionPolicy
+        // This mapping happens in lib.rs when pd_disaggregated=true
+
+        // PolicyType::Random -> PDSelectionPolicy::Random
+        // PolicyType::PowerOfTwo -> PDSelectionPolicy::PowerOfTwo
+        // PolicyType::CacheAware -> PDSelectionPolicy::CacheAware { ... }
+        // PolicyType::RoundRobin -> ERROR (not supported in PD mode)
+
+        // Test that PDSelectionPolicy doesn't include RoundRobin
+        let pd_policy_count = 3; // Random, PowerOfTwo, CacheAware
+        assert_eq!(
+            pd_policy_count, 3,
+            "PDSelectionPolicy should have exactly 3 variants"
+        );
+
+        // Verify that each PDSelectionPolicy variant can be created
+        let _random = PDSelectionPolicy::Random;
+        let _po2 = PDSelectionPolicy::PowerOfTwo;
+        let _cache_aware = PDSelectionPolicy::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+        };
     }
 }

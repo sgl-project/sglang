@@ -38,10 +38,20 @@ impl ToPdRequest for GenerateRequest {
     type Output = GenerateReqInput;
 
     fn to_pd_request(self) -> Self::Output {
-        // Handle different input formats
-        let (text, input_ids) = if let Some(inputs) = self.inputs {
-            // Text input case
-            (Some(SingleOrBatch::Single(inputs)), None)
+        // Build the other fields first
+        let mut other = serde_json::Map::new();
+
+        // Handle text input - check in priority order: text (SGLang), prompt (OpenAI)
+        let (text, input_ids) = if let Some(text_str) = self.text {
+            // SGLang native format
+            (Some(SingleOrBatch::Single(text_str)), None)
+        } else if let Some(prompt) = self.prompt {
+            // OpenAI style prompt
+            let text = match prompt {
+                StringOrArray::String(s) => Some(SingleOrBatch::Single(s)),
+                StringOrArray::Array(v) => Some(SingleOrBatch::Batch(v)),
+            };
+            (text, None)
         } else if let Some(ids) = self.input_ids {
             // Input IDs case
             let input_ids = match ids {
@@ -54,13 +64,23 @@ impl ToPdRequest for GenerateRequest {
             (None, None)
         };
 
-        // Build the other fields
-        let mut other = serde_json::Map::new();
-
         // Add parameters to other - handle both old and new style
         if let Some(params) = self.parameters {
-            let params_value = serde_json::to_value(&params).unwrap_or(Value::Null);
-            if !params_value.is_null() {
+            // For generate endpoint, extract max_new_tokens to top level if present
+            let mut params_value = serde_json::to_value(&params).unwrap_or(Value::Null);
+            if let Value::Object(ref mut params_map) = params_value {
+                // Move max_new_tokens to top level if it exists
+                if let Some(max_new_tokens) = params_map.remove("max_new_tokens") {
+                    other.insert("max_new_tokens".to_string(), max_new_tokens);
+                }
+                // Move temperature to top level if it exists
+                if let Some(temperature) = params_map.remove("temperature") {
+                    other.insert("temperature".to_string(), temperature);
+                }
+            }
+            // Only add parameters if there are remaining fields
+            if !params_value.is_null() && params_value.as_object().map_or(false, |m| !m.is_empty())
+            {
                 other.insert("parameters".to_string(), params_value);
             }
         }
@@ -69,6 +89,15 @@ impl ToPdRequest for GenerateRequest {
         if let Some(sampling_params) = self.sampling_params {
             let params_value = serde_json::to_value(&sampling_params).unwrap_or(Value::Null);
             if !params_value.is_null() {
+                // Extract commonly used fields to top level
+                if let Value::Object(ref params_map) = params_value {
+                    if let Some(max_new_tokens) = params_map.get("max_new_tokens") {
+                        other.insert("max_new_tokens".to_string(), max_new_tokens.clone());
+                    }
+                    if let Some(temperature) = params_map.get("temperature") {
+                        other.insert("temperature".to_string(), temperature.clone());
+                    }
+                }
                 other.insert("sampling_params".to_string(), params_value);
             }
         }

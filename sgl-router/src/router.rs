@@ -596,74 +596,83 @@ impl Router {
         typed_req: &T,
         route: &str,
     ) -> HttpResponse {
-        if self.is_prefill_decode() {
-            HttpResponse::InternalServerError()
-                .body("PD routing should use specialized typed handlers")
-        } else {
-            // Handle retries like the original implementation
-            let start = Instant::now();
-            const MAX_REQUEST_RETRIES: u32 = 3;
-            const MAX_TOTAL_RETRIES: u32 = 6;
-            let mut total_retries = 0;
+        match self {
+            Router::PrefillDecode { .. } => HttpResponse::InternalServerError()
+                .body("PD routing should use specialized typed handlers"),
+            _ => {
+                // Handle retries like the original implementation
+                let start = Instant::now();
+                const MAX_REQUEST_RETRIES: u32 = 3;
+                const MAX_TOTAL_RETRIES: u32 = 6;
+                let mut total_retries = 0;
 
-            while total_retries < MAX_TOTAL_RETRIES {
-                // Extract routing text directly from typed request
-                let text = typed_req.extract_text_for_routing();
-                let is_stream = typed_req.is_stream();
+                while total_retries < MAX_TOTAL_RETRIES {
+                    // Extract routing text directly from typed request
+                    let text = typed_req.extract_text_for_routing();
+                    let is_stream = typed_req.is_stream();
 
-                // Select worker based on text
-                let worker_url = self.select_generate_worker_from_text(&text);
-                let mut request_retries = 0;
+                    // Select worker based on text
+                    let worker_url = self.select_generate_worker_from_text(&text);
+                    let mut request_retries = 0;
 
-                // Try the same worker multiple times
-                while request_retries < MAX_REQUEST_RETRIES {
-                    if total_retries >= 1 {
-                        info!("Retrying request after {} failed attempts", total_retries);
-                        counter!("sgl_router_retries_total", "route" => route.to_string())
-                            .increment(1);
-                    }
-
-                    // Send typed request directly
-                    let response = self
-                        .send_typed_request(client, req, typed_req, route, &worker_url, is_stream)
-                        .await;
-
-                    if response.status().is_success() {
-                        let duration = start.elapsed();
-                        histogram!("sgl_router_generate_duration_seconds", "route" => route.to_string())
-                            .record(duration.as_secs_f64());
-                        return response;
-                    } else {
-                        // if the worker is healthy, it means the request is bad, so return the error response
-                        let health_response =
-                            self.send_request(client, &worker_url, "/health", req).await;
-                        if health_response.status().is_success() {
-                            counter!("sgl_router_request_errors_total", "route" => route.to_string())
+                    // Try the same worker multiple times
+                    while request_retries < MAX_REQUEST_RETRIES {
+                        if total_retries >= 1 {
+                            info!("Retrying request after {} failed attempts", total_retries);
+                            counter!("sgl_router_retries_total", "route" => route.to_string())
                                 .increment(1);
+                        }
+
+                        // Send typed request directly
+                        let response = self
+                            .send_typed_request(
+                                client,
+                                req,
+                                typed_req,
+                                route,
+                                &worker_url,
+                                is_stream,
+                            )
+                            .await;
+
+                        if response.status().is_success() {
+                            let duration = start.elapsed();
+                            histogram!("sgl_router_generate_duration_seconds", "route" => route.to_string())
+                                .record(duration.as_secs_f64());
                             return response;
+                        } else {
+                            // if the worker is healthy, it means the request is bad, so return the error response
+                            let health_response =
+                                self.send_request(client, &worker_url, "/health", req).await;
+                            if health_response.status().is_success() {
+                                counter!("sgl_router_request_errors_total", "route" => route.to_string())
+                                    .increment(1);
+                                return response;
+                            }
+                        }
+
+                        warn!(
+                            "Generate request to {} failed (attempt {}/{})",
+                            worker_url,
+                            request_retries + 1,
+                            MAX_REQUEST_RETRIES
+                        );
+
+                        request_retries += 1;
+                        total_retries += 1;
+
+                        if request_retries == MAX_REQUEST_RETRIES {
+                            warn!("Removing failed worker: {}", worker_url);
+                            self.remove_worker(&worker_url);
+                            break;
                         }
                     }
-
-                    warn!(
-                        "Generate request to {} failed (attempt {}/{})",
-                        worker_url,
-                        request_retries + 1,
-                        MAX_REQUEST_RETRIES
-                    );
-
-                    request_retries += 1;
-                    total_retries += 1;
-
-                    if request_retries == MAX_REQUEST_RETRIES {
-                        warn!("Removing failed worker: {}", worker_url);
-                        self.remove_worker(&worker_url);
-                        break;
-                    }
                 }
-            }
 
-            counter!("sgl_router_request_errors_total", "route" => route.to_string()).increment(1);
-            HttpResponse::InternalServerError().body("All retry attempts failed")
+                counter!("sgl_router_request_errors_total", "route" => route.to_string())
+                    .increment(1);
+                HttpResponse::InternalServerError().body("All retry attempts failed")
+            }
         }
     }
 
@@ -868,10 +877,6 @@ impl Router {
                     actix_web::error::ErrorInternalServerError("Failed to read stream")
                 }))
         }
-    }
-
-    pub fn is_prefill_decode(&self) -> bool {
-        matches!(self, Router::PrefillDecode { .. })
     }
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
