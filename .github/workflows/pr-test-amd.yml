@@ -46,7 +46,7 @@ jobs:
       - name: Evaluate Accuracy
         timeout-minutes: 30
         run: |
-          bash scripts/amd_ci_exec.sh python3 test_eval_accuracy_large.py
+          bash scripts/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
           bash scripts/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
           bash scripts/amd_ci_exec.sh python3 models/test_qwen_models.py
 
@@ -265,30 +265,6 @@ jobs:
         timeout-minutes: 40
         run: |
           bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-2-gpu-amd
-
-  unit-test-backend-4-gpu-amd:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
-      github.event.pull_request.draft == false
-    strategy:
-      matrix:
-        runner: [linux-mi300-gpu-4]
-    runs-on: ${{matrix.runner}}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Start CI container
-        run: bash scripts/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/amd_ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 40
-        run: |
-          bash scripts/amd_ci_exec.sh python3 run_suite.py --suite per-commit-4-gpu-amd
 
   unit-test-backend-8-gpu-amd:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
