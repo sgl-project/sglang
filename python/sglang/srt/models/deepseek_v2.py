@@ -1503,6 +1503,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
+            # NOTE: this line resolves the degradation of MTP reception rate for non-zero DP ranks.
+            # See discussion here (https://github.com/sgl-project/sglang/pull/6081#discussion_r2147452251).
             hidden_states = hidden_states.clone()
 
         return hidden_states, residual
@@ -1834,8 +1836,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                         and weight_block_size[1] == 128
                         and model_dtype == torch.bfloat16
                     ):
-                        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and get_bool_env_var(
-                            "SGL_USE_DEEPGEMM_BMM", "false"
+                        if (
+                            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                            and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+                            and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
                         ):
                             block_scale = weight_scale
                             use_deep_gemm_bmm = True

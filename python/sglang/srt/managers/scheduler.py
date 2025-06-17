@@ -391,7 +391,7 @@ class Scheduler(
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
-        self.num_prefill_tokens = 0
+        self.last_prefill_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
         self.return_health_check_ct = 0
@@ -656,6 +656,7 @@ class Scheduler(
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 max_total_num_tokens=self.max_total_num_tokens,
                 prefill_pp_size=self.server_args.disaggregation_prefill_pp,
+                num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
 
@@ -1149,6 +1150,7 @@ class Scheduler(
             recv_req.input_text,
             recv_req.input_ids,
             recv_req.sampling_params,
+            token_type_ids=recv_req.token_type_ids,
         )
         req.tokenizer = self.tokenizer
 
@@ -1193,8 +1195,8 @@ class Scheduler(
     ):
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = time.perf_counter()
-        self.last_input_throughput = self.num_prefill_tokens / gap_latency
-        self.num_prefill_tokens = 0
+        self.last_input_throughput = self.last_prefill_tokens / gap_latency
+        self.last_prefill_tokens = adder.log_input_tokens
 
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool_allocator.available_size()
@@ -1404,6 +1406,8 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
+
+        # TODO(ch-wan): minor refactor is needed here to improve readability
         any_new_batch = (
             self.server_args.enable_dp_attention
             and not self.spec_algorithm.is_none()
