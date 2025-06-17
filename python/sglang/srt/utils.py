@@ -12,10 +12,12 @@
 # limitations under the License.
 # ==============================================================================
 """Common utilities."""
+
 import base64
 import builtins
 import ctypes
 import dataclasses
+import functools
 import importlib
 import io
 import ipaddress
@@ -24,6 +26,7 @@ import json
 import logging
 import os
 import pickle
+import platform
 import random
 import re
 import resource
@@ -43,9 +46,22 @@ from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from importlib.util import find_spec
 from io import BytesIO
+from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generic,
+    List,
+    Optional,
+    Protocol,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import numpy as np
 import psutil
@@ -124,10 +140,6 @@ builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
 builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
 
-def is_rocm() -> bool:
-    return torch.cuda.is_available() and torch.version.hip
-
-
 def is_cuda():
     return torch.cuda.is_available() and torch.version.cuda
 
@@ -142,6 +154,19 @@ def is_hpu() -> bool:
 
 def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
+
+
+def is_npu() -> bool:
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+
+def is_cpu() -> bool:
+    machine = platform.machine().lower()
+    return (
+        machine in ("x86_64", "amd64", "i386", "i686")
+        and hasattr(torch, "cpu")
+        and torch.cpu.is_available()
+    )
 
 
 def is_flashinfer_available():
@@ -245,7 +270,7 @@ def mark_start(name, interval=0.1, color=0, indent=0):
     torch.cuda.synchronize()
     if time_infos.get(name, None) is None:
         time_infos[name] = TimeInfo(name, interval, color, indent)
-    time_infos[name].acc_time -= time.time()
+    time_infos[name].acc_time -= time.perf_counter()
 
 
 def mark_end(name):
@@ -253,7 +278,7 @@ def mark_end(name):
     if not show_time_cost:
         return
     torch.cuda.synchronize()
-    time_infos[name].acc_time += time.time()
+    time_infos[name].acc_time += time.perf_counter()
     if time_infos[name].check():
         time_infos[name].pretty_print()
 
@@ -263,11 +288,11 @@ def calculate_time(show=False, min_cost_ms=0.0):
         def inner_func(*args, **kwargs):
             torch.cuda.synchronize()
             if show:
-                start_time = time.time()
+                start_time = time.perf_counter()
             result = func(*args, **kwargs)
             torch.cuda.synchronize()
             if show:
-                cost_time = (time.time() - start_time) * 1000
+                cost_time = (time.perf_counter() - start_time) * 1000
                 if cost_time > min_cost_ms:
                     print(f"Function {func.__name__} took {cost_time} ms to run.")
             return result
@@ -277,7 +302,9 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
-def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True):
+def get_available_gpu_memory(
+    device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
+):
     """
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
@@ -327,12 +354,22 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
         free_gpu_memory = psutil.virtual_memory().available
+    elif device == "npu":
+        num_gpus = torch.npu.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.npu.current_device() != gpu_id:
+            print(
+                f"WARNING: current device is not {gpu_id}, but {torch.npu.current_device()}, ",
+                "which may cause useless memory allocation for torch NPU context.",
+            )
+        free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
 
     if distributed:
-        tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
-            torch.device(device, gpu_id)
+        tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
+        torch.distributed.all_reduce(
+            tensor, op=torch.distributed.ReduceOp.MIN, group=cpu_group
         )
-        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
         free_gpu_memory = tensor.item()
 
     return free_gpu_memory / (1 << 30)
@@ -414,16 +451,40 @@ class LayerFn(Protocol):
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
+    pp_rank: Optional[int] = None,
+    pp_size: Optional[int] = None,
     prefix: str = "",
+    return_tuple: bool = False,
 ) -> Tuple[int, int, torch.nn.ModuleList]:
     """Make a list of layers with the given layer function"""
+    # circula imports
+    from sglang.srt.distributed import get_pp_indices
+    from sglang.srt.layers.utils import PPMissingLayer
+
+    assert not pp_size or num_hidden_layers >= pp_size
+    start_layer, end_layer = (
+        get_pp_indices(
+            num_hidden_layers,
+            pp_rank,
+            pp_size,
+        )
+        if pp_rank is not None and pp_size is not None
+        else (0, num_hidden_layers)
+    )
     modules = torch.nn.ModuleList(
-        [
+        [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
+        + [
             maybe_offload_to_cpu(layer_fn(idx=idx, prefix=add_prefix(idx, prefix)))
-            for idx in range(num_hidden_layers)
+            for idx in range(start_layer, end_layer)
+        ]
+        + [
+            PPMissingLayer(return_tuple=return_tuple)
+            for _ in range(end_layer, num_hidden_layers)
         ]
     )
-    return modules
+    if pp_rank is None or pp_size is None:
+        return modules
+    return modules, start_layer, end_layer
 
 
 def set_random_seed(seed: int) -> None:
@@ -777,6 +838,7 @@ class CustomCacheManager(FileCacheManager):
 
 
 def set_ulimit(target_soft_limit=65535):
+    # number of open files
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
 
@@ -785,6 +847,18 @@ def set_ulimit(target_soft_limit=65535):
             resource.setrlimit(resource_type, (target_soft_limit, current_hard))
         except ValueError as e:
             logger.warning(f"Fail to set RLIMIT_NOFILE: {e}")
+
+    # stack size
+    resource_type = resource.RLIMIT_STACK
+    current_soft, current_hard = resource.getrlimit(resource_type)
+    target_soft_limit_stack_size = 1024 * target_soft_limit
+    if current_soft < target_soft_limit_stack_size:
+        try:
+            resource.setrlimit(
+                resource_type, (target_soft_limit_stack_size, current_hard)
+            )
+        except ValueError as e:
+            logger.warning(f"Fail to set RLIMIT_STACK: {e}")
 
 
 def add_api_key_middleware(app, api_key: str):
@@ -872,12 +946,15 @@ def broadcast_pyobj(
     src: int = 0,
     force_cpu_device: bool = True,
 ):
-    """Broadcast inputs from rank=0 to all other ranks with torch.dist backend."""
+    """Broadcast inputs from src rank to all other ranks with torch.dist backend.
+    The `rank` here refer to the source rank on global process group (regardless
+    of dist_group argument).
+    """
     device = torch.device(
         "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
     )
 
-    if rank == 0:
+    if rank == src:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.broadcast(tensor_size, src=src, group=dist_group)
@@ -907,6 +984,50 @@ def broadcast_pyobj(
         serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
         return data
+
+
+def point_to_point_pyobj(
+    data: List[Any],
+    rank: int,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    src: int = 0,
+    dst: int = 1,
+):
+    """Send data from src to dst in group."""
+
+    if rank == src:
+        if len(data) == 0:
+            tensor_size = torch.tensor([0], dtype=torch.long)
+            dist.send(tensor_size, dst=dst, group=group)
+        else:
+            serialized_data = pickle.dumps(data)
+            size = len(serialized_data)
+            tensor_data = torch.ByteTensor(
+                np.frombuffer(serialized_data, dtype=np.uint8)
+            )
+            tensor_size = torch.tensor([size], dtype=torch.long)
+
+            dist.send(tensor_size, dst=dst, group=group)
+            dist.send(tensor_data, dst=dst, group=group)
+        return data
+
+    elif rank == dst:
+        tensor_size = torch.tensor([0], dtype=torch.long)
+        dist.recv(tensor_size, src=src, group=group)
+        size = tensor_size.item()
+
+        if size == 0:
+            return []
+
+        tensor_data = torch.empty(size, dtype=torch.uint8)
+        dist.recv(tensor_data, src=src, group=group)
+
+        serialized_data = bytes(tensor_data.cpu().numpy())
+        data = pickle.loads(serialized_data)
+        return data
+
+    # Other ranks in pp_group do nothing
+    return []
 
 
 step_counter = 0
@@ -1170,6 +1291,15 @@ def get_hpu_memory_capacity():
         )
 
 
+def get_npu_memory_capacity():
+    try:
+        import torch_npu
+
+        return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+    except ImportError as e:
+        raise ImportError("torch_npu is required when run on npu device.")
+
+
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
@@ -1177,6 +1307,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_amdgpu_memory_capacity()
     elif device == "hpu":
         gpu_mem = get_hpu_memory_capacity()
+    elif device == "npu":
+        gpu_mem = get_npu_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -1266,6 +1398,11 @@ def print_warning_once(msg: str) -> None:
     logger.warning(msg, stacklevel=2)
 
 
+@functools.lru_cache(None)
+def print_info_once(msg: str) -> None:
+    logger.info(msg)
+
+
 def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_name(device_id)
@@ -1275,6 +1412,9 @@ def get_device_name(device_id: int = 0) -> str:
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return torch.hpu.get_device_name(device_id)
+
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.npu.get_device_name(device_id)
 
 
 @lru_cache(maxsize=1)
@@ -1293,6 +1433,11 @@ def get_device(device_id: Optional[int] = None) -> str:
         if device_id == None:
             return "xpu"
         return "xpu:{}".format(device_id)
+
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        if device_id == None:
+            return "npu"
+        return "npu:{}".format(device_id)
 
     if is_habana_available():
         try:
@@ -1368,9 +1513,36 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     return major, minor
 
 
+def get_npu_compiler_config():
+    config = {
+        "frozen_parameter": True,
+        "tiling_schedule_optimize": True,
+        "topology_sorting_strategy": "StableRDFS",
+    }
+    return config
+
+
 def get_compiler_backend() -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
+
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        try:
+            import torchair
+            import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
+            from torchair.configs.compiler_config import CompilerConfig
+        except ImportError as e:
+            raise ImportError(
+                "NPU detected, but torchair package is not installed. "
+                "Please install torchair for torch.compile support on NPU."
+            )
+        compiler_config = CompilerConfig()
+        predefined_config = get_npu_compiler_config()
+        for k, v in predefined_config.items():
+            setattr(compiler_config.experimental_config, k, v)
+
+        npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
+        return npu_backend
 
     return "inductor"
 
@@ -1732,6 +1904,13 @@ def configure_ipv6(dist_init_addr):
     return port, host
 
 
+def rank0_log(msg: str):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() == 0:
+        logger.info(msg)
+
+
 def rank0_print(msg: str):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
@@ -1746,6 +1925,8 @@ def get_cuda_version():
 
 
 def launch_dummy_health_check_server(host, port):
+    import asyncio
+
     import uvicorn
     from fastapi import FastAPI, Response
 
@@ -1761,13 +1942,27 @@ def launch_dummy_health_check_server(host, port):
         """Check the health of the http server."""
         return Response(status_code=200)
 
-    uvicorn.run(
+    config = uvicorn.Config(
         app,
         host=host,
         port=port,
         timeout_keep_alive=5,
-        loop="uvloop",
+        loop="auto",
+        log_config=None,
+        log_level="warning",
     )
+    server = uvicorn.Server(config=config)
+
+    try:
+        loop = asyncio.get_running_loop()
+        logger.info(
+            f"Dummy health check server scheduled on existing loop at {host}:{port}"
+        )
+        loop.create_task(server.serve())
+
+    except RuntimeError:
+        logger.info(f"Starting dummy health check server at {host}:{port}")
+        server.run()
 
 
 def create_checksum(directory: str):
@@ -1788,14 +1983,16 @@ def next_power_of_2(n: int):
 setattr(triton, "next_power_of_2", next_power_of_2)
 
 
-@contextmanager
-def empty_context(*args, **kwargs):
-    try:
-        # Setup code goes here
-        yield
-    finally:
-        # Cleanup code goes here
+class EmptyContextManager:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
         pass
+
+
+def empty_context(*args, **kwargs):
+    return EmptyContextManager()
 
 
 def add_prefix(name: str, prefix: str) -> str:
@@ -1896,6 +2093,14 @@ class DeepEPMode(Enum):
             return DeepEPMode.normal
 
 
+def is_non_idle_and_non_empty(forward_mode, hidden_states):
+    return (
+        (forward_mode is not None)
+        and not forward_mode.is_idle()
+        and hidden_states.shape[0] > 0
+    )
+
+
 def fast_topk(values, topk, dim):
     if topk == 1:
         # Use max along the specified dimension to get both value and index
@@ -1905,13 +2110,22 @@ def fast_topk(values, topk, dim):
         return torch.topk(values, topk, dim=dim)
 
 
-def is_hopper_with_cuda_12_3():
+def _check(cc_major):
     if not is_cuda():
         return False
-    is_hopper = torch.cuda.get_device_capability()[0] == 9
-    cuda_version = torch.version.cuda.split(".")
-    is_cuda_compatible = int(cuda_version[0]) == 12 and int(cuda_version[1]) >= 3
-    return is_hopper and is_cuda_compatible
+    return torch.cuda.get_device_capability()[0] == cc_major and tuple(
+        map(int, torch.version.cuda.split(".")[:2])
+    ) >= (12, 3)
+
+
+is_ampere_with_cuda_12_3 = lambda: _check(8)
+is_hopper_with_cuda_12_3 = lambda: _check(9)
+
+
+def is_blackwell():
+    if not is_cuda():
+        return False
+    return torch.cuda.get_device_capability()[0] == 10
 
 
 def get_free_port():
@@ -1936,6 +2150,14 @@ def get_local_ip_by_remote() -> str:
     except Exception:
         pass
 
+    try:
+        hostname = socket.gethostname()
+        ip = socket.gethostbyname(hostname)
+        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+            return ip
+    except Exception:
+        pass
+
     # try ipv6
     try:
         s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
@@ -1944,7 +2166,7 @@ def get_local_ip_by_remote() -> str:
         s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
     except Exception:
-        raise ValueError(f"Can not get local ip")
+        raise ValueError("Can not get local ip")
 
 
 def is_page_size_one(server_args):
@@ -1969,9 +2191,10 @@ def is_fa3_default_architecture(hf_config):
         "Qwen2ForCausalLM",
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
-        "MistralForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
+        "Qwen3ForCausalLM",
+        "Qwen3MoeForCausalLM",
     }
     return architectures[0] in default_archs
 
@@ -1987,3 +2210,182 @@ class BumpAllocator:
         output = self._buffer[self._pointer : self._pointer + size]
         self._pointer += size
         return output
+
+
+def log_info_on_rank0(logger, msg):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() == 0:
+        logger.info(msg)
+
+
+def load_json_config(data: str):
+    try:
+        return json.loads(data)
+    except JSONDecodeError:
+        return json.loads(Path(data).read_text())
+
+
+def dispose_tensor(x: torch.Tensor):
+    x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
+
+
+T = TypeVar("T")
+
+
+class Withable(Generic[T]):
+    def __init__(self):
+        self._value: Optional[T] = None
+
+    @property
+    def value(self) -> T:
+        return self._value
+
+    @contextmanager
+    def with_value(self, new_value: T):
+        assert self._value is None
+        self._value = new_value
+        try:
+            yield
+        finally:
+            assert self._value is new_value
+            self._value = None
+
+
+def merge_bias_tensor(
+    lhs: Optional[torch.Tensor],
+    rhs: Optional[torch.Tensor],
+    bs1: int,
+    bs2: int,
+    device: str,
+    default: float,
+):
+    """Merge two bias tensors for batch merging.
+
+    Args:
+        lhs: Left-hand side tensor
+        rhs: Right-hand side tensor
+        bs1: Batch size of left-hand side tensor
+        bs2: Batch size of right-hand side tensor
+        device: Device to place the merged tensor on
+        default: Default value for missing tensor elements
+
+    Returns:
+        Merged tensor or None if both inputs are None
+    """
+    if lhs is None and rhs is None:
+        return None
+
+    if lhs is not None and rhs is not None:
+        return torch.cat([lhs, rhs])
+    else:
+        if lhs is not None:
+            shape, dtype = lhs.shape[1:], lhs.dtype
+        else:
+            shape, dtype = rhs.shape[1:], rhs.dtype
+
+        if lhs is None:
+            lhs = torch.empty((bs1, *shape), device=device, dtype=dtype).fill_(default)
+        if rhs is None:
+            rhs = torch.empty((bs2, *shape), device=device, dtype=dtype).fill_(default)
+        return torch.cat([lhs, rhs])
+
+
+def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
+    import huggingface_hub as hf
+
+    # Build cache path
+    cache_path = os.path.join(
+        hf.constants.HF_HUB_CACHE,
+        hf.constants.REPO_ID_SEPARATOR.join(["models", *repo_id.split("/")]),
+    )
+
+    # Get revision from main ref if not specified
+    if not revision:
+        ref_path = os.path.join(cache_path, "refs", "main")
+        if os.path.isfile(ref_path):
+            with open(ref_path) as f:
+                revision = f.read().strip()
+
+    # List files from revision directory
+    if revision:
+        rev_dir = os.path.join(cache_path, "snapshots", revision)
+        if os.path.isdir(rev_dir):
+            return rev_dir
+
+    return None
+
+
+def read_system_prompt_from_file(model_name: str) -> str:
+    """Read system prompt from a file in the HuggingFace cache directory.
+
+    Args:
+        model_name: The model name to construct the file path
+
+    Returns:
+        The system prompt content from the file, or empty string if file not found
+    """
+    try:
+        local_repo_dir = find_local_repo_dir(model_name)
+        if local_repo_dir:
+            system_prompt_file = os.path.join(local_repo_dir, "SYSTEM_PROMPT.txt")
+            if os.path.exists(system_prompt_file):
+                with open(system_prompt_file, "r", encoding="utf-8") as f:
+                    return f.read()
+
+        return ""
+    except Exception:
+        # If anything fails, return empty string
+        return ""
+
+
+def bind_or_assign(target, source):
+    if target is not None:
+        target.copy_(source)
+        return target
+    else:
+        return source
+
+
+def support_triton(backend: str) -> bool:
+    return backend not in ["torch_native", "intel_amx"]
+
+
+try:
+    import sgl_kernel
+
+    is_intel_amx_backend_available = hasattr(
+        torch.ops.sgl_kernel, "convert_weight_packed"
+    )
+except:
+    is_intel_amx_backend_available = False
+
+
+def cpu_has_amx_support():
+    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
+
+
+class LazyValue:
+    def __init__(self, creator: Callable):
+        self._creator = creator
+        self._value = None
+
+    @property
+    def value(self):
+        if self._creator is not None:
+            self._value = self._creator()
+            self._creator = None
+        return self._value
+
+
+def dynamic_import(func_path: str):
+    parts = func_path.split(".")
+    if len(parts) < 2:
+        raise ValueError(
+            "func_path should contain both module name and func name (such as 'module.func')"
+        )
+    module_path = ".".join(parts[:-1])
+    func_name = parts[-1]
+    module = importlib.import_module(module_path)
+    func = getattr(module, func_name)
+    return func

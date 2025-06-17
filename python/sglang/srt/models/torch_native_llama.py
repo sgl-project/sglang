@@ -37,7 +37,7 @@ $ python3 -m sglang.bench_one_batch --correct \
   --tensor-parallel-size 2 \
   --disable-cuda-graph
 ```
-We will eanble CUDA Graph support soon.
+We will enable CUDA Graph support soon.
 """
 
 import types

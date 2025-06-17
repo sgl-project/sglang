@@ -140,7 +140,7 @@ class ChatCompletionSampler(SamplerBase):
                     max_tokens=self.max_tokens,
                 )
                 return response.choices[0].message.content
-            # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are reruning MMMU
+            # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:
                 print("Bad Request Error", e)
                 return ""

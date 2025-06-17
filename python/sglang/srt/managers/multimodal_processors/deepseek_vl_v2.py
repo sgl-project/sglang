@@ -16,6 +16,7 @@
 # COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 # IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+from typing import List, Union
 
 import torch
 
@@ -35,7 +36,13 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
         self.IMAGE_TOKEN = "<image>"
 
     async def process_mm_data_async(
-        self, image_data, input_ids, request_obj, max_req_input_len, *args, **kwargs
+        self,
+        image_data: List[Union[str, bytes]],
+        input_text,
+        request_obj,
+        max_req_input_len,
+        *args,
+        **kwargs
     ):
         if not image_data:
             return None
@@ -45,7 +52,7 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
 
         image_token = self.IMAGE_TOKEN
         base_output = self.load_mm_data(
-            input_ids,
+            input_text,
             image_data=image_data,
             multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
             max_req_input_len=max_req_input_len,
@@ -63,8 +70,13 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
         batched_images_spatial_crop = torch.stack(batched_images_spatial_crop, dim=0)
 
         items = []
+        input_ids = res["input_ids"]
+        image_offsets = self.get_mm_items_offset(
+            input_ids=input_ids, mm_token_id=self._processor.image_token_id
+        )
         item = MultimodalDataItem(
             pixel_values=res["images"],
+            image_offsets=image_offsets,
             modality=Modality.IMAGE,
             image_emb_mask=images_seq_mask,
             image_spatial_crop=batched_images_spatial_crop,
@@ -73,6 +85,6 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
 
         return {
             "mm_items": items,
-            "input_ids": res["input_ids"].tolist(),
+            "input_ids": input_ids.tolist(),
             "im_token_id": self._processor.image_token_id,
         }

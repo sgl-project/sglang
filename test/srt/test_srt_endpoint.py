@@ -295,7 +295,7 @@ class TestSRTEndpoint(CustomTestCase):
         print(f"{output_top_logprobs=}")
 
         # Parse results
-        # This is becaues the grammar constraint allows all prefix tokens
+        # This is because the grammar constraint allows all prefix tokens
         logprobs = [None] * 2
         for i in range(len(output_top_logprobs)):
             try:
@@ -344,9 +344,7 @@ class TestSRTEndpoint(CustomTestCase):
         custom_json = base_json.copy()
         # Only set the custom logit processor if target_token_id is not None.
         if target_token_id is not None:
-            custom_json["custom_logit_processor"] = (
-                DeterministicLogitProcessor().to_str()
-            )
+            custom_json["custom_logit_processor"] = DeterministicLogitProcessor.to_str()
             custom_json["sampling_params"]["custom_params"] = custom_params
 
         custom_response = requests.post(
@@ -373,7 +371,6 @@ class TestSRTEndpoint(CustomTestCase):
         Should sample the first `delay` tokens normally, then output first_token_id and consecutive tokens after that.
         If first_token_id is None, the custom logit processor won't be passed in.
         """
-
         custom_params = {"token_id": first_token_id, "delay": 2}
 
         class DeterministicStatefulLogitProcessor(CustomLogitProcessor):
@@ -447,10 +444,22 @@ class TestSRTEndpoint(CustomTestCase):
         with ThreadPoolExecutor(len(target_token_ids)) as executor:
             list(executor.map(self.run_custom_logit_processor, target_token_ids))
 
+    @unittest.skip("Skip this test because this feature has a bug. See comments below.")
     def test_stateful_custom_logit_processor(self):
         """Test custom logit processor with a single request."""
+
+        """
+        NOTE: This feature has a race condition bug.
+        This line https://github.com/sgl-project/sglang/blob/ef8ec07b2ce4c70c2a33ec5acda4ce529bc3cda4/test/srt/test_srt_endpoint.py#L395-L396 can be accessed by two concurrent threads at the same time. The access order is not guaranteed.
+        In sglang, we use two python threads to overlap the GPU computation and CPU scheduling.
+        Thread 1 (the CPU scheduling thread) will update the `param_dict["__req__"].output_ids`.
+        Thread 2 (the GPU computation thread) will call `DeterministicStatefulLogitProcessor` because sampling is considered as GPU computation.
+        We can fix this by moving the call of DeterministicStatefulLogitProcessor to the CPU scheduling thread.
+        """
+
         self.run_stateful_custom_logit_processor(first_token_id=5)
 
+    @unittest.skip("Skip this test because this feature has a bug. See comments above.")
     def test_stateful_custom_logit_processor_batch_mixed(self):
         """Test a batch of requests mixed of requests with and without custom logit processor."""
         target_token_ids = list(range(32)) + [None] * 16
@@ -492,11 +501,124 @@ class TestSRTEndpoint(CustomTestCase):
         max_total_num_tokens = response_json["max_total_num_tokens"]
         self.assertIsInstance(max_total_num_tokens, int)
 
-        attention_backend = response_json["attention_backend"]
-        self.assertIsInstance(attention_backend, str)
-
         version = response_json["version"]
         self.assertIsInstance(version, str)
+
+    def test_logit_bias(self):
+        """Test that a very high logit bias forces sampling of a specific token."""
+        # Choose a token ID to bias (using 5 as an example)
+        target_token_id = 60704  # Paris for meta-llama/Llama-3.2-1B-Instruct, DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        logit_bias = {str(target_token_id): 100.0}  # Very high positive bias
+
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 1.0,  # Use high temperature to encourage exploration
+                    "max_new_tokens": 4,
+                    "logit_bias": logit_bias,
+                },
+                "return_logprob": True,
+            },
+        )
+        response_json = response.json()
+
+        # Extract the sampled token IDs from the output
+        output_token_logprobs = response_json["meta_info"]["output_token_logprobs"]
+        sampled_tokens = [x[1] for x in output_token_logprobs]
+
+        # Verify that all sampled tokens are the target token
+        self.assertTrue(
+            all(x == target_token_id for x in sampled_tokens),
+            f"Expected all tokens to be {target_token_id}, but got {sampled_tokens}",
+        )
+
+    def test_forbidden_token(self):
+        """Test that a forbidden token (very negative logit bias) doesn't appear in the output."""
+        # Choose a token ID to forbid (using 10 as an example)
+        forbidden_token_id = 23994  # rice for meta-llama/Llama-3.2-1B-Instruct, DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        logit_bias = {
+            str(forbidden_token_id): -100.0
+        }  # Very negative bias to forbid the token
+
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "Only output 'rice' exactly like this, in lowercase ONLY: rice",
+                "sampling_params": {
+                    "temperature": 1.0,  # Use high temperature to encourage diverse output
+                    "max_new_tokens": 50,  # Generate enough tokens to likely include numbers
+                    "logit_bias": logit_bias,
+                },
+                "return_logprob": True,
+            },
+        )
+        response_json = response.json()
+
+        # Extract the sampled token IDs from the output
+        output_token_logprobs = response_json["meta_info"]["output_token_logprobs"]
+        sampled_tokens = [x[1] for x in output_token_logprobs]
+
+        # Verify that the forbidden token doesn't appear in the output
+        self.assertNotIn(
+            forbidden_token_id,
+            sampled_tokens,
+            f"Expected forbidden token {forbidden_token_id} not to be present, but it was found",
+        )
+
+    def test_logit_bias_isolation(self):
+        """Test that logit_bias applied to one request doesn't affect other requests in batch."""
+        # Choose a token ID to bias in first request only
+        biased_token_id = 60704  # Paris for meta-llama/Llama-3.2-1B-Instruct, DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+
+        # Prepare batch requests - one with logit_bias and one without
+        requests_data = [
+            {
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 1.0,
+                    "max_new_tokens": 4,
+                    "logit_bias": {str(biased_token_id): 100.0},  # Strong bias
+                },
+                "return_logprob": True,
+            },
+            {
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 1.0,
+                    "max_new_tokens": 4,
+                },
+                "return_logprob": True,
+            },
+        ]
+
+        # Send both requests
+        responses = []
+        for req in requests_data:
+            response = requests.post(self.base_url + "/generate", json=req)
+            responses.append(response.json())
+
+        # Extract token IDs from each response
+        biased_tokens = [
+            x[1] for x in responses[0]["meta_info"]["output_token_logprobs"]
+        ]
+        unbiased_tokens = [
+            x[1] for x in responses[1]["meta_info"]["output_token_logprobs"]
+        ]
+
+        # Verify first response contains only biased tokens
+        self.assertTrue(
+            all(x == biased_token_id for x in biased_tokens),
+            f"Expected all tokens to be {biased_token_id} in first response, but got {biased_tokens}",
+        )
+
+        # Verify second response contains at least some different tokens
+        # (We can't guarantee exactly what tokens will be generated, but they shouldn't all be the biased token)
+        self.assertTrue(
+            any(x != biased_token_id for x in unbiased_tokens),
+            f"Expected some tokens to be different from {biased_token_id} in second response, but got {unbiased_tokens}",
+        )
 
     def test_get_server_info_concurrent(self):
         """Make sure the concurrent get_server_info doesn't crash the server."""

@@ -3,21 +3,47 @@
 SGLang provides robust support for embedding models by integrating efficient serving mechanisms with its flexible programming interface. This integration allows for streamlined handling of embedding tasks, facilitating faster and more accurate retrieval and semantic search operations. SGLang's architecture enables better resource utilization and reduced latency in embedding model deployment.
 
 ```{important}
-They are executed with `--is-embedding` and some may require `--trust-remote-code` and/or `--chat-template`
+They are executed with `--is-embedding` and some may require `--trust-remote-code`
 ```
 
-## Example launch Command
+## Example Launch Command
 
 ```shell
 python3 -m sglang.launch_server \
-  --model-path Alibaba-NLP/gme-Qwen2-VL-2B-Instruct \  # example HF/local path
+  --model-path Alibaba-NLP/gme-Qwen2-VL-2B-Instruct \
   --is-embedding \
   --host 0.0.0.0 \
-  --chat-template gme-qwen2-vl \                     # set chat template
-  --port 30000 \
+  --chat-template gme-qwen2-vl \
+  --port 30000
+```
+## Example Client Request
+```python
+import requests
+
+url = "http://127.0.0.1:30000"
+
+text_input = "Represent this image in embedding space."
+image_path = "https://huggingface.co/datasets/liuhaotian/llava-bench-in-the-wild/resolve/main/images/023.jpg"
+
+payload = {
+    "model": "gme-qwen2-vl",
+    "input": [
+        {
+            "text": text_input
+        },
+        {
+            "image": image_path
+        }
+    ],
+}
+
+response = requests.post(url + "/v1/embeddings", json=payload).json()
+
+print("Embeddings:", [x.get("embedding") for x in response.get("data", [])])
 ```
 
-## Supporting Matrixs
+
+## Supported models
 
 | Model Family (Embedding)                        | Example HuggingFace Identifier                | Chat Template | Description                                                                                                                          |
 |-------------------------------------------------|-----------------------------------------------|---------------|--------------------------------------------------------------------------------------------------------------------------------------|

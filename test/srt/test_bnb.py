@@ -29,15 +29,18 @@ from sglang.test.test_utils import (
 )
 
 VISION_MODELS = [
-    ("unsloth/Qwen2.5-VL-7B-Instruct-bnb-4bit", "qwen2-vl"),
-    ("unsloth/Qwen2-VL-7B-Instruct-bnb-4bit", "qwen2-vl"),
-    ("unsloth/Llama-3.2-11B-Vision-Instruct-bnb-4bit", "llama_3_vision"),
-    ("unsloth/Llama-3.2-11B-Vision-bnb-4bit", "llama_3_vision"),
+    "unsloth/Qwen2.5-VL-7B-Instruct-bnb-4bit",
+    "unsloth/Qwen2-VL-7B-Instruct-bnb-4bit",
+    "unsloth/Llama-3.2-11B-Vision-Instruct-bnb-4bit",
+    "unsloth/Llama-3.2-11B-Vision-bnb-4bit",
+    "unsloth/gemma-3-4b-it-bnb-4bit",
+    "unsloth/gemma-3-4b-it-unsloth-bnb-4bit",
 ]
 LANGUAGE_MODELS = [
     "unsloth/Qwen2.5-7B-Instruct-bnb-4bit",
     "unsloth/Qwen2-7B-Instruct-bnb-4bit",
     "unsloth/Llama-3.2-3B-Instruct-bnb-4bit",
+    "unsloth/gemma-3-1b-it-bnb-4bit",
 ]
 
 # image
@@ -249,15 +252,14 @@ class TestVisionModel(CustomTestCase):
         if is_in_ci():
             models_to_test = [random.choice(VISION_MODELS)]
 
-        for model, template in models_to_test:
+        for model in models_to_test:
             with self.subTest(model=model):
                 other_args = [
-                    "--chat-template",
-                    template,
                     "--mem-fraction-static",
                     "0.6",
                     "--load-format",
                     "bitsandbytes",
+                    "--enable-multimodal",
                 ]
                 try:
                     process = popen_launch_server_wrapper(

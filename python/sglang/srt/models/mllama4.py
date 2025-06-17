@@ -10,7 +10,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternImageTokens,
+    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
@@ -53,7 +53,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         # Get all special token IDs
         im_token_id: int = mm_inputs.im_token_id
 
-        pattern = MultiModalityDataPaddingPatternImageTokens(torch.tensor(im_token_id))
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens([im_token_id])
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(

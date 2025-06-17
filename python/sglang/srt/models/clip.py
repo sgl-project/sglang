@@ -151,24 +151,24 @@ class CLIPEncoderLayer(nn.Module):
         self.layer_norm1 = norm_layer(config.hidden_size)
         self.layer_norm2 = norm_layer(config.hidden_size)
         if attn_implementation == "sdpa":
-            use_context_forward = False
+            qkv_backend = "sdpa"
             softmax_in_single_precision = False
         elif attn_implementation == "flash_attention_2":
+            qkv_backend = "triton_attn"
             softmax_in_single_precision = False
-            use_context_forward = True
         elif attn_implementation == "eager":
+            qkv_backend = "sdpa"
             softmax_in_single_precision = True
-            use_context_forward = False
         self.self_attn = VisionAttention(
             embed_dim=config.hidden_size,
             num_heads=config.num_attention_heads,
             projection_size=config.hidden_size,
             use_qkv_parallel=True,
-            use_context_forward=use_context_forward,
+            qkv_backend=qkv_backend,
             softmax_in_single_precision=softmax_in_single_precision,
             flatten_batch=True,
             quant_config=quant_config,
-            prefix=add_prefix("attn", prefix),
+            prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = CLIPMLP(
             config,
@@ -394,6 +394,10 @@ class CLIPVisionModel(nn.Module):
         self.vision_model = CLIPVisionTransformer(
             config, quant_config, prefix=add_prefix("vision_model", prefix)
         )
+
+    @property
+    def device(self) -> torch.device:
+        return self.vision_model.device
 
     def forward(self, pixel_values: torch.Tensor):
         return self.vision_model(pixel_values)

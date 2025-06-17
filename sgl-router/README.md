@@ -67,6 +67,67 @@ $ pip install -e .
 
 **Note:** When modifying Rust code, you must rebuild the wheel for changes to take effect.
 
+### Logging
+
+The SGL Router includes structured logging with console output by default. To enable log files:
+
+```python
+# Enable file logging when creating a router
+router = Router(
+    worker_urls=["http://worker1:8000", "http://worker2:8000"],
+    log_dir="./logs"  # Daily log files will be created here
+)
+```
+
+Use the `--verbose` flag with the CLI for more detailed logs.
+
+### Metrics
+
+SGL Router exposes a Prometheus HTTP scrape endpoint for monitoring, which by default listens at 127.0.0.1:29000.
+
+To change the endpoint to listen on all network interfaces and set the port to 9000, configure the following options when launching the router:
+```
+python -m sglang_router.launch_router \
+  --worker-urls http://localhost:8080 http://localhost:8081 \
+  --prometheus-host 0.0.0.0 \
+  --prometheus-port 9000
+```
+
+### Kubernetes Service Discovery
+
+SGL Router supports automatic service discovery for worker nodes in Kubernetes environments. When enabled, the router will automatically:
+
+- Discover and add worker pods with matching labels
+- Remove unhealthy or deleted worker pods
+- Dynamically adjust the worker pool based on pod health and availability
+
+#### Command Line Usage
+
+```bash
+python -m sglang_router.launch_router \
+    --service-discovery \
+    --selector app=sglang-worker role=inference \
+    --service-discovery-port 8000 \
+    --service-discovery-namespace default
+```
+
+#### Service Discovery Arguments
+
+- `--service-discovery`: Enable Kubernetes service discovery feature
+- `--selector`: One or more label key-value pairs for pod selection (format: key1=value1 key2=value2)
+- `--service-discovery-port`: Port to use when generating worker URLs (default: 80)
+- `--service-discovery-namespace`: Optional. Kubernetes namespace to watch for pods. If not provided, watches all namespaces (requires cluster-wide permissions)
+
+#### RBAC Requirements
+
+When using service discovery, you must configure proper Kubernetes RBAC permissions:
+
+- **If using namespace-scoped discovery** (with `--service-discovery-namespace`):
+  Set up a ServiceAccount, Role, and RoleBinding
+
+- **If watching all namespaces** (without specifying namespace):
+  Set up a ServiceAccount, ClusterRole, and ClusterRoleBinding with permissions to list/watch pods at the cluster level
+
 ### Troubleshooting
 
 1. If rust analyzer is not working in VSCode, set `rust-analyzer.linkedProjects` to the absolute path of `Cargo.toml` in your repo. For example:

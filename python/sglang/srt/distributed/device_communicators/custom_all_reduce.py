@@ -296,7 +296,6 @@ class CustomAllreduce:
                 self.meta, self.rank_data, handles, offsets, rank, self.full_nvlink
             )
             self.register_buffer(self.buffer)
-            self.MSCCL = os.getenv("RCCL_MSCCL_ENABLE", "1") == "1"
 
         self.disabled = False
 
@@ -430,13 +429,7 @@ class CustomAllreduce:
 
         if _is_hip:
             if self.full_nvlink:
-                if self.world_size == 8:
-                    if self.MSCCL:
-                        return False
-                    else:
-                        return inp_size < self.max_size
-                else:
-                    return inp_size < self.max_size
+                return inp_size < self.max_size
             return False
 
         return False

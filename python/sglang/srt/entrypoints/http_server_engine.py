@@ -24,10 +24,10 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 
     base_url = server_args.url()
     timeout = 300.0  # Increased timeout to 5 minutes for downloading large models
-    start_time = time.time()
+    start_time = time.perf_counter()
 
     with requests.Session() as session:
-        while time.time() - start_time < timeout:
+        while time.perf_counter() - start_time < timeout:
             try:
                 headers = {
                     "Content-Type": "application/json; charset=utf-8",
@@ -140,3 +140,6 @@ class HttpServerEngineAdapter(EngineBase):
 
     def resume_memory_occupation(self):
         return self._make_request("resume_memory_occupation")
+
+    def flush_cache(self):
+        return self._make_request("flush_cache")

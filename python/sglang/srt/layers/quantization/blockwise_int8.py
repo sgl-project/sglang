@@ -152,7 +152,7 @@ class BlockInt8LinearMethod(LinearMethodBase):
                     f"{input_size_per_partition} is not divisible by "
                     f"weight quantization block_k = {block_k}."
                 )
-        # Required by collum parallel or enabling merged weights
+        # Required by column parallel or enabling merged weights
         if (tp_size > 1 and output_size // output_size_per_partition == tp_size) or len(
             output_partition_sizes
         ) > 1:
@@ -285,7 +285,7 @@ class BlockInt8MoEMethod:
             self.quant_config.weight_block_size[1],
         )
         # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
-        # Required by collum parallel or enabling merged weights
+        # Required by column parallel or enabling merged weights
         if intermediate_size % block_n != 0:
             raise ValueError(
                 f"The output_size of gate's and up's weight = "
@@ -367,6 +367,7 @@ class BlockInt8MoEMethod:
         use_grouped_topk: bool,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
@@ -387,6 +388,7 @@ class BlockInt8MoEMethod:
             renormalize=renormalize,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
+            num_fused_shared_experts=num_fused_shared_experts,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
@@ -409,4 +411,5 @@ class BlockInt8MoEMethod:
             a2_scale=layer.w2_input_scale,
             block_shape=self.quant_config.weight_block_size,
             no_combine=no_combine,
+            routed_scaling_factor=routed_scaling_factor,
         )

@@ -62,9 +62,9 @@ class TestW8A8(CustomTestCase):
     def test_throughput(self):
         max_tokens = 256
 
-        tic = time.time()
+        tic = time.perf_counter()
         res = self.run_decode(max_tokens)
-        tok = time.time()
+        tok = time.perf_counter()
         print(res["text"])
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")

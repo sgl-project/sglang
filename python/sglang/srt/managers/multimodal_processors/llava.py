@@ -2,18 +2,24 @@ import asyncio
 from typing import List, Optional, Union
 
 import numpy as np
+from transformers.models.auto.processing_auto import (
+    PROCESSOR_MAPPING_NAMES as HF_MAPPING_NAMES,
+)
 
+import sglang.srt.managers.multimodal_processor as sgl_mm_processor_utils
 from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor,
 )
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mm_utils import expand2square, process_anyres_image
 from sglang.srt.models.llava import (
+    LlavaForConditionalGeneration,
     LlavaLlamaForCausalLM,
     LlavaMistralForCausalLM,
     LlavaQwenForCausalLM,
 )
 from sglang.srt.models.llavavid import LlavaVidForCausalLM
+from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
 from sglang.srt.utils import load_image, logger
 from sglang.utils import get_exception_traceback
 
@@ -133,6 +139,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                             img_data, aspect_ratio, grid_pinpoints
                         )
                     )
+
                 res = await asyncio.gather(*res)
                 for pixel_v, image_h, image_s in res:
                     pixel_values.append(pixel_v)
@@ -165,3 +172,42 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 )
             ],
         }
+
+
+class LlavaMultimodalProcessor(BaseMultimodalProcessor):
+    """
+    This is a wrapper class used to identify the multimodal processor for Llava architectures' vision model.
+    """
+
+    models = [LlavaForConditionalGeneration, Mistral3ForConditionalGeneration]
+
+    def _get_sgl_processor_cls(self, model_type: str):
+        if hf_name := HF_MAPPING_NAMES.get(model_type):
+            sgl_mm_processor_set = sgl_mm_processor_utils.PROCESSOR_MAPPING.values()
+            sgl_processor_cls = list(
+                filter(lambda p: p.__name__ == hf_name, sgl_mm_processor_set)
+            )
+            if sgl_processor_cls:
+                return sgl_processor_cls[0]
+        raise ValueError(
+            f"Cannot find corresponding multimodal processor registered in sglang for model type `{model_type}`"
+        )
+
+    def __init__(self, hf_config, server_args, _processor):
+        assert hasattr(hf_config, "vision_config")
+        assert hasattr(hf_config, "text_config")
+        self.vision_config = hf_config.vision_config
+        self.text_config = hf_config.text_config
+        self.hf_config = hf_config
+
+        if vision_type := getattr(self.vision_config, "model_type"):
+            self.inner = self._get_sgl_processor_cls(vision_type)(
+                hf_config, server_args, _processor
+            )
+        else:
+            raise ValueError(
+                f"Required `vision_config.model_type` is not found in hf_config: `{hf_config}`"
+            )
+
+    async def process_mm_data_async(self, *args, **kwargs):
+        return await self.inner.process_mm_data_async(*args, **kwargs)

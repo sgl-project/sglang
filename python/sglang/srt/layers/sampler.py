@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from sglang.srt.distributed import get_tensor_model_parallel_group
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -30,7 +30,7 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.use_nan_detection = global_server_args_dict["enable_nan_detection"]
-        self.tp_sync_group = get_tensor_model_parallel_group().device_group
+        self.tp_sync_group = get_tp_group().device_group
 
         if global_server_args_dict["enable_dp_attention"]:
             self.tp_sync_group = get_attention_tp_group().device_group
@@ -59,7 +59,7 @@ class Sampler(nn.Module):
 
         # Apply the custom logit processors if registered in the sampling info.
         if sampling_info.has_custom_logit_processor:
-            self._apply_custom_logit_processor(logits, sampling_info)
+            apply_custom_logit_processor(logits, sampling_info)
 
         if self.use_nan_detection and torch.any(torch.isnan(logits)):
             logger.warning("Detected errors during sampling! NaN in the logits.")
@@ -81,54 +81,39 @@ class Sampler(nn.Module):
             probs = logits
             del logits
 
-            if global_server_args_dict["sampling_backend"] == "flashinfer":
-                if return_logprob:
-                    # NOTE: the top_p_renorm_prob from flashinfer has numerical problems,
-                    # https://github.com/flashinfer-ai/flashinfer/issues/708
-                    # so we use the torch implementation.
-
-                    # clamp to avoid -inf
-                    logprobs = torch.log(
-                        top_p_normalize_probs_torch(probs, sampling_info.top_ps)
-                    ).clamp(min=torch.finfo(probs.dtype).min)
-
-                max_top_k_round, batch_size = 32, probs.shape[0]
-                if sampling_info.need_min_p_sampling:
-                    probs = top_k_renorm_prob(probs, sampling_info.top_ks)
-                    probs = top_p_renorm_prob(probs, sampling_info.top_ps)
-                    batch_next_token_ids = min_p_sampling_from_probs(
-                        probs, sampling_info.min_ps
-                    )
-                else:
-                    # Check Nan will throw exception, only check when crash_on_warnings is True
-                    check_nan = self.use_nan_detection and crash_on_warnings()
-                    batch_next_token_ids = top_k_top_p_sampling_from_probs(
+            if True:  # Keep this redundant check to simplify some internal code sync
+                if global_server_args_dict["sampling_backend"] == "flashinfer":
+                    if sampling_info.need_min_p_sampling:
+                        probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+                        probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+                        batch_next_token_ids = min_p_sampling_from_probs(
+                            probs, sampling_info.min_ps
+                        )
+                    else:
+                        batch_next_token_ids = top_k_top_p_sampling_from_probs(
+                            probs,
+                            sampling_info.top_ks,
+                            sampling_info.top_ps,
+                            filter_apply_order="joint",
+                            check_nan=self.use_nan_detection,
+                        )
+                elif global_server_args_dict["sampling_backend"] == "pytorch":
+                    # A slower fallback implementation with torch native operations.
+                    batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
                         probs,
                         sampling_info.top_ks,
                         sampling_info.top_ps,
-                        filter_apply_order="joint",
-                        check_nan=check_nan,
+                        sampling_info.min_ps,
+                        sampling_info.need_min_p_sampling,
+                    )
+                else:
+                    raise ValueError(
+                        f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
                     )
 
-            elif global_server_args_dict["sampling_backend"] == "pytorch":
-                # A slower fallback implementation with torch native operations.
-                batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
-                    probs,
-                    sampling_info.top_ks,
-                    sampling_info.top_ps,
-                    sampling_info.min_ps,
-                    sampling_info.need_min_p_sampling,
-                )
-
-                if return_logprob:
-                    # clamp to avoid -inf
-                    logprobs = torch.log(
-                        top_p_normalize_probs_torch(probs, sampling_info.top_ps)
-                    ).clamp(min=torch.finfo(probs.dtype).min)
-            else:
-                raise ValueError(
-                    f"Invalid sampling backend: {global_server_args_dict['sampling_backend']}"
-                )
+            if return_logprob:
+                # clamp to avoid -inf
+                logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
@@ -165,39 +150,6 @@ class Sampler(nn.Module):
 
         return batch_next_token_ids
 
-    def _apply_custom_logit_processor(
-        self, logits: torch.Tensor, sampling_batch_info: SamplingBatchInfo
-    ):
-        """Apply custom logit processors to the logits.
-        This function will modify the logits in-place."""
-
-        assert logits.shape[0] == len(sampling_batch_info), (
-            f"The batch size of logits ({logits.shape[0]}) does not match the batch size of "
-            f"sampling_batch_info ({len(sampling_batch_info)})"
-        )
-
-        for _, (
-            processor,
-            batch_mask,
-        ) in sampling_batch_info.custom_logit_processor.items():
-            # Get the batch indices that need to be processed
-            batch_indices = batch_mask.nonzero(as_tuple=True)[0]
-
-            assert batch_mask.shape[0] == len(sampling_batch_info), (
-                f"The number of batch mask ({batch_mask.shape[0]}) does not match the number of "
-                f"sampling_batch_info ({len(sampling_batch_info)})"
-            )
-
-            # Apply the processor to the logits
-            logits[batch_mask] = processor(
-                logits[batch_mask],
-                [sampling_batch_info.custom_params[i] for i in batch_indices],
-            )
-
-            logger.debug(
-                f"Custom logit processor {processor.__class__.__name__} is applied."
-            )
-
 
 def top_k_top_p_min_p_sampling_from_probs_torch(
     probs: torch.Tensor,
@@ -226,6 +178,14 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     return batch_next_token_ids
 
 
+def sampling_from_probs_torch(probs: torch.Tensor):
+    """A sampling implementation with native pytorch operations, without
+    top-k, top-p, or min-p filtering."""
+    sampled_index = torch.multinomial(probs, num_samples=1)
+    batch_next_token_ids = sampled_index.view(-1).to(torch.int32)
+    return batch_next_token_ids
+
+
 def top_p_normalize_probs_torch(
     probs: torch.Tensor,
     top_ps: torch.Tensor,
@@ -239,10 +199,6 @@ def top_p_normalize_probs_torch(
 
 
 def get_top_logprobs(logprobs: torch.Tensor, top_logprobs_nums: List[int]):
-    assert len(top_logprobs_nums) == logprobs.shape[0], (
-        len(top_logprobs_nums),
-        logprobs.shape[0],
-    )
     max_k = max(top_logprobs_nums)
     ret = logprobs.topk(max_k, dim=1)
     values = ret.values.tolist()
@@ -268,3 +224,44 @@ def get_token_ids_logprobs(logprobs: torch.Tensor, token_ids_logprobs: List[List
             output_token_ids_logprobs_idx.append([])
 
     return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
+
+
+def apply_custom_logit_processor(
+    logits: torch.Tensor,
+    sampling_batch_info: SamplingBatchInfo,
+    num_tokens_in_batch: int = 1,
+):
+    """Apply custom logit processors to the logits.
+    This function will modify the logits in-place.
+    num_tokens_in_batch is needed to support spec decoding, where each batch can contain multiple
+    tokens. By default, we assume each batch contains only 1 token.
+    """
+
+    assert logits.shape[0] == len(sampling_batch_info) * num_tokens_in_batch, (
+        f"The batch size of logits ({logits.shape[0]}) does not match the batch size of "
+        f"sampling_batch_info ({len(sampling_batch_info)}) x num_tokens_in_batch "
+        f"({num_tokens_in_batch})"
+    )
+
+    for _, (
+        processor,
+        batch_mask,
+    ) in sampling_batch_info.custom_logit_processor.items():
+        # Get the batch indices that need to be processed
+        batch_indices = batch_mask.nonzero(as_tuple=True)[0]
+
+        assert batch_mask.shape[0] == len(sampling_batch_info), (
+            f"The number of batch mask ({batch_mask.shape[0]}) does not match the number of "
+            f"sampling_batch_info ({len(sampling_batch_info)})"
+        )
+        batch_mask = torch.repeat_interleave(batch_mask, num_tokens_in_batch)
+
+        # Apply the processor to the logits
+        logits[batch_mask] = processor(
+            logits[batch_mask],
+            [sampling_batch_info.custom_params[i] for i in batch_indices],
+        )
+
+        logger.debug(
+            f"Custom logit processor {processor.__class__.__name__} is applied."
+        )

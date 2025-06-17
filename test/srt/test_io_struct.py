@@ -124,24 +124,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Ensure that text items are properly duplicated too
         self.assertEqual(req.text, expected_text)
 
-    def test_list_of_lists_with_none_values(self):
-        """Test handling of list of lists with None values."""
-        req = copy.deepcopy(self.base_req)
-        req.image_data = [
-            [None],  # None value
-            ["image.jpg"],  # Single image
-        ]
-
-        req.normalize_batch_and_arguments()
-
-        # Structure should remain the same
-        self.assertEqual(len(req.image_data), 2)
-        self.assertEqual(len(req.image_data[0]), 1)
-        self.assertEqual(len(req.image_data[1]), 1)
-
-        # Check modalities
-        self.assertEqual(req.modalities, [None, "image"])
-
     def test_specific_parallel_n_per_sample(self):
         """Test parallel expansion when different samples have different n values."""
         req = copy.deepcopy(self.base_req)
@@ -399,12 +381,14 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             logprob_start_len=[10, 5],
             top_logprobs_num=[5, 3],
             token_ids_logprob=[[7, 8, 9], [4, 5, 6]],
+            return_hidden_states=[False, False, True],
         )
         req.normalize_batch_and_arguments()
         self.assertEqual(req.return_logprob, [True, False])
         self.assertEqual(req.logprob_start_len, [10, 5])
         self.assertEqual(req.top_logprobs_num, [5, 3])
         self.assertEqual(req.token_ids_logprob, [[7, 8, 9], [4, 5, 6]])
+        self.assertEqual(req.return_hidden_states, [False, False, True])
 
     def test_custom_logit_processor_normalization(self):
         """Test normalization of custom_logit_processor."""

@@ -18,7 +18,6 @@ from typing import Optional
 
 from torch import nn
 
-from sglang.srt.layers.linear import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -52,9 +51,9 @@ class RadixAttention(nn.Module):
         sliding_window_size: int = -1,
         is_cross_attention: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
-        attn_type=AttentionType.DECODER,
-        prefix: str = "",
+        attn_type: AttentionType = AttentionType.DECODER,
         use_irope: bool = False,
+        prefix: str = "",
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -92,8 +91,11 @@ class RadixAttention(nn.Module):
         if k is not None:
             # For cross-layer sharing, kv can be None
             assert v is not None
-            k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
-            v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
+            if "k_rope" not in kwargs:
+                k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
+                v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
+            else:
+                k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
         return forward_batch.attn_backend.forward(
             q,
