@@ -258,6 +258,12 @@ class ModelOptFp8MoEMethod:
     """
 
     def __new__(cls, *args, **kwargs):
+        """
+        Dynamic class composition pattern.
+
+        This allows us to effectively "inject" FusedMoEMethodBase as a parent class
+        at runtime while avoiding circular import issues.
+        """
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
 
         if not hasattr(cls, "_initialized"):
