@@ -1,3 +1,4 @@
+#undef Py_LIMITED_API
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
@@ -7,9 +8,18 @@
 
 #include "tree_v2.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+#ifdef TORCH_EXTENSION_NAME
+#define PYBIND11_MODULE_NAME TORCH_EXTENSION_NAME
+#else
+#define PYBIND11_MODULE_NAME radix_tree_cpp
+#endif
+
+PYBIND11_MODULE(PYBIND11_MODULE_NAME, m) {
   using namespace radix_tree_v2;
   namespace py = pybind11;
+#ifndef TORCH_EXTENSION_NAME
+  m.attr("__name__") = "sgl_kernel.radix_tree_cpp";
+#endif
   py::class_<RadixTree>(m, "RadixTree")
       .def(
           py::init<bool, std::optional<std::size_t>, std::size_t, std::size_t>(),
