@@ -226,7 +226,6 @@ class HiCacheController_v2:
                     self.mem_pool_device,
                 )
                 self.write_stream.synchronize()
-            self.mem_pool_host.complete_io(operation.host_indices)
             for handle in operation.handles:
                 self.ack_write_queue.put(handle)
 
@@ -278,8 +277,6 @@ class HiCacheController_v2:
                     )
                     self.load_stream.synchronize()
                 self.layer_done_counter.increment()
-
-            self.mem_pool_host.complete_io(batch_operation.host_indices)
             for handle in batch_operation.handles:
                 self.ack_load_queue.put(handle)
 
