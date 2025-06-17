@@ -139,8 +139,7 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
 
   at::cuda::CUDAGuard device_guard{(char)a_ptrs.get_device()};
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(a_ptrs.get_device());
-  
-  // TODO(qiyuhang): skip can_implement when problem_sizes_host is nullptr
+
   auto can_implement_status = gemm_op.can_implement(args);
   TORCH_CHECK(can_implement_status == cutlass::Status::kSuccess, "Failed to implement GEMM");
 
@@ -647,7 +646,7 @@ void fp8_blockwise_scaled_grouped_mm(
 #endif
 
 #if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED) && defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
-  if (sm_version == 90 && a.size(0) > 256) {
+  if (sm_version == 90 && a.size(1) > 256) {
     if (output.scalar_type() == torch::kBFloat16) {
       sm90_fp8_blockwise_group_mm_dispatch_shape<cutlass::bfloat16_t>(
           output,
@@ -693,5 +692,5 @@ void fp8_blockwise_scaled_grouped_mm(
   }
 #endif
   TORCH_CHECK_NOT_IMPLEMENTED(
-      can_implement, "No implemented fp8_blockwise_scaled_mm for current compute capability: ", sm_version);
+      can_implement, "No implemented fp8_blockwise_scaled_mm for current compute capability or K size: ", sm_version, a.size(1));
 }
