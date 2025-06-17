@@ -87,7 +87,7 @@ class TestDeepseekV3MTP(CustomTestCase):
             "--speculative-num-steps",
             "3",
             "--speculative-eagle-topk",
-            "2",
+            "1",
             "--speculative-num-draft-tokens",
             "4",
         ]
@@ -155,7 +155,7 @@ class TestDeepseekV3MTP(CustomTestCase):
             if is_in_amd_ci():
                 self.assertGreater(speed, 15)
             else:
-                self.assertGreater(speed, 105)
+                self.assertGreater(speed, 130)
 
 
 if __name__ == "__main__":

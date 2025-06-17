@@ -324,7 +324,10 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
     def init_cuda_graph_state(
-        self, max_bs: int, kv_indices_buf: Optional[torch.Tensor] = None
+        self,
+        max_bs: int,
+        max_num_tokens: int,
+        kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         self.cuda_graph_kv_last_page_len = torch.ones(max_bs, dtype=torch.int)
         if kv_indices_buf is None:
@@ -338,7 +341,7 @@ class AiterAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_bs * self.max_context_len),
+                (max_num_tokens * self.max_context_len),
                 dtype=torch.uint8,
                 device=self.device,
             )
@@ -717,6 +720,11 @@ class AiterIndicesUpdaterPrefill:
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.update = self.update_single_wrapper
 
+        # get the last index of the pool
+        self.pool_size = (
+            model_runner.token_to_kv_pool.size + model_runner.token_to_kv_pool.page_size
+        ) - 1
+
         self.kv_indices = None
         self.max_q_len = 0
         self.max_kv_len = 0
@@ -754,8 +762,16 @@ class AiterIndicesUpdaterPrefill:
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.empty(
-                paged_kernel_lens_sum + 256,
+
+            # (TODO: Kk) WA - CI test_moe_eval_accuracy_large.py
+            # mha_batch_prefill reads 128 data to do computatoin
+            # if real data is not long enough then original padding value 0 is used
+            # but the 0 location will be made nan (noqa) in cuda graph capture mode
+            # this will cause the output tensor value becomes nan
+            # WA is to assure that last index of pool not changed
+            kv_indices = torch.full(
+                (paged_kernel_lens_sum + 128,),
+                self.pool_size,
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )

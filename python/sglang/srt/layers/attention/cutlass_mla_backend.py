@@ -11,8 +11,6 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 import triton
 
-from sglang.global_config import global_config
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -22,7 +20,6 @@ from sglang.srt.utils import is_cuda
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpecInfo
 
 _is_cuda = is_cuda()
@@ -108,7 +105,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                     PAGE_SIZE,
                 )
                 workspace_size = cutlass_mla_get_workspace_size(
-                    max_seqlen_pad * PAGE_SIZE, bs
+                    max_seqlen_pad * PAGE_SIZE, bs, num_kv_splits=1
                 )
                 workspace = torch.empty(
                     workspace_size, device="cuda", dtype=torch.uint8
@@ -125,6 +122,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
+        max_num_tokens: int,
         block_kv_indices: Optional[torch.Tensor] = None,
     ):
         if block_kv_indices is None:
@@ -138,7 +136,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
             cuda_graph_kv_indices = block_kv_indices
 
         workspace_size = cutlass_mla_get_workspace_size(
-            cuda_graph_kv_indices.shape[1] * PAGE_SIZE, max_bs
+            cuda_graph_kv_indices.shape[1] * PAGE_SIZE, max_bs, num_kv_splits=1
         )
         self.cuda_graph_mla_workspace = torch.empty(
             workspace_size, device="cuda", dtype=torch.uint8
@@ -157,7 +155,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
     ):
         if forward_mode.is_decode_or_idle():
             if spec_info is None:
-                max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
+                max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
 
                 create_flashmla_kv_indices_triton[(bs,)](
                     self.req_to_token,
@@ -168,12 +166,6 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                     self.req_to_token.stride(0),
                     self.cuda_graph_kv_indices.stride(0),
                     PAGE_SIZE,
-                )
-                workspace_size = cutlass_mla_get_workspace_size(
-                    max_seqlen_pad * PAGE_SIZE, bs
-                )
-                self.cuda_graph_mla_workspace = torch.empty(
-                    workspace_size, device="cuda", dtype=torch.uint8
                 )
                 self.forward_metadata = CutlassMLADecodeMetadata(
                     self.cuda_graph_mla_workspace,
@@ -205,8 +197,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         if forward_mode.is_decode_or_idle():
             assert seq_lens_cpu is not None
             seq_lens = seq_lens[:bs]
-            seq_lens_cpu = seq_lens_cpu[:bs]
-            max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
+
             create_flashmla_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices[:bs],
@@ -217,16 +208,6 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                 self.cuda_graph_kv_indices.stride(0),
                 PAGE_SIZE,
             )
-            workspace_size = cutlass_mla_get_workspace_size(
-                max_seqlen_pad * PAGE_SIZE, bs
-            )
-            self.cuda_graph_mla_workspace = torch.empty(
-                workspace_size, device="cuda", dtype=torch.uint8
-            )
-            self.forward_metadata.workspace = self.cuda_graph_mla_workspace
-            self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
-                :bs, :max_seqlen_pad
-            ]
         else:
             super().init_forward_metadata_replay_cuda_graph(
                 bs,
@@ -250,29 +231,55 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        # For multi-head latent attention
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ):
         cache_loc = forward_batch.out_cache_loc
 
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    cache_loc,
-                    k,
-                    v,
-                )
-        bs = forward_batch.batch_size
+                if k_rope is not None:
+                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                    )
+                else:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                    )
+
+        # Reshape inputs
+        if q_rope is not None:
+            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+        else:
+            reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            q_nope = reshaped_q[:, :, : layer.v_head_dim]
+            q_rope = reshaped_q[:, :, layer.v_head_dim :]
+
+        q_nope = q_nope.to(self.q_data_type)
+        q_rope = q_rope.to(self.q_data_type)
+
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
-        reshape_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-
         o = cutlass_mla_decode(
-            q_nope_and_q_pe=reshape_q.to(self.q_data_type),
+            q_nope=q_nope,
+            q_pe=q_rope,
             kv_c_and_k_pe_cache=k_cache.view(-1, PAGE_SIZE, self.kv_cache_dim),
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             page_table=self.forward_metadata.block_kv_indices,
             workspace=self.forward_metadata.workspace,
+            sm_scale=layer.scaling,
+            num_kv_splits=1,
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
