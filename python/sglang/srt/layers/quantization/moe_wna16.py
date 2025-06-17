@@ -5,7 +5,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
-
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
@@ -17,15 +16,8 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.utils import get_device_capability, set_weight_attrs
 
-try:
-    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-        marlin_permute_scales,
-    )
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
-        marlin_weights,
-    )
-    
 logger = logging.getLogger(__name__)
+
 
 def get_weight_perm(num_bits: int):
     perm_list: List[int] = []
@@ -55,14 +47,6 @@ def get_weight_perm(num_bits: int):
     perm = perm.reshape((-1, len(interleave)))[:, interleave].ravel()
     perm = torch.from_numpy(perm)
     return perm
-
-
-def marlin_weights_transform(w, s, num_bits, group_size):
-    size_k, size_n = w.shape
-    weight_perm = get_weight_perm(num_bits)
-    marlin_q_w = marlin_weights(w, size_k, size_n, num_bits, weight_perm)
-    marlin_s = marlin_permute_scales(s, size_k, size_n, group_size)
-    return [marlin_q_w, marlin_s]
 
 
 class MoeWNA16Config(QuantizationConfig):

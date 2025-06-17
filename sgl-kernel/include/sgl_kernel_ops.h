@@ -280,21 +280,11 @@ void scaled_fp4_experts_quant(
 
 namespace marlin_moe_wna16 {
 
-torch::Tensor gptq_marlin_repack(
-    torch::Tensor& b_q_weight, 
-    torch::Tensor& perm,
-    int64_t size_k, int64_t size_n,
-    int64_t num_bits);
+torch::Tensor
+gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm, int64_t size_k, int64_t size_n, int64_t num_bits);
 
 }  // namespace marlin_moe_wna16
 
-// torch::Tensor gptq_marlin_repack_meta(
-//     torch::Tensor& b_q_weight,
-//     torch::Tensor& perm,
-//     c10::SymInt size_k,
-//     c10::SymInt size_n,
-//     int64_t num_bits);
-    
 /*
  * From csrc/speculative
  */

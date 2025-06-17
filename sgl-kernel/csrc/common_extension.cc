@@ -184,8 +184,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("gptq_marlin_repack(Tensor b_q_weight, Tensor perm, int size_k, int size_n, int num_bits) -> Tensor");
   m.impl("gptq_marlin_repack", torch::kCUDA, &marlin_moe_wna16::gptq_marlin_repack);
-//   m.impl("gptq_marlin_repack", torch::kMeta, &gptq_marlin_repack_meta);
-
 
   /*
    * From csrc/speculative
