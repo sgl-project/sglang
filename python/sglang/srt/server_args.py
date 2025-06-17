@@ -1578,7 +1578,7 @@ class ServerArgs:
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
         parser.add_argument(
-            "-prefill-mem-fraction",
+            "--prefill-mem-fraction",
             type=float,
             default=None,
             help="The fraction of the memory used for prefill kv cache allocation. It's only used when disaggregation mode is set to decode.",
