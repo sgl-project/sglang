@@ -38,10 +38,7 @@ struct TreeNode {
   using iterator_t = typename map_t::iterator;
   using timestamp_t = std::chrono::steady_clock::time_point;
 
-  // static member counter
-  inline static std::size_t _counter = 0;
-
-  TreeNode()
+  TreeNode(std::size_t node_id_)
       : ref_count(0),
         hit_count(0),
         m_io_locked(std::nullopt),
@@ -53,7 +50,7 @@ struct TreeNode {
         m_parent(),
         m_children(),
         m_last_access_time(std::chrono::steady_clock::now()),
-        node_id(_counter++) {}
+        node_id(node_id_) {}
 
   void access(timestamp_t time = std::chrono::steady_clock::now()) {
     m_last_access_time = time;

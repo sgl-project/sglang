@@ -21,13 +21,14 @@ using node_iterator_t = typename TreeNode::iterator_t;
 struct RadixTree::Impl {
  public:
   Impl(bool disabled, bool use_hicache, std::size_t page_size, std::size_t host_size, std::size_t threshold)
-      : m_root(),
+      : m_root(/*node_id_=*/0),
         m_evictable_size(0),
         m_protected_size(0),
         m_cached_vec(),
         m_host_pool(page_size, host_size),
         m_node_map(),
         m_io_map(),
+        m_node_counter(1),  // start from 1 to avoid confusion with root node
         m_io_ticket_counter(0),
         disabled(disabled),
         use_hicache(use_hicache),
@@ -35,8 +36,8 @@ struct RadixTree::Impl {
         threshold(threshold) {
     _assert(page_size > 0, "Page size must be greater than zero");
     _assert(use_hicache == (host_size > 0), "Hierarchical cache is enabled iff host size > 0");
-    m_root.ref_count = 1;  // root node is always protected
-    m_cached_vec.reserve(page_size);
+    m_root.ref_count = 1;                  // root node is always protected
+    m_cached_vec.reserve(page_size);       // to avoid repeated allocations
     m_node_map[m_root.node_id] = &m_root;  // add root to the map
   }
 
@@ -44,7 +45,7 @@ struct RadixTree::Impl {
     // from `parent -> old_node` to `parent-> new_node -> old_node`
     // the prefix part of the old node is moved to the new node
     auto old_node_ptr = std::move(it->second);
-    auto new_node_ptr = std::make_unique<TreeNode>();
+    auto new_node_ptr = std::make_unique<TreeNode>(m_node_counter++);
     auto* old_node = old_node_ptr.get();
     auto* new_node = new_node_ptr.get();
     auto* parent = old_node->parent();
@@ -62,7 +63,7 @@ struct RadixTree::Impl {
 
   // node: x -> [GPU]
   TreeNode* create_device_node(TreeNode* parent, token_vec_t vec, at::Tensor indices) {
-    auto new_node_ptr = std::make_unique<TreeNode>();
+    auto new_node_ptr = std::make_unique<TreeNode>(m_node_counter++);
     auto new_node = new_node_ptr.get();
     new_node_ptr->_unsafe_tokens() = std::move(vec);
     new_node_ptr->_unsafe_device_indices() = std::move(indices);
@@ -273,6 +274,7 @@ struct RadixTree::Impl {
 
   void reset() {
     _assert(m_root.ref_count == 1, "Root node must be protected during reset");
+    m_node_counter = 1;  // reset node counter
     m_root.root_reset();
     m_evictable_size = 0;
     m_protected_size = 0;
@@ -287,7 +289,7 @@ struct RadixTree::Impl {
 
   [[nodiscard]]
   std::pair<IOTicket, IOiterator_t> new_io_ticket() {
-    auto ticket = m_io_ticket_counter++;
+    const auto ticket = m_io_ticket_counter++;
     auto [it, success] = m_io_map.try_emplace(ticket);
     _assert(success, "IO ticket already exists, maybe unresolved IO?");
     it->second.reserve(2);  // we expect to split at most once
@@ -371,6 +373,7 @@ struct RadixTree::Impl {
   std::unordered_map<std::size_t, TreeNode*> m_node_map;          // map of node keys to nodes
   std::unordered_map<IOTicket, std::vector<TreeNode*>> m_io_map;  // map of IO tickets to nodes
 
+  std::size_t m_node_counter;    // counter for node IDs
   IOTicket m_io_ticket_counter;  // counter for IO tickets
 
  public:
