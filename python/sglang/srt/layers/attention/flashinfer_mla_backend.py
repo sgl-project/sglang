@@ -15,7 +15,6 @@ from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
-import triton
 
 if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
     import logging
@@ -33,7 +32,7 @@ from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -365,7 +364,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return 0
+        return 1
 
     def forward_extend(
         self,
@@ -756,7 +755,7 @@ class FlashInferMLAMultiStepDraftBackend:
 
         if topk > 1:
             raise ValueError(
-                f"Currently Flashinfer MLA only supports topk=1 for speculative decoding"
+                "Currently Flashinfer MLA only supports topk=1 for speculative decoding"
             )
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
@@ -790,6 +789,7 @@ class FlashInferMLAMultiStepDraftBackend:
 
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+        self.page_size = model_runner.server_args.page_size
 
     def common_template(
         self,
@@ -810,14 +810,13 @@ class FlashInferMLAMultiStepDraftBackend:
             kv_indices_buffer,
             self.kv_indptr,
             forward_batch.positions,
-            num_seqs,
-            self.topk,
             self.pool_len,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
-            triton.next_power_of_2(num_seqs),
-            triton.next_power_of_2(self.speculative_num_steps),
-            triton.next_power_of_2(bs),
+            next_power_of_2(num_seqs),
+            next_power_of_2(self.speculative_num_steps),
+            next_power_of_2(bs),
+            self.page_size,
         )
 
         assert forward_batch.spec_info is not None

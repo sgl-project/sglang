@@ -26,6 +26,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt import debug_utils
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -45,10 +46,9 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base_layer
-from sglang.srt.layers.quantization.deep_gemm import (
-    _ENABLE_JIT_DEEPGEMM,
-    update_deep_gemm_config,
+from sglang.srt.layers.quantization import (
+    deep_gemm_wrapper,
+    monkey_patch_isinstance_for_vllm_base_layer,
 )
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
@@ -93,6 +93,7 @@ from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     cpu_has_amx_support,
+    dynamic_import,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -205,8 +206,8 @@ class ModelRunner:
         min_per_gpu_memory = self.init_torch_distributed()
 
         # Update deep gemm configure
-        if _ENABLE_JIT_DEEPGEMM:
-            update_deep_gemm_config(gpu_id, server_args)
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
 
         # If it is a draft model, tp_group can be different
         self.initialize(min_per_gpu_memory)
@@ -761,6 +762,9 @@ class ModelRunner:
         ]
         if load_format == "direct":
             _model_load_weights_direct(self.model, named_tensors)
+        elif load_format in self.server_args.custom_weight_loader:
+            custom_loader = dynamic_import(load_format)
+            custom_loader(self.model, named_tensors)
         elif load_format is None:
             self.model.load_weights(named_tensors)
         else:
