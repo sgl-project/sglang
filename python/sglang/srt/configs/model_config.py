@@ -550,6 +550,11 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "Qwen2ForRewardModel" in model_architectures
         or "Qwen2ForSequenceClassification" in model_architectures
         or "CLIPModel" in model_architectures
+        or "BertModel" in model_architectures
+        or "Contriever" in model_architectures
+        or "BertForSequenceClassification" in model_architectures
+        or "XLMRobertaModel" in model_architectures
+        or "XLMRobertaForSequenceClassification" in model_architectures
     ):
         return False
     else:

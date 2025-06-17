@@ -391,7 +391,7 @@ class Scheduler(
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
-        self.num_prefill_tokens = 0
+        self.last_prefill_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
         self.return_health_check_ct = 0
@@ -1150,6 +1150,7 @@ class Scheduler(
             recv_req.input_text,
             recv_req.input_ids,
             recv_req.sampling_params,
+            token_type_ids=recv_req.token_type_ids,
         )
         req.tokenizer = self.tokenizer
 
@@ -1194,8 +1195,8 @@ class Scheduler(
     ):
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = time.perf_counter()
-        self.last_input_throughput = self.num_prefill_tokens / gap_latency
-        self.num_prefill_tokens = 0
+        self.last_input_throughput = self.last_prefill_tokens / gap_latency
+        self.last_prefill_tokens = adder.log_input_tokens
 
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool_allocator.available_size()
