@@ -445,6 +445,7 @@ class Req:
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
         lora_path: Optional[str] = None,
         input_embeds: Optional[List[List[float]]] = None,
+        token_type_ids: List[int] = None,
         session_id: Optional[str] = None,
         custom_logit_processor: Optional[str] = None,
         return_hidden_states: bool = False,
@@ -469,6 +470,9 @@ class Req:
         self.fill_ids = None
         self.session_id = session_id
         self.input_embeds = input_embeds
+
+        # for corss-endoder model
+        self.token_type_ids = token_type_ids
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -833,6 +837,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Batched arguments to model runner
     input_ids: torch.Tensor = None  # shape: [b], int64
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
+    token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
@@ -849,6 +854,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     can_run_dp_cuda_graph: bool = False
+    is_extend_in_batch: bool = False
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
 
@@ -1137,6 +1143,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
 
+        token_type_ids = [
+            r.token_type_ids for r in reqs if r.token_type_ids is not None
+        ]
+
         req_pool_indices_tensor = torch.tensor(req_pool_indices, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
@@ -1149,6 +1159,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         prefix_lens_tensor = torch.tensor(
             prefix_lens, dtype=torch.int64, device=self.device
         )
+
+        token_type_ids_tensor = None
+        if len(token_type_ids) > 0:
+            token_type_ids_tensor = torch.tensor(
+                sum(token_type_ids, []), dtype=torch.int64
+            ).to(self.device, non_blocking=True)
+
         extend_lens_tensor = seq_lens_tensor - prefix_lens_tensor
 
         # Copy prefix and do some basic check
@@ -1264,6 +1281,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         self.device, non_blocking=True
                     )
         self.multimodal_inputs = multimodal_inputs
+        self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
 
         if self.return_logprob:
@@ -1410,6 +1428,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req = self.reqs[idx]
             retracted_reqs.append(req)
 
+            if server_args.disaggregation_mode == "decode":
+                req.offload_kv_cache(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
+                )
+
             if isinstance(self.tree_cache, ChunkCache):
                 # ChunkCache does not have eviction
                 token_indices = self.req_to_token_pool.req_to_token[
@@ -1440,6 +1463,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.tree_cache.evict(residual_size)
 
             req.reset_for_retract()
+
+            if len(retracted_reqs) == 0:
+                # Corner case: only one request left
+                raise ValueError(
+                    "Failed to retract any request. No space left for only one request."
+                )
 
         self.filter_batch(keep_indices=sorted_indices)
 
@@ -1698,6 +1727,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             lora_paths=[req.lora_path for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
+            token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             hicache_consumer_index=self.hicache_consumer_index,
@@ -1727,11 +1757,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
             enable_custom_logit_processor=self.enable_custom_logit_processor,
+            global_num_tokens=self.global_num_tokens,
+            global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            is_extend_in_batch=self.is_extend_in_batch,
         )
 
     def __str__(self):
         return (
-            f"ScheduleBatch(forward_mode={self.forward_mode.name}, "
+            f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
             f"#req={(len(self.reqs))})"
         )
 
@@ -1792,11 +1826,15 @@ class ModelWorkerBatch:
     # The input Embeds
     input_embeds: Optional[torch.tensor] = None
 
+    # For corss-encoder model
+    token_type_ids: Optional[torch.Tensor] = None
+
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
+    spec_num_draft_tokens: Optional[int] = None
     hicache_consumer_index: int = 0
 
     # Overlap event
