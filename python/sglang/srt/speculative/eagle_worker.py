@@ -707,14 +707,14 @@ class EAGLEWorker(TpModelWorker):
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
+        if batch.return_logprob:
+            self.add_logprob_values(batch, res, logits_output)
+
         # Prepare the batch for the next draft forwards.
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
         batch.spec_info = res.draft_input
-
-        if batch.return_logprob:
-            self.add_logprob_values(batch, res, logits_output)
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
