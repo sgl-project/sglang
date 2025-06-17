@@ -166,6 +166,10 @@ class EAGLEWorker(TpModelWorker):
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
+
+        self.has_prefill_wrapper_verify = False
+        self.draft_extend_attn_backend = None
+
         if self.server_args.attention_backend == "flashinfer":
             if not global_server_args_dict["use_mla_backend"]:
                 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -213,7 +217,6 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner,
                 skip_prefill=False,
             )
-            self.has_prefill_wrapper_verify = False
         elif self.server_args.attention_backend == "fa3":
             from sglang.srt.layers.attention.flashattention_backend import (
                 FlashAttentionBackend,
@@ -229,7 +232,6 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner,
                 skip_prefill=False,
             )
-            self.has_prefill_wrapper_verify = False
         elif self.server_args.attention_backend == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import (
                 FlashMLAMultiStepDraftBackend,
@@ -240,8 +242,6 @@ class EAGLEWorker(TpModelWorker):
                 self.topk,
                 self.speculative_num_steps,
             )
-            self.draft_extend_attn_backend = None
-            self.has_prefill_wrapper_verify = False
         else:
             raise ValueError(
                 f"EAGLE is not supported in attention backend {self.server_args.attention_backend}"

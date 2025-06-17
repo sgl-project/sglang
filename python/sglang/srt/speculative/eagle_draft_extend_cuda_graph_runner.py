@@ -207,9 +207,9 @@ class EAGLEDraftExtendCudaGraphRunner:
         index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
         if bs * self.num_tokens_per_bs != num_tokens:
-            self.seq_lens.fill_(1)
-            self.accept_length.fill_(1)
+            self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
+            self.accept_length.fill_(1)
 
         # Common inputs
         self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
@@ -223,18 +223,19 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
-                self.seq_lens_cpu.fill_(1)
+                self.seq_lens_cpu.fill_(self.seq_len_fill_value)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
 
         if bs != raw_bs:
+            forward_batch.spec_info.positions = self.positions[:num_tokens]
             forward_batch.spec_info.accept_length = self.accept_length[:bs]
-        forward_batch.spec_info.positions = None
 
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
-            seq_lens_sum=forward_batch.seq_lens_sum + (bs - raw_bs),
+            seq_lens_sum=forward_batch.seq_lens_sum
+            + (bs - raw_bs) * self.seq_len_fill_value,
             encoder_lens=None,
             forward_mode=ForwardMode.DRAFT_EXTEND,
             spec_info=forward_batch.spec_info,

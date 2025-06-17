@@ -364,7 +364,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return 0
+        return 1
 
     def forward_extend(
         self,
