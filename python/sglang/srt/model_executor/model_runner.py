@@ -163,6 +163,7 @@ class ModelRunner:
             logger.addFilter(RankZeroFilter(tp_rank == 0))
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.dp_size = server_args.dp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.dist_port = nccl_port
@@ -196,6 +197,7 @@ class ModelRunner:
             | {
                 # TODO it is indeed not a "server args"
                 "use_mla_backend": self.use_mla_backend,
+                "speculative_algorithm": self.spec_algorithm,
             }
         )
 
