@@ -655,14 +655,6 @@ class Req:
                 self.prefix_indices, self.last_node = tree_cache.match_prefix(
                     rid=self.rid, key=self.adjust_max_prefix_ids()
                 )
-        elif enable_hierarchical_cache:
-            # in case last_node is evicted during scheduling, we need to update the prefix_indices
-            while self.last_node.evicted:
-                self.prefix_indices = self.prefix_indices[
-                    : -len(self.last_node.host_value)
-                ]
-                self.last_node = self.last_node.parent
-
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
@@ -902,6 +894,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Whether to return hidden states
     return_hidden_states: bool = False
+
+    # hicache pointer for synchronizing data loading from CPU to GPU
+    hicache_consumer_index: int = 0
 
     @classmethod
     def init_new(
@@ -1705,6 +1700,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             input_embeds=self.input_embeds,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
+            hicache_consumer_index=self.hicache_consumer_index,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.return_hidden_states
@@ -1801,6 +1797,7 @@ class ModelWorkerBatch:
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
+    hicache_consumer_index: int = 0
 
     # Overlap event
     launch_done: Optional[threading.Event] = None
