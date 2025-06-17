@@ -228,9 +228,9 @@ class EBNFComposer:
             #   Allows: {"req": "x"}, {"req": "x", "opt1": "y"}, {"req": "x", "opt2": "z"},
             #           {"req": "x", "opt1": "y", "opt2": "z"}
             #
-            # - All optional properties:
-            #   "{" ( "opt1" ":" value ( "," "opt2" ":" value )? )? "}"
-            #   Allows: {}, {"opt1": "x"}, {"opt1": "x", "opt2": "y"}
+            # - All optional properties with flexible ordering:
+            #   "{" ( "opt1" ":" value ( "," "opt2" ":" value )? | "opt2" ":" value )? "}"
+            #   Allows: {}, {"opt1": "x"}, {"opt2": "y"}, {"opt1": "x", "opt2": "y"}
 
             prop_kv_pairs = {}
             ordered_props = list(properties.keys())
@@ -252,33 +252,30 @@ class EBNFComposer:
             if required:
                 rule_parts.append(' "," '.join(prop_kv_pairs[k] for k in required))
 
-            # Add optional properties with llama.cpp's approach
+            # Add optional properties with flexible ordering
             if optional:
-                # If we have required properties, optional group needs outer comma handling
+                # Build alternatives where any optional property can appear first
+                opt_alternatives = []
+                for i in range(len(optional)):
+                    # Build pattern for optional[i] appearing first
+                    opt_parts = []
+                    for j in range(i, len(optional)):
+                        if j == i:
+                            opt_parts.append(prop_kv_pairs[optional[j]])
+                        else:
+                            opt_parts.append(f' ( "," {prop_kv_pairs[optional[j]]} )?')
+                    opt_alternatives.append("".join(opt_parts))
+
+                # Wrap with appropriate comma handling based on whether we have required properties
                 if required:
+                    # Required properties exist, so optional group needs outer comma
                     rule_parts.append(' ( "," ( ')
-
-                    # Each optional property can appear with its predecessors
-                    opt_alternatives = []
-                    for i in range(len(optional)):
-                        # Build pattern for optional[i] appearing (with all following optionals possible)
-                        opt_parts = []
-                        for j in range(i, len(optional)):
-                            if j == i:
-                                opt_parts.append(prop_kv_pairs[optional[j]])
-                            else:
-                                opt_parts.append(
-                                    f' ( "," {prop_kv_pairs[optional[j]]} )?'
-                                )
-                        opt_alternatives.append("".join(opt_parts))
-
                     rule_parts.append(" | ".join(opt_alternatives))
                     rule_parts.append(" ) )?")
                 else:
-                    # All properties are optional - first one doesn't need comma
-                    rule_parts.append(f"( {prop_kv_pairs[optional[0]]}")
-                    for opt in optional[1:]:
-                        rule_parts.append(f' ( "," {prop_kv_pairs[opt]} )?')
+                    # All properties are optional
+                    rule_parts.append("( ")
+                    rule_parts.append(" | ".join(opt_alternatives))
                     rule_parts.append(" )?")
 
             combined_args = "".join(rule_parts)

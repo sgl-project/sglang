@@ -738,6 +738,77 @@ class TestEBNFGeneration(unittest.TestCase):
                 except RuntimeError as e:
                     self.fail(f"Failed to compile {name} EBNF: {e}")
 
+    def test_all_optional_parameters_ordering(self):
+        """Test the behavior when ALL parameters are optional - verifies ordering constraints."""
+        # Create a tool with only optional parameters
+        all_optional_tool = Tool(
+            type="function",
+            function=Function(
+                name="optional_func",
+                description="Function with all optional parameters",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "opt1": {"type": "string"},
+                        "opt2": {"type": "number"},
+                        "opt3": {"type": "boolean"},
+                    },
+                    "required": [],  # No required parameters
+                },
+            ),
+        )
+
+        # Test JSON-based detectors
+        json_detectors = {
+            "deepseekv3": self.deepseekv3_detector,
+            "llama32": self.llama32_detector,
+            "mistral": self.mistral_detector,
+            "qwen25": self.qwen25_detector,
+        }
+
+        for name, detector in json_detectors.items():
+            with self.subTest(detector=name):
+                ebnf = detector.build_ebnf([all_optional_tool])
+                self.assertIsNotNone(ebnf, f"{name} detector should generate EBNF")
+
+                # Extract the arguments rule
+                lines = ebnf.split("\n")
+                args_rule = None
+                for line in lines:
+                    if line.startswith("arguments_optional_func ::="):
+                        args_rule = line
+                        break
+
+                self.assertIsNotNone(
+                    args_rule, f"{name} should have arguments_optional_func rule"
+                )
+
+                if args_rule:
+                    # When all parameters are optional, the pattern now uses alternation:
+                    # "{" ( opt1 ... | opt2 ... | opt3 ... )? "}"
+                    # This allows flexible ordering where any optional can appear first
+
+                    # Check the structure
+                    self.assertIn('"opt1\\"" ":" basic_string', args_rule)
+                    self.assertIn('"opt2\\"" ":" basic_number', args_rule)
+                    self.assertIn('"opt3\\"" ":" basic_boolean', args_rule)
+
+                    # The pattern SHOULD have alternation (|) for flexible ordering
+                    self.assertIn(
+                        "|",
+                        args_rule,
+                        f"{name} should use alternation for flexible ordering even when all properties are optional",
+                    )
+
+                # Validate compilation
+                try:
+                    ctx = self.grammar_compiler.compile_grammar(ebnf)
+                    self.assertIsNotNone(
+                        ctx, f"{name} EBNF should compile successfully"
+                    )
+                except RuntimeError as e:
+                    self.fail(f"Failed to compile {name} EBNF: {e}")
+
 
 class TestBaseFormatDetector(unittest.TestCase):
     """Test buffer management and sequential tool index assignment in BaseFormatDetector."""
