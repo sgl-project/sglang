@@ -30,21 +30,11 @@ class CustomAllocator:
             so_path = os.path.join(base_path, "hook.so")
             if os.path.exists(so_path):
                 return so_path
-        except ImportError:
-            pass
-
-        # Final fallback: load from environment variable
-        try:
-            env_path = os.environ.get("SGLANG_MOONCAKE_ALLOCATOR_SO_PATH")
-            if env_path and os.path.exists(env_path):
-                return env_path
-        except OSError:
-            pass
-
-        raise RuntimeError(
-            "hook.so not found in mooncake package. "
-            "Set SGLANG_MOONCAKE_ALLOCATOR_SO_PATH or install mooncake correctly."
-        )
+        except (ImportError, FileNotFoundError, TypeError):
+            raise ImportError(
+                "hook.so not found in mooncake package. "
+                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL require mooncake-transfer-engine >= 0.3.3.post2."
+            )
 
     @classmethod
     def get_allocator(cls, device: torch.device) -> CUDAPluggableAllocator:
