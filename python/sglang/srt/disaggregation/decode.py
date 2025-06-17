@@ -90,7 +90,7 @@ class DecodeReqToTokenPool:
         self.max_context_len = max_context_len
         self.device = device
         self.pre_alloc_size = pre_alloc_size
-        with memory_saver_adapter.region():
+        with memory_saver_adapter.region(tag="kv_cache"):
             self.req_to_token = torch.zeros(
                 (size + pre_alloc_size, max_context_len),
                 dtype=torch.int32,
