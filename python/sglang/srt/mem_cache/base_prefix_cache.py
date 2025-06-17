@@ -114,3 +114,6 @@ class BasePrefixCache(ABC):
 
     def take_events(self):
         return []
+
+    def try_cancel_write_through(self):
+        """Cancel any ongoing write-through operations to make space for prefill."""

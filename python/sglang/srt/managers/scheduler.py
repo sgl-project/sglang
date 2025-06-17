@@ -1357,6 +1357,10 @@ class Scheduler(
         if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
             ret, _ = self.prepare_dp_attn_batch(ret)
 
+        # try to cancel write-through to make space for new requests
+        if ret is None and self.prefill_no_memory:
+            self.tree_cache.try_cancel_write_through()
+
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -1366,6 +1370,7 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+        self.prefill_no_memory = False
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -1451,6 +1456,7 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            self.prefill_no_memory = True
             return None
 
         if self.enable_metrics:

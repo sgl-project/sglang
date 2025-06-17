@@ -1,6 +1,6 @@
 import os
 import threading
-from typing import TYPE_CHECKING, List, Set
+from typing import TYPE_CHECKING, List, Set, Tuple
 
 import torch
 from sgl_kernel.radix_tree import IOHandle, RadixTreeCpp, TreeNodeCpp
@@ -150,6 +150,8 @@ class HiCacheController_v2:
 
         self.write_queue = PriorityQueue[CacheOperation]()
         self.load_queue = PriorityQueue[CacheOperation]()
+        self.write_cancel_queue = Queue[int]()
+        self.ack_write_cancel_queue = Queue[Tuple[List[IOHandle], int]]()
 
         self.ack_write_queue = Queue[IOHandle]()
         self.ack_load_queue = Queue[IOHandle]()
@@ -230,6 +232,20 @@ class HiCacheController_v2:
                 self.ack_write_queue.put(handle)
 
         while not self.stop_event.is_set():
+            if self.write_cancel_queue.qsize() > 0:
+                cancel_count = self.write_cancel_queue.get(block=False)
+                op_list: List[CacheOperation] = []
+                for _ in range(self.write_queue.qsize()):
+                    op_list.append(self.write_queue.get(block=False))
+                # cancel the last `cancel_count` operations
+                handle_list: List[IOHandle] = []
+                real_count = min(cancel_count, len(op_list))
+                for op in op_list[-cancel_count:]:
+                    handle_list.extend(op.handles)
+                op_list = op_list[:-cancel_count]
+                self.ack_write_cancel_queue.put((handle_list, real_count))
+                for op in op_list:
+                    self.write_queue.put(op)
             try:
                 operation = self.write_queue.get(block=True, timeout=1)
                 _write_to_host(operation)
@@ -305,6 +321,9 @@ def make_tree(
         return tree
 
 
+DEFAULT_CANCEL_COUNT = 1
+
+
 class HiRadixCacheCpp(BasePrefixCache):
     def merge_tensor(self, l: List[torch.Tensor]) -> torch.Tensor:
         """
@@ -334,8 +353,10 @@ class HiRadixCacheCpp(BasePrefixCache):
         hicache_write_policy: str,
         enable_kv_cache_events: bool = False,
         hicache_oracle: bool = False,
+        enable_write_cancel: bool = True,
     ):
         self.disable = disable
+        self.enable_write_cancel = enable_write_cancel
 
         assert (
             enable_kv_cache_events is False
@@ -357,6 +378,8 @@ class HiRadixCacheCpp(BasePrefixCache):
 
         self.tp_group = tp_cache_group
         self.load_cache_event = threading.Event()
+
+        self.last_cancel_count = DEFAULT_CANCEL_COUNT
 
         if not use_hicache:
             self.tree = make_tree(
@@ -410,6 +433,7 @@ class HiRadixCacheCpp(BasePrefixCache):
             # need to clear the acks before resetting the cache controller
             self.cache_controller.reset(lambda: self.check_host_cache())
         self.tree.reset()
+        self.last_cancel_count = DEFAULT_CANCEL_COUNT
 
     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
         device_indices_vec, host_indices_length, node_gpu, node_cpu = (
@@ -569,6 +593,8 @@ class HiRadixCacheCpp(BasePrefixCache):
         self.ongoing_load_back.add(io_handle)
 
     def ready_to_load_host(self):
+        # able to perform prefill here (means no OOM now), so we reset last cancel count
+        self.last_cancel_count = DEFAULT_CANCEL_COUNT
         torch.cuda.current_stream().synchronize()
         self.load_cache_event.set()
 
@@ -576,9 +602,9 @@ class HiRadixCacheCpp(BasePrefixCache):
         self.writing_check()
         self.loading_check()
 
-    def writing_check(self):
+    def writing_check(self) -> int:
         if self.cache_controller is None:
-            return  # no host cache, nothing to check
+            return 0  # no host cache, nothing to check
         queue_size = torch.tensor(
             self.cache_controller.ack_write_queue.qsize(), dtype=torch.int
         )
@@ -589,10 +615,12 @@ class HiRadixCacheCpp(BasePrefixCache):
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_group,
             )
-        for _ in range(int(queue_size.item())):
+        num_committed = int(queue_size.item())
+        for _ in range(num_committed):
             ack_id = self.cache_controller.ack_write_queue.get()
             self.tree.commit_writing_through(ack_id, True)
             self.ongoing_write_through.remove(ack_id)
+        return num_committed
 
     def loading_check(self):
         if self.cache_controller is None:
@@ -607,3 +635,42 @@ class HiRadixCacheCpp(BasePrefixCache):
 
     def pretty_print(self):
         return self.tree.debug_print()
+
+    def try_cancel_write_through(self):
+        # no ongoing write through, nothing to cancel
+        if (
+            not self.enable_write_cancel
+            or self.cache_controller is None
+            or len(self.ongoing_write_through) == 0
+        ):
+            return
+
+        last_cancel_count = self.last_cancel_count
+        if self.writing_check() >= last_cancel_count:
+            return
+
+        # no ongoing write through, nothing to cancel (just check again)
+        if len(self.ongoing_write_through) == 0:
+            return
+
+        # if we reach here, it means we are really stuck by the write through
+        logger.warning(
+            f"Write through may get stuck, trying to cancel last {last_cancel_count} writes"
+        )
+        self.cache_controller.write_cancel_queue.put(last_cancel_count)
+        handles, count = self.cache_controller.ack_write_cancel_queue.get()
+        logger.warning(f"Cancelled {count} write through operations")
+        for handle in handles:
+            self.tree.commit_writing_through(handle, False)
+            self.ongoing_write_through.remove(handle)
+        self.writing_check()  # still ensure all writes are committed
+
+        # if we cannot cancel that many writes, there will be only a few left
+        # so we just wait for the queue result to be processed
+        if count < last_cancel_count:
+            while len(self.ongoing_write_through) > 0:
+                handle = self.cache_controller.ack_write_queue.get()
+                self.tree.commit_writing_through(handle, True)
+                self.ongoing_write_through.remove(handle)
+        else:
+            self.last_cancel_count = last_cancel_count * 2
