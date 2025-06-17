@@ -116,6 +116,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
+    get_bool_env_var,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -417,6 +418,20 @@ class TokenizerManager:
 
         obj.normalize_batch_and_arguments()
 
+        if isinstance(obj, GenerateReqInput):
+            return_hidden_states = obj.return_hidden_states
+            has_return_hidden_states = return_hidden_states == True or (
+                isinstance(return_hidden_states, list) and any(return_hidden_states)
+            )
+            if (
+                not self.server_args.enable_return_hidden_states
+                and has_return_hidden_states
+            ):
+                raise ValueError(
+                    "return_hidden_states=True requires the server to be started "
+                    "with --enable-return-hidden-states (ServerArgs.enable_return_hidden_states)."
+                )
+
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
             logger.info(
@@ -444,6 +459,10 @@ class TokenizerManager:
         # Tokenize
         input_embeds = None
         input_text = obj.text
+        token_type_ids = None
+        is_cross_encoder_request = (
+            isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
+        )
         if obj.input_embeds is not None:
             if not self.server_args.disable_radix_cache:
                 raise ValueError(
@@ -462,7 +481,14 @@ class TokenizerManager:
                     "accept text prompts. Please provide input_ids or re-initialize "
                     "the engine with skip_tokenizer_init=False."
                 )
-            input_ids = self.tokenizer.encode(input_text)
+            encoded = self.tokenizer(
+                input_text, return_token_type_ids=is_cross_encoder_request
+            )
+
+            input_ids = encoded["input_ids"]
+            if is_cross_encoder_request:
+                input_ids = encoded["input_ids"][0]
+                token_type_ids = encoded.get("token_type_ids", [None])[0]
 
         if self.mm_processor and obj.contains_mm_input():
             image_inputs = await self.mm_processor.process_mm_data_async(
@@ -478,7 +504,7 @@ class TokenizerManager:
 
         self._validate_token_len(obj, input_ids)
         return self._create_tokenized_object(
-            obj, input_text, input_ids, input_embeds, image_inputs
+            obj, input_text, input_ids, input_embeds, image_inputs, token_type_ids
         )
 
     def _validate_token_len(
@@ -517,6 +543,7 @@ class TokenizerManager:
         input_ids: List[int],
         input_embeds: Optional[Union[List[float], None]] = None,
         image_inputs: Optional[Dict] = None,
+        token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
 
@@ -569,6 +596,7 @@ class TokenizerManager:
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
                 return_hidden_states=obj.return_hidden_states,
+                data_parallel_rank=obj.data_parallel_rank,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -576,6 +604,7 @@ class TokenizerManager:
                 input_text,
                 input_ids,
                 image_inputs,
+                token_type_ids,
                 sampling_params,
             )
 
@@ -805,6 +834,8 @@ class TokenizerManager:
         profile_by_stage: bool = False,
     ):
         self.auto_create_handle_loop()
+        env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
+        with_stack = False if with_stack is False or env_with_stack is False else True
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
@@ -852,7 +883,7 @@ class TokenizerManager:
             obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
-        if True:
+        if True:  # Keep this redundant check to simplify some internal code sync
             # Hold the lock if it is not async. This means that weight sync
             # cannot run while requests are in progress.
             async with self.model_update_lock.writer_lock:

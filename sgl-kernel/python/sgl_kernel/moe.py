@@ -88,6 +88,24 @@ def ep_moe_pre_reorder(
     )
 
 
+def ep_moe_silu_and_mul(
+    gateup_output,
+    down_input,
+    reorder_topk_ids,
+    scales,
+    start_expert_id,
+    end_expert_id,
+):
+    return torch.ops.sgl_kernel.ep_moe_silu_and_mul.default(
+        gateup_output,
+        down_input,
+        reorder_topk_ids,
+        scales,
+        start_expert_id,
+        end_expert_id,
+    )
+
+
 def ep_moe_post_reorder(
     down_output,
     output,
@@ -175,6 +193,17 @@ def prepare_moe_input(
         num_experts,
         n,
         k,
+    )
+
+
+def apply_shuffle_mul_sum(
+    input,
+    output,
+    permutation,
+    factors,
+):
+    torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(
+        input, output, permutation, factors
     )
 
 
