@@ -117,16 +117,22 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         # WEIGHT SCALE
         # TODO: update create_xxx_parameter functions to return
         # the newly added parameters
+
+        if hasattr(layer, 'fused_parameters') and layer.fused_parameters > 0:
+            fused_parameters = layer.fused_parameters
+        else:
+            fused_parameters = 1
+
         if self.strategy == QuantizationStrategy.CHANNEL:
             weight_scale = ChannelQuantScaleParameter(
-                data=torch.empty((sum(output_partition_sizes), 1), dtype=torch.float32),
+                data=torch.empty((sum(output_partition_sizes) * fused_parameters, 1), dtype=torch.float32),
                 output_dim=0,
                 weight_loader=weight_loader,
             )
         else:
             assert self.strategy == QuantizationStrategy.TENSOR
             weight_scale = PerTensorScaleParameter(
-                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                data=torch.empty(len(output_partition_sizes) * fused_parameters, dtype=torch.float32),
                 weight_loader=weight_loader,
             )
 
@@ -137,7 +143,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         # INPUT SCALE
         if self.is_static_input_scheme:
             input_scale = PerTensorScaleParameter(
-                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                data=torch.empty(len(output_partition_sizes) * fused_parameters, dtype=torch.float32),
                 weight_loader=weight_loader,
             )
             input_scale[:] = torch.finfo(torch.float32).min
