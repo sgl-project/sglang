@@ -1139,7 +1139,7 @@ class TokenizerManager:
         while True:
             remain_num_req = len(self.rid_to_state)
 
-            if self.health_check_failed or os.environ.get("SGL_NO_WAIT_ON_EXIT"):
+            if self.health_check_failed or get_bool_env_var("SGL_NO_WAIT_ON_EXIT"):
                 # if health check failed or no wait flag set, exit immediately
                 logger.error(
                     "Signal SIGTERM received while health check failed or no wait flag set. Exiting... remaining number of requests: %d",
