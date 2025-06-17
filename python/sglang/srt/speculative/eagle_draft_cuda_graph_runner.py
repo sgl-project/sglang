@@ -272,7 +272,6 @@ class EAGLEDraftCudaGraphRunner:
         if bs != raw_bs:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
-            self.positions.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
 
@@ -311,6 +310,7 @@ class EAGLEDraftCudaGraphRunner:
         self.model_runner.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
             forward_batch, bs
         )
+        # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
 
         # Replay
         self.graphs[bs].replay()
