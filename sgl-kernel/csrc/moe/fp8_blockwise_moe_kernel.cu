@@ -453,18 +453,7 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace) {
-  struct MmaConfig1 {
-    using ElementA = cutlass::float_e4m3_t;
-    using MmaTileShape = Shape<_128, _128, _128>;
-    using ClusterShape = Shape<_1, _2, _1>;
-    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
-    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
-    using ScaleConfig   = cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128>;
-
-    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
-    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
-  };
-  struct MmaConfig2 {
+  struct MmaConfig {
     using ElementA = cutlass::float_e4m3_t;
     using MmaTileShape = Shape<_64, _128, _128>;
     using ClusterShape = Shape<_2, _1, _1>;
@@ -475,122 +464,41 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
     using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
     using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
   };
-  struct MmaConfig3 {
-    using ElementA = cutlass::float_e4m3_t;
-    using MmaTileShape = Shape<_128, _128, _128>;
-    using ClusterShape = Shape<_1, _1, _1>;
-    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
-    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
-    using ScaleConfig   = cutlass::detail::Sm90BlockwiseScaleConfig<64, 1, 128>;
-    using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
-    using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
-  };
 
   int num_experts = (int)expert_offsets.size(0);
   torch::TensorOptions options_int = torch::TensorOptions().dtype(torch::kInt64).device(a.device());
   torch::Tensor problem_sizes_transpose = torch::empty(num_experts * 3, options_int);
-  torch::Tensor output_t = output.t();
-  torch::Tensor a_t = a.t();
-  torch::Tensor b_t = b.transpose(1, 2);
-  torch::Tensor scales_a_t = scales_a.t();
-  torch::Tensor scales_b_t = scales_b.transpose(1, 2);
 
-  if (a.size(0) <= 2048 && a.size(1) >= 2048) {
-    run_get_group_gemm_starts<MmaConfig1::LayoutSFA, MmaConfig1::LayoutSFB, MmaConfig1::ScaleConfig>(
-        expert_offsets,
-        a_ptrs,
-        b_ptrs,
-        out_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        b_t,
-        a_t,
-        output_t,
-        scales_b_t,
-        scales_a_t,
-        layout_sfa,
-        layout_sfb,
-        problem_sizes,
-        problem_sizes_transpose,
-        true);
-    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, MmaConfig1, cutlass::layout::ColumnMajor>(
-        out_ptrs,
-        a_ptrs,
-        b_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        stride_a,
-        stride_b,
-        stride_c,
-        layout_sfa,
-        layout_sfb,
-        problem_sizes_transpose,
-        expert_offsets,
-        workspace);
-    output = output_t.t();
-  } else if (a.size(0) > 2048 && a.size(1) >= 2048) {
-    run_get_group_gemm_starts<MmaConfig2::LayoutSFA, MmaConfig2::LayoutSFB, MmaConfig2::ScaleConfig>(
-        expert_offsets,
-        a_ptrs,
-        b_ptrs,
-        out_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        a,
-        b,
-        output,
-        scales_a,
-        scales_b,
-        layout_sfa,
-        layout_sfb,
-        problem_sizes,
-        problem_sizes_transpose);
-    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, MmaConfig2, cutlass::layout::RowMajor>(
-        out_ptrs,
-        a_ptrs,
-        b_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        stride_a,
-        stride_b,
-        stride_c,
-        layout_sfa,
-        layout_sfb,
-        problem_sizes,
-        expert_offsets,
-        workspace);
-  } else {
-    run_get_group_gemm_starts<MmaConfig3::LayoutSFA, MmaConfig3::LayoutSFB, MmaConfig3::ScaleConfig>(
-        expert_offsets,
-        a_ptrs,
-        b_ptrs,
-        out_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        a,
-        b,
-        output,
-        scales_a,
-        scales_b,
-        layout_sfa,
-        layout_sfb,
-        problem_sizes,
-        problem_sizes_transpose);
-    launch_sm90_fp8_blockwise_scaled_group_mm<OutType, MmaConfig3, cutlass::layout::RowMajor>(
-        out_ptrs,
-        a_ptrs,
-        b_ptrs,
-        a_scales_ptrs,
-        b_scales_ptrs,
-        stride_a,
-        stride_b,
-        stride_c,
-        layout_sfa,
-        layout_sfb,
-        problem_sizes,
-        expert_offsets,
-        workspace);
-  }
+  run_get_group_gemm_starts<MmaConfig::LayoutSFA, MmaConfig::LayoutSFB, MmaConfig::ScaleConfig>(
+      expert_offsets,
+      a_ptrs,
+      b_ptrs,
+      out_ptrs,
+      a_scales_ptrs,
+      b_scales_ptrs,
+      a,
+      b,
+      output,
+      scales_a,
+      scales_b,
+      layout_sfa,
+      layout_sfb,
+      problem_sizes,
+      problem_sizes_transpose);
+  launch_sm90_fp8_blockwise_scaled_group_mm<OutType, MmaConfig, cutlass::layout::RowMajor>(
+      out_ptrs,
+      a_ptrs,
+      b_ptrs,
+      a_scales_ptrs,
+      b_scales_ptrs,
+      stride_a,
+      stride_b,
+      stride_c,
+      layout_sfa,
+      layout_sfb,
+      problem_sizes,
+      expert_offsets,
+      workspace);
 }
 
 /**
@@ -738,8 +646,8 @@ void fp8_blockwise_scaled_grouped_mm(
 #endif
 #endif
 
-#if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED)
-  if (sm_version == 90) {
+#if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED) && defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
+  if (sm_version == 90 && a.size(0) > 256) {
     if (output.scalar_type() == torch::kBFloat16) {
       sm90_fp8_blockwise_group_mm_dispatch_shape<cutlass::bfloat16_t>(
           output,
