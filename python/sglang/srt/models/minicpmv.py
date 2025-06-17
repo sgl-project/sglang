@@ -829,6 +829,10 @@ class MiniCPMV:
     def __call__(self, *args, **kwargs):
         return self.minicpmv(*args, **kwargs)
 
+    def eval(self):
+        self.minicpmv.eval()
+        return self
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
