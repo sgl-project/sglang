@@ -12,7 +12,7 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.quantization import deep_gemm_wrapper
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
@@ -149,7 +149,11 @@ class TboCudaGraphRunnerPlugin:
 
 class TboDPAttentionPreparer:
     def prepare_all_gather(
-        self, local_batch, deepep_mode, enable_deepep_moe, enable_two_batch_overlap
+        self,
+        local_batch: ScheduleBatch,
+        deepep_mode: DeepEPMode,
+        enable_deepep_moe: bool,
+        enable_two_batch_overlap: bool,
     ):
         self.enable_two_batch_overlap = enable_two_batch_overlap
 
@@ -159,7 +163,7 @@ class TboDPAttentionPreparer:
                 num_tokens=local_batch.input_ids.shape[0],
                 extend_lens=local_batch.extend_lens,
             )
-            resolved_deepep_mode = deepep_mode.resolve(local_batch.forward_mode)
+            resolved_deepep_mode = deepep_mode.resolve(local_batch.is_extend_in_batch)
             local_can_run_tbo = (self.local_tbo_split_seq_index is not None) and not (
                 local_batch.forward_mode.is_extend()
                 and enable_deepep_moe
