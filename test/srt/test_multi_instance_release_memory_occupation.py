@@ -24,8 +24,8 @@ MODEL_INFO = dict(
 
 
 def get_gpu_memory_gb(gpu_id=0):
-    cmd = f"nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits --id={gpu_id}"
-    result = subprocess.check_output(cmd, shell=True, text=True).strip()
+    cmd_list = ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits", f"--id={gpu_id}"]
+    result = subprocess.check_output(cmd_list, text=True, shell=False).strip()
     return int(result) / 1024
 
 
@@ -126,7 +126,7 @@ def _run_sglang_subprocess(
         hf_model = AutoModelForCausalLM.from_pretrained(
             DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
             torch_dtype="bfloat16",
-            device_map="cuda",
+            device_map=f"cuda:{rank}",
             trust_remote_code=True
         ).cuda()
         _curr_usage = get_gpu_memory_gb(rank)
