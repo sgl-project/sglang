@@ -2472,8 +2472,10 @@ class Scheduler(
                 if self.profiler_decode_ct > self.profiler_target_decode_ct:
                     if self.profile_in_progress:
                         self.stop_profile(stage=ForwardMode.DECODE)
+            elif batch.forward_mode.is_idle():
+                pass
             else:
-                raise RuntimeError("unsupported profile stage")
+                raise RuntimeError(f"unsupported profile stage: {batch.forward_mode}")
         else:
             # Check profiler
             if (
