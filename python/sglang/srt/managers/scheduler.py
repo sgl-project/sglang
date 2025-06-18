@@ -113,6 +113,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     global_server_args_dict,
+    WaitingStatus
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -451,6 +452,12 @@ class Scheduler(
         t.start()
         self.parent_process = psutil.Process().parent()
 
+        self.enable_mooncake_store_l3_cache = server_args.enable_mooncake_store_l3_cache
+        # Init loading l3 cache thread
+        if self.enable_hierarchical_cache and self.enable_mooncake_store_l3_cache:
+            loading_l3_cache_thread = threading.Thread(target=self.loading_l3_cache, daemon=True)
+            loading_l3_cache_thread.start()
+
         # Init memory saver
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
@@ -564,6 +571,7 @@ class Scheduler(
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
+                    enable_mooncake_store_l3_cache=server_args.enable_mooncake_store_l3_cache
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -1461,6 +1469,8 @@ class Scheduler(
             # check for completion of hierarchical cache activities to release memory
             self.tree_cache.writing_check()
             self.tree_cache.loading_check()
+            if self.enable_mooncake_store_l3_cache:
+                self.tree_cache.l3_loading_check()
 
         # Get priority queue
         prefix_computed = self.policy.calc_priority(self.waiting_queue)
@@ -1508,10 +1518,18 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
                     break
 
-            req.init_next_round_input(
-                None if prefix_computed else self.tree_cache,
-                self.enable_hierarchical_cache,
-            )
+            if (
+                self.enable_hierarchical_cache
+                and self.enable_mooncake_store_l3_cache
+            ):
+                if not self.tree_cache.waiting_status_check(req):
+                    continue
+
+            if not self.enable_mooncake_store_l3_cache:
+                req.init_next_round_input(
+                    None if prefix_computed else self.tree_cache,
+                    self.enable_hierarchical_cache,
+                )
 
             res = adder.add_one_req(
                 req, self.chunked_req, self.enable_hierarchical_cache
@@ -1933,6 +1951,22 @@ class Scheduler(
                 batch.next_batch_sampling_info.update_regex_vocab_mask()
                 self.current_stream.synchronize()
             batch.next_batch_sampling_info.sampling_info_done.set()
+
+    def loading_l3_cache(self):
+        while True:
+            if len(self.waiting_queue) > 0:
+                for req in self.waiting_queue:
+                    if req.waiting_status != WaitingStatus.UNREADY:
+                        continue
+
+                    req.init_next_round_input(
+                        self.tree_cache,
+                        self.enable_hierarchical_cache,
+                    )
+                    req.waiting_status = WaitingStatus.LOADING
+                    self.tree_cache.mooncake_load_back(req, req.last_node_global)
+            time.sleep(0.001)
+
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
