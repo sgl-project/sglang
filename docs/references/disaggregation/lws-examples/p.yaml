@@ -134,7 +134,7 @@ spec:
         tolerations:
         - key: bopd
           operator: Exists
-        - key: node-role.alibabacloud.com/lingjun
+        - key: node-role
           operator: Exists
         volumes:
         - emptyDir:
@@ -288,7 +288,7 @@ spec:
         tolerations:
         - key: bopd
           operator: Exists
-        - key: node-role.alibabacloud.com/lingjun
+        - key: node-role
           operator: Exists
         volumes:
         - emptyDir:

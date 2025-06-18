@@ -123,7 +123,7 @@ spec:
         tolerations:
         - key: bopd
           operator: Exists
-        - key: node-role.alibabacloud.com/lingjun
+        - key: node-role
           operator: Exists
         volumes:
         - hostPath:
@@ -260,7 +260,7 @@ spec:
         tolerations:
         - key: bopd
           operator: Exists
-        - key: node-role.alibabacloud.com/lingjun
+        - key: node-role
           operator: Exists
         volumes:
         - hostPath:

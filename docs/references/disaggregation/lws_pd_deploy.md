@@ -156,7 +156,7 @@ spec:
         tolerations:
         - key: pd
           operator: Exists
-        - key: node-role.alibabacloud.com/lingjun
+        - key: node-role
           operator: Exists
         volumes:
         - emptyDir:
@@ -310,7 +310,7 @@ spec:
         tolerations:
         - key: pd
           operator: Exists
-        - key: node-role.alibabacloud.com/lingjun
+        - key: node-role
           operator: Exists
         volumes:
         - emptyDir:
@@ -467,7 +467,7 @@ spec:
         tolerations:
         - key: pd
           operator: Exists
-        - key: node-role.alibabacloud.com/lingjun
+        - key: node-role
           operator: Exists
         volumes:
         - hostPath:
@@ -604,7 +604,7 @@ spec:
         tolerations:
         - key: pd
           operator: Exists
-        - key: node-role.alibabacloud.com/lingjun
+        - key: node-role
           operator: Exists
         volumes:
         - hostPath:
@@ -712,7 +712,7 @@ spec:
       tolerations:
         - key: pd
           operator: Exists
-        - key: node-role.alibabacloud.com/lingjun
+        - key: node-role
           operator: Exists
       containers:
         - name: sgl-minilb

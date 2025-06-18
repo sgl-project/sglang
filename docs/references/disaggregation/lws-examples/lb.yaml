@@ -19,7 +19,7 @@ spec:
       tolerations:
         - key: bopd
           operator: Exists
-        - key: node-role.alibabacloud.com/lingjun
+        - key: node-role
           operator: Exists
       containers:
         - name: sgl-minilb
