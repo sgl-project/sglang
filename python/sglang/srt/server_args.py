@@ -235,6 +235,9 @@ class ServerArgs:
     pdlb_url: Optional[str] = None
     prefill_mem_fraction: Optional[float] = None
 
+    # For model weight update
+    custom_weight_loader: Optional[List[str]] = None
+
     def __post_init__(self):
         # Expert parallelism
         if self.enable_ep_moe:
@@ -538,6 +541,9 @@ class ServerArgs:
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
         )
+
+        if self.custom_weight_loader is None:
+            self.custom_weight_loader = []
 
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
         larger_tp = max(decode_tp, prefill_tp)
@@ -1582,6 +1588,13 @@ class ServerArgs:
             type=float,
             default=None,
             help="The fraction of the memory used for prefill kv cache allocation. It's only used when disaggregation mode is set to decode.",
+        )
+        parser.add_argument(
+          "--custom-weight-loader",
+            type=str,
+            nargs="*",
+            default=None,
+            help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
         )
 
     @classmethod
