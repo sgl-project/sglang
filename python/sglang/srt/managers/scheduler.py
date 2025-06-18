@@ -1468,15 +1468,14 @@ class Scheduler(
             return None
 
         if self.enable_hierarchical_cache:
-            # check for completion of hierarchical cache activities to release memory
-            self.tree_cache.writing_check()
-            self.tree_cache.loading_check()
+            self.tree_cache.check_host_cache()
 
         # Get priority queue
-        prefix_computed = self.policy.calc_priority(self.waiting_queue)
+        self.policy.calc_priority(self.waiting_queue)
 
         # Prefill policy
         adder = PrefillAdder(
+            self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
@@ -1518,19 +1517,8 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
                     break
 
-            # bypass prefix_computed if enable_hierarchical_cache
-            req.init_next_round_input(
-                (
-                    None
-                    if (prefix_computed and not self.enable_hierarchical_cache)
-                    else self.tree_cache
-                ),
-                self.enable_hierarchical_cache,
-            )
-
-            res = adder.add_one_req(
-                req, self.chunked_req, self.enable_hierarchical_cache
-            )
+            req.init_next_round_input(self.tree_cache)
+            res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -1582,7 +1570,9 @@ class Scheduler(
         )
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
-            new_batch.hicache_consumer_index = self.tree_cache.ready_to_load_cache()
+            new_batch.hicache_consumer_index = (
+                self.tree_cache.ready_to_load_host_cache()
+            )
 
         new_batch.prepare_for_extend()
 

@@ -6,17 +6,11 @@ from typing import TYPE_CHECKING, Any, Callable, List, Tuple
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-
-
-class ChunkCacheEntry:
-    def __init__(self, rid: str, value: torch.Tensor):
-        self.rid = rid
-        self.value = value
 
 
 class ChunkCache(BasePrefixCache):
@@ -29,15 +23,19 @@ class ChunkCache(BasePrefixCache):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
-        self.disable = True
 
     def reset(self):
         pass
 
-    def match_prefix(self, **unused_kwargs) -> Tuple[List[int], int]:
-        return [], None
+    def match_prefix(self, **unused_kwargs) -> MatchResult:
+        return MatchResult(
+            device_indices=torch.empty((0,), dtype=torch.int64),
+            last_device_node=None,
+            last_host_node=None,
+        )
 
     def cache_finished_req(self, req: Req):
+        assert req.req_pool_idx is not None
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx,
             # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
@@ -53,9 +51,6 @@ class ChunkCache(BasePrefixCache):
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices
-
-    def insert(self):
-        raise NotImplementedError()
 
     def evict(self, num_tokens: int):
         pass

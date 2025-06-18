@@ -7,15 +7,12 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.mem_cache.base_prefix_cache import LoadHostResult, MatchResult
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
     TokenToKVPoolAllocator,
-)
-from sglang.srt.mem_cache.memory_pool_host import (
-    MHATokenToKVPoolHost,
-    MLATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
@@ -283,41 +280,47 @@ class HiRadixCache(RadixCache):
     def init_load_back(
         self,
         last_node: TreeNode,
-        prefix_indices: torch.Tensor,
+        host_indices_length: int,
         mem_quota: Optional[int] = None,
-    ):
-        assert (
-            len(prefix_indices) == 0 or prefix_indices.is_cuda
-        ), "indices of device kV caches should be on GPU"
+    ) -> LoadHostResult:
+        _ = host_indices_length  # unused, but kept for compatibility
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
-                prefix_indices = (
-                    loading_values
-                    if len(prefix_indices) == 0
-                    else torch.cat([prefix_indices, loading_values])
-                )
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
+                )
+                return LoadHostResult(
+                    new_device_indices=loading_values,
+                    new_last_device_node=last_node,
                 )
 
             while last_node.evicted:
                 last_node = last_node.parent
 
-        return last_node, prefix_indices
+        return LoadHostResult(
+            new_device_indices=torch.empty((0,), dtype=torch.int64, device=self.device),
+            new_last_device_node=last_node,
+        )
 
-    def ready_to_load_cache(self):
+    def ready_to_load_host_cache(self):
         producer_index = self.cache_controller.layer_done_counter.next_producer()
         self.load_cache_event.set()
         return producer_index
 
-    def match_prefix(self, key: List[int], include_evicted=False, **kwargs):
+    def check_host_cache(self):
+        self.writing_check()
+        self.loading_check()
+
+    def match_prefix(self, key: List[int], **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         if self.disable or len(key) == 0:
-            if include_evicted:
-                return empty_value, self.root_node, self.root_node
-            else:
-                return empty_value, self.root_node
+            return MatchResult(
+                device_indices=empty_value,
+                last_device_node=self.root_node,
+                last_host_node=self.root_node,
+                host_indices_length=0,
+            )
 
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
@@ -329,14 +332,18 @@ class HiRadixCache(RadixCache):
         else:
             value = empty_value
 
+        host_indices_length = 0
         last_node_global = last_node
         while last_node.evicted:
+            host_indices_length += len(last_node.host_value)
             last_node = last_node.parent
 
-        if include_evicted:
-            return value, last_node, last_node_global
-        else:
-            return value, last_node
+        return MatchResult(
+            device_indices=value,
+            last_device_node=last_node,
+            last_host_node=last_node_global,
+            host_indices_length=host_indices_length,
+        )
 
     def _match_prefix_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.monotonic()
