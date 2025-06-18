@@ -2354,14 +2354,12 @@ def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> 
         if transpose_dims and transpose_dims[i]:
             weight_tensor = weight_tensor.transpose(*transpose_dims[i])
 
-        setattr(
-            module,
-            weight_name,
-            torch.nn.Parameter(
-                prepack_weight_if_needed(weight_tensor),
-                requires_grad=False,
-            ),
+        packed_weight = torch.nn.Parameter(
+            prepack_weight_if_needed(weight_tensor),
+            requires_grad=False,
         )
+        packed_weight.__dict__ = weight_tensor.__dict__
+        setattr(module, weight_name, packed_weight)
 
     module.use_intel_amx_backend = (
         device == torch.device("cpu") and cpu_has_amx_support()
