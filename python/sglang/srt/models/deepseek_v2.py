@@ -72,7 +72,7 @@ from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import get_rope, get_rope_wrapper
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -95,8 +95,10 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     bind_or_assign,
+    cpu_has_amx_support,
     get_bool_env_var,
     get_int_env_var,
+    is_cpu,
     is_cuda,
     is_hip,
     is_non_idle_and_non_empty,
@@ -107,9 +109,13 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8, merge_state_v2
+elif _is_cpu and _is_cpu_amx_available:
+    pass
 else:
     from vllm._custom_ops import awq_dequantize
 
@@ -665,13 +671,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
 
-        self.rotary_emb = get_rope(
+        self.rotary_emb = get_rope_wrapper(
             qk_rope_head_dim,
             rotary_dim=qk_rope_head_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=False,
+            device=global_server_args_dict["device"],
         )
 
         if rope_scaling:
@@ -1932,6 +1939,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             self._weight_requant_ue8m0()
 
     def _weight_requant_ue8m0(self):
+        if self.config.architectures[0] == "DeepseekV3ForCausalLMNextN":
+            return
         weight_block_size = self.quant_config.weight_block_size
 
         moe_layers = list(

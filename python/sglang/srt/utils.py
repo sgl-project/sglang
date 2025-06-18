@@ -160,13 +160,17 @@ def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
-def is_cpu() -> bool:
+def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (
         machine in ("x86_64", "amd64", "i386", "i686")
         and hasattr(torch, "cpu")
         and torch.cpu.is_available()
     )
+
+
+def is_cpu() -> bool:
+    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
 
 
 def is_flashinfer_available():
@@ -1452,6 +1456,15 @@ def get_device(device_id: Optional[int] = None) -> str:
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
 
+    if is_cpu():
+        if cpu_has_amx_support():
+            logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
+        else:
+            logger.warning(
+                "CPU device enabled, using torch native backend, low performance expected."
+            )
+        return "cpu"
+
     raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
 
 
@@ -2139,6 +2152,44 @@ def get_free_port():
         with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
             s.bind(("", 0))
             return s.getsockname()[1]
+
+
+def get_local_ip_auto() -> str:
+    interface = os.environ.get("SGLANG_LOCAL_IP_NIC", None)
+    return (
+        get_local_ip_by_nic(interface)
+        if interface is not None
+        else get_local_ip_by_remote()
+    )
+
+
+def get_local_ip_by_nic(interface: str) -> str:
+    try:
+        import netifaces
+    except ImportError as e:
+        raise ImportError(
+            "Environment variable SGLANG_LOCAL_IP_NIC requires package netifaces, please install it through 'pip install netifaces'"
+        ) from e
+
+    try:
+        addresses = netifaces.ifaddresses(interface)
+        if netifaces.AF_INET in addresses:
+            for addr_info in addresses[netifaces.AF_INET]:
+                ip = addr_info.get("addr")
+                if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+                    return ip
+        if netifaces.AF_INET6 in addresses:
+            for addr_info in addresses[netifaces.AF_INET6]:
+                ip = addr_info.get("addr")
+                if ip and not ip.startswith("fe80::") and ip != "::1":
+                    return ip.split("%")[0]
+    except (ValueError, OSError) as e:
+        raise ValueError(
+            "Can not get local ip from NIC. Please verify whether SGLANG_LOCAL_IP_NIC is set correctly."
+        )
+
+    # Fallback
+    return get_local_ip_by_remote()
 
 
 def get_local_ip_by_remote() -> str:

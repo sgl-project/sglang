@@ -250,17 +250,17 @@ class TestEBNFConstrained(CustomTestCase):
         # Test patterns that should match - flexible ordering of optional parameters
         allowed_patterns = [
             # Empty arguments
-            r'^\{"name":"config_service", "arguments":\{\}\}$',
+            r'^\{"name":"config_service",\s*"arguments":\{\}\}$',
             # Single optional parameters (any can appear first)
-            r'^\{"name":"config_service", "arguments":\{"theme":"(light|dark)"\}\}$',
-            r'^\{"name":"config_service", "arguments":\{"language":"(en|es|fr)"\}\}$',
-            r'^\{"name":"config_service", "arguments":\{"notifications":(true|false)\}\}$',
+            r'^\{"name":"config_service",\s*"arguments":\{"theme":"(light|dark)"\}\}$',
+            r'^\{"name":"config_service",\s*"arguments":\{"language":"(en|es|fr)"\}\}$',
+            r'^\{"name":"config_service",\s*"arguments":\{"notifications":(true|false)\}\}$',
             # Two optional parameters (in any order)
-            r'^\{"name":"config_service", "arguments":\{"theme":"(light|dark)", "language":"(en|es|fr)"\}\}$',
-            r'^\{"name":"config_service", "arguments":\{"theme":"(light|dark)", "notifications":(true|false)\}\}$',
-            r'^\{"name":"config_service", "arguments":\{"language":"(en|es|fr)", "notifications":(true|false)\}\}$',
+            r'^\{"name":"config_service",\s*"arguments":\{"theme":"(light|dark)",\s*"language":"(en|es|fr)"\}\}$',
+            r'^\{"name":"config_service",\s*"arguments":\{"theme":"(light|dark)",\s*"notifications":(true|false)\}\}$',
+            r'^\{"name":"config_service",\s*"arguments":\{"language":"(en|es|fr)",\s*"notifications":(true|false)\}\}$',
             # All three optional parameters
-            r'^\{"name":"config_service", "arguments":\{"theme":"(light|dark)", "language":"(en|es|fr)", "notifications":(true|false)\}\}$',
+            r'^\{"name":"config_service",\s*"arguments":\{"theme":"(light|dark)",\s*"language":"(en|es|fr)",\s*"notifications":(true|false)\}\}$',
         ]
         prompt = "Configure the service with optional settings:"
 
