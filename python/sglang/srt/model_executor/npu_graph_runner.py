@@ -78,13 +78,10 @@ class NpuGraphRunner:
                 )
 
         # Attention backend
-        self.max_bs = max(self.compile_bs)
+        self.max_bs = max(self.compile_bs) if self.compile_bs else 1
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
         # todo: use npu attention backend
-        if global_server_args_dict["attention_backend"] == "flashmla":
-            self.model_runner.attn_backend.init_cuda_graph_state(self.max_bs)
-        else:
-            self.model_runner.attn_backend.init_cuda_graph_state(self.max_num_token)
+        self.model_runner.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
