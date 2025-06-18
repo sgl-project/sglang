@@ -167,6 +167,7 @@ class CompletionRequest(BaseModel):
     temperature: float = 1.0
     top_p: float = 1.0
     user: Optional[str] = None
+    return_hidden_states: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -202,6 +203,7 @@ class CompletionResponseChoice(BaseModel):
     logprobs: Optional[LogProbs] = None
     finish_reason: Literal["stop", "length", "content_filter", "abort"]
     matched_stop: Union[None, int, str] = None
+    hidden_states: Optional[object] = None
 
 
 class CompletionResponse(BaseModel):
@@ -219,6 +221,7 @@ class CompletionResponseStreamChoice(BaseModel):
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[Literal["stop", "length", "content_filter"]] = None
     matched_stop: Union[None, int, str] = None
+    hidden_states: Optional[object] = None
 
 
 class CompletionStreamResponse(BaseModel):
@@ -376,6 +379,7 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
+    return_hidden_states: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -437,6 +441,7 @@ class ChatCompletionResponseChoice(BaseModel):
         "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
     ]
     matched_stop: Union[None, int, str] = None
+    hidden_states: Optional[object] = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -453,6 +458,7 @@ class DeltaMessage(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    hidden_states: Optional[object] = None
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
