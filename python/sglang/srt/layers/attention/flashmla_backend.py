@@ -148,6 +148,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
+        max_num_tokens: int,
         block_kv_indices: Optional[torch.Tensor] = None,
     ):
         if block_kv_indices is None:
@@ -502,9 +503,11 @@ class FlashMLAMultiStepDraftBackend:
 
         self.common_template(forward_batch, call_fn)
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps):
-            self.attn_backends[i].init_cuda_graph_state(max_bs, block_kv_indices=None)
+            self.attn_backends[i].init_cuda_graph_state(
+                max_bs, max_num_tokens, block_kv_indices=None
+            )
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
         def call_fn(i, forward_batch):

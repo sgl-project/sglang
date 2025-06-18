@@ -239,7 +239,7 @@ class WorkloadGenerator:
             tokenizer=self.tokenizer,
             dataset_path=args.dataset_path,
         )
-        self.candidate_inputs = [i[0] for i in self.candidate_inputs]
+        self.candidate_inputs = [i.prompt for i in self.candidate_inputs]
 
         init_requests = [
             (i, gen_payload(self.candidate_inputs[i], args.output_length))

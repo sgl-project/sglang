@@ -122,6 +122,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
+        max_num_tokens: int,
         block_kv_indices: Optional[torch.Tensor] = None,
     ):
         if block_kv_indices is None:

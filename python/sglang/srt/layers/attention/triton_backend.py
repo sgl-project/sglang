@@ -261,6 +261,7 @@ class TritonAttnBackend(AttentionBackend):
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
+
         elif forward_batch.forward_mode.is_draft_extend():
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
@@ -335,24 +336,27 @@ class TritonAttnBackend(AttentionBackend):
         )
 
     def init_cuda_graph_state(
-        self, max_bs: int, kv_indices_buf: Optional[torch.Tensor] = None
+        self,
+        max_bs: int,
+        max_num_tokens: int,
+        kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         self.cuda_graph_attn_logits = torch.zeros(
-            (max_bs, self.num_head, self.max_kv_splits, self.v_head_dim),
+            (max_num_tokens, self.num_head, self.max_kv_splits, self.v_head_dim),
             dtype=torch.float32,
             device=self.device,
         )
         self.cuda_graph_attn_lse = torch.zeros(
-            (max_bs, self.num_head, self.max_kv_splits),
+            (max_num_tokens, self.num_head, self.max_kv_splits),
             dtype=torch.float32,
             device=self.device,
         )
         self.cuda_graph_num_kv_splits = torch.full(
-            (max_bs,), self.max_kv_splits, dtype=torch.int32, device=self.device
+            (max_num_tokens,), self.max_kv_splits, dtype=torch.int32, device=self.device
         )
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
-                (max_bs * self.max_context_len),
+                (max_num_tokens * self.max_context_len),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -361,7 +365,7 @@ class TritonAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_bs * self.max_context_len),
+                (max_num_tokens * self.max_context_len),
                 dtype=torch.uint8,
                 device=self.device,
             )
@@ -369,7 +373,7 @@ class TritonAttnBackend(AttentionBackend):
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             if kv_indices_buf is None:
                 self.cuda_graph_window_kv_indices = torch.zeros(
-                    (max_bs * self.sliding_window_size),
+                    (max_num_tokens * self.sliding_window_size),
                     dtype=torch.int32,
                     device=self.device,
                 )
@@ -377,7 +381,10 @@ class TritonAttnBackend(AttentionBackend):
                 self.cuda_graph_window_kv_indices = torch.zeros_like(kv_indices_buf)
 
             self.cuda_graph_window_num_kv_splits = torch.full(
-                (max_bs,), self.max_kv_splits, dtype=torch.int32, device=self.device
+                (max_num_tokens,),
+                self.max_kv_splits,
+                dtype=torch.int32,
+                device=self.device,
             )
 
     def init_forward_metadata_capture_cuda_graph(
@@ -458,6 +465,7 @@ class TritonAttnBackend(AttentionBackend):
             )
 
             custom_mask = self.cuda_graph_custom_mask
+            custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
             seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
             mask_indptr = self.mask_indptr[: bs + 1]
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
@@ -821,15 +829,15 @@ class TritonMultiStepDraftBackend:
 
         self.common_template(forward_batch, kv_indices, call_fn)
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, max_bs * self.max_context_len),
+            (self.speculative_num_steps, max_num_tokens * self.max_context_len),
             dtype=torch.int32,
             device=self.device,
         )
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_cuda_graph_state(
-                max_bs, kv_indices_buf=self.cuda_graph_kv_indices[i]
+                max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
             )
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):

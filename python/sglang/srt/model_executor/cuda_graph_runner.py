@@ -242,13 +242,13 @@ class CudaGraphRunner:
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        if global_server_args_dict["attention_backend"] == "flashmla":
-            self.model_runner.attn_backend.init_cuda_graph_state(self.max_bs)
-        else:
-            self.model_runner.attn_backend.init_cuda_graph_state(self.max_num_token)
+        self.model_runner.attn_backend.init_cuda_graph_state(
+            self.max_bs, self.max_num_token
+        )
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
+
         # FIXME(lsyin): leave it here for now, I don't know whether it is necessary
         self.encoder_len_fill_value = 0
         self.seq_lens_cpu = torch.full(
@@ -323,12 +323,15 @@ class CudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.enable_dp_attention or self.enable_sp_layernorm:
-            total_global_tokens = sum(forward_batch.global_num_tokens_cpu)
-
+            total_batch_size = (
+                sum(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
+                if self.model_runner.spec_algorithm.is_eagle()
+                else sum(forward_batch.global_num_tokens_cpu)
+            )
             is_bs_supported = forward_batch.can_run_dp_cuda_graph and (
-                total_global_tokens in self.graphs
+                total_batch_size in self.graphs
                 if self.disable_padding
-                else total_global_tokens <= self.max_bs
+                else total_batch_size <= self.max_bs
             )
         else:
             is_bs_supported = (
@@ -460,7 +463,7 @@ class CudaGraphRunner:
             self.global_num_tokens_gpu.copy_(
                 torch.tensor(
                     [
-                        num_tokens // self.dp_size + (i < bs % self.dp_size)
+                        num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
                         for i in range(self.dp_size)
                     ],
                     dtype=torch.int32,
@@ -605,9 +608,12 @@ class CudaGraphRunner:
 
         # Pad
         if self.enable_dp_attention or self.enable_sp_layernorm:
-            index = bisect.bisect_left(
-                self.capture_bs, sum(forward_batch.global_num_tokens_cpu)
+            total_batch_size = (
+                sum(forward_batch.global_num_tokens_cpu) / self.num_tokens_per_bs
+                if self.model_runner.spec_algorithm.is_eagle()
+                else sum(forward_batch.global_num_tokens_cpu)
             )
+            index = bisect.bisect_left(self.capture_bs, total_batch_size)
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
@@ -650,13 +656,13 @@ class CudaGraphRunner:
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
-            self.req_pool_indices,
-            self.seq_lens,
+            self.req_pool_indices[:bs],
+            self.seq_lens[:bs],
             forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
-            self.encoder_lens,
+            self.encoder_lens[:bs] if self.is_encoder_decoder else None,
             forward_batch.forward_mode,
             forward_batch.spec_info,
-            seq_lens_cpu=self.seq_lens_cpu,
+            seq_lens_cpu=self.seq_lens_cpu[:bs],
         )
 
         # Store fields
