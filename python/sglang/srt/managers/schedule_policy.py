@@ -473,6 +473,9 @@ class PrefillAdder:
 
             input_tokens = -(-req.extend_input_len // self.page_size) * self.page_size
 
+            if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+                return AddReqResult.OTHER
+
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
