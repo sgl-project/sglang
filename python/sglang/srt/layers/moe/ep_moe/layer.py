@@ -339,11 +339,12 @@ class EPMoE(torch.nn.Module):
 
         assert self.quant_method is not None
 
+        use_fbgemm = global_server_args_dict.get("use_fbgemm_grouped_gemm", False)
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device,
                 use_flashinfer=False,  # TODO: use flashinfer
-                use_fbgemm=True,
+                use_fbgemm=use_fbgemm,
                 use_per_token_if_dynamic=self.use_per_token_if_dynamic,
             )
 
@@ -1102,8 +1103,8 @@ class DeepEPMoE(EPMoE):
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device,
-                use_flashinfer=False,
-                use_fbgemm=False,  # TODO: use flashinfer
+                use_flashinfer=False,  # TODO: use flashinfer
+                use_fbgemm=False,  # TODO: DeepEPMoE support FBGEMM
             )
 
         if self.activation_scheme == "dynamic" and not self.use_block_quant:
