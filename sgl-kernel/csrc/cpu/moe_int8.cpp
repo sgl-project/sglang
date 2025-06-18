@@ -644,16 +644,16 @@ void fused_experts_int8_kernel_impl(
     alignas(64) float As[BLOCK_M];
 
     loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
-      // nb0 from top half and nb1 from bottom half
-      int64_t nb0 = nb, nb1 = nb + NB;
-      int64_t n_size = std::min(N - nb0 * BLOCK_N, BLOCK_N);
+      // nb_upper from top half and nb_lower from bottom half
+      int64_t nb_upper = nb, nb_lower = nb + NB;
+      int64_t n_size = std::min(N - nb * BLOCK_N, BLOCK_N);
 
       // B shape [K, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
-      const int8_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb0 * BLOCK_N * stride_n;
-      const int8_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + nb1 * BLOCK_N * stride_n;
-      const float* __restrict__ Bs0 = w1s + expert_id * 2 * N + nb0 * BLOCK_N;
-      const float* __restrict__ Bs1 = w1s + expert_id * 2 * N + nb1 * BLOCK_N;
+      const int8_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb_upper * BLOCK_N * stride_n;
+      const int8_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + nb_lower * BLOCK_N * stride_n;
+      const float* __restrict__ Bs0 = w1s + expert_id * 2 * N + nb_upper * BLOCK_N;
+      const float* __restrict__ Bs1 = w1s + expert_id * 2 * N + nb_lower * BLOCK_N;
 
       // 1.a load A
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
@@ -894,9 +894,9 @@ void shared_expert_int8_kernel_impl(
     int32_t* __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
 
     loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
-      // nb0 from top half and nb1 from bottom half
-      int64_t nb0 = nb, nb1 = nb + NB;
-      int64_t n_size = std::min(N - nb0 * BLOCK_N, BLOCK_N);
+      // nb_upper from top half and nb_lower from bottom half
+      int64_t nb_upper = nb, nb_lower = nb + NB;
+      int64_t n_size = std::min(N - nb * BLOCK_N, BLOCK_N);
       int64_t m_size = std::min(M - mb * BLOCK_M, BLOCK_M);
 
       // A shape [m_size, K]
@@ -904,10 +904,10 @@ void shared_expert_int8_kernel_impl(
       const float* As = As_tmp + mb * BLOCK_M;
 
       // B shape [K, n_size] in vnni format
-      const int8_t* __restrict__ B0 = packed_w1 + nb0 * BLOCK_N * stride_n;
-      const int8_t* __restrict__ B1 = packed_w1 + nb1 * BLOCK_N * stride_n;
-      const float* __restrict__ Bs0 = w1s + nb0 * BLOCK_N;
-      const float* __restrict__ Bs1 = w1s + nb1 * BLOCK_N;
+      const int8_t* __restrict__ B0 = packed_w1 + nb_upper * BLOCK_N * stride_n;
+      const int8_t* __restrict__ B1 = packed_w1 + nb_lower * BLOCK_N * stride_n;
+      const float* __restrict__ Bs0 = w1s + nb_upper * BLOCK_N;
+      const float* __restrict__ Bs1 = w1s + nb_lower * BLOCK_N;
 
       if (use_brgemm) {
         // 1.b gemm: C0 = A @ B0
