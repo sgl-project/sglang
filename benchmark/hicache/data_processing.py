@@ -83,8 +83,9 @@ def common_filter_chat(
                 input_tokens += prompt_len
                 output_tokens += output_len
                 processed.append((prompt, prompt_len, output_len))
-            filtered_dataset.append(processed)
-            l += 1
+            if len(processed) != 0:
+                filtered_dataset.append(processed)
+                l += 1
 
     print(f"#Input tokens: {input_tokens}")
     print(f"#Output tokens: {output_tokens}")
