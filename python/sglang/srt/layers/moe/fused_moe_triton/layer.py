@@ -20,10 +20,10 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.utils import (
     get_bool_env_var,
+    is_cpu,
     is_hip,
     narrow_padded_param_and_loaded_weight,
     set_weight_attrs,
-    use_cpu,
 )
 
 if torch.cuda.is_available():
@@ -41,7 +41,7 @@ if _use_aiter:
     from aiter.fused_moe_bf16_asm import ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
 
-_use_cpu = use_cpu()
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
@@ -451,7 +451,7 @@ class FusedMoE(torch.nn.Module):
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         shard_size = expert_data.shape[shard_dim] // 2
 
-        if _use_cpu:
+        if _is_cpu:
             if shard_id == "w1":
                 param_data_start = 0
             else:
@@ -497,7 +497,7 @@ class FusedMoE(torch.nn.Module):
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
 
-        if _use_cpu:
+        if _is_cpu:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,

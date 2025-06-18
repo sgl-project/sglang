@@ -7,7 +7,7 @@ from typing import Callable, Optional, Union
 import torch
 from torch.nn import Parameter
 
-from sglang.srt.utils import use_cpu
+from sglang.srt.utils import is_cpu
 
 __all__ = [
     "BasevLLMParameter",
@@ -23,7 +23,7 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-_use_cpu = use_cpu()
+_is_cpu = is_cpu()
 
 
 class BasevLLMParameter(Parameter):
@@ -100,7 +100,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
 
             from sglang.srt.utils import narrow_padded_param_and_loaded_weight
 
-            if _use_cpu:
+            if _is_cpu:
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     self.data,
                     loaded_weight,
@@ -140,7 +140,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
 
         from sglang.srt.utils import narrow_padded_param_and_loaded_weight
 
-        if _use_cpu:
+        if _is_cpu:
             param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 param_data,
                 loaded_weight,
@@ -221,7 +221,7 @@ class RowvLLMParameter(BasevLLMParameter):
 
             from sglang.srt.utils import narrow_padded_param_and_loaded_weight
 
-            if _use_cpu:
+            if _is_cpu:
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     self.data,
                     loaded_weight,

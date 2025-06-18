@@ -31,14 +31,14 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.utils import (
+    is_cpu,
     narrow_padded_param_and_loaded_weight,
     set_weight_attrs,
-    use_cpu,
 )
 
 logger = logging.getLogger(__name__)
 
-_use_cpu = use_cpu()
+_is_cpu = is_cpu()
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
@@ -415,7 +415,7 @@ class ColumnParallelLinear(LinearBase):
             shard_size = param_data.shape[output_dim]
             start_idx = self.tp_rank * shard_size
 
-            if _use_cpu:
+            if _is_cpu:
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     param_data,
                     loaded_weight,
@@ -647,7 +647,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size
 
-            if _use_cpu:
+            if _is_cpu:
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     param_data,
                     loaded_weight,
@@ -1129,7 +1129,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_id = self.tp_rank // self.num_kv_head_replicas
             start_idx = shard_id * shard_size
 
-            if _use_cpu:
+            if _is_cpu:
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     param_data,
                     loaded_weight,
@@ -1288,7 +1288,7 @@ class RowParallelLinear(LinearBase):
             shard_size = param_data.shape[input_dim]
             start_idx = self.tp_rank * shard_size
 
-            if _use_cpu:
+            if _is_cpu:
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     param_data,
                     loaded_weight,

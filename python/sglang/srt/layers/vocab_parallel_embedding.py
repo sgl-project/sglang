@@ -20,9 +20,9 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
-from sglang.srt.utils import set_weight_attrs, use_cpu
+from sglang.srt.utils import is_cpu, set_weight_attrs
 
-_use_cpu = use_cpu()
+_is_cpu = is_cpu()
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
@@ -248,7 +248,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         # Support the case where the vocab size is not divisible by the TP size.
         if (
-            _use_cpu
+            _is_cpu
             and pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size != 0
         ):
             padding_size *= self.tp_size
