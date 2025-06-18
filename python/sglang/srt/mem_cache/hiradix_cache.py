@@ -14,6 +14,10 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.memory_pool_host import (
+    MHATokenToKVPoolHost,
+    MLATokenToKVPoolHost,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
 logger = logging.getLogger(__name__)
