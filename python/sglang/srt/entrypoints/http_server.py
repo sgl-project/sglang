@@ -43,7 +43,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import (
-    FakeBootstrapHost,
+    FAKE_BOOTSTRAP_HOST,
     register_disaggregation_server,
 )
 from sglang.srt.entrypoints.engine import _launch_subprocesses
@@ -67,6 +67,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+    V1RerankReqInput,
     VertexGenerateReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -79,6 +80,7 @@ from sglang.srt.openai_api.adapter import (
     v1_delete_file,
     v1_embeddings,
     v1_files_create,
+    v1_rerank,
     v1_retrieve_batch,
     v1_retrieve_file,
     v1_retrieve_file_content,
@@ -323,6 +325,15 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         ret = await _global_state.tokenizer_manager.generate_request(
             obj, request
         ).__anext__()
+        return ret
+    except ValueError as e:
+        return _create_error_response(e)
+
+
+@app.api_route("/v1/rerank", methods=["POST", "PUT"])
+async def v1_rerank_request(obj: V1RerankReqInput, raw_request: Request):
+    try:
+        ret = await v1_rerank(_global_state.tokenizer_manager, obj, raw_request)
         return ret
     except ValueError as e:
         return _create_error_response(e)
@@ -878,7 +889,7 @@ def _wait_and_warmup(
                     "max_new_tokens": 8,
                     "ignore_eos": True,
                 },
-                "bootstrap_host": [FakeBootstrapHost] * server_args.dp_size,
+                "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
                 # This is a hack to ensure fake transfer is enabled during prefill warmup
                 # ensure each dp rank has a unique bootstrap_room during prefill warmup
                 "bootstrap_room": [

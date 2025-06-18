@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum, auto
+from functools import total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -117,13 +118,14 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
 
+@total_ordering
 class CaptureHiddenMode(IntEnum):
     # Do not capture anything.
-    NULL = auto()
-    # Capture hidden states of all tokens.
-    FULL = auto()
+    NULL = 0
     # Capture a hidden state of the last token.
-    LAST = auto()
+    LAST = 1
+    # Capture hidden states of all tokens.
+    FULL = 2
 
     def need_capture(self):
         return self != CaptureHiddenMode.NULL
@@ -133,6 +135,9 @@ class CaptureHiddenMode(IntEnum):
 
     def is_last(self):
         return self == CaptureHiddenMode.LAST
+
+    def __lt__(self, other):
+        return self.value < other.value
 
 
 @dataclass
@@ -219,6 +224,9 @@ class ForwardBatch:
     # For input embeddings
     input_embeds: Optional[torch.tensor] = None
 
+    # For cross-encoder model
+    token_type_ids: Optional[torch.Tensor] = None
+
     # Sampling info
     sampling_info: SamplingBatchInfo = None
 
@@ -295,6 +303,7 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
+            token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
         )
         device = model_runner.device
@@ -311,17 +320,30 @@ class ForwardBatch:
 
         # For DP attention
         if batch.global_num_tokens is not None:
-            ret.global_num_tokens_cpu = batch.global_num_tokens
+
+            spec_num_draft_tokens = (
+                batch.spec_num_draft_tokens
+                if batch.spec_num_draft_tokens is not None
+                else 1
+            )
+            global_num_tokens = [
+                x * spec_num_draft_tokens for x in batch.global_num_tokens
+            ]
+            global_num_tokens_for_logprob = [
+                x * spec_num_draft_tokens for x in batch.global_num_tokens_for_logprob
+            ]
+
+            ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
-                batch.global_num_tokens, dtype=torch.int64
+                global_num_tokens, dtype=torch.int64
             ).to(device, non_blocking=True)
 
-            ret.global_num_tokens_for_logprob_cpu = batch.global_num_tokens_for_logprob
+            ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                batch.global_num_tokens_for_logprob, dtype=torch.int64
+                global_num_tokens_for_logprob, dtype=torch.int64
             ).to(device, non_blocking=True)
 
-            sum_len = sum(batch.global_num_tokens)
+            sum_len = sum(global_num_tokens)
             ret.gathered_buffer = torch.zeros(
                 (sum_len, model_runner.model_config.hidden_size),
                 dtype=model_runner.dtype,
@@ -351,8 +373,8 @@ class ForwardBatch:
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
+            ret.extend_num_tokens = batch.extend_num_tokens
             if support_triton(model_runner.server_args.attention_backend):
-                ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
                     ret.extend_prefix_lens,
                     ret.extend_seq_lens,

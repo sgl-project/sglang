@@ -71,7 +71,7 @@ class TestSharedExpert(CustomTestCase):
         )
 
         atol = rtol = precision[ref.dtype]
-        self.assertTrue(torch.allclose(ref, res, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref, res, atol=atol, rtol=rtol)
 
     def test_bf16_shared_expert(self):
         for params in itertools.product(
@@ -129,7 +129,7 @@ class TestSharedExpert(CustomTestCase):
         )
 
         atol = rtol = precision[ref2.dtype]
-        self.assertTrue(torch.allclose(ref2, res2, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref2, res2, atol=atol, rtol=rtol)
 
     def test_int8_shared_expert(self):
         for params in itertools.product(
@@ -199,7 +199,7 @@ class TestSharedExpert(CustomTestCase):
         )
 
         atol = rtol = precision[ref_out.dtype]
-        self.assertTrue(torch.allclose(ref_out, out, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
     def test_fp8_shared_expert(self):
         for params in itertools.product(
