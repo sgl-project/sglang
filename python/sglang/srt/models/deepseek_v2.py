@@ -736,6 +736,12 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         # For tensor parallel attention
         if self.q_lora_rank is not None:
+
+            if layer_id == 52:
+                print(
+                    f"[{prefix}.fused_qkv_a_proj_with_mqa] q_lora_rank : {self.q_lora_rank}, latent : {self.kv_lora_rank + self.qk_rope_head_dim}, hidden_size : {hidden_size}"
+                )
+
             self.fused_qkv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
                 self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
@@ -743,6 +749,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
                 fused_parameters=2,
+                fused_rank=1,
+                fused_shapes=(
+                    self.q_lora_rank,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ),
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(

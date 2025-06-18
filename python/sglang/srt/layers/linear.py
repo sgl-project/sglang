@@ -213,6 +213,8 @@ class LinearBase(torch.nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         fused_parameters: int = 0,
+        fused_rank: int = -1,
+        fused_shapes: tuple = (),
     ):
         super().__init__()
 
@@ -225,6 +227,9 @@ class LinearBase(torch.nn.Module):
         self.skip_bias_add = skip_bias_add
         # Fix to PR#5619, to create fused weight/input scalars with correct size
         self.fused_parameters = fused_parameters
+        # Fix to PR#5619, to apply fused scalars to each shards
+        self.fused_rank = fused_rank
+        self.fused_shapes = fused_shapes
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
@@ -260,7 +265,9 @@ class ReplicatedLinear(LinearBase):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        fused_parameters: int = None,
+        fused_parameters: int = 0,
+        fused_rank: int = -1,
+        fused_shapes: tuple = (),
     ):
         super().__init__(
             input_size,
@@ -270,6 +277,8 @@ class ReplicatedLinear(LinearBase):
             quant_config,
             prefix=prefix,
             fused_parameters=fused_parameters,
+            fused_rank=fused_rank,
+            fused_shapes=fused_shapes,
         )
 
         # All the linear layer supports quant method.
