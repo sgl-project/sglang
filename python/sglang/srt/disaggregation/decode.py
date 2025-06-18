@@ -54,7 +54,6 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
 

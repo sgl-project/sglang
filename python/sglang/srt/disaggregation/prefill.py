@@ -404,12 +404,18 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 self.disagg_prefill_inflight_queue.append(req)
-                req.hidden_states_tensor = logits_output.hidden_states[
+                req.hidden_states_tensor = (
+                    logits_output.hidden_states[
                         hidden_state_offset : (
                             hidden_state_offset := hidden_state_offset
-                                + len(req.origin_input_ids)
-                            )
-                        ][-1].cpu().clone() if logits_output.hidden_states is not None else None
+                            + len(req.origin_input_ids)
+                        )
+                    ][-1]
+                    .cpu()
+                    .clone()
+                    if logits_output.hidden_states is not None
+                    else None
+                )
                 if req.return_logprob:
                     assert extend_logprob_start_len_per_req is not None
                     assert extend_input_len_per_req is not None

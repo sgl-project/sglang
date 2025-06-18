@@ -165,7 +165,9 @@ class MetadataBuffers:
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         if req.hidden_states_tensor is not None:
-            self.output_hidden_states[req.metadata_buffer_index].copy_(req.hidden_states_tensor)
+            self.output_hidden_states[req.metadata_buffer_index].copy_(
+                req.hidden_states_tensor
+            )
         if req.return_logprob:
             if req.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
