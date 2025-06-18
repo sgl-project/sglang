@@ -6,17 +6,13 @@ from typing import List, Mapping, Tuple, Union
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_npu
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
-if not _is_cuda:
+if not _is_cuda and not _is_npu:
     from vllm._custom_ops import scaled_fp8_quant
-
-
-def is_fp8_fnuz() -> bool:
-    # only device 0 is checked, this assumes MI300 platforms are homogeneous
-    return "gfx94" in torch.cuda.get_device_properties(0).gcnArchName
 
 
 def is_layer_skipped(

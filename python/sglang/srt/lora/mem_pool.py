@@ -50,15 +50,15 @@ class LoRAMemoryPool:
         self.uid_to_buffer_id: Dict[Optional[str], int] = {}
 
         # Buffer idx -> lora uid in memory pool
-        # All uids are initalized as empty strings for empty buffer slots
-        # Here we don't initalize to None since None is a valid uid
+        # All uids are initialized as empty strings for empty buffer slots
+        # Here we don't initialize to None since None is a valid uid
         self.buffer_id_to_uid: List[Optional[str]] = [""] * self.max_loras_per_batch
 
     def get_lora_A_shape(
         self, module_name: str, base_model: torch.nn.Module
     ) -> Tuple[int]:
         """
-        Given a module_name (might be a stacked name), return the hidden dims of modules's input and output.
+        Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
         """
         input_dim, _ = get_hidden_dim(module_name, self.base_hf_config, base_model)
         c = get_stacked_multiply(module_name)
@@ -75,7 +75,7 @@ class LoRAMemoryPool:
         self, module_name: str, base_model: torch.nn.Module
     ) -> Tuple[int]:
         """
-        Given a module_name (might be a stacked name), return the hidden dims of modules's input and output.
+        Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
         """
         _, output_dim = get_hidden_dim(module_name, self.base_hf_config, base_model)
         c = get_stacked_multiply(module_name)
@@ -91,18 +91,16 @@ class LoRAMemoryPool:
 
     def init_buffers(
         self,
-        lora_weight_names: Set[Tuple[str]],
+        lora_weight_names: Tuple[Set[str]],
         base_model: torch.nn.Module,
     ):
 
         # lora_weight_names is a set of name pairs indicating each pair of lora modules to load
         #   e.g., {("qkv_proj", "q_proj"), ("qkv_proj", "kv_proj"), ("o_proj", "o_proj")}
-        self.lora_weight_names: Set[Tuple[str]] = lora_weight_names
+        self.lora_weight_names: Tuple[Set[str]] = lora_weight_names
         device = next(base_model.parameters()).device
-        lora_module_A_names = set([name[0] for name in lora_weight_names])
-        lora_module_B_names = set([name[1] for name in lora_weight_names])
         # Init A tensor, column_major=False
-        for module_A in lora_module_A_names:
+        for module_A in lora_weight_names[0]:
             lora_A_shape = self.get_lora_A_shape(module_A, base_model)
             self.A_buffer[module_A] = [
                 torch.empty(
@@ -110,10 +108,10 @@ class LoRAMemoryPool:
                     dtype=self.dtype,
                     device=device,
                 )
-                for i in range(self.num_layer)
+                for _ in range(self.num_layer)
             ]
         # Init B tensor, column_major=True
-        for module_B in lora_module_B_names:
+        for module_B in lora_weight_names[1]:
             lora_B_shape = self.get_lora_B_shape(module_B, base_model)
             self.B_buffer[module_B] = [
                 torch.empty(
@@ -134,12 +132,13 @@ class LoRAMemoryPool:
             for buffer_id in range(self.max_loras_per_batch):
                 # Prioritize empty slots
                 if self.buffer_id_to_uid[buffer_id] == "":
-                    return buffer_id, ""
+                    return buffer_id
 
             for buffer_id in range(self.max_loras_per_batch):
                 # Evict unneeded lora
                 if self.buffer_id_to_uid[buffer_id] not in cur_uids:
-                    return buffer_id, self.buffer_id_to_uid[buffer_id]
+                    self.uid_to_buffer_id.pop(self.buffer_id_to_uid[buffer_id])
+                    return buffer_id
 
             raise ValueError(
                 "No available buffer slots found. Please ensure the number of active loras is less than max_loras_per_batch."
@@ -147,9 +146,7 @@ class LoRAMemoryPool:
 
         for uid in cur_uids:
             if uid not in self.uid_to_buffer_id:
-                buffer_id, evicted_lora_uid = get_available_buffer_slot()
-                if evicted_lora_uid != "":
-                    self.uid_to_buffer_id.pop(evicted_lora_uid)
+                buffer_id = get_available_buffer_slot()
                 self.load_lora_weight_to_buffer(
                     uid, buffer_id, lora_adapters.get(uid, None)
                 )
@@ -159,6 +156,10 @@ class LoRAMemoryPool:
     def load_lora_weight_to_buffer(
         self, uid: str, buffer_id: int, lora_adapter: LoRAAdapter = None
     ):
+        def check_lora_weight_shape(buffer_view: torch.Tensor, weight: torch.Tensor):
+            assert (
+                buffer_view.shape == weight.shape
+            ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
 
         if uid is None:
             for i in range(self.num_layer):
@@ -210,21 +211,27 @@ class LoRAMemoryPool:
 
             for name, weights in temp_A_buffer.items():
                 c = get_stacked_multiply(name)
-                self.A_buffer[name][layer_id][buffer_id][: lora_rank * c, :].copy_(
-                    weights
-                )
+                buffer_view = self.A_buffer[name][layer_id][buffer_id][
+                    : lora_rank * c, :
+                ]
+                check_lora_weight_shape(buffer_view, weights)
+                buffer_view.copy_(weights)
 
             for name, weights in temp_B_buffer.items():
                 c = get_stacked_multiply(name)
                 if c > 1:
                     for stacked_id in range(c):
-                        self.B_buffer[name][layer_id][stacked_id][buffer_id][
-                            :, :lora_rank
-                        ].copy_(weights[stacked_id])
+                        buffer_view = self.B_buffer[name][layer_id][stacked_id][
+                            buffer_id
+                        ][:, :lora_rank]
+                        check_lora_weight_shape(buffer_view, weights[stacked_id])
+                        buffer_view.copy_(weights[stacked_id])
                 else:
-                    self.B_buffer[name][layer_id][0][buffer_id][:, :lora_rank].copy_(
-                        weights
-                    )
+                    buffer_view = self.B_buffer[name][layer_id][0][buffer_id][
+                        :, :lora_rank
+                    ]
+                    check_lora_weight_shape(buffer_view, weights)
+                    buffer_view.copy_(weights)
 
     def get_tensor(
         self, weight_name: str, layer_id: int, lora_type: LoRAType

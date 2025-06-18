@@ -33,17 +33,25 @@ class EvalArgs:
     prompt_format_file: str = "prompt_format.yaml"
     dataset_path: str = "MMMU/MMMU"
     extra_request_body: Optional[str] = None
+    profile: bool = False
+    profile_number: int = 5
+    concurrency: int = 1
+    lora_path: Optional[str] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument(
-            "--result-filename", type=str, default=EvalArgs.result_filename
+            "--result-filename",
+            type=str,
+            default=EvalArgs.result_filename,
+            help="The filename to save the evaluation results.",
         )
-
         parser.add_argument(
-            "--image-pixels-limit", type=int, default=EvalArgs.image_pixels_limit
+            "--image-pixels-limit",
+            type=int,
+            default=EvalArgs.image_pixels_limit,
+            help="The maximum number of pixels allowed for an image. If an image exceeds this limit, it will be skipped during evaluation.",
         )
-
         parser.add_argument(
             "--dataset-path",
             type=str,
@@ -56,7 +64,12 @@ class EvalArgs:
             type=str,
             help="The path to the prompt format of mmmu. If not, a default format llava_config.yaml will be used",
         )
-        parser.add_argument("--split", type=str, default=EvalArgs.split)
+        parser.add_argument(
+            "--split",
+            type=str,
+            default=EvalArgs.split,
+            help='Split of the dataset to use for evaluation. Default is "validation".',
+        )
         parser.add_argument(
             "--extra-request-body",
             metavar='{"key1": "value1", "key2": "value2"}',
@@ -64,6 +77,27 @@ class EvalArgs:
             default=EvalArgs.extra_request_body,
             help="Append given JSON object to the request payload. You can use this to specify"
             "additional generate params like sampling params.",
+        )
+        parser.add_argument(
+            "--profile", action="store_true", help="enable mmmu profile"
+        )
+        parser.add_argument(
+            "--profile-number",
+            type=int,
+            default=EvalArgs.profile_number,
+            help="Number of samples to profile. If not set, will profile all samples.",
+        )
+        parser.add_argument(
+            "--concurrency",
+            type=int,
+            default=EvalArgs.concurrency,
+            help="Number of concurrent requests to make during evaluation. Default is 1, which means no concurrency.",
+        )
+        parser.add_argument(
+            "--lora-path",
+            type=str,
+            default=EvalArgs.lora_path,
+            help="Specify the LoRA path to use for evaluation. If specified, the value will be specified in the body of every request as `lora-path`.",
         )
 
     @classmethod

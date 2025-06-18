@@ -147,7 +147,7 @@ class ReasoningParser:
 
     Args:
         model_type (str): Type of model to parse reasoning from
-        stream_reasoning (bool): If Flase, accumulates reasoning content until complete.
+        stream_reasoning (bool): If False, accumulates reasoning content until complete.
             If True, streams reasoning content as it arrives.
     """
 

@@ -82,8 +82,8 @@ def launch_server_process_and_send_one_request(
     base_url = f"http://{server_args.host}:{server_args.port}"
     timeout = compile_args.timeout
 
-    start_time = time.time()
-    while time.time() - start_time < timeout:
+    start_time = time.perf_counter()
+    while time.perf_counter() - start_time < timeout:
         try:
             headers = {
                 "Content-Type": "application/json; charset=utf-8",
@@ -112,9 +112,9 @@ def launch_server_process_and_send_one_request(
                         raise RuntimeError(f"Sync request failed: {error}")
                 # Other nodes should wait for the exit signal from Rank-0 node.
                 else:
-                    start_time_waiting = time.time()
+                    start_time_waiting = time.perf_counter()
                     while proc.is_alive():
-                        if time.time() - start_time_waiting < timeout:
+                        if time.perf_counter() - start_time_waiting < timeout:
                             time.sleep(10)
                         else:
                             raise TimeoutError("Waiting for main node timeout!")
@@ -129,7 +129,7 @@ def launch_server_process_and_send_one_request(
 
 
 def refine_server_args(server_args: ServerArgs, compile_args: CompileArgs):
-    # Disbale cuda graph and torch compile to save time
+    # Disable cuda graph and torch compile to save time
     server_args.disable_cuda_graph = True
     server_args.enable_torch_compile = False
     print(f"Disable CUDA Graph and Torch Compile to save time...")

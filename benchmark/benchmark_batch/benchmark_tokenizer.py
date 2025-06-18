@@ -44,10 +44,10 @@ def benchmark_sequential_vs_batch(prompts, batch_size, tokenizer):
     for run in range(NUM_RUNS):
         batch_prompts = prompts[:batch_size]  # Use same prompts for fair comparison
 
-        start_time = time.time()
+        start_time = time.perf_counter()
         for prompt in batch_prompts:
             tokens = tokenizer.encode(prompt)
-        sequential_time = (time.time() - start_time) * 1000
+        sequential_time = (time.perf_counter() - start_time) * 1000
         sequential_times.append(sequential_time)
 
     # Batch tokenization using tokenizer()
@@ -55,9 +55,9 @@ def benchmark_sequential_vs_batch(prompts, batch_size, tokenizer):
     for run in range(NUM_RUNS):
         batch_prompts = prompts[:batch_size]  # Use same prompts for fair comparison
 
-        start_time = time.time()
+        start_time = time.perf_counter()
         tokens = tokenizer(batch_prompts)
-        batch_time = (time.time() - start_time) * 1000
+        batch_time = (time.perf_counter() - start_time) * 1000
         batch_times.append(batch_time)
 
     return {

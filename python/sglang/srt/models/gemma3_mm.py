@@ -21,7 +21,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict
 
 import torch
 from torch import nn
-from transformers import AutoModel, Gemma3Config, PreTrainedModel
+from transformers import Gemma3Config, PreTrainedModel
 
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
@@ -42,6 +42,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
+from sglang.srt.models.siglip import SiglipVisionModel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         ".k_proj.",
         ".v_proj.",
         ".o_proj.",
+        ".out_proj.",
     ]
     bitsandbytes_stacked_params_mapping = {
         # shard_name, weight_name, index
@@ -126,6 +128,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         "v_proj": ("qkv_proj", 2),
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
+        "out_proj": ("proj", 0),
     }
 
     packed_modules_mapping = {
@@ -161,20 +164,21 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         super().__init__(config=config)
         self.config = config
         self.quant_config = quant_config
-        # Vision components
-        # TODO: replace with vision attention
-        # self.vision_tower = SiglipVisionModel(
-        #     config.vision_config,
-        #     quant_config,
-        #     prefix=add_prefix("vision_tower", prefix),
-        # )
-        self.vision_tower = AutoModel.from_config(config=config.vision_config)
+
+        self.vision_tower = SiglipVisionModel(
+            config=config.vision_config,
+            quant_config=quant_config,
+            prefix=add_prefix("vision_tower", prefix),
+        )
+
         self.multi_modal_projector = Gemma3MultiModalProjector(config)
         self.vocab_size = config.text_config.vocab_size
 
         # Text model
         self.language_model = Gemma3ForCausalLM(
-            config.text_config, quant_config, prefix=add_prefix("model", prefix)
+            config.text_config,
+            quant_config,
+            prefix=add_prefix("language_model", prefix),
         )
         if self.language_model.logits_processor.logit_scale:
             logit_scale = getattr(config, "logit_scale", 1.0)
@@ -278,13 +282,33 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
-        pixel_values = torch.stack(
-            flatten_nested_list([item.pixel_values for item in items]), dim=0
-        )
-        pixel_values = pixel_values.to("cuda")
-        pixel_values = pixel_values.to(dtype=self.language_model.dtype())
+        # Process images one by one to handle flatten_batch=True constraint in vision_tower
+        all_pixel_values = flatten_nested_list([item.pixel_values for item in items])
+        vision_outputs_list = []
 
-        vision_outputs = self.vision_tower(pixel_values=pixel_values).last_hidden_state
+        for pixel_values_batch in all_pixel_values:
+            # Normalize input shape to [batch_size, channels, height, width]
+            if pixel_values_batch.dim() == 5:
+                pixel_values_batch = pixel_values_batch.squeeze(0)
+            elif pixel_values_batch.dim() == 3:
+                pixel_values_batch = pixel_values_batch.unsqueeze(0)
+            elif pixel_values_batch.dim() != 4:
+                raise ValueError(
+                    f"Unexpected pixel_values shape: {pixel_values_batch.shape}"
+                )
+
+            # Process each image in the batch
+            batch_size = pixel_values_batch.shape[0]
+            for i in range(batch_size):
+                pixel_value = pixel_values_batch[i : i + 1]  # Keep batch dimension as 1
+                pixel_value = pixel_value.to(
+                    device=self.vision_tower.device, dtype=self.language_model.dtype()
+                )
+                vision_output = self.vision_tower(pixel_values=pixel_value)
+                vision_outputs_list.append(vision_output)
+
+        # Concatenate all vision outputs
+        vision_outputs = torch.cat(vision_outputs_list, dim=0)
         image_features = self.multi_modal_projector(vision_outputs)
         return image_features
 
@@ -360,6 +384,14 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         return self.language_model.tie_weights()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            ("gate_up_proj", "up_proj", 1),
+            ("gate_up_proj", "gate_proj", 0),
+        ]
         """Load weights for the model."""
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
@@ -373,21 +405,33 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                 loaded_params.update(causal_loaded_params)
                 continue
             else:
-                # Skip lm_head.weight as it's tied with embed_tokens
-                if "lm_head.weight" in name:
-                    continue
-
-                # Skip loading extra bias for GPTQ models
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                # Remapping the name of FP8 kv-scale
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    break
+                else:
+                    if "vision_model" in name:
+                        # adapt to VisionAttention
+                        name = name.replace(".self_attn.out_proj", ".self_attn.proj")
+                    # Skip loading extra bias for GPTQ models
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Remapping the name of FP8 kv-scale
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
                 loaded_params.add(name)
         unloaded_params = params_dict.keys() - loaded_params
         if unloaded_params:
@@ -398,5 +442,3 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
 
 
 EntryClass = Gemma3ForConditionalGeneration
-
-AutoModel.register(Gemma3Config, Gemma3ForConditionalGeneration, exist_ok=True)

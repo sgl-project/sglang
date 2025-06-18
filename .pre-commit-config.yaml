@@ -23,7 +23,7 @@ repos:
     hooks:
       - id: isort
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.2
+    rev: v0.11.7
     hooks:
       - id: ruff
         args: [--select=F401, --fixable=F401]
@@ -33,6 +33,12 @@ repos:
     rev: 24.10.0
     hooks:
       - id: black-jupyter
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        additional_dependencies: ['tomli']
+        args: ['--toml', 'python/pyproject.toml']
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.8
     hooks:

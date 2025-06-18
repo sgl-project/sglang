@@ -1,3 +1,4 @@
+# python3 benchmark/kernels/fused_moe_triton/benchmark_vllm_vs_sglang_fused_moe_triton.py --model /DeepSeek-V3/ --tp-size 8 --use-fp8-w8a8
 import argparse
 
 import torch
@@ -6,6 +7,12 @@ import vllm
 from transformers import AutoConfig
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_moe as fused_moe_vllm
 
+from sglang.srt.distributed.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe as fused_moe_sglang,
 )
@@ -36,9 +43,18 @@ def get_model_config(model_name: str, tp_size: int):
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // tp_size
     elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
-        E = config.n_routed_experts
+        E = (
+            config.n_routed_experts + 1
+            if config.architectures[0] in ["DeepseekV3ForCausalLM"]
+            else config.n_routed_experts
+        )
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // tp_size
+    elif config.architectures[0] == "Llama4ForConditionalGeneration":
+        E = config.text_config.num_local_experts
+        topk = config.text_config.num_experts_per_tok
+        intermediate_size = config.text_config.intermediate_size
         shard_intermediate_size = 2 * intermediate_size // tp_size
     elif config.architectures[0] in [
         "Grok1ForCausalLM",
@@ -182,7 +198,7 @@ def fused_moe_sglang_api(
         args={},
     )
 )
-def benchmark(batch_size, provider, model_config, use_fp8=False):
+def benchmark(batch_size, provider, model_config, use_fp8_w8a8=False):
     print(f"benchmark {provider} with batch_size={batch_size}")
     torch.set_default_device("cuda")
     torch.cuda.manual_seed_all(0)
@@ -193,12 +209,12 @@ def benchmark(batch_size, provider, model_config, use_fp8=False):
     shard_intermediate_size = model_config["shard_intermediate_size"]
     topk = model_config["topk"]
     dtype = model_config["dtype"]
-    block_shape = getattr(model_config, "block_shape", None)
+    block_shape = model_config["block_shape"]
 
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
     w1_scale = w2_scale = a1_scale = a2_scale = None
 
-    if use_fp8:
+    if use_fp8_w8a8:
         init_dtype = dtype
         w1 = torch.randn(
             num_experts, shard_intermediate_size, hidden_size, dtype=init_dtype
@@ -247,7 +263,7 @@ def benchmark(batch_size, provider, model_config, use_fp8=False):
             w2,
             input_gating,
             topk,
-            use_fp8_w8a8=use_fp8,
+            use_fp8_w8a8=use_fp8_w8a8,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=a1_scale,
@@ -264,7 +280,7 @@ def benchmark(batch_size, provider, model_config, use_fp8=False):
             w2,
             input_gating,
             topk,
-            use_fp8_w8a8=use_fp8,
+            use_fp8_w8a8=use_fp8_w8a8,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=a1_scale,
@@ -282,7 +298,7 @@ def main():
         "--model", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1"
     )
     parser.add_argument("--tp-size", type=int, default=2)
-    parser.add_argument("--use-fp8", action="store_true")
+    parser.add_argument("--use-fp8-w8a8", action="store_true")
     parser.add_argument(
         "--save-path",
         type=str,
@@ -290,14 +306,39 @@ def main():
     )
     args = parser.parse_args()
 
-    model_config = get_model_config(args.model, args.tp_size)
-    benchmark.run(
-        show_plots=True,
-        print_data=True,
-        save_path=args.save_path,
-        model_config=model_config,
-        use_fp8=args.use_fp8,
-    )
+    try:
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                backend="nccl" if torch.cuda.is_available() else "gloo",
+                init_method="tcp://127.0.0.1:23456",
+                world_size=1,
+                rank=0,
+            )
+
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            distributed_init_method="tcp://127.0.0.1:23456",
+            local_rank=0,
+            backend="nccl" if torch.cuda.is_available() else "gloo",
+        )
+
+        initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+        )
+
+        model_config = get_model_config(args.model, args.tp_size)
+        benchmark.run(
+            show_plots=True,
+            print_data=True,
+            save_path=args.save_path,
+            model_config=model_config,
+            use_fp8_w8a8=args.use_fp8_w8a8,
+        )
+    finally:
+        destroy_model_parallel()
+        destroy_distributed_environment()
 
 
 if __name__ == "__main__":

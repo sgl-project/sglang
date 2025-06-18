@@ -111,7 +111,9 @@ class BaseFlashAttentionTest(CustomTestCase):
 
         if self.speculative_decode:
             server_info = requests.get(self.base_url + "/get_server_info")
-            avg_spec_accept_length = server_info.json()["avg_spec_accept_length"]
+            avg_spec_accept_length = server_info.json()["internal_states"][0][
+                "avg_spec_accept_length"
+            ]
             print(f"{avg_spec_accept_length=}")
             self.assertGreater(avg_spec_accept_length, self.spec_decode_threshold)
 
@@ -141,7 +143,7 @@ class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
         args.extend(
             [
                 "--cuda-graph-max-bs",
-                "2",
+                "4",
                 "--speculative-algorithm",
                 "EAGLE3",
                 "--speculative-draft",
@@ -167,7 +169,7 @@ class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
     model = DEFAULT_MODEL_NAME_FOR_TEST
     accuracy_threshold = 0.65
     speculative_decode = True
-    spec_decode_threshold = 1.5
+    spec_decode_threshold = 1.6
 
     @classmethod
     def get_server_args(cls):
@@ -175,7 +177,7 @@ class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
         args.extend(
             [
                 "--cuda-graph-max-bs",
-                "2",
+                "4",
                 "--speculative-algorithm",
                 "EAGLE3",
                 "--speculative-draft",
@@ -199,7 +201,7 @@ class TestFlashAttention3MLASpeculativeDecode(BaseFlashAttentionTest):
     model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
     accuracy_threshold = 0.60
     speculative_decode = True
-    spec_decode_threshold = 1.5
+    spec_decode_threshold = 2.5
 
     @classmethod
     def get_server_args(cls):
@@ -207,7 +209,7 @@ class TestFlashAttention3MLASpeculativeDecode(BaseFlashAttentionTest):
         args.extend(
             [
                 "--cuda-graph-max-bs",
-                "2",
+                "4",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-draft",
@@ -231,7 +233,7 @@ class TestFlashAttention3MLASpeculativeDecodeTopk(BaseFlashAttentionTest):
     model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
     accuracy_threshold = 0.60
     speculative_decode = True
-    spec_decode_threshold = 1.5
+    spec_decode_threshold = 2.95
 
     @classmethod
     def get_server_args(cls):
@@ -239,7 +241,7 @@ class TestFlashAttention3MLASpeculativeDecodeTopk(BaseFlashAttentionTest):
         args.extend(
             [
                 "--cuda-graph-max-bs",
-                "2",
+                "4",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-draft",

@@ -197,6 +197,15 @@ class DefaultModelLoader(BaseModelLoader):
         fall_back_to_pt: bool = True
         """Whether .pt weights can be used."""
 
+        @classmethod
+        def init_new(cls, model_config: ModelConfig, model):
+            return cls(
+                model_config.model_path,
+                model_config.revision,
+                prefix="",
+                fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
+            )
+
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         if load_config.model_loader_extra_config:
@@ -341,12 +350,7 @@ class DefaultModelLoader(BaseModelLoader):
         model: nn.Module,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
 
-        primary_weights = DefaultModelLoader.Source(
-            model_config.model_path,
-            model_config.revision,
-            prefix="",
-            fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
-        )
+        primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
         yield from self._get_weights_iterator(primary_weights)
 
         secondary_weights = cast(
@@ -374,19 +378,26 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config,
                 )
 
-            model.load_weights(self._get_all_weights(model_config, model))
+            self.load_weights_and_postprocess(
+                model, self._get_all_weights(model_config, model), target_device
+            )
 
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    # When quant methods need to process weights after loading
-                    # (for repacking, quantizing, etc), they expect parameters
-                    # to be on the global target device. This scope is for the
-                    # case where cpu offloading is used, where we will move the
-                    # parameters onto device for processing and back off after.
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
         return model.eval()
+
+    @staticmethod
+    def load_weights_and_postprocess(model, weights, target_device):
+        model.load_weights(weights)
+
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                # When quant methods need to process weights after loading
+                # (for repacking, quantizing, etc), they expect parameters
+                # to be on the global target device. This scope is for the
+                # case where cpu offloading is used, where we will move the
+                # parameters onto device for processing and back off after.
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -1248,12 +1259,19 @@ class GGUFModelLoader(BaseModelLoader):
         ):
             model_config.hf_config.update({"tie_word_embeddings": True})
 
+        target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
+            with target_device:
                 model = _initialize_model(model_config, self.load_config)
             model.load_weights(
                 self._get_weights_iterator(local_model_path, gguf_weights_map)
             )
+
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
         return model
 
 

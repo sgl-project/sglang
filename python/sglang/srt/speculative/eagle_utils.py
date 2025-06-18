@@ -1,45 +1,52 @@
 from __future__ import annotations
 
+import logging
 import os
+import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import (
+    Req,
     ScheduleBatch,
     get_last_loc,
     global_server_args_dict,
 )
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.speculative.build_eagle_tree import build_tree_kernel_efficient
-from sglang.srt.utils import fast_topk, is_cuda, is_hip, next_power_of_2
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
+
+logger = logging.getLogger(__name__)
 
 if is_cuda():
     from sgl_kernel import (
+        fast_topk,
         top_k_renorm_prob,
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
         verify_tree_greedy,
     )
 elif is_hip():
-    from sgl_kernel import verify_tree_greedy
+    from sgl_kernel import fast_topk, verify_tree_greedy
 
-if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
-
-import logging
 
 logger = logging.getLogger(__name__)
 
 
+# Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
+SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
+
+TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 
 
 @dataclass
@@ -63,9 +70,9 @@ class EagleDraftInput:
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
 
-    all_padding_lens: Optional[torch.Tensor] = None
-
     def prepare_for_extend(self, batch: ScheduleBatch):
+        if batch.forward_mode.is_idle():
+            return
         # Prefill only generate 1 token.
         assert len(self.verified_id) == len(batch.seq_lens)
 
@@ -77,36 +84,51 @@ class EagleDraftInput:
             )
             pt += extend_len
 
+    @classmethod
+    def create_idle_input(
+        cls,
+        device: torch.device,
+        hidden_size: int,
+        topk: int,
+        capture_hidden_mode: CaptureHiddenMode,
+    ):
+        return cls(
+            verified_id=None,
+            hidden_states=torch.empty(
+                (0, hidden_size), device=device, dtype=torch.float32
+            ),
+            topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
+            topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
+            capture_hidden_mode=capture_hidden_mode,
+        )
+
     def prepare_extend_after_decode(
         self,
         batch: ScheduleBatch,
         speculative_num_steps: int,
     ):
-        assert len(self.verified_id) == len(batch.out_cache_loc)
-        accept_length_cpu = batch.spec_info.accept_length_cpu
-        batch.extend_lens = [x + 1 for x in accept_length_cpu]
+        batch.forward_mode = ForwardMode.DRAFT_EXTEND
+        batch.input_ids = self.verified_id
+        batch.extend_lens = [x + 1 for x in batch.spec_info.accept_length_cpu]
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
         batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
-        seq_lens_cpu = batch.seq_lens.tolist()
+        batch.return_logprob = False
+        batch.return_hidden_states = False
 
-        self.positions = torch.empty_like(self.verified_id, dtype=torch.long)
-        new_verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
+        self.capture_hidden_mode = CaptureHiddenMode.LAST
         self.accept_length.add_(1)
+        self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
+        self.verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
 
-        create_extend_spec_info[(self.accept_length.numel(),)](
-            self.verified_id,
+        create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
+            batch.input_ids,
             batch.seq_lens,
             self.accept_length,
-            torch.cumsum(self.accept_length, axis=0, dtype=torch.int),
             self.positions,
-            new_verified_id,
-            next_power_of_2(speculative_num_steps + 1),
+            self.verified_id,
+            next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
         )
-
-        batch.seq_lens_sum = sum(seq_lens_cpu)
-        batch.input_ids = self.verified_id
-        self.verified_id = new_verified_id
 
     def generate_attn_arg_prefill(
         self,
@@ -116,15 +138,17 @@ class EagleDraftInput:
         req_to_token: torch.Tensor,
     ):
         bs = self.accept_length.numel()
-
         qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         qo_indptr[1:] = torch.cumsum(self.accept_length, dim=0)
-
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device="cuda")
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
-        # TODO: replace cum_kv_seq_len[-1] with paged_kernel_lens_sum to avoid the device sync.
-        kv_indices = torch.empty(cum_kv_seq_len[-1], dtype=torch.int32, device="cuda")
+        if paged_kernel_lens_sum is None:
+            paged_kernel_lens_sum = cum_kv_seq_len[-1]
+
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
+        )
 
         create_flashinfer_kv_indices_triton[(bs,)](
             req_to_token,
@@ -135,7 +159,6 @@ class EagleDraftInput:
             kv_indices,
             req_to_token.size(1),
         )
-
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
     def filter_batch(self, new_indices: torch.Tensor):
@@ -167,12 +190,12 @@ class EagleVerifyOutput:
     draft_input: EagleDraftInput
     # Logit outputs from target worker
     logits_output: LogitsProcessorOutput
-    # Accepeted token ids including the bonus token
+    # Accepted token ids including the bonus token
     verified_id: torch.Tensor
-    # Accepeted token length per sequence in a batch in CPU.
+    # Accepted token length per sequence in a batch in CPU.
     accept_length_per_req_cpu: List[int]
-    # Accepeted indices from logits_output.next_token_logits
-    accepeted_indices: torch.Tensor
+    # Accepted indices from logits_output.next_token_logits
+    accepted_indices: torch.Tensor
 
 
 @dataclass
@@ -184,56 +207,43 @@ class EagleVerifyInput:
     retrive_next_token: torch.Tensor
     retrive_next_sibling: torch.Tensor
     retrive_cum_len: torch.Tensor
-    draft_token_num: int
     spec_steps: int
+    topk: int
+    draft_token_num: int
     capture_hidden_mode: CaptureHiddenMode
+    seq_lens_sum: int
+    seq_lens_cpu: torch.Tensor
+    grammar: BaseGrammarObject = None
 
     @classmethod
-    def create(
-        cls,
-        verified_id: torch.Tensor,
-        score_list: List[torch.Tensor],
-        token_list: List[torch.Tensor],
-        parents_list: List[torch.Tensor],
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        topk: int,
-        spec_steps: int,
-        num_verify_tokens: int,
-    ):
-        (
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            verified_id,
-            score_list,
-            token_list,
-            parents_list,
-            seq_lens,
-            seq_lens_sum,
-            topk,
-            spec_steps,
-            num_verify_tokens,
-        )
-
+    def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
         return cls(
-            draft_tokens,
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            None,
-            num_verify_tokens,
-            spec_steps,
-            CaptureHiddenMode.FULL,
+            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
+            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
+            retrive_index=torch.full(
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+            ),
+            retrive_next_token=torch.full(
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+            ),
+            retrive_next_sibling=torch.full(
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+            ),
+            retrive_cum_len=None,
+            topk=topk,
+            draft_token_num=num_verify_tokens,
+            spec_steps=spec_steps,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            seq_lens_sum=0,
+            seq_lens_cpu=torch.empty((0,), dtype=torch.int32),
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
+
+        if batch.forward_mode.is_idle():
+            return
+
         batch.input_ids = self.draft_token
 
         if page_size == 1:
@@ -307,6 +317,7 @@ class EagleVerifyInput:
         logits_output: torch.Tensor,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         page_size: int,
+        vocab_mask: Optional[torch.Tensor] = None,  # For grammar
     ) -> torch.Tensor:
         """
         Verify and find accepted tokens based on logits output and batch
@@ -316,8 +327,27 @@ class EagleVerifyInput:
 
         This API updates values inside logits_output based on the accepted
         tokens. I.e., logits_output.next_token_logits only contains
-        accepeted token logits.
+        accepted token logits.
         """
+        if batch.forward_mode.is_idle():
+            return EagleVerifyOutput(
+                draft_input=EagleDraftInput.create_idle_input(
+                    device=batch.device,
+                    hidden_size=batch.model_config.hidden_size,
+                    topk=self.topk,
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                ),
+                logits_output=logits_output,
+                verified_id=torch.empty(0, dtype=torch.long, device=batch.device),
+                accept_length_per_req_cpu=[],
+                accepted_indices=torch.full(
+                    (0, self.spec_steps + 1),
+                    -1,
+                    dtype=torch.int32,
+                    device=batch.device,
+                ),
+            )
+
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
@@ -329,6 +359,14 @@ class EagleVerifyInput:
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
         )
         accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
+
+        # Apply the custom logit processors if registered in the sampling info.
+        if sampling_info.has_custom_logit_processor:
+            apply_custom_logit_processor(
+                logits_output.next_token_logits,
+                sampling_info,
+                num_tokens_in_batch=self.draft_token_num,
+            )
 
         # Apply penalty
         if sampling_info.penalizer_orchestrator.is_required:
@@ -343,6 +381,13 @@ class EagleVerifyInput:
                 torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
             )
 
+        # Apply grammar mask
+        if vocab_mask is not None:
+            assert self.grammar is not None
+            self.grammar.apply_vocab_mask(
+                logits=logits_output.next_token_logits, vocab_mask=vocab_mask
+            )
+
         # Sample tokens
         if batch.sampling_info.is_all_greedy:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
@@ -352,11 +397,11 @@ class EagleVerifyInput:
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=accept_length,  # mutable
-                candidates=candidates.to(torch.int32),
-                retrive_index=self.retrive_index.to(torch.int32),
-                retrive_next_token=self.retrive_next_token.to(torch.int32),
-                retrive_next_sibling=self.retrive_next_sibling.to(torch.int32),
-                target_predict=target_predict.to(torch.int32),
+                candidates=candidates,
+                retrive_index=self.retrive_index,
+                retrive_next_token=self.retrive_next_token,
+                retrive_next_sibling=self.retrive_next_sibling,
+                target_predict=target_predict,
             )
         else:
             # apply temperature and get target probs
@@ -384,16 +429,23 @@ class EagleVerifyInput:
             draft_probs = torch.zeros(
                 target_probs.shape, dtype=torch.float32, device="cuda"
             )
+
+            # coins for rejection sampling
             coins = torch.rand_like(candidates, dtype=torch.float32, device="cuda")
+            # coins for final sampling
+            coins_for_final_sampling = torch.rand(
+                (bs,), dtype=torch.float32, device="cuda"
+            )
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=accept_length,  # mutable
-                candidates=candidates.to(torch.int32),
-                retrive_index=self.retrive_index.to(torch.int32),
-                retrive_next_token=self.retrive_next_token.to(torch.int32),
-                retrive_next_sibling=self.retrive_next_sibling.to(torch.int32),
+                candidates=candidates,
+                retrive_index=self.retrive_index,
+                retrive_next_token=self.retrive_next_token,
+                retrive_next_sibling=self.retrive_next_sibling,
                 uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
                 target_probs=target_probs,
                 draft_probs=draft_probs,
                 threshold_single=global_server_args_dict[
@@ -416,8 +468,8 @@ class EagleVerifyInput:
                 spec_steps=self.spec_steps,
             )
 
-        new_accept_index = []
         unfinished_index = []
+        unfinished_accept_index = []
         accept_index_cpu = accept_index.tolist()
         predict_cpu = predict.tolist()
         has_finished = False
@@ -425,12 +477,10 @@ class EagleVerifyInput:
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
-            new_accept_index_ = []
             for j, idx in enumerate(accept_index_row):
                 if idx == -1:
                     break
                 id = predict_cpu[idx]
-                # if not found_finished:
                 req.output_ids.append(id)
                 req.check_finished()
                 if req.finished():
@@ -439,52 +489,113 @@ class EagleVerifyInput:
                     accept_index[i, j + 1 :] = -1
                     break
                 else:
-                    new_accept_index_.append(idx)
+                    if req.grammar is not None:
+                        try:
+                            req.grammar.accept_token(id)
+                        except ValueError as e:
+                            logger.info(
+                                f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
+                            )
+                            raise e
             if not req.finished():
-                new_accept_index.extend(new_accept_index_)
                 unfinished_index.append(i)
+                if idx == -1:
+                    unfinished_accept_index.append(accept_index[i, :j])
+                else:
+                    unfinished_accept_index.append(accept_index[i])
             req.spec_verify_ct += 1
 
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
 
         # Free the KV cache for unaccepted tokens
+        # TODO: fuse them
         accept_index = accept_index[accept_index != -1]
         verified_id = predict[accept_index]
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
 
-        if page_size != 1:
-            align_evict_mask_to_page_size[len(batch.seq_lens),](
-                batch.seq_lens,
-                evict_mask,
-                page_size,
-                self.draft_token_num,
-                next_power_of_2(self.draft_token_num),
-            )
+        if page_size == 1:
+            # TODO: boolean array index leads to a device sync. Remove it.
+            token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+        else:
+            if self.topk == 1:
+                # Only evict full empty page. Do not evict partial empty page
+                align_evict_mask_to_page_size[len(batch.seq_lens),](
+                    batch.seq_lens,
+                    evict_mask,
+                    page_size,
+                    self.draft_token_num,
+                    next_power_of_2(self.draft_token_num),
+                )
+                token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+            else:
+                # Shift the accepted tokens to the beginning.
+                # Only evict the last part
+                src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    accept_index,
+                    accept_length,
+                    self.draft_token_num,
+                    page_size,
+                )
+                to_free_slots = torch.empty(
+                    (to_free_num_slots.sum().item(),),
+                    dtype=torch.int64,
+                    device=to_free_num_slots.device,
+                )
 
-        token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+                # out_cache_loc: [0  1  2,  3  4  5,  6  7  8]
+                # accept_index:  [0 -1  2,  3  4 -1,  6 -1 -1]
+                # tgt_cache_loc: [0  1   ,  3  4   ,  6      ]
+                # to_free_slots: [      2,        5,     7  8]
+                # to_free_slots also needs to be page-aligned without the first partial page
+                #
+                # split each row of out_cache_loc into two parts.
+                # 1. the first part goes to tgt_cache_loc. length = accept_length[i] + 1
+                # 2. the second part goes to to_free_slots.
+                get_target_cache_loc[(bs,)](
+                    tgt_cache_loc,
+                    to_free_slots,
+                    accept_length,
+                    to_free_num_slots,
+                    batch.out_cache_loc,
+                    self.draft_token_num,
+                    next_power_of_2(self.draft_token_num),
+                    next_power_of_2(bs),
+                )
+
+                # Free the kv cache
+                token_to_kv_pool_allocator.free(to_free_slots)
+
+                # Copy the kv cache
+                batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                    tgt_cache_loc, src_cache_loc
+                )
 
         # Construct EagleVerifyOutput
         if not has_finished:
-            batch.out_cache_loc = batch.out_cache_loc[accept_index]
-            assign_req_to_token_pool[(bs,)](
-                batch.req_pool_indices,
-                batch.req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.seq_lens + accept_length + 1,
-                batch.out_cache_loc,
-                batch.req_to_token_pool.req_to_token.shape[1],
-                next_power_of_2(bs),
-            )
+            if page_size == 1 or self.topk == 1:
+                batch.out_cache_loc = batch.out_cache_loc[accept_index]
+                assign_req_to_token_pool[(bs,)](
+                    batch.req_pool_indices,
+                    batch.req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.seq_lens + accept_length + 1,
+                    batch.out_cache_loc,
+                    batch.req_to_token_pool.req_to_token.shape[1],
+                    next_power_of_2(bs),
+                )
+            else:
+                batch.out_cache_loc = tgt_cache_loc
             batch.seq_lens.add_(accept_length + 1)
-            accept_length_cpu = accept_length.tolist()
 
             draft_input = EagleDraftInput()
             draft_input.hidden_states = batch.spec_info.hidden_states[accept_index]
             draft_input.verified_id = verified_id
             draft_input.accept_length = accept_length
-            draft_input.accept_length_cpu = accept_length_cpu
+            draft_input.accept_length_cpu = accept_length.tolist()
             draft_input.seq_lens_for_draft_extend = batch.seq_lens
             draft_input.req_pool_indices_for_draft_extend = batch.req_pool_indices
 
@@ -492,78 +603,99 @@ class EagleVerifyInput:
                 draft_input=draft_input,
                 logits_output=logits_output,
                 verified_id=verified_id,
-                accept_length_per_req_cpu=accept_length_cpu,
-                accepeted_indices=accept_index,
+                accept_length_per_req_cpu=draft_input.accept_length_cpu,
+                accepted_indices=accept_index,
             )
         else:
-            assign_req_to_token_pool[(bs,)](
-                batch.req_pool_indices,
-                batch.req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.seq_lens + accept_length + 1,
-                batch.out_cache_loc[accept_index],
-                batch.req_to_token_pool.req_to_token.shape[1],
-                next_power_of_2(bs),
-            )
-            batch.seq_lens.add_(accept_length + 1)
-            accept_length_cpu = accept_length.tolist()
+            if page_size == 1 or self.topk == 1:
+                assign_req_to_token_pool[(bs,)](
+                    batch.req_pool_indices,
+                    batch.req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.seq_lens + accept_length + 1,
+                    batch.out_cache_loc[accept_index],
+                    batch.req_to_token_pool.req_to_token.shape[1],
+                    next_power_of_2(bs),
+                )
+                batch.seq_lens.add_(accept_length + 1)
 
+            accept_length_cpu = accept_length.tolist()
             draft_input = EagleDraftInput()
-            if len(new_accept_index) > 0:
-                new_accept_index = torch.tensor(new_accept_index, device="cuda")
-                unfinished_index_device = torch.tensor(unfinished_index, device="cuda")
-                draft_input.hidden_states = batch.spec_info.hidden_states[
-                    new_accept_index
-                ]
-                draft_input.verified_id = predict[new_accept_index]
-                draft_input.accept_length_cpu = [
+            if len(unfinished_accept_index) > 0:
+                unfinished_accept_index = torch.cat(unfinished_accept_index)
+                unfinished_index_device = torch.tensor(
+                    unfinished_index, dtype=torch.int64, device=predict.device
+                )
+                draft_input_accept_length_cpu = [
                     accept_length_cpu[i] for i in unfinished_index
                 ]
-                draft_input.accept_length = accept_length[unfinished_index_device]
-                if has_finished:
-                    draft_input.seq_lens_for_draft_extend = batch.seq_lens[
-                        unfinished_index_device
-                    ]
-                    draft_input.req_pool_indices_for_draft_extend = (
-                        batch.req_pool_indices[unfinished_index_device]
-                    )
+                if page_size == 1 or self.topk == 1:
+                    batch.out_cache_loc = batch.out_cache_loc[unfinished_accept_index]
                 else:
-                    draft_input.seq_lens_for_draft_extend = batch.seq_lens
-                    draft_input.req_pool_indices_for_draft_extend = (
-                        batch.req_pool_indices
+                    batch.out_cache_loc = torch.empty(
+                        len(unfinished_index) + sum(draft_input_accept_length_cpu),
+                        dtype=torch.int64,
+                        device=predict.device,
                     )
-            batch.out_cache_loc = batch.out_cache_loc[new_accept_index]
+                    accept_length_filter = create_accept_length_filter(
+                        accept_length,
+                        unfinished_index_device,
+                        batch.seq_lens,
+                    )
+                    filter_finished_cache_loc_kernel[(bs,)](
+                        batch.out_cache_loc,
+                        tgt_cache_loc,
+                        accept_length,
+                        accept_length_filter,
+                        next_power_of_2(bs),
+                        next_power_of_2(self.draft_token_num),
+                    )
+
+                draft_input.hidden_states = batch.spec_info.hidden_states[
+                    unfinished_accept_index
+                ]
+                draft_input.verified_id = predict[unfinished_accept_index]
+                draft_input.accept_length_cpu = draft_input_accept_length_cpu
+                draft_input.accept_length = accept_length[unfinished_index_device]
+                draft_input.seq_lens_for_draft_extend = batch.seq_lens[
+                    unfinished_index_device
+                ]
+                draft_input.req_pool_indices_for_draft_extend = batch.req_pool_indices[
+                    unfinished_index_device
+                ]
 
             return EagleVerifyOutput(
                 draft_input=draft_input,
                 logits_output=logits_output,
                 verified_id=verified_id,
                 accept_length_per_req_cpu=accept_length_cpu,
-                accepeted_indices=accept_index,
+                accepted_indices=accept_index,
             )
 
 
 @triton.jit
-def create_extend_spec_info(
+def create_extend_after_decode_spec_info(
     verified_id,
-    seq_len,
-    accept_len,
-    accept_len_cum,
+    seq_lens,
+    accept_lens,
     positions,
     new_verified_id,
-    accept_len_upper: tl.constexpr,
+    bs_upper: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    offset = 0 if pid == 0 else tl.load(accept_len_cum + pid - 1)
-    seq_length = tl.load(seq_len + pid)
-    accept_length = tl.load(accept_len + pid)
-    positions_ptr = positions + offset
-    data = tl.arange(0, accept_len_upper)
-    mask = data < accept_length
-    tl.store(positions_ptr + data, seq_length - accept_length + data, mask)
+    offsets = tl.arange(0, bs_upper)
+    seq_length = tl.load(seq_lens + pid)
+    accept_length = tl.load(accept_lens + pid)
 
-    offset = tl.load(accept_len_cum + pid) - 1
-    verified_id_data = tl.load(verified_id + offset)
+    accept_len_cumsum = tl.sum(
+        tl.load(accept_lens + offsets, mask=offsets < pid, other=0)
+    )
+    positions_ptr = positions + accept_len_cumsum
+    mask = offsets < accept_length
+    tl.store(positions_ptr + offsets, seq_length - accept_length + offsets, mask)
+
+    accept_len_cumsum += accept_length - 1
+    verified_id_data = tl.load(verified_id + accept_len_cumsum)
     tl.store(new_verified_id + pid, verified_id_data)
 
 
@@ -584,8 +716,8 @@ def assign_req_to_token_pool(
     token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
 
     length_offset = tl.arange(0, bs_upper)
-    start = tl.load(start_offset + length_offset, mask=length_offset < pid)
-    end = tl.load(end_offset + length_offset, mask=length_offset < pid)
+    start = tl.load(start_offset + length_offset, mask=length_offset < pid, other=0)
+    end = tl.load(end_offset + length_offset, mask=length_offset < pid, other=0)
     out_offset = tl.sum(end - start, axis=0)
 
     out_cache_ptr = out_cache_loc + out_offset
@@ -607,36 +739,75 @@ def assign_draft_cache_locs(
     req_pool_indices,
     req_to_token,
     seq_lens,
+    extend_lens,
+    num_new_pages_per_topk,
     out_cache_loc,
     pool_len: tl.constexpr,
     topk: tl.constexpr,
     speculative_num_steps: tl.constexpr,
     page_size: tl.constexpr,
+    bs_upper: tl.constexpr,
+    iter_upper: tl.constexpr,
 ):
-    BLOCK_SIZE: tl.constexpr = 32
+    BLOCK_SIZE: tl.constexpr = 128
     pid = tl.program_id(axis=0)
-    kv_start = tl.load(seq_lens + pid)
 
     if page_size == 1 or topk == 1:
-        kv_end = tl.load(seq_lens + pid) + topk * speculative_num_steps
+        copy_len = topk * speculative_num_steps
         out_cache_ptr = out_cache_loc + pid * topk * speculative_num_steps
     else:
-        prefix_len = tl.load(seq_lens + pid)
-        last_page_len = prefix_len % page_size
-        num_new_page = (
-            last_page_len + speculative_num_steps + page_size - 1
-        ) // page_size
-        kv_end = prefix_len // page_size * page_size + num_new_page * (page_size * topk)
+        bs_offset = tl.arange(0, bs_upper)
+        copy_len = tl.load(extend_lens + pid)
+        cum_copy_len = tl.sum(tl.load(extend_lens + bs_offset, mask=bs_offset < pid))
+        out_cache_ptr = out_cache_loc + cum_copy_len
 
+    # Part 1: Copy from out_cache_loc to req_to_token
+    kv_start = tl.load(seq_lens + pid)
     token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
-
-    num_loop = tl.cdiv(topk * speculative_num_steps, BLOCK_SIZE)
+    num_loop = tl.cdiv(copy_len, BLOCK_SIZE)
     for i in range(num_loop):
-        save_offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE + kv_start
-        load_offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = save_offset < kv_end
-        data = tl.load(out_cache_ptr + load_offset, mask=mask)
-        tl.store(token_pool + save_offset, data, mask=mask)
+        copy_offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = copy_offset < copy_len
+        data = tl.load(out_cache_ptr + copy_offset, mask=mask)
+        tl.store(token_pool + kv_start + copy_offset, data, mask=mask)
+
+    if page_size == 1 or topk == 1:
+        return
+
+    # Part 2: Copy the indices for the last partial page
+    prefix_len = tl.load(seq_lens + pid)
+    last_page_len = prefix_len % page_size
+    offsets = tl.arange(0, page_size)
+    mask = offsets < last_page_len
+    num_new_pages_per_topk_ = tl.load(num_new_pages_per_topk + pid)
+    prefix_base = token_pool + prefix_len - last_page_len
+
+    for topk_id in range(topk):
+        value = tl.load(prefix_base + offsets, mask=mask)
+        tl.store(
+            prefix_base + topk_id * num_new_pages_per_topk_ * page_size + offsets,
+            value,
+            mask=mask,
+        )
+
+    # Part 3: Remove the padding in out_cache_loc
+    iter_offest = tl.arange(0, iter_upper)
+    for topk_id in range(topk):
+        indices = tl.load(
+            prefix_base
+            + topk_id * num_new_pages_per_topk_ * page_size
+            + last_page_len
+            + iter_offest,
+            mask=iter_offest < speculative_num_steps,
+        )
+        tl.store(
+            out_cache_loc
+            + pid * topk * speculative_num_steps
+            + topk_id * speculative_num_steps
+            + iter_offest,
+            indices,
+            mask=iter_offest < speculative_num_steps,
+        )
 
 
 @triton.jit
@@ -647,29 +818,33 @@ def generate_draft_decode_kv_indices(
     kv_indices,
     kv_indptr,
     positions,
-    num_seqs: tl.constexpr,
-    topk: tl.constexpr,
     pool_len: tl.constexpr,
     kv_indices_stride: tl.constexpr,
     kv_indptr_stride: tl.constexpr,
     bs_upper: tl.constexpr,
     iter_upper: tl.constexpr,
     num_tokens_upper: tl.constexpr,
+    page_size: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 128
     iters = tl.program_id(axis=0)
     bid = tl.program_id(axis=1)
     topk_id = tl.program_id(axis=2)
 
+    num_steps = tl.num_programs(axis=0)
+    num_seqs = tl.num_programs(axis=1)
+    topk = tl.num_programs(axis=2)
+
     kv_indices += kv_indices_stride * iters
     kv_indptr += kv_indptr_stride * iters
     iters += 1
 
     load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(paged_kernel_lens + load_offset, mask=load_offset < bid)
+    seq_lens = tl.load(paged_kernel_lens + load_offset, mask=load_offset < bid, other=0)
     seq_len = tl.load(paged_kernel_lens + bid)
     cum_seq_len = tl.sum(seq_lens)
 
+    # Update kv_indices
     kv_offset = cum_seq_len * topk + bid * iters * topk + topk_id * (seq_len + iters)
     kv_ptr = kv_indices + kv_offset
     token_pool_ptr = req_to_token + tl.load(req_pool_indices + bid) * pool_len
@@ -683,10 +858,26 @@ def generate_draft_decode_kv_indices(
         kv_offset += BLOCK_SIZE
 
     extend_offset = tl.arange(0, iter_upper)
-    extend_data = tl.load(
-        token_pool_ptr + seq_len + tl.arange(0, iter_upper) * topk + topk_id,
-        mask=extend_offset < iters,
-    )
+    if page_size == 1 or topk == 1:
+        extend_data = tl.load(
+            token_pool_ptr + seq_len + topk_id * num_steps + tl.arange(0, iter_upper),
+            mask=extend_offset < iters,
+        )
+    else:
+        prefix_len = seq_len
+        last_page_len = prefix_len % page_size
+        num_new_pages_per_topk = (
+            last_page_len + num_steps + page_size - 1
+        ) // page_size
+        prefix_base = seq_len // page_size * page_size
+        start = (
+            prefix_base + topk_id * num_new_pages_per_topk * page_size + last_page_len
+        )
+        extend_data = tl.load(
+            token_pool_ptr + start + extend_offset,
+            mask=extend_offset < iters,
+        )
+
     tl.store(kv_ptr + seq_len + extend_offset, extend_data, mask=extend_offset < iters)
 
     # Update kv_indptr
@@ -695,7 +886,7 @@ def generate_draft_decode_kv_indices(
     zid = bid * topk + topk_id
     if zid == 0:
         zid = num_seqs * topk
-    positions = tl.load(positions + bs_offset, mask=bs_offset < zid)
+    positions = tl.load(positions + bs_offset, mask=bs_offset < zid, other=0)
     base = tl.sum(positions)
     tl.store(kv_indptr + zid, base + zid * iters)
 
@@ -713,7 +904,9 @@ def align_evict_mask_to_page_size(
     bid = tl.program_id(axis=0)
     seq_len = tl.load(seq_lens + bid)
     io_mask = t_range < num_draft_tokens
-    mask_row = tl.load(evict_mask + bid * num_draft_tokens + t_range, mask=io_mask)
+    mask_row = tl.load(
+        evict_mask + bid * num_draft_tokens + t_range, mask=io_mask, other=0
+    )
 
     num_trues = tl.sum(mask_row)
     num_false = num_draft_tokens - num_trues
@@ -721,6 +914,116 @@ def align_evict_mask_to_page_size(
     start = (seq_len + num_false - 1) // page_size * page_size - seq_len
     for i in range(max(start, 0), min(start + page_size, num_draft_tokens)):
         tl.store(evict_mask + bid * num_draft_tokens + i, False)
+
+
+@triton.jit
+def get_target_cache_loc(
+    tgt_cache_loc,
+    to_free_slots,
+    accept_length,
+    to_free_num_slots,
+    out_cache_loc,
+    num_verify_tokens: tl.constexpr,
+    num_verify_tokens_upper: tl.constexpr,
+    bs_upper: tl.constexpr,
+):
+    bid = tl.program_id(axis=0)
+    offset = tl.arange(0, num_verify_tokens_upper)
+    bs_offset = tl.arange(0, bs_upper)
+
+    # write the first part to tgt_cache_loc
+    accept_len_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid)
+    tgt_cache_loc_start = tl.sum(accept_len_all) + bid
+    copy_len = tl.load(accept_length + bid) + 1
+    out_cache_loc_row = tl.load(
+        out_cache_loc + bid * num_verify_tokens + offset, mask=offset < copy_len
+    )
+    tl.store(
+        tgt_cache_loc + tgt_cache_loc_start + offset,
+        out_cache_loc_row,
+        mask=offset < copy_len,
+    )
+
+    # write the second part to to_free_num_pages
+    to_free_num_slots_all = tl.load(to_free_num_slots + bs_offset, mask=bs_offset < bid)
+    to_free_num_slots_cur = tl.load(to_free_num_slots + bid)
+    out_cache_loc_start = num_verify_tokens - to_free_num_slots_cur
+    to_free_slots_start = tl.sum(to_free_num_slots_all)
+
+    copy_len = to_free_num_slots_cur
+    out_cache_loc_row = tl.load(
+        out_cache_loc + bid * num_verify_tokens + out_cache_loc_start + offset,
+        mask=offset < copy_len,
+    )
+    tl.store(
+        to_free_slots + to_free_slots_start + offset,
+        out_cache_loc_row,
+        mask=offset < copy_len,
+    )
+
+
+@torch.compile(dynamic=True)
+def get_src_tgt_cache_loc(
+    seq_lens: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_length: torch.Tensor,
+    draft_token_num: int,
+    page_size: int,
+):
+    src_cache_loc = out_cache_loc[accept_index]
+    tgt_cache_loc = torch.empty_like(src_cache_loc)
+    extended_len = seq_lens + draft_token_num
+    keep_len = torch.minimum(
+        (seq_lens + accept_length + 1 + page_size - 1) // page_size * page_size,
+        extended_len,
+    )
+    to_free_num_slots = extended_len - keep_len
+    return src_cache_loc, tgt_cache_loc, to_free_num_slots
+
+
+@triton.jit
+def filter_finished_cache_loc_kernel(
+    out_cache_loc,
+    tgt_cache_loc,
+    accept_length,
+    accept_length_filter,
+    bs_upper: tl.constexpr,
+    num_verify_tokens_upper: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    bs_offset = tl.arange(0, bs_upper)
+
+    accept_length_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid)
+    old_start = tl.sum(accept_length_all) + bid
+
+    accept_length_filter_all = tl.load(
+        accept_length_filter + bs_offset, mask=bs_offset < bid
+    )
+    new_start = tl.sum(accept_length_filter_all)
+
+    copy_len = tl.load(accept_length_filter + bid)
+    copy_offset = tl.arange(0, num_verify_tokens_upper)
+    value = tl.load(
+        tgt_cache_loc + old_start + copy_offset, mask=copy_offset < copy_len
+    )
+    tl.store(
+        out_cache_loc + new_start + copy_offset, value, mask=copy_offset < copy_len
+    )
+
+
+@torch.compile(dynamic=True)
+def create_accept_length_filter(
+    accept_length: torch.Tensor,
+    unfinished_index_device: torch.Tensor,
+    seq_lens: torch.Tensor,
+):
+    accept_length_filter = torch.zeros_like(accept_length)
+    accept_length_filter[unfinished_index_device] = (
+        accept_length[unfinished_index_device] + 1
+    )
+    seq_lens.add_(accept_length + 1)
+    return accept_length_filter
 
 
 @torch.compile(dynamic=True)
@@ -758,10 +1061,11 @@ def select_top_k_tokens(
         topk_index = topk_index.reshape(-1, topk**2)
         input_ids = torch.gather(topk_index, index=topk_cs_index, dim=1).flatten()
 
-        selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
-            0, hidden_states.shape[0], step=topk, device="cuda"
-        ).repeat_interleave(topk)
-        hidden_states = hidden_states[selected_input_index, :]
+        if hidden_states.shape[0] > 0:
+            selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
+                0, hidden_states.shape[0], step=topk, device="cuda"
+            ).repeat_interleave(topk)
+            hidden_states = hidden_states[selected_input_index, :]
 
         tree_info = (
             expand_scores,  # shape: (b, topk, topk)
@@ -781,15 +1085,35 @@ def _generate_simulated_accept_index(
     spec_steps,
 ):
     simulate_acc_len_float = float(simulate_acc_len)
-    simulated_values = torch.normal(
-        mean=simulate_acc_len_float,
-        std=1.0,
-        size=(1,),
-        device="cpu",
-    )
-    # clamp simulated values to be between 1 and self.spec_steps
-    simulated_values = torch.clamp(simulated_values, min=1.0, max=spec_steps)
-    simulate_acc_len = int(simulated_values.round().item())
+    if SIMULATE_ACC_METHOD == "multinomial":
+        simulated_values = torch.normal(
+            mean=simulate_acc_len_float,
+            std=1.0,
+            size=(1,),
+            device="cpu",
+        )
+        # clamp simulated values to be between 1 and self.spec_steps
+        simulated_values = torch.clamp(simulated_values, min=1.0, max=spec_steps + 1)
+        simulate_acc_len = int(simulated_values.round().item())
+    elif SIMULATE_ACC_METHOD == "match-expected":
+        # multinomial sampling does not match the expected length
+        # we keep it for the sake of compatibility of existing tests
+        # but it's better to use "match-expected" for the cases that need to
+        # match the expected length, One caveat is that this will only sample
+        # either round down or round up of the expected length
+        simulate_acc_len_float = max(1.0, min(spec_steps + 1, simulate_acc_len_float))
+        lower = int(simulate_acc_len_float // 1)
+        upper = lower + 1 if lower < spec_steps + 1 else lower
+        if lower == upper:
+            simulate_acc_len = lower
+        else:
+            weight_upper = simulate_acc_len_float - lower
+            weight_lower = 1.0 - weight_upper
+            probs = torch.tensor([weight_lower, weight_upper], device="cpu")
+            sampled_index = torch.multinomial(probs, num_samples=1)
+            simulate_acc_len = lower if sampled_index == 0 else upper
+    else:
+        raise ValueError(f"Invalid simulate_acc_method: {SIMULATE_ACC_METHOD}")
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
@@ -801,3 +1125,120 @@ def _generate_simulated_accept_index(
     accept_length.fill_(simulate_acc_len - 1)
     predict.fill_(100)  # some legit token id
     return sim_accept_index
+
+
+def traverse_tree(
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    grammar: BaseGrammarObject,
+    allocate_token_bitmask: torch.Tensor,
+):
+    """
+    Traverse the tree constructed by the draft model to generate the logits mask.
+    """
+    assert (
+        retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
+    )
+
+    allocate_token_bitmask.fill_(0)
+
+    def dfs(
+        curr: int,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
+        parent_pos: int,
+    ):
+        if curr == 0:
+            # the first token generated by the target model, and thus it is always
+            # accepted from the previous iteration
+            accepted = True
+        else:
+            parent_bitmask = allocate_token_bitmask[parent_pos]
+            curr_token_id = draft_tokens[curr]
+            # 32 boolean bitmask values are packed into 32-bit integers
+            accepted = (
+                parent_bitmask[curr_token_id // 32] & (1 << (curr_token_id % 32))
+            ) != 0
+
+        if accepted:
+            if curr != 0:
+                # Accept the current token
+                grammar.accept_token(draft_tokens[curr])
+            if not grammar.is_terminated():
+                # Generate the bitmask for the current token
+                grammar.fill_vocab_mask(allocate_token_bitmask, curr)
+                if retrieve_next_token[curr] != -1:
+                    # Visit the child node
+                    dfs(
+                        retrieve_next_token[curr],
+                        retrieve_next_token,
+                        retrieve_next_sibling,
+                        curr,
+                    )
+
+            if curr != 0:
+                # Rollback the current token
+                grammar.rollback(1)
+
+        if retrieve_next_sibling[curr] != -1:
+            # Visit the sibling node
+            dfs(
+                retrieve_next_sibling[curr],
+                retrieve_next_token,
+                retrieve_next_sibling,
+                parent_pos,
+            )
+
+    dfs(0, retrieve_next_token, retrieve_next_sibling, -1)
+
+
+def generate_token_bitmask(
+    reqs: List[Req],
+    verify_input: EagleVerifyInput,
+    retrieve_next_token_cpu: torch.Tensor,
+    retrieve_next_sibling_cpu: torch.Tensor,
+    draft_tokens_cpu: torch.Tensor,
+    vocab_size: int,
+):
+    """
+    Generate the logit mask for structured output.
+    Draft model's token can be either valid or invalid with respect to the grammar.
+    We need to perform DFS to
+    1. figure out which tokens are accepted by the grammar.
+    2. if so, what is the corresponding logit mask.
+    """
+
+    num_draft_tokens = draft_tokens_cpu.shape[-1]
+
+    allocate_token_bitmask = None
+    assert len(reqs) == retrieve_next_token_cpu.shape[0]
+    grammar = None
+    for i, req in enumerate(reqs):
+        if req.grammar is not None:
+            if allocate_token_bitmask is None:
+                allocate_token_bitmask = req.grammar.allocate_vocab_mask(
+                    vocab_size=vocab_size,
+                    batch_size=draft_tokens_cpu.numel(),
+                    device="cpu",
+                )
+            grammar = req.grammar
+            s = time.perf_counter()
+            traverse_tree(
+                retrieve_next_token_cpu[i],
+                retrieve_next_sibling_cpu[i],
+                draft_tokens_cpu[i],
+                req.grammar,
+                allocate_token_bitmask[
+                    i * num_draft_tokens : (i + 1) * num_draft_tokens
+                ],
+            )
+            tree_traverse_time = time.perf_counter() - s
+            if tree_traverse_time > TREE_TRAVERSE_TIME_THRESHOLD:
+                logger.warning(
+                    f"Bit mask generation took {tree_traverse_time} seconds with "
+                    f"grammar: {req.grammar}"
+                )
+
+    verify_input.grammar = grammar
+    return allocate_token_bitmask

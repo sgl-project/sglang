@@ -1,9 +1,9 @@
 use crate::tree::Tree;
+use ::metrics::{counter, gauge, histogram};
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
-use log::{debug, error, info, warn};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -11,7 +11,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 use tokio;
+use tracing::{debug, error, info, warn};
 
 fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
     req.headers()
@@ -135,6 +137,9 @@ pub enum PolicyConfig {
 
 impl Router {
     pub fn new(worker_urls: Vec<String>, policy_config: PolicyConfig) -> Result<Self, String> {
+        // Update active workers gauge
+        gauge!("sgl_router_active_workers").set(worker_urls.len() as f64);
+
         // Get timeout and interval from policy config
         let (timeout_secs, interval_secs) = match &policy_config {
             PolicyConfig::RandomConfig {
@@ -240,6 +245,15 @@ impl Router {
         })
     }
 
+    /// Get a reference to the worker URLs shared across threads
+    pub fn get_worker_urls(&self) -> Arc<RwLock<Vec<String>>> {
+        match self {
+            Router::RoundRobin { worker_urls, .. } => Arc::clone(worker_urls),
+            Router::Random { worker_urls, .. } => Arc::clone(worker_urls),
+            Router::CacheAware { worker_urls, .. } => Arc::clone(worker_urls),
+        }
+    }
+
     fn wait_for_healthy_workers(
         worker_urls: &[String],
         timeout_secs: u64,
@@ -319,6 +333,7 @@ impl Router {
         route: &str,
         req: &HttpRequest,
     ) -> HttpResponse {
+        let start = Instant::now();
         let mut request_builder = client.get(format!("{}{}", worker_url, route));
 
         // Copy all headers from original request except for /health because it does not need authorization
@@ -328,7 +343,7 @@ impl Router {
             }
         }
 
-        match request_builder.send().await {
+        let response = match request_builder.send().await {
             Ok(res) => {
                 let status = actix_web::http::StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
@@ -343,7 +358,21 @@ impl Router {
                 "Failed to send request to worker {}: {}",
                 worker_url, e
             )),
+        };
+
+        // Record request metrics
+        if route != "/health" {
+            let duration = start.elapsed();
+            counter!("sgl_router_requests_total", "route" => route.to_string()).increment(1);
+            histogram!("sgl_router_request_duration_seconds", "route" => route.to_string())
+                .record(duration.as_secs_f64());
+
+            if !response.status().is_success() {
+                counter!("sgl_router_request_errors_total", "route" => route.to_string())
+                    .increment(1);
+            }
         }
+        response
     }
 
     pub async fn route_to_first(
@@ -501,6 +530,10 @@ impl Router {
                         max_load, min_load, running_queue
                     );
 
+                    counter!("sgl_router_load_balancing_events_total").increment(1);
+                    gauge!("sgl_router_max_load").set(max_load as f64);
+                    gauge!("sgl_router_min_load").set(min_load as f64);
+
                     // Use shortest queue routing when load is imbalanced
                     running_queue
                         .iter()
@@ -514,8 +547,10 @@ impl Router {
                         matched_text.chars().count() as f32 / text.chars().count() as f32;
 
                     if matched_rate > *cache_threshold {
+                        counter!("sgl_router_cache_hits_total").increment(1);
                         matched_worker.to_string()
                     } else {
+                        counter!("sgl_router_cache_misses_total").increment(1);
                         tree.get_smallest_tenant()
                     }
                 };
@@ -528,6 +563,11 @@ impl Router {
                     .unwrap()
                     .get_mut(&selected_url)
                     .unwrap() += 1;
+
+                gauge!("sgl_router_running_requests", "worker" => selected_url.to_string())
+                    .set(*running_queue.get(&selected_url).unwrap() as f64);
+                counter!("sgl_router_processed_requests_total", "worker" => selected_url.to_string()).increment(1);
+
                 tree.insert(&text, &selected_url);
 
                 selected_url
@@ -627,6 +667,7 @@ impl Router {
         body: &Bytes,
         route: &str,
     ) -> HttpResponse {
+        let start = Instant::now();
         const MAX_REQUEST_RETRIES: u32 = 3;
         const MAX_TOTAL_RETRIES: u32 = 6;
         let mut total_retries = 0;
@@ -639,18 +680,24 @@ impl Router {
             while request_retries < MAX_REQUEST_RETRIES {
                 if total_retries >= 1 {
                     info!("Retrying request after {} failed attempts", total_retries);
+                    counter!("sgl_router_retries_total", "route" => route.to_string()).increment(1);
                 }
+
                 let response = self
                     .send_generate_request(client, req, body, route, &worker_url)
                     .await;
 
                 if response.status().is_success() {
+                    let duration = start.elapsed();
+                    histogram!("sgl_router_generate_duration_seconds", "route" => route.to_string()).record(duration.as_secs_f64());
                     return response;
                 } else {
                     // if the worker is healthy, it means the request is bad, so return the error response
                     let health_response =
                         self.send_request(client, &worker_url, "/health", req).await;
                     if health_response.status().is_success() {
+                        counter!("sgl_router_request_errors_total", "route" => route.to_string())
+                            .increment(1);
                         return response;
                     }
                 }
@@ -673,6 +720,7 @@ impl Router {
             }
         }
 
+        counter!("sgl_router_request_errors_total", "route" => route.to_string()).increment(1);
         HttpResponse::InternalServerError().body("All retry attempts failed")
     }
 
@@ -724,6 +772,7 @@ impl Router {
                                 }
                                 info!("Added worker: {}", worker_url);
                                 urls.push(worker_url.to_string());
+                                gauge!("sgl_router_active_workers").set(urls.len() as f64);
                             }
                         }
 
@@ -795,6 +844,7 @@ impl Router {
                 if let Some(index) = urls.iter().position(|url| url == &worker_url) {
                     urls.remove(index);
                     info!("Removed worker: {}", worker_url);
+                    gauge!("sgl_router_active_workers").set(urls.len() as f64);
                 } else {
                     warn!("Worker {} not found, skipping removal", worker_url);
                     return;

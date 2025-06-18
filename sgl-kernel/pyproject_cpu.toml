@@ -1,0 +1,36 @@
+[build-system]
+requires = [
+  "scikit-build-core>=0.10",
+  "torch>=2.7.1",
+  "wheel",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "sgl-kernel"
+version = "0.1.9"
+description = "Kernel Library for SGLang"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Environment :: CPU"
+]
+dependencies = []
+
+[project.urls]
+"Homepage" = "https://github.com/sgl-project/sglang/tree/main/sgl-kernel"
+"Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[tool.wheel]
+exclude = [
+  "dist*",
+  "tests*",
+]
+
+[tool.scikit-build]
+cmake.source-dir = "csrc/cpu"
+cmake.build-type = "Release"
+minimum-version = "build-system.requires"

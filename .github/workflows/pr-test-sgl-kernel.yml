@@ -37,8 +37,6 @@ jobs:
       matrix:
         include:
           - python-version: '3.9'
-            cuda-version: '11.8'
-          - python-version: '3.9'
             cuda-version: '12.4'
           - python-version: '3.9'
             cuda-version: '12.8'
@@ -64,8 +62,7 @@ jobs:
           chmod +x ./build.sh
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
 
-      - name: Upload artifacts (only for CUDA 12.4)
-        if: ${{ matrix.cuda-version == '12.4' }}
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
@@ -83,12 +80,12 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-*
+          pattern: wheel-python3.9-cuda12.4
 
       - name: Install
         run: |
           bash scripts/ci_install_dependency.sh
-          pip3 install torch==2.6.0 torchvision && pip3 install pytest
+          pip3 install torch==2.7.1 torchvision && pip3 install pytest
           pip3 uninstall sgl-kernel -y || true
           pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
           pip3 list | grep sgl-kernel
@@ -115,11 +112,12 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-*
+          pattern: wheel-python3.9-cuda12.4
 
       - name: Install
         run: |
           bash scripts/ci_install_dependency.sh
+          pip3 install torch==2.7.1 torchvision
           pip3 uninstall sgl-kernel -y || true
           pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
           pip3 list | grep sgl-kernel

@@ -278,7 +278,7 @@ def graceful_registry(sub_module_name: str):
             f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown..."
         )
         if signum == signal.SIGTERM:
-            logger.info(f"{sub_module_name} recive sigterm")
+            logger.info(f"{sub_module_name} receive sigterm")
 
     signal.signal(signal.SIGTERM, graceful_shutdown)
 
@@ -436,7 +436,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
         base_url: The base URL of the server
         timeout: Maximum time to wait in seconds. None means wait forever.
     """
-    start_time = time.time()
+    start_time = time.perf_counter()
     while True:
         try:
             response = requests.get(
@@ -455,7 +455,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                 )
                 break
 
-            if timeout and time.time() - start_time > timeout:
+            if timeout and time.perf_counter() - start_time > timeout:
                 raise TimeoutError("Server did not become ready within timeout period")
         except requests.exceptions.RequestException:
             time.sleep(1)
@@ -512,3 +512,12 @@ async def async_stream_and_merge(llm, prompt, sampling_params):
         cleaned_chunk = trim_overlap(final_text, chunk_text)
         final_text += cleaned_chunk
         yield cleaned_chunk  # yield the non-overlapping portion
+
+
+def resolve_obj_by_qualname(qualname: str) -> Any:
+    """
+    Resolve an object by its fully qualified name.
+    """
+    module_name, obj_name = qualname.rsplit(".", 1)
+    module = importlib.import_module(module_name)
+    return getattr(module, obj_name)

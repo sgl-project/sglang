@@ -68,7 +68,7 @@ def main(args):
     sgl.set_default_backend(backend)
 
     # Run requests
-    tic = time.time()
+    tic = time.perf_counter()
     rets = answer_mt_bench.run_batch(
         arguments,
         temperature=0,
@@ -78,7 +78,7 @@ def main(args):
     )
     answers = [[s["answer_1"], s["answer_2"]] for s in rets]
 
-    latency = time.time() - tic
+    latency = time.perf_counter() - tic
     num_output_tokens = sum(
         s.get_meta_info("answer_1")["completion_tokens"]
         + s.get_meta_info("answer_2")["completion_tokens"]

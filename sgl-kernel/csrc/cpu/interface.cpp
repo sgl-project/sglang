@@ -1,5 +1,5 @@
 #include <ATen/record_function.h>
-#include <torch/extension.h>
+#include <torch/all.h>
 
 #include "shm.h"
 
@@ -11,7 +11,7 @@ static bool is_initialized = false;
 
 static bool all_ranks_local_p = false;
 
-void initialize(int size, int rank) {
+void initialize(int64_t size, int64_t rank) {
   if (is_initialized) {
     return;
   }
@@ -33,11 +33,11 @@ void initialize(int size, int rank) {
   world_rank = rank;
   is_initialized = true;
 
-  auto addr_string = std::getenv("MASTER_ADDR");
+  const char* addr_string = std::getenv("MASTER_ADDR");
   if (addr_string == NULL) {
     addr_string = "";
   }
-  auto port_string = std::getenv("MASTER_PORT");
+  const char* port_string = std::getenv("MASTER_PORT");
   if (port_string == NULL) {
     port_string = "";
   }
@@ -47,12 +47,11 @@ void initialize(int size, int rank) {
   }
 }
 
-void shm_allreduce(torch::Tensor& data, c10::intrusive_ptr<c10d::ProcessGroup> process_group, py::object op) {
+void shm_allreduce(
+    torch::Tensor& data, c10::intrusive_ptr<c10d::ProcessGroup> process_group, c10::intrusive_ptr<c10d::ReduceOp> op) {
   RECORD_FUNCTION("sgl-kernel::shm_allreduce", std::vector<c10::IValue>({data}));
 
-  static py::object ReduceOp = py::module_::import("torch.distributed").attr("ReduceOp");
-  static auto ReduceOpSum = (int)py::int_(ReduceOp.attr("SUM").attr("value"));
-  TORCH_CHECK(py::int_(op.attr("value")) == ReduceOpSum, "Only torch.distributed.ReduceOp.SUM is supported");
+  TORCH_CHECK(op == c10d::ReduceOp::SUM, "Only torch.distributed.ReduceOp.SUM is supported");
 
   auto numel = data.numel();
 
@@ -81,7 +80,7 @@ void shm_allreduce(torch::Tensor& data, c10::intrusive_ptr<c10d::ProcessGroup> p
   return;
 }
 
-torch::Tensor shm_allgather(torch::Tensor& data, c10::intrusive_ptr<c10d::ProcessGroup> process_group, int dim) {
+torch::Tensor shm_allgather(torch::Tensor& data, c10::intrusive_ptr<c10d::ProcessGroup> process_group, int64_t dim) {
   RECORD_FUNCTION("sgl-kernel::shm_allgather", std::vector<c10::IValue>({data}));
 
   auto numel = data.numel();

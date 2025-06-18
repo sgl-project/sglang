@@ -162,9 +162,8 @@ def init_process_hf(
         rank=rank,
         group_name="test_parameter_update_group",
     )
-    dist.barrier(group=group, device_ids=[rank])
     torch.cuda.synchronize()
-    time_begin_broadcast = time.time()
+    time_begin_broadcast = time.perf_counter()
 
     # The last parameter is lm_head.weight, which is tied
     # with embed_tokens.weight. Actually, we only need
@@ -182,7 +181,7 @@ def init_process_hf(
             group=group,
         )
     torch.cuda.synchronize()
-    time_end_broadcast = time.time()
+    time_end_broadcast = time.perf_counter()
 
     # Measure the latency of broadcasting/weights update.
     broadcast_time = time_end_broadcast - time_begin_broadcast
@@ -223,8 +222,8 @@ def init_process_sgl(
         if rank == 1:
             url = DEFAULT_URL_FOR_TEST
         else:
-            host, port = DEFAULT_URL_FOR_TEST.split(":")
-            url = ":".join(host, str(int(port) + 10000))
+            host, _, port = DEFAULT_URL_FOR_TEST.rpartition(":")
+            url = ":".join([host, str(int(port) + 10000)])
 
         print(f"[sgl] rank {rank} init server on url: {url}")
         process = popen_launch_server(
@@ -282,7 +281,7 @@ def init_process_sgl(
         )
 
     torch.cuda.synchronize()
-    time_begin_update = time.time()
+    time_begin_update = time.perf_counter()
 
     # The last parameter is lm_head.weight, which is tied
     # with embed_tokens.weight. Actually, we only need
@@ -312,7 +311,7 @@ def init_process_sgl(
                 },
             )
     torch.cuda.synchronize()
-    time_end_update = time.time()
+    time_end_update = time.perf_counter()
 
     # Measure the latency of broadcast/weights update.
     update_time = time_end_update - time_begin_update

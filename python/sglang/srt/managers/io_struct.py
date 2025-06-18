@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """
-The definition of objects transfered between different
+The definition of objects transferred between different
 processes (TokenizerManager, DetokenizerManager, Controller).
 """
 
@@ -20,7 +20,9 @@ import copy
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+
+from sglang.srt.mm_utils import has_valid_data
 
 # handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -40,6 +42,10 @@ class SessionParams:
     replace: Optional[bool] = None
 
 
+AudioDataItem = Union[str, Dict]
+ImageDataItem = Union[Image, str, Dict]
+
+
 @dataclass
 class GenerateReqInput:
     # The input prompt. It can be a single prompt or a batch of prompts.
@@ -55,10 +61,10 @@ class GenerateReqInput:
     # - List of lists of images (multiple images per request)
     # See also python/sglang/srt/utils.py:load_image for more details.
     image_data: Optional[
-        Union[List[List[Union[Image, str]]], List[Union[Image, str]], Union[Image, str]]
+        Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]
     ] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
-    audio_data: Optional[Union[List[str], str]] = None
+    audio_data: Optional[Union[List[AudioDataItem], AudioDataItem]] = None
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # The request id.
@@ -81,7 +87,7 @@ class GenerateReqInput:
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
-    # LoRA related
+    # The path to the LoRA
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
     # Session info for continual prompting
@@ -93,12 +99,18 @@ class GenerateReqInput:
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
 
     # Whether to return hidden states
-    return_hidden_states: bool = False
+    return_hidden_states: Union[List[bool], bool] = False
 
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[int], int]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
+
+    def contains_mm_input(self) -> bool:
+        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
 
     def normalize_batch_and_arguments(self):
         """
@@ -397,7 +409,12 @@ class GenerateReqInput:
                 if self.custom_logit_processor is not None
                 else None
             ),
-            return_hidden_states=self.return_hidden_states,
+            return_hidden_states=(
+                self.return_hidden_states[i]
+                if isinstance(self.return_hidden_states, list)
+                else self.return_hidden_states
+            ),
+            # if `__getitem__` is called, the bootstrap_host, bootstrap_port, bootstrap_room must be a list
             bootstrap_host=(
                 self.bootstrap_host[i] if self.bootstrap_host is not None else None
             ),
@@ -406,6 +423,9 @@ class GenerateReqInput:
             ),
             bootstrap_room=(
                 self.bootstrap_room[i] if self.bootstrap_room is not None else None
+            ),
+            data_parallel_rank=(
+                self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
         )
 
@@ -454,11 +474,14 @@ class TokenizedGenerateReqInput:
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
 
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
+
 
 @dataclass
 class EmbeddingReqInput:
     # The input prompt. It can be a single prompt or a batch of prompts.
-    text: Optional[Union[List[str], str]] = None
+    text: Optional[Union[List[List[str]], List[str], str]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
     # Can be formatted as:
     # - Single image for a single request
@@ -482,6 +505,11 @@ class EmbeddingReqInput:
     log_metrics: bool = True
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
+    # For cross-encoder requests
+    is_cross_encoder_request: bool = False
+
+    def contains_mm_input(self) -> bool:
+        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -538,6 +566,16 @@ class EmbeddingReqInput:
         return self.rid
 
     def __getitem__(self, i):
+        if self.is_cross_encoder_request:
+            return EmbeddingReqInput(
+                text=[self.text[i]] if self.text is not None else None,
+                input_ids=None,
+                image_data=None,
+                sampling_params=self.sampling_params[i],
+                rid=self.rid[i],
+                is_cross_encoder_request=True,
+            )
+
         return EmbeddingReqInput(
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
@@ -557,6 +595,8 @@ class TokenizedEmbeddingReqInput:
     input_ids: List[int]
     # The image inputs
     image_inputs: dict
+    # The token type ids
+    token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
 
@@ -791,6 +831,16 @@ class ResumeMemoryOccupationReqOutput:
 
 
 @dataclass
+class SlowDownReqInput:
+    forward_sleep_time: Optional[float]
+
+
+@dataclass
+class SlowDownReqOutput:
+    pass
+
+
+@dataclass
 class AbortReq:
     # The request id
     rid: str
@@ -812,6 +862,12 @@ class SetInternalStateReq:
 
 
 @dataclass
+class V1RerankReqInput:
+    query: str
+    documents: List[str]
+
+
+@dataclass
 class SetInternalStateReqOutput:
     updated: bool
     server_args: Dict[str, Any]
@@ -825,7 +881,10 @@ class ProfileReqInput:
     # If it is set, profiling is automatically stopped after this step, and
     # the caller doesn't need to run stop_profile.
     num_steps: Optional[int] = None
-    activities: Optional[List[Literal["CPU", "GPU", "MEM", "CUDA_PROFILER"]]] = None
+    activities: Optional[List[str]] = None
+    profile_by_stage: bool = False
+    with_stack: Optional[bool] = None
+    record_shapes: Optional[bool] = None
 
 
 class ProfileReqType(Enum):
@@ -850,6 +909,7 @@ class ProfileReq:
     output_dir: Optional[str] = None
     num_steps: Optional[int] = None
     activities: Optional[List[str]] = None
+    profile_by_stage: bool = False
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None

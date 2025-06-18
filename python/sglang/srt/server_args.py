@@ -22,7 +22,7 @@ import random
 import tempfile
 from typing import List, Literal, Optional
 
-from sglang.srt.hf_transformers_utils import check_gguf_file
+from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     configure_ipv6,
@@ -46,7 +46,6 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
-    enable_tokenizer_batch_encode: bool = False
     load_format: str = "auto"
     trust_remote_code: bool = False
     dtype: str = "auto"
@@ -59,7 +58,9 @@ class ServerArgs:
     chat_template: Optional[str] = None
     completion_template: Optional[str] = None
     is_embedding: bool = False
+    enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
+    impl: str = "auto"
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -79,6 +80,8 @@ class ServerArgs:
 
     # Other runtime options
     tp_size: int = 1
+    pp_size: int = 1
+    max_micro_batch_size: Optional[int] = None
     stream_interval: int = 1
     stream_output: bool = False
     random_seed: Optional[int] = None
@@ -88,6 +91,7 @@ class ServerArgs:
     download_dir: Optional[str] = None
     base_gpu_id: int = 0
     gpu_id_step: int = 1
+    sleep_on_idle: bool = False
 
     # Logging
     log_level: str = "info"
@@ -96,20 +100,24 @@ class ServerArgs:
     log_requests_level: int = 0
     show_time_cost: bool = False
     enable_metrics: bool = False
+    bucket_time_to_first_token: Optional[List[float]] = None
+    bucket_e2e_request_latency: Optional[List[float]] = None
+    bucket_inter_token_latency: Optional[List[float]] = None
+    collect_tokens_histogram: bool = False
     decode_log_interval: int = 40
+    enable_request_time_stats_logging: bool = False
+    kv_events_config: Optional[str] = None
 
     # API related
     api_key: Optional[str] = None
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
+    tool_call_parser: Optional[str] = None
 
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
-
-    # Expert parallelism
-    ep_size: int = 1
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -118,6 +126,7 @@ class ServerArgs:
 
     # Model override args in JSON
     json_model_override_args: str = "{}"
+    preferred_sampling_params: Optional[str] = None
 
     # LoRA
     lora_paths: Optional[List[str]] = None
@@ -128,6 +137,7 @@ class ServerArgs:
     attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
+    mm_attention_backend: Optional[str] = None
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -139,6 +149,26 @@ class ServerArgs:
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
 
+    # Expert parallelism
+    ep_size: int = 1
+    enable_ep_moe: bool = False
+    enable_deepep_moe: bool = False
+    deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
+    ep_num_redundant_experts: int = 0
+    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
+    init_expert_location: str = "trivial"
+    enable_eplb: bool = False
+    eplb_algorithm: str = "auto"
+    eplb_rebalance_num_iterations: int = 1000
+    eplb_rebalance_layers_per_chunk: Optional[int] = None
+    expert_distribution_recorder_mode: Optional[
+        Literal["stat", "stat_approx", "per_pass", "per_token"]
+    ] = None
+    expert_distribution_recorder_buffer_size: Optional[int] = None
+    enable_expert_distribution_metrics: bool = False
+    deepep_config: Optional[str] = None
+    moe_dense_tp_size: Optional[int] = None
+
     # Double Sparsity
     enable_double_sparsity: bool = False
     ds_channel_config_path: Optional[str] = None
@@ -149,22 +179,24 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
-    disable_cuda_graph: bool = False
-    disable_cuda_graph_padding: bool = False
-    enable_nccl_nvls: bool = False
-    disable_outlines_disk_cache: bool = False
-    disable_custom_all_reduce: bool = False
-    enable_multimodal: Optional[bool] = None
-    disable_overlap_schedule: bool = False
-    enable_mixed_chunk: bool = False
-    enable_dp_attention: bool = False
-    enable_ep_moe: bool = False
-    enable_deepep_moe: bool = False
-    deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
-    enable_torch_compile: bool = False
-    torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
+    disable_cuda_graph: bool = False
+    disable_cuda_graph_padding: bool = False
+    enable_profile_cuda_graph: bool = False
+    enable_nccl_nvls: bool = False
+    enable_tokenizer_batch_encode: bool = False
+    disable_outlines_disk_cache: bool = False
+    disable_custom_all_reduce: bool = False
+    enable_mscclpp: bool = False
+    disable_overlap_schedule: bool = False
+    disable_overlap_cg_plan: bool = False
+    enable_mixed_chunk: bool = False
+    enable_dp_attention: bool = False
+    enable_dp_lm_head: bool = False
+    enable_two_batch_overlap: bool = False
+    enable_torch_compile: bool = False
+    torch_compile_max_bs: int = 32
     torchao_config: str = ""
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
@@ -175,28 +207,36 @@ class ServerArgs:
     enable_memory_saver: bool = False
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
-    tool_call_parser: Optional[str] = None
     enable_hierarchical_cache: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
     flashinfer_mla_disable_ragged: bool = False
-    warmups: Optional[str] = None
-    moe_dense_tp_size: Optional[int] = None
-    n_share_experts_fusion: int = 0
+    disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
+    enable_return_hidden_states: bool = False
+    warmups: Optional[str] = None
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
     debug_tensor_dump_input_file: Optional[str] = None
     debug_tensor_dump_inject: bool = False
+    debug_tensor_dump_prefill_only: bool = False
 
     # For PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: str = "null"
-    disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
+    disaggregation_bootstrap_port: int = 8998
+    disaggregation_decode_tp: Optional[int] = None
+    disaggregation_decode_dp: Optional[int] = None
+    disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
+    num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
+    pdlb_url: Optional[str] = None
+
+    # For model weight update
+    custom_weight_loader: Optional[List[str]] = None
 
     def __post_init__(self):
         # Expert parallelism
@@ -221,30 +261,71 @@ class ServerArgs:
 
         gpu_mem = get_device_memory_capacity(self.device)
 
-        # Set mem fraction static, which depends on the tensor parallelism size
+        # Set mem fraction static
         if self.mem_fraction_static is None:
-            if gpu_mem <= 81920:
-                if self.tp_size >= 16:
-                    self.mem_fraction_static = 0.79
-                elif self.tp_size >= 8:
-                    self.mem_fraction_static = 0.81
-                elif self.tp_size >= 4:
-                    self.mem_fraction_static = 0.85
-                elif self.tp_size >= 2:
-                    self.mem_fraction_static = 0.87
+            if gpu_mem is not None:
+                # GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
+                # mem_fraction_static = (model weights + KV cache pool) / GPU memory capacity.
+
+                # We want mem_fraction_static to be as large as possible but still has enough room
+                # for activations and cuda graph buffers. We use the following heuristic to
+                # compute the needed size for activations and cuda graph buffers:
+                # - The size of the activation depends on the chunked_prefill_size and model size.
+                # - The size of cuda graph buffers depends on the cuda graph capture range and model size.
+                # For GPUs with more memory, we use a larger chunked_prefill_size and
+                # capture more cuda graphs, so they need to reserve more memory.
+                parallel_size = self.tp_size * self.pp_size
+
+                if gpu_mem < 20 * 1024:
+                    # T4, 4080. (chunked_prefill_size 2k, cuda_graph_max_bs 8)
+                    reserved_mem = (2.8 + parallel_size / 10) * 1024
+                elif gpu_mem < 35 * 1024:
+                    # A10, L40, 4090, 5090. (chunked_prefill_size 2k, cuda_graph_max_bs 8)
+                    reserved_mem = (2.8 + parallel_size / 10) * 1024
+                elif gpu_mem < 90 * 1024:
+                    # H100, A100. (chunked_prefill_size 8k, cuda_graph_max_bs 160)
+                    reserved_mem = (9.5 + parallel_size / 2) * 1024
+                elif gpu_mem < 100 * 1024:
+                    # H20. (chunked_prefill_size 8k, cuda_graph_max_bs 256)
+                    reserved_mem = (12 + parallel_size / 2) * 1024
+                elif gpu_mem < 160 * 1024:
+                    # H200. (chunked_prefill_size 8k, cuda_graph_max_bs 256)
+                    reserved_mem = (12 + parallel_size / 2) * 1024
                 else:
-                    self.mem_fraction_static = 0.88
+                    # B200, MI300. (chunked_prefill_size 16k, cuda_graph_max_bs 512)
+                    reserved_mem = 32 * 1024
+
+                if self.speculative_algorithm is not None:
+                    # draft model and larger cuda graph buffers
+                    reserved_mem += 2 * 1024
+                if self.enable_dp_attention:
+                    reserved_mem += 4 * 1024
+
+                self.mem_fraction_static = round((gpu_mem - reserved_mem) / gpu_mem, 3)
             else:
-                # FIXME: more fine grained auto-selection polices
-                self.mem_fraction_static = (gpu_mem - 1024 * 13) / gpu_mem
+                self.mem_fraction_static = 0.88
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
-            if gpu_mem is not None and gpu_mem < 25_000:
-                self.chunked_prefill_size = 2048
+            if gpu_mem is not None:
+                if gpu_mem < 35 * 1024:  # A10, L40, 4090
+                    self.chunked_prefill_size = 2048
+                elif gpu_mem < 160 * 1024:  # H100, H200, A100, H20
+                    self.chunked_prefill_size = 8192
+                else:  # B200, MI300
+                    self.chunked_prefill_size = 16384
             else:
-                self.chunked_prefill_size = 8192
+                self.chunked_prefill_size = 4096
         assert self.chunked_prefill_size % self.page_size == 0
+
+        # Set cuda graph max batch size
+        if self.cuda_graph_max_bs is None:
+            # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
+            if gpu_mem is not None and gpu_mem < 35 * 1024:
+                if self.tp_size < 4:
+                    self.cuda_graph_max_bs = 8
+                else:
+                    self.cuda_graph_max_bs = 80
 
         assert self.moe_dense_tp_size in {
             1,
@@ -263,21 +344,17 @@ class ServerArgs:
             )
             self.page_size = 128
 
-        # Set cuda graph max batch size
-        if self.cuda_graph_max_bs is None:
-            # Based on detailed statistics, when serving TP1/TP2 models on lower-end GPUs with HBM<25G, you can either disable cuda graph or set `cuda_graph_max_bs` to a very small value to reduce the memory overhead of creating cuda graphs, with almost no impact on performance. However, when serving models with TP4 or TP8, we need to enable cuda graph to maintain high performance. In this case, we can set `cuda_graph_max_bs` to 80 (half of the default value 160) to reduce the memory overhead of creating cuda graphs. Looking at the logs from TP4 serving of qwen2-72b, a value of 80 is sufficient and can reduce the memory overhead of creating cuda graphs on lower-end GPUs compared to the original 160, avoiding OOM issues.
-            if gpu_mem is not None and gpu_mem < 25_000:
-                if self.tp_size < 4:
-                    self.cuda_graph_max_bs = 8
-                else:
-                    self.cuda_graph_max_bs = 80
-
         # Set kernel backends for hpu device
         if self.device == "hpu":
             self.attention_backend = "torch_native"
             self.sampling_backend = "pytorch"
 
         # Set kernel backends
+        if self.device == "cpu":
+            if self.attention_backend is None:
+                self.attention_backend = "intel_amx"
+            self.sampling_backend = "pytorch"
+
         if self.sampling_backend is None:
             self.sampling_backend = (
                 "flashinfer" if is_flashinfer_available() else "pytorch"
@@ -305,6 +382,11 @@ class ServerArgs:
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
 
+        if self.enable_dp_lm_head:
+            assert (
+                self.enable_dp_attention
+            ), "Please enable dp attention when setting enable_dp_attention. "
+
         # DeepEP MoE
         self.enable_sp_layernorm = False
         if self.enable_deepep_moe:
@@ -312,6 +394,9 @@ class ServerArgs:
                 assert (
                     not self.enable_dp_attention
                 ), "DeepEP MoE `auto` mode is not supported with DP Attention."
+            if self.deepep_mode == "normal":
+                logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
+                self.disable_cuda_graph = True
             self.ep_size = self.tp_size
             self.enable_sp_layernorm = (
                 self.dp_size < self.tp_size if self.enable_dp_attention else True
@@ -319,6 +404,37 @@ class ServerArgs:
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
+
+        if self.pp_size > 1:
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Pipeline parallelism is incompatible with overlap schedule."
+            )
+
+        if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
+            self.expert_distribution_recorder_mode = "stat"
+            logger.info(
+                "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
+            )
+
+        if (self.enable_eplb or (self.init_expert_location is not None)) and (
+            self.ep_dispatch_algorithm is None
+        ):
+            self.ep_dispatch_algorithm = "static"
+            logger.info(
+                "EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
+            )
+
+        if self.enable_expert_distribution_metrics and (
+            self.expert_distribution_recorder_mode is None
+        ):
+            self.expert_distribution_recorder_mode = "stat"
+
+        if self.expert_distribution_recorder_buffer_size is None:
+            if (x := self.eplb_rebalance_num_iterations) is not None:
+                self.expert_distribution_recorder_buffer_size = x
+            elif self.expert_distribution_recorder_mode is not None:
+                self.expert_distribution_recorder_buffer_size = 1000
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -333,6 +449,23 @@ class ServerArgs:
                 "Overlap scheduler is disabled because of using "
                 "eagle speculative decoding."
             )
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using "
+                    "eagle speculative decoding."
+                )
+
+            model_arch = get_model_arch(self)
+
+            # Auto set draft_model_path DeepSeek-V3/R1
+            if model_arch == "DeepseekV3ForCausalLM":
+                if self.speculative_draft_model_path is None:
+                    self.speculative_draft_model_path = self.model_path
+                else:
+                    logger.warning(
+                        "DeepSeek MTP does not require setting speculative_draft_model_path."
+                    )
 
             # Auto choose parameters
             if self.speculative_num_steps is None:
@@ -379,12 +512,27 @@ class ServerArgs:
             self.triton_attention_num_kv_splits = 16
 
         # PD disaggregation
-        if self.disaggregation_mode == "prefill":
-            self.disable_cuda_graph = True
-            logger.warning("Cuda graph is disabled for prefill server")
-        elif self.disaggregation_mode == "decode":
+        if self.disaggregation_mode == "decode":
+            assert (
+                self.disaggregation_decode_tp is None
+            ), "Cannot set --disaggregation-decode-tp for the decode engine."
+            assert (
+                self.disaggregation_decode_dp is None
+            ), "Cannot set --disaggregation-decode-dp for the decode engine."
+
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
+        elif self.disaggregation_mode == "prefill":
+            if self.disaggregation_decode_tp is None:
+                self.disaggregation_decode_tp = self.tp_size
+            if self.disaggregation_decode_dp is None:
+                self.disaggregation_decode_dp = self.dp_size
+
+            self.disaggregation_prefill_pp = self.pp_size
+            self.validate_disagg_tp_size(self.tp_size, self.disaggregation_decode_tp)
+
+            self.disable_cuda_graph = True
+            logger.warning("Cuda graph is disabled for prefill server")
 
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
@@ -392,6 +540,17 @@ class ServerArgs:
         # Set env var before grammar backends init
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
+        )
+
+        if self.custom_weight_loader is None:
+            self.custom_weight_loader = []
+
+    def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
+        larger_tp = max(decode_tp, prefill_tp)
+        smaller_tp = min(decode_tp, prefill_tp)
+        assert larger_tp % smaller_tp == 0, (
+            "Different tp size is supported only when one tp is multiple of the other. "
+            f"decode_tp={decode_tp}, prefill_tp={prefill_tp}"
         )
 
     @staticmethod
@@ -410,10 +569,16 @@ class ServerArgs:
             help="The path of the tokenizer.",
         )
         parser.add_argument(
-            "--host", type=str, default=ServerArgs.host, help="The host of the server."
+            "--host",
+            type=str,
+            default=ServerArgs.host,
+            help="The host of the HTTP server.",
         )
         parser.add_argument(
-            "--port", type=int, default=ServerArgs.port, help="The port of the server."
+            "--port",
+            type=int,
+            default=ServerArgs.port,
+            help="The port of the HTTP server.",
         )
         parser.add_argument(
             "--root-path", type=str, default=ServerArgs.root_path, help="App is behind a path based routing proxy."
@@ -431,11 +596,6 @@ class ServerArgs:
             "--skip-tokenizer-init",
             action="store_true",
             help="If set, skip init tokenizer and pass input_ids in generate request.",
-        )
-        parser.add_argument(
-            "--enable-tokenizer-batch-encode",
-            action="store_true",
-            help="Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
         )
         parser.add_argument(
             "--load-format",
@@ -514,6 +674,7 @@ class ServerArgs:
                 "w8a8_int8",
                 "w8a8_fp8",
                 "moe_wna16",
+                "qoq",
             ],
             help="The quantization method.",
         )
@@ -536,7 +697,7 @@ class ServerArgs:
             "--device",
             type=str,
             default=ServerArgs.device,
-            help="The device to use ('cuda', 'xpu', 'hpu', 'cpu'). Defaults to auto-detection if not specified.",
+            help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
             "--served-model-name",
@@ -562,12 +723,30 @@ class ServerArgs:
             help="Whether to use a CausalLM as an embedding model.",
         )
         parser.add_argument(
+            "--enable-multimodal",
+            default=ServerArgs.enable_multimodal,
+            action="store_true",
+            help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
+        )
+        parser.add_argument(
             "--revision",
             type=str,
             default=None,
             help="The specific model version to use. It can be a branch "
             "name, a tag name, or a commit id. If unspecified, will use "
             "the default version.",
+        )
+        parser.add_argument(
+            "--impl",
+            type=str,
+            default=ServerArgs.impl,
+            help="Which implementation of the model to use.\n\n"
+            '* "auto" will try to use the SGLang implementation if it exists '
+            "and fall back to the Transformers implementation if no SGLang "
+            "implementation is available.\n"
+            '* "sglang" will use the SGLang model implementation.\n'
+            '* "transformers" will use the Transformers model '
+            "implementation.\n",
         )
 
         # Memory and scheduling
@@ -637,6 +816,19 @@ class ServerArgs:
             help="The tensor parallelism size.",
         )
         parser.add_argument(
+            "--pipeline-parallel-size",
+            "--pp-size",
+            type=int,
+            default=ServerArgs.pp_size,
+            help="The pipeline parallelism size.",
+        )
+        parser.add_argument(
+            "--max-micro-batch-size",
+            type=int,
+            default=ServerArgs.max_micro_batch_size,
+            help="The maximum micro batch size in pipeline parallelism.",
+        )
+        parser.add_argument(
             "--stream-interval",
             type=int,
             default=ServerArgs.stream_interval,
@@ -689,6 +881,11 @@ class ServerArgs:
             default=ServerArgs.gpu_id_step,
             help="The delta between consecutive GPU IDs that are used. For example, setting it to 2 will use GPU 0,2,4,...",
         )
+        parser.add_argument(
+            "--sleep-on-idle",
+            action="store_true",
+            help="Reduce CPU usage when sglang is idle.",
+        )
 
         # Logging
         parser.add_argument(
@@ -726,10 +923,49 @@ class ServerArgs:
             help="Enable log prometheus metrics.",
         )
         parser.add_argument(
+            "--bucket-time-to-first-token",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_time_to_first_token,
+            help="The buckets of time to first token, specified as a list of floats.",
+        )
+        parser.add_argument(
+            "--bucket-inter-token-latency",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_inter_token_latency,
+            help="The buckets of inter-token latency, specified as a list of floats.",
+        )
+        parser.add_argument(
+            "--bucket-e2e-request-latency",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_e2e_request_latency,
+            help="The buckets of end-to-end request latency, specified as a list of floats.",
+        )
+        parser.add_argument(
+            "--collect-tokens-histogram",
+            action="store_true",
+            default=ServerArgs.collect_tokens_histogram,
+            help="Collect prompt/generation tokens histogram.",
+        )
+        parser.add_argument(
+            "--kv-events-config",
+            type=str,
+            default=None,
+            help="Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used.",
+        )
+        parser.add_argument(
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
             help="The log interval of decode batch.",
+        )
+        parser.add_argument(
+            "--enable-request-time-stats-logging",
+            action="store_true",
+            default=ServerArgs.enable_request_time_stats_logging,
+            help="Enable per request time stats logging",
         )
 
         # API related
@@ -757,6 +993,13 @@ class ServerArgs:
             default=ServerArgs.reasoning_parser,
             help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
         )
+        parser.add_argument(
+            "--tool-call-parser",
+            type=str,
+            choices=["qwen25", "mistral", "llama3", "deepseekv3", "pythonic"],
+            default=ServerArgs.tool_call_parser,
+            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', and 'pythonic'.",
+        )
 
         # Data parallelism
         parser.add_argument(
@@ -777,19 +1020,10 @@ class ServerArgs:
             ],
         )
 
-        # Expert parallelism
-        parser.add_argument(
-            "--expert-parallel-size",
-            "--ep-size",
-            type=int,
-            default=ServerArgs.ep_size,
-            help="The expert parallelism size.",
-        )
-
         # Multi-node distributed serving
         parser.add_argument(
             "--dist-init-addr",
-            "--nccl-init-addr",  # For backward compatbility. This will be removed in the future.
+            "--nccl-init-addr",  # For backward compatibility. This will be removed in the future.
             type=str,
             help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
         )
@@ -806,6 +1040,11 @@ class ServerArgs:
             type=str,
             help="A dictionary in JSON string format used to override default model configurations.",
             default=ServerArgs.json_model_override_args,
+        )
+        parser.add_argument(
+            "--preferred-sampling-params",
+            type=str,
+            help="json-formatted sampling settings that will be returned in /get_model_info",
         )
 
         # LoRA
@@ -835,12 +1074,14 @@ class ServerArgs:
             "--attention-backend",
             type=str,
             choices=[
-                "flashinfer",
-                "triton",
-                "torch_native",
-                "fa3",
-                "flashmla",
+                "aiter",
                 "cutlass_mla",
+                "fa3",
+                "flashinfer",
+                "flashmla",
+                "intel_amx",
+                "torch_native",
+                "triton",
             ],
             default=ServerArgs.attention_backend,
             help="Choose the kernels for attention layers.",
@@ -858,21 +1099,6 @@ class ServerArgs:
             choices=["xgrammar", "outlines", "llguidance", "none"],
             default=ServerArgs.grammar_backend,
             help="Choose the backend for grammar-guided decoding.",
-        )
-        parser.add_argument(
-            "--enable-flashinfer-mla",
-            action=DeprecatedAction,
-            help="--enable-flashinfer-mla is deprecated. Please use '--attention-backend flashinfer' instead.",
-        )
-        parser.add_argument(
-            "--enable-flashmla",
-            action=DeprecatedAction,
-            help="--enable-flashmla is deprecated. Please use '--attention-backend flashmla' instead.",
-        )
-        parser.add_argument(
-            "--flashinfer-mla-disable-ragged",
-            action="store_true",
-            help="Not using ragged prefill wrapper when running flashinfer mla",
         )
 
         # Speculative decoding
@@ -923,6 +1149,109 @@ class ServerArgs:
             help="The path of the draft model's small vocab table.",
             default=ServerArgs.speculative_token_map,
         )
+        parser.add_argument(
+            "--mm-attention-backend",
+            type=str,
+            choices=["sdpa", "fa3", "triton_attn"],
+            default=ServerArgs.mm_attention_backend,
+            help="Set multimodal attention backend.",
+        )
+
+        # Expert parallelism
+        parser.add_argument(
+            "--expert-parallel-size",
+            "--ep-size",
+            type=int,
+            default=ServerArgs.ep_size,
+            help="The expert parallelism size.",
+        )
+        parser.add_argument(
+            "--enable-ep-moe",
+            action="store_true",
+            help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
+        )
+        parser.add_argument(
+            "--enable-deepep-moe",
+            action="store_true",
+            help="Enabling DeepEP MoE implementation for EP MoE.",
+        )
+        parser.add_argument(
+            "--deepep-mode",
+            type=str,
+            choices=["normal", "low_latency", "auto"],
+            default="auto",
+            help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+        )
+        parser.add_argument(
+            "--ep-num-redundant-experts",
+            type=int,
+            default=ServerArgs.ep_num_redundant_experts,
+            help="Allocate this number of redundant experts in expert parallel.",
+        )
+        parser.add_argument(
+            "--ep-dispatch-algorithm",
+            type=str,
+            default=ServerArgs.ep_dispatch_algorithm,
+            help="The algorithm to choose ranks for redundant experts in expert parallel.",
+        )
+        parser.add_argument(
+            "--init-expert-location",
+            type=str,
+            default=ServerArgs.init_expert_location,
+            help="Initial location of EP experts.",
+        )
+        parser.add_argument(
+            "--enable-eplb",
+            action="store_true",
+            help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--eplb-algorithm",
+            type=str,
+            default=ServerArgs.eplb_algorithm,
+            help="Chosen EPLB algorithm",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-num-iterations",
+            type=int,
+            default=ServerArgs.eplb_rebalance_num_iterations,
+            help="Number of iterations to automatically trigger a EPLB re-balance.",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-layers-per-chunk",
+            type=int,
+            default=ServerArgs.eplb_rebalance_layers_per_chunk,
+            help="Number of layers to rebalance per forward pass.",
+        )
+        parser.add_argument(
+            "--expert-distribution-recorder-mode",
+            type=str,
+            default=ServerArgs.expert_distribution_recorder_mode,
+            help="Mode of expert distribution recorder.",
+        )
+        parser.add_argument(
+            "--expert-distribution-recorder-buffer-size",
+            type=int,
+            default=ServerArgs.expert_distribution_recorder_buffer_size,
+            help="Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.",
+        )
+        parser.add_argument(
+            "--enable-expert-distribution-metrics",
+            action="store_true",
+            help="Enable logging metrics for expert balancedness",
+        )
+        parser.add_argument(
+            "--deepep-config",
+            type=str,
+            default=ServerArgs.deepep_config,
+            help="Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.",
+        )
+        parser.add_argument(
+            "--moe-dense-tp-size",
+            type=int,
+            default=ServerArgs.moe_dense_tp_size,
+            help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
+        )
 
         # Double Sparsity
         parser.add_argument(
@@ -968,6 +1297,18 @@ class ServerArgs:
             help="Disable RadixAttention for prefix caching.",
         )
         parser.add_argument(
+            "--cuda-graph-max-bs",
+            type=int,
+            default=ServerArgs.cuda_graph_max_bs,
+            help="Set the maximum batch size for cuda graph. It will extend the cuda graph capture batch size to this value.",
+        )
+        parser.add_argument(
+            "--cuda-graph-bs",
+            type=int,
+            nargs="+",
+            help="Set the list of batch sizes for cuda graph.",
+        )
+        parser.add_argument(
             "--disable-cuda-graph",
             action="store_true",
             help="Disable cuda graph.",
@@ -978,9 +1319,19 @@ class ServerArgs:
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
         )
         parser.add_argument(
+            "--enable-profile-cuda-graph",
+            action="store_true",
+            help="Enable profiling of cuda graph capture.",
+        )
+        parser.add_argument(
             "--enable-nccl-nvls",
             action="store_true",
             help="Enable NCCL NVLS for prefill heavy requests when available.",
+        )
+        parser.add_argument(
+            "--enable-tokenizer-batch-encode",
+            action="store_true",
+            help="Enable batch tokenization for improved performance when processing multiple text inputs. Do not use with image inputs, pre-tokenized input_ids, or input_embeds.",
         )
         parser.add_argument(
             "--disable-outlines-disk-cache",
@@ -993,15 +1344,19 @@ class ServerArgs:
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
-            "--enable-multimodal",
-            default=ServerArgs.enable_multimodal,
+            "--enable-mscclpp",
             action="store_true",
-            help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
+            help="Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
             action="store_true",
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
+        )
+        parser.add_argument(
+            "--disable-overlap-cg-plan",
+            action="store_true",
+            help="Disable the overlap optimization for cudagraph preparation in eagle verify.",
         )
         parser.add_argument(
             "--enable-mixed-chunk",
@@ -1011,12 +1366,17 @@ class ServerArgs:
         parser.add_argument(
             "--enable-dp-attention",
             action="store_true",
-            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently only DeepSeek-V2 is supported.",
+            help="Enabling data parallelism for attention and tensor parallelism for FFN. The dp size should be equal to the tp size. Currently DeepSeek-V2 and Qwen 2/3 MoE models are supported.",
         )
         parser.add_argument(
-            "--enable-ep-moe",
+            "--enable-dp-lm-head",
             action="store_true",
-            help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
+            help="Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention.",
+        )
+        parser.add_argument(
+            "--enable-two-batch-overlap",
+            action="store_true",
+            help="Enabling two micro batches to overlap.",
         )
         parser.add_argument(
             "--enable-torch-compile",
@@ -1028,18 +1388,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.torch_compile_max_bs,
             help="Set the maximum batch size when using torch compile.",
-        )
-        parser.add_argument(
-            "--cuda-graph-max-bs",
-            type=int,
-            default=ServerArgs.cuda_graph_max_bs,
-            help="Set the maximum batch size for cuda graph.",
-        )
-        parser.add_argument(
-            "--cuda-graph-bs",
-            type=int,
-            nargs="+",
-            help="Set the list of batch sizes for cuda graph.",
         )
         parser.add_argument(
             "--torchao-config",
@@ -1060,7 +1408,7 @@ class ServerArgs:
         parser.add_argument(
             "--triton-attention-reduce-in-fp32",
             action="store_true",
-            help="Cast the intermidiate attention results to fp32 to avoid possible crashes related to fp16."
+            help="Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."
             "This only affects Triton attention kernels.",
         )
         parser.add_argument(
@@ -1098,13 +1446,6 @@ class ServerArgs:
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
         )
         parser.add_argument(
-            "--tool-call-parser",
-            type=str,
-            choices=["qwen25", "mistral", "llama3", "deepseekv3"],
-            default=ServerArgs.tool_call_parser,
-            help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', and 'llama3'.",
-        )
-        parser.add_argument(
             "--enable-hierarchical-cache",
             action="store_true",
             help="Enable hierarchical cache",
@@ -1129,30 +1470,14 @@ class ServerArgs:
             help="The write policy of hierarchical cache.",
         )
         parser.add_argument(
-            "--enable-deepep-moe",
+            "--flashinfer-mla-disable-ragged",
             action="store_true",
-            help="Enabling DeepEP MoE implementation for EP MoE.",
+            help="Not using ragged prefill wrapper when running flashinfer mla",
         )
         parser.add_argument(
-            "--moe-dense-tp-size",
-            type=int,
-            default=ServerArgs.moe_dense_tp_size,
-            help="TP size for MoE dense MLP layers. This flag is useful when, with large TP size, there are errors caused by weights in MLP layers having dimension smaller than the min dimension GEMM supports.",
-        )
-        parser.add_argument(
-            "--deepep-mode",
-            type=str,
-            choices=["normal", "low_latency", "auto"],
-            default="auto",
-            help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
-        )
-
-        parser.add_argument(
-            "--n-share-experts-fusion",
-            type=int,
-            default=0,
-            help="The number of shared_experts need to be replicated to fuse with normal experts in deepseek v3/r1, "
-            "set it to tp_size can get best optimized performace.",
+            "--disable-shared-experts-fusion",
+            action="store_true",
+            help="Disable shared experts fusion optimization for deepseek v3/r1.",
         )
         parser.add_argument(
             "--disable-chunked-prefix-cache",
@@ -1164,8 +1489,11 @@ class ServerArgs:
             action="store_true",
             help="Adopt base image processor instead of fast image processor.",
         )
-
-        # Server warmups
+        parser.add_argument(
+            "--enable-return-hidden-states",
+            action="store_true",
+            help="Enable returning hidden states with responses.",
+        )
         parser.add_argument(
             "--warmups",
             type=str,
@@ -1193,6 +1521,11 @@ class ServerArgs:
             default=ServerArgs.debug_tensor_dump_inject,
             help="Inject the outputs from jax as the input of every layer.",
         )
+        parser.add_argument(
+            "--debug-tensor-dump-prefill-only",
+            action="store_true",
+            help="Only dump the tensors for prefill requests (i.e. batch size > 1).",
+        )
 
         # Disaggregation
         parser.add_argument(
@@ -1203,12 +1536,6 @@ class ServerArgs:
             help='Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
         )
         parser.add_argument(
-            "--disaggregation-bootstrap-port",
-            type=int,
-            default=ServerArgs.disaggregation_bootstrap_port,
-            help="Bootstrap server port on the prefill server. Default is 8998.",
-        )
-        parser.add_argument(
             "--disaggregation-transfer-backend",
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
@@ -1216,15 +1543,61 @@ class ServerArgs:
             help="The backend for disaggregation transfer. Default is mooncake.",
         )
         parser.add_argument(
+            "--disaggregation-bootstrap-port",
+            type=int,
+            default=ServerArgs.disaggregation_bootstrap_port,
+            help="Bootstrap server port on the prefill server. Default is 8998.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-tp",
+            type=int,
+            default=ServerArgs.disaggregation_decode_tp,
+            help="Decode tp size. If not set, it matches the tp size of the current engine. This is only set on the prefill server.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-dp",
+            type=int,
+            default=ServerArgs.disaggregation_decode_dp,
+            help="Decode dp size. If not set, it matches the dp size of the current engine. This is only set on the prefill server.",
+        )
+        parser.add_argument(
+            "--disaggregation-prefill-pp",
+            type=int,
+            default=ServerArgs.disaggregation_prefill_pp,
+            help="Prefill pp size. If not set, it is default to 1. This is only set on the decode server.",
+        )
+        parser.add_argument(
             "--disaggregation-ib-device",
             type=str,
             default=ServerArgs.disaggregation_ib_device,
-            help="The ib device for disaggregation transfer. Default is None, it will be detected automatically if using the mooncake backend.",
+            help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
+            "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
+            "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+        )
+        parser.add_argument(
+            "--num-reserved-decode-tokens",
+            type=int,
+            default=ServerArgs.num_reserved_decode_tokens,
+            help="Number of decode tokens that will have memory reserved when adding new request to the running batch.",
+        )
+        parser.add_argument(
+            "--pdlb-url",
+            type=str,
+            default=None,
+            help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
+        )
+        parser.add_argument(
+            "--custom-weight-loader",
+            type=str,
+            nargs="*",
+            default=None,
+            help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
         )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
+        args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]
@@ -1238,8 +1611,17 @@ class ServerArgs:
 
     def check_server_args(self):
         assert (
-            self.tp_size % self.nnodes == 0
-        ), "tp_size must be divisible by number of nodes"
+            self.tp_size * self.pp_size
+        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+
+        # FIXME pp constraints
+        if self.pp_size > 1:
+            assert (
+                self.disable_overlap_schedule
+                and self.speculative_algorithm is None
+                and not self.enable_mixed_chunk
+            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding, mixed chunked prefill."
+
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
         ), "multi-node data parallel is not supported unless dp attention!"
@@ -1247,7 +1629,7 @@ class ServerArgs:
             self.max_loras_per_batch > 0
             # FIXME
             and (self.lora_paths is None or self.disable_radix_cache)
-        ), "compatibility of lora and cuda graph and radix attention is in progress"
+        ), "compatibility of lora and radix attention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
@@ -1371,26 +1753,39 @@ class DeprecatedAction(argparse.Action):
         raise ValueError(self.help)
 
 
+def get_model_arch(args: ServerArgs):
+    hf_config = get_config(
+        args.model_path,
+        trust_remote_code=args.trust_remote_code,
+        revision=args.revision,
+        model_override_args=json.loads(args.json_model_override_args),
+    )
+    return hf_config.architectures[0]
+
+
 def auto_choose_speculative_params(self: ServerArgs):
     """
     Automatically choose the parameters for speculative decoding.
 
     You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
     """
-    config_path = os.path.join(self.model_path, "config.json")
-    if not os.path.exists(config_path):
-        raise ValueError(f"{config_path} is not found.")
+    kwargs = {}
 
-    config = json.load(open(config_path))
-
-    arch = config.get("architectures", ["Unknown"])[0]
+    hf_config = get_config(
+        self.model_path,
+        trust_remote_code=self.trust_remote_code,
+        revision=self.revision,
+        model_override_args=json.loads(self.json_model_override_args),
+        **kwargs,
+    )
+    arch = hf_config.architectures[0]
 
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama
         return (5, 4, 8)
     elif arch in ["DeepseekV3ForCausalLM", "DeepseekV2ForCausalLM"]:
         # The default value for deepseek
-        return (5, 4, 8)
+        return (3, 1, 4)
     elif arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)
     else:

@@ -24,9 +24,12 @@ class ChunkCache(BasePrefixCache):
         self,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        page_size: int,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.page_size = page_size
+        self.disable = True
 
     def reset(self):
         pass
@@ -36,7 +39,9 @@ class ChunkCache(BasePrefixCache):
 
     def cache_finished_req(self, req: Req):
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(req.origin_input_ids) + len(req.output_ids) - 1
+            req.req_pool_idx,
+            # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
+            : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool_allocator.free(kv_indices)
