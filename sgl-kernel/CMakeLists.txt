@@ -331,7 +331,6 @@ if (SGL_KERNEL_ENABLE_FA3)
         "--use_fast_math"
         "-Xcompiler=-Wconversion"
         "-Xcompiler=-fno-strict-aliasing"
-        # The --threads flag is now set conditionally below
     )
 
     if (ENABLE_BELOW_SM90)
