@@ -230,10 +230,10 @@ class TokenToKVPoolAllocator:
             prefill_indices = free_index[prefill_mask]
             decode_indices = free_index[decode_mask]
             if prefill_indices.numel() > 0:
-                self.prefill_free_slots = torch.cat((self.prefill_free_slots, free_index))
+                self.prefill_free_slots = torch.cat((self.prefill_free_slots, prefill_indices))
 
             if decode_indices.numel() > 0:
-                self.decode_free_slots = torch.cat((self.decode_free_slots, free_index))
+                self.decode_free_slots = torch.cat((self.decode_free_slots, decode_indices))
         else:
             self.free_slots = torch.cat((self.free_slots, free_index))
 
