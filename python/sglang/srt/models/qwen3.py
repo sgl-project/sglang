@@ -292,11 +292,6 @@ class Qwen3ForCausalLM(nn.Module):
                 self.config.hidden_size,
                 self.config.head_dim * self.config.num_attention_heads,
             )
-        elif module_name in ['k_proj', 'v_proj']:
-            return (
-                self.config.hidden_size,
-                model.config.head_dim * model.config.num_attention_heads // model.config.num_key_value_heads
-        )
         elif module_name in ["o_proj"]:
             return (
                 self.config.head_dim * self.config.num_attention_heads,
