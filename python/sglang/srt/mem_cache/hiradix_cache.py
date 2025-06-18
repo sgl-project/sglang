@@ -1,14 +1,15 @@
+import hashlib
 import heapq
 import logging
 import threading
 import time
-import hashlib
 from typing import List, Optional
 
-import torch
 import numpy as np
+import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.managers.schedule_batch import Req, WaitingStatus
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -19,17 +20,14 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
-from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 from sglang.srt.mem_cache.mooncake_store import MooncakeStore
-from sglang.srt.managers.schedule_batch import Req, WaitingStatus
+from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
 logger = logging.getLogger(__name__)
 
 
 def page_token_ids_to_key(
-    prefix_block_key: str,
-    current_page_ids: List,
-    local_rank: int
+    prefix_block_key: str, current_page_ids: List, local_rank: int
 ):
     prefix_str = ""
     if len(prefix_block_key):
@@ -38,6 +36,7 @@ def page_token_ids_to_key(
     current_hash_object = hashlib.sha256(current_token_ids_bytes)
     current_hash_hex = current_hash_object.hexdigest()
     return f"{prefix_str}_{int(current_hash_hex[:16], 16)}_{local_rank}"
+
 
 def get_node_l3_keys(
     token_ids: List,
@@ -51,11 +50,14 @@ def get_node_l3_keys(
     current_block_len = current_token_len // page_size
     for i in range(total_block_len - current_block_len, total_block_len):
         current_block_token_ids = token_ids[i * page_size : (i + 1) * page_size]
-        current_block_key = page_token_ids_to_key(prefix_block_key, current_block_token_ids, local_rank)
+        current_block_key = page_token_ids_to_key(
+            prefix_block_key, current_block_token_ids, local_rank
+        )
         l3_keys.append(current_block_key)
         prefix_block_key = current_block_key
 
     return l3_keys
+
 
 class HiRadixCache(RadixCache):
 
@@ -68,7 +70,7 @@ class HiRadixCache(RadixCache):
         hicache_ratio: float,
         hicache_size: int,
         hicache_write_policy: str,
-        enable_mooncake_store_l3_cache: bool
+        enable_mooncake_store_l3_cache: bool,
     ):
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
@@ -90,9 +92,15 @@ class HiRadixCache(RadixCache):
             # TODO(huangtingwei9988):L3 cache only support write_through_selective and write_through write policy
             assert hicache_write_policy in ["write_through_selective", "write_through"]
             self.mooncake_l3_kv_pool = MooncakeStore(
-                self.token_to_kv_pool_host.get_flat_data(list(range(0,self.page_size))).shape,
+                self.token_to_kv_pool_host.get_flat_data(
+                    list(range(0, self.page_size))
+                ).shape,
                 self.token_to_kv_pool_host.dtype,
-                1 if isinstance(self.token_to_kv_pool_host, MLATokenToKVPoolHost) else 2
+                (
+                    1
+                    if isinstance(self.token_to_kv_pool_host, MLATokenToKVPoolHost)
+                    else 2
+                ),
             )
             self.mooncake_l3_load_cache_event = threading.Event()
             self.l3_ongoing_load_back = {}
@@ -108,7 +116,7 @@ class HiRadixCache(RadixCache):
             load_cache_event=self.load_cache_event,
             write_policy=hicache_write_policy,
             mooncake_l3_kv_pool=self.mooncake_l3_kv_pool,
-            mooncake_l3_load_cache_event=self.mooncake_l3_load_cache_event
+            mooncake_l3_load_cache_event=self.mooncake_l3_load_cache_event,
         )
 
         # record the nodes with ongoing write through
@@ -137,26 +145,37 @@ class HiRadixCache(RadixCache):
             height += 1
         return height
 
-    def write_backup(self, node: TreeNode, write_back=False, token_ids: Optional[List]=None):
+    def write_backup(
+        self, node: TreeNode, write_back=False, token_ids: Optional[List] = None
+    ):
         l3_keys = []
         if self.enable_mooncake_store_l3_cache:
             # The KV cache of each rank in the MLA model is the same, so only one copy needs to be stored
-            local_rank = 0 if isinstance(self.kv_cache, MLATokenToKVPool) else torch.cuda.current_device()
-            prefix_block_key = "" if node.parent is None or len(node.parent.l3_keys) == 0 else node.parent.l3_keys[-1]
-            l3_keys = get_node_l3_keys(token_ids, len(node.value), prefix_block_key,
-                                       local_rank, self.page_size)
+            local_rank = (
+                0
+                if isinstance(self.kv_cache, MLATokenToKVPool)
+                else torch.cuda.current_device()
+            )
+            prefix_block_key = (
+                ""
+                if node.parent is None or len(node.parent.l3_keys) == 0
+                else node.parent.l3_keys[-1]
+            )
+            l3_keys = get_node_l3_keys(
+                token_ids, len(node.value), prefix_block_key, local_rank, self.page_size
+            )
 
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
-            l3_keys=l3_keys if self.enable_mooncake_store_l3_cache else None
+            l3_keys=l3_keys if self.enable_mooncake_store_l3_cache else None,
         )
         if host_indices is None:
             self.evict_host(len(node.value))
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 node_id=node.id,
-                l3_keys=l3_keys if self.enable_mooncake_store_l3_cache else None
+                l3_keys=l3_keys if self.enable_mooncake_store_l3_cache else None,
             )
         if host_indices is not None:
             node.host_value = host_indices
@@ -172,7 +191,7 @@ class HiRadixCache(RadixCache):
 
         return len(host_indices)
 
-    def inc_hit_count(self, node: TreeNode, token_ids: Optional[List]=None):
+    def inc_hit_count(self, node: TreeNode, token_ids: Optional[List] = None):
         if node.backuped or self.cache_controller.write_policy == "write_back":
             return
         node.hit_count += 1
@@ -331,9 +350,7 @@ class HiRadixCache(RadixCache):
             if len(x.parent.children) == 0 and x.parent.evicted:
                 heapq.heappush(leaves, x.parent)
 
-    def mooncake_load_back(
-        self, req: Req, node: TreeNode
-    ):
+    def mooncake_load_back(self, req: Req, node: TreeNode):
         last_hit_node = node
         if last_hit_node.id in self.l3_ongoing_load_back.keys():
             return
@@ -347,16 +364,18 @@ class HiRadixCache(RadixCache):
 
         self.inc_lock_ref(ancester_node)
 
-        self.l3_ongoing_load_back[last_hit_node.id] = (ancester_node, last_hit_node, req)
+        self.l3_ongoing_load_back[last_hit_node.id] = (
+            ancester_node,
+            last_hit_node,
+            req,
+        )
 
         if last_hit_node == ancester_node:
             self.cache_controller.mooncake_l3_ack_load_queue.put(last_hit_node.id)
             return
 
         l3_keys = [key for n in l3_nodes_to_load for key in n.l3_keys]
-        self.cache_controller.mooncake_load(
-            node_id=last_hit_node.id, l3_keys=l3_keys
-        )
+        self.cache_controller.mooncake_load(node_id=last_hit_node.id, l3_keys=l3_keys)
         for node in l3_nodes_to_load:
             node.loading = True
 
@@ -384,8 +403,16 @@ class HiRadixCache(RadixCache):
         # protect the ancestor nodes from eviction
         delta = self.inc_lock_ref(ancester_node)
 
-        l3_keys = [key for n in l3_nodes_to_load for key in n.l3_keys] if len(l3_nodes_to_load) > 0 else []
-        host_indices = torch.cat([n.host_value for n in nodes_to_load]) if len(nodes_to_load) > 0 else []
+        l3_keys = (
+            [key for n in l3_nodes_to_load for key in n.l3_keys]
+            if len(l3_nodes_to_load) > 0
+            else []
+        )
+        host_indices = (
+            torch.cat([n.host_value for n in nodes_to_load])
+            if len(nodes_to_load) > 0
+            else []
+        )
 
         # load it all or not at all
         total_load_back_size = len(host_indices) + len(l3_keys) * self.page_size
@@ -397,12 +424,16 @@ class HiRadixCache(RadixCache):
             return None
 
         device_indices = self.cache_controller.load(
-            host_indices=host_indices, node_id=last_hit_node.id, load_back_size=total_load_back_size
+            host_indices=host_indices,
+            node_id=last_hit_node.id,
+            load_back_size=total_load_back_size,
         )
         if device_indices is None:
             self.evict(total_load_back_size)
             device_indices = self.cache_controller.load(
-                host_indices=host_indices, node_id=last_hit_node.id, load_back_size=total_load_back_size
+                host_indices=host_indices,
+                node_id=last_hit_node.id,
+                load_back_size=total_load_back_size,
             )
         self.dec_lock_ref(ancester_node)
         if device_indices is None:
@@ -416,7 +447,9 @@ class HiRadixCache(RadixCache):
             offset += len(node.host_value)
             node.loading = True
         for node in l3_nodes_to_load:
-            node.value = device_indices[offset: offset + len(node.l3_keys) * self.page_size]
+            node.value = device_indices[
+                offset : offset + len(node.l3_keys) * self.page_size
+            ]
             offset += len(node.l3_keys) * self.page_size
             node.loading = True
         self.evictable_size_ += total_load_back_size
@@ -519,10 +552,19 @@ class HiRadixCache(RadixCache):
         if self.enable_mooncake_store_l3_cache:
             # try to get the cross instance shared kv cache
             if len(key) and (not node.evicted or node.backuped):
-                local_rank = 0 if isinstance(self.kv_cache, MLATokenToKVPool) else torch.cuda.current_device()
-                prefix_block_key = "" if node.parent is None or len(node.parent.l3_keys) == 0 else node.parent.l3_keys[-1]
-                l3_keys = get_node_l3_keys(total_key, len(key), prefix_block_key,
-                                           local_rank, self.page_size)
+                local_rank = (
+                    0
+                    if isinstance(self.kv_cache, MLATokenToKVPool)
+                    else torch.cuda.current_device()
+                )
+                prefix_block_key = (
+                    ""
+                    if node.parent is None or len(node.parent.l3_keys) == 0
+                    else node.parent.l3_keys[-1]
+                )
+                l3_keys = get_node_l3_keys(
+                    total_key, len(key), prefix_block_key, local_rank, self.page_size
+                )
                 mooncake_exist_keys = self.mooncake_l3_kv_pool.is_batch_exist(l3_keys)
                 l3_exist_keys = []
                 for l3_key in l3_keys:
@@ -532,10 +574,12 @@ class HiRadixCache(RadixCache):
                         break
 
                 if len(l3_exist_keys) > 0:
-                    child_key = self.get_child_key_fn(key[:len(l3_exist_keys) * self.page_size])
+                    child_key = self.get_child_key_fn(
+                        key[: len(l3_exist_keys) * self.page_size]
+                    )
                     new_node = TreeNode()
                     new_node.parent = node
-                    new_node.key = key[:len(l3_exist_keys) * self.page_size]
+                    new_node.key = key[: len(l3_exist_keys) * self.page_size]
                     node.children[child_key] = new_node
                     new_node.l3_keys = l3_exist_keys
                     node = new_node
@@ -561,8 +605,8 @@ class HiRadixCache(RadixCache):
             new_node.host_value = child.host_value[:split_len]
             child.host_value = child.host_value[split_len:]
         if child.l3_backuped:
-            new_node.l3_keys = child.l3_keys[:split_len // self.page_size]
-            child.l3_keys = child.l3_keys[split_len // self.page_size:]
+            new_node.l3_keys = child.l3_keys[: split_len // self.page_size]
+            child.l3_keys = child.l3_keys[split_len // self.page_size :]
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
@@ -601,7 +645,9 @@ class HiRadixCache(RadixCache):
                     self.evictable_size_ += len(new_node.value)
                 else:
                     total_prefix_length += prefix_len
-                    self.inc_hit_count(new_node, token_ids=total_key[:total_prefix_length])
+                    self.inc_hit_count(
+                        new_node, token_ids=total_key[:total_prefix_length]
+                    )
                 node = new_node
 
             key = key[prefix_len:]

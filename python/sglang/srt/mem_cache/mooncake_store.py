@@ -11,7 +11,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -23,22 +23,20 @@ DEFAULT_LOCAL_BUFFER_SIZE = 8 * 1024 * 1024 * 1024  # 8.0 GiB
 
 logger = logging.getLogger(__name__)
 
+
 # TODO:(huangtingwei9988) Safetensors serialization performance is poor,
 #  this optimization is not completed
 def tensor_to_bytes(tensor):
     length = int(np.prod(tensor.shape).item())
-    bytes_per_item = 2 # for bfloat16, other will change accordingly
+    bytes_per_item = 2  # for bfloat16, other will change accordingly
     total_bytes = length * bytes_per_item
     ptr = tensor.data_ptr()
     new_ptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ubyte))
     data = np.ctypeslib.as_array(new_ptr, (total_bytes,))  # no internal copy
     return data.tobytes()
 
-def bytes_to_tensor(
-    data_bytes: bytes,
-    tensor_shape: torch.Size,
-    dtype: torch.dtype
-):
+
+def bytes_to_tensor(data_bytes: bytes, tensor_shape: torch.Size, dtype: torch.dtype):
     return torch.frombuffer(data_bytes, dtype=dtype).reshape(tensor_shape)
 
 
@@ -49,17 +47,18 @@ def safetensors_bytes_to_tensor(data: bytes):
         return tensor
     device_id_tensor = loaded_tensors["device_id"]
     device_id = int(device_id_tensor.item())
-    device = torch.device(
-        'cuda', device_id) if device_id >= 0 else torch.device('cpu')
+    device = torch.device("cuda", device_id) if device_id >= 0 else torch.device("cpu")
     return tensor.to(device)
+
 
 def safetensors_tensor_to_bytes(tensor_value: torch.Tensor):
     tensors = {"tensor": tensor_value}
-    device_id = tensor_value.device.index if tensor_value.device.type == 'cuda' else -1
+    device_id = tensor_value.device.index if tensor_value.device.type == "cuda" else -1
     if device_id != -1:
         device_tensor = torch.tensor(device_id, dtype=torch.int32)
-        tensors['device_id'] = device_tensor
+        tensors["device_id"] = device_tensor
     return safetensors_save(tensors)
+
 
 @dataclass
 class MooncakeStoreConfig:
@@ -72,60 +71,61 @@ class MooncakeStoreConfig:
     master_server_address: str
 
     @staticmethod
-    def from_file(file_path: str) -> 'MooncakeStoreConfig':
+    def from_file(file_path: str) -> "MooncakeStoreConfig":
         """Load the config from a JSON file."""
         with open(file_path) as fin:
             config = json.load(fin)
         return MooncakeStoreConfig(
             local_hostname=config.get("local_hostname"),
             metadata_server=config.get("metadata_server"),
-            global_segment_size=config.get("global_segment_size",
-                                           DEFAULT_GLOBAL_SEGMENT_SIZE),
-            local_buffer_size=config.get("local_buffer_size",
-                                         DEFAULT_LOCAL_BUFFER_SIZE),
+            global_segment_size=config.get(
+                "global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE
+            ),
+            local_buffer_size=config.get(
+                "local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE
+            ),
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", ""),
             master_server_address=config.get("master_server_address"),
         )
 
     @staticmethod
-    def load_from_env() -> 'MooncakeStoreConfig':
+    def load_from_env() -> "MooncakeStoreConfig":
         """Load config from a file specified in the environment variable."""
-        config_file_path = os.getenv('MOONCAKE_CONFIG_PATH')
+        config_file_path = os.getenv("MOONCAKE_CONFIG_PATH")
         if config_file_path is None:
             raise ValueError(
-                "The environment variable 'MOONCAKE_CONFIG_PATH' is not set.")
+                "The environment variable 'MOONCAKE_CONFIG_PATH' is not set."
+            )
         return MooncakeStoreConfig.from_file(config_file_path)
 
 
 class MooncakeStore:
 
-    def __init__(
-        self,
-        page_tensor_shape: torch.Size,
-        dtype: torch.dtype,
-        seq_dim: int
-    ):
+    def __init__(self, page_tensor_shape: torch.Size, dtype: torch.dtype, seq_dim: int):
         try:
             from mooncake.store import MooncakeDistributedStore
         except ImportError as e:
             raise ImportError(
                 "Please install mooncake by following the instructions at "
                 "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
-                "to run vLLM with MooncakeConnector.") from e
+                "to run vLLM with MooncakeConnector."
+            ) from e
 
         try:
             self.store = MooncakeDistributedStore()
             self.config = MooncakeStoreConfig.load_from_env()
             logger.info("Mooncake Configuration loaded successfully.")
 
-            self.store.setup(self.config.local_hostname,
-                             self.config.metadata_server,
-                             self.config.global_segment_size,
-                             self.config.local_buffer_size,
-                             self.config.protocol,
-                             self.config.device_name,
-                             self.config.master_server_address)
+            self.store.setup(
+                self.config.local_hostname,
+                self.config.metadata_server,
+                self.config.global_segment_size,
+                self.config.local_buffer_size,
+                self.config.protocol,
+                self.config.device_name,
+                self.config.master_server_address,
+            )
             logger.info("Connect to Mooncake store successfully.")
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
@@ -134,13 +134,11 @@ class MooncakeStore:
             self.dtype = dtype
             self.seq_dim = seq_dim
 
-
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
             raise
         except Exception as exc:
-            logger.error(
-                "An error occurred while loading the configuration: %s", exc)
+            logger.error("An error occurred while loading the configuration: %s", exc)
             raise
 
     def warmup(self):
@@ -165,20 +163,12 @@ class MooncakeStore:
             if self.is_exist(key):
                 self.store.remove(key)
 
-    def put(
-        self,
-        key: str,
-        value: Optional[torch.Tensor]
-    ) -> None:
+    def put(self, key: str, value: Optional[torch.Tensor]) -> None:
         # A message queue needs to be introduced before making it asynchronous.
         if value is not None:
             self._put_impl(key, value)
 
-    def batch_put(
-        self,
-        keys: List[str],
-        values: List[torch.Tensor]
-    ) -> None:
+    def batch_put(self, keys: List[str], values: List[torch.Tensor]) -> None:
         if keys is None or values is None:
             return
 
@@ -207,33 +197,23 @@ class MooncakeStore:
             return None
 
         for key in keys:
-            if key is None :
+            if key is None:
                 return None
 
         return self._get_batch_impl(keys)
 
-    def is_exist(
-        self,
-        key: str
-    ) -> bool:
+    def is_exist(self, key: str) -> bool:
         if key is not None:
             return self.store.is_exist(key) == 1
         return False
 
-    def is_batch_exist(
-        self,
-        keys: List[str]
-    ):
+    def is_batch_exist(self, keys: List[str]):
         for key in keys:
-            if key is None :
+            if key is None:
                 return None
         return self.store.is_batch_exist(keys)
 
-    def _put_batch_impl(
-        self,
-        keys: List[str],
-        values: List[torch.Tensor]
-    ) -> None:
+    def _put_batch_impl(self, keys: List[str], values: List[torch.Tensor]) -> None:
         value_bytes = [tensor_to_bytes(value) for value in values]
         batches = {}
         for i in range(len(keys)):
@@ -244,11 +224,7 @@ class MooncakeStore:
             logger.error("Failed to put value into Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Put Type Error.") from err
 
-    def _put_impl(
-        self,
-        key: str,
-        value: torch.Tensor
-    ) -> None:
+    def _put_impl(self, key: str, value: torch.Tensor) -> None:
         """Put KVCache to Mooncake Store"""
         value_bytes = tensor_to_bytes(value)
         try:
@@ -257,10 +233,7 @@ class MooncakeStore:
             logger.error("Failed to put value into Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Put Type Error.") from err
 
-    def _get_batch_impl(
-        self,
-        keys: List[str]
-    ) -> Optional[List[torch.Tensor]]:
+    def _get_batch_impl(self, keys: List[str]) -> Optional[List[torch.Tensor]]:
         try:
             batch_data = self.store.get_batch(keys)
         except TypeError as err:
@@ -269,8 +242,10 @@ class MooncakeStore:
 
         if batch_data:
             if len(batch_data) > 0:
-                tensor_list = [bytes_to_tensor(data,
-                                    self.page_tensor_shape, self.dtype) for data in batch_data]
+                tensor_list = [
+                    bytes_to_tensor(data, self.page_tensor_shape, self.dtype)
+                    for data in batch_data
+                ]
                 return torch.concat(tensor_list, dim=self.seq_dim)
         return None
 

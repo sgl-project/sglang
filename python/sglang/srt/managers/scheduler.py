@@ -112,8 +112,8 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     Req,
     ScheduleBatch,
+    WaitingStatus,
     global_server_args_dict,
-    WaitingStatus
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -455,7 +455,9 @@ class Scheduler(
         self.enable_mooncake_store_l3_cache = server_args.enable_mooncake_store_l3_cache
         # Init loading l3 cache thread
         if self.enable_hierarchical_cache and self.enable_mooncake_store_l3_cache:
-            loading_l3_cache_thread = threading.Thread(target=self.loading_l3_cache, daemon=True)
+            loading_l3_cache_thread = threading.Thread(
+                target=self.loading_l3_cache, daemon=True
+            )
             loading_l3_cache_thread.start()
 
         # Init memory saver
@@ -571,7 +573,7 @@ class Scheduler(
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
-                    enable_mooncake_store_l3_cache=server_args.enable_mooncake_store_l3_cache
+                    enable_mooncake_store_l3_cache=server_args.enable_mooncake_store_l3_cache,
                 )
             else:
                 self.tree_cache = RadixCache(
@@ -1486,10 +1488,7 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
                     break
 
-            if (
-                self.enable_hierarchical_cache
-                and self.enable_mooncake_store_l3_cache
-            ):
+            if self.enable_hierarchical_cache and self.enable_mooncake_store_l3_cache:
                 if not self.tree_cache.waiting_status_check(req):
                     continue
 
@@ -1934,7 +1933,6 @@ class Scheduler(
                     req.waiting_status = WaitingStatus.LOADING
                     self.tree_cache.mooncake_load_back(req, req.last_node_global)
             time.sleep(0.001)
-
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""

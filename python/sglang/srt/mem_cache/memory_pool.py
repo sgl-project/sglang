@@ -384,7 +384,7 @@ class MHATokenToKVPool(KVCache):
         return torch.stack(
             [
                 self.k_buffer[layer_id - self.start_layer][indices],
-                self.v_buffer[layer_id - self.start_layer][indices]
+                self.v_buffer[layer_id - self.start_layer][indices],
             ]
         )
 
@@ -682,7 +682,7 @@ class MLATokenToKVPool(KVCache):
         for i in range(len(device_indices_cpu)):
             d_index = device_indices_cpu[i]
             self.kv_buffer[layer_id - self.start_layer][
-            d_index: d_index + self.page_size
+                d_index : d_index + self.page_size
             ].copy_(flat_data_list[i])
 
 

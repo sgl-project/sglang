@@ -22,14 +22,17 @@ from typing import List, Optional, Union
 
 import torch
 
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache, MLATokenToKVPoolHost
 from sglang.srt.mem_cache.mooncake_store import MooncakeStore
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
-from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
-
 logger = logging.getLogger(__name__)
+
 
 class RLockCounter:
     def __init__(self, initial=0):
@@ -47,6 +50,7 @@ class RLockCounter:
     def reset(self):
         with self._lock:
             self.value = 0
+
 
 class LayerDoneCounter:
     def __init__(self, num_layers):
@@ -72,6 +76,7 @@ class LayerDoneCounter:
     def reset(self):
         with self.condition:
             self.counter = 0
+
 
 class L3LoadCacheOperation:
     counter = 0
@@ -165,7 +170,7 @@ class CacheOperation:
         self.priority = min(self.priority, other.priority)
         self.node_ids.extend(other.node_ids)
         if self.l3_keys and other.l3_keys:
-            self.l3_keys = self.l3_keys.extend(other.l3_keys)
+            self.l3_keys.extend(other.l3_keys)
 
     def split(self, factor) -> List["CacheOperation"]:
         # split an operation into smaller operations to reduce the size of intermediate buffers
@@ -180,9 +185,14 @@ class CacheOperation:
                     host_indices=self.host_indices[i : i + chunk_size],
                     device_indices=self.device_indices[i : i + chunk_size],
                     node_id=0,
-                    l3_keys=self.l3_keys[i / self.page_size : (i + chunk_size) /
-                                        self.page_size] if self.l3_keys else None,
-                    page_size=self.page_size
+                    l3_keys=(
+                        self.l3_keys[
+                            i / self.page_size : (i + chunk_size) / self.page_size
+                        ]
+                        if self.l3_keys
+                        else None
+                    ),
+                    page_size=self.page_size,
                 )
             )
         # Inherit the node_ids on the final chunk
@@ -329,7 +339,8 @@ class HiCacheController:
 
             # L2 -> L3
             self.mooncake_l3_write_thread = threading.Thread(
-                target=self.mooncake_l3_write_thread_func_direct, daemon=True,
+                target=self.mooncake_l3_write_thread_func_direct,
+                daemon=True,
             )
             # L3 -> tensor(cpu)
             self.mooncake_load_thread = threading.Thread(
@@ -384,7 +395,8 @@ class HiCacheController:
             self.mooncake_l3_ack_load_queue.queue.clear()
 
             self.mooncake_l3_write_thread = threading.Thread(
-                target=self.mooncake_l3_write_thread_func_direct, daemon=True,
+                target=self.mooncake_l3_write_thread_func_direct,
+                daemon=True,
             )
             self.mooncake_load_thread = threading.Thread(
                 target=self.mooncake_load_thread_func, daemon=True
@@ -414,7 +426,14 @@ class HiCacheController:
             return None
         self.mem_pool_host.protect_write(host_indices)
         self.write_queue.put(
-            CacheOperation(host_indices, device_indices, node_id, priority, l3_keys=l3_keys, page_size=self.page_size)
+            CacheOperation(
+                host_indices,
+                device_indices,
+                node_id,
+                priority,
+                l3_keys=l3_keys,
+                page_size=self.page_size,
+            )
         )
         return host_indices
 
@@ -423,7 +442,7 @@ class HiCacheController:
         host_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = 0,
-        load_back_size: int = 0
+        load_back_size: int = 0,
     ) -> Optional[torch.Tensor]:
         """
         Load KV caches from host memory to device memory.
@@ -437,12 +456,18 @@ class HiCacheController:
             # to ensure the device indices are ready before accessed by another CUDA stream
             torch.cuda.current_stream().synchronize()
             self.load_queue.put(
-                CacheOperation(host_indices, device_indices[:len(host_indices)], node_id, priority)
+                CacheOperation(
+                    host_indices, device_indices[: len(host_indices)], node_id, priority
+                )
             )
         if self.enable_mooncake_store_l3_cache and load_back_size > len(host_indices):
             l3_cache, l3_cache_len = self.l3_cache_pool.get(node_id)
             assert load_back_size - len(host_indices) == l3_cache_len
-            self.l3_load_queue.put(L3LoadCacheOperation(device_indices[len(host_indices):], l3_cache, node_id))
+            self.l3_load_queue.put(
+                L3LoadCacheOperation(
+                    device_indices[len(host_indices) :], l3_cache, node_id
+                )
+            )
 
         return device_indices
 
@@ -452,7 +477,9 @@ class HiCacheController:
         priority: Optional[int] = None,
         node_id: int = 0,
     ) -> Optional[torch.Tensor]:
-        self.mooncake_load_queue.put(MooncakeStoreCacheOperation(l3_keys, None, node_id, priority=priority))
+        self.mooncake_load_queue.put(
+            MooncakeStoreCacheOperation(l3_keys, None, node_id, priority=priority)
+        )
 
     def write_thread_func_direct(self):
         """
@@ -472,8 +499,12 @@ class HiCacheController:
 
                 # write L3 cache
                 if self.enable_mooncake_store_l3_cache:
-                    mooncake_operation = MooncakeStoreCacheOperation(operation.l3_keys, operation.host_indices,
-                                                                     operation.node_ids, priority=operation.priority)
+                    mooncake_operation = MooncakeStoreCacheOperation(
+                        operation.l3_keys,
+                        operation.host_indices,
+                        operation.node_ids,
+                        priority=operation.priority,
+                    )
 
                     self.mooncake_l3_write_queue.put(mooncake_operation)
 
@@ -501,11 +532,15 @@ class HiCacheController:
                         end_index = key_len // self.tp_size * (self.tp_rank + 1)
                     else:
                         start_index = (key_len // self.tp_size + 1) * self.tp_rank
-                        end_index = min((key_len // self.tp_size + 1) * (self.tp_rank + 1), key_len)
+                        end_index = min(
+                            (key_len // self.tp_size + 1) * (self.tp_rank + 1), key_len
+                        )
 
-                    fragment_keys = keys[start_index: end_index]
+                    fragment_keys = keys[start_index:end_index]
 
-                mooncake_exist_keys = self.mooncake_l3_kv_pool.is_batch_exist(fragment_keys)
+                mooncake_exist_keys = self.mooncake_l3_kv_pool.is_batch_exist(
+                    fragment_keys
+                )
 
                 non_exist_keys = []
                 non_exist_value = []
@@ -514,16 +549,20 @@ class HiCacheController:
                     # so only the cache that does not exist is written.
                     if not mooncake_exist_keys[fragment_keys[i]]:
                         non_exist_keys.append(fragment_keys[i])
-                        non_exist_value.append(self.mem_pool_host.get_flat_data(
-                            operation.host_indices[
-                            (start_index + i) * self.page_size: (start_index + i + 1) * self.page_size]))
+                        non_exist_value.append(
+                            self.mem_pool_host.get_flat_data(
+                                operation.host_indices[
+                                    (start_index + i)
+                                    * self.page_size : (start_index + i + 1)
+                                    * self.page_size
+                                ]
+                            )
+                        )
                 self.mooncake_l3_kv_pool.batch_put(non_exist_keys, non_exist_value)
             except Empty:
                 continue
             except Exception as e:
                 logger.error(e)
-
-
 
     def load_thread_func_direct(self):
         """
@@ -570,26 +609,45 @@ class HiCacheController:
                         end_index = key_len // self.tp_size * (self.tp_rank + 1)
                     else:
                         start_index = (key_len // self.tp_size + 1) * self.tp_rank
-                        end_index = min((key_len // self.tp_size + 1) * (self.tp_rank + 1), key_len)
+                        end_index = min(
+                            (key_len // self.tp_size + 1) * (self.tp_rank + 1), key_len
+                        )
 
-                    fragment_keys = keys[start_index: end_index]
+                    fragment_keys = keys[start_index:end_index]
                 batch_data = self.mooncake_l3_kv_pool.batch_get(fragment_keys)
 
                 # last rank need to pad
-                if (self.l3_fragment_load and
-                    self.tp_rank == self.tp_size - 1
-                    and key_len % self.tp_size != 0):
+                if (
+                    self.l3_fragment_load
+                    and self.tp_rank == self.tp_size - 1
+                    and key_len % self.tp_size != 0
+                ):
                     last_fragment_key_len = len(fragment_keys)
                     fragment_keys_pad_size = key_len // self.tp_size + 1
                     token_tensor_shape = self.mooncake_l3_kv_pool.page_tensor_shape
-                    token_tensor_shape_pad = torch.Size([token_tensor_shape[0], fragment_keys_pad_size
-                                                         * self.page_size, token_tensor_shape[2], token_tensor_shape[3]])
-                    batch_data_pad = torch.zeros(token_tensor_shape_pad, dtype=batch_data.dtype)
-                    batch_data_pad[:, :last_fragment_key_len * self.page_size] = batch_data
+                    token_tensor_shape_pad = torch.Size(
+                        [
+                            token_tensor_shape[0],
+                            fragment_keys_pad_size * self.page_size,
+                            token_tensor_shape[2],
+                            token_tensor_shape[3],
+                        ]
+                    )
+                    batch_data_pad = torch.zeros(
+                        token_tensor_shape_pad, dtype=batch_data.dtype
+                    )
+                    batch_data_pad[:, : last_fragment_key_len * self.page_size] = (
+                        batch_data
+                    )
                     batch_data = batch_data_pad
 
-                batch_data = self._fragment_cache_all_gather(batch_data, key_len * self.page_size)
-                self.l3_cache_pool[operation.node_ids[0]] = (batch_data, key_len * self.page_size)
+                batch_data = self._fragment_cache_all_gather(
+                    batch_data, key_len * self.page_size
+                )
+                self.l3_cache_pool[operation.node_ids[0]] = (
+                    batch_data,
+                    key_len * self.page_size,
+                )
 
                 for node_id in operation.node_ids:
                     if node_id != 0:
@@ -598,7 +656,6 @@ class HiCacheController:
                 continue
             except Exception as e:
                 logger.error(e)
-
 
     def l3_load_thread_func_layer_by_layer(self):
         torch.cuda.set_stream(self.mooncake_l3_load_stream)
@@ -622,14 +679,19 @@ class HiCacheController:
             self.l3_layer_counter.reset()
 
             # TODO:(huangtingwei9988): Can be optimized to layer_by_layer
-            self.mem_pool_device.transfer(batch_operation.device_indices, batch_operation.data)
+            self.mem_pool_device.transfer(
+                batch_operation.device_indices, batch_operation.data
+            )
             del batch_operation.data
 
             self.l3_layer_counter.increment(self.mem_pool_host.layer_num)
             self.mooncake_l3_load_stream.synchronize()
 
-            self.layer_done_counter.compare_increment(min(
-                self.l3_layer_counter.get_value(), self.l2_layer_counter.get_value()))
+            self.layer_done_counter.compare_increment(
+                min(
+                    self.l3_layer_counter.get_value(), self.l2_layer_counter.get_value()
+                )
+            )
 
             for node_id in batch_operation.node_ids:
                 if node_id != 0:
@@ -678,8 +740,12 @@ class HiCacheController:
                     self.load_stream.synchronize()
 
                 if self.enable_mooncake_store_l3_cache:
-                    self.layer_done_counter.compare_increment(min(
-                        self.l3_layer_counter.get_value(), self.l2_layer_counter.get_value()))
+                    self.layer_done_counter.compare_increment(
+                        min(
+                            self.l3_layer_counter.get_value(),
+                            self.l2_layer_counter.get_value(),
+                        )
+                    )
                 else:
                     self.layer_done_counter.increment()
 
@@ -814,8 +880,12 @@ class HiCacheController:
 
             # write L3 cache
             if self.enable_mooncake_store_l3_cache:
-                mooncake_operation = MooncakeStoreCacheOperation(operation.l3_keys, operation.host_indices,
-                                                                 operation.node_ids, priority=operation.priority)
+                mooncake_operation = MooncakeStoreCacheOperation(
+                    operation.l3_keys,
+                    operation.host_indices,
+                    operation.node_ids,
+                    priority=operation.priority,
+                )
 
                 self.mooncake_l3_write_queue.put(mooncake_operation)
 
