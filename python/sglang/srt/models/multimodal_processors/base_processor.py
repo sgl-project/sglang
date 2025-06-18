@@ -17,6 +17,24 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.utils import encode_video, load_audio, load_image
 
 
+@dataclasses.dataclass
+class BaseMultiModalProcessorOutput:
+    # input_text, with each frame of video/image represented with a image_token
+    input_text: str
+
+    # frames loaded from image and video, in given order
+    images: Optional[list[Union[Image.Image, MultimodalDataItem]]] = None
+
+    # audios
+    audios: Optional[list[Union[np.ndarray, MultimodalDataItem]]] = None
+
+    def normalize(self):
+        for field_name in ["images", "audios"]:
+            field = getattr(self, field_name, None)
+            if field is not None and isinstance(field, list) and len(field) == 0:
+                setattr(self, field_name, None)
+
+
 class MultimodalInputFormat(Enum):
     """Enum for different multimodal input formats."""
 
@@ -554,3 +572,11 @@ class BaseMultimodalProcessor(ABC):
         # Finalize with common processing
         combined_mm_item = finalize_mm_item(combined_mm_item, input_ids)
         return combined_mm_item, input_ids
+
+
+class DummyMultimodalProcessor(BaseMultimodalProcessor):
+    def __init__(self):
+        pass
+
+    async def process_mm_data_async(self, *args, **kwargs):
+        return None
