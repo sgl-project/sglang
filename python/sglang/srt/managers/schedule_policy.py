@@ -464,7 +464,7 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if req.host_indices_length > 0:
-                req.last_node, new_indices = self.tree_cache.init_load_back(
+                new_indices, req.last_node = self.tree_cache.init_load_back(
                     req.last_node_global, req.host_indices_length
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
