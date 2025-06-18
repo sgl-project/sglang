@@ -295,51 +295,31 @@ def main():
     shape_args = [
         # Prefill, DeepSeek-R1, gateup, chunk_size = 4096, TP = 8
         ShapeArg(expected_m_per_group=128, n=512, k=7168, num_groups=256),
-        # Prefill, DeepSeek-R1, down, chunk_size = 4096, TP = 8
-        ShapeArg(expected_m_per_group=128, n=7168, k=256, num_groups=256),
         # Prefill, DeepSeek-R1, gateup, chunk_size = 8192, TP = 8
         ShapeArg(expected_m_per_group=256, n=512, k=7168, num_groups=256),
-        # Prefill, DeepSeek-R1, down, chunk_size = 8192, TP = 8
-        ShapeArg(expected_m_per_group=256, n=7168, k=256, num_groups=256),
         # Prefill, DeepSeek-R1, gateup, chunk_size = 8192, TP = 16
         ShapeArg(expected_m_per_group=256, n=256, k=7168, num_groups=256),
-        # Prefill, DeepSeek-R1, down, chunk_size = 8192, TP = 16
-        ShapeArg(expected_m_per_group=256, n=7168, k=128, num_groups=256),
         # Prefill, DeepSeek-R1, gateup, chunk_size = 16384, TP = 16
         ShapeArg(expected_m_per_group=512, n=256, k=7168, num_groups=256),
-        # Prefill, DeepSeek-R1, down, chunk_size = 16384, TP = 16
-        ShapeArg(expected_m_per_group=512, n=7168, k=128, num_groups=256),
         # Decode, DeepSeek-R1, gateup, bs = 32, TP = 8
         ShapeArg(expected_m_per_group=1, n=512, k=7168, num_groups=256),
-        # Decode, DeepSeek-R1, down, bs = 32, TP = 8
-        ShapeArg(expected_m_per_group=1, n=7168, k=256, num_groups=256),
         # Decode, DeepSeek-R1, gateup, bs = 64, TP = 16
         ShapeArg(expected_m_per_group=2, n=256, k=7168, num_groups=256),
-        # Decode, DeepSeek-R1, down, bs = 64, TP = 16
-        ShapeArg(expected_m_per_group=2, n=7168, k=128, num_groups=256),
         # Prefill, DeepSeek-R1, gateup, chunk_size = 8192, EP = 8
         ShapeArg(expected_m_per_group=256, n=4096, k=7168, num_groups=32),
-        # Prefill, DeepSeek-R1, down, chunk_size = 8192, EP = 8
-        ShapeArg(expected_m_per_group=256, n=7168, k=2048, num_groups=32),
         # Prefill, DeepSeek-R1, gateup, chunk_size = 16384, EP = 16
         ShapeArg(expected_m_per_group=512, n=4096, k=7168, num_groups=16),
-        # Prefill, DeepSeek-R1, down, chunk_size = 16384, EP = 16
-        ShapeArg(expected_m_per_group=512, n=7168, k=2048, num_groups=16),
         # Decode, DeepSeek-R1, gateup, bs = 128, EP = 8
         ShapeArg(expected_m_per_group=4, n=4096, k=7168, num_groups=32),
-        # Decode, DeepSeek-R1, down, bs = 128, EP = 8
-        ShapeArg(expected_m_per_group=4, n=7168, k=2048, num_groups=32),
         # Decode, DeepSeek-R1, gateup, bs = 256, EP = 16
         ShapeArg(expected_m_per_group=8, n=4096, k=7168, num_groups=16),
-        # Decode, DeepSeek-R1, down, bs = 256, EP = 16
-        ShapeArg(expected_m_per_group=8, n=7168, k=2048, num_groups=16),
         # Prefill, Qwen3-235B-A22B-FP8, gateup, chunk_size = 16384, TP = 4
         ShapeArg(expected_m_per_group=1024, n=768, k=4096, num_groups=128),
-        # Prefill, Qwen3-235B-A22B-FP8, donw, chunk_size = 16384, TP = 4
+        # Prefill, Qwen3-235B-A22B-FP8, down, chunk_size = 16384, TP = 4
         ShapeArg(expected_m_per_group=1024, n=4096, k=384, num_groups=128),
         # Decode, Qwen3-235B-A22B-FP8, gateup, bs = 256, TP = 4
         ShapeArg(expected_m_per_group=16, n=768, k=4096, num_groups=128),
-        # Decode, Qwen3-235B-A22B-FP8, donw, bs = 256, TP = 4
+        # Decode, Qwen3-235B-A22B-FP8, down, bs = 256, TP = 4
         ShapeArg(expected_m_per_group=16, n=4096, k=384, num_groups=128),
     ]
     args = parser.parse_args()
