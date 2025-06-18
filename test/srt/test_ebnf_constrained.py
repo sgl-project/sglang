@@ -1,8 +1,10 @@
 """
 python3 -m unittest test_ebnf_constrained.TestEBNFConstrained.test_ebnf_generate_email
 python3 -m unittest test_ebnf_constrained.TestEBNFConstrained.test_ebnf_generate_greeting
+python3 -m unittest test_ebnf_constrained.TestEBNFConstrained.test_ebnf_generate_all_optional_function_params
 python3 -m unittest test_ebnf_constrained.TestEBNFConstrainedLLGuidance.test_ebnf_generate_email
 python3 -m unittest test_ebnf_constrained.TestEBNFConstrainedLLGuidance.test_ebnf_generate_greeting
+python3 -m unittest test_ebnf_constrained.TestEBNFConstrainedLLGuidance.test_ebnf_generate_all_optional_function_params
 """
 
 import json
@@ -235,6 +237,38 @@ class TestEBNFConstrained(CustomTestCase):
             expected_patterns=allowed_patterns,
             prompt=prompt,
             n=3,
+        )
+
+    def test_ebnf_generate_all_optional_function_params(self):
+        """Test function call with all optional parameters - verifies flexible ordering."""
+        self.__class__.ebnf_grammar = """
+        root ::= function_call
+        function_call ::= call_config_service
+        call_config_service ::= "{" "\\"name\\"" ":" "\\"config_service\\"" ", " "\\"arguments\\"" ":" arguments_config_service "}"
+        arguments_config_service ::= "{" ( "\\"theme\\"" ":" ("\\"light\\"" | "\\"dark\\"") ( "," "\\"language\\"" ":" ("\\"en\\"" | "\\"es\\"" | "\\"fr\\"") )? ( "," "\\"notifications\\"" ":" ("true" | "false") )? | "\\"language\\"" ":" ("\\"en\\"" | "\\"es\\"" | "\\"fr\\"") ( "," "\\"notifications\\"" ":" ("true" | "false") )? | "\\"notifications\\"" ":" ("true" | "false") )? "}"
+        """
+        # Test patterns that should match - flexible ordering of optional parameters
+        allowed_patterns = [
+            # Empty arguments
+            r'^\{"name":"config_service",\s*"arguments":\{\}\}$',
+            # Single optional parameters (any can appear first)
+            r'^\{"name":"config_service",\s*"arguments":\{"theme":"(light|dark)"\}\}$',
+            r'^\{"name":"config_service",\s*"arguments":\{"language":"(en|es|fr)"\}\}$',
+            r'^\{"name":"config_service",\s*"arguments":\{"notifications":(true|false)\}\}$',
+            # Two optional parameters (in any order)
+            r'^\{"name":"config_service",\s*"arguments":\{"theme":"(light|dark)",\s*"language":"(en|es|fr)"\}\}$',
+            r'^\{"name":"config_service",\s*"arguments":\{"theme":"(light|dark)",\s*"notifications":(true|false)\}\}$',
+            r'^\{"name":"config_service",\s*"arguments":\{"language":"(en|es|fr)",\s*"notifications":(true|false)\}\}$',
+            # All three optional parameters
+            r'^\{"name":"config_service",\s*"arguments":\{"theme":"(light|dark)",\s*"language":"(en|es|fr)",\s*"notifications":(true|false)\}\}$',
+        ]
+        prompt = "Configure the service with optional settings:"
+
+        self.run_decode(
+            ebnf=self.__class__.ebnf_grammar,
+            expected_patterns=allowed_patterns,
+            prompt=prompt,
+            n=5,
         )
 
 

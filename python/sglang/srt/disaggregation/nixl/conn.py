@@ -24,10 +24,8 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVManager,
     CommonKVReceiver,
 )
-from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
-    group_concurrent_contiguous,
-)
+from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_local_ip_by_remote
 
@@ -46,7 +44,7 @@ class TransferInfo:
     agent_metadata: bytes
     agent_name: str
     dst_kv_ptrs: list[int]
-    dst_kv_indices: npt.NDArray[np.int64]
+    dst_kv_indices: npt.NDArray[np.int32]
     dst_aux_ptrs: list[int]
     dst_aux_index: int
     dst_gpu_id: int
@@ -64,7 +62,7 @@ class TransferInfo:
             agent_metadata=msg[3],
             agent_name=msg[4].decode("ascii"),
             dst_kv_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
-            dst_kv_indices=np.frombuffer(msg[6], dtype=np.int64),
+            dst_kv_indices=np.frombuffer(msg[6], dtype=np.int32),
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[7])//8}Q", msg[7])),
             dst_aux_index=int(msg[8].decode("ascii")),
             dst_gpu_id=int(msg[9].decode("ascii")),
@@ -164,9 +162,9 @@ class NixlKVManager(CommonKVManager):
     def send_kvcache(
         self,
         peer_name: str,
-        prefill_kv_indices: npt.NDArray[np.int64],
+        prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: list[int],
-        dst_kv_indices: npt.NDArray[np.int64],
+        dst_kv_indices: npt.NDArray[np.int32],
         dst_gpu_id: int,
         notif: str,
     ):
@@ -248,7 +246,7 @@ class NixlKVManager(CommonKVManager):
     def add_transfer_request(
         self,
         bootstrap_room: int,
-        kv_indices: npt.NDArray[np.int64],
+        kv_indices: npt.NDArray[np.int32],
         index_slice: slice,
         is_last: bool,
         chunk_id: int,
@@ -350,7 +348,14 @@ class NixlKVManager(CommonKVManager):
 
 class NixlKVSender(BaseKVSender):
 
-    def __init__(self, mgr: NixlKVManager, bootstrap_addr: str, bootstrap_room: int):
+    def __init__(
+        self,
+        mgr: NixlKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: int,
+        dest_tp_ranks: List[int],
+        pp_rank: int,
+    ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
         self.aux_index = None
@@ -368,7 +373,7 @@ class NixlKVSender(BaseKVSender):
 
     def send(
         self,
-        kv_indices: npt.NDArray[np.int64],
+        kv_indices: npt.NDArray[np.int32],
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
@@ -412,7 +417,7 @@ class NixlKVReceiver(CommonKVReceiver):
         self.started_transfer = False
         super().__init__(mgr, bootstrap_addr, bootstrap_room, data_parallel_rank)
 
-    def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+    def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
         for bootstrap_info in self.bootstrap_infos:
             self.prefill_server_url = (
                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"

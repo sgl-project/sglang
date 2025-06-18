@@ -983,3 +983,9 @@ def match_devstral(model_path: str):
 def match_phi_4_mm(model_path: str):
     if "phi-4-multimodal" in model_path.lower():
         return "phi-4-mm"
+
+
+@register_conv_template_matching_function
+def match_vila(model_path: str):
+    if re.search(r"vila", model_path, re.IGNORECASE):
+        return "chatml"

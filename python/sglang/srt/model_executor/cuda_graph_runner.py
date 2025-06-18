@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import bisect
 import inspect
+import logging
 import os
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import tqdm
+from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -40,10 +42,13 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.patch_torch import monkey_patch_torch_compile
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
+    empty_context,
     get_available_gpu_memory,
     get_device_memory_capacity,
     rank0_log,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -147,10 +152,11 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
             )
 
         gpu_mem = get_device_memory_capacity()
-        if gpu_mem is not None and gpu_mem > 96 * 1024:
-            capture_bs += list(range(160, 257, 8))
-        if gpu_mem is not None and gpu_mem > 180 * 1000:
-            capture_bs += list(range(256, 513, 16))
+        if gpu_mem is not None:
+            if gpu_mem > 90 * 1024:  # H200, H20
+                capture_bs += list(range(160, 257, 8))
+            if gpu_mem > 160 * 1000:  # B200, MI300
+                capture_bs += list(range(256, 513, 16))
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
@@ -207,6 +213,9 @@ class CudaGraphRunner:
             model_runner.server_args.enable_two_batch_overlap
         )
         self.speculative_algorithm = model_runner.server_args.speculative_algorithm
+        self.enable_profile_cuda_graph = (
+            model_runner.server_args.enable_profile_cuda_graph
+        )
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
@@ -226,16 +235,20 @@ class CudaGraphRunner:
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
 
+        # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
+        if model_runner.server_args.enable_return_hidden_states:
+            self.capture_hidden_mode = CaptureHiddenMode.FULL
+
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        if global_server_args_dict["attention_backend"] == "flashmla":
-            self.model_runner.attn_backend.init_cuda_graph_state(self.max_bs)
-        else:
-            self.model_runner.attn_backend.init_cuda_graph_state(self.max_num_token)
+        self.model_runner.attn_backend.init_cuda_graph_state(
+            self.max_bs, self.max_num_token
+        )
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
+
         # FIXME(lsyin): leave it here for now, I don't know whether it is necessary
         self.encoder_len_fill_value = 0
         self.seq_lens_cpu = torch.full(
@@ -310,12 +323,15 @@ class CudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.enable_dp_attention or self.enable_sp_layernorm:
-            total_global_tokens = sum(forward_batch.global_num_tokens_cpu)
-
+            total_batch_size = (
+                sum(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
+                if self.model_runner.spec_algorithm.is_eagle()
+                else sum(forward_batch.global_num_tokens_cpu)
+            )
             is_bs_supported = forward_batch.can_run_dp_cuda_graph and (
-                total_global_tokens in self.graphs
+                total_batch_size in self.graphs
                 if self.disable_padding
-                else total_global_tokens <= self.max_bs
+                else total_batch_size <= self.max_bs
             )
         else:
             is_bs_supported = (
@@ -333,50 +349,91 @@ class CudaGraphRunner:
             else True
         )
 
+        requested_capture_hidden_mode = max(
+            forward_batch.capture_hidden_mode,
+            (
+                forward_batch.spec_info.capture_hidden_mode
+                if getattr(forward_batch.spec_info, "capture_hidden_mode", None)
+                is not None
+                else CaptureHiddenMode.NULL
+            ),
+        )
+        capture_hidden_mode_matches = (
+            requested_capture_hidden_mode == CaptureHiddenMode.NULL
+            or requested_capture_hidden_mode == self.capture_hidden_mode
+        )
         is_tbo_supported = (
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
 
-        return is_bs_supported and is_encoder_lens_supported and is_tbo_supported
+        return (
+            is_bs_supported
+            and is_encoder_lens_supported
+            and is_tbo_supported
+            and capture_hidden_mode_matches
+        )
 
-    def capture(self):
+    def capture(self) -> None:
+        profile_context = empty_context()
+        if self.enable_profile_cuda_graph:
+            profile_context = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+            )
+
         with graph_capture() as graph_capture_context:
-            self.stream = graph_capture_context.stream
-            avail_mem = get_available_gpu_memory(
-                self.model_runner.device, self.model_runner.gpu_id, empty_cache=False
-            )
-            # Reverse the order to enable better memory sharing across cuda graphs.
-            capture_range = (
-                tqdm.tqdm(list(reversed(self.capture_bs)))
-                if get_tensor_model_parallel_rank() == 0
-                else reversed(self.capture_bs)
-            )
-            for bs in capture_range:
-                if get_tensor_model_parallel_rank() == 0:
-                    avail_mem = get_available_gpu_memory(
-                        self.model_runner.device,
-                        self.model_runner.gpu_id,
-                        empty_cache=False,
-                    )
-                    capture_range.set_description(
-                        f"Capturing batches ({avail_mem=:.2f} GB)"
-                    )
+            with profile_context as prof:
+                self.stream = graph_capture_context.stream
+                avail_mem = get_available_gpu_memory(
+                    self.model_runner.device,
+                    self.model_runner.gpu_id,
+                    empty_cache=False,
+                )
+                # Reverse the order to enable better memory sharing across cuda graphs.
+                capture_range = (
+                    tqdm.tqdm(list(reversed(self.capture_bs)))
+                    if get_tensor_model_parallel_rank() == 0
+                    else reversed(self.capture_bs)
+                )
+                for i, bs in enumerate(capture_range):
+                    if get_tensor_model_parallel_rank() == 0:
+                        avail_mem = get_available_gpu_memory(
+                            self.model_runner.device,
+                            self.model_runner.gpu_id,
+                            empty_cache=False,
+                        )
+                        capture_range.set_description(
+                            f"Capturing batches ({avail_mem=:.2f} GB)"
+                        )
 
-                with patch_model(
-                    self.model_runner.model,
-                    bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_bs,
-                    tp_group=self.model_runner.tp_group,
-                ) as forward:
-                    (
-                        graph,
-                        output_buffers,
-                    ) = self.capture_one_batch_size(bs, forward)
-                    self.graphs[bs] = graph
-                    self.output_buffers[bs] = output_buffers
+                    with patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
+                        num_tokens=bs * self.num_tokens_per_bs,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        (
+                            graph,
+                            output_buffers,
+                        ) = self.capture_one_batch_size(bs, forward)
+                        self.graphs[bs] = graph
+                        self.output_buffers[bs] = output_buffers
 
-                # Save gemlite cache after each capture
-                save_gemlite_cache()
+                    # Save gemlite cache after each capture
+                    save_gemlite_cache()
+
+        if self.enable_profile_cuda_graph:
+            log_message = (
+                "Sorted by CUDA Time:\n"
+                + prof.key_averages(group_by_input_shape=True).table(
+                    sort_by="cuda_time_total", row_limit=10
+                )
+                + "\n\nSorted by CPU Time:\n"
+                + prof.key_averages(group_by_input_shape=True).table(
+                    sort_by="cpu_time_total", row_limit=10
+                )
+            )
+            logger.info(log_message)
 
     def capture_one_batch_size(self, bs: int, forward: Callable):
         graph = torch.cuda.CUDAGraph()
@@ -406,7 +463,7 @@ class CudaGraphRunner:
             self.global_num_tokens_gpu.copy_(
                 torch.tensor(
                     [
-                        num_tokens // self.dp_size + (i < bs % self.dp_size)
+                        num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
                         for i in range(self.dp_size)
                     ],
                     dtype=torch.int32,
@@ -443,7 +500,7 @@ class CudaGraphRunner:
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
             out_cache_loc=out_cache_loc,
-            seq_lens_sum=seq_lens.sum(),
+            seq_lens_sum=seq_lens.sum().item(),
             encoder_lens=encoder_lens,
             return_logprob=False,
             positions=positions,
@@ -509,21 +566,34 @@ class CudaGraphRunner:
         return graph, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
-        # If the capture_hidden_mode changes, we need to recapture the graph
-        hidden_mode_from_spec_info = getattr(
+
+        # If the required capture_hidden_mode changes, we need to recapture the graph
+
+        # These are the different factors that can influence the capture_hidden_mode
+        capture_hidden_mode_required_by_forward_batch = (
+            forward_batch.capture_hidden_mode
+        )
+        capture_hidden_mode_required_by_spec_info = getattr(
             forward_batch.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
         )
-        if (
-            forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
-            and self.capture_hidden_mode != CaptureHiddenMode.FULL
-        ):
-            self.capture_hidden_mode = CaptureHiddenMode.FULL
-            self.capture()
-        elif (
-            forward_batch.capture_hidden_mode != CaptureHiddenMode.FULL
-            and self.capture_hidden_mode != hidden_mode_from_spec_info
-        ):
-            self.capture_hidden_mode = hidden_mode_from_spec_info
+        capture_hidden_mode_required_for_returning_hidden_states = (
+            CaptureHiddenMode.FULL
+            if self.model_runner.server_args.enable_return_hidden_states
+            else CaptureHiddenMode.NULL
+        )
+
+        # Determine the highest capture_hidden_mode required
+        # (If we have FULL, we can emulate LAST or NULL)
+        # (If we have LAST, we can emulate NULL)
+        required_capture_hidden_mode = max(
+            capture_hidden_mode_required_by_forward_batch,
+            capture_hidden_mode_required_by_spec_info,
+            capture_hidden_mode_required_for_returning_hidden_states,
+        )
+
+        # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
+        if self.capture_hidden_mode != required_capture_hidden_mode:
+            self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
     def replay_prepare(
@@ -538,14 +608,17 @@ class CudaGraphRunner:
 
         # Pad
         if self.enable_dp_attention or self.enable_sp_layernorm:
-            index = bisect.bisect_left(
-                self.capture_bs, sum(forward_batch.global_num_tokens_cpu)
+            total_batch_size = (
+                sum(forward_batch.global_num_tokens_cpu) / self.num_tokens_per_bs
+                if self.model_runner.spec_algorithm.is_eagle()
+                else sum(forward_batch.global_num_tokens_cpu)
             )
+            index = bisect.bisect_left(self.capture_bs, total_batch_size)
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
         if bs != raw_bs:
-            self.seq_lens.fill_(1)
+            self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
 
         # Common inputs
@@ -557,7 +630,7 @@ class CudaGraphRunner:
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
-                self.seq_lens_cpu.fill_(1)
+                self.seq_lens_cpu.fill_(self.seq_len_fill_value)
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
 
         if pp_proxy_tensors:
@@ -583,13 +656,13 @@ class CudaGraphRunner:
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
-            self.req_pool_indices,
-            self.seq_lens,
-            forward_batch.seq_lens_sum + (bs - raw_bs),
-            self.encoder_lens,
+            self.req_pool_indices[:bs],
+            self.seq_lens[:bs],
+            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+            self.encoder_lens[:bs] if self.is_encoder_decoder else None,
             forward_batch.forward_mode,
             forward_batch.spec_info,
-            seq_lens_cpu=self.seq_lens_cpu,
+            seq_lens_cpu=self.seq_lens_cpu[:bs],
         )
 
         # Store fields
