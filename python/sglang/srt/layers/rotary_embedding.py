@@ -806,6 +806,7 @@ class Llama4VisionRotaryEmbedding(RotaryEmbedding):
         key_out = torch.view_as_real(key_ * freqs_ci).flatten(3)
         return query_out.type_as(query), key_out.type_as(key)
 
+
 class DynamicNTKAlphaRotaryEmbedding(RotaryEmbedding):
     """RotaryEmbedding extended with Dynamic NTK scaling.
 
@@ -823,12 +824,15 @@ class DynamicNTKAlphaRotaryEmbedding(RotaryEmbedding):
         dtype: torch.dtype,
     ) -> None:
         self.scaling_alpha = scaling_alpha
-        super().__init__(head_size, rotary_dim, max_position_embeddings, base,
-                         is_neox_style, dtype)
+        super().__init__(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+        )
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         max_len = self.max_position_embeddings
-        base = self.base * self.scaling_alpha ** (self.rotary_dim / (self.rotary_dim - 2))
+        base = self.base * self.scaling_alpha ** (
+            self.rotary_dim / (self.rotary_dim - 2)
+        )
 
         inv_freq = self._compute_inv_freq(base)
         t = torch.arange(max_len, dtype=torch.float)
@@ -838,6 +842,7 @@ class DynamicNTKAlphaRotaryEmbedding(RotaryEmbedding):
         sin = freqs.sin()
         cache = torch.cat((cos, sin), dim=-1)
         return cache
+
 
 class MRotaryEmbedding(RotaryEmbedding):
     """Rotary Embedding with Multimodal Sections."""
@@ -1191,7 +1196,7 @@ def get_rope(
                     base,
                     is_neox_style,
                     rope_scaling["alpha"],
-                    dtype
+                    dtype,
                 )
             else:
                 rotary_emb = DynamicNTKScalingRotaryEmbedding(
