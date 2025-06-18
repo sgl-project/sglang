@@ -1,3 +1,26 @@
+"""Test memory release and resume operations for SGLang engine in hybrid RL training.
+
+This test suite evaluates the SGLang engine's memory management capabilities, focusing
+on releasing and resuming memory occupation for KV cache and model weights. It simulates
+an RL workflow where the SGLang engine acts as a rollout engine for experience collection.
+The process involves initializing the engine, sending a small number of requests to simulate
+rollout, releasing memory to mimic offloading during RL training, resuming memory occupation,
+updating weights with a trained HuggingFace model, and verifying the updated weights.
+
+Detailed in our proposal (https://github.com/sgl-project/sglang/pull/7099), two test cases
+are included:
+
+1. Basic Release and Resume: Uses a lower mem_fraction_static (0.6) to control memory allocation
+and avoid OOM errors carefully. This test simulates a scenario without multi-stage memory management,
+ensuring the engine can release and resume memory occupation while maintaining functionality after
+weight updates.
+
+2. Multi-Stage Release and Resume: Employs a higher mem_fraction_static (0.9) to simulate higher
+memory pressure, leveraging multi-stage memory management. It sequentially releases and resumes
+KV cache and model weights, verifying memory deallocation and reallocation at each stage, and
+ensuring correct weight updates and text generation.
+"""
+
 import subprocess
 import time
 import unittest
