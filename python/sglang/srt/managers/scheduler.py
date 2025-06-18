@@ -36,6 +36,7 @@ from torch.distributed import barrier
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
@@ -2229,37 +2230,35 @@ class Scheduler(
         import subprocess
 
         if tags is None:
-            tags = ["weights", "kv_cache"]
+            tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
-        if "kv_cache" in tags:
-            self.memory_saver_adapter.pause("kv_cache")
+        if GPU_MEMORY_TYPE_KV_CACHE in tags:
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             self.flush_cache()
 
-        if "weights" in tags:
+        if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.worker.model_runner.model
             )
-            self.memory_saver_adapter.pause("weights")
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
         tags = recv_req.tags
         if tags is None or len(tags) == 0:
-            tags = ["weights", "kv_cache"]
+            tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
-        if "weights" in tags:
-            self.memory_saver_adapter.resume("weights")
+        if GPU_MEMORY_TYPE_WEIGHTS in tags:
+            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             _import_static_state(
                 self.tp_worker.worker.model_runner.model,
                 self.stashed_model_static_state,
             )
             del self.stashed_model_static_state
 
-        if "kv_cache" in tags:
-            self.memory_saver_adapter.resume("kv_cache")
-            torch.cuda.synchronize()
-            time.sleep(3)
+        if GPU_MEMORY_TYPE_KV_CACHE in tags:
+            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
 
         return ResumeMemoryOccupationReqOutput()
 

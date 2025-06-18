@@ -6,6 +6,7 @@ import torch
 from transformers import AutoModelForCausalLM
 
 import sglang as sgl
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
@@ -127,7 +128,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
 
         t = time.perf_counter()
         gpu_memory_usage_before_release_kv_cache = get_gpu_memory_gb()
-        engine.release_memory_occupation(tags=["kv_cache"])
+        engine.release_memory_occupation(tags=[GPU_MEMORY_TYPE_KV_CACHE])
 
         gpu_memory_usage_after_release_kv_cache = get_gpu_memory_gb()
 
@@ -135,7 +136,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             gpu_memory_usage_after_release_kv_cache,
             gpu_memory_usage_before_release_kv_cache,
         )
-        engine.release_memory_occupation(tags=["weights"])
+        engine.release_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
 
         gpu_memory_usage_after_release_weights = get_gpu_memory_gb()
 
@@ -154,7 +155,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
 
         t = time.perf_counter()
         gpu_memory_usage_before_resume_weights = get_gpu_memory_gb()
-        engine.resume_memory_occupation(tags=["weights"])
+        engine.resume_memory_occupation(tags=[GPU_MEMORY_TYPE_WEIGHTS])
         gpu_memory_usage_after_resume_weights = get_gpu_memory_gb()
 
         self.assertGreater(
@@ -174,7 +175,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         # destroy the hf model
         del hf_model_new
         torch.cuda.empty_cache()
-        engine.resume_memory_occupation(tags=["kv_cache"])
+        engine.resume_memory_occupation(tags=[GPU_MEMORY_TYPE_KV_CACHE])
 
         gpu_memory_usage_after_resume_kv_cache = get_gpu_memory_gb()
         self.assertGreater(
