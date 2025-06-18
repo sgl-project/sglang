@@ -591,14 +591,14 @@ void fused_experts_kernel_impl(
     float* __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
 
     loop_2d<scalar_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
-      // nb0 from top half and nb1 from bottom half
-      int64_t nb0 = nb, nb1 = nb + NB;
-      int64_t n_size = std::min(N - nb0 * BLOCK_N, BLOCK_N);
+      // nb_upper from top half and nb_lower from bottom half
+      int64_t nb_upper = nb, nb_lower = nb + NB;
+      int64_t n_size = std::min(N - nb * BLOCK_N, BLOCK_N);
 
       // B shape [K, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
-      const scalar_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb0 * BLOCK_N * stride_n;
-      const scalar_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + nb1 * BLOCK_N * stride_n;
+      const scalar_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb_upper * BLOCK_N * stride_n;
+      const scalar_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + nb_lower * BLOCK_N * stride_n;
 
       // 1.a load A
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
@@ -773,17 +773,17 @@ void shared_expert_kernel_impl(
     float* __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
 
     loop_2d<scalar_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
-      // nb0 from top half and nb1 from bottom half
-      int64_t nb0 = nb, nb1 = nb + NB;
-      int64_t n_size = std::min(N - nb0 * BLOCK_N, BLOCK_N);
+      // nb_upper from top half and nb_lower from bottom half
+      int64_t nb_upper = nb, nb_lower = nb + NB;
+      int64_t n_size = std::min(N - nb * BLOCK_N, BLOCK_N);
       int64_t m_size = std::min(M - mb * BLOCK_M, BLOCK_M);
 
       // A shape [m_size, K]
       const scalar_t* A = input + mb * BLOCK_M * K;
 
       // B shape [K, n_size] in vnni format
-      const scalar_t* __restrict__ B0 = packed_w1 + nb0 * BLOCK_N * stride_n;
-      const scalar_t* __restrict__ B1 = packed_w1 + nb1 * BLOCK_N * stride_n;
+      const scalar_t* __restrict__ B0 = packed_w1 + nb_upper * BLOCK_N * stride_n;
+      const scalar_t* __restrict__ B1 = packed_w1 + nb_lower * BLOCK_N * stride_n;
 
       if (use_brgemm) {
         // 1.b gemm: C0 = A @ B0
