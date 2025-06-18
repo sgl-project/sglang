@@ -34,7 +34,7 @@ spec:
           - --disaggregation-mode
           - decode
           - --mem-fraction-static
-          -  "0.849"
+          - "0.849"
           - --context-length
           - "32768"
           - --disaggregation-ib-device
@@ -172,7 +172,7 @@ spec:
           - --disaggregation-mode
           - decode
           - --mem-fraction-static
-          -  "0.849"
+          - "0.849"
           - --context-length
           - "32768"
           - --disaggregation-ib-device
