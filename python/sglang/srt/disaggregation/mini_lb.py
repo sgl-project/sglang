@@ -22,6 +22,7 @@ AIOHTTP_STREAM_READ_CHUNK_SIZE = (
     1024 * 64
 )  # 64KB, to prevent aiohttp's "Chunk too big" error
 
+
 def setup_logger():
     logger = logging.getLogger("pdlb")
     logger.setLevel(logging.INFO)
