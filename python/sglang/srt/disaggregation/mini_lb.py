@@ -18,6 +18,10 @@ from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import PDRegistryRequest
 
+AIOHTTP_STREAM_READ_CHUNK_SIZE = (
+    1024 * 64
+)  # 64KB, to prevent aiohttp's "Chunk too big" error
+
 
 def setup_logger():
     logger = logging.getLogger("pdlb")
@@ -154,7 +158,9 @@ class MiniLoadBalancer:
                         else:
                             yield chunk
                 else:
-                    async for chunk in decode_response.content:
+                    async for chunk in decode_response.content.iter_chunked(
+                        AIOHTTP_STREAM_READ_CHUNK_SIZE
+                    ):
                         yield chunk
 
         return StreamingResponse(
