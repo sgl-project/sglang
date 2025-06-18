@@ -12,11 +12,8 @@ from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.engine import Engine as SglangEngine
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase, find_available_port
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE, CustomTestCase, find_available_port
 
-
-DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693"
-MOCK_UPDATED_MODEL_NAME_FOR_TEST = "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B/48d6d0fc4e02fb1269b36940650a1b7233035cbb"
 
 MODEL_INFO = dict(
     model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -127,7 +124,7 @@ def _run_sglang_subprocess(
         _mem_usage = get_gpu_memory_gb(rank)
         print(f"GPU{rank} Memory usage after releasing Sgl weights and kv cache: {_mem_usage}")
         hf_model = AutoModelForCausalLM.from_pretrained(
-            MOCK_UPDATED_MODEL_NAME_FOR_TEST,
+            DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
             torch_dtype="bfloat16",
             device_map="cuda",
             trust_remote_code=True
