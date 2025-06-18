@@ -35,14 +35,14 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
-from sglang.srt.disaggregation.utils import (
-    FakeBootstrapHost,
-    register_disaggregation_server,
+from python.sglang.srt.entrypoints.openai.serving_embedding import (
+    OpenAIServingEmbedding,
 )
+from sglang.srt.disaggregation.utils import register_disaggregation_server
 from sglang.srt.entrypoints.engine import Engine, _launch_subprocesses
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
-from sglang.srt.openai_api.protocol import ModelCard, ModelList
+from sglang.srt.openai_api.protocol import EmbeddingRequest, ModelCard, ModelList
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
@@ -64,6 +64,7 @@ class AppState:
     server_args: Optional[ServerArgs] = None
     tokenizer_manager: Optional[TokenizerManager] = None
     scheduler_info: Optional[Dict] = None
+    embedding_server: Optional[OpenAIServingEmbedding] = None
 
 
 @asynccontextmanager
@@ -78,6 +79,9 @@ async def lifespan(app: FastAPI):
     tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
     app.state.tokenizer_manager = tokenizer_manager
     app.state.scheduler_info = scheduler_info
+    app.state.embedding_server = OpenAIServingEmbedding(
+        tokenizer_manager=tokenizer_manager
+    )
 
     if server_args.enable_metrics:
         add_prometheus_middleware(app)
@@ -169,7 +173,15 @@ async def openai_v1_chat_completions(raw_request: Request):
 
 @app.post("/v1/embeddings")
 async def openai_v1_embeddings(raw_request: Request):
-    pass
+    try:
+        request_json = await raw_request.json()
+        request = EmbeddingRequest(**request_json)
+    except Exception as e:
+        return app.state.embedding_server.create_error_response(
+            f"Invalid request body, error: {str(e)}"
+        )
+
+    return await app.state.embedding_server.handle_request(request, raw_request)
 
 
 @app.post("/v1/score")
