@@ -70,7 +70,7 @@ class BaseKVSender(ABC):
         ...
 
     @abstractmethod
-    def send(self, kv_indices: npt.NDArray[np.int64]):
+    def send(self, kv_indices: npt.NDArray[np.int32]):
         """
         Send the kv cache at the given kv indices to the decoder server
         """
@@ -102,7 +102,7 @@ class BaseKVReceiver(ABC):
     ): ...
 
     @abstractmethod
-    def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+    def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
         """
         Notify the prefill server about the kv indices and aux index
         """
