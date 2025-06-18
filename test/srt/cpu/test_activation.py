@@ -21,7 +21,7 @@ class TestActivation(CustomTestCase):
         ref_out = SiluAndMul(x)
 
         atol = rtol = precision[ref_out.dtype]
-        self.assertTrue(torch.allclose(ref_out, out, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
     def test_activation(self):
         for params in itertools.product(self.M, self.N, self.dtype):
