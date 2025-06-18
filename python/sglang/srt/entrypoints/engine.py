@@ -417,12 +417,15 @@ class Engine(EngineBase):
             self.tokenizer_manager.init_weights_update_group(obj, None)
         )
 
-    def update_weights_from_distributed(self, name: str, dtype, shape):
+    def update_weights_from_distributed(
+        self, names: str, dtypes, shapes, group_name: str
+    ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
-            name=name,
-            dtype=dtype,
-            shape=shape,
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name=group_name,
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
