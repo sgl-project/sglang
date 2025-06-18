@@ -72,6 +72,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     kill_process_tree,
     require_mlp_tp_gather,
+    require_mlp_sync,
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
@@ -244,7 +245,7 @@ def extend(reqs, model_runner):
         enable_custom_logit_processor=False,
     )
     batch.prepare_for_extend()
-    _maybe_prepare_gathered_buffer_batch(batch, model_runner)
+    _maybe_prepare_mlp_sync_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     logits_output, _ = model_runner.forward(forward_batch)
@@ -256,7 +257,7 @@ def extend(reqs, model_runner):
 def decode(input_token_ids, batch, model_runner):
     batch.output_ids = input_token_ids
     batch.prepare_for_decode()
-    _maybe_prepare_gathered_buffer_batch(batch, model_runner)
+    _maybe_prepare_mlp_sync_batch(batch, model_runner)
     model_worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
     logits_output, _ = model_runner.forward(forward_batch)
@@ -264,9 +265,9 @@ def decode(input_token_ids, batch, model_runner):
     return next_token_ids, logits_output.next_token_logits
 
 
-def _maybe_prepare_gathered_buffer_batch(batch: ScheduleBatch, model_runner):
-    if model_runner.server_args.enable_dp_attention:
-        Scheduler.prepare_gathered_buffer_batch_raw(
+def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
+    if require_mlp_sync(model_runner.server_args):
+        Scheduler.prepare_mlp_sync_batch_raw(
             batch,
             dp_size=model_runner.server_args.dp_size,
             attn_tp_size=1,

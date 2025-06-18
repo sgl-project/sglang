@@ -2331,6 +2331,10 @@ def require_gathered_buffer(server_args):
     return require_mlp_tp_gather(server_args) or require_attn_tp_gather(server_args)
 
 
+def require_mlp_sync(server_args):
+    return server_args.enable_dp_attention or require_gathered_buffer(server_args)
+
+
 def merge_bias_tensor(
     lhs: Optional[torch.Tensor],
     rhs: Optional[torch.Tensor],

@@ -148,7 +148,7 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
-    require_gathered_buffer,
+    require_mlp_sync,
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
     set_random_seed,
@@ -1436,9 +1436,8 @@ class Scheduler(
             else:
                 ret = None
 
-        # Handle DP attention
-        if require_gathered_buffer(self.server_args):
-            ret, _ = self.prepare_gathered_buffer_batch(ret)
+        if require_mlp_sync(self.server_args):
+            ret, _ = self.prepare_mlp_sync_batch(ret)
 
         return ret
 
@@ -1748,8 +1747,8 @@ class Scheduler(
             self.return_health_check_ct -= 1
             self.send_to_tokenizer.send_pyobj(HealthCheckOutput())
 
-    def prepare_gathered_buffer_batch(self, local_batch: ScheduleBatch):
-        return self.prepare_gathered_buffer_batch_raw(
+    def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
+        return self.prepare_mlp_sync_batch_raw(
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
@@ -1765,7 +1764,7 @@ class Scheduler(
         )
 
     @staticmethod
-    def prepare_gathered_buffer_batch_raw(
+    def prepare_mlp_sync_batch_raw(
         local_batch: ScheduleBatch,
         dp_size,
         attn_tp_size: int,
