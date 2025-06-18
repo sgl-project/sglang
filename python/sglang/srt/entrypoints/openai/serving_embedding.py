@@ -125,7 +125,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
             **prompt_kwargs,
         )
 
-        return adapted_request, (request)
+        return adapted_request, request
 
     async def _handle_non_streaming_request(
         self,
