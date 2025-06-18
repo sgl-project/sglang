@@ -331,7 +331,6 @@ class TboForwardBatchPreparer:
         output_attn_backend: AttentionBackend,
         out_num_token_non_padded: torch.Tensor,
     ):
-        # TODO @Qiaolin remove this
         assert end_token_index >= start_token_index, f"{end_token_index=}, {start_token_index=}, batch={batch}"
         num_tokens = batch.input_ids.shape[0]
         num_seqs = batch.batch_size
@@ -391,7 +390,6 @@ class TboForwardBatchPreparer:
                 _compute_extend_num_tokens(batch.input_ids, batch.forward_mode)
                 == batch.extend_num_tokens
             ), f"{batch=}"
-        # TODO @Qiaolin check here
         extend_num_tokens = _compute_extend_num_tokens(
             output_dict["input_ids"], output_dict["forward_mode"]
         )
