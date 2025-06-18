@@ -315,54 +315,6 @@ class Test5(CustomTestCase):
         self.assertGreater(metrics["score"], 0.8)
 
 
-class Test6(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "8",
-                "--enable-dp-lm-head",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.5)
-
-    def test_mgsm_en(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.8)
-
-
 class Test7(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -430,56 +382,6 @@ class Test8(CustomTestCase):
                 "--enable-dp-attention",
                 "--dp",
                 "8",
-                "--enable-dp-lm-head",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.5)
-
-    def test_mgsm_en(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.8)
-
-
-class Test9(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "8",
-                "--moe-dense-tp-size",
-                "1",
                 "--enable-dp-lm-head",
             ],
         )
@@ -945,58 +847,6 @@ class Test17(CustomTestCase):
         self.assertGreater(metrics["score"], 0.8)
 
 
-class Test18(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "8",
-                "--enable-dp-lm-head",
-                "--enable-deepep-moe",
-                "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.5)
-
-    def test_mgsm_en(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.8)
-
-
 class Test19(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -1068,60 +918,6 @@ class Test20(CustomTestCase):
                 "--enable-dp-attention",
                 "--dp",
                 "8",
-                "--enable-dp-lm-head",
-                "--enable-deepep-moe",
-                "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.5)
-
-    def test_mgsm_en(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.8)
-
-
-class Test21(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "8",
-                "--moe-dense-tp-size",
-                "1",
                 "--enable-dp-lm-head",
                 "--enable-deepep-moe",
                 "--deepep-mode",
@@ -1581,55 +1377,6 @@ class Test29(CustomTestCase):
         self.assertGreater(metrics["score"], 0.8)
 
 
-class Test30(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "8",
-                "--enable-dp-lm-head",
-                "--enable-ep-moe",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.5)
-
-    def test_mgsm_en(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.8)
-
-
 class Test31(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -1698,57 +1445,6 @@ class Test32(CustomTestCase):
                 "--enable-dp-attention",
                 "--dp",
                 "8",
-                "--enable-dp-lm-head",
-                "--enable-ep-moe",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.5)
-
-    def test_mgsm_en(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mgsm_en",
-            num_examples=None,
-            num_threads=1024,
-        )
-
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.8)
-
-
-class Test33(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "8",
-                "--moe-dense-tp-size",
-                "1",
                 "--enable-dp-lm-head",
                 "--enable-ep-moe",
             ],
