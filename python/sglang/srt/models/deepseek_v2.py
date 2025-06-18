@@ -747,7 +747,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         # If we have self.fused_qkv_a_proj_with_mqa, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
         # which requires self.w_kc and self.w_vc to be packed.
         # If not, we will use torch.bmm and weight shouldn't be packed in this case
-        if hasattr(self, "fused_qkv_a_proj_with_mqa"):
+        # TODO: use is_cpu() and cpu_has_amx_support() API for device check when #6614 lands
+        if (
+            hasattr(self, "fused_qkv_a_proj_with_mqa")
+            and global_server_args_dict["device"] == "cpu"
+        ):
             self.quant_method = PackWeightMethod(
                 weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
             )
@@ -784,12 +788,13 @@ class DeepseekV2AttentionMLA(nn.Module):
                 else:
                     return AttnForwardMethod.MLA
             else:
-                if hasattr(self, "fused_qkv_a_proj_with_mqa") and getattr(
-                    self, "use_intel_amx_backend", False
-                ):
-                    return AttnForwardMethod.MLA_FUSED_ROPE_CPU
-                else:
-                    return AttnForwardMethod.MLA
+                # if hasattr(self, "fused_qkv_a_proj_with_mqa") and getattr(
+                #     self, "use_intel_amx_backend", False
+                # ):
+                #     return AttnForwardMethod.MLA_FUSED_ROPE_CPU
+                # else:
+                #     return AttnForwardMethod.MLA
+                return AttnForwardMethod.MLA
 
         if self.attention_backend == "flashinfer":
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
