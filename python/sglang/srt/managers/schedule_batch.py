@@ -862,6 +862,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     can_run_dp_cuda_graph: bool = False
+    is_extend_in_batch: bool = False
     tbo_split_seq_index: Optional[int] = None
     global_forward_mode: Optional[ForwardMode] = None
 
@@ -1760,11 +1761,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
             enable_custom_logit_processor=self.enable_custom_logit_processor,
+            global_num_tokens=self.global_num_tokens,
+            global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            is_extend_in_batch=self.is_extend_in_batch,
         )
 
     def __str__(self):
         return (
-            f"ScheduleBatch(forward_mode={self.forward_mode.name}, "
+            f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
             f"#req={(len(self.reqs))})"
         )
 
@@ -1833,6 +1838,7 @@ class ModelWorkerBatch:
     spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
+    spec_num_draft_tokens: Optional[int] = None
 
     # Overlap event
     launch_done: Optional[threading.Event] = None
