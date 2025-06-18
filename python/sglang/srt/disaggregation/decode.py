@@ -540,7 +540,7 @@ class DecodeTransferQueue:
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.tree_cache = tree_cache
-        self.spec_algorithm = scheduler.draft_worker.model_runner.spec_algorithm
+        self.spec_algorithm = scheduler.spec_algorithm
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
