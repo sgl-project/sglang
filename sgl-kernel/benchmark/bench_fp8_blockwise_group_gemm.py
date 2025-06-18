@@ -333,6 +333,14 @@ def main():
         ShapeArg(expected_m_per_group=8, n=4096, k=7168, num_groups=16),
         # Decode, DeepSeek-R1, down, bs = 256, EP = 16
         ShapeArg(expected_m_per_group=8, n=7168, k=2048, num_groups=16),
+        # Prefill, Qwen3-235B-A22B-FP8, gateup, chunk_size = 16384, TP = 4
+        ShapeArg(expected_m_per_group=1024, n=768, k=4096, num_groups=128),
+        # Prefill, Qwen3-235B-A22B-FP8, donw, chunk_size = 16384, TP = 4
+        ShapeArg(expected_m_per_group=1024, n=4096, k=384, num_groups=128),
+        # Decode, Qwen3-235B-A22B-FP8, gateup, bs = 256, TP = 4
+        ShapeArg(expected_m_per_group=16, n=768, k=4096, num_groups=128),
+        # Decode, Qwen3-235B-A22B-FP8, donw, bs = 256, TP = 4
+        ShapeArg(expected_m_per_group=16, n=4096, k=384, num_groups=128),
     ]
     args = parser.parse_args()
     benchmark_one_shape(shape_args, args.num_warmup, args.num_run)
