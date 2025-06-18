@@ -409,7 +409,7 @@ class SchedulerDisaggregationPrefillMixin:
                             hidden_state_offset := hidden_state_offset
                                 + len(req.origin_input_ids)
                             )
-                        ][-1].cpu().clone()
+                        ][-1].cpu().clone() if logits_output.hidden_states is not None else None
                 if req.return_logprob:
                     assert extend_logprob_start_len_per_req is not None
                     assert extend_input_len_per_req is not None
