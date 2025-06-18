@@ -585,11 +585,6 @@ void fp8_blockwise_scaled_grouped_mm(
   TORCH_CHECK(out_ptrs.dim() == 1, "out_ptrs must be 1D tensor");
   TORCH_CHECK(a_scales_ptrs.dim() == 1, "a_scales_ptrs must be 1D tensor");
   TORCH_CHECK(b_scales_ptrs.dim() == 1, "b_scales_ptrs must be 1D tensor");
-  TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
-  TORCH_CHECK(problem_sizes.size(1) == 3, "problem_sizes must have shape (num_experts, 3)");
-  TORCH_CHECK(
-      problem_sizes.size(0) == expert_offsets.size(0), "Number of experts in problem_sizes must match expert_offsets");
-  TORCH_CHECK(problem_sizes.dtype() == torch::kInt32, "problem_sizes must be int32");
   TORCH_CHECK(expert_offsets.dim() == 1, "expert_offsets must be 1D tensor");
   TORCH_CHECK(workspace.dim() == 1, "workspace must be 1D tensor");
 
