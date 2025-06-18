@@ -111,6 +111,7 @@ from sglang.srt.utils import (
 )
 
 _is_hip = is_hip()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 # Use a small KV cache pool size for tests in CI
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
@@ -302,7 +303,7 @@ class ModelRunner:
         if (
             server_args.attention_backend == "intel_amx"
             and server_args.device == "cpu"
-            and not cpu_has_amx_support()
+            and not _is_cpu_amx_available
         ):
             logger.info(
                 "The current platform does not support Intel AMX, will fallback to torch_native backend."

@@ -60,8 +60,8 @@ class TestGemm(CustomTestCase):
         )
 
         atol = rtol = precision[ref.dtype]
-        self.assertTrue(torch.allclose(ref, out, atol=atol, rtol=rtol))
-        self.assertTrue(torch.allclose(ref, out2, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(ref, out2, atol=atol, rtol=rtol)
 
     def test_bf16_gemm(self):
         for params in itertools.product(
@@ -100,13 +100,13 @@ class TestGemm(CustomTestCase):
         out = torch.ops.sgl_kernel.int8_scaled_mm_cpu(
             Aq2, Bq, As2, Bs, bias if has_bias else None, torch.bfloat16, False
         )
-        self.assertTrue(torch.allclose(ref_out, out, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
         # test the fused version
         fused_out = torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
             A, Bq, Bs, bias if has_bias else None, torch.bfloat16, False
         )
-        self.assertTrue(torch.allclose(ref_out, fused_out, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref_out, fused_out, atol=atol, rtol=rtol)
 
     def test_int8_gemm(self):
         for params in itertools.product(
@@ -165,7 +165,7 @@ class TestGemm(CustomTestCase):
             prepack,
         )
         atol = rtol = precision[ref.dtype]
-        self.assertTrue(torch.allclose(ref, opt, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref, opt, atol=atol, rtol=rtol)
 
     def test_fp8_gemm(self):
         for params in itertools.product(
