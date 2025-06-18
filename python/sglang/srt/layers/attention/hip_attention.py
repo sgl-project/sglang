@@ -175,7 +175,6 @@ class HiPAttentionBackend(AttentionBackend):
             start_event.record()
             
         if need_dense_prefill:
-            print(using_chunked_sw, using_dense_prefill, force_dense_decode, delta_dense_decode)
             o = self.flashattention_backend.forward_extend(
                 q=q,
                 k=k,
