@@ -102,9 +102,13 @@ endif()
 # Enable gencode below SM90
 option(ENABLE_BELOW_SM90 "Enable below SM90" ON)
 
+set(SGL_NUM_THREADS 32)
+
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
     set(ENABLE_BELOW_SM90 OFF)
     message(STATUS "For aarch64, disable gencode below SM90 by default")
+    set(SGL_NUM_THREADS 8)
+    message(STATUS "For aarch64, setting compile threads to 8")
 endif()
 
 
@@ -135,7 +139,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
-    "--threads=32"
+    "--threads=${SGL_NUM_THREADS}"
 
     # Suppress warnings
     "-Xcompiler=-Wconversion"
@@ -303,6 +307,10 @@ install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
 # set flash-attention sources file
 # Now FA3 support sm80/sm86/sm90
 if (SGL_KERNEL_ENABLE_FA3)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+        list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS "--threads=2")
+        message(STATUS "For FA3 aarch64, setting compile threads to 2 to avoid OOM")
+    endif()
     set(SGL_FLASH_KERNEL_CUDA_FLAGS
         "-DNDEBUG"
         "-DOPERATOR_NAMESPACE=sgl-kernel"
@@ -323,7 +331,6 @@ if (SGL_KERNEL_ENABLE_FA3)
         "-Xcompiler=-Wconversion"
         "-Xcompiler=-fno-strict-aliasing"
     )
-
     if (ENABLE_BELOW_SM90)
         list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS
             "-gencode=arch=compute_80,code=sm_80"
