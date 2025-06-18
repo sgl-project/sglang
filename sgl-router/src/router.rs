@@ -34,11 +34,15 @@ pub enum Router {
         current_index: AtomicUsize,
         timeout_secs: u64,
         interval_secs: u64,
+        dp_awareness: bool,
+        api_key: Option<String>,
     },
     Random {
         worker_urls: Arc<RwLock<Vec<String>>>,
         timeout_secs: u64,
         interval_secs: u64,
+        dp_awareness: bool,
+        api_key: Option<String>,
     },
     CacheAware {
         /*
@@ -110,6 +114,8 @@ pub enum Router {
         balance_rel_threshold: f32,
         timeout_secs: u64,
         interval_secs: u64,
+        dp_awareness: bool,
+        api_key: Option<String>,
         _eviction_thread: Option<thread::JoinHandle<()>>,
     },
 }
@@ -119,10 +125,14 @@ pub enum PolicyConfig {
     RandomConfig {
         timeout_secs: u64,
         interval_secs: u64,
+        dp_awareness: bool,
+        api_key: Option<String>,
     },
     RoundRobinConfig {
         timeout_secs: u64,
         interval_secs: u64,
+        dp_awareness: bool,
+        api_key: Option<String>,
     },
     CacheAwareConfig {
         cache_threshold: f32,
@@ -132,6 +142,8 @@ pub enum PolicyConfig {
         max_tree_size: usize,
         timeout_secs: u64,
         interval_secs: u64,
+        dp_awareness: bool,
+        api_key: Option<String>,
     },
 }
 
@@ -141,43 +153,65 @@ impl Router {
         gauge!("sgl_router_active_workers").set(worker_urls.len() as f64);
 
         // Get timeout and interval from policy config
-        let (timeout_secs, interval_secs) = match &policy_config {
+        let (timeout_secs, interval_secs, dp_awareness, api_key) = match &policy_config {
             PolicyConfig::RandomConfig {
                 timeout_secs,
                 interval_secs,
-            } => (*timeout_secs, *interval_secs),
+                dp_awareness,
+                api_key,
+            } => (*timeout_secs, *interval_secs, *dp_awareness, api_key),
             PolicyConfig::RoundRobinConfig {
                 timeout_secs,
                 interval_secs,
-            } => (*timeout_secs, *interval_secs),
+                dp_awareness,
+                api_key,
+            } => (*timeout_secs, *interval_secs, *dp_awareness, api_key),
             PolicyConfig::CacheAwareConfig {
                 timeout_secs,
                 interval_secs,
+                dp_awareness,
+                api_key,
                 ..
-            } => (*timeout_secs, *interval_secs),
+            } => (*timeout_secs, *interval_secs, *dp_awareness, api_key),
         };
 
         // Wait until all workers are healthy
         Self::wait_for_healthy_workers(&worker_urls, timeout_secs, interval_secs)?;
+
+        let worker_urls = if dp_awareness {
+            // worker address now in the format of "http://host:port@dp_rank"
+            Self::get_dp_aware_workers(&worker_urls, api_key)
+                .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?
+        } else {
+            worker_urls
+        };
 
         // Create router based on policy...
         Ok(match policy_config {
             PolicyConfig::RandomConfig {
                 timeout_secs,
                 interval_secs,
+                dp_awareness,
+                api_key,
             } => Router::Random {
                 worker_urls: Arc::new(RwLock::new(worker_urls)),
                 timeout_secs,
                 interval_secs,
+                dp_awareness,
+                api_key,
             },
             PolicyConfig::RoundRobinConfig {
                 timeout_secs,
                 interval_secs,
+                dp_awareness,
+                api_key,
             } => Router::RoundRobin {
                 worker_urls: Arc::new(RwLock::new(worker_urls)),
                 current_index: std::sync::atomic::AtomicUsize::new(0),
                 timeout_secs,
                 interval_secs,
+                dp_awareness,
+                api_key,
             },
             PolicyConfig::CacheAwareConfig {
                 cache_threshold,
@@ -187,6 +221,8 @@ impl Router {
                 max_tree_size,
                 timeout_secs,
                 interval_secs,
+                dp_awareness,
+                api_key,
             } => {
                 let mut running_queue = HashMap::new();
                 for url in &worker_urls {
@@ -239,6 +275,8 @@ impl Router {
                     balance_rel_threshold,
                     timeout_secs,
                     interval_secs,
+                    dp_awareness,
+                    api_key,
                     _eviction_thread: Some(eviction_thread),
                 }
             }
@@ -251,6 +289,14 @@ impl Router {
             Router::RoundRobin { worker_urls, .. } => Arc::clone(worker_urls),
             Router::Random { worker_urls, .. } => Arc::clone(worker_urls),
             Router::CacheAware { worker_urls, .. } => Arc::clone(worker_urls),
+        }
+    }
+
+    fn get_dp_awareness(&self) -> bool {
+        match self {
+            Router::RoundRobin { dp_awareness, .. } => *dp_awareness,
+            Router::Random { dp_awareness, .. } => *dp_awareness,
+            Router::CacheAware { dp_awareness, .. } => *dp_awareness,
         }
     }
 
@@ -312,6 +358,65 @@ impl Router {
         }
     }
 
+    fn get_worker_dp_size(
+        worker_url: &str,
+        api_key: &Option<String>
+    ) -> Result<usize, String> {
+        let sync_client = reqwest::blocking::Client::new();
+        let mut req_builder = sync_client.get(&format!("{}/get_server_info", worker_url));
+        if let Some(key) = api_key {
+            req_builder = req_builder.bearer_auth(key);
+        }
+
+        match req_builder.send() {
+            Ok(res) => {
+                if res.status().is_success() {
+                    let server_info = res.text()
+                        .map_err(|e| format!("failed to read text from response: {}", e))?;
+
+                    let server_info: serde_json::Value = serde_json::from_str(&server_info)
+                        .map_err(|e| format!("failed to decode JSON: {}", e))?;
+
+                    let dp_size = server_info
+                        .get("dp_size")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| String::from("dp_size not found or not an u64"))?;
+
+                    Ok(if dp_size > usize::MAX as u64 {
+                        return Err(format!("dp_size is too large: {}", dp_size));
+                    } else {
+                        dp_size as usize
+                    })
+                } else {
+                    Err(format!("unexpected status code: {}", res.status()))
+                }
+            },
+            Err(e) => Err(format!("error response: {}", e)),
+        }
+    }
+
+    // Given a list of workers, return a list of workers with dp_rank as suffix
+    fn get_dp_aware_workers(
+        worker_urls: &[String],
+        api_key: &Option<String>,
+    ) -> Result<Vec<String>, String> {
+        let mut dp_aware_workers: Vec<String> = Vec::new();
+
+        for url in worker_urls {
+            match Self::get_worker_dp_size(&url[..], api_key) {
+                Ok(dp_size) => {
+                    for i in 0..dp_size {
+                        let worker_url_dp = String::from(format!("{}@{}", &url, i));
+                        dp_aware_workers.push(worker_url_dp);
+                    }
+                },
+                Err(e) => return Err(format!("get_worker_dp_size failed: {}", e)),
+            }
+        }
+
+        Ok(dp_aware_workers)
+    }
+
     fn select_first_worker(&self) -> Result<String, String> {
         match self {
             Router::RoundRobin { worker_urls, .. }
@@ -334,6 +439,21 @@ impl Router {
         req: &HttpRequest,
     ) -> HttpResponse {
         let start = Instant::now();
+
+        let worker_url = if self.get_dp_awareness() {
+            // Need to extract the URL from "http://host:port@dp_rank"
+            let (worker_url_prefix, _dp_rank) = match Self::extract_dp_rank(worker_url) {
+                Ok(tup) => tup,
+                Err(e) => {
+                    error!("Failed to extract dp_rank: {}", e);
+                    return HttpResponse::InternalServerError().finish();
+                },
+            };
+            worker_url_prefix
+        } else {
+            worker_url
+        };
+
         let mut request_builder = client.get(format!("{}{}", worker_url, route));
 
         // Copy all headers from original request except for /health because it does not need authorization
@@ -421,7 +541,7 @@ impl Router {
 
                         if request_retries == MAX_REQUEST_RETRIES {
                             warn!("Removing failed worker: {}", worker_url);
-                            self.remove_worker(&worker_url);
+                            self.remove_failed_worker(&worker_url);
                             break;
                         }
                     }
@@ -577,6 +697,19 @@ impl Router {
         worker_url
     }
 
+    fn extract_dp_rank(worker_url: &str) -> Result<(&str, usize), String> {
+        let parts: Vec<&str> = worker_url.split('@').collect();
+        if parts.len() != 2 {
+            return Err(format!("invalid worker_url format: {}", worker_url));
+        }
+
+        // Parse the second part (dp_rank) into an integer
+        match parts[1].parse::<usize>() {
+            Ok(dp_rank) => Ok((parts[0], dp_rank)),
+            Err(_) => Err(format!("failed to parse dp_rank from worker_url: {}", worker_url)),
+        }
+    }
+
     async fn send_generate_request(
         &self,
         client: &reqwest::Client,
@@ -589,13 +722,60 @@ impl Router {
             .map(|v| v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false))
             .unwrap_or(false);
 
-        let mut request_builder = client
-            .post(format!("{}{}", worker_url, route))
-            .body(body.to_vec());
+        let mut request_builder = if self.get_dp_awareness() {
+            let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
+                Ok(tup) => tup,
+                Err(e) => {
+                    error!("Failed to extract dp_rank: {}", e);
+                    return HttpResponse::InternalServerError().finish();
+                },
+            };
 
-        // Copy all headers from original request
-        for (name, value) in copy_request_headers(req) {
-            request_builder = request_builder.header(name, value);
+            // Parse the request body
+            let mut json_val = match serde_json::from_slice::<serde_json::Value>(&body) {
+                Ok(j) => j,
+                Err(e) => return HttpResponse::BadRequest().body(format!("Invalid JSON: {}", e)),
+            };
+
+            // Insert the data_parallel_rank field
+            if let Some(map) = json_val.as_object_mut() {
+                map.insert(String::from("data_parallel_rank"), serde_json::json!(dp_rank));
+                debug!("Modified request body: {}",
+                    serde_json::to_string(&json_val).unwrap_or(String::from("ERR")));
+            } else {
+                warn!("Failed to insert the data_parallel_rank field into the request body");
+                // still try to send the request
+            }
+
+            let body = match serde_json::to_vec(&json_val) {
+                Ok(body) => body,
+                Err(e) => {
+                    error!("Failed to serialize the altered JSON value: {}", e);
+                    return HttpResponse::InternalServerError().finish();
+                },
+            };
+            client
+                .post(format!("{}{}", worker_url_prefix, route))
+                .body(body)
+        } else {
+            client
+                .post(format!("{}{}", worker_url, route))
+                .body(body.to_vec())
+        };
+
+        if self.get_dp_awareness() {
+            // Copy all headers from original request
+            // excepting the "Content-Length" header
+            for (name, value) in copy_request_headers(req) {
+                if name.to_lowercase() != "Content-Length".to_lowercase() {
+                    request_builder = request_builder.header(name, value);
+                }
+            }
+        } else {
+            // Copy all headers from original request
+            for (name, value) in copy_request_headers(req) {
+                request_builder = request_builder.header(name, value);
+            }
         }
 
         let res = match request_builder.send().await {
@@ -714,7 +894,7 @@ impl Router {
 
                 if request_retries == MAX_REQUEST_RETRIES {
                     warn!("Removing failed worker: {}", worker_url);
-                    self.remove_worker(&worker_url);
+                    self.remove_failed_worker(&worker_url);
                     break;
                 }
             }
@@ -725,22 +905,25 @@ impl Router {
     }
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
-        let (timeout_secs, interval_secs) = match self {
+        let (timeout_secs, interval_secs, api_key) = match self {
             Router::Random {
                 timeout_secs,
                 interval_secs,
+                api_key,
                 ..
-            } => (*timeout_secs, *interval_secs),
+            } => (*timeout_secs, *interval_secs, api_key),
             Router::RoundRobin {
                 timeout_secs,
                 interval_secs,
+                api_key,
                 ..
-            } => (*timeout_secs, *interval_secs),
+            } => (*timeout_secs, *interval_secs, api_key),
             Router::CacheAware {
                 timeout_secs,
                 interval_secs,
+                api_key,
                 ..
-            } => (*timeout_secs, *interval_secs),
+            } => (*timeout_secs, *interval_secs, api_key),
         };
 
         let start_time = std::time::Instant::now();
@@ -761,43 +944,99 @@ impl Router {
             match client.get(&format!("{}/health", worker_url)).send().await {
                 Ok(res) => {
                     if res.status().is_success() {
-                        match self {
-                            Router::RoundRobin { worker_urls, .. }
-                            | Router::Random { worker_urls, .. }
-                            | Router::CacheAware { worker_urls, .. } => {
-                                info!("Worker {} health check passed", worker_url);
-                                let mut urls = worker_urls.write().unwrap();
-                                if urls.contains(&worker_url.to_string()) {
-                                    return Err(format!("Worker {} already exists", worker_url));
+                        info!("Worker {} health check passed", worker_url);
+                        if self.get_dp_awareness() {
+                            let url_vec = vec![String::from(worker_url)];
+                            let dp_url_vec = Self::get_dp_aware_workers(&url_vec, api_key)
+                                .map_err(|e| format!("Failed to get dp-aware workers: {}", e))?;
+
+                            match self {
+                                Router::RoundRobin { worker_urls, .. }
+                                | Router::Random { worker_urls, .. }
+                                | Router::CacheAware { worker_urls, .. } => {
+                                    let mut urls = worker_urls.write().unwrap();
+                                    for dp_url in &dp_url_vec {
+                                        if urls.contains(dp_url) {
+                                            warn!("Worker {} already exists", dp_url);
+                                            continue;
+                                        }
+                                        info!("Added worker: {}", dp_url);
+                                        urls.push(dp_url.to_string());
+                                    }
+                                    gauge!("sgl_router_active_workers").set(urls.len() as f64);
                                 }
-                                info!("Added worker: {}", worker_url);
-                                urls.push(worker_url.to_string());
-                                gauge!("sgl_router_active_workers").set(urls.len() as f64);
                             }
-                        }
 
-                        // If cache aware, initialize the queues for the new worker
-                        if let Router::CacheAware {
-                            running_queue,
-                            processed_queue,
-                            tree,
-                            ..
-                        } = self
-                        {
-                            // Add worker to running queue with initial count of 0
-                            running_queue
-                                .lock()
-                                .unwrap()
-                                .insert(worker_url.to_string(), 0);
+                            // If cache aware, initialize the queues for the new worker
+                            if let Router::CacheAware {
+                                worker_urls,
+                                running_queue,
+                                processed_queue,
+                                tree,
+                                ..
+                            } = self
+                            {
+                                let urls = worker_urls.read().unwrap();
+                                for dp_url in &dp_url_vec {
+                                    if urls.contains(dp_url) {
+                                        continue;
+                                    }
+                                    // Add worker to running queue with initial count of 0
+                                    running_queue
+                                        .lock()
+                                        .unwrap()
+                                        .insert(dp_url.to_string(), 0);
 
-                            // Add worker to processed queue with initial count of 0
-                            processed_queue
-                                .lock()
-                                .unwrap()
-                                .insert(worker_url.to_string(), 0);
+                                    // Add worker to processed queue with initial count of 0
+                                    processed_queue
+                                        .lock()
+                                        .unwrap()
+                                        .insert(dp_url.to_string(), 0);
 
-                            // Add worker to tree
-                            tree.lock().unwrap().insert(&"".to_string(), &worker_url);
+                                    // Add worker to tree
+                                    tree
+                                        .lock()
+                                        .unwrap()
+                                        .insert(&"".to_string(), &dp_url);
+                                }
+                            }
+                        } else {
+                            match self {
+                                Router::RoundRobin { worker_urls, .. }
+                                | Router::Random { worker_urls, .. }
+                                | Router::CacheAware { worker_urls, .. } => {
+                                    let mut urls = worker_urls.write().unwrap();
+                                    if urls.contains(&worker_url.to_string()) {
+                                        return Err(format!("Worker {} already exists", worker_url));
+                                    }
+                                    info!("Added worker: {}", worker_url);
+                                    urls.push(worker_url.to_string());
+                                }
+                            }
+
+                            // If cache aware, initialize the queues for the new worker
+                            if let Router::CacheAware {
+                                running_queue,
+                                processed_queue,
+                                tree,
+                                ..
+                            } = self
+                            {
+                                // Add worker to running queue with initial count of 0
+                                running_queue
+                                    .lock()
+                                    .unwrap()
+                                    .insert(worker_url.to_string(), 0);
+
+                                // Add worker to processed queue with initial count of 0
+                                processed_queue
+                                    .lock()
+                                    .unwrap()
+                                    .insert(worker_url.to_string(), 0);
+
+                                // Add worker to tree
+                                tree.lock().unwrap().insert(&"".to_string(), &worker_url);
+                            }
                         }
 
                         return Ok(format!("Successfully added worker: {}", worker_url));
@@ -836,6 +1075,118 @@ impl Router {
     }
 
     pub fn remove_worker(&self, worker_url: &str) {
+        if self.get_dp_awareness() {
+            // remove dp-aware workers in a prefix-matching fashion
+            // without contacting the remote worker
+            let mut candidate_workers: Vec<String> = Vec::new();
+            let worker_url_prefix = format!("{}@", worker_url);
+
+            match self {
+                Router::RoundRobin { worker_urls, .. }
+                | Router::Random { worker_urls, .. }
+                | Router::CacheAware { worker_urls, .. } => {
+                    {
+                        // find the candidate workers to be removed
+                        let urls = worker_urls.read().unwrap();
+                        for url in urls.iter() {
+                            if url.starts_with(&worker_url_prefix) {
+                                candidate_workers.push(url.clone());
+                            }
+                        }
+                    }
+
+                    {
+                        // do the removing on the worker_urls
+                        let mut urls = worker_urls.write().unwrap();
+                        for dp_url in candidate_workers.iter() {
+                            if let Some(index) = urls.iter().position(|url| url == dp_url) {
+                                urls.remove(index);
+                                info!("Removed worker: {}", dp_url);
+                            } else {
+                                warn!("Worker {} not found, skipping removal", dp_url);
+                                continue;
+                            }
+                        }
+                        gauge!("sgl_router_active_workers").set(urls.len() as f64);
+                    }
+                }
+            }
+
+            // if cache aware, remove the workers from the tree and queues
+            if let Router::CacheAware {
+                worker_urls,
+                tree,
+                running_queue,
+                processed_queue,
+                ..
+            } = self
+            {
+                let urls = worker_urls.read().unwrap();
+                for dp_url in candidate_workers.iter() {
+                    if !urls.contains(dp_url) {
+                        continue;
+                    }
+                    tree
+                        .lock()
+                        .unwrap()
+                        .remove_tenant(dp_url);
+                    running_queue
+                        .lock()
+                        .unwrap()
+                        .remove(dp_url);
+                    processed_queue
+                        .lock()
+                        .unwrap()
+                        .remove(dp_url);
+                    info!(
+                        "Removed worker from tree and cleaned up queues: {}",
+                        dp_url
+                    );
+                }
+            }
+        } else {
+            match self {
+                Router::RoundRobin { worker_urls, .. }
+                | Router::Random { worker_urls, .. }
+                | Router::CacheAware { worker_urls, .. } => {
+                    let mut urls = worker_urls.write().unwrap();
+                    if let Some(index) = urls.iter().position(|url| url == &worker_url) {
+                        urls.remove(index);
+                        info!("Removed worker: {}", worker_url);
+                        gauge!("sgl_router_active_workers").set(urls.len() as f64);
+                    } else {
+                        warn!("Worker {} not found, skipping removal", worker_url);
+                        return;
+                    }
+                }
+            }
+
+            // if cache aware, remove the worker from the tree
+            if let Router::CacheAware {
+                tree,
+                running_queue,
+                processed_queue,
+                ..
+            } = self
+            {
+                tree.lock().unwrap().remove_tenant(&worker_url);
+                running_queue
+                    .lock()
+                    .unwrap()
+                    .remove(&worker_url.to_string());
+                processed_queue
+                    .lock()
+                    .unwrap()
+                    .remove(&worker_url.to_string());
+                info!(
+                    "Removed worker from tree and cleaned up queues: {}",
+                    worker_url
+                );
+            }
+        }
+    }
+
+    fn remove_failed_worker(&self, worker_url: &str) {
         match self {
             Router::RoundRobin { worker_urls, .. }
             | Router::Random { worker_urls, .. }

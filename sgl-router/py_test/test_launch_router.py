@@ -42,6 +42,7 @@ class TestLaunchRouter(unittest.TestCase):
             selector=None,
             service_discovery_port=80,
             service_discovery_namespace=None,
+            dp_awareness=False,
         )
 
     def create_router_args(self, **kwargs):
@@ -97,6 +98,31 @@ class TestLaunchRouter(unittest.TestCase):
             service_discovery=True,
             selector=["app=test-worker"],
             service_discovery_namespace="test-namespace",
+        )
+        self.run_router_process(args)
+
+    def test_launch_router_common_with_dp_awareness(self):
+        args = self.create_router_args(
+            worker_urls=["http://localhost:8000"],
+            dp_awareness=True,
+        )
+        self.run_router_process(args)
+
+    def test_launch_router_with_empty_worker_urls_with_dp_awareness(self):
+        args = self.create_router_args(
+            worker_urls=[],
+            dp_awareness=True,
+        )
+        self.run_router_process(args)
+
+    def test_launch_router_common_with_dp_awareness_service_discovery(self):
+        # Test launch routre with bot srevice_discovery and dp_awareness enabled
+        # The service_discovery should be turned off automatically
+        args = self.create_router_args(
+            worker_urls=["http://localhost:8000"],
+            dp_awareness=True,
+            service_discovery=True,
+            selector=["app=test-worker"],
         )
         self.run_router_process(args)
 
