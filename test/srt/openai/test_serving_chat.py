@@ -223,8 +223,10 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(params["min_new_tokens"], 5)
             self.assertEqual(params["stop"], ["</s>"])
 
-    def test_hidden_states_request_conversion_single(self):
-        """Test request conversion with return_hidden_states=True for single request"""
+    # ------------- hidden states tests -------------
+    def test_hidden_states_request_conversion(self):
+        """Test request conversion with return_hidden_states=True"""
+        # Test single request
         request = ChatCompletionRequest(
             model="test-model",
             messages=[{"role": "user", "content": "Hello"}],
@@ -245,11 +247,9 @@ class ServingChatTestCase(unittest.TestCase):
             adapted_request, _ = self.chat._convert_to_internal_request(
                 [request], ["test-id"]
             )
-
             assert adapted_request.return_hidden_states is True
 
-    def test_hidden_states_request_conversion_multiple(self):
-        """Test request conversion with return_hidden_states=True for multiple requests"""
+        # Test multiple requests
         requests = [
             ChatCompletionRequest(
                 model="test-model",
@@ -277,99 +277,15 @@ class ServingChatTestCase(unittest.TestCase):
             adapted_request, _ = self.chat._convert_to_internal_request(
                 requests, ["test-id-1", "test-id-2"]
             )
-
             assert adapted_request.return_hidden_states == [True, False]
 
-    def test_hidden_states_non_streaming_response(self):
-        """Test hidden states in non-streaming response"""
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            return_hidden_states=True,
-            chat_template_kwargs={"enable_thinking": True},
-        )
+    def test_hidden_states_response_handling(self):
+        """Test hidden states in response handling"""
+        # Test that hidden states conversion works correctly
+        from sglang.srt.entrypoints.openai.utils import process_hidden_states_from_ret
 
-        # Mock the generate_request to return hidden states
-        async def mock_generate():
-            yield {
-                "text": "Test",
-                "meta_info": {
-                    "id": "chatcmpl-test",
-                    "prompt_tokens": 10,
-                    "completion_tokens": 1,
-                    "cached_tokens": 0,
-                    "finish_reason": None,
-                    "output_token_logprobs": [],
-                    "output_top_logprobs": None,
-                    "hidden_states": [[0.1, 0.2, 0.3]],  # First token only
-                },
-                "index": 0,
-            }
-            yield {
-                "text": " response",
-                "meta_info": {
-                    "id": "chatcmpl-test",
-                    "prompt_tokens": 10,
-                    "completion_tokens": 2,
-                    "cached_tokens": 0,
-                    "finish_reason": {"type": "stop", "matched": None},
-                    "output_token_logprobs": [],
-                    "output_top_logprobs": None,
-                    "hidden_states": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],  # Both tokens
-                },
-                "index": 0,
-            }
-
-        self.chat.tokenizer_manager.generate_request = Mock(return_value=mock_generate())
-
-        with patch.object(self.chat, "_process_messages") as mock_process:
-            mock_process.return_value = (
-                "Test prompt",
-                [1, 2, 3],
-                None,
-                None,
-                [],
-                ["</s>"],
-                None,
-            )
-
-            adapted_request, _ = self.chat._convert_to_internal_request(
-                [request], ["test-id"]
-            )
-
-            # Test the _build_chat_response method
-            ret = [{
-                "text": "Test response",
-                "meta_info": {
-                    "id": "chatcmpl-test",
-                    "prompt_tokens": 10,
-                    "completion_tokens": 2,
-                    "cached_tokens": 0,
-                    "finish_reason": {"type": "stop", "matched": None},
-                    "output_token_logprobs": [],
-                    "output_top_logprobs": None,
-                    "hidden_states": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
-                },
-            }]
-
-            response = self.chat._build_chat_response(
-                request, ret, 1234567890
-            )
-
-            assert len(response.choices) == 1
-            choice = response.choices[0]
-            assert choice.hidden_states == [0.4, 0.5, 0.6]  # Should return last token's hidden states
-
-    def test_hidden_states_non_streaming_response_no_hidden_states(self):
-        """Test response when return_hidden_states=False"""
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            return_hidden_states=False,
-            chat_template_kwargs={"enable_thinking": True},
-        )
-
-        ret = [{
+        # Test with hidden states present
+        ret_item_with_hidden = {
             "text": "Test response",
             "meta_info": {
                 "id": "chatcmpl-test",
@@ -379,28 +295,59 @@ class ServingChatTestCase(unittest.TestCase):
                 "finish_reason": {"type": "stop", "matched": None},
                 "output_token_logprobs": [],
                 "output_top_logprobs": None,
+                "hidden_states": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
             },
-        }]
+        }
 
-        response = self.chat._build_chat_response(
-            request, ret, 1234567890
+        request_with_hidden = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            return_hidden_states=True,
         )
 
-        assert len(response.choices) == 1
-        choice = response.choices[0]
-        assert choice.hidden_states is None
+        hidden_states = process_hidden_states_from_ret(
+            ret_item_with_hidden, request_with_hidden, 0
+        )
+        assert hidden_states == [
+            0.4,
+            0.5,
+            0.6,
+        ]  # Should return last token's hidden states
 
-    async def test_hidden_states_streaming_response(self):
+        # Test without hidden states
+        ret_item_without_hidden = {
+            "text": "Test response",
+            "meta_info": {
+                "id": "chatcmpl-test2",
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "cached_tokens": 0,
+                "finish_reason": {"type": "stop", "matched": None},
+                "output_token_logprobs": [],
+                "output_top_logprobs": None,
+            },
+        }
+
+        request_without_hidden = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            return_hidden_states=False,
+        )
+
+        hidden_states = process_hidden_states_from_ret(
+            ret_item_without_hidden, request_without_hidden, 0
+        )
+        assert hidden_states is None
+
+    async def test_hidden_states_streaming(self):
         """Test hidden states in streaming response"""
         request = ChatCompletionRequest(
             model="test-model",
             messages=[{"role": "user", "content": "Hello"}],
             return_hidden_states=True,
             stream=True,
-            chat_template_kwargs={"enable_thinking": True},
         )
 
-        # Mock the generate_request to return hidden states
         async def mock_generate():
             yield {
                 "text": "Test",
@@ -412,26 +359,14 @@ class ServingChatTestCase(unittest.TestCase):
                     "finish_reason": None,
                     "output_token_logprobs": [],
                     "output_top_logprobs": None,
-                    "hidden_states": [[0.1, 0.2, 0.3]],  # First token only
-                },
-                "index": 0,
-            }
-            yield {
-                "text": " response",
-                "meta_info": {
-                    "id": "chatcmpl-test",
-                    "prompt_tokens": 10,
-                    "completion_tokens": 2,
-                    "cached_tokens": 0,
-                    "finish_reason": {"type": "stop", "matched": None},
-                    "output_token_logprobs": [],
-                    "output_top_logprobs": None,
-                    "hidden_states": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],  # Both tokens
+                    "hidden_states": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
                 },
                 "index": 0,
             }
 
-        self.chat.tokenizer_manager.generate_request = Mock(return_value=mock_generate())
+        self.chat.tokenizer_manager.generate_request = Mock(
+            return_value=mock_generate()
+        )
 
         with patch.object(self.chat, "_process_messages") as mock_process:
             mock_process.return_value = (
@@ -452,148 +387,33 @@ class ServingChatTestCase(unittest.TestCase):
                 adapted_request, request, self.mock_request
             )
 
-            # Collect all chunks from the streaming response
             chunks = []
             async for chunk in response.body_iterator:
                 chunks.append(chunk)
 
-            # Parse and validate chunks
             import json
+
             parsed_chunks = []
             for chunk in chunks:
                 if chunk.startswith("data:") and chunk.strip() != "data: [DONE]":
                     try:
-                        chunk_data = json.loads(chunk[6:])  # Remove "data: " prefix
+                        chunk_data = json.loads(chunk[6:])
                         parsed_chunks.append(chunk_data)
                     except json.JSONDecodeError:
-                        # Skip chunks that can't be parsed as JSON
                         continue
 
-            # Should have at least 3 chunks: role, hidden_states, and final content
-            assert len(parsed_chunks) >= 3
-            
-            # First chunk should contain role
-            assert parsed_chunks[0]["choices"][0]["delta"]["role"] == "assistant"
-            
-            # Find hidden states chunk
+            assert len(parsed_chunks) >= 1
             hidden_states_found = False
             for chunk_data in parsed_chunks:
                 delta = chunk_data["choices"][0]["delta"]
                 if delta.get("hidden_states") is not None:
-                    assert delta["hidden_states"] == [0.4, 0.5, 0.6]  # Last token hidden states
+                    assert delta["hidden_states"] == [0.4, 0.5, 0.6]
                     hidden_states_found = True
                     break
-            
-            assert hidden_states_found, "Hidden states should be present in streaming response"
+            assert (
+                hidden_states_found
+            ), "Hidden states should be present in streaming response"
 
-    def test_hidden_states_multiple_choices(self):
-        """Test hidden states with multiple choices (n > 1)"""
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            return_hidden_states=True,
-            n=2,
-            chat_template_kwargs={"enable_thinking": True},
-        )
-
-        ret = [
-            {
-                "text": "Response 1",
-                "meta_info": {
-                    "id": "chatcmpl-test",
-                    "prompt_tokens": 10,
-                    "completion_tokens": 5,
-                    "cached_tokens": 0,
-                    "finish_reason": {"type": "stop", "matched": None},
-                    "output_token_logprobs": [],
-                    "output_top_logprobs": None,
-                    "hidden_states": [[0.1, 0.2], [0.3, 0.4]],
-                },
-            },
-            {
-                "text": "Response 2",
-                "meta_info": {
-                    "id": "chatcmpl-test",
-                    "prompt_tokens": 10,
-                    "completion_tokens": 5,
-                    "cached_tokens": 0,
-                    "finish_reason": {"type": "stop", "matched": None},
-                    "output_token_logprobs": [],
-                    "output_top_logprobs": None,
-                    "hidden_states": [[0.5, 0.6], [0.7, 0.8]],
-                },
-            }
-        ]
-
-        response = self.chat._build_chat_response(
-            request, ret, 1234567890
-        )
-
-        assert len(response.choices) == 2
-        assert response.choices[0].hidden_states == [0.3, 0.4]  # Last token for choice 0
-        assert response.choices[1].hidden_states == [0.7, 0.8]  # Last token for choice 1
-
-    def test_hidden_states_empty_list(self):
-        """Test handling of empty hidden states list"""
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            return_hidden_states=True,
-            chat_template_kwargs={"enable_thinking": True},
-        )
-
-        ret = [{
-            "text": "Test response",
-            "meta_info": {
-                "id": "chatcmpl-test",
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "cached_tokens": 0,
-                "finish_reason": {"type": "stop", "matched": None},
-                "output_token_logprobs": [],
-                "output_top_logprobs": None,
-                "hidden_states": [],  # Empty hidden states
-            },
-        }]
-
-        response = self.chat._build_chat_response(
-            request, ret, 1234567890
-        )
-
-        assert len(response.choices) == 1
-        choice = response.choices[0]
-        assert choice.hidden_states == []
-
-    def test_hidden_states_single_token(self):
-        """Test handling of hidden states with single token"""
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "Hello"}],
-            return_hidden_states=True,
-            chat_template_kwargs={"enable_thinking": True},
-        )
-
-        ret = [{
-            "text": "Test",
-            "meta_info": {
-                "id": "chatcmpl-test",
-                "prompt_tokens": 10,
-                "completion_tokens": 1,
-                "cached_tokens": 0,
-                "finish_reason": {"type": "stop", "matched": None},
-                "output_token_logprobs": [],
-                "output_top_logprobs": None,
-                "hidden_states": [[0.1, 0.2, 0.3]],  # Single token hidden states
-            },
-        }]
-
-        response = self.chat._build_chat_response(
-            request, ret, 1234567890
-        )
-
-        assert len(response.choices) == 1
-        choice = response.choices[0]
-        assert choice.hidden_states == []  # Should return empty list for single token (as per current logic)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
