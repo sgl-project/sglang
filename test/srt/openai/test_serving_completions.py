@@ -181,19 +181,24 @@ class TestHiddenStates:
             return_hidden_states=True,
         )
 
-        ret = [{
-            "text": "Test response",
-            "meta_info": {
-                "id": "cmpl-test",
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "cached_tokens": 0,
-                "finish_reason": {"type": "stop", "matched": None},
-                "output_token_logprobs": [],
-                "output_top_logprobs": None,
-                "hidden_states": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],  # Mock hidden states
-            },
-        }]
+        ret = [
+            {
+                "text": "Test response",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": [],
+                    "output_top_logprobs": None,
+                    "hidden_states": [
+                        [0.1, 0.2, 0.3],
+                        [0.4, 0.5, 0.6],
+                    ],  # Mock hidden states
+                },
+            }
+        ]
 
         response = serving_completion._build_completion_response(
             request, ret, 1234567890
@@ -201,9 +206,15 @@ class TestHiddenStates:
 
         assert len(response.choices) == 1
         choice = response.choices[0]
-        assert choice.hidden_states == [0.4, 0.5, 0.6]  # Should return last token's hidden states
+        assert choice.hidden_states == [
+            0.4,
+            0.5,
+            0.6,
+        ]  # Should return last token's hidden states
 
-    def test_hidden_states_non_streaming_response_no_hidden_states(self, serving_completion):
+    def test_hidden_states_non_streaming_response_no_hidden_states(
+        self, serving_completion
+    ):
         """Test response when return_hidden_states=False"""
         request = CompletionRequest(
             model="test-model",
@@ -211,18 +222,20 @@ class TestHiddenStates:
             return_hidden_states=False,
         )
 
-        ret = [{
-            "text": "Test response",
-            "meta_info": {
-                "id": "cmpl-test",
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "cached_tokens": 0,
-                "finish_reason": {"type": "stop", "matched": None},
-                "output_token_logprobs": [],
-                "output_top_logprobs": None,
-            },
-        }]
+        ret = [
+            {
+                "text": "Test response",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": [],
+                    "output_top_logprobs": None,
+                },
+            }
+        ]
 
         response = serving_completion._build_completion_response(
             request, ret, 1234567890
@@ -256,7 +269,10 @@ class TestHiddenStates:
                     "output_top_logprobs": None,
                     "input_token_logprobs": None,
                     "input_top_logprobs": None,
-                    "hidden_states": [[0.1, 0.2, 0.3], [0.2, 0.3, 0.4]],  # At least 2 vectors
+                    "hidden_states": [
+                        [0.1, 0.2, 0.3],
+                        [0.2, 0.3, 0.4],
+                    ],  # At least 2 vectors
                 },
                 "index": 0,
             }
@@ -277,7 +293,9 @@ class TestHiddenStates:
                 "index": 0,
             }
 
-        serving_completion.tokenizer_manager.generate_request = Mock(return_value=mock_generate())
+        serving_completion.tokenizer_manager.generate_request = Mock(
+            return_value=mock_generate()
+        )
 
         adapted_request, _ = serving_completion._convert_to_internal_request(
             [request], ["test-id"]
@@ -295,6 +313,7 @@ class TestHiddenStates:
 
         # Parse and validate chunks
         import json
+
         parsed_chunks = []
         for chunk in chunks:
             if chunk.startswith("data:") and chunk.strip() != "data: [DONE]":
@@ -313,11 +332,17 @@ class TestHiddenStates:
         for chunk_data in parsed_chunks:
             choice = chunk_data["choices"][0]
             if choice.get("hidden_states") is not None:
-                assert choice["hidden_states"] == [0.4, 0.5, 0.6]  # Last token hidden states
+                assert choice["hidden_states"] == [
+                    0.4,
+                    0.5,
+                    0.6,
+                ]  # Last token hidden states
                 hidden_states_found = True
                 break
 
-        assert hidden_states_found, "Hidden states should be present in streaming response"
+        assert (
+            hidden_states_found
+        ), "Hidden states should be present in streaming response"
 
     def test_hidden_states_with_echo_non_streaming(self, serving_completion):
         """Test hidden states with echo enabled in non-streaming response"""
@@ -328,21 +353,23 @@ class TestHiddenStates:
             echo=True,
         )
 
-        ret = [{
-            "text": "world",
-            "meta_info": {
-                "id": "cmpl-test",
-                "prompt_tokens": 5,
-                "completion_tokens": 5,
-                "cached_tokens": 0,
-                "finish_reason": {"type": "stop", "matched": None},
-                "output_token_logprobs": [],
-                "output_top_logprobs": None,
-                "input_token_logprobs": [],
-                "input_top_logprobs": None,
-                "hidden_states": [[0.1, 0.2], [0.3, 0.4]],
-            },
-        }]
+        ret = [
+            {
+                "text": "world",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 5,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": [],
+                    "output_top_logprobs": None,
+                    "input_token_logprobs": [],
+                    "input_top_logprobs": None,
+                    "hidden_states": [[0.1, 0.2], [0.3, 0.4]],
+                },
+            }
+        ]
 
         response = serving_completion._build_completion_response(
             request, ret, 1234567890
@@ -388,7 +415,7 @@ class TestHiddenStates:
                     "output_top_logprobs": None,
                     "hidden_states": [[0.5, 0.6], [0.7, 0.8]],
                 },
-            }
+            },
         ]
 
         response = serving_completion._build_completion_response(
@@ -396,8 +423,14 @@ class TestHiddenStates:
         )
 
         assert len(response.choices) == 2
-        assert response.choices[0].hidden_states == [0.3, 0.4]  # Last token for choice 0
-        assert response.choices[1].hidden_states == [0.7, 0.8]  # Last token for choice 1
+        assert response.choices[0].hidden_states == [
+            0.3,
+            0.4,
+        ]  # Last token for choice 0
+        assert response.choices[1].hidden_states == [
+            0.7,
+            0.8,
+        ]  # Last token for choice 1
 
     def test_hidden_states_empty_list(self, serving_completion):
         """Test handling of empty hidden states list"""
@@ -407,19 +440,21 @@ class TestHiddenStates:
             return_hidden_states=True,
         )
 
-        ret = [{
-            "text": "world",
-            "meta_info": {
-                "id": "cmpl-test",
-                "prompt_tokens": 5,
-                "completion_tokens": 5,
-                "cached_tokens": 0,
-                "finish_reason": {"type": "stop", "matched": None},
-                "output_token_logprobs": [],
-                "output_top_logprobs": None,
-                "hidden_states": [],  # Empty hidden states
-            },
-        }]
+        ret = [
+            {
+                "text": "world",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 5,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": [],
+                    "output_top_logprobs": None,
+                    "hidden_states": [],  # Empty hidden states
+                },
+            }
+        ]
 
         response = serving_completion._build_completion_response(
             request, ret, 1234567890
@@ -437,19 +472,21 @@ class TestHiddenStates:
             return_hidden_states=True,
         )
 
-        ret = [{
-            "text": "world",
-            "meta_info": {
-                "id": "cmpl-test",
-                "prompt_tokens": 5,
-                "completion_tokens": 1,
-                "cached_tokens": 0,
-                "finish_reason": {"type": "stop", "matched": None},
-                "output_token_logprobs": [],
-                "output_top_logprobs": None,
-                "hidden_states": [[0.1, 0.2, 0.3]],  # Single token hidden states
-            },
-        }]
+        ret = [
+            {
+                "text": "world",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": [],
+                    "output_top_logprobs": None,
+                    "hidden_states": [[0.1, 0.2, 0.3]],  # Single token hidden states
+                },
+            }
+        ]
 
         response = serving_completion._build_completion_response(
             request, ret, 1234567890
@@ -500,7 +537,7 @@ class TestHiddenStates:
                     "output_top_logprobs": None,
                     "hidden_states": [[0.5, 0.6], [0.7, 0.8]],
                 },
-            }
+            },
         ]
 
         # Test the hidden states logic manually since the method doesn't support list requests properly
@@ -508,10 +545,12 @@ class TestHiddenStates:
         hidden_states_1 = ret[0]["meta_info"].get("hidden_states", None)
         if hidden_states_1 is not None:
             hidden_states_1 = (
-                hidden_states_1[-1] if hidden_states_1 and len(hidden_states_1) > 1 else []
+                hidden_states_1[-1]
+                if hidden_states_1 and len(hidden_states_1) > 1
+                else []
             )
-        
-        # Second request with return_hidden_states=False 
+
+        # Second request with return_hidden_states=False
         hidden_states_2 = None  # Should be None when return_hidden_states=False
 
         assert hidden_states_1 == [0.3, 0.4]  # Last token for choice 0
@@ -535,7 +574,7 @@ class TestHiddenStates:
     @pytest.mark.asyncio
     async def test_hidden_states_streaming_with_echo(self, serving_completion):
         """Test hidden states in streaming response with echo enabled
-        
+
         Note: Currently hidden states are not included in streaming responses.
         This test validates that the streaming response works without errors.
         """
@@ -566,7 +605,9 @@ class TestHiddenStates:
                 "index": 0,
             }
 
-        serving_completion.tokenizer_manager.generate_request = Mock(return_value=mock_generate())
+        serving_completion.tokenizer_manager.generate_request = Mock(
+            return_value=mock_generate()
+        )
 
         adapted_request, _ = serving_completion._convert_to_internal_request(
             [request], ["test-id"]
@@ -584,12 +625,13 @@ class TestHiddenStates:
 
         # Validate that streaming response works without errors
         assert len(chunks) >= 2, "Should have at least content and [DONE] chunks"
-        
+
         # Validate that text content is present in some chunk
         text_found = False
         for chunk in chunks:
             if "data:" in chunk and chunk != "data: [DONE]":
                 import json
+
                 chunk_data = json.loads(chunk[6:])  # Remove "data: " prefix
                 if chunk_data["choices"][0]["text"]:
                     text_found = True

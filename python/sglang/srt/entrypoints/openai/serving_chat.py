@@ -30,7 +30,6 @@ from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     detect_template_content_format,
     process_content_for_template_format,
-    process_hidden_states_from_ret,
     to_openai_style_logprobs,
 )
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -58,21 +57,6 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
         """Convert OpenAI chat completion request to internal format"""
-<<<<<<< HEAD
-=======
-        input_ids = []
-        prompts = []
-        sampling_params_list = []
-        image_data_list = []
-        audio_data_list = []
-        return_logprobs = []
-        logprob_start_lens = []
-        top_logprobs_nums = []
-        modalities_list = []
-        lora_paths = []
-        return_hidden_states = []
-
->>>>>>> ed68ab6 (Add hidden state support)
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
@@ -86,7 +70,6 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint,
         ) = self._process_messages(request, is_multimodal)
 
-<<<<<<< HEAD
         # Build sampling parameters
         sampling_params = self._build_sampling_params(
             request, stop, tool_call_constraint
@@ -95,46 +78,6 @@ class OpenAIServingChat(OpenAIServingBase):
         # Handle single vs multiple requests
         if is_multimodal:
             prompt_kwargs = {"text": prompt}
-=======
-            input_ids.append(prompt_ids)
-            prompts.append(prompt)
-            return_logprobs.append(request.logprobs)
-            logprob_start_lens.append(-1)
-            top_logprobs_nums.append(request.top_logprobs or 0)
-            lora_paths.append(request.lora_path)
-            return_hidden_states.append(request.return_hidden_states)
-
-            # Build sampling parameters
-            sampling_params = self._build_sampling_params(
-                request, stop, tool_call_constraint
-            )
-            sampling_params_list.append(sampling_params)
-
-            image_data_list.append(image_data)
-            audio_data_list.append(audio_data)
-            modalities_list.append(modalities)
-
-        # Handle single vs multiple requests
-        if len(all_requests) == 1:
-            if is_multimodal:
-                prompt_kwargs = {"text": prompts[0]}
-            else:
-                if isinstance(input_ids[0], str):
-                    prompt_kwargs = {"text": input_ids[0]}
-                else:
-                    prompt_kwargs = {"input_ids": input_ids[0]}
-
-            sampling_params_list = sampling_params_list[0]
-            image_data_list = image_data_list[0]
-            audio_data_list = audio_data_list[0]
-            return_logprobs = return_logprobs[0]
-            logprob_start_lens = logprob_start_lens[0]
-            top_logprobs_nums = top_logprobs_nums[0]
-            modalities_list = modalities_list[0]
-            lora_paths = lora_paths[0]
-            request_ids = request_ids[0]
-            return_hidden_states = return_hidden_states[0]
->>>>>>> ed68ab6 (Add hidden state support)
         else:
             if isinstance(prompt_ids, str):
                 prompt_kwargs = {"text": prompt_ids}
@@ -151,21 +94,12 @@ class OpenAIServingChat(OpenAIServingBase):
             top_logprobs_num=request.top_logprobs or 0,
             stream=request.stream,
             return_text_in_logprobs=True,
-<<<<<<< HEAD
             modalities=modalities,
             lora_path=request.lora_path,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
-=======
-            rid=request_ids,
-            modalities=modalities_list,
-            lora_path=lora_paths,
-            bootstrap_host=all_requests[0].bootstrap_host,
-            bootstrap_port=all_requests[0].bootstrap_port,
-            bootstrap_room=all_requests[0].bootstrap_room,
-            return_hidden_states=return_hidden_states,
->>>>>>> ed68ab6 (Add hidden state support)
+            return_hidden_states=request.return_hidden_states
         )
 
         return adapted_request, request
@@ -449,7 +383,6 @@ class OpenAIServingChat(OpenAIServingBase):
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
 
-<<<<<<< HEAD
     async def _generate_chat_stream(
         self,
         adapted_request: GenerateReqInput,
@@ -460,19 +393,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # Parsers for tool calls and reasoning
         parser_dict = {}
         reasoning_parser_dict = {}
-=======
-        async def generate_stream_resp():
-            parser_dict = {}
-            reasoning_parser_dict = {}
-            tool_call_first = True
-            is_firsts = {}
-            stream_buffers = {}
-            n_prev_tokens = {}
-            prompt_tokens = {}
-            completion_tokens = {}
-            cached_tokens = {}
-            hidden_states = {}
->>>>>>> ed68ab6 (Add hidden state support)
+
 
         # State tracking for streaming
         is_firsts = {}
@@ -483,23 +404,18 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
+        hidden_states = {}
 
-<<<<<<< HEAD
         try:
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
-=======
-                    prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
-                    completion_tokens[index] = content["meta_info"]["completion_tokens"]
-                    cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
-                    hidden_states[index] = content["meta_info"].get("hidden_states", None)
->>>>>>> ed68ab6 (Add hidden state support)
 
                 prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                hidden_states[index] = content["meta_info"].get("hidden_states", None)
 
                 # Handle logprobs
                 choice_logprobs = None
@@ -632,7 +548,31 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             yield f"data: {finish_reason_chunk.model_dump_json()}\n\n"
 
-<<<<<<< HEAD
+            # Send hidden states if requested
+            if request.return_hidden_states and hidden_states:
+                for index, choice_hidden_states in hidden_states.items():
+                    if choice_hidden_states:
+                        last_token_hidden_states = (
+                            choice_hidden_states[-1]
+                            if choice_hidden_states and len(choice_hidden_states) > 1
+                            else []
+                        )
+                        hidden_states_chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            choices=[
+                                ChatCompletionResponseStreamChoice(
+                                    index=index,
+                                    delta=DeltaMessage(
+                                        hidden_states=last_token_hidden_states
+                                    ),
+                                    finish_reason=finish_reason_type,
+                                )
+                            ],
+                            model=request.model,
+                        )
+                        yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
+                        
             # Additional usage chunk
             if request.stream_options and request.stream_options.include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
@@ -643,93 +583,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
-=======
-                        if not delta:
-                            stream_buffers[index] = new_stream_buffer
-                            is_firsts[index] = is_first
-                            n_prev_tokens[index] = n_prev_token
-                            continue
-
-                    # Handle tool calls
-                    if request.tool_choice != "none" and request.tools:
-                        async for chunk in self._process_tool_call_stream(
-                            index,
-                            delta,
-                            parser_dict,
-                            content,
-                            request,
-                            finish_reason_type,
-                        ):
-                            yield chunk
-                    else:
-                        # Regular content
-                        if delta or not (
-                            request.stream_options
-                            and request.stream_options.include_usage
-                        ):
-                            choice_data = ChatCompletionResponseStreamChoice(
-                                index=index,
-                                delta=DeltaMessage(content=delta if delta else None),
-                                finish_reason=(
-                                    None
-                                    if request.stream_options
-                                    and request.stream_options.include_usage
-                                    else finish_reason_type
-                                ),
-                                matched_stop=(
-                                    finish_reason["matched"]
-                                    if finish_reason and "matched" in finish_reason
-                                    else None
-                                ),
-                                logprobs=choice_logprobs,
-                            )
-                            chunk = ChatCompletionStreamResponse(
-                                id=content["meta_info"]["id"],
-                                created=int(time.time()),
-                                choices=[choice_data],
-                                model=request.model,
-                            )
-                            yield f"data: {chunk.model_dump_json()}\n\n"
-
-                    stream_buffers[index] = new_stream_buffer
-                    is_firsts[index] = is_first
-                    n_prev_tokens[index] = n_prev_token
-
-                # Final chunk with usage
-                if request.stream_options and request.stream_options.include_usage:
-                    usage = self._calculate_streaming_usage_base(
-                        prompt_tokens, completion_tokens, cached_tokens, request.n
-                    )
-                else:
-                    usage = None
-
-                # Send hidden states if requested
-                if request.return_hidden_states and hidden_states:
-                    for index, choice_hidden_states in hidden_states.items():
-                        if choice_hidden_states:
-                            last_token_hidden_states = (
-                                choice_hidden_states[-1]
-                                if choice_hidden_states and len(choice_hidden_states) > 1
-                                else []
-                            )
-                            hidden_states_chunk = ChatCompletionStreamResponse(
-                                id=content["meta_info"]["id"],
-                                created=int(time.time()),
-                                choices=[
-                                    ChatCompletionResponseStreamChoice(
-                                        index=index,
-                                        delta=DeltaMessage(
-                                            hidden_states=last_token_hidden_states
-                                        ),
-                                        finish_reason=finish_reason_type,
-                                    )
-                                ],
-                                model=request.model,
-                            )
-                            yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
-
-                final_chunk = ChatCompletionStreamResponse(
->>>>>>> ed68ab6 (Add hidden state support)
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
                     choices=[],  # Empty choices array as per OpenAI spec
@@ -785,7 +638,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 choice_logprobs = self._process_response_logprobs(ret_item)
 
             # Handle hidden states
-            hidden_states = process_hidden_states_from_ret(ret_item, request, idx)
+            hidden_states = None
+            if isinstance(request, list) and request[idx].return_hidden_states:
+                hidden_states = ret_item["meta_info"].get("hidden_states", None)
+            elif not isinstance(request, list) and request.return_hidden_states:
+                hidden_states = ret_item["meta_info"].get("hidden_states", None)
+            if hidden_states is not None:
+                hidden_states = (
+                    hidden_states[-1] if hidden_states and len(hidden_states) > 1 else []
+                )
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]

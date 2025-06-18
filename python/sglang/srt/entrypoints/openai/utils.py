@@ -206,14 +206,17 @@ def to_openai_style_logprobs(
 
     return ret_logprobs
 
-def process_hidden_states_from_ret(ret_item: Dict[str, Any], request: Any, idx: int) -> Optional[List]:
+
+def process_hidden_states_from_ret(
+    ret_item: Dict[str, Any], request: Any, idx: int
+) -> Optional[List]:
     """Process hidden states from a ret item in non-streaming response.
-    
+
     Args:
         ret_item: Response item containing meta_info
         request: The original request object
         idx: Index of the current item
-        
+
     Returns:
         Processed hidden states for the last token, or None
     """
@@ -227,4 +230,3 @@ def process_hidden_states_from_ret(ret_item: Dict[str, Any], request: Any, idx: 
             hidden_states[-1] if hidden_states and len(hidden_states) > 1 else []
         )
     return hidden_states
-
