@@ -136,10 +136,12 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(CustomTestCase):
         )
         self.assertGreater(avg_spec_accept_length, 2.5)
 
+
 class TestDPAttentionDP2TP2DeepseekV3MTPTBO(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         import os
+
         # print debug log for tbo
         os.environ["TBO_DEBUG"] = "1"
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
@@ -214,6 +216,7 @@ class TestDPAttentionDP2TP2DeepseekV3MTPTBO(CustomTestCase):
             f"{avg_spec_accept_length=:.3f}\n"
         )
         self.assertGreater(avg_spec_accept_length, 2.3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,12 +1,10 @@
 import dataclasses
 import logging
-from typing import Dict, List, Optional, Sequence
-from typing import Union
+from typing import Dict, List, Optional, Sequence, Union
 
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSummableTensorPairFn,
@@ -18,6 +16,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
+from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import BumpAllocator, DeepEPMode, get_bool_env_var
 
 _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
@@ -331,7 +330,9 @@ class TboForwardBatchPreparer:
         output_attn_backend: AttentionBackend,
         out_num_token_non_padded: torch.Tensor,
     ):
-        assert end_token_index >= start_token_index, f"{end_token_index=}, {start_token_index=}, batch={batch}"
+        assert (
+            end_token_index >= start_token_index
+        ), f"{end_token_index=}, {start_token_index=}, batch={batch}"
         num_tokens = batch.input_ids.shape[0]
         num_seqs = batch.batch_size
 
