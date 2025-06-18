@@ -15,11 +15,21 @@ echo "ARCH:  $ARCH"
 if [ ${ARCH} = "aarch64" ]; then
    LIBCUDA_ARCH="sbsa"
    BUILDER_NAME="pytorch/manylinuxaarch64-builder"
-   CMAKE_BUILD_PARALLEL_LEVEL=16
+   export MAX_JOBS=16
+   export CMAKE_BUILD_PARALLEL_LEVEL=16
+   export NVCC_THREADS=2
 else
    LIBCUDA_ARCH=${ARCH}
    BUILDER_NAME="pytorch/manylinux2_28-builder"
+   export MAX_JOBS=${MAX_JOBS:-$(nproc)}
+   export CMAKE_BUILD_PARALLEL_LEVEL=$MAX_JOBS
+   export NVCC_THREADS=${MAX_JOBS}
 fi
+
+echo "Building with MAX_JOBS=${MAX_JOBS} and CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}"
+echo "Using Python version: ${PYTHON_VERSION}"
+echo "Using CUDA version: ${CUDA_VERSION}"Ç
+echo ""
 
 if [ ${CUDA_VERSION} = "12.8" ]; then
    DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
@@ -53,13 +63,16 @@ docker run --rm \
    ln -sv /usr/lib64/libibverbs.so.1 /usr/lib64/libibverbs.so && \
    ${PYTHON_ROOT_PATH}/bin/${TORCH_INSTALL} && \
    ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core && \
-   export TORCH_CUDA_ARCH_LIST='7.5 8.0 8.9 9.0+PTX' && \
+   export TORCH_CUDA_ARCH_LIST='7.5 8.0 8.9 9.0 10.0 12.0 12.1+PTX' && \
    export CUDA_VERSION=${CUDA_VERSION} && \
+   export MAX_JOBS=${MAX_JOBS} && \
+   export NVCC_THREADS=${NVCC_THREADS} && \
+   export CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL} && \
    mkdir -p /usr/lib/${ARCH}-linux-gnu/ && \
    ln -s /usr/local/cuda-${CUDA_VERSION}/targets/${LIBCUDA_ARCH}-linux/lib/stubs/libcuda.so /usr/lib/${ARCH}-linux-gnu/libcuda.so && \
 
    cd /sgl-kernel && \
    ls -la ${PYTHON_ROOT_PATH}/lib/python${PYTHON_VERSION}/site-packages/wheel/ && \
-   PYTHONPATH=${PYTHON_ROOT_PATH}/lib/python${PYTHON_VERSION}/site-packages ${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation && \
+   PYTHONPATH=${PYTHON_ROOT_PATH}/lib/python${PYTHON_VERSION}/site-packages ${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir=build . --verbose --color=always --no-build-isolation && \
    ./rename_wheels.sh
    "
