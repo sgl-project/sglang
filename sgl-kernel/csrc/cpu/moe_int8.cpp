@@ -629,22 +629,21 @@ void fused_experts_int8_kernel_impl(
 
   const int64_t stride_e = 2 * N * packed_K;
   const int64_t stride_n = packed_K;
+
+  int64_t avg_M = std::max(int64_t(1), M * topk / E);
+  const bool use_brgemm = can_use_brgemm<int8_t>(avg_M);
+
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
-  at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
+  parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // get local pointers
-    int tid = at::get_thread_num();
+    int tid = get_thread_num();
     uint8_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
     int32_t* __restrict__ C0 = reinterpret_cast<int32_t*>(C_tmp) + tid * 2 * BLOCK_M * BLOCK_N;
     int32_t* __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
 
-    bool is_brgemm_used = false;
-
     alignas(64) float As[BLOCK_M];
 
-    for (int64_t i = begin; i < end; ++i) {
-      int64_t mb = i / NB;
-      int64_t nb = i % NB;
-
+    loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       // nb0 from top half and nb1 from bottom half
       int64_t nb0 = nb, nb1 = nb + NB;
       int64_t n_size = std::min(N - nb0 * BLOCK_N, BLOCK_N);
@@ -659,9 +658,6 @@ void fused_experts_int8_kernel_impl(
       // 1.a load A
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
       int64_t m_size = offsets[mb + 1] - offsets[mb];
-
-      const bool use_brgemm = can_use_brgemm<int8_t>(m_size);
-      is_brgemm_used = is_brgemm_used || use_brgemm;
 
       for (int64_t m = 0; m < m_size; ++m) {
         int32_t index = A_ids[m] / topk;
@@ -721,9 +717,9 @@ void fused_experts_int8_kernel_impl(
             /* ldb   */ n_size,
             /* ldc   */ N);
       }
-    }
+    });
 
-    if (is_brgemm_used) {
+    if (use_brgemm) {
       at::native::cpublas::brgemm_release();
     }
   });
@@ -745,23 +741,15 @@ void fused_experts_int8_kernel_impl(
   const int64_t stride_oc = packed_N;
 
   // parallel on [MB2, NB2]
-  at::parallel_for(0, MB2 * NB2, 0, [&](int64_t begin, int64_t end) {
+  parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // get local pointers
-    int tid = at::get_thread_num();
+    int tid = get_thread_num();
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
     int32_t* __restrict__ C32 = reinterpret_cast<int32_t*>(C + BLOCK_M * BLOCK_N);
 
-    bool is_brgemm_used = false;
-
-    for (int64_t i = begin; i < end; ++i) {
-      int64_t mb = i / NB2;
-      int64_t nb = i % NB2;
-
+    loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t m_size = offsets[mb + 1] - offsets[mb];
       int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
-
-      const bool use_brgemm = can_use_brgemm<int8_t>(m_size);
-      is_brgemm_used = is_brgemm_used || use_brgemm;
 
       // A ptr from ic1 of [M * topk, N] in sorted order
       // so as to avoid copy A to tmp buffer again
@@ -813,9 +801,9 @@ void fused_experts_int8_kernel_impl(
         float weight = topk_weights[index];
         copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, weight, n_size);
       }
-    }
+    });
 
-    if (is_brgemm_used) {
+    if (use_brgemm) {
       at::native::cpublas::brgemm_release();
     }
   });
@@ -896,26 +884,20 @@ void shared_expert_int8_kernel_impl(
   const int64_t packed_N = get_row_size<int8_t>(N);
   const int64_t stride_n = packed_K;
 
+  const bool use_brgemm = can_use_brgemm<int8_t>(M);
+
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
-  at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
+  parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // get local pointers
-    int tid = at::get_thread_num();
+    int tid = get_thread_num();
     int32_t* __restrict__ C0 = reinterpret_cast<int32_t*>(C_tmp) + tid * 2 * BLOCK_M * BLOCK_N;
     int32_t* __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
 
-    bool is_brgemm_used = false;
-
-    for (int64_t i = begin; i < end; ++i) {
-      int64_t mb = i / NB;
-      int64_t nb = i % NB;
-
+    loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       // nb0 from top half and nb1 from bottom half
       int64_t nb0 = nb, nb1 = nb + NB;
       int64_t n_size = std::min(N - nb0 * BLOCK_N, BLOCK_N);
       int64_t m_size = std::min(M - mb * BLOCK_M, BLOCK_M);
-
-      const bool use_brgemm = can_use_brgemm<scalar_t>(m_size);
-      is_brgemm_used = is_brgemm_used || use_brgemm;
 
       // A shape [m_size, K]
       const uint8_t* A = Aq_tmp + mb * BLOCK_M * K;
@@ -977,9 +959,9 @@ void shared_expert_int8_kernel_impl(
             /* ldb   */ n_size,
             /* ldc   */ N);
       }
-    }
+    });
 
-    if (is_brgemm_used) {
+    if (use_brgemm) {
       at::native::cpublas::brgemm_release();
     }
   });
@@ -1000,23 +982,15 @@ void shared_expert_int8_kernel_impl(
   const int64_t stride_oc = packed_N;
 
   // parallel on [MB2, NB2]
-  at::parallel_for(0, MB2 * NB2, 0, [&](int64_t begin, int64_t end) {
+  parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // get local pointers
-    int tid = at::get_thread_num();
+    int tid = get_thread_num();
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
     int32_t* __restrict__ C32 = reinterpret_cast<int32_t*>(C + BLOCK_M * BLOCK_N);
 
-    bool is_brgemm_used = false;
-
-    for (int64_t i = begin; i < end; ++i) {
-      int64_t mb = i / NB2;
-      int64_t nb = i % NB2;
-
+    loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t m_size = std::min(M - mb * BLOCK_M, BLOCK_M);
       int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
-
-      const bool use_brgemm = can_use_brgemm<scalar_t>(m_size);
-      is_brgemm_used = is_brgemm_used || use_brgemm;
 
       // A shape [m_size, IC]
       const uint8_t* __restrict__ A = Aq_tmp + mb * BLOCK_M * N;
@@ -1064,9 +1038,9 @@ void shared_expert_int8_kernel_impl(
       for (int64_t m = 0; m < m_size; ++m) {
         add_mul_stub(out + m * K, C + m * BLOCK_N, fused_out + m * K, routed_scaling_factor, n_size);
       }
-    }
+    });
 
-    if (is_brgemm_used) {
+    if (use_brgemm) {
       at::native::cpublas::brgemm_release();
     }
   });

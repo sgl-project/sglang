@@ -344,16 +344,13 @@ void weight_packed_linear_kernel_impl(
 
   const bool use_brgemm = can_use_brgemm<scalar_t>(M);
 
-  // l2 cache block for n
-  int64_t cache_blocks_nb = get_cache_blocks<scalar_t>(BLOCK_N, K);
-
   // parallel on [MB, NB]
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
     parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
       // for brgemm, use float32 for accumulate
       alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
 
-      loop_2d(mb0, mb1, nb0, nb1, cache_blocks_nb, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      loop_2d<scalar_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
         int64_t mb_start = mb * BLOCK_M;
         int64_t mb_size = std::min(M - mb_start, BLOCK_M);
         int64_t nb_start = nb * BLOCK_N;

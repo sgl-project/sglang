@@ -105,11 +105,10 @@ namespace {
 
 #define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
 
-
 // [NB] Parallel Routines
 //
 //  * at::parallel_for - applies for most of generic use cases, this will be compiled
-//                       agains openmp in default torch release.
+//                       against openmp in default torch release.
 //
 //  * parallel_for     - same function as above, can choose payload partition scheme in
 //                       balance211.
@@ -236,14 +235,32 @@ inline void parallel_2d(int m, int n, const func_t& f) {
 #endif
 }
 
-// 2d sequential loop: [mb0, mb1), [nb0, nb1)
-// do L2 cache for NB only (skip MB for now)
-//
-// loop order: [NB/BlkSize, MB, BlkSize]
-// TODO: implement reverse order of [MB/BlkSize, NB, BlkSize]
-//
-template <typename func_t>
-inline void loop_2d(int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1, int64_t cache_blocks_nb, const func_t& f) {
+// limit max cache blocks
+// when we need to do pre-unpack for weights, e.g. fp8
+#define MAX_CACHE_BLOCK_SIZE 4
+
+template <typename T>
+inline int get_cache_blocks(int chunk_size) {
+  // L2 2MB and ratio of 50%
+  const int L2_size = 2048 * 1024 >> 1;
+  return std::max(1, int(L2_size / (chunk_size * sizeof(T))));
+}
+
+template <>
+inline int get_cache_blocks<at::Float8_e4m3fn>(int chunk_size) {
+  // fp8 uses bf16 as accumulate type
+  int cache_block_size = get_cache_blocks<at::BFloat16>(chunk_size);
+  return std::min(MAX_CACHE_BLOCK_SIZE, cache_block_size);
+}
+
+// 2d sequential loop in range : [mb0, mb1), [nb0, nb1)
+template <typename T, typename func_t>
+inline void loop_2d(int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1, int64_t chunk_size, const func_t& f) {
+  // get number of blocks for L2 in most inner loop
+  int64_t cache_blocks_nb = get_cache_blocks<T>(chunk_size);
+
+  // loop order: [NB / cache_blocks_nb, MB, cache_blocks_nb]
+  // TODO: implement reverse order of [MB / cache_blocks_mb, NB, cache_blocks_mb]
   for (int64_t nbb = nb0; nbb < nb1; nbb += cache_blocks_nb) {
     for (int64_t mb = mb0; mb < mb1; ++mb) {
       for (int64_t nb = nbb; nb < std::min(nbb + cache_blocks_nb, nb1); ++nb) {
@@ -251,26 +268,6 @@ inline void loop_2d(int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1, int64_t 
       }
     }
   }
-}
-
-#define MAX_CACHE_BLOCK_SIZE 4
-
-template <typename T>
-inline int get_cache_blocks(int BLOCK_SIZE, int K) {
-  // L2 2MB and ratio of 50%
-  const int L2_size = 2048 * 1024 >> 1;
-  return std::max(1, int(L2_size / (BLOCK_SIZE * K * sizeof(T))));
-}
-
-template <>
-inline int get_cache_blocks<at::Float8_e4m3fn>(int BLOCK_SIZE, int K) {
-  // fp8 uses bf16 as accumulate type
-  // also limit max cache blocks to `MAX_CACHE_BLOCK_SIZE`
-  // since we need to do pre-unpack for weights
-  using accum_t = at::BFloat16;
-  const int L2_size = 2048 * 1024 >> 1;
-  int cache_block_size = std::max(1, int(L2_size / (BLOCK_SIZE * K * sizeof(accum_t))));
-  return std::min(MAX_CACHE_BLOCK_SIZE, cache_block_size);
 }
 
 // data indexing for dimension collapse

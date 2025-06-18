@@ -379,9 +379,6 @@ void fp8_scaled_mm_kernel_impl(
 
   const bool use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(M);
 
-  // l2 cache block for n
-  int64_t cache_blocks_nb = get_cache_blocks<at::Float8_e4m3fn>(BLOCK_N, K);
-
   // parallel on [MB, NB]
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
     parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
@@ -389,7 +386,7 @@ void fp8_scaled_mm_kernel_impl(
       scalar_t* __restrict__ Btmp = buffer + tid * buffer_size_per_thread;
       float* __restrict__ Ctmp = (float*)((void*)(Btmp + MAX_CACHE_BLOCK_SIZE * BLOCK_N * K));
 
-      loop_2d(mb0, mb1, nb0, nb1, cache_blocks_nb, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
         const float* scale_ptr = scales2 + (nb / blocks_n_per_group) * scale_size_K;
 
         int64_t mb_start = mb * BLOCK_M;
