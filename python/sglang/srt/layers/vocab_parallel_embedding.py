@@ -552,7 +552,10 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         from sglang.srt.utils import PackWeightMethod
 
-        self.quant_method = PackWeightMethod(weight_names=["weight"])
+        # We only support pack LMHead if it's not quantized. For LMHead with quant_config, the weight_name will be "qweight"
+        if self.quant_config is None:
+            self.quant_method = PackWeightMethod(weight_names=["weight"])
+
         if bias:
             self.bias = Parameter(
                 torch.empty(self.num_embeddings_per_partition, dtype=params_dtype)
