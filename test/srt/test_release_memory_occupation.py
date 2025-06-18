@@ -157,6 +157,12 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         t = time.perf_counter()
         gpu_memory_usage_before_resume_weights = get_gpu_memory_gb()
         engine.resume_memory_occupation(tags=["weights"])
+        gpu_memory_usage_after_resume_weights = get_gpu_memory_gb()
+
+        self.assertGreater(
+            gpu_memory_usage_after_resume_weights,
+            gpu_memory_usage_before_resume_weights,
+        )
 
         # Update weights from a trained model to serving engine, and then destroy the trained model
         hf_model_new = AutoModelForCausalLM.from_pretrained(
@@ -170,13 +176,6 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         # destroy the hf model
         del hf_model_new
         torch.cuda.empty_cache()
-        gpu_memory_usage_after_destroyed_hf_model = get_gpu_memory_gb()
-
-        gpu_memory_usage_after_resume_weights = get_gpu_memory_gb()
-        self.assertGreater(
-            gpu_memory_usage_after_resume_weights,
-            gpu_memory_usage_before_resume_weights,
-        )
         engine.resume_memory_occupation(tags=["kv_cache"])
 
         gpu_memory_usage_after_resume_kv_cache = get_gpu_memory_gb()
@@ -187,20 +186,17 @@ class TestReleaseMemoryOccupation(CustomTestCase):
 
         print(f"Resume + update took {time.perf_counter() - t:.2f}s")
         print(
-            f"Memory: {gpu_memory_usage_before_resume_weights:.1f} → {gpu_memory_usage_after_resume_weights:.1f} → {gpu_memory_usage_after_loaded_hf_model:.1f} → {gpu_memory_usage_after_destroyed_hf_model:.1f} → {gpu_memory_usage_after_resume_kv_cache:.1f} GB"
+            f"Memory: {gpu_memory_usage_before_resume_weights:.1f} → {gpu_memory_usage_after_resume_weights:.1f} → {gpu_memory_usage_after_loaded_hf_model:.1f} → {gpu_memory_usage_after_resume_kv_cache:.1f} GB"
         )
 
         print("generate (#2)")
         outputs = engine.generate(params["prompt"], params["sampling_params"])["text"]
         self.assertEqual(outputs, params["expect_output_after_update_weights"])
-
         engine.shutdown()
 
 
-def get_gpu_memory_gb(gpu_id=0):
-    cmd = f"nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits --id={gpu_id}"
-    result = subprocess.check_output(cmd, shell=True, text=True).strip()
-    return int(result) / 1024
+def get_gpu_memory_gb():
+    return torch.cuda.device_memory_used() / 1024**3
 
 
 if __name__ == "__main__":
