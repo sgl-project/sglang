@@ -641,7 +641,6 @@ class Scheduler(
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 tree_cache=self.tree_cache,
-                server_args=self.server_args,
             )
 
             # The decode requests pending for pre-allocation

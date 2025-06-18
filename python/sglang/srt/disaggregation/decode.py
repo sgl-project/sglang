@@ -31,7 +31,6 @@ import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVPoll
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -534,7 +533,6 @@ class DecodeTransferQueue:
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
-        server_args:ServerArgs,
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
@@ -543,9 +541,7 @@ class DecodeTransferQueue:
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.tree_cache = tree_cache
-        self.spec_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
+        self.spec_algorithm = scheduler.draft_worker.model_runner.spec_algorithm
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
