@@ -150,17 +150,18 @@ class HiPAttentionBackend(AttentionBackend):
         if layer.use_irope:
             using_chunked_sw = True
             sw_size = self.attention_chunk_size
-        need_dense_decode = using_chunked_sw
         
         using_dense_prefill = os.getenv("HIP_DEBUG_USING_DENSE_PREFILL", "0") == "1"
-        need_dense_decode = need_dense_decode or (using_dense_prefill and (layer.layer_id in self.hip_config.dense_layers))
+        using_dense_prefill = (using_dense_prefill and (layer.layer_id in self.hip_config.dense_layers))
         
         force_dense_decode = os.getenv("HIP_DEBUG_FORCE_DENSE_DECODE", "0") == "1"
-        need_dense_decode = need_dense_decode or force_dense_decode
         
         delta_attention_args = os.getenv('HIP_DELTA_ATTENTION_ARGS', "")
-        delta_dense_decode = any(['exp' == key for key in delta_attention_args.split('-')])
-        need_dense_decode = need_dense_decode or delta_dense_decode
+        delta_dense_decode = any(['dense_decode' == key for key in delta_attention_args.split('-')])
+        
+        is_decode = False
+        need_dense_prefill = using_chunked_sw or using_dense_prefill
+        need_dense_decode = using_chunked_sw or delta_dense_decode
         
         run_benchmark = (
             (not torch.cuda.is_current_stream_capturing()) and 
@@ -173,7 +174,8 @@ class HiPAttentionBackend(AttentionBackend):
             end_event = torch.cuda.Event(True)
             start_event.record()
             
-        if need_dense_decode:
+        if need_dense_prefill:
+            print(using_chunked_sw, using_dense_prefill, force_dense_decode, delta_dense_decode)
             o = self.flashattention_backend.forward_extend(
                 q=q,
                 k=k,
@@ -294,19 +296,20 @@ class HiPAttentionBackend(AttentionBackend):
         if layer.use_irope:
             using_chunked_sw = True
             sw_size = self.attention_chunk_size
-        need_dense_decode = using_chunked_sw
         
         using_dense_prefill = os.getenv("HIP_DEBUG_USING_DENSE_PREFILL", "0") == "1"
-        need_dense_decode = need_dense_decode or (using_dense_prefill and (layer.layer_id in self.hip_config.dense_layers))
+        using_dense_prefill = (using_dense_prefill and (layer.layer_id in self.hip_config.dense_layers))
         
         force_dense_decode = os.getenv("HIP_DEBUG_FORCE_DENSE_DECODE", "0") == "1"
-        need_dense_decode = need_dense_decode or force_dense_decode
         
         delta_attention_args = os.getenv('HIP_DELTA_ATTENTION_ARGS', "")
-        delta_dense_decode = any(['exp' == key for key in delta_attention_args.split('-')])
-        need_dense_decode = need_dense_decode or delta_dense_decode
+        delta_dense_decode = any(['dense_decode' == key for key in delta_attention_args.split('-')])
         
-        if using_chunked_sw:
+        is_decode = False
+        need_dense_prefill = using_chunked_sw or using_dense_prefill
+        need_dense_decode = using_chunked_sw or delta_dense_decode
+        
+        if need_dense_decode:
             o = self.flashattention_backend.forward_extend(
                 q=q,
                 k=k,
