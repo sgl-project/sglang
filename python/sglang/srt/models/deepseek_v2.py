@@ -1932,6 +1932,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             self._weight_requant_ue8m0()
 
     def _weight_requant_ue8m0(self):
+        if self.config.architectures[0] == "DeepseekV3ForCausalLMNextN":
+            return
         weight_block_size = self.quant_config.weight_block_size
 
         moe_layers = list(
@@ -2137,8 +2139,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                         ):
                             q_a_proj_weight = cached_a_proj[q_a_proj_name]
                             kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+                            cat_dim = 0
+                            if (
+                                self.quant_config.get_name() == "awq"
+                                or self.quant_config.get_name() == "moe_wna16"
+                            ):
+                                cat_dim = 1
                             fused_weight = torch.cat(
-                                [q_a_proj_weight, kv_a_proj_weight], dim=0
+                                [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
                             )
                             param_name = (
                                 name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
