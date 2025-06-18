@@ -788,13 +788,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                 else:
                     return AttnForwardMethod.MLA
             else:
-                # if hasattr(self, "fused_qkv_a_proj_with_mqa") and getattr(
-                #     self, "use_intel_amx_backend", False
-                # ):
-                #     return AttnForwardMethod.MLA_FUSED_ROPE_CPU
-                # else:
-                #     return AttnForwardMethod.MLA
-                return AttnForwardMethod.MLA
+                if hasattr(self, "fused_qkv_a_proj_with_mqa") and getattr(
+                    self, "use_intel_amx_backend", False
+                ):
+                    return AttnForwardMethod.MLA_FUSED_ROPE_CPU
+                else:
+                    return AttnForwardMethod.MLA
 
         if self.attention_backend == "flashinfer":
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
