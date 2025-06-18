@@ -46,9 +46,9 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_device_memory_capacity,
     rank0_log,
-    require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_tp_gather,
+    require_attn_tp_gather,
 )
 
 logger = logging.getLogger(__name__)
@@ -324,7 +324,9 @@ class CudaGraphRunner:
                         ),
                         dtype=self.model_runner.dtype,
                     )
-                    self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
+                    self.global_num_tokens_gpu = torch.zeros(
+                        (1,), dtype=torch.int32
+                    )
 
         # Capture
         try:
