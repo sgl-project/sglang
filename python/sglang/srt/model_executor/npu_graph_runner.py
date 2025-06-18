@@ -93,6 +93,8 @@ class NpuGraphRunner:
 
         if self.enable_torch_compile:
             set_torch_compile_config()
+            from sglang.srt.utils import set_npu_compiler_config
+            set_npu_compiler_config()
 
         if self.model_runner.server_args.lora_paths is not None:
             self.model_runner.lora_manager.init_cuda_graph_batch_info(self.max_bs)

@@ -1525,14 +1525,20 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 
     return major, minor
 
-
-def get_npu_compiler_config():
-    config = {
-        "frozen_parameter": True,
-        "tiling_schedule_optimize": True,
-        "topology_sorting_strategy": "StableRDFS",
+npu_compile_config = {}
+def set_npu_compiler_config():
+    global npu_compile_config
+    npu_compile_config = {
+        "experimental_config": {
+            "frozen_parameter": True,
+            "tiling_schedule_optimize": True,
+            "topology_sorting_strategy": "StableRDFS",
+        },
+        "inference_config": {
+            "dynamic_gears_merge_policy": "zip"  # 移入配置字典
+        },
+        # add compile here
     }
-    return config
 
 
 def get_compiler_backend() -> str:
@@ -1550,10 +1556,12 @@ def get_compiler_backend() -> str:
                 "Please install torchair for torch.compile support on NPU."
             )
         compiler_config = CompilerConfig()
-        predefined_config = get_npu_compiler_config()
-        for k, v in predefined_config.items():
-            setattr(compiler_config.experimental_config, k, v)
-        compiler_config.inference_config.dynamic_gears_merge_policy = "zip"
+        for config_group, config_dict in npu_compile_config.items():
+            config_obj = getattr(compiler_config, config_group, None)
+            if config_obj is None:
+                continue
+            for key, value in config_dict.items():
+                setattr(config_obj, key, value)
         npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
         return npu_backend
 
