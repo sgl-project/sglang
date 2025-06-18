@@ -306,9 +306,9 @@ class HiPAttentionBackend(AttentionBackend):
         
         is_decode = False
         need_dense_prefill = using_chunked_sw or using_dense_prefill
-        need_dense_decode = using_chunked_sw # or delta_dense_decode or force_dense_decode
+        need_dense_decode = using_chunked_sw or delta_dense_decode or force_dense_decode
         
-        if need_dense_decode:
+        if need_dense_decode and False:
             o = self.flashattention_backend.forward_decode(
                 q=q,
                 k=k,
