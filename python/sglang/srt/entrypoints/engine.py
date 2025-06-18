@@ -175,7 +175,7 @@ class Engine(EngineBase):
         """
         if self.server_args.enable_dp_attention:
             if data_parallel_rank is None:
-                logger.info("data_parallel_rank not provided, using default dispatch")
+                logger.debug("data_parallel_rank not provided, using default dispatch")
             elif data_parallel_rank < 0:
                 raise ValueError("data_parallel_rank must be non-negative")
             elif data_parallel_rank >= self.server_args.dp_size:
@@ -258,7 +258,7 @@ class Engine(EngineBase):
 
         if self.server_args.enable_dp_attention:
             if data_parallel_rank is None:
-                logger.info("data_parallel_rank not provided, using default dispatch")
+                logger.debug("data_parallel_rank not provided, using default dispatch")
             elif data_parallel_rank < 0:
                 raise ValueError("data_parallel_rank must be non-negative")
             elif data_parallel_rank >= self.server_args.dp_size:
