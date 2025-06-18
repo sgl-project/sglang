@@ -148,11 +148,14 @@ class InternLM2Config(PretrainedConfig):
         if (
             rope_scaling_factor is None
             or not isinstance(rope_scaling_factor, float)
+            or not isinstance(rope_scaling_factor, int)
             or rope_scaling_factor < 1.0
         ):
             raise ValueError(
-                f"`rope_scaling`'s factor field must be a float >= 1, got {rope_scaling_factor}"
+                f"`rope_scaling`'s factor field must be a float|int >= 1, got {rope_scaling_factor}"
             )
+        if isinstance(rope_scaling_factor, int):
+            rope_scaling_factor = float(rope_scaling_factor)
 
 
 class InternVisionConfig(PretrainedConfig):
