@@ -207,7 +207,7 @@ class CompletionResponseChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Literal["stop", "length", "content_filter", "abort"]
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
 
@@ -457,9 +457,11 @@ class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
-    finish_reason: Literal[
-        "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
-    ]
+    finish_reason: Optional[
+        Literal[
+            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+        ]
+    ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
 
@@ -530,7 +532,7 @@ class EmbeddingRequest(BaseModel):
     input: EmbeddingInput
     model: str
     encoding_format: str = "float"
-    dimensions: int = None
+    dimensions: Optional[int] = None
     user: Optional[str] = None
 
     # The request id.
