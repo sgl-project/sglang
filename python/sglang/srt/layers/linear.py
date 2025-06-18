@@ -1262,9 +1262,3 @@ class RowParallelLinear(LinearBase):
         s += f", tp_size={self.tp_size}"
         s += f", reduce_results={self.reduce_results}"
         return s
-
-try:
-    import importlib
-    importlib.import_module("sglang.srt.layers.quantization.awq")
-except ModuleNotFoundError:
-    pass
