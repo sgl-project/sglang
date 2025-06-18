@@ -155,7 +155,9 @@ class MiniLoadBalancer:
                         else:
                             yield chunk
                 else:
-                    async for chunk in decode_response.content.iter_chunked(AIOHTTP_STREAM_READ_CHUNK_SIZE):
+                    async for chunk in decode_response.content.iter_chunked(
+                        AIOHTTP_STREAM_READ_CHUNK_SIZE
+                    ):
                         yield chunk
 
         return StreamingResponse(
