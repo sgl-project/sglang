@@ -71,8 +71,8 @@ from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
     kill_process_tree,
-    require_mlp_tp_gather,
     require_mlp_sync,
+    require_mlp_tp_gather,
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
