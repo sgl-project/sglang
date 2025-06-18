@@ -211,12 +211,12 @@ class TestQKVProjWithROPE(CustomTestCase):
             qk_rope_head_dim,
         )
         atol = rtol = precision[q_ref.dtype]
-        self.assertTrue(torch.allclose(q_ref, q_out, atol=atol, rtol=rtol))
-        self.assertTrue(torch.allclose(k_ref, k_out, atol=atol, rtol=rtol))
-        self.assertTrue(torch.allclose(v_ref, v_out, atol=atol, rtol=rtol))
-        self.assertTrue(torch.allclose(fused_q_out, q_out))
-        self.assertTrue(torch.allclose(fused_k_out, k_out))
-        self.assertTrue(torch.allclose(fused_v_out, v_out))
+        torch.testing.assert_close(q_ref, q_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_ref, k_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(v_ref, v_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(fused_q_out, q_out)
+        torch.testing.assert_close(fused_k_out, k_out)
+        torch.testing.assert_close(fused_v_out, v_out)
 
     def test_int8_qkv_proj_with_rope(self):
         dtype = torch.bfloat16
@@ -302,12 +302,12 @@ class TestQKVProjWithROPE(CustomTestCase):
             qk_rope_head_dim,
         )
         atol = rtol = precision[q_ref.dtype]
-        self.assertTrue(torch.allclose(q_ref, q_out, atol=atol, rtol=rtol))
-        self.assertTrue(torch.allclose(k_ref, k_out, atol=atol, rtol=rtol))
-        self.assertTrue(torch.allclose(v_ref, v_out, atol=atol, rtol=rtol))
-        self.assertTrue(torch.allclose(fused_q_out, q_out))
-        self.assertTrue(torch.allclose(fused_k_out, k_out))
-        self.assertTrue(torch.allclose(fused_v_out, v_out))
+        torch.testing.assert_close(q_ref, q_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_ref, k_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(v_ref, v_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(fused_q_out, q_out)
+        torch.testing.assert_close(fused_k_out, k_out)
+        torch.testing.assert_close(fused_v_out, v_out)
 
     def test_fp8_qkv_proj_with_rope(self):
         dtype = torch.bfloat16

@@ -77,7 +77,11 @@ class TestToolChoiceLlama32(CustomTestCase):
                             "city": {
                                 "type": "string",
                                 "description": "name of the city to get weather for",
-                            }
+                            },
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
                         },
                         "required": ["city"],
                     },
@@ -152,7 +156,7 @@ class TestToolChoiceLlama32(CustomTestCase):
                                 "enum": ["celsius", "fahrenheit"],
                             },
                         },
-                        "required": ["location", "unit"],
+                        "required": ["location"],
                     },
                 },
             },
