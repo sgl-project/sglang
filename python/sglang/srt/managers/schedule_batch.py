@@ -35,6 +35,7 @@ import copy
 import dataclasses
 import hashlib
 import logging
+import os
 import threading
 from enum import Enum, auto
 from http import HTTPStatus
@@ -69,6 +70,14 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
+
+# Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
+# This can prevent the server from being too conservative.
+# Note that this only clips the estimation in the scheduler but does not change the stop
+# condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
+CLIP_MAX_NEW_TOKENS_ESTIMATION = int(
+    os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
+)
 
 GLOBAL_SERVER_ARGS_KEYS = [
     "attention_backend",
@@ -626,6 +635,22 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
+
+    def estimated_max_new_tokens(self, ratio: float = 1.0) -> int:
+        """Return the estimated maximum number of new tokens that can be generated."""
+        # TODO(dark): may be this should be page-aligned estimated.
+        # but for now we just use the old logic (simply subtraction with ratio)
+        return (
+            self.sampling_params.max_new_tokens - len(self.output_ids)
+            if self.sampling_params.ignore_eos
+            else int(
+                min(
+                    self.sampling_params.max_new_tokens - len(self.output_ids),
+                    CLIP_MAX_NEW_TOKENS_ESTIMATION,
+                )
+                * ratio  # this ratio only applies when no ignore_eos
+            )
+        )
 
     @property
     def seqlen(self):

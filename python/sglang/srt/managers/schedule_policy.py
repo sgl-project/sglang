@@ -27,14 +27,6 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
-# Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
-# This can prevent the server from being too conservative.
-# Note that this only clips the estimation in the scheduler but does not change the stop
-# condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
-CLIP_MAX_NEW_TOKENS_ESTIMATION = int(
-    os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
-)
-
 # Threshold for in-batch prefix cache.
 # If a request has a matched prefix length (against existing cache) less than this value,
 # the scheduler runs the in-batch prefix caching check for this request.
@@ -297,11 +289,7 @@ class PrefillAdder:
         if running_batch is not None:
             self.rem_total_token_offset += sum(
                 [
-                    min(
-                        (r.sampling_params.max_new_tokens - len(r.output_ids)),
-                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
-                    )
-                    * self.new_token_ratio
+                    r.estimated_max_new_tokens(ratio=self.new_token_ratio)
                     for r in running_batch.reqs
                 ]
             )
@@ -353,11 +341,7 @@ class PrefillAdder:
         self._prefill_one_req(
             0,
             req.extend_input_len,
-            (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
-                if not truncated
-                else 0
-            ),
+            (req.estimated_max_new_tokens() if not truncated else 0),
         )
 
         # Return if chunked prefill not finished
@@ -423,9 +407,7 @@ class PrefillAdder:
             # Non-chunked prefill
             self.can_run_list.append(req)
             self._prefill_one_req(
-                0,
-                req.extend_input_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION),
+                0, req.extend_input_len, req.estimated_max_new_tokens()
             )
         else:
             if self.rem_chunk_tokens == 0:
@@ -448,9 +430,7 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
-        total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
-        )
+        total_tokens = req.extend_input_len + req.estimated_max_new_tokens()
         input_tokens = (
             -(-req.extend_input_len // self.tree_cache.page_size)
             * self.tree_cache.page_size
@@ -487,12 +467,7 @@ class PrefillAdder:
                 self.can_run_list.append(req)
                 self.tree_cache.inc_lock_ref(req.last_node)
                 self._prefill_one_req(
-                    prefix_len,
-                    input_tokens,
-                    min(
-                        req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
-                    ),
+                    prefix_len, input_tokens, req.estimated_max_new_tokens()
                 )
             else:
                 # Make sure at least one page is available
