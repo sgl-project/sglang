@@ -91,9 +91,7 @@ class TestFusedExperts(CustomTestCase):
         fused_output = fused_moe(a, w1, w2, score, topk, renormalize, prepack)
 
         atol = rtol = precision[torch_output.dtype]
-        self.assertTrue(
-            torch.allclose(torch_output, fused_output, atol=atol, rtol=rtol)
-        )
+        torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)
 
     def test_bf16_moe(self):
         for params in itertools.product(
@@ -171,7 +169,7 @@ class TestFusedExperts(CustomTestCase):
         # Increase the tolerance for large input shapes
         if M > 35:
             atol = rtol = 0.02
-        self.assertTrue(torch.allclose(ref_out, out, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
     def test_int8_moe(self):
         for params in itertools.product(
@@ -235,7 +233,7 @@ class TestFusedExperts(CustomTestCase):
         )
 
         atol = rtol = precision[dtype]
-        self.assertTrue(torch.allclose(ref_out.bfloat16(), out, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
 
     def test_fp8_moe(self):
         for params in itertools.product(
