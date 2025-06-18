@@ -43,11 +43,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import (
-    FakeBootstrapHost,
+    FAKE_BOOTSTRAP_HOST,
     register_disaggregation_server,
 )
 from sglang.srt.entrypoints.engine import _launch_subprocesses
-from sglang.srt.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -67,6 +67,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+    V1RerankReqInput,
     VertexGenerateReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -79,9 +80,11 @@ from sglang.srt.openai_api.adapter import (
     v1_delete_file,
     v1_embeddings,
     v1_files_create,
+    v1_rerank,
     v1_retrieve_batch,
     v1_retrieve_file,
     v1_retrieve_file_content,
+    v1_score,
 )
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -182,9 +185,9 @@ async def health_generate(request: Request) -> Response:
         async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
             break
 
-    tic = time.time()
+    tic = time.perf_counter()
     task = asyncio.create_task(gen())
-    while time.time() < tic + HEALTH_CHECK_TIMEOUT:
+    while time.perf_counter() < tic + HEALTH_CHECK_TIMEOUT:
         await asyncio.sleep(1)
         if _global_state.tokenizer_manager.last_receive_tstamp > tic:
             task.cancel()
@@ -229,6 +232,11 @@ async def get_server_info():
     }
 
 
+@app.get("/get_load")
+async def get_load():
+    return await _global_state.tokenizer_manager.get_load()
+
+
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
@@ -251,7 +259,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     ) + b"\n\n"
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
-                logger.error(f"Error: {e}")
+                logger.error(f"[http_server] Error: {e}")
                 yield b"data: " + orjson.dumps(
                     out, option=orjson.OPT_NON_STR_KEYS
                 ) + b"\n\n"
@@ -269,7 +277,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             ).__anext__()
             return ret
         except ValueError as e:
-            logger.error(f"Error: {e}")
+            logger.error(f"[http_server] Error: {e}")
             return _create_error_response(e)
 
 
@@ -322,6 +330,15 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         return _create_error_response(e)
 
 
+@app.api_route("/v1/rerank", methods=["POST", "PUT"])
+async def v1_rerank_request(obj: V1RerankReqInput, raw_request: Request):
+    try:
+        ret = await v1_rerank(_global_state.tokenizer_manager, obj, raw_request)
+        return ret
+    except ValueError as e:
+        return _create_error_response(e)
+
+
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 async def flush_cache():
     """Flush the radix cache."""
@@ -345,6 +362,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         activities=obj.activities,
         with_stack=obj.with_stack,
         record_shapes=obj.record_shapes,
+        profile_by_stage=obj.profile_by_stage,
     )
     return Response(
         content="Start profiling.\n",
@@ -355,7 +373,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
 @app.api_route("/stop_profile", methods=["GET", "POST"])
 async def stop_profile_async():
     """Stop profiling."""
-    _global_state.tokenizer_manager.stop_profile()
+    await _global_state.tokenizer_manager.stop_profile()
     return Response(
         content="Stop profiling. This will take some time.\n",
         status_code=200,
@@ -714,6 +732,12 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     return ORJSONResponse({"predictions": ret})
 
 
+@app.post("/v1/score")
+async def v1_score_request(raw_request: Request):
+    """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
+    return await v1_score(_global_state.tokenizer_manager, raw_request)
+
+
 def _create_error_response(e):
     return ORJSONResponse(
         {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
@@ -865,7 +889,7 @@ def _wait_and_warmup(
                     "max_new_tokens": 8,
                     "ignore_eos": True,
                 },
-                "bootstrap_host": [FakeBootstrapHost] * server_args.dp_size,
+                "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
                 # This is a hack to ensure fake transfer is enabled during prefill warmup
                 # ensure each dp rank has a unique bootstrap_room during prefill warmup
                 "bootstrap_room": [

@@ -1,9 +1,7 @@
 import asyncio
 import math
-from typing import List, Optional, Union
+from typing import List, Union
 
-import numpy as np
-from transformers import PretrainedConfig
 from transformers.models.pixtral.image_processing_pixtral import (
     _num_image_tokens as _get_pixtral_hf_num_image_tokens,
 )
@@ -12,11 +10,7 @@ from sglang.srt.managers.multimodal_processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.pixtral import PixtralVisionModel
 
 
@@ -108,15 +102,21 @@ class PixtralProcessor(BaseMultimodalProcessor):
         )
 
         if "pixel_values" in processor_output:
+            input_ids = processor_output["input_ids"].view(-1)
+            image_offsets = self.get_mm_items_offset(
+                input_ids=input_ids,
+                mm_token_id=self.image_token_id,
+            )
             mm_items = [
                 MultimodalDataItem(
                     pixel_values=processor_output["pixel_values"],
                     image_sizes=processor_output["image_sizes"],
                     modality=Modality.IMAGE,
+                    image_offsets=image_offsets,
                 )
             ]
 
-            input_ids = processor_output["input_ids"].view(-1).tolist()
+            input_ids = input_ids.tolist()
             processor_output.update(
                 input_ids=input_ids,
                 mm_items=mm_items,

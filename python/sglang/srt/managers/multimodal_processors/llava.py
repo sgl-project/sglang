@@ -1,5 +1,4 @@
 import asyncio
-import importlib
 from typing import List, Optional, Union
 
 import numpy as np
@@ -20,6 +19,7 @@ from sglang.srt.models.llava import (
     LlavaQwenForCausalLM,
 )
 from sglang.srt.models.llavavid import LlavaVidForCausalLM
+from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
 from sglang.srt.utils import load_image, logger
 from sglang.utils import get_exception_traceback
 
@@ -176,10 +176,10 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
 
 class LlavaMultimodalProcessor(BaseMultimodalProcessor):
     """
-    This is a wrapper class used to identify the multimodal processor for Llava architecture models.
+    This is a wrapper class used to identify the multimodal processor for Llava architectures' vision model.
     """
 
-    models = [LlavaForConditionalGeneration]
+    models = [LlavaForConditionalGeneration, Mistral3ForConditionalGeneration]
 
     def _get_sgl_processor_cls(self, model_type: str):
         if hf_name := HF_MAPPING_NAMES.get(model_type):
