@@ -307,7 +307,6 @@ install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
 # set flash-attention sources file
 # Now FA3 support sm80/sm86/sm90
 if (SGL_KERNEL_ENABLE_FA3)
-    if (SGL_KERNEL_ENABLE_FA3)
     if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
         message(STATUS "FA3 build: Setting compile threads to 2 for aarch64 to avoid OOM issues")
         list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS "--threads=2")
