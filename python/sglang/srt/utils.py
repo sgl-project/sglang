@@ -160,13 +160,17 @@ def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
-def is_cpu() -> bool:
+def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (
         machine in ("x86_64", "amd64", "i386", "i686")
         and hasattr(torch, "cpu")
         and torch.cpu.is_available()
     )
+
+
+def is_cpu() -> bool:
+    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
 
 
 def is_flashinfer_available():
@@ -1451,6 +1455,15 @@ def get_device(device_id: Optional[int] = None) -> str:
             raise ImportError(
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
+
+    if is_cpu():
+        if cpu_has_amx_support():
+            logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
+        else:
+            logger.warning(
+                "CPU device enabled, using torch native backend, low performance expected."
+            )
+        return "cpu"
 
     raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
 
