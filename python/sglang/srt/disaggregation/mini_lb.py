@@ -154,7 +154,7 @@ class MiniLoadBalancer:
                         else:
                             yield chunk
                 else:
-                    async for chunk in decode_response.content:
+                    async for chunk in decode_response.content.iter_chunked(1024*64):
                         yield chunk
 
         return StreamingResponse(
