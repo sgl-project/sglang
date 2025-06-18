@@ -36,84 +36,20 @@ class OpenAIServingCompletion(OpenAIServingBase):
         request: CompletionRequest,
     ) -> tuple[GenerateReqInput, CompletionRequest]:
         """Convert OpenAI completion request to internal format"""
-<<<<<<< HEAD
         # NOTE: with openai API, the prompt's logprobs are always not computed
         if request.echo and request.logprobs:
             logger.warning(
                 "Echo is not compatible with logprobs. "
                 "To compute logprobs of input prompt, please use the native /generate API."
-=======
-        # Validate batch requests
-        if len(all_requests) > 1:
-            first_prompt_type = type(all_requests[0].prompt)
-            for request in all_requests:
-                assert (
-                    type(request.prompt) is first_prompt_type
-                ), "All prompts must be of the same type in file input settings"
-                if request.n > 1:
-                    raise ValueError(
-                        "Parallel sampling is not supported for completions from files"
-                    )
-
-        prompts = []
-        sampling_params_list = []
-        return_logprobs = []
-        logprob_start_lens = []
-        top_logprobs_nums = []
-        lora_paths = []
-        return_hidden_states = []
-
-        for request in all_requests:
-            # Process prompt
-            prompt = request.prompt
-            if is_completion_template_defined():
-                prompt = generate_completion_prompt_from_request(request)
-
-            prompts.append(prompt)
-
-            lora_paths.append(request.lora_path)
-            return_hidden_states.append(request.return_hidden_states)
-
-            # Set logprob start length based on echo and logprobs
-            if request.echo and request.logprobs:
-                current_logprob_start_len = 0
-            else:
-                current_logprob_start_len = -1
-
-            # Build sampling parameters
-            sampling_params = self._build_sampling_params(request)
-            sampling_params_list.append(sampling_params)
-
-            return_logprobs.append(request.logprobs is not None)
-            logprob_start_lens.append(current_logprob_start_len)
-            top_logprobs_nums.append(
-                request.logprobs if request.logprobs is not None else 0
->>>>>>> ed68ab6 (Add hidden state support)
             )
         # Process prompt
         prompt = request.prompt
         if is_completion_template_defined():
             prompt = generate_completion_prompt_from_request(request)
 
-<<<<<<< HEAD
         # Set logprob start length based on echo and logprobs
         if request.echo and request.logprobs:
             logprob_start_len = 0
-=======
-        # Handle single vs multiple requests
-        if len(all_requests) == 1:
-            if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
-                prompt_kwargs = {"text": prompts[0]}
-            else:
-                prompt_kwargs = {"input_ids": prompts[0]}
-            sampling_params_list = sampling_params_list[0]
-            return_logprobs = return_logprobs[0]
-            logprob_start_lens = logprob_start_lens[0]
-            top_logprobs_nums = top_logprobs_nums[0]
-            lora_paths = lora_paths[0]
-            request_ids = request_ids[0]
-            return_hidden_states = return_hidden_states[0]
->>>>>>> ed68ab6 (Add hidden state support)
         else:
             logprob_start_len = -1
 
@@ -135,21 +71,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
             top_logprobs_num=request.logprobs if request.logprobs is not None else 0,
             logprob_start_len=logprob_start_len,
             return_text_in_logprobs=True,
-<<<<<<< HEAD
             stream=request.stream,
             lora_path=request.lora_path,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
-=======
-            stream=all_requests[0].stream,
-            rid=request_ids,
-            lora_path=lora_paths,
-            bootstrap_host=all_requests[0].bootstrap_host,
-            bootstrap_port=all_requests[0].bootstrap_port,
-            bootstrap_room=all_requests[0].bootstrap_room,
-            return_hidden_states=return_hidden_states,
->>>>>>> ed68ab6 (Add hidden state support)
+            return_hidden_states=request.return_hidden_states,
         )
 
         return adapted_request, request
@@ -188,146 +115,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
         raw_request: Request,
     ) -> StreamingResponse:
         """Handle streaming completion request"""
-<<<<<<< HEAD
-=======
-        created = int(time.time())
-
-        async def generate_stream_resp():
-            stream_buffers = {}
-            n_prev_tokens = {}
-            prompt_tokens = {}
-            completion_tokens = {}
-            cached_tokens = {}
-            hidden_states = {}
-
-            try:
-                async for content in self.tokenizer_manager.generate_request(
-                    adapted_request, raw_request
-                ):
-                    index = content.get("index", 0)
-
-                    stream_buffer = stream_buffers.get(index, "")
-                    n_prev_token = n_prev_tokens.get(index, 0)
-
-                    text = content["text"]
-                    prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
-                    completion_tokens[index] = content["meta_info"]["completion_tokens"]
-                    cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
-                    hidden_states[index] = content["meta_info"].get("hidden_states", None)
-
-                    # Handle echo for first chunk
-                    if not stream_buffer:  # The first chunk
-                        if request.echo:
-                            echo_text = self._get_echo_text(request, index)
-                            text = echo_text + text
-
-                    # Handle logprobs
-                    logprobs = None
-                    if request.logprobs is not None:
-                        # The first chunk and echo is enabled.
-                        if not stream_buffer and request.echo:
-                            input_token_logprobs = content["meta_info"][
-                                "input_token_logprobs"
-                            ]
-                            input_top_logprobs = content["meta_info"][
-                                "input_top_logprobs"
-                            ]
-                        else:
-                            input_token_logprobs = None
-                            input_top_logprobs = None
-
-                        logprobs = to_openai_style_logprobs(
-                            input_token_logprobs=input_token_logprobs,
-                            input_top_logprobs=input_top_logprobs,
-                            output_token_logprobs=content["meta_info"][
-                                "output_token_logprobs"
-                            ][n_prev_token:],
-                            output_top_logprobs=content["meta_info"][
-                                "output_top_logprobs"
-                            ][n_prev_token:],
-                        )
-                        n_prev_token = len(
-                            content["meta_info"]["output_token_logprobs"]
-                        )
-
-                    # Generate delta
-                    delta = text[len(stream_buffer) :]
-                    stream_buffer = stream_buffer + delta
-                    finish_reason = content["meta_info"]["finish_reason"]
-
-                    choice_data = CompletionResponseStreamChoice(
-                        index=index,
-                        text=delta,
-                        logprobs=logprobs,
-                        finish_reason=finish_reason["type"] if finish_reason else None,
-                        matched_stop=(
-                            finish_reason["matched"]
-                            if finish_reason and "matched" in finish_reason
-                            else None
-                        ),
-                    )
-                    chunk = CompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        created=created,
-                        object="text_completion",
-                        choices=[choice_data],
-                        model=request.model,
-                    )
-
-                    stream_buffers[index] = stream_buffer
-                    n_prev_tokens[index] = n_prev_token
-
-                    yield f"data: {chunk.model_dump_json()}\n\n"
-
-                # Send hidden states if requested
-                if request.return_hidden_states and hidden_states:
-                    for index, choice_hidden_states in hidden_states.items():
-                        if choice_hidden_states:
-                            last_token_hidden_states = (
-                                choice_hidden_states[-1]
-                                if choice_hidden_states and len(choice_hidden_states) > 1
-                                else []
-                            )
-                            hidden_states_chunk = CompletionStreamResponse(
-                                id=content["meta_info"]["id"],
-                                created=created,
-                                object="text_completion",
-                                choices=[
-                                    CompletionResponseStreamChoice(
-                                        index=index,
-                                        text="",
-                                        hidden_states=last_token_hidden_states,
-                                        finish_reason=None,
-                                    )
-                                ],
-                                model=request.model,
-                            )
-                            yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
-
-                # Handle final usage chunk
-                if request.stream_options and request.stream_options.include_usage:
-                    usage = self._calculate_streaming_usage_base(
-                        prompt_tokens, completion_tokens, cached_tokens, request.n
-                    )
-                    final_usage_chunk = CompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        created=created,
-                        choices=[],
-                        model=request.model,
-                        usage=usage,
-                    )
-                    final_usage_data = final_usage_chunk.model_dump_json(
-                        exclude_none=True
-                    )
-                    yield f"data: {final_usage_data}\n\n"
-
-            except Exception as e:
-                error = self.create_streaming_error_response(str(e))
-                yield f"data: {error}\n\n"
-
-            yield "data: [DONE]\n\n"
-
->>>>>>> ed68ab6 (Add hidden state support)
         return StreamingResponse(
             self._generate_completion_stream(adapted_request, request, raw_request),
             media_type="text/event-stream",
@@ -402,6 +189,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 delta = text[len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
                 finish_reason = content["meta_info"]["finish_reason"]
+                hidden_states = content["meta_info"].get("hidden_states", None)
 
                 choice_data = CompletionResponseStreamChoice(
                     index=index,
@@ -423,6 +211,31 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
+            
+            
+            if request.return_hidden_states and hidden_states:
+                for index, choice_hidden_states in hidden_states.items():
+                    if choice_hidden_states:
+                        last_token_hidden_states = (
+                            choice_hidden_states[-1]
+                            if choice_hidden_states and len(choice_hidden_states) > 1
+                            else []
+                        )
+                        hidden_states_chunk = CompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=created,
+                            object="text_completion",
+                            choices=[
+                                CompletionResponseStreamChoice(
+                                    index=index,
+                                    text="",
+                                    hidden_states=last_token_hidden_states,
+                                    finish_reason=None,
+                                )
+                            ],
+                            model=request.model,
+                        )
+                        yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
             # Handle final usage chunk
             if request.stream_options and request.stream_options.include_usage:

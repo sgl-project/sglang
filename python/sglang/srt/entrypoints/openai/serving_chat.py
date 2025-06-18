@@ -30,6 +30,7 @@ from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     detect_template_content_format,
     process_content_for_template_format,
+    process_hidden_states_from_ret,
     to_openai_style_logprobs,
 )
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -784,15 +785,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 choice_logprobs = self._process_response_logprobs(ret_item)
 
             # Handle hidden states
-            hidden_states = None
-            if isinstance(request, list) and request[idx].return_hidden_states:
-                hidden_states = ret_item["meta_info"].get("hidden_states", None)
-            elif not isinstance(request, list) and request.return_hidden_states:
-                hidden_states = ret_item["meta_info"].get("hidden_states", None)
-            if hidden_states is not None:
-                hidden_states = (
-                    hidden_states[-1] if hidden_states and len(hidden_states) > 1 else []
-                )
+            hidden_states = process_hidden_states_from_ret(ret_item, request, idx)
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]
