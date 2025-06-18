@@ -751,13 +751,13 @@ class DeepseekV2AttentionMLA(nn.Module):
             "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
         )
 
-        # If we have self.fused_qkv_a_proj_with_mqa, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
+        # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
         # which requires self.w_kc and self.w_vc to be packed.
         # If not, we will use torch.bmm and weight shouldn't be packed in this case
-        # TODO: use is_cpu() and cpu_has_amx_support() API for device check when #6614 lands
         if (
             hasattr(self, "fused_qkv_a_proj_with_mqa")
-            and global_server_args_dict["device"] == "cpu"
+            and _is_cpu
+            and _is_cpu_amx_available
         ):
             self.quant_method = PackWeightMethod(
                 weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
