@@ -63,7 +63,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
             out,
             masked_m,
             expected_m,
-            **({"recipe": recipe} if DEEPGEMM_BLACKWELL else {})
+            **({"recipe": recipe} if DEEPGEMM_BLACKWELL else {}),
         )
 
 
