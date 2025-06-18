@@ -181,7 +181,8 @@ async def openai_v1_embeddings(raw_request: Request):
             f"Invalid request body, error: {str(e)}"
         )
 
-    return await app.state.embedding_server.handle_request(request, raw_request)
+    ret = await app.state.embedding_server.handle_request(request, raw_request)
+    return ret
 
 
 @app.post("/v1/score")
