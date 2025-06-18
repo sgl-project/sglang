@@ -447,15 +447,15 @@ class PrefillAdder:
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
         )
 
-        # consider the possible host indices length when scheduling
-        real_extend_tokens = req.extend_input_len - req.host_indices_length
-        input_tokens = -(-real_extend_tokens // self.page_size) * self.page_size
+        # we should consider the possible host indices length when scheduling
+        min_extend_tokens = req.extend_input_len - req.host_indices_length
+        min_input_tokens = -(-min_extend_tokens // self.page_size) * self.page_size
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
-        if input_tokens > self.rem_input_tokens and len(self.can_run_list) != 0:
+        if min_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
@@ -469,10 +469,9 @@ class PrefillAdder:
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                input_tokens = (
-                    -(-req.extend_input_len // self.page_size) * self.page_size
-                )
                 prefix_len = len(req.prefix_indices)
+
+            input_tokens = -(-req.extend_input_len // self.page_size) * self.page_size
 
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
