@@ -20,12 +20,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.speculative.eagle_utils import EagleDraftInput, fast_topk
 from sglang.srt.utils import (
+    require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_tp_gather,
-    require_attn_tp_gather,
 )
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, fast_topk
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -115,9 +115,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                     )
                 else:
                     assert self.require_attn_tp_gather
-                    self.global_num_tokens_gpu = torch.zeros(
-                        (1,), dtype=torch.int32
-                    )
+                    self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                     self.global_num_tokens_for_logprob_gpu = torch.zeros(
                         (1,), dtype=torch.int32
                     )

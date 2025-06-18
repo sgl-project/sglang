@@ -21,11 +21,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.speculative.eagle_utils import EagleDraftInput
 from sglang.srt.utils import (
+    require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_tp_gather,
-    require_attn_tp_gather,
 )
-
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -112,9 +111,7 @@ class EAGLEDraftCudaGraphRunner:
                     )
                 else:
                     assert self.require_attn_tp_gather
-                    self.global_num_tokens_gpu = torch.zeros(
-                        (1,), dtype=torch.int32
-                    )
+                    self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                     self.global_num_tokens_for_logprob_gpu = torch.zeros(
                         (1,), dtype=torch.int32
                     )
