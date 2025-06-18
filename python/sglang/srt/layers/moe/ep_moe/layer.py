@@ -6,6 +6,7 @@ import torch
 from sgl_kernel import silu_and_mul
 from torch.nn import Module
 
+from sglang.math_utils import ceil_div
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -1130,10 +1131,19 @@ class DeepEPMoE(EPMoE):
                 device=hidden_states_fp8.device,
                 dtype=hidden_states_fp8.dtype,
             ),
-            torch.empty(
-                (all_tokens, K // 128),
-                device=hidden_states_fp8.device,
-                dtype=torch.float32,
+            (
+                # TODO check whether need `zeros`
+                torch.zeros(
+                    (ceil_div(K // 128, 4), all_tokens),
+                    device=hidden_states_fp8.device,
+                    dtype=torch.int,
+                ).transpose(0, 1)
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                else torch.empty(
+                    (all_tokens, K // 128),
+                    device=hidden_states_fp8.device,
+                    dtype=torch.float32,
+                )
             ),
         ]
         m_indices = torch.empty(
@@ -1159,6 +1169,7 @@ class DeepEPMoE(EPMoE):
             input_tensor[1],
             m_indices,
             output_index,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
         dispose_tensor(hidden_states_fp8)
 
@@ -1167,7 +1178,8 @@ class DeepEPMoE(EPMoE):
             device=hidden_states_fp8_device,
             dtype=torch.bfloat16,
         )
-        input_tensor[1] = tma_align_input_scale(input_tensor[1])
+        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            input_tensor[1] = tma_align_input_scale(input_tensor[1])
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             input_tensor, self.w13_weight_fp8, gateup_output, m_indices
         )
@@ -1188,10 +1200,15 @@ class DeepEPMoE(EPMoE):
             dtype=torch.bfloat16,
         )
         down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
-            down_input, scale_block_size
+            down_input,
+            scale_block_size,
+            column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
         del down_input
-        down_input_scale = tma_align_input_scale(down_input_scale)
+        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            down_input_scale = tma_align_input_scale(down_input_scale)
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
             self.w2_weight_fp8,
