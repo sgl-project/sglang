@@ -26,6 +26,8 @@ KVCache actually holds the physical kv cache.
 
 import abc
 import logging
+import os
+from contextlib import nullcontext
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -34,7 +36,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import debug_timing, is_cuda, next_power_of_2
+from sglang.srt.utils import debug_timing, get_bool_env_var, is_cuda, next_power_of_2
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +262,22 @@ class MHATokenToKVPool(KVCache):
 
         self.head_num = head_num
         self.head_dim = head_dim
+
+        # for disagg with nvlink
+        self.enable_custom_mem_pool = get_bool_env_var(
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
+        )
+        if self.enable_custom_mem_pool:
+            from sglang.srt.disaggregation.mooncake.memory_pool import (
+                MooncakeNVLinkAllocator,
+            )
+
+            # TODO(shangming): abstract custom allocator class for more backends
+            allocator = MooncakeNVLinkAllocator.get_allocator(self.device)
+            self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
+        else:
+            self.custom_mem_pool = None
+
         self._create_buffers()
 
         # used for chunked cpu-offloading
@@ -275,24 +293,42 @@ class MHATokenToKVPool(KVCache):
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region():
-            # [size, head_num, head_dim] for each layer
-            # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
-            self.v_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                # [size, head_num, head_dim] for each layer
+                # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                self.k_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros(
+                        (self.size + self.page_size, self.head_num, self.head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer + self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
 
     def _clear_buffers(self):
         del self.k_buffer
@@ -335,6 +371,9 @@ class MHATokenToKVPool(KVCache):
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def maybe_get_custom_mem_pool(self):
+        return self.custom_mem_pool
 
     def get_cpu_copy(self, indices):
         torch.cuda.synchronize()
@@ -451,6 +490,16 @@ class MHATokenToKVPool(KVCache):
             self.k_buffer[layer_id - self.start_layer][loc] = cache_k
             self.v_buffer[layer_id - self.start_layer][loc] = cache_v
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        copy_all_layer_kv_cache[(len(self.data_ptrs),)](
+            self.data_ptrs,
+            self.data_strides,
+            tgt_loc,
+            src_loc,
+            len(tgt_loc),
+            next_power_of_2(len(tgt_loc)),
+        )
+
 
 @triton.jit
 def set_mla_kv_buffer_kernel(
@@ -546,16 +595,36 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
 
+        # for disagg with nvlink
+        self.enable_custom_mem_pool = get_bool_env_var(
+            "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
+        )
+        if self.enable_custom_mem_pool:
+            from sglang.srt.disaggregation.mooncake.memory_pool import (
+                MooncakeNVLinkAllocator,
+            )
+
+            # TODO(shangming): abstract custom allocator class for more backends
+            allocator = MooncakeNVLinkAllocator.get_allocator(self.device)
+            self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
+        else:
+            self.custom_mem_pool = None
+
         with self.memory_saver_adapter.region():
-            # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.kv_buffer = [
-                torch.zeros(
-                    (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
-                    dtype=self.store_dtype,
-                    device=device,
-                )
-                for _ in range(layer_num)
-            ]
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                self.kv_buffer = [
+                    torch.zeros(
+                        (size + page_size, 1, kv_lora_rank + qk_rope_head_dim),
+                        dtype=self.store_dtype,
+                        device=device,
+                    )
+                    for _ in range(layer_num)
+                ]
 
         self.layer_transfer_counter = None
 
@@ -580,6 +649,9 @@ class MLATokenToKVPool(KVCache):
             self.kv_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def maybe_get_custom_mem_pool(self):
+        return self.custom_mem_pool
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -741,3 +813,41 @@ class DoubleSparseTokenToKVPool(KVCache):
 
     def transfer_per_layer(self, indices, flat_data, layer_id):
         pass
+
+
+@triton.jit
+def copy_all_layer_kv_cache(
+    data_ptrs,
+    strides,
+    tgt_loc_ptr,
+    src_loc_ptr,
+    num_locs,
+    num_locs_upper: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 128
+
+    bid = tl.program_id(0)
+    stride = tl.load(strides + bid)
+
+    data_ptr = tl.load(data_ptrs + bid)
+    data_ptr = tl.cast(data_ptr, tl.pointer_type(tl.uint8))
+
+    num_locs_offset = tl.arange(0, num_locs_upper)
+    tgt_locs = tl.load(tgt_loc_ptr + num_locs_offset, mask=num_locs_offset < num_locs)
+    src_locs = tl.load(src_loc_ptr + num_locs_offset, mask=num_locs_offset < num_locs)
+
+    # NOTE: we cannot parallelize over the tgt_loc_ptr dim with cuda blocks
+    # because this copy is an inplace operation.
+
+    num_loop = tl.cdiv(stride, BLOCK_SIZE)
+    for i in range(num_loop):
+        copy_offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = (num_locs_offset < num_locs)[:, None] and (copy_offset < stride)[None, :]
+        value = tl.load(
+            data_ptr + src_locs[:, None] * stride + copy_offset[None, :], mask=mask
+        )
+        tl.store(
+            data_ptr + tgt_locs[:, None] * stride + copy_offset[None, :],
+            value,
+            mask=mask,
+        )
