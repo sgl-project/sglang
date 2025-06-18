@@ -332,7 +332,10 @@ class WaveAttnBackend(AttentionBackend):
         )
 
     def init_cuda_graph_state(
-        self, max_bs: int, kv_indices_buf: Optional[torch.Tensor] = None
+        self,
+        max_bs: int,
+        max_num_tokens: int,
+        kv_indices_buf: Optional[torch.Tensor] = None
     ):
         self.cuda_graph_attn_logits = torch.zeros(
             (self.max_kv_splits, max_bs, self.v_head_dim, self.num_head),
