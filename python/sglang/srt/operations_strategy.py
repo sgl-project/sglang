@@ -74,7 +74,7 @@ def _compute_moe_deepseek_layer_operations_strategy_tbo(
     elif forward_mode == ForwardMode.DECODE:
         return _compute_moe_deepseek_blog_decode(layer)
     elif forward_mode == ForwardMode.TARGET_VERIFY:
-        return _compute_moe_deepseek_blog_target_verify(layer)
+        return _compute_moe_deepseek_blog_decode(layer)
     else:
         raise NotImplementedError(f"Unsupported {forward_mode=}")
 
@@ -136,34 +136,6 @@ def _compute_moe_deepseek_blog_decode(layer):
     )
 
 
-def _compute_moe_deepseek_blog_target_verify(layer):
-    return OperationsStrategy(
-        deep_gemm_num_sms=None,
-        tbo_delta_stages=2,
-        operations=[
-            layer.op_comm_prepare_attn,
-            layer.self_attn.op_prepare,
-            operations.YieldOperation(),
-            layer.self_attn.op_core,
-            layer.op_comm_prepare_mlp,
-            layer.mlp.op_gate,
-            layer.mlp.op_select_experts,
-            operations.YieldOperation(),
-            layer.mlp.op_dispatch_a,
-            layer.mlp.op_shared_experts,
-            operations.YieldOperation(),
-            layer.mlp.op_dispatch_b,
-            layer.mlp.op_experts,
-            layer.mlp.op_combine_a,
-            operations.YieldOperation(),
-            layer.mlp.op_combine_b,
-            operations.YieldOperation(),
-            layer.mlp.op_output,
-            layer.op_comm_postprocess_layer,
-        ],
-    )
-
-
 # -------------------------------- Strategy for Qwen3 ---------------------------------------
 
 
@@ -179,7 +151,7 @@ def _compute_moe_qwen3_layer_operations_strategy_tbo(
     elif forward_mode == ForwardMode.DECODE:
         return _compute_moe_qwen3_decode(layer)
     elif forward_mode == ForwardMode.TARGET_VERIFY:
-        return _compute_moe_qwen3_target_verify(layer)
+        return _compute_moe_qwen3_decode(layer)
     else:
         raise NotImplementedError(f"Unsupported {forward_mode=}")
 
@@ -213,33 +185,6 @@ def _compute_moe_qwen3_prefill(layer):
 
 
 def _compute_moe_qwen3_decode(layer):
-    return OperationsStrategy(
-        deep_gemm_num_sms=None,
-        tbo_delta_stages=2,
-        operations=[
-            layer.op_comm_prepare_attn,
-            layer.self_attn.op_prepare,
-            operations.YieldOperation(),
-            layer.self_attn.op_core,
-            layer.op_comm_prepare_mlp,
-            layer.mlp.op_gate,
-            layer.mlp.op_select_experts,
-            operations.YieldOperation(),
-            layer.mlp.op_dispatch_a,
-            operations.YieldOperation(),
-            layer.mlp.op_dispatch_b,
-            layer.mlp.op_experts,
-            layer.mlp.op_combine_a,
-            operations.YieldOperation(),
-            layer.mlp.op_combine_b,
-            layer.mlp.op_output,
-            layer.op_comm_postprocess_layer,
-            operations.YieldOperation(),
-        ],
-    )
-
-
-def _compute_moe_qwen3_target_verify(layer):
     return OperationsStrategy(
         deep_gemm_num_sms=None,
         tbo_delta_stages=2,

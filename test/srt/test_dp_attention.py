@@ -169,7 +169,7 @@ class TestDPAttentionDP2TP2DeepseekV3MTPTBO(CustomTestCase):
             "--deepep-mode",
             "low_latency",
             "--chunked-prefill-size",
-            "256",
+            "128",
             "--cuda-graph-max-bs",
             "32",
             "--max-running-requests",
