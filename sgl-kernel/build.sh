@@ -15,8 +15,8 @@ echo "ARCH:  $ARCH"
 if [ ${ARCH} = "aarch64" ]; then
    LIBCUDA_ARCH="sbsa"
    BUILDER_NAME="pytorch/manylinuxaarch64-builder"
-   export MAX_JOBS=16
-   export CMAKE_BUILD_PARALLEL_LEVEL=16
+   export MAX_JOBS=8
+   export CMAKE_BUILD_PARALLEL_LEVEL=8
    export NVCC_THREADS=2
 else
    LIBCUDA_ARCH=${ARCH}
