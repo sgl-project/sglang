@@ -36,7 +36,7 @@ if ENABLE_JIT_DEEPGEMM:
             m_grouped_gemm_fp8_fp8_bf16_nt_masked as _grouped_gemm_nt_f8f8bf16_masked_raw,
         )
 
-_SANITY_CHECK = get_bool_env_var("SGLANG_W8A8_DEEPGEMM_SANITY_CHECK")
+_SANITY_CHECK = get_bool_env_var("SGLANG_DEEPGEMM_SANITY_CHECK")
 
 
 def grouped_gemm_nt_f8f8bf16_masked(
