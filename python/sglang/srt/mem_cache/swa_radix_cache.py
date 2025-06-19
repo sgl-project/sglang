@@ -464,7 +464,7 @@ class SWARadixCache(BasePrefixCache):
         cur_time = time.monotonic()
         while node:
             node.last_access_time = cur_time
-            cur_time -= 0.01
+            cur_time -= 0.0001
             node = node.parent
 
         return value[:best_value_len], best_last_node
