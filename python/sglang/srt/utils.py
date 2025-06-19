@@ -1230,7 +1230,7 @@ def get_device_sm():
         major, minor = torch.cuda.get_device_capability()
         return major * 10 + minor
     return 0
-    
+
 def is_jetson():
     """Checks if the system is an NVIDIA Jetson device."""
     return os.path.exists('/etc/nv_tegra_release')
@@ -1288,9 +1288,6 @@ def get_nvgpu_memory_capacity():
                 "Not a Jetson device and nvidia-smi was not found. "
                 "Ensure NVIDIA drivers are installed and in the system's PATH."
             )
-        except subprocess.CalledProcessEror as e:
-            raise RuntimeError(f"nvidia-smi command failed: {e.stderr.strip()}")
-
 
 def get_hpu_memory_capacity():
     try:
