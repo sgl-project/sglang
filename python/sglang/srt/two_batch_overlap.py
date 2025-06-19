@@ -27,21 +27,32 @@ logger = logging.getLogger(__name__)
 # -------------------------------- Compute Basic Info ---------------------------------------
 
 
+def get_token_num_per_batch(
+    forward_mode: ForwardMode,
+    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+):
+    if forward_mode.is_target_verify():
+        return spec_info.draft_token_num
+    elif forward_mode.is_decode():
+        return 1
+    else:
+        # For extend, we should not use `token_num_per_batch`.
+        return None
+
+
 # TODO: may smartly disable TBO when batch size is too small b/c it will slow down
 def compute_split_seq_index(
     forward_mode: "ForwardMode",
     num_tokens: int,
     extend_lens: Optional[Sequence[int]],
-    draft_token_num_per_batch: Optional[int],
+    token_num_per_batch: Optional[int],
 ) -> Optional[int]:
-    if forward_mode.is_target_verify():
-        assert draft_token_num_per_batch is not None
-        return (num_tokens // draft_token_num_per_batch) // 2
+    if forward_mode.is_target_verify() or forward_mode.is_decode():
+        assert token_num_per_batch is not None
+        return (num_tokens // token_num_per_batch) // 2
     if forward_mode.is_extend():
         assert extend_lens is not None
         return _split_array_by_half_sum(extend_lens)
-    elif forward_mode.is_decode():
-        return num_tokens // 2
     elif forward_mode.is_idle():
         assert num_tokens == 0
         return 0
@@ -72,16 +83,14 @@ def compute_split_token_index(
     split_seq_index: int,
     forward_mode: "ForwardMode",
     extend_seq_lens: Optional[Sequence[int]],
-    draft_token_num_per_batch: Optional[int],
+    token_num_per_batch: Optional[int],
 ) -> int:
-    if forward_mode.is_target_verify():
-        assert draft_token_num_per_batch is not None
-        return split_seq_index * draft_token_num_per_batch
+    if forward_mode.is_target_verify() or forward_mode.is_decode():
+        assert token_num_per_batch is not None
+        return split_seq_index * token_num_per_batch
     elif forward_mode.is_extend():
         assert extend_seq_lens is not None
         return sum(extend_seq_lens[:split_seq_index])
-    elif forward_mode.is_decode():
-        return split_seq_index
     elif forward_mode.is_idle():
         assert split_seq_index == 0
         return 0
@@ -97,21 +106,20 @@ def compute_split_indices_for_cuda_graph_replay(
     forward_mode_for_tbo_split = (
         forward_mode if forward_mode != ForwardMode.IDLE else ForwardMode.DECODE
     )
-    if forward_mode.is_target_verify():
-        draft_token_num_per_batch = spec_info.draft_token_num
-    else:
-        draft_token_num_per_batch = None
+    token_num_per_batch = get_token_num_per_batch(
+        forward_mode=forward_mode, spec_info=spec_info
+    )
     tbo_split_seq_index = compute_split_seq_index(
         forward_mode=forward_mode_for_tbo_split,
         num_tokens=cuda_graph_num_tokens,
         extend_lens=None,
-        draft_token_num_per_batch=draft_token_num_per_batch,
+        token_num_per_batch=token_num_per_batch,
     )
     tbo_split_token_index = compute_split_token_index(
         split_seq_index=tbo_split_seq_index,
         forward_mode=forward_mode_for_tbo_split,
         extend_seq_lens=None,
-        draft_token_num_per_batch=draft_token_num_per_batch,
+        token_num_per_batch=token_num_per_batch,
     )
     return tbo_split_seq_index, tbo_split_token_index
 
@@ -126,13 +134,15 @@ class TboCudaGraphRunnerPlugin:
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
         if not global_server_args_dict["enable_two_batch_overlap"]:
             return
-        draft_token_num_per_batch = batch.draft_token_num
+        token_num_per_batch = get_token_num_per_batch(
+            forward_mode=batch.forward_mode, spec_info=batch.spec_info
+        )
 
         batch.tbo_split_seq_index = compute_split_seq_index(
             forward_mode=batch.forward_mode,
             num_tokens=num_tokens,
             extend_lens=None,
-            draft_token_num_per_batch=draft_token_num_per_batch,
+            token_num_per_batch=token_num_per_batch,
         )
         # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
         assert batch.tbo_split_seq_index is not None, f"{num_tokens=}"
@@ -153,10 +163,9 @@ class TboCudaGraphRunnerPlugin:
         num_token_non_padded: int,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        if forward_mode.is_target_verify():
-            token_num_per_batch = spec_info.draft_token_num
-        else:
-            token_num_per_batch = 1
+        token_num_per_batch = get_token_num_per_batch(
+            forward_mode=forward_mode, spec_info=spec_info
+        )
         tbo_split_seq_index, tbo_split_token_index = (
             compute_split_indices_for_cuda_graph_replay(
                 forward_mode=forward_mode,
@@ -180,20 +189,22 @@ class TboDPAttentionPreparer:
         self.enable_two_batch_overlap = enable_two_batch_overlap
 
         if local_batch is not None:
-            if local_batch.forward_mode.is_target_verify():
-                draft_token_num_per_batch = local_batch.spec_info.draft_token_num
-                num_tokens = local_batch.batch_size() * draft_token_num_per_batch
+            token_num_per_batch = get_token_num_per_batch(
+                forward_mode=local_batch.forward_mode, spec_info=local_batch.spec_info
+            )
+
+            if (
+                local_batch.forward_mode.is_target_verify()
+                or local_batch.forward_mode.is_decode()
+            ):
+                num_tokens = local_batch.batch_size() * token_num_per_batch
             else:
-                draft_token_num_per_batch = None
-                if local_batch.forward_mode.is_decode():
-                    num_tokens = local_batch.batch_size()
-                else:
-                    num_tokens = local_batch.extend_num_tokens
+                num_tokens = local_batch.extend_num_tokens
             self.local_tbo_split_seq_index = compute_split_seq_index(
                 forward_mode=local_batch.forward_mode,
                 num_tokens=num_tokens,
                 extend_lens=local_batch.extend_lens,
-                draft_token_num_per_batch=draft_token_num_per_batch,
+                token_num_per_batch=token_num_per_batch,
             )
             resolved_deepep_mode = deepep_mode.resolve(local_batch.forward_mode)
             local_can_run_tbo = (self.local_tbo_split_seq_index is not None) and not (
@@ -257,8 +268,8 @@ class TboDPAttentionPreparer:
 
 class TboForwardBatchPreparer:
     @classmethod
-    def prepare(cls, batch: ForwardBatch):
-        if batch.tbo_split_seq_index is None:
+    def prepare(cls, batch: ForwardBatch, is_draft_worker: bool = False):
+        if batch.tbo_split_seq_index is None or is_draft_worker:
             return
 
         tbo_children_num_token_non_padded = (
@@ -470,12 +481,14 @@ class TboForwardBatchPreparer:
 
     @classmethod
     def _compute_split_token_index(cls, batch: ForwardBatch):
-        draft_token_num_per_batch = batch.draft_token_num
+        token_num_per_batch = get_token_num_per_batch(
+            forward_mode=batch.forward_mode, spec_info=batch.spec_info
+        )
         return compute_split_token_index(
             split_seq_index=batch.tbo_split_seq_index,
             forward_mode=batch.forward_mode,
             extend_seq_lens=batch.extend_seq_lens_cpu,
-            draft_token_num_per_batch=draft_token_num_per_batch,
+            token_num_per_batch=token_num_per_batch,
         )
 
 

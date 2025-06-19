@@ -352,10 +352,9 @@ class ForwardBatch:
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
-            if not model_runner.is_draft_worker:
-                TboForwardBatchPreparer.prepare(ret)
-            else:
-                ret.tbo_split_seq_index = None
+            TboForwardBatchPreparer.prepare(
+                ret, is_draft_worker=model_runner.is_draft_worker
+            )
             return ret
 
         # Override the positions with spec_info
@@ -400,10 +399,9 @@ class ForwardBatch:
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        if not model_runner.is_draft_worker:
-            TboForwardBatchPreparer.prepare(ret)
-        else:
-            ret.tbo_split_seq_index = None
+        TboForwardBatchPreparer.prepare(
+            ret, is_draft_worker=model_runner.is_draft_worker
+        )
 
         return ret
 
@@ -632,13 +630,6 @@ class ForwardBatch:
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
-
-    @property
-    def draft_token_num(self):
-        if self.forward_mode.is_target_verify():
-            return self.spec_info.draft_token_num
-        else:
-            return None
 
 
 def enable_num_token_non_padded(server_args):
