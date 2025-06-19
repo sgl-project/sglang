@@ -557,6 +557,8 @@ class HiCacheController:
                                     * self.page_size
                                 ]
                             )
+                            .contiguous()
+                            .pin_memory()
                         )
                 self.mooncake_l3_kv_pool.batch_put(non_exist_keys, non_exist_value)
             except Empty:
@@ -587,7 +589,7 @@ class HiCacheController:
                 logger.error(e)
 
     def _fragment_cache_all_gather(self, fragment_tensor, unpadded_len):
-        fragment_tensor = fragment_tensor.to(f"cuda:{self.tp_rank}")
+        fragment_tensor = fragment_tensor.to(f"cuda:{self.tp_rank}", non_blocking=True)
         if not self.l3_fragment_load:
             return fragment_tensor
         gathered_tensor = tensor_model_parallel_all_gather(fragment_tensor, dim=1)
