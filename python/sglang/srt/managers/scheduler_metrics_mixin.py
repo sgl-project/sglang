@@ -130,7 +130,7 @@ class SchedulerMetricsMixin:
         self._publish_kv_events()
 
     def log_decode_stats(
-        self, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
+        self, can_run_graph: bool, running_batch: ScheduleBatch = None
     ):
         batch = running_batch or self.running_batch
 
@@ -184,8 +184,9 @@ class SchedulerMetricsMixin:
             msg += f"pre-allocated usage: {self.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
+        graph_msg = f"cpu torch-compile" if self.device == "cpu" else "cuda graph"
         msg += (
-            f"cuda graph: {can_run_cuda_graph}, "
+            f"{graph_msg}: {can_run_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )
