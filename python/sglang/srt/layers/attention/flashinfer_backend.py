@@ -25,6 +25,7 @@ from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import is_flashinfer_available, next_power_of_2
@@ -149,8 +150,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 for _ in range(self.num_wrappers)
             ]
 
+        fmha_backend = "auto"
+        if is_sm100_supported():
+            fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD"
+            self.workspace_buffer, "NHD", backend=fmha_backend
         )
 
         # Two wrappers: one for sliding window attention and one for full attention.
@@ -258,11 +262,14 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
     def init_cuda_graph_state(
-        self, max_bs: int, kv_indices_buf: Optional[torch.Tensor] = None
+        self,
+        max_bs: int,
+        max_num_tokens: int,
+        kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
-                (max_bs * self.max_context_len,),
+                (max_num_tokens * self.max_context_len,),
                 dtype=torch.int32,
                 device="cuda",
             )
@@ -281,7 +288,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_bs * self.max_context_len),
+                (max_num_tokens * self.max_context_len),
                 dtype=torch.uint8,
                 device="cuda",
             )
@@ -358,6 +365,35 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+        elif forward_mode.is_draft_extend():
+            prefill_wrappers = []
+            for i in range(self.num_wrappers):
+                prefill_wrappers.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        backend="fa2",
+                        use_cuda_graph=True,
+                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                    )
+                )
+
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrappers=prefill_wrappers,
+                use_ragged=False,
+                encoder_lens=encoder_lens,
+                spec_info=spec_info,
+            )
+            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -392,11 +428,22 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
             )
+        elif forward_mode.is_draft_extend():
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                use_ragged=False,
+                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                spec_info=spec_info,
+            )
         else:
             raise ValueError("Invalid forward mode")
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return 0
+        return 1
 
     def forward_extend(
         self,
@@ -1005,14 +1052,13 @@ class FlashInferMultiStepDraftBackend:
             kv_indices_buffer,
             self.kv_indptr,
             forward_batch.positions,
-            num_seqs,
-            self.topk,
             self.pool_len,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
             next_power_of_2(num_seqs),
             next_power_of_2(self.speculative_num_steps),
             next_power_of_2(bs),
+            self.page_size,
         )
 
         assert forward_batch.spec_info is not None
@@ -1053,7 +1099,7 @@ class FlashInferMultiStepDraftBackend:
 
         self.common_template(forward_batch, kv_indices, call_fn)
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, max_bs * self.max_context_len),
             dtype=torch.int32,
@@ -1062,7 +1108,7 @@ class FlashInferMultiStepDraftBackend:
 
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_cuda_graph_state(
-                max_bs, kv_indices_buf=self.cuda_graph_kv_indices[i]
+                max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
             )
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):

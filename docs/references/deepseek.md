@@ -3,7 +3,7 @@
 SGLang provides many optimizations specifically designed for the DeepSeek models, making it the inference engine recommended by the official [DeepSeek team](https://github.com/deepseek-ai/DeepSeek-V3/tree/main?tab=readme-ov-file#62-inference-with-sglang-recommended) from Day 0.
 
 This document outlines current optimizations for DeepSeek.
-Additionally, the SGLang team is actively developing enhancements following this [Roadmap](https://github.com/sgl-project/sglang/issues/2591).
+For an overview of the implemented features see the completed [Roadmap](https://github.com/sgl-project/sglang/issues/2591).
 
 ## Launch DeepSeek V3 with SGLang
 
@@ -221,6 +221,6 @@ Important Notes:
 
 ## FAQ
 
-1. **Question**: What should I do if model loading takes too long and NCCL timeout occurs?
+**Q: Model loading is taking too long, and I'm encountering an NCCL timeout. What should I do?**
 
-    **Answer**: You can try to add `--dist-timeout 3600` when launching the model, this allows for 1-hour timeout.
+A: If you're experiencing extended model loading times and an NCCL timeout, you can try increasing the timeout duration. Add the argument `--dist-timeout 3600` when launching your model. This will set the timeout to one hour, which often resolves the issue.

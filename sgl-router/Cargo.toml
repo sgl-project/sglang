@@ -15,13 +15,13 @@ serde = { version = "1.0", features = ["derive"] }
 clap = { version = "4.4", features = ["derive"] }
 bytes = "1.8.0"
 rand = "0.8.5"
-reqwest = { version = "0.12.8", features = ["stream", "blocking"] }
+reqwest = { version = "0.12.8", features = ["stream", "blocking", "json"] }
 futures-util = "0.3"
 serde_json = "1.0"
 pyo3 = { version = "0.22.5", features = ["extension-module"] }
 dashmap = "6.1.0"
 http = "1.1.0"
-tokio = "1.42.0"
+tokio = { version = "1.42.0", features = ["macros", "rt-multi-thread"] }
 # Added for enhanced logging system
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
@@ -30,6 +30,11 @@ tracing-appender = "0.2.3"
 kube = { version = "0.88.1", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.21.0", features = ["v1_29"] }
 futures = "0.3"
+# Added for metrics
+metrics = "0.24.2"
+metrics-exporter-prometheus = "0.17.0"
+# Added for request tracing
+uuid = { version = "1.10", features = ["v4", "serde"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1

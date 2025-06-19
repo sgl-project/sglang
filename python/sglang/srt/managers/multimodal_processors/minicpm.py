@@ -42,7 +42,8 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             audio_data=audio_data,
             image_data=image_data,
             multimodal_tokens=MultimodalSpecialTokens(
-                image_token=self.image_token, audio_token=self.audio_token
+                image_token=self.image_token,
+                audio_token=self.audio_token,
             ),
         )
         if base_output is None:

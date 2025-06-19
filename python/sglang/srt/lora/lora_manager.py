@@ -32,7 +32,7 @@ from sglang.srt.lora.utils import (
     LoRAType,
     get_customized_names_from_hf_names,
     get_layer_id,
-    get_stacked_name,
+    get_normalized_lora_weight_names,
     get_weight_name,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -81,12 +81,23 @@ class LoRAManager:
                 seg_indptr=torch.zeros(
                     self.max_bs_in_cuda_graph + 1, dtype=torch.int32
                 ),
-                max_len=0,
+                max_len=1,
                 weight_indices=torch.zeros(
                     self.max_bs_in_cuda_graph, dtype=torch.int32
                 ),
                 lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
+            )
+
+            # Initialize seg_lens and seg_indptr for CUDA graph as they remain constant
+            # across batches.
+            self.cuda_graph_batch_info.seg_lens[: self.max_bs_in_cuda_graph].fill_(1)
+            torch.cumsum(
+                self.cuda_graph_batch_info.seg_lens[: self.max_bs_in_cuda_graph],
+                dim=0,
+                out=self.cuda_graph_batch_info.seg_indptr[
+                    1 : self.max_bs_in_cuda_graph + 1
+                ],
             )
 
     def init_loras(self):
@@ -101,10 +112,13 @@ class LoRAManager:
             self.hf_target_names.update(self.configs[name].target_modules)
 
         # Target lora weight names for lora_a and lora_b modules respectively.
-        # e.g., {("qkv_proj", "q_proj"), ("qkv_proj", "kv_proj")}
-        self.lora_weight_names: Set[Tuple[str]] = set(
-            [get_stacked_name(module) for module in self.hf_target_names]
-        )
+        weights_A: List[str] = []
+        weights_B: List[str] = []
+        for module in self.hf_target_names:
+            lora_A, lora_B = get_normalized_lora_weight_names(module)
+            weights_A += lora_A
+            weights_B += lora_B
+        self.lora_weight_names: Tuple[Set[str]] = set(weights_A), set(weights_B)
 
         # load all weights to cpu
         self.loras: Dict[str, LoRAAdapter] = {}
@@ -156,6 +170,45 @@ class LoRAManager:
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
 
+        def transfer_adapter_info(
+            weight_indices_out: torch.Tensor,
+            lora_ranks_out: torch.Tensor,
+            scalings_out: torch.Tensor,
+        ):
+            """
+            Transfer adapter metadata (weight indices, LoRA rank, scalings) from host
+            to device (CUDA) asynchronously.
+            """
+            weight_indices = [0] * len(forward_batch.lora_paths)
+            lora_ranks = [0] * self.max_loras_per_batch
+            scalings = [0] * self.max_loras_per_batch
+            for i, lora_path in enumerate(forward_batch.lora_paths):
+                weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
+                if lora_path is not None:
+                    lora = self.loras[lora_path]
+                    lora_ranks[weight_indices[i]] = lora.config.hf_config["r"]
+                    scalings[weight_indices[i]] = lora.scaling
+
+            # Use pinned memory to avoid synchronizations during host-to-device transfer
+            weight_indices_tensor = torch.tensor(
+                weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"
+            )
+            lora_ranks_tensor = torch.tensor(
+                lora_ranks, dtype=torch.int32, pin_memory=True, device="cpu"
+            )
+            scalings_tensor = torch.tensor(
+                scalings, dtype=torch.float, pin_memory=True, device="cpu"
+            )
+
+            # Copy to device tensors asynchronously
+            weight_indices_out[:bs].copy_(weight_indices_tensor, non_blocking=True)
+            lora_ranks_out[: self.max_loras_per_batch].copy_(
+                lora_ranks_tensor, non_blocking=True
+            )
+            scalings_out[: self.max_loras_per_batch].copy_(
+                scalings_tensor, non_blocking=True
+            )
+
         if (
             hasattr(self, "max_bs_in_cuda_graph")
             and bs <= self.max_bs_in_cuda_graph
@@ -163,51 +216,46 @@ class LoRAManager:
         ):
             # Do in-place updates when CUDA graph is enabled and the batch forward mode
             # could use CUDA graph.
-            self.cuda_graph_batch_info.bs = bs
-            self.cuda_graph_batch_info.seg_lens[:bs].fill_(1)
-            torch.cumsum(
-                self.cuda_graph_batch_info.seg_lens[:bs],
-                dim=0,
-                out=self.cuda_graph_batch_info.seg_indptr[1 : bs + 1],
-            )
-            self.cuda_graph_batch_info.max_len = 1
 
-            for i, lora_path in enumerate(forward_batch.lora_paths):
-                self.cuda_graph_batch_info.weight_indices[i] = (
-                    self.memory_pool.get_buffer_id(lora_path)
-                )
-                if lora_path is not None:
-                    lora = self.loras[lora_path]
-                    self.cuda_graph_batch_info.lora_ranks[
-                        self.cuda_graph_batch_info.weight_indices[i]
-                    ] = lora.config.hf_config["r"]
-                    self.cuda_graph_batch_info.scalings[
-                        self.cuda_graph_batch_info.weight_indices[i]
-                    ] = lora.scaling
+            transfer_adapter_info(
+                self.cuda_graph_batch_info.weight_indices,
+                self.cuda_graph_batch_info.lora_ranks,
+                self.cuda_graph_batch_info.scalings,
+            )
+
+            self.cuda_graph_batch_info.bs = bs
+            self.cuda_graph_batch_info.max_len = 1
             batch_info = self.cuda_graph_batch_info
         else:
+            weight_indices = torch.empty((bs,), dtype=torch.int32, device=self.device)
+            lora_ranks = torch.zeros(
+                (self.max_loras_per_batch,), dtype=torch.int64, device=self.device
+            )
+            scalings = torch.zeros(
+                (self.max_loras_per_batch,), dtype=torch.float, device=self.device
+            )
+            transfer_adapter_info(
+                weight_indices,
+                lora_ranks,
+                scalings,
+            )
+
             seg_lens = (
                 forward_batch.extend_seq_lens
                 if forward_batch.forward_mode.is_extend()
                 else torch.ones(bs, device=self.device)
             )
+
+            max_len = (
+                # Calculate max_len from the CPU copy to avoid D2H transfer.
+                max(forward_batch.extend_seq_lens_cpu)
+                if forward_batch.forward_mode.is_extend()
+                else 1
+            )
+
             seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
             seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
-            max_len = int(torch.max(seg_lens))
-            weight_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
 
-            lora_ranks = torch.zeros(
-                (self.max_loras_per_batch,), dtype=torch.int64, device="cuda"
-            )
-            scalings = torch.zeros(
-                (self.max_loras_per_batch,), dtype=torch.float, device="cuda"
-            )
-            for i, lora_path in enumerate(forward_batch.lora_paths):
-                weight_indices[i] = self.memory_pool.get_buffer_id(lora_path)
-                if lora_path is not None:
-                    lora = self.loras[lora_path]
-                    lora_ranks[weight_indices[i]] = lora.config.hf_config["r"]
-                    scalings[weight_indices[i]] = lora.scaling
             batch_info = LoRABatchInfo(
                 bs=bs,
                 seg_lens=seg_lens,
@@ -263,7 +311,18 @@ class LoRAManager:
         self.lora_modules: Dict[int, List[Tuple[str, BaseLayerWithLoRA]]] = {
             i: [] for i in range(self.base_hf_config.num_hidden_layers)
         }
+
         for module_name, module in self.base_model.named_modules():
+            # TODO (lifuhuang): in the future, we should consider generalizing the
+            # should_apply_lora function to support mapping by full module name instead
+            # of just the last part (e.g., "qkv_proj") to support scenarios with multiple
+            # attention stacks (e.g., multimodal models).
+            # See: https://github.com/sgl-project/sglang/issues/6608
+            if getattr(
+                self.base_model, "should_apply_lora", None
+            ) and not self.base_model.should_apply_lora(module_name):
+                continue
+
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in customized_target_names:
                 layer_id = get_layer_id(module_name)
