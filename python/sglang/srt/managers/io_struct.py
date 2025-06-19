@@ -226,11 +226,11 @@ class GenerateReqInput:
 
         # Expand input based on type
         self._expand_inputs(num)
+        self._normalize_rid(num)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
-        self._normalize_rid(num)
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
 
