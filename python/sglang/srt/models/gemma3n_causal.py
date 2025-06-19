@@ -30,16 +30,19 @@ from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
-    ColumnParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -86,6 +89,7 @@ class Gemma3nTextScaledWordEmbedding(VocabParallelEmbedding):
     """
     This module overrides VocabParallelEmbedding's forward by multiplying with embeddings scale.
     """
+
     def __init__(
         self,
         num_embeddings: int,
@@ -93,7 +97,6 @@ class Gemma3nTextScaledWordEmbedding(VocabParallelEmbedding):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         org_num_embeddings: Optional[int] = None,
-        padding_idx: Optional[int] = None,
         embed_scale: float = 1.0,
     ):
         super().__init__(
@@ -102,7 +105,6 @@ class Gemma3nTextScaledWordEmbedding(VocabParallelEmbedding):
             quant_config=quant_config,
             prefix=prefix,
             org_num_embeddings=org_num_embeddings,
-            padding_idx=padding_idx,
         )
         self.embed_scale = embed_scale
 
@@ -147,21 +149,23 @@ class Gemma3nMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        
+
         # Split gate and up projections
         gate_proj, up_proj = gate_up.chunk(2, dim=-1)
-        
+
         # Apply activation sparsity if needed
         if self.activation_sparsity > 0.0 and self.training:
             gate_proj = self._gaussian_topk(gate_proj)
-        
+
         # Combine with up_proj after activation
         x = self.act_fn(torch.cat([gate_proj, up_proj], dim=-1))
         x, _ = self.down_proj(x)
         return x
-    
+
     def _gaussian_topk(self, inputs: torch.Tensor) -> torch.Tensor:
-        target_sparsity_tensor = torch.tensor(self.activation_sparsity, dtype=torch.float32, device=inputs.device)
+        target_sparsity_tensor = torch.tensor(
+            self.activation_sparsity, dtype=torch.float32, device=inputs.device
+        )
         normal_dist = torch.distributions.normal.Normal(0, 1)
         std_multiplier = normal_dist.icdf(target_sparsity_tensor)
         std_multiplier = std_multiplier.type(inputs.dtype)
@@ -174,20 +178,25 @@ class Gemma3nMLP(nn.Module):
 class Gemma3nLaurelBlock(nn.Module):
     """Learned Augmented Residual Layer"""
 
-    def __init__(self, config: Gemma3nTextConfig, quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
+    def __init__(
+        self,
+        config: Gemma3nTextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.config = config
 
         self.linear_left = ColumnParallelLinear(
-            config.hidden_size, 
-            config.laurel_rank, 
+            config.hidden_size,
+            config.laurel_rank,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("linear_left", prefix),
         )
         self.linear_right = RowParallelLinear(
-            config.laurel_rank, 
-            config.hidden_size, 
+            config.laurel_rank,
+            config.hidden_size,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("linear_right", prefix),
@@ -209,28 +218,35 @@ class Gemma3nLaurelBlock(nn.Module):
 class Gemma3nAltUp(nn.Module):
     """Alternating Updates (AltUp)"""
 
-    def __init__(self, config: Gemma3nTextConfig, quant_config: Optional[QuantizationConfig] = None, prefix: str = ""):
+    def __init__(
+        self,
+        config: Gemma3nTextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.config = config
 
-        self.correct_output_scale = nn.Parameter(torch.zeros(config.hidden_size, dtype=torch.float32))
+        self.correct_output_scale = nn.Parameter(
+            torch.zeros(config.hidden_size, dtype=torch.float32)
+        )
         self.correction_coefs = ColumnParallelLinear(
-            config.altup_num_inputs, 
-            config.altup_num_inputs, 
+            config.altup_num_inputs,
+            config.altup_num_inputs,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("correction_coefs", prefix),
         )
         self.prediction_coefs = ColumnParallelLinear(
-            config.altup_num_inputs, 
-            config.altup_num_inputs**2, 
+            config.altup_num_inputs,
+            config.altup_num_inputs**2,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("prediction_coefs", prefix),
         )
         self.modality_router = ColumnParallelLinear(
-            config.hidden_size, 
-            config.altup_num_inputs, 
+            config.hidden_size,
+            config.altup_num_inputs,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("modality_router", prefix),
@@ -250,16 +266,22 @@ class Gemma3nAltUp(nn.Module):
         )
 
     def compute_router_modalities(self, x: torch.Tensor) -> torch.Tensor:
-        router_inputs = self.router_norm(x) * self.router_input_scale.type(self.router_norm.weight.dtype)
+        router_inputs = self.router_norm(x) * self.router_input_scale.type(
+            self.router_norm.weight.dtype
+        )
         routed, _ = self.modality_router(router_inputs)
         return torch.tanh(routed.float())
 
     def predict(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Predicts the output of a layer using a trainable map."""
-        modalities = self.compute_router_modalities(hidden_states[self.config.altup_active_idx])
-        
+        modalities = self.compute_router_modalities(
+            hidden_states[self.config.altup_active_idx]
+        )
+
         if self.config.altup_coef_clip is not None:
-            self.prediction_coefs.weight.data.clamp_(-self.config.altup_coef_clip, self.config.altup_coef_clip)
+            self.prediction_coefs.weight.data.clamp_(
+                -self.config.altup_coef_clip, self.config.altup_coef_clip
+            )
 
         all_coefs, _ = self.prediction_coefs(modalities)
         all_coefs = all_coefs.reshape(
@@ -274,14 +296,18 @@ class Gemma3nAltUp(nn.Module):
         predictions += hidden_states  # add the original input
         return predictions.contiguous().type_as(hidden_states)
 
-    def correct(self, predictions: torch.Tensor, activated: torch.Tensor) -> torch.Tensor:
+    def correct(
+        self, predictions: torch.Tensor, activated: torch.Tensor
+    ) -> torch.Tensor:
         """Corrects the predictions relative to the activated inputs."""
         modalities = self.compute_router_modalities(activated)
         innovation = activated - predictions[self.config.altup_active_idx]
         innovation = innovation.repeat(self.config.altup_num_inputs, 1, 1, 1)
-        
+
         if self.config.altup_coef_clip is not None:
-            self.correction_coefs.weight.data.clamp_(-self.config.altup_coef_clip, self.config.altup_coef_clip)
+            self.correction_coefs.weight.data.clamp_(
+                -self.config.altup_coef_clip, self.config.altup_coef_clip
+            )
 
         all_coefs, _ = self.correction_coefs(modalities)
         all_coefs = (all_coefs + 1.0).permute(2, 0, 1).unsqueeze(-1)
@@ -294,7 +320,9 @@ class Gemma3nAltUp(nn.Module):
         """Scales the provided 3D tensor."""
         return corrected * self.correct_output_scale
 
-    def forward(self, hidden_states: torch.Tensor, activated: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, hidden_states: torch.Tensor, activated: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predicts, correct, and optionally scales the output of a layer using trainable maps."""
         predictions = self.predict(hidden_states)
         corrected = self.correct(predictions=predictions, activated=activated)
@@ -333,7 +361,9 @@ class Gemma3nAttention(nn.Module):
             assert tp_size % self.total_num_kv_heads == 0
 
         hidden_size = config.hidden_size
-        head_dim = getattr(config, "head_dim", hidden_size // config.num_attention_heads)
+        head_dim = getattr(
+            config, "head_dim", hidden_size // config.num_attention_heads
+        )
         self.head_dim = head_dim
 
         self.q_size = self.num_heads * self.head_dim
@@ -361,7 +391,9 @@ class Gemma3nAttention(nn.Module):
         self.is_sliding = config.layer_types[layer_id] == "sliding_attention"
 
         # Check if this is a KV shared layer
-        first_kv_shared_layer_idx = config.num_hidden_layers - config.num_kv_shared_layers
+        first_kv_shared_layer_idx = (
+            config.num_hidden_layers - config.num_kv_shared_layers
+        )
         self.is_kv_shared_layer = layer_id >= first_kv_shared_layer_idx
 
         # Compute the layer index from which shared KV cache values will be retrieved
@@ -396,7 +428,7 @@ class Gemma3nAttention(nn.Module):
 
         # Gemma3n adds normalization for q, k, v
         self.qkv_norm = Gemma3nRMSNorm(
-            dim=config.head_dim, 
+            dim=config.head_dim,
             eps=config.rms_norm_eps,
             scale_shift=0.0,
             with_scale=False,
@@ -427,7 +459,7 @@ class Gemma3nAttention(nn.Module):
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
             k = k.transpose(0, 1).unsqueeze(0)
             k = self.qkv_norm(k)
-            
+
             v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
             v = v.transpose(0, 1).unsqueeze(0)
             v = self.qkv_norm(v)
@@ -444,9 +476,13 @@ class Gemma3nAttention(nn.Module):
             v = v.permute(0, 2, 1, 3)
 
         attn_output = self.attn(
-            q, k, v, 
+            q,
+            k,
+            v,
             forward_batch=forward_batch,
-            kv_shared_layer_idx=self.kv_shared_layer_index if self.is_kv_shared_layer else None,
+            kv_shared_layer_idx=(
+                self.kv_shared_layer_index if self.is_kv_shared_layer else None
+            ),
         )
 
         # Compatible with triton backend which returns [1, s, h, head_dim]
@@ -462,7 +498,9 @@ class Gemma3nRotaryEmbedding(nn.Module):
     def __init__(self, config: Gemma3nTextConfig, device=None):
         super().__init__()
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+            self.rope_type = config.rope_scaling.get(
+                "rope_type", config.rope_scaling.get("type")
+            )
         else:
             self.rope_type = "default"
         self.max_seq_len_cached = config.max_position_embeddings
@@ -534,7 +572,7 @@ class Gemma3nDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
         self.attention_type = config.layer_types[layer_id]
-        
+
         self.self_attn = Gemma3nAttention(
             layer_id=layer_id,
             config=config,
@@ -542,7 +580,7 @@ class Gemma3nDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
-        
+
         activation_sparsity = config.activation_sparsity_pattern[layer_id]
         self.mlp = Gemma3nMLP(
             hidden_size=self.hidden_size,
@@ -552,7 +590,7 @@ class Gemma3nDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
-        
+
         self.input_layernorm = Gemma3nRMSNorm(
             self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
         )
@@ -568,19 +606,23 @@ class Gemma3nDecoderLayer(nn.Module):
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
 
-        self.altup = Gemma3nAltUp(config, quant_config, prefix=add_prefix("altup", prefix))
-        self.laurel = Gemma3nLaurelBlock(config, quant_config, prefix=add_prefix("laurel", prefix))
-        
+        self.altup = Gemma3nAltUp(
+            config, quant_config, prefix=add_prefix("altup", prefix)
+        )
+        self.laurel = Gemma3nLaurelBlock(
+            config, quant_config, prefix=add_prefix("laurel", prefix)
+        )
+
         self.per_layer_input_gate = ColumnParallelLinear(
-            self.hidden_size, 
-            self.hidden_size_per_layer_input, 
+            self.hidden_size,
+            self.hidden_size_per_layer_input,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("per_layer_input_gate", prefix),
         )
         self.per_layer_projection = RowParallelLinear(
-            self.hidden_size_per_layer_input, 
-            self.hidden_size, 
+            self.hidden_size_per_layer_input,
+            self.hidden_size,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("per_layer_projection", prefix),
@@ -657,8 +699,6 @@ class Gemma3nTextModel(PreTrainedModel):
         super().__init__(config=config)
         self.config = config
         self.quant_config = quant_config
-
-        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         # Gemma3n downcasts the below to float16, causing sqrt(3072)=55.4256 to become 55.5
@@ -667,7 +707,6 @@ class Gemma3nTextModel(PreTrainedModel):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("embed_tokens", prefix),
-            padding_idx=self.padding_idx,
             embed_scale=self.config.hidden_size**0.5,
         )
 
@@ -677,7 +716,7 @@ class Gemma3nTextModel(PreTrainedModel):
             scale_shift=0.0,
             with_scale=True,
         )
-        
+
         self.rotary_emb = Gemma3nRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
@@ -707,7 +746,6 @@ class Gemma3nTextModel(PreTrainedModel):
             config.num_hidden_layers * config.hidden_size_per_layer_input,
             quant_config=quant_config,
             prefix=add_prefix("embed_tokens_per_layer", prefix),
-            padding_idx=self.padding_idx,
             embed_scale=config.hidden_size_per_layer_input**0.5,
         )
 
@@ -726,34 +764,48 @@ class Gemma3nTextModel(PreTrainedModel):
             with_scale=True,
         )
 
-        self.altup_projections = nn.ModuleList([
-            ColumnParallelLinear(
-                self.hidden_size, 
-                self.hidden_size, 
+        self.altup_projections = make_layers(
+            self.config.altup_num_inputs - 1,
+            lambda idx, prefix: ColumnParallelLinear(
+                self.hidden_size,
+                self.hidden_size,
                 bias=False,
                 quant_config=quant_config,
-                prefix=add_prefix(f"altup_projections.{i}", prefix),
-            ) for i in range(1, self.config.altup_num_inputs)
-        ])
+                prefix=prefix,
+            ),
+            prefix=add_prefix("altup_projections", prefix),
+        )
 
-        self.altup_unembed_projections = nn.ModuleList([
-            ColumnParallelLinear(
-                self.hidden_size, 
-                self.hidden_size, 
+        self.altup_unembed_projections = make_layers(
+            self.config.altup_num_inputs - 1,
+            lambda idx, prefix: ColumnParallelLinear(
+                self.hidden_size,
+                self.hidden_size,
                 bias=False,
                 quant_config=quant_config,
-                prefix=add_prefix(f"altup_unembed_projections.{i}", prefix),
-            ) for i in range(1, self.config.altup_num_inputs)
-        ])
+                prefix=prefix,
+            ),
+            prefix=add_prefix("altup_unembed_projections", prefix),
+        )
 
-        self.register_buffer("per_layer_projection_scale", torch.tensor(self.hidden_size**-0.5), persistent=False)
-        self.register_buffer("per_layer_input_scale", torch.rsqrt(torch.tensor(2.0)), persistent=False)
+        self.register_buffer(
+            "per_layer_projection_scale",
+            torch.tensor(self.hidden_size**-0.5),
+            persistent=False,
+        )
+        self.register_buffer(
+            "per_layer_input_scale", torch.rsqrt(torch.tensor(2.0)), persistent=False
+        )
 
         self.post_init()
 
     def get_per_layer_inputs(self, input_ids: torch.LongTensor) -> torch.Tensor:
-        per_layer_inputs_mask = torch.logical_and(input_ids >= 0, input_ids < self.vocab_size)
-        tokens = torch.where(per_layer_inputs_mask, input_ids, torch.zeros_like(input_ids))
+        per_layer_inputs_mask = torch.logical_and(
+            input_ids >= 0, input_ids < self.vocab_size
+        )
+        tokens = torch.where(
+            per_layer_inputs_mask, input_ids, torch.zeros_like(input_ids)
+        )
         embeddings = self.embed_tokens_per_layer(tokens)
         return embeddings.reshape(
             *input_ids.shape,
@@ -767,7 +819,9 @@ class Gemma3nTextModel(PreTrainedModel):
         per_layer_inputs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         per_layer_projection, _ = self.per_layer_model_projection(inputs_embeds)
-        per_layer_projection *= self.per_layer_projection_scale.type(inputs_embeds.dtype)
+        per_layer_projection *= self.per_layer_projection_scale.type(
+            inputs_embeds.dtype
+        )
         per_layer_projection = per_layer_projection.reshape(
             *inputs_embeds.shape[:-1],
             self.config.num_hidden_layers,
@@ -782,7 +836,9 @@ class Gemma3nTextModel(PreTrainedModel):
             # per-layer inputs are sometimes padded with zeros, slice the relevant embeddings
             per_layer_inputs = per_layer_inputs[..., : self.config.num_hidden_layers, :]
 
-        return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale.type(inputs_embeds.dtype)
+        return (
+            per_layer_projection + per_layer_inputs
+        ) * self.per_layer_input_scale.type(inputs_embeds.dtype)
 
     def forward(
         self,
@@ -801,7 +857,9 @@ class Gemma3nTextModel(PreTrainedModel):
         if per_layer_inputs is None and input_ids is not None:
             per_layer_inputs = self.get_per_layer_inputs(input_ids)
 
-        per_layer_inputs = self.project_per_layer_inputs(hidden_states, per_layer_inputs)
+        per_layer_inputs = self.project_per_layer_inputs(
+            hidden_states, per_layer_inputs
+        )
 
         if positions.dim() == 1:
             positions = positions.unsqueeze(0)
@@ -819,10 +877,16 @@ class Gemma3nTextModel(PreTrainedModel):
         for i in range(1, self.config.altup_num_inputs):
             altup_proj, _ = self.altup_projections[i - 1](hidden_states_list[i])
             hidden_states_list[i] = altup_proj.type(hidden_states.dtype)
-            new_magnitude = torch.mean(hidden_states_list[i] ** 2, dim=-1, keepdim=True) ** 0.5
-            hidden_states_list[i] *= target_magnitude / torch.maximum(new_magnitude, epsilon_tensor)
+            new_magnitude = (
+                torch.mean(hidden_states_list[i] ** 2, dim=-1, keepdim=True) ** 0.5
+            )
+            hidden_states_list[i] *= target_magnitude / torch.maximum(
+                new_magnitude, epsilon_tensor
+            )
 
-        hidden_states = torch.stack(hidden_states_list, dim=0)  # [num_altup_inputs, batch, seq_len, hidden_size]
+        hidden_states = torch.stack(
+            hidden_states_list, dim=0
+        )  # [num_altup_inputs, batch, seq_len, hidden_size]
 
         for layer_idx, layer in enumerate(self.layers):
             per_layer_input = per_layer_inputs[:, :, layer_idx, :]
@@ -837,12 +901,20 @@ class Gemma3nTextModel(PreTrainedModel):
             )
 
         # Per-layer inputs to single output
-        target_magnitude = torch.mean(hidden_states[0] ** 2, dim=-1, keepdim=True) ** 0.5
+        target_magnitude = (
+            torch.mean(hidden_states[0] ** 2, dim=-1, keepdim=True) ** 0.5
+        )
         for i in range(1, self.config.altup_num_inputs):
-            altup_unemb_proj, _ = self.altup_unembed_projections[i - 1](hidden_states[i])
+            altup_unemb_proj, _ = self.altup_unembed_projections[i - 1](
+                hidden_states[i]
+            )
             hidden_states[i] = altup_unemb_proj.type(hidden_states[0].dtype)
-            new_magnitude = torch.mean(hidden_states[i] ** 2, dim=-1, keepdim=True) ** 0.5
-            hidden_states[i] *= target_magnitude / torch.maximum(new_magnitude, epsilon_tensor)
+            new_magnitude = (
+                torch.mean(hidden_states[i] ** 2, dim=-1, keepdim=True) ** 0.5
+            )
+            hidden_states[i] *= target_magnitude / torch.maximum(
+                new_magnitude, epsilon_tensor
+            )
 
         hidden_states = torch.mean(hidden_states, dim=0)
         hidden_states = self.norm(hidden_states)
@@ -911,7 +983,9 @@ class Gemma3nForCausalLM(PreTrainedModel):
         self.config = config
         self.quant_config = quant_config
         self.model = Gemma3nTextModel(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config=config,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
 
@@ -946,7 +1020,12 @@ class Gemma3nForCausalLM(PreTrainedModel):
         **kwargs,
     ) -> LogitsProcessor:
         hidden_states = self.model(
-            input_ids, positions, forward_batch, input_embeds, per_layer_inputs, **kwargs
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            per_layer_inputs,
+            **kwargs,
         )
 
         return self.logits_processor(
@@ -964,7 +1043,7 @@ class Gemma3nForCausalLM(PreTrainedModel):
         ]
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
-        
+
         for name, loaded_weight in weights:
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:
