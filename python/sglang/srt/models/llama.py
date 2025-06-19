@@ -20,7 +20,6 @@ import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
-from srt.model_loader.utils import SupportsPP
 from torch import nn
 from transformers import LlamaConfig
 
@@ -48,6 +47,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.utils import SupportsPP
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
