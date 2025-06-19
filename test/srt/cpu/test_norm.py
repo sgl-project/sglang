@@ -8,6 +8,8 @@ from utils import make_non_contiguous, precision
 
 from sglang.test.test_utils import CustomTestCase
 
+torch.manual_seed(0)
+
 
 class TestNorm(CustomTestCase):
     M = [4096, 1024]
