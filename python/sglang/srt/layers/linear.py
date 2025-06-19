@@ -89,6 +89,7 @@ def adjust_scalar_to_fused_array(param, loaded_weight, shard_id):
 #  Quant-method abstractions
 # ======================================================================
 
+
 class LinearMethodBase(QuantizeMethodBase):
     @abstractmethod
     def create_weights(
@@ -149,6 +150,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
 #  Base classes – replicated / TP variants
 # ======================================================================
 
+
 class LinearBase(torch.nn.Module):
     def __init__(
         self,
@@ -174,6 +176,7 @@ class LinearBase(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # noqa: D401
         raise NotImplementedError
+
 
 class ReplicatedLinear(LinearBase):
     """Replicated linear layer.
