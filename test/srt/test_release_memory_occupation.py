@@ -15,7 +15,7 @@ and avoid OOM errors carefully. This test simulates a scenario without multi-sta
 ensuring the engine can release and resume memory occupation while maintaining functionality after
 weight updates.
 
-2. Multi-Stage Release and Resume: Employs a higher mem_fraction_static (0.9) to simulate higher
+2. Multi-Stage Release and Resume: Employs a higher mem_fraction_static (0.85) to simulate higher
 memory pressure, leveraging multi-stage memory management. It sequentially releases and resumes
 KV cache and model weights, verifying memory deallocation and reallocation at each stage, and
 ensuring correct weight updates and text generation.
@@ -147,7 +147,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             engine.shutdown()
 
     def test_multi_stage_release_and_resume(self):
-        # With multi-stage release and resume, we can set the memory fraction to 0.9 without concern of OOM
+        # With multi-stage release and resume, we can set the memory fraction to 0.85 without concern of OOM
         model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
         for tp_size in [1, 2]:
@@ -159,7 +159,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
                 model_path=model_name,
                 random_seed=42,
                 enable_memory_saver=True,
-                mem_fraction_static=0.9,  # Higher memory pressure
+                mem_fraction_static=0.85,  # Higher memory pressure
                 tp_size=tp_size,
             )
             params = self._common_test_params()
