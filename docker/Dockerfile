@@ -11,7 +11,7 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections
 
 # Deps
-RUN apt-get update &&  apt-get install -y software-properties-common netcat-openbsd  \
+RUN apt-get update &&  apt-get install -y --no-install-recommends software-properties-common netcat-openbsd  \
                         libopenmpi-dev libnuma1 \
                         lsof  zsh ccache tmux htop git-lfs tree \
                         kmod \
