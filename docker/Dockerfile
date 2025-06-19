@@ -97,23 +97,13 @@ RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six  --ignore
     && git clone --depth=1 https://github.com/sgl-project/sglang.git \
     && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
          export CUINDEX=126; \
-       elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
-         export CUINDEX=124; \
        elif [ "$CUDA_VERSION" = "12.8.1" ]; then \
-         export CUINDEX=124; \
-       elif [ "$CUDA_VERSION" = "11.8.0" ]; then \
-         export CUINDEX=118; \
-         python3 -m pip install --no-cache-dir sgl-kernel -i https://docs.sglang.ai/whl/cu118 ; \
+         export CUINDEX=128; \
        else \
          echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1; \
        fi \
-    && if [ "$CUDA_VERSION" = "12.4.1" ]; then \
-         python3 -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu126 ; \
-       else \
-         python3 -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu${CUINDEX} ; \
-       fi \
     && cd sglang \
-    && python3 -m pip --no-cache-dir install -e "python[${BUILD_TYPE}]"  \
+    && python3 -m pip --no-cache-dir install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
     && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
          python3 -m pip install nvidia-nccl-cu12==2.27.3 --force-reinstall --no-deps ; \
        fi
