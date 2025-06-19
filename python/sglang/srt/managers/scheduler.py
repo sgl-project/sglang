@@ -811,11 +811,14 @@ class Scheduler(
                                     "extend_input_len_per_req": result.extend_input_len_per_req,
                                     "extend_logprob_start_len_per_req": result.extend_logprob_start_len_per_req,
                                 }
-                                | ({
-                                    f"logits_output.{k}": v
-                                    for k, v in result.logits_output.__dict__.items()
-                                } if result.logits_output is not None else {})
-                            )
+                                | (
+                                    {
+                                        f"logits_output.{k}": v
+                                        for k, v in result.logits_output.__dict__.items()
+                                    }
+                                    if result.logits_output is not None
+                                    else {}
+                                )
                             )
                         else:
                             pp_outputs = PPProxyTensors(
