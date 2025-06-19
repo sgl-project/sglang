@@ -10,6 +10,8 @@ from sglang.srt.layers.rotary_embedding import (
 )
 from sglang.test.test_utils import CustomTestCase
 
+torch.manual_seed(0)
+
 
 class TestROPE(CustomTestCase):
     def test_deepseek_v2_rope(self):
