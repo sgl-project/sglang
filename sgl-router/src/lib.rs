@@ -42,6 +42,10 @@ struct Router {
     selector: HashMap<String, String>,
     service_discovery_port: u16,
     service_discovery_namespace: Option<String>,
+    // PD service discovery fields
+    prefill_selector: HashMap<String, String>,
+    decode_selector: HashMap<String, String>,
+    bootstrap_port_annotation: String,
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
     request_timeout_secs: u64,
@@ -74,6 +78,9 @@ impl Router {
         selector = HashMap::new(),
         service_discovery_port = 80,
         service_discovery_namespace = None,
+        prefill_selector = HashMap::new(),
+        decode_selector = HashMap::new(),
+        bootstrap_port_annotation = String::from("sglang.ai/mooncake.bootstrap-port"),
         prometheus_port = None,
         prometheus_host = None,
         request_timeout_secs = 600,  // Add configurable request timeout
@@ -100,6 +107,9 @@ impl Router {
         selector: HashMap<String, String>,
         service_discovery_port: u16,
         service_discovery_namespace: Option<String>,
+        prefill_selector: HashMap<String, String>,
+        decode_selector: HashMap<String, String>,
+        bootstrap_port_annotation: String,
         prometheus_port: Option<u16>,
         prometheus_host: Option<String>,
         request_timeout_secs: u64,
@@ -126,6 +136,9 @@ impl Router {
             selector,
             service_discovery_port,
             service_discovery_namespace,
+            prefill_selector,
+            decode_selector,
+            bootstrap_port_annotation,
             prometheus_port,
             prometheus_host,
             request_timeout_secs,
@@ -207,6 +220,11 @@ impl Router {
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
+                // PD mode configuration
+                pd_mode: self.pd_disaggregated,
+                prefill_selector: self.prefill_selector.clone(),
+                decode_selector: self.decode_selector.clone(),
+                bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
             })
         } else {
             None
