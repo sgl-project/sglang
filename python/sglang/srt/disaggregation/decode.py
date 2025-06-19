@@ -31,6 +31,7 @@ import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVPoll
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -90,7 +91,7 @@ class DecodeReqToTokenPool:
         self.max_context_len = max_context_len
         self.device = device
         self.pre_alloc_size = pre_alloc_size
-        with memory_saver_adapter.region():
+        with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
                 (size + pre_alloc_size, max_context_len),
                 dtype=torch.int32,

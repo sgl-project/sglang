@@ -38,7 +38,10 @@ from fastapi.responses import Response
 from python.sglang.srt.entrypoints.openai.serving_embedding import (
     OpenAIServingEmbedding,
 )
-from sglang.srt.disaggregation.utils import register_disaggregation_server
+from sglang.srt.disaggregation.utils import (
+    FAKE_BOOTSTRAP_HOST,
+    register_disaggregation_server,
+)
 from sglang.srt.entrypoints.engine import Engine, _launch_subprocesses
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
@@ -278,7 +281,7 @@ def _wait_and_warmup(
                     "max_new_tokens": 8,
                     "ignore_eos": True,
                 },
-                "bootstrap_host": [FakeBootstrapHost] * server_args.dp_size,
+                "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
                 # This is a hack to ensure fake transfer is enabled during prefill warmup
                 # ensure each dp rank has a unique bootstrap_room during prefill warmup
                 "bootstrap_room": [
