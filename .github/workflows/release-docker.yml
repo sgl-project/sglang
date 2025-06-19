@@ -14,10 +14,10 @@ jobs:
     environment: 'prod'
     strategy:
       matrix:
-        cuda_version: ['12.4.1', '12.8.1']
+        cuda_version: ['12.6.1', '12.8.1']
         build_type: ['all', 'blackwell']
         exclude:
-          - cuda_version: '12.4.1'
+          - cuda_version: '12.6.1'
             build_type: 'blackwell'
     steps:
       - name: Delete huge unnecessary tools folder
@@ -44,6 +44,8 @@ jobs:
             cuda_tag="cu124"
           elif [ "${{ matrix.cuda_version }}" = "12.5.1" ]; then
             cuda_tag="cu125"
+          elif [ "${{ matrix.cuda_version }}" = "12.6.1" ]; then
+            cuda_tag="cu126"
           elif [ "${{ matrix.cuda_version }}" = "12.8.1" ]; then
             cuda_tag="cu128"
           else
