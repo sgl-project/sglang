@@ -1,176 +1,101 @@
 """
-Tests for the refactored completions serving handler
+Unit-tests for the refactored completions-serving handler (no pytest).
+Run with:
+    python -m unittest tests.test_serving_completions_unit -v
 """
 
+import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-import pytest
-
-from sglang.srt.entrypoints.openai.protocol import (
-    CompletionRequest,
-    CompletionResponse,
-    CompletionResponseChoice,
-    CompletionStreamResponse,
-    ErrorResponse,
-)
+from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
-from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 
-@pytest.fixture
-def mock_tokenizer_manager():
-    """Create a mock tokenizer manager"""
-    manager = Mock(spec=TokenizerManager)
+class ServingCompletionTestCase(unittest.TestCase):
+    """Bundle all prompt/echo tests in one TestCase."""
 
-    # Mock tokenizer
-    manager.tokenizer = Mock()
-    manager.tokenizer.encode = Mock(return_value=[1, 2, 3, 4])
-    manager.tokenizer.decode = Mock(return_value="decoded text")
-    manager.tokenizer.bos_token_id = 1
+    # ---------- shared test fixtures ----------
+    def setUp(self):
+        # build the mock TokenizerManager once for every test
+        tm = Mock(spec=TokenizerManager)
 
-    # Mock model config
-    manager.model_config = Mock()
-    manager.model_config.is_multimodal = False
+        tm.tokenizer = Mock()
+        tm.tokenizer.encode.return_value = [1, 2, 3, 4]
+        tm.tokenizer.decode.return_value = "decoded text"
+        tm.tokenizer.bos_token_id = 1
 
-    # Mock server args
-    manager.server_args = Mock()
-    manager.server_args.enable_cache_report = False
+        tm.model_config = Mock(is_multimodal=False)
+        tm.server_args = Mock(enable_cache_report=False)
 
-    # Mock generation
-    manager.generate_request = AsyncMock()
-    manager.create_abort_task = Mock(return_value=None)
+        tm.generate_request = AsyncMock()
+        tm.create_abort_task = Mock()
 
-    return manager
+        self.sc = OpenAIServingCompletion(tm)
 
+    # ---------- prompt-handling ----------
+    def test_single_string_prompt(self):
+        req = CompletionRequest(model="x", prompt="Hello world", max_tokens=100)
+        internal, _ = self.sc._convert_to_internal_request([req], ["id"])
+        self.assertEqual(internal.text, "Hello world")
 
-@pytest.fixture
-def serving_completion(mock_tokenizer_manager):
-    """Create a OpenAIServingCompletion instance"""
-    return OpenAIServingCompletion(mock_tokenizer_manager)
+    def test_single_token_ids_prompt(self):
+        req = CompletionRequest(model="x", prompt=[1, 2, 3, 4], max_tokens=100)
+        internal, _ = self.sc._convert_to_internal_request([req], ["id"])
+        self.assertEqual(internal.input_ids, [1, 2, 3, 4])
 
-
-class TestPromptHandling:
-    """Test different prompt types and formats from adapter.py"""
-
-    def test_single_string_prompt(self, serving_completion):
-        """Test handling single string prompt"""
-        request = CompletionRequest(
-            model="test-model", prompt="Hello world", max_tokens=100
+    def test_completion_template_handling(self):
+        req = CompletionRequest(
+            model="x", prompt="def f():", suffix="return 1", max_tokens=100
         )
-
-        adapted_request, _ = serving_completion._convert_to_internal_request(
-            [request], ["test-id"]
-        )
-
-        assert adapted_request.text == "Hello world"
-
-    def test_single_token_ids_prompt(self, serving_completion):
-        """Test handling single token IDs prompt"""
-        request = CompletionRequest(
-            model="test-model", prompt=[1, 2, 3, 4], max_tokens=100
-        )
-
-        adapted_request, _ = serving_completion._convert_to_internal_request(
-            [request], ["test-id"]
-        )
-
-        assert adapted_request.input_ids == [1, 2, 3, 4]
-
-    def test_completion_template_handling(self, serving_completion):
-        """Test completion template processing"""
-        request = CompletionRequest(
-            model="test-model",
-            prompt="def hello():",
-            suffix="return 'world'",
-            max_tokens=100,
-        )
-
         with patch(
             "sglang.srt.entrypoints.openai.serving_completions.is_completion_template_defined",
             return_value=True,
+        ), patch(
+            "sglang.srt.entrypoints.openai.serving_completions.generate_completion_prompt_from_request",
+            return_value="processed_prompt",
         ):
-            with patch(
-                "sglang.srt.entrypoints.openai.serving_completions.generate_completion_prompt_from_request",
-                return_value="processed_prompt",
-            ):
-                adapted_request, _ = serving_completion._convert_to_internal_request(
-                    [request], ["test-id"]
-                )
+            internal, _ = self.sc._convert_to_internal_request([req], ["id"])
+            self.assertEqual(internal.text, "processed_prompt")
 
-                assert adapted_request.text == "processed_prompt"
+    # ---------- echo-handling ----------
+    def test_echo_with_string_prompt_streaming(self):
+        req = CompletionRequest(model="x", prompt="Hello", max_tokens=1, echo=True)
+        self.assertEqual(self.sc._get_echo_text(req, 0), "Hello")
 
-
-class TestEchoHandling:
-    """Test echo functionality from adapter.py"""
-
-    def test_echo_with_string_prompt_streaming(self, serving_completion):
-        """Test echo handling with string prompt in streaming"""
-        request = CompletionRequest(
-            model="test-model", prompt="Hello", max_tokens=100, echo=True
+    def test_echo_with_list_of_strings_streaming(self):
+        req = CompletionRequest(
+            model="x", prompt=["A", "B"], max_tokens=1, echo=True, n=1
         )
+        self.assertEqual(self.sc._get_echo_text(req, 0), "A")
+        self.assertEqual(self.sc._get_echo_text(req, 1), "B")
 
-        # Test _get_echo_text method
-        echo_text = serving_completion._get_echo_text(request, 0)
-        assert echo_text == "Hello"
+    def test_echo_with_token_ids_streaming(self):
+        req = CompletionRequest(model="x", prompt=[1, 2, 3], max_tokens=1, echo=True)
+        self.sc.tokenizer_manager.tokenizer.decode.return_value = "decoded_prompt"
+        self.assertEqual(self.sc._get_echo_text(req, 0), "decoded_prompt")
 
-    def test_echo_with_list_of_strings_streaming(self, serving_completion):
-        """Test echo handling with list of strings in streaming"""
-        request = CompletionRequest(
-            model="test-model",
-            prompt=["Hello", "World"],
-            max_tokens=100,
-            echo=True,
-            n=1,
+    def test_echo_with_multiple_token_ids_streaming(self):
+        req = CompletionRequest(
+            model="x", prompt=[[1, 2], [3, 4]], max_tokens=1, echo=True, n=1
         )
+        self.sc.tokenizer_manager.tokenizer.decode.return_value = "decoded"
+        self.assertEqual(self.sc._get_echo_text(req, 0), "decoded")
 
-        echo_text = serving_completion._get_echo_text(request, 0)
-        assert echo_text == "Hello"
+    def test_prepare_echo_prompts_non_streaming(self):
+        # single string
+        req = CompletionRequest(model="x", prompt="Hi", echo=True)
+        self.assertEqual(self.sc._prepare_echo_prompts(req), ["Hi"])
 
-        echo_text = serving_completion._get_echo_text(request, 1)
-        assert echo_text == "World"
+        # list of strings
+        req = CompletionRequest(model="x", prompt=["Hi", "Yo"], echo=True)
+        self.assertEqual(self.sc._prepare_echo_prompts(req), ["Hi", "Yo"])
 
-    def test_echo_with_token_ids_streaming(self, serving_completion):
-        """Test echo handling with token IDs in streaming"""
-        request = CompletionRequest(
-            model="test-model", prompt=[1, 2, 3], max_tokens=100, echo=True
-        )
+        # token IDs
+        req = CompletionRequest(model="x", prompt=[1, 2, 3], echo=True)
+        self.sc.tokenizer_manager.tokenizer.decode.return_value = "decoded"
+        self.assertEqual(self.sc._prepare_echo_prompts(req), ["decoded"])
 
-        serving_completion.tokenizer_manager.tokenizer.decode.return_value = (
-            "decoded_prompt"
-        )
-        echo_text = serving_completion._get_echo_text(request, 0)
-        assert echo_text == "decoded_prompt"
 
-    def test_echo_with_multiple_token_ids_streaming(self, serving_completion):
-        """Test echo handling with multiple token ID prompts in streaming"""
-        request = CompletionRequest(
-            model="test-model", prompt=[[1, 2], [3, 4]], max_tokens=100, echo=True, n=1
-        )
-
-        serving_completion.tokenizer_manager.tokenizer.decode.return_value = "decoded"
-        echo_text = serving_completion._get_echo_text(request, 0)
-        assert echo_text == "decoded"
-
-    def test_prepare_echo_prompts_non_streaming(self, serving_completion):
-        """Test prepare echo prompts for non-streaming response"""
-        # Test with single string
-        request = CompletionRequest(model="test-model", prompt="Hello", echo=True)
-
-        echo_prompts = serving_completion._prepare_echo_prompts(request)
-        assert echo_prompts == ["Hello"]
-
-        # Test with list of strings
-        request = CompletionRequest(
-            model="test-model", prompt=["Hello", "World"], echo=True
-        )
-
-        echo_prompts = serving_completion._prepare_echo_prompts(request)
-        assert echo_prompts == ["Hello", "World"]
-
-        # Test with token IDs
-        request = CompletionRequest(model="test-model", prompt=[1, 2, 3], echo=True)
-
-        serving_completion.tokenizer_manager.tokenizer.decode.return_value = "decoded"
-        echo_prompts = serving_completion._prepare_echo_prompts(request)
-        assert echo_prompts == ["decoded"]
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
