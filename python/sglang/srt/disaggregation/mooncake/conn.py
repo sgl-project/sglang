@@ -17,7 +17,6 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import numpy.typing as npt
 import requests
-from python.sglang.srt.metrics.collector import SchedulerMetricsCollector
 import zmq
 from aiohttp import web
 
@@ -46,6 +45,7 @@ from sglang.srt.utils import (
     is_valid_ipv6_address,
     maybe_wrap_ipv6_address,
 )
+from sglang.srt.metrics.collector import SchedulerMetricsCollector
 
 logger = logging.getLogger(__name__)
 
