@@ -1240,60 +1240,47 @@ class MHATokenToKVPoolDisk(DiskKVCache):
         self.kv_buffer[:, :, indices] = flat_data
 
     def write_page_all_layers(self, disk_indices, device_indices, device_pool):
-        # TODO: fix
-        # device_indices[:: self.page_size].cpu() may return different values
-        # tmp fix --disable-overlap-schedule
         device_page_indices = device_indices[:: self.page_size]
         device_indices_cpu = device_page_indices.cpu()
         for i in range(len(device_indices_cpu)):
             h_index = disk_indices[i * self.page_size]
             d_index = device_indices_cpu[i]
-            try:
-                for j in range(self.layer_num):
-                    self.kv_buffer[0, j, h_index : h_index + self.page_size].copy_(
-                        device_pool.k_buffer[j][d_index : d_index + self.page_size],
-                        non_blocking=True,
-                    )
-                    self.kv_buffer[1, j, h_index : h_index + self.page_size].copy_(
-                        device_pool.v_buffer[j][d_index : d_index + self.page_size],
-                        non_blocking=True,
-                    )
-            except Exception as e:
-                logger.error(
-                    f"disk write_page_all_layers {e=}, {h_index=}, {d_index=}, {self.page_size=}, {device_indices=}, {device_indices_cpu=}"
+            for j in range(self.layer_num):
+                self.kv_buffer[0, j, h_index : h_index + self.page_size].copy_(
+                    device_pool.k_buffer[j][d_index : d_index + self.page_size],
+                    non_blocking=True,
                 )
-                raise e
+                self.kv_buffer[1, j, h_index : h_index + self.page_size].copy_(
+                    device_pool.v_buffer[j][d_index : d_index + self.page_size],
+                    non_blocking=True,
+                )
 
     def load_page_per_layer(self, disk_indices, device_indices, device_pool, layer_id):
         device_page_indices = device_indices[:: self.page_size]
         device_indices_cpu = device_page_indices.cpu()
-        try:
-            for i in range(len(device_indices_cpu)):
-                h_index = disk_indices[i * self.page_size]
-                d_index = device_indices_cpu[i]
-                device_pool.k_buffer[layer_id - self.start_layer][
-                    d_index : d_index + self.page_size
-                ].copy_(
-                    self.kv_buffer[
-                        0,
-                        layer_id - self.start_layer,
-                        h_index : h_index + self.page_size,
-                    ],
-                    non_blocking=True,
-                )
-                device_pool.v_buffer[layer_id - self.start_layer][
-                    d_index : d_index + self.page_size
-                ].copy_(
-                    self.kv_buffer[
-                        1,
-                        layer_id - self.start_layer,
-                        h_index : h_index + self.page_size,
-                    ],
-                    non_blocking=True,
-                )
-        except Exception as e:
-            logger.error(f"disk load_page_per_layer {traceback.format_exc}")
-            raise e
+        for i in range(len(device_indices_cpu)):
+            h_index = disk_indices[i * self.page_size]
+            d_index = device_indices_cpu[i]
+            device_pool.k_buffer[layer_id - self.start_layer][
+                d_index : d_index + self.page_size
+            ].copy_(
+                self.kv_buffer[
+                    0,
+                    layer_id - self.start_layer,
+                    h_index : h_index + self.page_size,
+                ],
+                non_blocking=True,
+            )
+            device_pool.v_buffer[layer_id - self.start_layer][
+                d_index : d_index + self.page_size
+            ].copy_(
+                self.kv_buffer[
+                    1,
+                    layer_id - self.start_layer,
+                    h_index : h_index + self.page_size,
+                ],
+                non_blocking=True,
+            )
 
 
 class MLATokenToKVPoolDisk(DiskKVCache):
@@ -1344,9 +1331,6 @@ class MLATokenToKVPoolDisk(DiskKVCache):
         self.kv_buffer[:, indices] = flat_data
 
     def write_page_all_layers(self, disk_indices, device_indices, device_pool):
-        # TODO: fix
-        # device_indices[:: self.page_size].cpu() may return different values
-        # tmp fix --disable-overlap-schedule
         device_page_indices = device_indices[:: self.page_size]
         device_indices_cpu = device_page_indices.cpu()
         for i in range(len(device_indices_cpu)):
