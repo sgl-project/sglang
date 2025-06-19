@@ -68,6 +68,7 @@ RUN apt-get update &&  apt-get install -y --no-install-recommends software-prope
                         libfabric-dev \
                         python3 \
                         python3-pip \
+                        wget \
                         && rm -rf /var/lib/apt/lists/* \
                         && ln -s /usr/bin/python3 /usr/bin/python \
                         && apt clean
