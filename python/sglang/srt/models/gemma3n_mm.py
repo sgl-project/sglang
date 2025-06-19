@@ -17,6 +17,7 @@
 
 import logging
 from functools import lru_cache
+import re
 from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict
 
 import torch
@@ -46,11 +47,9 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.gemma3n_audio import Gemma3nAudioEncoder
 from sglang.srt.models.gemma3n_causal import (
-    Gemma3nForCausalLM,
     Gemma3nRMSNorm,
-    Gemma3nTextScaledWordEmbedding,
+    Gemma3nTextModel,
 )
-from sglang.srt.models.siglip import SiglipVisionModel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -295,7 +294,9 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         super().__init__(config=config)
         self.config = config
         self.quant_config = quant_config
-
+        print(f"DEBUG: prefix: {prefix}")
+        prefix = add_prefix("model", prefix)
+        
         # Vision components
         # TODO: Use sglang's vision model
         self.vision_tower = AutoModel.from_config(config=config.vision_config)
@@ -327,15 +328,15 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         self.vocab_size = config.text_config.vocab_size
 
         # Text model
-        self.language_model = Gemma3nForCausalLM(
+        self.language_model = Gemma3nTextModel(
             config.text_config,
             quant_config,
             prefix=add_prefix("language_model", prefix),
         )
 
-        if self.language_model.logits_processor.logit_scale:
-            logit_scale = getattr(config, "logit_scale", 1.0)
-            self.language_model.logits_processor.logit_scale *= logit_scale
+        # if self.language_model.logits_processor.logit_scale:
+        #     logit_scale = getattr(config, "logit_scale", 1.0)
+        #     self.language_model.logits_processor.logit_scale *= logit_scale
 
         self.post_init()
 
@@ -558,8 +559,8 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
-            ("gate_up_proj", "up_proj", 1),
-            ("gate_up_proj", "gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+            (".gate_up_proj", ".gate_proj", 0),
         ]
         """Load weights for the model."""
         params_dict = dict(self.named_parameters())
@@ -567,41 +568,42 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
-            if "language_model" in name:
-                causal_loaded_params = Gemma3nForCausalLM.load_weights(
-                    self, [(name, loaded_weight)]
-                )
-                loaded_params.update(causal_loaded_params)
-                continue
+            name = re.sub(r"^model\.", "", name)
+            # if "language_model" in name:
+            #     causal_loaded_params = Gemma3nForCausalLM.load_weights(
+            #         self, [(name, loaded_weight)]
+            #     )
+            #     loaded_params.update(causal_loaded_params)
+            #     continue
+            # else:
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
             else:
-                for param_name, weight_name, shard_id in stacked_params_mapping:
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    # Skip loading extra bias for GPTQ models
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
-                    break
-                else:
-                    if "vision_model" in name:
-                        # adapt to VisionAttention
-                        name = name.replace(".self_attn.out_proj", ".self_attn.proj")
-                    # Skip loading extra bias for GPTQ models
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    # Remapping the name of FP8 kv-scale
-                    name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                loaded_params.add(name)
+                if "vision_model" in name:
+                    # adapt to VisionAttention
+                    name = name.replace(".self_attn.out_proj", ".self_attn.proj")
+                # Skip loading extra bias for GPTQ models
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Remapping the name of FP8 kv-scale
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
+                )
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
         return loaded_params
 
 

@@ -22,7 +22,7 @@ from transformers import Gemma3nAudioConfig, PreTrainedModel
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear, QKVParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.models.gemma3n_causal import Gemma3nRMSNorm
 from sglang.srt.utils import add_prefix, make_layers
@@ -303,26 +303,14 @@ class Gemma3nAudioAttention(nn.Module):
         )
         self.per_dim_scale = nn.Parameter(torch.zeros((self.head_dim,)))
 
-        self.q_proj = ColumnParallelLinear(
+        self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
-            self.num_heads * self.head_dim,
+            self.head_dim,
+            self.num_heads,
+            self.num_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("q_proj", prefix),
-        )
-        self.k_proj = ColumnParallelLinear(
-            self.hidden_size,
-            self.num_heads * self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("k_proj", prefix),
-        )
-        self.v_proj = ColumnParallelLinear(
-            self.hidden_size,
-            self.num_heads * self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("v_proj", prefix),
+            prefix=add_prefix("qkv_proj", prefix),
         )
 
         q_scale = self.head_dim**-0.5
@@ -397,9 +385,8 @@ class Gemma3nAudioAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.BoolTensor) -> torch.Tensor:
         # Project to Q, K, V
-        query_states, _ = self.q_proj(x)
-        key_states, _ = self.k_proj(x)
-        value_states, _ = self.v_proj(x)
+        qkv, _ = self.qkv_proj(x)
+        query_states, key_states, value_states = qkv.chunk(chunks=3, dim=-1)
 
         # Reshape
         query_states = query_states.reshape(
