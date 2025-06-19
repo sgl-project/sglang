@@ -231,7 +231,6 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
-    max_tokens_across_dp: int = 2048
 
     def __post_init__(self):
         # Expert parallelism
@@ -741,12 +740,7 @@ class ServerArgs:
             default=ServerArgs.chunked_prefill_size,
             help="The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         )
-        parser.add_argument(
-            "--max-tokens-across-dp",
-            type=int,
-            default=ServerArgs.max_tokens_across_dp,
-            help="The maximum number of tokens accross dp group. default value is 2048"
-        )
+
         parser.add_argument(
             "--max-prefill-tokens",
             type=int,

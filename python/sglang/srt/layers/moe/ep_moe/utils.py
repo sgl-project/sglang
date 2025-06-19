@@ -5,13 +5,16 @@ from typing import Optional
 
 import torch
 
-from vllm import _custom_ops as ops
 from sglang.srt.layers.quantization.fp8_kernel import (
-    per_token_group_quant_fp8)
+    per_token_group_quant_fp8,
+    scaled_fp8_quant
+)
 from sglang.srt.layers.quantization.int8_kernel import (
     per_token_group_quant_int8, per_token_quant_int8)
-from vllm.utils import cdiv
 
+def cdiv(a: int, b: int) -> int:
+    """Ceiling division."""
+    return -(a // -b)
 
 def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
     """
@@ -34,7 +37,7 @@ def _fp8_quantize(
     is provided, the output will be blocked.
     """
     if block_shape is None:
-        A, A_scale = ops.scaled_fp8_quant(
+        A, A_scale = scaled_fp8_quant(
             A, A_scale, use_per_token_if_dynamic=per_act_token)
     else:
         assert len(block_shape) == 2

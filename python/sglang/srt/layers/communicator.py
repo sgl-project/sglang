@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
+import logging
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -30,11 +30,13 @@ from sglang.srt.layers.dp_attention import (
     dp_scatter,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_attention_tp_group,
     get_local_attention_dp_size,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+logger = logging.getLogger(__name__)
 
 class ScatterMode(Enum):
     """
@@ -101,11 +103,12 @@ class LayerScatterModes:
     @classmethod
     def _compute_mlp_mode(cls, context: _LayerModeComputationContext):
         if context.is_layer_sparse:
-            return (
-                ScatterMode.SCATTERED
-                if global_server_args_dict["enable_deepep_moe"] or global_server_args_dict["enable_pplx_moe"]
-                else ScatterMode.FULL
-            )
+            if global_server_args_dict["enable_deepep_moe"]:
+                return ScatterMode.SCATTERED
+            elif global_server_args_dict["enable_pplx_moe"]:
+                return ScatterMode.TP_ATTN_FULL
+            else:
+                return ScatterMode.FULL
         else:
             return (
                 ScatterMode.SCATTERED
@@ -118,7 +121,7 @@ class LayerScatterModes:
         mlp_mode = cls._compute_mlp_mode(context)
         if mlp_mode == ScatterMode.SCATTERED:
             return ScatterMode.SCATTERED
-        if mlp_mode == ScatterMode.FULL:
+        if mlp_mode == ScatterMode.FULL or mlp_mode == ScatterMode.TP_ATTN_FULL:
             return ScatterMode.TP_ATTN_FULL
         raise NotImplementedError
 
@@ -129,7 +132,7 @@ class LayerScatterModes:
             return ScatterMode.model_input_output()
         if mlp_mode == ScatterMode.SCATTERED:
             return ScatterMode.SCATTERED
-        if mlp_mode == ScatterMode.FULL:
+        if mlp_mode == ScatterMode.FULL or mlp_mode == ScatterMode.TP_ATTN_FULL:
             return ScatterMode.TP_ATTN_FULL
         raise NotImplementedError
 
@@ -342,8 +345,19 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 residual_input_mode=residual_input_mode,
             )
 
+        if (
+            (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
+            and (residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL])
+            and (hidden_states_output_mode == ScatterMode.TP_ATTN_FULL)
+            and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
+        ):
+            return partial(
+                CommunicateWithAllReduceAndLayerNormFn._all_reduce_hidden_states_and_residual,
+                residual_input_mode=residual_input_mode,
+            )
+
         raise NotImplementedError(
-            f"{hidden_states_input_mode=} {residual_input_mode=} {residual_output_mode=} {residual_output_mode=}"
+            f"{hidden_states_input_mode=} {residual_input_mode=} {hidden_states_output_mode=} {residual_output_mode=}"
         )
 
     @staticmethod
@@ -400,6 +414,28 @@ class CommunicateWithAllReduceAndLayerNormFn:
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
+        return hidden_states, residual
+
+    @staticmethod
+    def _all_reduce_hidden_states_and_residual(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layernorm: torch.nn.Module,
+        context: CommunicateContext,
+        *,
+        residual_input_mode,
+    ):
+        if hidden_states.shape[0] != 0:
+            if residual_input_mode == ScatterMode.SCATTERED:
+                tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
+                tensor_list[context.attn_tp_rank] += residual
+            else:
+                if context.attn_tp_rank == 0:
+                    hidden_states += residual
+            hidden_states = get_attention_tp_group().all_reduce(hidden_states)
+            residual = hidden_states
+            hidden_states = layernorm(hidden_states)
         return hidden_states, residual
 
 

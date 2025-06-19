@@ -19,6 +19,14 @@ try:
 except ImportError:
     use_deepep = False
 
+try:
+    import pplx_kernels as pplx
+    from sglang.srt.layers.moe.ep_moe.pplx_prepare_finalize import construct_prepare_finalize
+
+    use_pplx = True
+except ImportError:
+    use_pplx = False
+
 from enum import Enum, IntEnum, auto
 from typing import Optional, Tuple, Union
 
@@ -30,7 +38,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, ForwardBatch
+from sglang.srt.layers.moe.ep_moe.pplx_prepare_finalize import PplxPrepareAndFinalize
 
 logger = logging.getLogger(__name__)
 
@@ -745,3 +754,94 @@ class DeepEPDispatcher:
     def _update_stage(self, old_stage, new_stage):
         assert self._stage == old_stage
         self._stage = new_stage
+
+class PplxDispatcher:
+    def __init__(
+        self,
+        group: torch.distributed.ProcessGroup,
+        router_topk: int,
+        rank: int,
+        world_size: int,
+        dp_size: int,
+        pplx_max_tokens: int,
+        num_experts: int = None,
+        hidden_size: int = None,
+        params_dtype: torch.dtype = None,
+        # permute_fusion: bool = False,
+        # num_local_experts: int = None,
+        # deepep_mode: DeepEPMode = DeepEPMode.auto,
+        # async_finish: bool = False,
+        # return_recv_hook: bool = False,
+    ):
+        self.group = group
+        self.num_experts = num_experts
+        self.experts_per_token = router_topk
+        self.hidden_dim = hidden_size
+        self.params_dtype = params_dtype
+        self.block_size = 128
+        self.rank = rank
+        self.world_size = world_size
+        self.dp_size = dp_size
+        self.pplx_max_tokens = pplx_max_tokens
+
+        # rem_experts need to be 0 for pplx to work properly.
+        rem_experts = self.num_experts % self.world_size
+        assert rem_experts == 0
+        self.num_local_experts = ((self.num_experts // self.world_size) +
+                                  (1 if self.rank < rem_experts else 0))
+
+        self.pplx_prepare_and_finalize = construct_prepare_finalize(
+            max_num_tokens=self.pplx_max_tokens,
+            num_experts=self.num_experts,
+            experts_per_token=self.experts_per_token,
+            rank=self.rank,
+            world_size=self.world_size,
+            dp_size=self.dp_size,
+            hidden_dim=self.hidden_dim,
+            param_dtype=self.params_dtype,
+            block_size=self.block_size,
+        )
+
+    def dispatch(self,
+                 hidden_states: torch.Tensor,
+                 topk_idx: torch.Tensor,
+                 topk_weights: torch.Tensor,
+                 forward_batch: ForwardBatch,
+                 apply_router_weight_on_input:bool = False,
+                 a1_scale: Optional[torch.Tensor] = None,
+                 a2_scale: Optional[torch.Tensor] = None,
+                 ):
+        if forward_batch.forward_mode is not None and \
+            (not forward_batch.forward_mode.is_decode() and not forward_batch.forward_mode.is_idle()):
+            assert max(forward_batch.global_num_tokens_cpu) <= self.pplx_max_tokens
+        topk_ids = topk_idx.type(torch.uint32)
+
+        expert_x, expert_x_scale, expert_num_tokens = self.pplx_prepare_and_finalize.prepare(
+            a1=hidden_states,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,  # not supported now
+            rank_topk_weights=topk_weights,
+            rank_topk_ids=topk_ids,
+            expert_map=None,
+            apply_router_weight_on_input=apply_router_weight_on_input
+        )
+        return expert_x, expert_x_scale, expert_num_tokens
+
+    def combine(self,
+                hidden_states: torch.Tensor,
+                topk_idx: torch.Tensor,
+                topk_weights: torch.Tensor,
+                output: torch.Tensor,
+                apply_router_weight_on_input: bool = False,
+                ):
+        topk_ids = topk_idx.type(torch.uint32)
+        self.pplx_prepare_and_finalize.finalize(
+            output=output,
+            fused_expert_output=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            apply_router_weight_on_input=apply_router_weight_on_input
+        )
+        return output
+
+

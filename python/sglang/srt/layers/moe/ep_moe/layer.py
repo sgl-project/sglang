@@ -3,13 +3,12 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 from torch.nn import Module
-from weakref import WeakValueDictionary
-import threading
 
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.layers.moe.ep_moe.modular_kernel import _moe_problem_size
 
 try:
     from deep_gemm import (
@@ -58,23 +57,8 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import DeepEPMode, dispose_tensor, is_hip, set_weight_attrs
-from sglang.srt.layers.moe.ep_moe.modular_kernel import (FusedMoEModularKernel,
-                                                         FusedMoEPermuteExpertsUnpermute,
-                                                         FusedMoEPrepareAndFinalize)
-from sglang.srt.layers.moe.ep_moe.fused_batched_moe import BatchedTritonExperts
-from dataclasses import dataclass
-from sglang.srt.layers.dp_attention import (
-    attn_tp_all_gather,
-    attn_tp_reduce_scatter,
-    dp_gather_partial,
-    dp_scatter,
-    get_attention_dp_size,
-    get_attention_tp_rank,
-    get_attention_tp_size,
-    get_attention_dp_rank,
-)
-from .pplx_prepare_finalize import PplxPrepareAndFinalize
-MOE_DP_CHUNK_SIZE = 256
+from sglang.srt.layers.moe.ep_moe.modular_kernel import BatchedTritonExperts
+
 _is_hip = is_hip()
 
 if _is_hip:
@@ -1270,208 +1254,14 @@ class DeepEPMoE(EPMoE):
         return down_output
 
 
-# Adapted from https://github.com/vllm-project/vllm/blob/f9c069c85e029830094ff9abb926ffbf37b7c7e7/vllm/model_executor/layers/fused_moe/layer.py#L277
-class AllToAllCache:
-
-    def __init__(self):
-        self._cache: WeakValueDictionary = WeakValueDictionary()
-        self._lock = threading.RLock()  # Reentrant lock for thread safety
-
-    def destroy(self):
-        with self._lock:
-            # TODO: can we do del self._cache?
-            for _, a2a in self._cache.items():
-                a2a.destroy()
-
-    def get_or_create(self, **kwargs):
-        import pplx_kernels as pplx
-
-        # Create a hashable key from the kwargs
-        key = tuple(sorted((k, v) for k, v in kwargs.items()))
-
-        with self._lock:
-            instance = self._cache.get(key)
-            if instance is None:
-                # TODO (varun): Add support to switch to intranode
-                # when all communications are within the same
-                # node.
-                logger.debug("Create AllToAll %s", kwargs)
-                instance = pplx.AllToAll.internode(**kwargs)
-                self._cache[key] = instance
-            return instance
-
-# Global singleton
-_all_to_all_cache = AllToAllCache()
-
-# Factory function as a cleaner interface
-def get_all_to_all(**kwargs):
-    return _all_to_all_cache.get_or_create(**kwargs)
-
-# Adapted from https://github.com/vllm-project/vllm/blob/f9c069c85e029830094ff9abb926ffbf37b7c7e7/vllm/model_executor/layers/fused_moe/layer.py#L64
-@dataclass
-class FusedMoEParallelConfig:
-    tp_size: int
-    dp_size: int
-    ep_size: int
-    tp_rank: int
-    dp_rank: int
-    ep_rank: int
-
-    use_ep: bool  # whether to use EP or not
-
-    @property
-    def use_pplx_kernels(self):
-        return True
-
-    @staticmethod
-    def make(tp_size_: int, dp_size_: int,) -> "FusedMoEParallelConfig":
-
-        dp_size = dp_size_
-        dp_rank = get_attention_dp_rank() if dp_size > 1 else 0
-        tp_rank = 0 if tp_size_ == 1 else get_tensor_model_parallel_rank()
-        tp_size = tp_size_
-
-        ep_size = tp_size
-        ep_rank = tp_rank
-        return FusedMoEParallelConfig(tp_size=1,
-                                      tp_rank=0,
-                                      dp_size=dp_size,
-                                      dp_rank=dp_rank,
-                                      ep_size=ep_size,
-                                      ep_rank=ep_rank,
-                                      use_ep=True)
-
-# Adapted from https://github.com/vllm-project/vllm/blob/f9c069c85e029830094ff9abb926ffbf37b7c7e7/vllm/model_executor/layers/fused_moe/layer.py#L186
-# Adapted from pplx-kernels tests/all_to_all_utils.py
-@dataclass
-class MoEConfig:
-    num_experts: int
-    experts_per_token: int
-    hidden_dim: int
-
-    num_local_experts: int
-    moe_parallel_config: FusedMoEParallelConfig
-
-    in_dtype: torch.dtype  # The activation type.
-
-    # TODO: add more quantization params, blocked, per-token, etc.
-    block_size: int = 128
-
-    @property
-    def tp_size(self):
-        return self.moe_parallel_config.tp_size
-
-    @property
-    def dp_size(self):
-        return self.moe_parallel_config.dp_size
-
-    @property
-    def ep_size(self):
-        return self.moe_parallel_config.ep_size
-
-    @property
-    def tp_rank(self):
-        return self.moe_parallel_config.tp_rank
-
-    @property
-    def dp_rank(self):
-        return self.moe_parallel_config.dp_rank
-
-    @property
-    def ep_rank(self):
-        return self.moe_parallel_config.ep_rank
-
-    @property
-    def use_ep(self):
-        return self.moe_parallel_config.use_ep
-
-    @property
-    def use_pplx_kernels(self):
-        return self.moe_parallel_config.use_pplx_kernels
-
-# Adapted from https://github.com/vllm-project/vllm/blob/f9c069c85e029830094ff9abb926ffbf37b7c7e7/vllm/model_executor/layers/fused_moe/layer.py#L683
-def _construct_prepare_finalize(
-    moe: MoEConfig
-) -> Optional[FusedMoEPrepareAndFinalize]:
-    max_num_tokens = MOE_DP_CHUNK_SIZE
-    world_size = moe.ep_size
-    dp_size = moe.ep_size // moe.dp_size  # The size of a DP group
-    rank = moe.ep_rank
-
-    if moe.use_pplx_kernels:
-        logger.debug("using PplxPrepareAndFinalize")
-
-        all_to_all = get_all_to_all(
-            max_num_tokens=max_num_tokens,
-            num_experts=moe.num_experts,
-            experts_per_token=moe.experts_per_token,  # topk
-            rank=rank,
-            world_size=world_size,
-            dp_size=dp_size,
-            hidden_dim=moe.hidden_dim,
-            hidden_dim_bytes=moe.hidden_dim * moe.in_dtype.itemsize,
-            # For blocked per token: set to
-            #   ceil_div(hidden_dim, block_size) * sizeof(float32)
-            # For per-token: set to sizeof(float32)
-            hidden_dim_scale_bytes=(0 if moe.in_dtype.itemsize != 1 else
-                                    ((moe.hidden_dim + moe.block_size - 1) //
-                                     moe.block_size * torch.float32.itemsize)))
-
-        return PplxPrepareAndFinalize(
-            all_to_all,
-            max_num_tokens=max_num_tokens,
-            world_size=world_size,
-            rank=rank,
-            dp_size=dp_size,
-            quant_dtype=moe.in_dtype,
-        )
-
-    return None
-
-# Adapted from https://github.com/vllm-project/vllm/blob/f9c069c85e029830094ff9abb926ffbf37b7c7e7/vllm/model_executor/layers/fused_moe/layer.py#L638
-def determine_expert_map(
-        ep_size: int, ep_rank: int,
-        global_num_experts: int) -> tuple[int, Optional[torch.Tensor]]:
-    """
-        Calculates how many experts should be assigned to each rank for EP and
-        creates a mapping from global to local expert index. Experts are
-        distributed evenly across ranks. Any remaining are assigned to the
-        last rank.
-
-        Args:
-            ep_size (int): The size of the expert parallel group
-            global_num_experts (int): The total number of experts in the model.
-
-        Returns:
-            tuple[int, Optional[torch.Tensor]]: A tuple containing:
-                - local_num_experts (int): The number of experts assigned
-                    to the current rank.
-                - expert_map (Optional[torch.Tensor]): A tensor of shape
-                    (global_num_experts,) mapping from global to local index.
-                    Contains -1 for experts not assigned to the current rank.
-                    Returns None if ep_size is 1.
-        """
-    assert ep_size > 0
-    if ep_size == 1:
-        return (global_num_experts, None)
-
-    local_num_experts = global_num_experts // ep_size
-
-    # Create a tensor of size num_experts filled with -1
-    expert_map = torch.full((global_num_experts, ), -1, dtype=torch.int32)
-    # Create a expert map for the local experts
-    if ep_rank < (ep_size - 1):
-        # Each non-last rank gets local_num_experts experts.
-        expert_map[ep_rank * local_num_experts:
-                        (ep_rank + 1) * local_num_experts] = \
-            torch.arange(0, local_num_experts, dtype=torch.int32)
-    else:
-        # All remaining experts are assigned to the last rank.
-        local_num_experts = (global_num_experts - ep_rank * local_num_experts)
-
-        expert_map[-local_num_experts:] = \
-            torch.arange(0, local_num_experts, dtype=torch.int32)
-    return (local_num_experts, expert_map)
+def get_moe_impl_class():
+    if global_server_args_dict["enable_deepep_moe"]:
+        return DeepEPMoE
+    if global_server_args_dict["enable_ep_moe"]:
+        return EPMoE
+    if global_server_args_dict["enable_pplx_moe"]:
+        return PPlxMoE
+    return FusedMoE
 
 # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/f9c069c85e029830094ff9abb926ffbf37b7c7e7/vllm/model_executor/layers/fused_moe/layer.py#L722
 class PPlxMoE(EPMoE):
@@ -1498,9 +1288,16 @@ class PPlxMoE(EPMoE):
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
+        dp_size: int = 1,
+        max_tokens: int = 1024
     ):
         if params_dtype == None:
             params_dtype = torch.bfloat16
+
+        assert (
+            num_fused_shared_experts == 0
+        ), "num_fused_shared_experts is not supported in EP"
+
         super().__init__(
             num_experts,
             top_k,
@@ -1525,36 +1322,8 @@ class PPlxMoE(EPMoE):
             num_fused_shared_experts == 0
         ), "num_fused_shared_experts is not supported in EP"
 
-        # Determine expert maps
-        self.local_num_experts, self.expert_map = determine_expert_map(
-            ep_size=self.tp_size,
-            ep_rank=get_tensor_model_parallel_rank(),
-            global_num_experts=self.num_experts,
-        )
-
-        self.moe_parallel_config: FusedMoEParallelConfig = (
-            FusedMoEParallelConfig.make(
-                tp_size_=(tp_size if tp_size is not None else
-                          get_tensor_model_parallel_world_size()),
-                dp_size_=(get_attention_dp_size()),))
-
-        moe = MoEConfig(
-            num_experts=num_experts,
-            experts_per_token=top_k,
-            hidden_dim=hidden_size,
-            num_local_experts=num_experts // get_tensor_model_parallel_world_size(),
-            moe_parallel_config=self.moe_parallel_config,
-            # TODO (bnell): this needs to be fixed for quantized types.
-            in_dtype=params_dtype,
-        )
-
-        prepare_finalize = _construct_prepare_finalize(moe)
-        world_size = moe.ep_size
-        dp_size = int(moe.ep_size // moe.dp_size)
-        experts: Optional[FusedMoEPermuteExpertsUnpermute] = None
-        self.experts = BatchedTritonExperts(
-            max_num_tokens=MOE_DP_CHUNK_SIZE,
-            world_size=world_size,
+        self._fused_experts = BatchedTritonExperts(
+            max_num_tokens=max_tokens,
             dp_size=dp_size,
             use_fp8_w8a8=False,
             use_int8_w8a8=False,
@@ -1562,84 +1331,59 @@ class PPlxMoE(EPMoE):
             use_int4_w4a16=False,
             block_shape=None,
         )
-        self.fused_experts = FusedMoEModularKernel(
-            prepare_finalize,
-            self.experts,
+
+    def forward(self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        expert_x: torch.Tensor,
+        expert_x_scale: torch.Tensor,
+        expert_num_tokens: torch.Tensor,
+        global_num_experts: int = -1,
+        inplace:bool = False,
+        no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
+        ):
+        # unpack
+        a1 = hidden_states
+        a1q = expert_x
+        a1q_scale = expert_x_scale
+        topk_ids = topk_idx.type(torch.uint32)
+        E, M, N, K, top_k = _moe_problem_size(a1, self.w13_weight, self.w2_weight, topk_ids)
+
+        if global_num_experts == -1:
+            global_num_experts = E
+
+        workspace13_shape, workspace2_shape, workspace_dtype = (
+            self._fused_experts.workspace_shapes(a1, M, N, K, top_k,
+                                                 global_num_experts))
+
+        # We can reuse the memory between cache1 and cache3 because by the time
+        # we need cache3, we're done with cache1
+        workspace13 = torch.zeros(workspace13_shape,
+                                  device=a1.device,
+                                  dtype=workspace_dtype)
+        workspace2 = torch.zeros(workspace2_shape,
+                                 device=a1.device,
+                                 dtype=workspace_dtype)
+
+        fused_out = self._fused_experts.apply(
+            a1q,
+            self.w13_weight,
+            self.w2_weight,
+            topk_ids,
+            activation=self.activation,
+            global_num_experts=global_num_experts,
+            expert_map=None,  #
+            w1_scale=self.w13_input_scale,
+            w2_scale=self.w2_input_scale,
+            w1_zp=None,
+            w2_zp=None,
+            a1q_scale=a1q_scale,
+            a2_scale=None,
+            workspace13=workspace13,
+            workspace2=workspace2,
+            expert_num_tokens=expert_num_tokens,
         )
-        self.max_tokens_across_dp = None
 
-    def forward(self, full_hidden_states: torch.Tensor,
-                             full_router_logits: torch.Tensor):
-
-        full_final_hidden_states = torch.empty_like(full_hidden_states)
-
-        def process_chunk(chunk_start, chunk_end, skip_result_store=False):
-            hidden_states = full_hidden_states[chunk_start:chunk_end, :]
-            topk_weights = None
-            topk_ids = None
-            if full_router_logits is None:
-                topk_ids = torch.full(
-                   (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device,
-                )
-                topk_weights = torch.empty(
-                   (0, self.top_k), dtype=torch.float32, device=hidden_states.device,
-                )
-            else:
-                router_logits = full_router_logits[chunk_start:chunk_end, :]
-                # Matrix multiply.
-                topk_weights, topk_ids = select_experts(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    top_k=self.top_k,
-                    use_grouped_topk=self.use_grouped_topk,
-                    renormalize=self.renormalize,
-                    topk_group=self.topk_group,
-                    num_expert_group=self.num_expert_group,
-                    correction_bias=self.correction_bias,
-                    routed_scaling_factor=self.routed_scaling_factor,
-                )
-
-            final_hidden_states = self.fused_experts(
-                hidden_states=hidden_states,
-                w1=self.w13_weight,
-                w2=self.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                inplace=True,
-                activation=self.activation,
-                apply_router_weight_on_input=False,
-                global_num_experts=self.num_experts,
-                expert_map=self.expert_map,
-            )
-
-            if not skip_result_store:
-                full_final_hidden_states[chunk_start:chunk_end, :].copy_(
-                    final_hidden_states)
-
-        max_tokens_across_dp = self.max_tokens_across_dp
-        moe_dp_chunk_size_per_rank = MOE_DP_CHUNK_SIZE
-
-        num_tokens = full_hidden_states.size(0)
-        for chunk_start_ in range(0, max_tokens_across_dp,
-                                  moe_dp_chunk_size_per_rank):
-            chunk_start = chunk_start_
-            chunk_end = min(chunk_start + moe_dp_chunk_size_per_rank,
-                            max_tokens_across_dp)
-            # clamp start and end
-            chunk_start = min(chunk_start, num_tokens - 1)
-            chunk_end = min(chunk_end, num_tokens)
-
-            process_chunk(chunk_start,
-                          chunk_end,
-                          skip_result_store=chunk_start_ >= num_tokens)
-
-        return full_final_hidden_states
-
-def get_moe_impl_class():
-    if global_server_args_dict["enable_deepep_moe"]:
-        return DeepEPMoE
-    if global_server_args_dict["enable_ep_moe"]:
-        return EPMoE
-    if global_server_args_dict["enable_pplx_moe"]:
-        return PPlxMoE
-    return FusedMoE
+        return fused_out

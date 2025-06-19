@@ -25,10 +25,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
+
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
@@ -41,6 +43,7 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_attention_dp_size,
     get_local_attention_dp_size,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -53,6 +56,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
+from sglang.srt.layers.moe.ep_moe.token_dispatcher import PplxDispatcher
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
@@ -272,10 +276,14 @@ class DeepseekV2MoE(nn.Module):
                 if global_server_args_dict["enable_deepep_moe"]
                 else {}
             ),
+            **(
+                dict(dp_size=get_attention_dp_size(),
+                     max_tokens=get_int_env_var("SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK", global_server_args_dict["chunked_prefill_size"])
+                     )
+                if global_server_args_dict["enable_pplx_moe"]
+                else {}
+            )
         )
-
-        if global_server_args_dict["enable_pplx_moe"]:
-            self.experts.max_tokens_across_dp = global_server_args_dict["max_tokens_across_dp"]
 
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -295,8 +303,8 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self.top_k = config.num_experts_per_tok
-
-        if global_server_args_dict["enable_deepep_moe"]:
+        # TODO 先尝试不共用逻辑
+        if global_server_args_dict["enable_deepep_moe"] or global_server_args_dict["enable_pplx_moe"]:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_tensor_model_parallel_world_size()
             self.num_experts = (
@@ -312,18 +320,31 @@ class DeepseekV2MoE(nn.Module):
                 else None
             )
 
-            self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
-                group=parallel_state.get_tp_group().device_group,
-                router_topk=self.top_k,
-                permute_fusion=True,
-                num_experts=self.num_experts,
-                num_local_experts=config.n_routed_experts // self.tp_size,
-                hidden_size=config.hidden_size,
-                params_dtype=config.torch_dtype,
-                deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
-                async_finish=True,
-                return_recv_hook=True,
-            )
+            if global_server_args_dict["enable_deepep_moe"]:
+                self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
+                    group=parallel_state.get_tp_group().device_group,
+                    router_topk=self.top_k,
+                    permute_fusion=True,
+                    num_experts=self.num_experts,
+                    num_local_experts=config.n_routed_experts // self.tp_size,
+                    hidden_size=config.hidden_size,
+                    params_dtype=config.torch_dtype,
+                    deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]],
+                    async_finish=True,
+                    return_recv_hook=True,
+                )
+            else:
+                self.pplx_dispatcher = PplxDispatcher(
+                    group = parallel_state.get_tp_group().device_group,
+                    router_topk=self.top_k,
+                    rank=get_tensor_model_parallel_rank(),
+                    world_size=get_tensor_model_parallel_world_size(),
+                    dp_size=get_attention_dp_size(),
+                    pplx_max_tokens=get_int_env_var("SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK", global_server_args_dict["chunked_prefill_size"]),
+                    num_experts=self.num_experts,
+                    hidden_size=config.hidden_size,
+                    params_dtype=torch.bfloat16,
+                )
 
         self._enable_deepep_moe = global_server_args_dict["enable_deepep_moe"]
 
@@ -345,17 +366,71 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_normal(hidden_states)
 
     def forward_pplx(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+        forward_mode = forward_batch.forward_mode
         shared_output = None
-        router_logits = None
-        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
+        if is_non_idle_and_non_empty(forward_mode, hidden_states):
             router_logits = self.gate(hidden_states)
             shared_output = self._forward_shared_experts(hidden_states)
-        final_hidden_states = (
-            self.experts(hidden_states, router_logits)
-            * self.routed_scaling_factor
+            topk_weights, topk_idx = select_experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                top_k=self.top_k,
+                use_grouped_topk=True,
+                renormalize=self.renormalize,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                correction_bias=self.correction_bias,
+                routed_scaling_factor=self.routed_scaling_factor,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
+        else:
+            topk_idx = torch.full(
+                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+            )
+            topk_weights = torch.empty(
+                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+            )
+
+        if self.ep_size > 1:
+            (
+                expert_x,
+                expert_x_scale,
+                expert_num_tokens
+            ) = self.pplx_dispatcher.dispatch(
+                hidden_states=hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                forward_batch=forward_batch,
+            )
+
+        final_hidden_states = self.experts(
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            expert_x=expert_x,
+            expert_x_scale=expert_x_scale,
+            expert_num_tokens=expert_num_tokens,
         )
+
+        if self.ep_size > 1:
+            # inplace combine
+            final_hidden_states = self.pplx_dispatcher.combine(
+                output=hidden_states,
+                hidden_states=final_hidden_states,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+            )
+
         if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+            x = shared_output
+            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            final_hidden_states = x
+        else:
+            final_hidden_states *= self.routed_scaling_factor
+
         return final_hidden_states
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1747,13 +1822,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
             elif (
                 global_server_args_dict["enable_deepep_moe"]
-                or global_server_args_dict["enable_ep_moe"] or global_server_args_dict["enable_pplx_moe"]
+                or global_server_args_dict["enable_ep_moe"]
+                or global_server_args_dict["enable_pplx_moe"]
             ):
                 self.num_fused_shared_experts = 0
                 global_server_args_dict["disable_shared_experts_fusion"] = True
                 log_info_on_rank0(
                     logger,
-                    "Deepseek V3/R1 can not use shared experts fusion optimization when in deepep_moe or ep_moe mode. Shared experts fusion optimization is disabled.",
+                    "Deepseek V3/R1 can not use shared experts fusion optimization when in deepep_moe or ep_moe or pplx_moe mode. Shared experts fusion optimization is disabled.",
                 )
         elif self.num_fused_shared_experts == 0:
             if (
