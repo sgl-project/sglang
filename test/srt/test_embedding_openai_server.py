@@ -1,4 +1,3 @@
-import socket
 import unittest
 
 import openai
@@ -7,25 +6,17 @@ from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-
-
-def find_free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        s.listen(1)
-        port = s.getsockname()[1]
-    return port
 
 
 class TestOpenAIServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "intfloat/e5-mistral-7b-instruct"
-        port = find_free_port()
-        cls.base_url = f"http://127.0.0.1:{port}"
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
             cls.model,
