@@ -107,7 +107,6 @@ class MetadataBuffers:
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
             self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
 
-            # TODO: pad to 64B
             self.output_hidden_states = torch.zeros(
                 (size, hidden_size), dtype=dtype, device=device
             )
@@ -127,7 +126,7 @@ class MetadataBuffers:
     def get_buf_infos(self):
         ptrs = [
             self.output_ids.data_ptr(),
-            self.output_hidden_states.data_ptr(),
+            self.output_hidden_states.data_ptr(),  # TODO: set None to avoid transfer hidden_states when spec_algorithm is None
             self.output_token_logprobs_val.data_ptr(),
             self.output_token_logprobs_idx.data_ptr(),
             self.output_top_logprobs_val.data_ptr(),
