@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, List, NamedTuple, Tuple
 
 import torch
 
@@ -13,31 +13,19 @@ class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 
     Attributes:
-        device_indices: Indices of the data on the device matched by the prefix.
-        last_device_node: The last node on the device that was matched.
-        last_host_node: The last node on the host that was matched.
-                        Note that if the prefix cache does not support host cache,
-                        this **must** be the same as `last_device_node`.
-        host_indices_length: Length of the indices on the host, if applicable.
-                             This is `None` if the prefix cache does not support host cache.
+        device_indices  :   Indices of the KV cache on the device matched by common prefix.
+        last_device_node:   The last TreeNode on the device that was matched.
+        last_host_node  :   The last TreeNode on the host that was matched.
+                            Note that if HiCache is not enabled,
+                            this **must** be the same as `last_device_node`.
+        host_hit_length :   Length of the KV cache hit on the host, if applicable.
+                            0 if HiCache is not enabled.
     """
 
     device_indices: torch.Tensor
     last_device_node: Any
     last_host_node: Any
-    host_indices_length: int = 0
-
-
-class LoadHostResult(NamedTuple):
-    """Result of loading from host to device.
-
-    Attributes:
-        new_device_indices: New indices on the device after loading.
-        last_device_node: The last node on the device after loading.
-    """
-
-    new_device_indices: torch.Tensor
-    new_last_device_node: Any
+    host_hit_length: int = 0
 
 
 class BasePrefixCache(ABC):
@@ -58,42 +46,6 @@ class BasePrefixCache(ABC):
     @abstractmethod
     def cache_unfinished_req(self, req: Req, **kwargs):
         pass
-
-    def init_load_back(
-        self,
-        last_host_node: Any,
-        host_indices_length: int,
-    ) -> LoadHostResult:
-        """
-        Initial the load from host to device.
-        Caller should provide the device indices that will be loaded into.
-        The device node and host node should be returned from `match_prefix` call.
-        If the prefix cache does support host cache, this method should be overridden.
-        Otherwise, it should not be called and will raise a NotImplementedError.
-
-        Args:
-            last_host_node: The last node on the host that was matched.
-            host_indices_length: length of the indices on the host.
-        """
-        raise NotImplementedError(
-            "init_load_host should be overridden if the prefix cache supports host cache."
-        )
-
-    def ready_to_load_host_cache(self) -> Any:
-        """
-        This method is called after the prefill batch is prepared,
-        and all the initialized load from host operations will be executed after this call.
-        If the prefix cache supports host cache, this method must be overridden.
-        Otherwise, it is just a no-op.
-        """
-
-    def check_host_cache(self) -> Any:
-        """
-        Check about host cache status and try to update evictable memory.
-        This will be called before the prefill batch is prepared.
-        If the prefix cache supports host cache, this method must be overridden.
-        Otherwise, it is just a no-op.
-        """
 
     @abstractmethod
     def evict(self, num_tokens: int):
@@ -117,6 +69,28 @@ class BasePrefixCache(ABC):
         raise NotImplementedError()
 
     def pretty_print(self):
+        raise NotImplementedError()
+
+    def init_load_back(
+        self,
+        last_host_node: Any,
+        host_hit_length: int,
+    ) -> Tuple[torch.Tensor, Any]:
+        """
+        Preparing KV cache loading from host to device.
+        """
+        raise NotImplementedError()
+
+    def ready_to_load_host_cache(self) -> Any:
+        """
+        Notify the cache controller to start the KV cache loading
+        """
+        raise NotImplementedError()
+
+    def check_hicache_events(self) -> Any:
+        """
+        Check HiCache related activities to update radix tree and synchronize across TP workers if needed
+        """
         raise NotImplementedError()
 
     def take_events(self):

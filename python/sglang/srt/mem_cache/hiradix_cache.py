@@ -7,7 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
-from sglang.srt.mem_cache.base_prefix_cache import LoadHostResult, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -284,27 +284,24 @@ class HiRadixCache(RadixCache):
     def init_load_back(
         self,
         last_node: TreeNode,
-        host_indices_length: int,
+        host_hit_length: int,
         mem_quota: Optional[int] = None,
-    ) -> LoadHostResult:
-        _ = host_indices_length  # unused, but kept for compatibility
+    ):
+        _ = host_hit_length  # unused, but kept for compatibility
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
-                return LoadHostResult(
-                    new_device_indices=loading_values,
-                    new_last_device_node=last_node,
-                )
+                return loading_values, last_node
 
             while last_node.evicted:
                 last_node = last_node.parent
 
-        return LoadHostResult(
-            new_device_indices=torch.empty((0,), dtype=torch.int64, device=self.device),
-            new_last_device_node=last_node,
+        return (
+            torch.empty((0,), dtype=torch.int64, device=self.device),
+            last_node,
         )
 
     def ready_to_load_host_cache(self):
@@ -312,7 +309,7 @@ class HiRadixCache(RadixCache):
         self.load_cache_event.set()
         return producer_index
 
-    def check_host_cache(self):
+    def check_hicache_events(self):
         self.writing_check()
         self.loading_check()
 
@@ -323,7 +320,7 @@ class HiRadixCache(RadixCache):
                 device_indices=empty_value,
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
-                host_indices_length=0,
+                host_hit_length=0,
             )
 
         if self.page_size != 1:
@@ -336,17 +333,17 @@ class HiRadixCache(RadixCache):
         else:
             value = empty_value
 
-        host_indices_length = 0
-        last_node_global = last_node
+        host_hit_length = 0
+        last_host_node = last_node
         while last_node.evicted:
-            host_indices_length += len(last_node.host_value)
+            host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
 
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
-            last_host_node=last_node_global,
-            host_indices_length=host_indices_length,
+            last_host_node=last_host_node,
+            host_hit_length=host_hit_length,
         )
 
     def _match_prefix_helper(self, node: TreeNode, key: List):

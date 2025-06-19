@@ -525,8 +525,8 @@ class Req:
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
         self.last_node: Any = None
-        self.last_node_global: Any = None
-        self.host_indices_length = 0
+        self.last_host_node: Any = None
+        self.host_hit_length = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -651,8 +651,8 @@ class Req:
             (
                 self.prefix_indices,
                 self.last_node,
-                self.last_node_global,
-                self.host_indices_length,
+                self.last_host_node,
+                self.host_hit_length,
             ) = tree_cache.match_prefix(
                 key=self.adjust_max_prefix_ids(),
             )

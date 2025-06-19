@@ -158,7 +158,7 @@ class SchedulePolicy:
             prefix_ids = r.adjust_max_prefix_ids()
 
             # NOTE: the prefix_indices must always be aligned with last_node
-            r.prefix_indices, r.last_node, r.last_node_global, r.host_indices_length = (
+            r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length = (
                 self.tree_cache.match_prefix(rid=r.rid, key=prefix_ids)
             )
 
@@ -447,25 +447,25 @@ class PrefillAdder:
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
         )
 
-        # we should consider the possible host indices length when scheduling
-        min_extend_tokens = req.extend_input_len - req.host_indices_length
-        min_input_tokens = -(-min_extend_tokens // self.page_size) * self.page_size
+        # adjusting the input_tokens based on host_hit_length and page_size
+        real_input_tokens = req.extend_input_len - req.host_hit_length
+        real_input_tokens = -(-real_input_tokens // self.page_size) * self.page_size
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
-        if min_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+        if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
-            # self.rem_total_tokens may decrease during the lock acquisition
+            # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
-            if req.host_indices_length > 0:
+            if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
-                    req.last_node_global, req.host_indices_length
+                    req.last_host_node, req.host_hit_length
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
