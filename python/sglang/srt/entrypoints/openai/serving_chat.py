@@ -28,12 +28,11 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
-    detect_template_content_format,
-    process_content_for_template_format,
     process_hidden_states_from_ret,
     to_openai_style_logprobs,
 )
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.jinja_template_utils import process_content_for_template_format
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.utils import convert_json_schema_to_str
@@ -44,11 +43,11 @@ logger = logging.getLogger(__name__)
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for chat completion requests"""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Instance-specific cache for template content format detection
-        self._cached_chat_template = None
-        self._cached_template_format = None
+    def __init__(
+        self, tokenizer_manager: TokenizerManager, template_manager: TemplateManager
+    ):
+        super().__init__(tokenizer_manager)
+        self.template_manager = template_manager
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -142,7 +141,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
 
             # Use chat template
-            if chat_template_name is None:
+            if self.template_manager.chat_template_name is None:
                 prompt, prompt_ids, image_data, audio_data, modalities, stop = (
                     self._apply_jinja_template(request, tools, is_multimodal)
                 )
@@ -183,18 +182,7 @@ class OpenAIServingChat(OpenAIServingBase):
         audio_data = []
         modalities = []
 
-        # Detect template content format
-        current_template = self.tokenizer_manager.tokenizer.chat_template
-        if current_template != self._cached_chat_template:
-            self._cached_chat_template = current_template
-            self._cached_template_format = detect_template_content_format(
-                current_template
-            )
-            logger.info(
-                f"Detected chat template content format: {self._cached_template_format}"
-            )
-
-        template_content_format = self._cached_template_format
+        template_content_format = self.template_manager.jinja_template_content_format
 
         for message in request.messages:
             if message.content is None:
@@ -271,7 +259,7 @@ class OpenAIServingChat(OpenAIServingBase):
         """Apply conversation template"""
         prompt = ""
         prompt_ids = []
-        conv = generate_chat_conv(request, self.tokenizer_manager.chat_template_name)
+        conv = generate_chat_conv(request, self.template_manager.chat_template_name)
 
         # If we should continue the final assistant message, adjust the conversation.
         if (

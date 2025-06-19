@@ -83,6 +83,7 @@ from sglang.srt.managers.io_struct import (
     V1RerankReqInput,
     VertexGenerateReqInput,
 )
+from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -107,6 +108,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 @dataclasses.dataclass
 class _GlobalState:
     tokenizer_manager: TokenizerManager
+    template_manager: TemplateManager
     scheduler_info: Dict
 
 
@@ -124,13 +126,13 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
-        _global_state.tokenizer_manager
+        _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_chat = OpenAIServingChat(
-        _global_state.tokenizer_manager
+        _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
-        _global_state.tokenizer_manager
+        _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_score = OpenAIServingScore(
         _global_state.tokenizer_manager
@@ -755,10 +757,13 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
+    tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
+        server_args=server_args
+    )
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
+            template_manager=template_manager,
             scheduler_info=scheduler_info,
         )
     )

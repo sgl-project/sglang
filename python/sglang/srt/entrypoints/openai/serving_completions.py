@@ -5,10 +5,7 @@ from typing import Any, AsyncGenerator, Dict, List, Union
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
-from sglang.srt.code_completion_parser import (
-    generate_completion_prompt_from_request,
-    is_completion_template_defined,
-)
+from sglang.srt.code_completion_parser import generate_completion_prompt_from_request
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -31,6 +28,14 @@ logger = logging.getLogger(__name__)
 class OpenAIServingCompletion(OpenAIServingBase):
     """Handler for completion requests"""
 
+    def __init__(
+        self,
+        tokenizer_manager: TokenizerManager,
+        template_manager: TemplateManager,
+    ):
+        super().__init__(tokenizer_manager)
+        self.template_manager = template_manager
+
     def _request_id_prefix(self) -> str:
         return "cmpl-"
 
@@ -47,7 +52,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             )
         # Process prompt
         prompt = request.prompt
-        if is_completion_template_defined():
+        if self.template_manager.completion_template_name is not None:
             prompt = generate_completion_prompt_from_request(request)
 
         # Set logprob start length based on echo and logprobs

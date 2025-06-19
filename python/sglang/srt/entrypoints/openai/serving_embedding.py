@@ -3,7 +3,6 @@ from typing import Any, Dict, List, Optional, Union
 from fastapi import Request
 
 from sglang.srt.conversation import generate_embedding_convs
-from sglang.srt.entrypoints.openai.utils import chat_template_name
 from sglang.srt.entrypoints.openai.protocol import (
     EmbeddingObject,
     EmbeddingRequest,
@@ -18,6 +17,14 @@ from sglang.srt.managers.io_struct import EmbeddingReqInput
 
 class OpenAIServingEmbedding(OpenAIServingBase):
     """Handler for embedding requests"""
+
+    def __init__(
+        self,
+        tokenizer_manager: TokenizerManager,
+        template_manager: TemplateManager,
+    ):
+        super().__init__(tokenizer_manager)
+        self.template_manager = template_manager
 
     def _request_id_prefix(self) -> str:
         return "embd-"
@@ -85,11 +92,8 @@ class OpenAIServingEmbedding(OpenAIServingBase):
 
                 generate_prompts = []
                 # Check if we have a chat template for multimodal embeddings
-                chat_template_name = getattr(
-                    self.tokenizer_manager, "chat_template_name", None
-                )
-                if chat_template_name is not None:
-                    convs = generate_embedding_convs(texts, images, chat_template_name)
+                if self.template_manager.chat_template_name is not None:
+                    convs = generate_embedding_convs(texts, images, self.template_manager.chat_template_nam)
                     for conv in convs:
                         generate_prompts.append(conv.get_prompt())
                 else:
