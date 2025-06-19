@@ -27,7 +27,7 @@ RUN http_proxy='' pip install eic==${eic_sdk_version} --extra-index-url https://
 RUN http_proxy='' pip install absl-py==${absl_version} --extra-index-url https://bytedpypi.byted.org/simple
 
 # group_gemm 安装
-#RUN pip install --verbose git+https://github.com/bytedance-iaas/grouped_gemm@dev
+RUN pip install --verbose git+https://github.com/bytedance-iaas/grouped_gemm@dev
 
 # examples 覆盖
 ARG branch=release_0.0.2
