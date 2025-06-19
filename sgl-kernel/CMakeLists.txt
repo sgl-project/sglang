@@ -207,6 +207,12 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
     )
 endif()
 
+# Jack: if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER 12.0 AND SCALED_MM_ARCHS)
+# Jack: This doesn't help. TODO: Fix
+list(APPEND SGL_KERNEL_CUDA_FLAGS "-DENABLE_SCALED_MM_SM90=1")
+list(APPEND SGL_KERNEL_CUDA_FLAGS "-DENABLE_CUTLASS_MOE_SM90=1")
+# TODO: use SGL_KERNEL_ENABLE_SM90A in CMakeLists.txt e.g., make build -DSGL_KERNEL_ENABLE_SM90A. And check SGL_KERNEL_ENABLE_SM90A in scaled_mm_enty.cu
+
 string(REPLACE "-D__CUDA_NO_HALF_OPERATORS__"       "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 string(REPLACE "-D__CUDA_NO_HALF_CONVERSIONS__"     "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
 string(REPLACE "-D__CUDA_NO_BFLOAT16_CONVERSIONS__" "" CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}")
@@ -251,6 +257,9 @@ set(SOURCES
     "csrc/speculative/speculative_sampling.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
     "csrc/kvcacheio/transfer.cu"
+    "csrc/quantization/cutlass_w8a8/scaled_mm_entry.cu"
+    "csrc/quantization/cutlass_w8a8/moe/moe_data.cu"
+    "csrc/quantization/cutlass_w8a8/moe/grouped_mm_c3x.cu"
     "csrc/common_extension.cc"
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"

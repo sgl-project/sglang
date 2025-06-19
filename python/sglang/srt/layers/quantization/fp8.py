@@ -8,6 +8,16 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp8
+from sglang.srt.utils import get_bool_env_var
+
+MAX_SEQ_LEN = 32768
+USE_CUTLASS_OPT = True
+try:
+    from grouped_gemm.ops import permute
+except:
+    logging.warning(f"import permute op failed")
+    USE_CUTLASS_OPT = False
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
         apply_fp8_marlin_linear,
@@ -99,6 +109,88 @@ if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
+
+
+def singleton(cls):
+    instances = {}
+
+    def get_instance(*args, **kwargs):
+        if cls not in instances:
+            instances[cls] = cls(*args, **kwargs)
+        return instances[cls]
+
+    return get_instance
+
+
+@singleton
+class GlobalVar:
+    def __init__(self):
+        self.inited = False
+        self.act_scale = None
+        self.a_q_fp8 = None
+        self.expert_offsets = None
+        self.problem_sizes = []
+        self.permute_map = []
+        self.inter = None
+        self.c1 = None
+        self.c2 = None
+        self.inter_q = None
+        self.remap_q = None
+        self.permute_ws_inited = False
+
+    def init_permute_ws(self, top_k, hidden_size):
+        if not self.permute_ws_inited and USE_CUTLASS_OPT:
+            errs = [list(range(top_k)) for i in range(MAX_SEQ_LEN)]
+            indexes = torch.tensor(errs, dtype=torch.int32, device="cuda")
+
+            input_act = torch.empty(
+                (MAX_SEQ_LEN, hidden_size), dtype=torch.float8_e4m3fn, device="cuda"
+            )
+            _, _ = permute(input_act, indexes, max_token_num=MAX_SEQ_LEN)
+            self.permute_ws_inited = True
+            del input_act
+
+    def create_workspace(self, max_m, n, k, top_k, expert_num):
+
+        device_id = torch.cuda.current_device()
+
+        if self.inited:
+            return
+
+        # print("add ws tensors")
+        # print("check args m {} n {} k {}, top_k {} expert_num {} ".format(max_m, n, k, top_k, expert_num))
+        self.inited = True
+        device = "cuda"
+        self.a1_scale = torch.empty((1), device=device, dtype=torch.float)
+        self.a2_scale = torch.empty((1), device=device, dtype=torch.float)
+        self.a_q_fp8 = torch.empty((max_m, k), device=device, dtype=torch.float8_e4m3fn)
+        self.expert_offsets = torch.empty(
+            (expert_num + 1), dtype=torch.int32, device=device
+        )
+        self.problem_sizes = [
+            torch.empty((expert_num, 3), dtype=torch.int32, device=device),
+            torch.empty((expert_num, 3), dtype=torch.int32, device=device),
+        ]
+        self.permute_map = [
+            torch.empty((int(max_m * top_k)), dtype=torch.int32, device=device),
+            torch.empty((int(max_m * top_k)), dtype=torch.int32, device=device),
+        ]
+
+        self.inter = torch.empty(
+            (int(max_m * top_k), n), device=device, dtype=torch.bfloat16
+        )
+        self.c1 = torch.empty(
+            (int(max_m * top_k), n * 2), device=device, dtype=torch.bfloat16
+        )
+        self.c2 = torch.empty(
+            (int(max_m * top_k), k), device=device, dtype=torch.bfloat16
+        )
+        self.inter_q = torch.empty(
+            (int(max_m * top_k), n), device=device, dtype=torch.float8_e4m3fn
+        )
+        self.remap_q = torch.empty(
+            (max_m * top_k, k), device=device, dtype=torch.float8_e4m3fn
+        )
 
 
 class Fp8Config(QuantizationConfig):
@@ -493,6 +585,28 @@ class Fp8MoEMethod:
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        if get_bool_env_var("SGL_USE_CUTLASS_MOE_FP8"):
+            device = "cuda"
+            self.ab_strides1 = torch.full(
+                (num_experts,), hidden_size, device=device, dtype=torch.int64  # k
+            )
+            self.c_strides1 = torch.full(
+                (num_experts,),
+                2 * intermediate_size,  # n
+                device=device,
+                dtype=torch.int64,
+            )
+            self.ab_strides2 = torch.full(
+                (num_experts,), intermediate_size, device=device, dtype=torch.int64
+            )
+            self.c_strides2 = torch.full(
+                (num_experts,), hidden_size, device=device, dtype=torch.int64
+            )
+
+            singleton_var = GlobalVar()
+            # [TODO]: for other moe  topk_nums modify here
+            singleton_var.init_permute_ws(8, hidden_size)
+
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
         tp_size = get_tensor_model_parallel_world_size()
@@ -706,6 +820,27 @@ class Fp8MoEMethod:
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
+    def fp8_bf16_fp8(self, fp8_tensor, fp8_scale):
+        blocked_tensor = fp8_tensor.view(
+            fp8_tensor.shape[0],
+            fp8_tensor.shape[1] // 128,
+            128,
+            fp8_tensor.shape[2] // 128,
+            128,
+        ).to(torch.float32)
+
+        dequant_tensor = (
+            (blocked_tensor * fp8_scale.unsqueeze(2).unsqueeze(4))
+            .view(fp8_tensor.shape)
+            .to(torch.bfloat16)
+            .to(torch.float32)
+        )
+
+        scale_tensor = torch.abs(dequant_tensor).max() / 448
+        quant_tensor = dequant_tensor / scale_tensor
+
+        return quant_tensor, scale_tensor
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
@@ -746,11 +881,39 @@ class Fp8MoEMethod:
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
+            if get_bool_env_var("SGL_USE_CUTLASS_MOE_FP8"):
+                # Only support CUDA not AMD
+                w13_weight = layer.w13_weight.data
+                w13_weight_scale_inv = layer.w13_weight_scale_inv.data
+                w2_weight = layer.w2_weight
+                w2_weight_scale_inv = layer.w2_weight_scale_inv
+
+                w13_weight, w13_weight_scale_inv = self.fp8_bf16_fp8(
+                    w13_weight, w13_weight_scale_inv
+                )
+                w2_weight, w2_weight_scale_inv = self.fp8_bf16_fp8(
+                    w2_weight, w2_weight_scale_inv
+                )
+
+                w13_weight_scale_inv = w13_weight_scale_inv.repeat(w13_weight.size(0))
+                w2_weight_scale_inv = w2_weight_scale_inv.repeat(w13_weight.size(0))
+
+                # Minimize new GPU memory allocations
+                layer.w13_weight.data.copy_(w13_weight.contiguous())
+                layer.w13_weight_scale_inv = Parameter(
+                    w13_weight_scale_inv, requires_grad=False
+                )  # cuz changed shape
+                layer.w2_weight.data.copy_(w2_weight.contiguous())
+                layer.w2_weight_scale_inv = Parameter(
+                    w2_weight_scale_inv, requires_grad=False
+                )  # cuz changed shape
+
             return
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
         if not self.quant_config.is_checkpoint_fp8_serialized:
-            # If ROCm, fp8_dtype will be float8_e4m3fnuz (MI300x HW)
+            # If ROCm, use float8_e4m3fnuz instead (MI300x HW)
+            fp8_dtype = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
             w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
             w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
 
@@ -1014,31 +1177,63 @@ class Fp8MoEMethod:
                 self.problem_sizes2,
                 use_fp8_blockscale=True,
             )
-        # Expert fusion with FP8 quantization
-        return fused_experts(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=inplace and not no_combine,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            use_fp8_w8a8=True,
-            w1_scale=(
-                layer.w13_weight_scale_inv
-                if self.block_quant
-                else layer.w13_weight_scale
-            ),
-            w2_scale=(
-                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
-            ),
-            a1_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-            block_shape=self.quant_config.weight_block_size,
-            no_combine=no_combine,
-            routed_scaling_factor=routed_scaling_factor,
-        )
+        elif get_bool_env_var("SGL_USE_CUTLASS_MOE_FP8") and USE_CUTLASS_OPT:
+            moe_args = GlobalVar()
+            n = layer.w13_weight.shape[1] / 2
+            k = x.shape[1]
+            expert_num = layer.w13_weight.shape[0]
+            top_k = topk_ids.shape[1]
+
+            moe_args.create_workspace(MAX_SEQ_LEN, int(n), k, top_k, expert_num)
+            return cutlass_moe_fp8(
+                x,
+                layer.w13_weight.transpose(
+                    1, 2
+                ),  # per-block = scale_inv # .transpose(1, 2), Hidden size matches w1
+                layer.w2_weight.transpose(1, 2),
+                layer.w13_weight_scale_inv,  # per-block = scale_inv # Hidden size match w2
+                layer.w2_weight_scale_inv,
+                topk_weights,
+                topk_ids,
+                self.ab_strides1,  # missing
+                self.c_strides1,  # missing
+                self.ab_strides2,  # missing
+                self.c_strides2,  # missing
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                out_dtype=x.dtype,
+                # expert_map=expert_map, # no map in sglang
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                moe_ws=moe_args,
+            )
+        else:
+            # Expert fusion with FP8 quantization
+            return fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=inplace and not no_combine,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                use_fp8_w8a8=True,
+                w1_scale=(
+                    layer.w13_weight_scale_inv
+                    if self.block_quant
+                    else layer.w13_weight_scale
+                ),
+                w2_scale=(
+                    layer.w2_weight_scale_inv
+                    if self.block_quant
+                    else layer.w2_weight_scale
+                ),
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                block_shape=self.quant_config.weight_block_size,
+                no_combine=no_combine,
+                routed_scaling_factor=routed_scaling_factor,
+            )
 
     def maybe_apply_hip_fused_experts(
         self,

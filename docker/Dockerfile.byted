@@ -6,6 +6,7 @@ ARG sglang_version=0.4.6.post2+byted.0.0.2.202505261551
 ARG sgl_kernel_version=0.1.1+byted.0.0.2.202505261548
 ARG gdkv_sdk_version=0.0.1
 ARG eic_sdk_version=1.0
+ARG absl_version=2.3.0
 RUN pip config set global.index-url https://mirrors.ivolces.com/pypi/simple/
 
 RUN http_proxy='' pip index versions sglang -i https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/
@@ -21,6 +22,12 @@ RUN http_proxy='' pip install hpkv==${gdkv_sdk_version} --extra-index-url https:
 
 # eic sdk安装
 RUN http_proxy='' pip install eic==${eic_sdk_version} --extra-index-url https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/ --extra-index-url https://bytedpypi.byted.org/simple
+
+# group_gemm依赖安装
+RUN http_proxy='' pip install absl-py==${absl_version} --extra-index-url https://bytedpypi.byted.org/simple
+
+# group_gemm 安装
+RUN pip install --verbose git+https://github.com/bytedance-iaas/grouped_gemm@dev
 
 # examples 覆盖
 ARG branch=release_0.0.2

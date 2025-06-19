@@ -79,6 +79,10 @@ from sgl_kernel.speculative import (
     verify_tree_greedy,
 )
 from sgl_kernel.top_k import fast_topk
+from sgl_kernel.cutlass_moe_mm import (
+    get_cutlass_moe_mm_data,
+    cutlass_moe_mm,
+)
 from sgl_kernel.version import __version__
 
 build_tree_kernel = (

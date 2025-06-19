@@ -9,6 +9,12 @@ check-deps: ## Check and install required Python formatting dependencies
 	@command -v isort >/dev/null 2>&1 || (echo "Installing isort..." && pip install isort)
 	@command -v black >/dev/null 2>&1 || (echo "Installing black..." && pip install black)
 
+GROUPED_GEMM_URL := git+https://github.com/bytedance-iaas/grouped_gemm@dev
+PYPI_MIRROR := -i http://pypi.mirrors.ustc.edu.cn/simple/ --trusted-host pypi.mirrors.ustc.edu.cn
+
+install-grouped-gemm: ## Install grouped_gemm from GitHub
+	pip install --verbose $(GROUPED_GEMM_URL) $(PYPI_MIRROR)
+
 install-deps: ## Install Python formatting tools (isort and black)
 	pip install scikit-build-core isort black
 
