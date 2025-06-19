@@ -22,7 +22,11 @@ from transformers import Gemma3nAudioConfig, PreTrainedModel
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear, QKVParallelLinear
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.models.gemma3n_causal import Gemma3nRMSNorm
 from sglang.srt.utils import add_prefix, make_layers

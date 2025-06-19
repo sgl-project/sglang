@@ -16,8 +16,8 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/gemma3n_mm.py
 
 import logging
-from functools import lru_cache
 import re
+from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict
 
 import torch
@@ -46,10 +46,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3n_audio import Gemma3nAudioEncoder
-from sglang.srt.models.gemma3n_causal import (
-    Gemma3nRMSNorm,
-    Gemma3nTextModel,
-)
+from sglang.srt.models.gemma3n_causal import Gemma3nRMSNorm, Gemma3nTextModel
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -296,7 +293,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         self.quant_config = quant_config
         print(f"DEBUG: prefix: {prefix}")
         prefix = add_prefix("model", prefix)
-        
+
         # Vision components
         # TODO: Use sglang's vision model
         self.vision_tower = AutoModel.from_config(config=config.vision_config)
@@ -374,10 +371,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         return self.language_model.get_input_embeddings()
 
     def get_attention_sliding_window_size(self):
-        """
-        This value is used to initialize attention backends in `ForwardBatch`.
-        """
-        return self.language_model.get_attention_sliding_window_size()
+        return self.config.text_config.sliding_window - 1
 
     def get_image_feature(self, items: List[MultimodalDataItem]):
         """
@@ -487,14 +481,14 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
     def get_per_layer_inputs(
         self, input_ids: torch.LongTensor
     ) -> Optional[torch.Tensor]:
-        return self.language_model.model.get_per_layer_inputs(input_ids)
+        return self.language_model.get_per_layer_inputs(input_ids)
 
     def project_per_layer_inputs(
         self,
         inputs_embeds: torch.Tensor,
         per_layer_inputs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.language_model.model.project_per_layer_inputs(
+        return self.language_model.project_per_layer_inputs(
             inputs_embeds, per_layer_inputs
         )
 
@@ -599,9 +593,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
                 if name is None:
                     continue
                 param = params_dict[name]
-                weight_loader = getattr(
-                    param, "weight_loader", default_weight_loader
-                )
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params

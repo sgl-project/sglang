@@ -13,7 +13,8 @@
 # ==============================================================================
 
 import re
-from typing import Dict, List, Union, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
+
 import numpy as np
 
 from sglang.srt.managers.multimodal_processor import (
@@ -28,12 +29,12 @@ from sglang.srt.models.gemma3n_mm import Gemma3nForConditionalGeneration
 
 class Gemma3nSGLangProcessor(SGLangBaseProcessor):
     """Multimodal processor for Gemma3n supporting image and audio inputs."""
-    
+
     models = [Gemma3nForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        
+
         self.IMAGE_TOKEN = "<image_soft_token>"
         self.IMAGE_TOKEN_REGEX = re.compile(
             r"<start_of_image>(?:(?:<image_soft_token>)*<end_of_image>)?"
@@ -43,7 +44,7 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
         self.AUDIO_TOKEN_REGEX = re.compile(
             r"<start_of_audio>(?:(?:<audio_soft_token>)*<end_of_audio>)?"
         )
-        
+
         self.IM_START_TOKEN_ID = hf_config.boi_token_id
         self.IM_END_TOKEN_ID = hf_config.eoi_token_id
 
@@ -55,22 +56,22 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
         image_data: Optional[List[Union[str, bytes, Dict]]] = None,
         audio_data: Optional[List[Union[str, bytes, Dict]]] = None,
         input_text: str = "",
-        request_obj = None,
+        request_obj=None,
         max_req_input_len: int = 0,
         *args,
         **kwargs,
     ):
         """Process multimodal data including images and audio."""
-        
+
         if not image_data and not audio_data:
             return None
-        
+
         if isinstance(image_data, str):
             image_data = [image_data]
-        
+
         if isinstance(audio_data, str):
             audio_data = [audio_data]
-        
+
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
@@ -82,7 +83,7 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
                 audio_token_regex=self.AUDIO_TOKEN_REGEX,
             ),
         )
-        
+
         combined_mm_item, input_ids = self.process_and_combine_mm_data(base_output)
 
         return {
