@@ -19,6 +19,8 @@ jobs:
         exclude:
           - cuda_version: '12.6.1'
             build_type: 'blackwell'
+          - cuda_version: '12.8.1'
+            build_type: 'all'
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
