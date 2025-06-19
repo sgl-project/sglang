@@ -34,6 +34,8 @@ from sglang.srt.entrypoints.openai.utils import (
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.jinja_template_utils import process_content_for_template_format
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.template_manager import TemplateManager
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.utils import convert_json_schema_to_str
 
@@ -147,7 +149,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             else:
                 prompt, prompt_ids, image_data, audio_data, modalities, stop = (
-                    self._apply_conversation_template(request)
+                    self._apply_conversation_template(request, is_multimodal)
                 )
         else:
             # Use raw prompt
@@ -254,7 +256,9 @@ class OpenAIServingChat(OpenAIServingBase):
         return prompt, prompt_ids, image_data, audio_data, modalities, stop
 
     def _apply_conversation_template(
-        self, request: ChatCompletionRequest
+        self,
+        request: ChatCompletionRequest,
+        is_multimodal: bool,
     ) -> tuple[str, Optional[Any], Optional[Any], List[str], List[str]]:
         """Apply conversation template"""
         prompt = ""
@@ -638,9 +642,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle reasoning content
             reasoning_text = None
-            chat_template_kwargs = getattr(request, "chat_template_kwargs", {})
-            if chat_template_kwargs:
-                enable_thinking = chat_template_kwargs.get("enable_thinking", True)
+            if request.chat_template_kwargs is not None:
+                enable_thinking = request.chat_template_kwargs.get(
+                    "enable_thinking", True
+                )
             if reasoning_parser and request.separate_reasoning and enable_thinking:
                 try:
                     parser = ReasoningParser(
