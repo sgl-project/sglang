@@ -328,6 +328,7 @@ if (SGL_KERNEL_ENABLE_FA3)
         list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS
             "-gencode=arch=compute_80,code=sm_80"
             "-gencode=arch=compute_86,code=sm_86"
+            "-gencode=arch=compute_87,code=sm_87"
         )
         # SM8X Logic
         file(GLOB FA3_SM8X_GEN_SRCS
