@@ -94,7 +94,7 @@ WORKDIR /sgl-workspace
 RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six  --ignore-installed \
     && git clone --depth=1 https://github.com/sgl-project/sglang.git \
     && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
-         export CUINDEX=121; \
+         export CUINDEX=126; \
        elif [ "$CUDA_VERSION" = "12.4.1" ]; then \
          export CUINDEX=124; \
        elif [ "$CUDA_VERSION" = "12.8.1" ]; then \
