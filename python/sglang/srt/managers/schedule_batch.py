@@ -798,7 +798,6 @@ class Req:
         if get_tensor_model_parallel_rank() == 0:
             logger.error(f"{error_msg}, {self.rid=}")
         self.release_mm_resources()
-        self.multimodal_inputs = None
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
         self.finished_reason = FINISH_ABORT(
