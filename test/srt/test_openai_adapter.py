@@ -5,7 +5,7 @@ Unit tests for OpenAI adapter utils.
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.openai_api.utils import (
+from sglang.srt.entrypoints.openai.utils import (
     detect_template_content_format,
     process_content_for_template_format,
 )

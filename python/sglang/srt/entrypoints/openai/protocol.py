@@ -404,20 +404,12 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def set_tool_choice_default(cls, values):
-        if isinstance(values, dict):
-            if values.get("tool_choice") is None:
-                if values.get("tools") is None:
-                    values["tool_choice"] = "none"
-                else:
-                    values["tool_choice"] = "auto"
+        if values.get("tool_choice") is None:
+            if values.get("tools") is None:
+                values["tool_choice"] = "none"
+            else:
+                values["tool_choice"] = "auto"
         return values
-
-    @field_validator("messages")
-    @classmethod
-    def validate_messages_not_empty(cls, v):
-        if not v:
-            raise ValueError("Messages cannot be empty")
-        return v
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1

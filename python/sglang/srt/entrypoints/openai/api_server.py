@@ -43,7 +43,7 @@ from sglang.srt.entrypoints.engine import Engine, _launch_subprocesses
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
-from sglang.srt.openai_api.protocol import EmbeddingRequest, ModelCard, ModelList
+from sglang.srt.entrypoints.openai.protocol import EmbeddingRequest, ModelCard, ModelList
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,

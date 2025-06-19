@@ -47,6 +47,19 @@ from sglang.srt.disaggregation.utils import (
     register_disaggregation_server,
 )
 from sglang.srt.entrypoints.engine import _launch_subprocesses
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    EmbeddingRequest,
+    ModelCard,
+    ModelList,
+    ScoringRequest,
+)
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
+from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
+from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
+from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -72,21 +85,6 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
-from sglang.srt.openai_api.adapter import (
-    v1_batches,
-    v1_cancel_batch,
-    v1_chat_completions,
-    v1_completions,
-    v1_delete_file,
-    v1_embeddings,
-    v1_files_create,
-    v1_rerank,
-    v1_retrieve_batch,
-    v1_retrieve_file,
-    v1_retrieve_file_content,
-    v1_score,
-)
-from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -123,6 +121,24 @@ def set_global_state(global_state: _GlobalState):
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
     server_args: ServerArgs = fast_api_app.server_args
+
+    # Initialize OpenAI serving handlers
+    fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
+        _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_chat = OpenAIServingChat(
+        _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
+        _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_score = OpenAIServingScore(
+        _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
+        _global_state.tokenizer_manager
+    )
+
     if server_args.warmups is not None:
         await execute_warmups(
             server_args.warmups.split(","), _global_state.tokenizer_manager
@@ -331,12 +347,11 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
 
 
 @app.api_route("/v1/rerank", methods=["POST", "PUT"])
-async def v1_rerank_request(obj: V1RerankReqInput, raw_request: Request):
-    try:
-        ret = await v1_rerank(_global_state.tokenizer_manager, obj, raw_request)
-        return ret
-    except ValueError as e:
-        return _create_error_response(e)
+async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
+    """Endpoint for reranking documents based on query relevance."""
+    return await raw_request.app.state.openai_serving_rerank.handle_request(
+        request, raw_request
+    )
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
@@ -620,24 +635,34 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
 
 
 @app.post("/v1/completions")
-async def openai_v1_completions(raw_request: Request):
-    return await v1_completions(_global_state.tokenizer_manager, raw_request)
+async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
+    """OpenAI-compatible text completion endpoint."""
+    return await raw_request.app.state.openai_serving_completion.handle_request(
+        request, raw_request
+    )
 
 
 @app.post("/v1/chat/completions")
-async def openai_v1_chat_completions(raw_request: Request):
-    return await v1_chat_completions(_global_state.tokenizer_manager, raw_request)
+async def openai_v1_chat_completions(
+    request: ChatCompletionRequest, raw_request: Request
+):
+    """OpenAI-compatible chat completion endpoint."""
+    return await raw_request.app.state.openai_serving_chat.handle_request(
+        request, raw_request
+    )
 
 
 @app.post("/v1/embeddings", response_class=ORJSONResponse)
-async def openai_v1_embeddings(raw_request: Request):
-    response = await v1_embeddings(_global_state.tokenizer_manager, raw_request)
-    return response
+async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
+    """OpenAI-compatible embeddings endpoint."""
+    return await raw_request.app.state.openai_serving_embedding.handle_request(
+        request, raw_request
+    )
 
 
 @app.get("/v1/models", response_class=ORJSONResponse)
-def available_models():
-    """Show available models."""
+async def available_models():
+    """Show available models. OpenAI-compatible endpoint."""
     served_model_names = [_global_state.tokenizer_manager.served_model_name]
     model_cards = []
     for served_model_name in served_model_names:
@@ -651,47 +676,6 @@ def available_models():
     return ModelList(data=model_cards)
 
 
-@app.post("/v1/files")
-async def openai_v1_files(file: UploadFile = File(...), purpose: str = Form("batch")):
-    return await v1_files_create(
-        file, purpose, _global_state.tokenizer_manager.server_args.file_storage_path
-    )
-
-
-@app.delete("/v1/files/{file_id}")
-async def delete_file(file_id: str):
-    # https://platform.openai.com/docs/api-reference/files/delete
-    return await v1_delete_file(file_id)
-
-
-@app.post("/v1/batches")
-async def openai_v1_batches(raw_request: Request):
-    return await v1_batches(_global_state.tokenizer_manager, raw_request)
-
-
-@app.post("/v1/batches/{batch_id}/cancel")
-async def cancel_batches(batch_id: str):
-    # https://platform.openai.com/docs/api-reference/batch/cancel
-    return await v1_cancel_batch(_global_state.tokenizer_manager, batch_id)
-
-
-@app.get("/v1/batches/{batch_id}")
-async def retrieve_batch(batch_id: str):
-    return await v1_retrieve_batch(batch_id)
-
-
-@app.get("/v1/files/{file_id}")
-async def retrieve_file(file_id: str):
-    # https://platform.openai.com/docs/api-reference/files/retrieve
-    return await v1_retrieve_file(file_id)
-
-
-@app.get("/v1/files/{file_id}/content")
-async def retrieve_file_content(file_id: str):
-    # https://platform.openai.com/docs/api-reference/files/retrieve-contents
-    return await v1_retrieve_file_content(file_id)
-
-
 ## SageMaker API
 @app.get("/ping")
 async def sagemaker_health() -> Response:
@@ -700,8 +684,13 @@ async def sagemaker_health() -> Response:
 
 
 @app.post("/invocations")
-async def sagemaker_chat_completions(raw_request: Request):
-    return await v1_chat_completions(_global_state.tokenizer_manager, raw_request)
+async def sagemaker_chat_completions(
+    request: ChatCompletionRequest, raw_request: Request
+):
+    """OpenAI-compatible chat completion endpoint."""
+    return await raw_request.app.state.openai_serving_chat.handle_request(
+        request, raw_request
+    )
 
 
 ## Vertex AI API
@@ -733,9 +722,11 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
 
 
 @app.post("/v1/score")
-async def v1_score_request(raw_request: Request):
+async def v1_score_request(request: ScoringRequest, raw_request: Request):
     """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
-    return await v1_score(_global_state.tokenizer_manager, raw_request)
+    return await raw_request.app.state.openai_serving_score.handle_request(
+        request, raw_request
+    )
 
 
 def _create_error_response(e):

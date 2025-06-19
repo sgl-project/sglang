@@ -20,7 +20,7 @@ import re
 from enum import IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
-from sglang.srt.openai_api.protocol import ChatCompletionRequest
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.utils import read_system_prompt_from_file
 
 
