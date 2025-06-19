@@ -1230,38 +1230,69 @@ def get_device_sm():
         major, minor = torch.cuda.get_device_capability()
         return major * 10 + minor
     return 0
-
+    
+def is_jetson():
+    """Checks if the system is an NVIDIA Jetson device."""
+    return os.path.exists('/etc/nv_tegra_release')
 
 def get_nvgpu_memory_capacity():
-    try:
-        # Run nvidia-smi and capture the output
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+    """
+    Gets the total memory capacity of the GPU in MiB.
 
-        if result.returncode != 0:
-            raise RuntimeError(f"nvidia-smi error: {result.stderr.strip()}")
+    This function is adapted to work robustly on both standard PCs with
+    NVIDIA GPUs and on NVIDIA Jetson devices. It explicitly checks for a
+    Jetson platform first.
+    """
+    # -----------------------------------------------------------------------
+    # 1. Explicitly check for Jetson platform
+    # -----------------------------------------------------------------------
+    if is_jetson():
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if "MemTotal" in line:
+                        # Line is "MemTotal:       16343580 kB"
+                        # Value is in KiB, convert to MiB
+                        mem_total_kb = float(line.split()[1])
+                        return mem_total_kb / 1024
+            raise ValueError("Could not find MemTotal in /proc/meminfo on Jetson device.")
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to read system memory from /proc/meminfo on a Jetson device."
+            ) from e
 
-        # Parse the output to extract memory values
-        memory_values = [
-            float(mem)
-            for mem in result.stdout.strip().split("\n")
-            if re.match(r"^\d+(\.\d+)?$", mem.strip())
-        ]
+    # -----------------------------------------------------------------------
+    # 2. If not a Jetson, assume a discrete GPU and use nvidia-smi
+    # -----------------------------------------------------------------------
+    else:
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,  # Raises CalledProcessError for non-zero exit codes
+            )
 
-        if not memory_values:
-            raise ValueError("No GPU memory values found.")
+            memory_values = [
+                float(mem)
+                for mem in result.stdout.strip().split("\n")
+                if re.match(r"^\d+(\.\d+)?$", mem.strip())
+            ]
 
-        # Return the minimum memory value
-        return min(memory_values)
+            if not memory_values:
+                # This should be rare with check=True, but as a safeguard:
+                raise ValueError("No GPU memory values found in nvidia-smi output.")
 
-    except FileNotFoundError:
-        raise RuntimeError(
-            "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
-        )
+            return min(memory_values)
+
+        except FileNotFoundError:
+            raise RuntimeError(
+                "Not a Jetson device and nvidia-smi was not found. "
+                "Ensure NVIDIA drivers are installed and in the system's PATH."
+            )
+        except subprocess.CalledProcessEror as e:
+            raise RuntimeError(f"nvidia-smi command failed: {e.stderr.strip()}")
 
 
 def get_hpu_memory_capacity():
