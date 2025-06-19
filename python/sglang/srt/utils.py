@@ -2622,6 +2622,20 @@ def update_config(
             model_config.hidden_size // model_config.num_attention_heads
         )
 
+        model_config.hf_config.original_num_attention_heads = (
+            model_config.num_attention_heads
+        )
+        model_config.hf_text_config.original_num_attention_heads = (
+            model_config.num_attention_heads
+        )
+
+        model_config.hf_config.original_total_num_kv_heads = (
+            model_config.get_total_num_kv_heads()
+        )
+        model_config.hf_text_config.original_total_num_kv_heads = (
+            model_config.get_total_num_kv_heads()
+        )
+
         query_heads_per_kv = (
             model_config.num_attention_heads // model_config.get_total_num_kv_heads()
         )
