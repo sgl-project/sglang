@@ -143,7 +143,7 @@ class TestDPAttentionDP2TP2DeepseekV3MTPTBO(CustomTestCase):
         import os
 
         # print debug log for tbo
-        os.environ["TBO_DEBUG"] = "1"
+        os.environ["SGLANG_TBO_DEBUG"] = "1"
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
@@ -182,7 +182,6 @@ class TestDPAttentionDP2TP2DeepseekV3MTPTBO(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env={"SGL_ENABLE_JIT_DEEPGEMM": "1", **os.environ},
         )
 
     @classmethod

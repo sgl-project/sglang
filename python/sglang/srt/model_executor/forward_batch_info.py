@@ -633,6 +633,13 @@ class ForwardBatch:
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
 
+    @property
+    def draft_token_num(self):
+        if self.forward_mode.is_target_verify():
+            return self.spec_info.draft_token_num
+        else:
+            return None
+
 
 def enable_num_token_non_padded(server_args):
     return server_args.enable_ep_moe or server_args.enable_deepep_moe

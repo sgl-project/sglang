@@ -126,10 +126,7 @@ class TboCudaGraphRunnerPlugin:
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
         if not global_server_args_dict["enable_two_batch_overlap"]:
             return
-        if batch.forward_mode.is_target_verify():
-            draft_token_num_per_batch = batch.spec_info.draft_token_num
-        else:
-            draft_token_num_per_batch = None
+        draft_token_num_per_batch = batch.draft_token_num
 
         batch.tbo_split_seq_index = compute_split_seq_index(
             forward_mode=batch.forward_mode,
@@ -364,7 +361,14 @@ class TboForwardBatchPreparer:
             old_value = getattr(batch, key)
             if old_value is None:
                 continue
-            elif batch.forward_mode.is_target_verify() and key.startswith("extend_"):
+            elif batch.forward_mode.is_target_verify() and (
+                key == "extend_seq_lens"
+                or key == "extend_prefix_lens"
+                or key == "extend_start_loc"
+                or key == "extend_prefix_lens_cpu"
+                or key == "extend_seq_lens_cpu"
+                or key == "extend_logprob_start_lens_cpu"
+            ):
                 output_dict[key] = None
                 continue
             assert (
@@ -466,10 +470,7 @@ class TboForwardBatchPreparer:
 
     @classmethod
     def _compute_split_token_index(cls, batch: ForwardBatch):
-        if batch.forward_mode.is_target_verify():
-            draft_token_num_per_batch = batch.spec_info.draft_token_num
-        else:
-            draft_token_num_per_batch = None
+        draft_token_num_per_batch = batch.draft_token_num
         return compute_split_token_index(
             split_seq_index=batch.tbo_split_seq_index,
             forward_mode=batch.forward_mode,
