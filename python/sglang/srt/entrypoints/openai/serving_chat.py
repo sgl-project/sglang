@@ -147,11 +147,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     self._apply_jinja_template(request, tools, is_multimodal)
                 )
             else:
-                prompt, image_data, audio_data, modalities, stop = (
+                prompt, prompt_ids, image_data, audio_data, modalities, stop = (
                     self._apply_conversation_template(request)
                 )
-                if not is_multimodal:
-                    prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
         else:
             # Use raw prompt
             prompt_ids = request.messages
@@ -178,6 +176,8 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal: bool,
     ) -> tuple[str, List[int], Optional[Any], Optional[Any], List[str], List[str]]:
         """Apply Jinja chat template"""
+        prompt = ""
+        prompt_ids = []
         openai_compatible_messages = []
         image_data = []
         audio_data = []
@@ -259,14 +259,18 @@ class OpenAIServingChat(OpenAIServingBase):
         if is_multimodal:
             prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
-        stop = request.stop or []
-        
+        stop = request.stop
+        image_data = image_data if image_data else None
+        audio_data = audio_data if audio_data else None
+        modalities = modalities if modalities else []
         return prompt, prompt_ids, image_data, audio_data, modalities, stop
 
     def _apply_conversation_template(
         self, request: ChatCompletionRequest
     ) -> tuple[str, Optional[Any], Optional[Any], List[str], List[str]]:
         """Apply conversation template"""
+        prompt = ""
+        prompt_ids = []
         conv = generate_chat_conv(request, self.tokenizer_manager.chat_template_name)
 
         # If we should continue the final assistant message, adjust the conversation.
@@ -305,7 +309,10 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 stop.extend(request.stop)
 
-        return prompt, image_data, audio_data, modalities, stop
+        if not is_multimodal:
+            prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
+
+        return prompt, prompt_ids, image_data, audio_data, modalities, stop
 
     def _build_sampling_params(
         self,
@@ -645,9 +652,7 @@ class OpenAIServingChat(OpenAIServingBase):
             reasoning_text = None
             chat_template_kwargs = getattr(request, "chat_template_kwargs", {})
             if chat_template_kwargs:
-                enable_thinking = chat_template_kwargs.get(
-                    "enable_thinking", True
-                )
+                enable_thinking = chat_template_kwargs.get("enable_thinking", True)
             if reasoning_parser and request.separate_reasoning and enable_thinking:
                 try:
                     parser = ReasoningParser(
