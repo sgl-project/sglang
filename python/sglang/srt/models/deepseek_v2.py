@@ -1822,13 +1822,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                 )
             elif (
                 global_server_args_dict["enable_deepep_moe"]
-                or global_server_args_dict["enable_ep_moe"] or global_server_args_dict["enable_pplx_moe"]
+                or global_server_args_dict["enable_ep_moe"]
+                or global_server_args_dict["enable_pplx_moe"]
             ):
                 self.num_fused_shared_experts = 0
                 global_server_args_dict["disable_shared_experts_fusion"] = True
                 log_info_on_rank0(
                     logger,
-                    "Deepseek V3/R1 can not use shared experts fusion optimization when in deepep_moe or ep_moe mode. Shared experts fusion optimization is disabled.",
+                    "Deepseek V3/R1 can not use shared experts fusion optimization when in deepep_moe or ep_moe or pplx_moe mode. Shared experts fusion optimization is disabled.",
                 )
         elif self.num_fused_shared_experts == 0:
             if (
