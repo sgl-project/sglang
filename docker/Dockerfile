@@ -1,10 +1,10 @@
-ARG CUDA_VERSION=12.4.1
+ARG CUDA_VERSION=12.6.1
+ARG BUILD_TYPE=all
 
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV CUDA_HOME=/usr/local/cuda
-ARG BUILD_TYPE=all
 
 # TZ
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
