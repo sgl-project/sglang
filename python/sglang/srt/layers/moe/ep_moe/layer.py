@@ -179,6 +179,7 @@ class EPMoE(torch.nn.Module):
         assert (
             num_fused_shared_experts == 0
         ), "num_fused_shared_experts is not supported in EP"
+        self.num_fused_shared_experts = num_fused_shared_experts
         self.num_experts_per_partition = self.num_experts // self.tp_size
         self.start_expert_id = self.tp_rank * self.num_experts_per_partition
         self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1
@@ -263,6 +264,7 @@ class EPMoE(torch.nn.Module):
             renormalize=self.renormalize,
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
+            num_fused_shared_experts=self.num_fused_shared_experts,
             correction_bias=self.correction_bias,
             custom_routing_function=self.custom_routing_function,
             routed_scaling_factor=self.routed_scaling_factor,
@@ -382,6 +384,7 @@ class EPMoE(torch.nn.Module):
             renormalize=self.renormalize,
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
+            num_fused_shared_experts=self.num_fused_shared_experts,
             correction_bias=self.correction_bias,
             custom_routing_function=self.custom_routing_function,
             routed_scaling_factor=self.routed_scaling_factor,
