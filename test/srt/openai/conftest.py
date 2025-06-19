@@ -12,9 +12,10 @@ import pytest
 import requests
 
 from sglang.srt.utils import kill_process_tree  # reuse SGLang helper
+from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 SERVER_MODULE = "sglang.srt.entrypoints.openai.api_server"
-DEFAULT_MODEL = "dummy-model"
+DEFAULT_MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 STARTUP_TIMEOUT = float(os.getenv("SGLANG_OPENAI_STARTUP_TIMEOUT", 120))
 
 
@@ -39,7 +40,7 @@ def _wait_until_healthy(proc: subprocess.Popen, base: str, timeout: float) -> No
 
 
 def launch_openai_server(model: str = DEFAULT_MODEL, **kw):
-    """Spawn the draft OpenAI-compatible server and wait until it’s ready."""
+    """Spawn the draft OpenAI-compatible server and wait until it's ready."""
     port = _pick_free_port()
     cmd = [
         sys.executable,
@@ -79,7 +80,7 @@ def launch_openai_server(model: str = DEFAULT_MODEL, **kw):
 
 @pytest.fixture(scope="session")
 def openai_server() -> Generator[str, None, None]:
-    """PyTest fixture that provides the server’s base URL and cleans up."""
+    """PyTest fixture that provides the server's base URL and cleans up."""
     proc, base, log_file = launch_openai_server()
     yield base
     kill_process_tree(proc.pid)
