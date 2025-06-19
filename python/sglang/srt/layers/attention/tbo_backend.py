@@ -222,7 +222,7 @@ def _init_forward_metadata_cuda_graph_split(
         )
         assert (
             capture_num_tokens == bs * token_num_per_batch
-        ), "Only support num_tokens==bs currently unless target-verify mode"
+        ), "Only support num_tokens==bs * token_num_per_batch for target-verify or decode mode"
         ans.update(
             dict(
                 num_tokens=output_bs * token_num_per_batch,
