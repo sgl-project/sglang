@@ -63,8 +63,12 @@ class OpenAIServingBase(ABC):
         """Generate request ID based on request type"""
         pass
 
-    def _generate_request_id_base(self, request: OpenAIServingRequest) -> str:
+    def _generate_request_id_base(self, request: OpenAIServingRequest) -> Optional[str]:
         """Generate request ID based on request type"""
+        return None
+
+        # TODO(chang): the rid is used in io_strcut check and often violates `The rid should be a list` AssertionError
+        # Temporarily return None in this function until the rid logic is clear.
         if rid := getattr(request, "rid", None):
             return rid
 
