@@ -585,7 +585,7 @@ class Fp8MoEMethod:
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        if get_bool_env_var("SGL_USE_CUTLASS_MOE_FP8"):
+        if get_bool_env_var("SGL_USE_CUTLASS_MOE_FP8") and USE_CUTLASS_OPT:
             device = "cuda"
             self.ab_strides1 = torch.full(
                 (num_experts,), hidden_size, device=device, dtype=torch.int64  # k
@@ -881,7 +881,7 @@ class Fp8MoEMethod:
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
-            if get_bool_env_var("SGL_USE_CUTLASS_MOE_FP8"):
+            if get_bool_env_var("SGL_USE_CUTLASS_MOE_FP8") and USE_CUTLASS_OPT:
                 # Only support CUDA not AMD
                 w13_weight = layer.w13_weight.data
                 w13_weight_scale_inv = layer.w13_weight_scale_inv.data
