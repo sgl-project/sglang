@@ -30,7 +30,7 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import is_cuda, set_weight_attrs
+from sglang.srt.utils import is_cuda
 
 if is_cuda():
     from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
