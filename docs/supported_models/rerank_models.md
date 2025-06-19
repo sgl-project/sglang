@@ -46,4 +46,4 @@ for item in response_json:
 
 | Model Family (Rerank)                          | Example HuggingFace Identifier       | Chat Template | Description                                                                                                                      |
 |------------------------------------------------|--------------------------------------|---------------|----------------------------------------------------------------------------------------------------------------------------------|
-| **BGE-Reranker (BgeRerankModel)**              | `BAAI/bge-reranker-v2-m3`            | N/A           | A Currently only support `attention-backend`   `triton` and `torch_native`.  high-performance cross-encoder reranker model from BAAI. Suitable for reranking search results based on semantic relevance.   |
+| **BGE-Reranker (BgeRerankModel)**              | `BAAI/bge-reranker-v2-m3`            | N/A           | Currently only support `attention-backend`   `triton` and `torch_native`.  high-performance cross-encoder reranker model from BAAI. Suitable for reranking search results based on semantic relevance.   |
