@@ -393,6 +393,8 @@ class SchedulerDisaggregationPrefillMixin:
                     logits_output.input_token_logprobs = tuple(
                         logits_output.input_token_logprobs.tolist()
                     )
+
+        hidden_state_offset = 0
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
@@ -402,6 +404,16 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 self.disagg_prefill_inflight_queue.append(req)
+                if logits_output.hidden_states is not None:
+                    last_hidden_index = (
+                        hidden_state_offset + extend_input_len_per_req[i] - 1
+                    )
+                    req.hidden_states_tensor = (
+                        logits_output.hidden_states[last_hidden_index].cpu().clone()
+                    )
+                    hidden_state_offset += extend_input_len_per_req[i]
+                else:
+                    req.hidden_states_tensor = None
                 if req.return_logprob:
                     assert extend_logprob_start_len_per_req is not None
                     assert extend_input_len_per_req is not None
