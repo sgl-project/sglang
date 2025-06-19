@@ -74,7 +74,6 @@ suites = {
         TestFile("test_radix_attention.py", 105),
         TestFile("test_reasoning_content.py", 89),
         TestFile("test_regex_constrained.py", 64),
-        TestFile("test_release_memory_occupation.py", 44),
         TestFile("test_request_length_validation.py", 31),
         TestFile("test_retract_decode.py", 54),
         TestFile("test_server_args.py", 1),
@@ -146,6 +145,7 @@ suites = {
         TestFile("test_patch_torch.py", 19),
         TestFile("test_update_weights_from_distributed.py", 103),
         TestFile("test_verl_engine_2_gpu.py", 64),
+        TestFile("test_release_memory_occupation.py", 44),
     ],
     "per-commit-2-gpu-amd": [
         TestFile("models/lora/test_lora_tp.py", 116),
