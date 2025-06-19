@@ -80,7 +80,7 @@ async def lifespan(app: FastAPI):
     tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
     app.state.tokenizer_manager = tokenizer_manager
     app.state.scheduler_info = scheduler_info
-    app.state.embedding_server = OpenAIServingEmbedding(
+    app.state.serving_embedding = OpenAIServingEmbedding(
         tokenizer_manager=tokenizer_manager
     )
 
@@ -178,11 +178,11 @@ async def openai_v1_embeddings(raw_request: Request):
         request_json = await raw_request.json()
         request = EmbeddingRequest(**request_json)
     except Exception as e:
-        return app.state.embedding_server.create_error_response(
+        return app.state.serving_embedding.create_error_response(
             f"Invalid request body, error: {str(e)}"
         )
 
-    ret = await app.state.embedding_server.handle_request(request, raw_request)
+    ret = await app.state.serving_embedding.handle_request(request, raw_request)
     return ret
 
 
