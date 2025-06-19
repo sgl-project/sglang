@@ -90,7 +90,6 @@ if _is_hip:
     from aiter import ActivationType, QuantType, biased_grouped_topk
     from aiter.fused_moe import fused_moe
     from aiter.fused_moe_bf16_asm import asm_moe, ck_moe_2stages
-    from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
 if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available)):
@@ -1089,6 +1088,8 @@ class Fp8MoEMethod:
             )
 
         if _use_aiter:
+            assert not no_combine, f"{no_combine=} is not supported."
+            if self.block_quant:
                 return fused_moe(
                     x,
                     layer.w13_weight,

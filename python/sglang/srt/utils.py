@@ -2428,6 +2428,7 @@ class LazyValue:
             self._creator = None
         return self._value
 
+
 def dynamic_import(func_path: str):
     parts = func_path.split(".")
     if len(parts) < 2:
@@ -2444,7 +2445,7 @@ def dynamic_import(func_path: str):
 class AiterTopKRoutingBuffers:
     MAX_NUM_TOKENS: int = 4096 * 128
 
-    def __init__(self, top_k: int, n_routed_experts: int, n_shared_experts: int):
+    def __init__(self, top_k: int):
         self.non_shared_topk_ids = torch.empty(
             (AiterTopKRoutingBuffers.MAX_NUM_TOKENS, top_k),
             dtype=torch.int32,
