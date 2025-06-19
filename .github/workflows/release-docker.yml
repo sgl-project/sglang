@@ -14,8 +14,11 @@ jobs:
     environment: 'prod'
     strategy:
       matrix:
-        cuda_version: ['12.4.1']
-        build_type: ['all']
+        cuda_version: ['12.4.1', '12.8.1']
+        build_type: ['all', 'blackwell']
+        exclude:
+          - cuda_version: '12.4.1'
+            build_type: 'blackwell'
     steps:
       - name: Delete huge unnecessary tools folder
         run: rm -rf /opt/hostedtoolcache
@@ -41,6 +44,8 @@ jobs:
             cuda_tag="cu124"
           elif [ "${{ matrix.cuda_version }}" = "12.5.1" ]; then
             cuda_tag="cu125"
+          elif [ "${{ matrix.cuda_version }}" = "12.8.1" ]; then
+            cuda_tag="cu128"
           else
             echo "Unsupported CUDA version"
             exit 1
@@ -52,12 +57,14 @@ jobs:
             tag_suffix=""
           elif [ "${{ matrix.build_type }}" = "srt" ]; then
             tag_suffix="-srt"
+          elif [ "${{ matrix.build_type }}" = "blackwell" ]; then
+            tag_suffix="-blackwell"
           else
             echo "Unsupported build type"
             exit 1
           fi
 
-          docker build . -f docker/Dockerfile --build-arg CUDA_VERSION=${{ matrix.cuda_version }} --build-arg BUILD_TYPE=${{ matrix.build_type }} -t lmsysorg/sglang:${tag}${tag_suffix} --no-cache
+          docker buildx build . -f docker/Dockerfile  --build-arg CUDA_VERSION=${{ matrix.cuda_version }} --build-arg BUILD_TYPE=${{ matrix.build_type }} -t lmsysorg/sglang:${tag}${tag_suffix} --no-cache
           docker push lmsysorg/sglang:${tag}${tag_suffix}
 
           if [ "${{ matrix.cuda_version }}" = "12.4.1" ]; then
