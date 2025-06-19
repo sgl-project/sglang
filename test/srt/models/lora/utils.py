@@ -96,7 +96,7 @@ ALL_OTHER_LORA_MODELS = [
 CI_MULTI_LORA_MODELS = [
     # multi-rank case
     LoRAModelCase(
-        base="meta-llama/Llama-2-7b-hf",
+        base="unsloth/Meta-Llama-3.1-8B",
         adaptors=[
             LoRAAdaptor(
                 name="winddude/wizardLM-LlaMA-LoRA-7B",
@@ -109,11 +109,29 @@ CI_MULTI_LORA_MODELS = [
         ],
         max_loras_per_batch=2,
     ),
+
+]
+
+LORA_MODELS_QWEN3 = [
+    LoRAModelCase(
+        base="Qwen/Qwen3-4B",
+        adaptors=[
+            LoRAAdaptor(
+                name="nissenj/Qwen3-4B-lora-v2",
+                prefill_tolerance=3e-1,
+            ),
+            LoRAAdaptor(
+                name="y9760210/Qwen3-4B-lora_model",
+                prefill_tolerance=3e-1,
+            ),
+        ],
+        max_loras_per_batch=2,
+    ),    
 ]
 
 ALL_OTHER_MULTI_LORA_MODELS = [
     LoRAModelCase(
-        base="meta-llama/Llama-3.1-8B-Instruct",
+        base="unsloth/Meta-Llama-3.1-8B",
         adaptors=[
             LoRAAdaptor(
                 name="algoprog/fact-generation-llama-3.1-8b-instruct-lora",

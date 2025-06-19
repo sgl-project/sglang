@@ -23,6 +23,7 @@ from utils import (
     CI_MULTI_LORA_MODELS,
     TORCH_DTYPES,
     LoRAModelCase,
+    LORA_MODELS_QWEN3,
 )
 
 from sglang.test.runners import HFRunner, SRTRunner
@@ -55,10 +56,10 @@ TEST_MULTIPLE_BATCH_PROMPTS = [
 
 class TestLoRA(CustomTestCase):
 
-    def _run_lora_multiple_batch_on_model_cases(self, model_cases: List[LoRAModelCase]):
+    def _run_lora_multiple_batch_on_model_cases(self, model_cases: List[LoRAModelCase], max_new_tokens=32):
         for model_case in model_cases:
             for torch_dtype in TORCH_DTYPES:
-                max_new_tokens = 32
+                max_new_tokens = max_new_tokens
                 backend = "triton"
                 base_path = model_case.base
                 lora_adapter_paths = [a.name for a in model_case.adaptors]
@@ -171,6 +172,7 @@ class TestLoRA(CustomTestCase):
 
     def test_ci_lora_models(self):
         self._run_lora_multiple_batch_on_model_cases(CI_MULTI_LORA_MODELS)
+        self._run_lora_multiple_batch_on_model_cases(LORA_MODELS_QWEN3, max_new_tokens=10)
 
     def test_all_lora_models(self):
         if is_in_ci():
@@ -183,6 +185,14 @@ class TestLoRA(CustomTestCase):
             filtered_models.append(model_case)
 
         self._run_lora_multiple_batch_on_model_cases(filtered_models)
+        
+        qwen_filtered_models = []
+        for model_case in LORA_MODELS_QWEN3:
+            if "ONLY_RUN" in os.environ and os.environ["ONLY_RUN"] != model_case.base:
+                continue
+            qwen_filtered_models.append(model_case)
+
+        self._run_lora_multiple_batch_on_model_cases(qwen_filtered_models, max_new_tokens=10)
 
 
 if __name__ == "__main__":

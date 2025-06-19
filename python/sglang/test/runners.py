@@ -407,7 +407,7 @@ class HFRunner:
                 )
             else:
                 model = base_model
-
+            model.generation_config.do_sample = False
             outputs = model.generate(
                 input_ids=input_ids,
                 generation_config=GenerationConfig(
