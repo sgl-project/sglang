@@ -36,6 +36,7 @@ from torch.distributed import barrier
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
@@ -450,8 +451,6 @@ class Scheduler(
         t = threading.Thread(target=self.watchdog_thread, daemon=True)
         t.start()
         self.parent_process = psutil.Process().parent()
-
-        # Init memory saver
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
@@ -565,6 +564,10 @@ class Scheduler(
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
                 )
+                self.tp_worker.register_hicache_layer_transfer_counter(
+                    self.tree_cache.cache_controller.layer_done_counter
+                )
+
             else:
                 self.tree_cache = RadixCache(
                     req_to_token_pool=self.req_to_token_pool,
@@ -622,7 +625,10 @@ class Scheduler(
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
+            self.disagg_metadata_buffers = MetadataBuffers(
+                buffer_size,
+                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+            )
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
@@ -669,7 +675,10 @@ class Scheduler(
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
+            self.disagg_metadata_buffers = MetadataBuffers(
+                buffer_size,
+                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+            )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
@@ -1350,6 +1359,29 @@ class Scheduler(
             self.metrics_collector.log_stats(self.stats)
         self._publish_kv_events()
 
+    def coordinate_spec_dp_attn_batch(self, new_batch: Optional[ScheduleBatch]):
+        """Coordinate the DP attention batch."""
+
+        local_info = torch.tensor(
+            [
+                (new_batch is not None),
+            ],
+            dtype=torch.int64,
+        )
+        global_info = torch.empty(
+            (self.server_args.dp_size, self.attn_tp_size, 1),
+            dtype=torch.int64,
+        )
+        torch.distributed.all_gather_into_tensor(
+            global_info.flatten(),
+            local_info,
+            group=self.tp_cpu_group,
+        )
+        any_new_batch = any(
+            global_info[:, 0, 0].tolist()
+        )  # Any DP worker has forward batch
+        return any_new_batch
+
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
@@ -1383,7 +1415,14 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
-        if new_batch is not None:
+
+        # TODO(ch-wan): minor refactor is needed here to improve readability
+        any_new_batch = (
+            self.server_args.enable_dp_attention
+            and not self.spec_algorithm.is_none()
+            and self.coordinate_spec_dp_attn_batch(new_batch)
+        )
+        if new_batch is not None or any_new_batch:
             # Run prefill first if possible
             ret = new_batch
         else:
@@ -1478,8 +1517,13 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
                     break
 
+            # bypass prefix_computed if enable_hierarchical_cache
             req.init_next_round_input(
-                None if prefix_computed else self.tree_cache,
+                (
+                    None
+                    if (prefix_computed and not self.enable_hierarchical_cache)
+                    else self.tree_cache
+                ),
                 self.enable_hierarchical_cache,
             )
 
@@ -1512,9 +1556,6 @@ class Scheduler(
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
 
-        if self.enable_hierarchical_cache:
-            self.tree_cache.ready_to_load_cache()
-
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
@@ -1538,6 +1579,10 @@ class Scheduler(
             self.server_args.enable_custom_logit_processor,
             chunked_req=self.chunked_req,
         )
+        if self.enable_hierarchical_cache:
+            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+            new_batch.hicache_consumer_index = self.tree_cache.ready_to_load_cache()
+
         new_batch.prepare_for_extend()
 
         # Mixed-style chunked prefill
@@ -1613,6 +1658,11 @@ class Scheduler(
         if self.is_generation:
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
+
+                # update the consumer index of hicache to the running batch
+                self.tp_worker.set_hicache_consumer(
+                    model_worker_batch.hicache_consumer_index
+                )
                 if self.pp_group.is_last_rank:
                     logits_output, next_token_ids, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
@@ -1732,8 +1782,6 @@ class Scheduler(
             num_tokens_for_logprob = 0
         elif local_batch.forward_mode.is_decode():
             num_tokens = local_batch.batch_size()
-            if not spec_algorithm.is_none() and spec_algorithm.is_eagle():
-                num_tokens = num_tokens * speculative_num_draft_tokens
             num_tokens_for_logprob = num_tokens
         else:
             num_tokens = local_batch.extend_num_tokens
@@ -1809,6 +1857,7 @@ class Scheduler(
                 local_batch.global_num_tokens_for_logprob = (
                     global_num_tokens_for_logprob
                 )
+            local_batch.is_extend_in_batch = any(is_extend_in_batch)
             local_batch.tbo_split_seq_index = tbo_split_seq_index
             local_batch.global_forward_mode = global_forward_mode
 
@@ -1816,6 +1865,7 @@ class Scheduler(
             if not disable_cuda_graph:
                 local_batch.can_run_dp_cuda_graph = can_cuda_graph
 
+        # TODO(ch-wan): refactor: any(is_extend_in_batch) now is a part of local_batch. Remove it from here.
         return local_batch, any(is_extend_in_batch)
 
     def get_idle_batch(self):
@@ -2176,23 +2226,40 @@ class Scheduler(
         return GetWeightsByNameReqOutput(parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
-        self.memory_saver_adapter.check_validity(
-            caller_name="release_memory_occupation"
-        )
-        self.stashed_model_static_state = _export_static_state(
-            self.tp_worker.worker.model_runner.model
-        )
-        self.memory_saver_adapter.pause()
-        self.flush_cache()
+        tags = recv_req.tags
+        import subprocess
+
+        if tags is None:
+            tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
+
+        if GPU_MEMORY_TYPE_KV_CACHE in tags:
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            self.flush_cache()
+
+        if GPU_MEMORY_TYPE_WEIGHTS in tags:
+            self.stashed_model_static_state = _export_static_state(
+                self.tp_worker.worker.model_runner.model
+            )
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
+
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
-        self.memory_saver_adapter.check_validity(caller_name="resume_memory_occupation")
-        self.memory_saver_adapter.resume()
-        _import_static_state(
-            self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
-        )
-        del self.stashed_model_static_state
+        tags = recv_req.tags
+        if tags is None or len(tags) == 0:
+            tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
+
+        if GPU_MEMORY_TYPE_WEIGHTS in tags:
+            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
+            _import_static_state(
+                self.tp_worker.worker.model_runner.model,
+                self.stashed_model_static_state,
+            )
+            del self.stashed_model_static_state
+
+        if GPU_MEMORY_TYPE_KV_CACHE in tags:
+            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+
         return ResumeMemoryOccupationReqOutput()
 
     def slow_down(self, recv_req: SlowDownReqInput):
@@ -2421,8 +2488,10 @@ class Scheduler(
                 if self.profiler_decode_ct > self.profiler_target_decode_ct:
                     if self.profile_in_progress:
                         self.stop_profile(stage=ForwardMode.DECODE)
+            elif batch.forward_mode.is_idle():
+                pass
             else:
-                raise RuntimeError("unsupported profile stage")
+                raise RuntimeError(f"unsupported profile stage: {batch.forward_mode}")
         else:
             # Check profiler
             if (

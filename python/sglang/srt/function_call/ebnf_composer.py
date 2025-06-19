@@ -211,20 +211,74 @@ class EBNFComposer:
             properties = params.get("properties", {})
             required_props = set(params.get("required", []))
 
-            # Build argument rules for this tool
-            arg_rules = []
+            # The generated pattern ensures:
+            # 1. Required properties appear first, joined by commas
+            # 2. Optional properties are wrapped with comma included: ( "," ( "prop" : value )? )?
+            # 3. For multiple optional properties, we allow flexible ordering:
+            #    - Each optional can be skipped entirely
+            #    - They can appear in any combination
+            #
+            # Example patterns generated:
+            # - One required, one optional:
+            #   "{" "location" ":" string ( "," ( "unit" ":" enum ) )? "}"
+            #   Allows: {"location": "Paris"} or {"location": "Paris", "unit": "celsius"}
+            #
+            # - Multiple optional properties with flexible ordering:
+            #   "{" "req" ":" string ( "," ( "opt1" ":" value ( "," "opt2" ":" value )? | "opt2" ":" value ) )? "}"
+            #   Allows: {"req": "x"}, {"req": "x", "opt1": "y"}, {"req": "x", "opt2": "z"},
+            #           {"req": "x", "opt1": "y", "opt2": "z"}
+            #
+            # - All optional properties with flexible ordering:
+            #   "{" ( "opt1" ":" value ( "," "opt2" ":" value )? | "opt2" ":" value )? "}"
+            #   Allows: {}, {"opt1": "x"}, {"opt2": "y"}, {"opt1": "x", "opt2": "y"}
+
+            prop_kv_pairs = {}
+            ordered_props = list(properties.keys())
+
             for prop_name, prop_schema in properties.items():
                 value_rule = EBNFComposer.get_value_rule(prop_schema, function_format)
                 # Create key=value pair
                 pair = key_value_template.format(key=prop_name, valrule=value_rule)
+                prop_kv_pairs[prop_name] = pair
 
-                if prop_name not in required_props:
-                    pair = f"[ {pair} ]"
+            # Separate into required and optional while preserving order
+            required = [p for p in ordered_props if p in required_props]
+            optional = [p for p in ordered_props if p not in required_props]
 
-                arg_rules.append(pair)
+            # Build the combined rule
+            rule_parts = []
 
-            # Combine all argument rules
-            combined_args = ' "," '.join(arg_rules) if arg_rules else ""
+            # Add required properties joined by commas
+            if required:
+                rule_parts.append(' "," '.join(prop_kv_pairs[k] for k in required))
+
+            # Add optional properties with flexible ordering
+            if optional:
+                # Build alternatives where any optional property can appear first
+                opt_alternatives = []
+                for i in range(len(optional)):
+                    # Build pattern for optional[i] appearing first
+                    opt_parts = []
+                    for j in range(i, len(optional)):
+                        if j == i:
+                            opt_parts.append(prop_kv_pairs[optional[j]])
+                        else:
+                            opt_parts.append(f' ( "," {prop_kv_pairs[optional[j]]} )?')
+                    opt_alternatives.append("".join(opt_parts))
+
+                # Wrap with appropriate comma handling based on whether we have required properties
+                if required:
+                    # Required properties exist, so optional group needs outer comma
+                    rule_parts.append(' ( "," ( ')
+                    rule_parts.append(" | ".join(opt_alternatives))
+                    rule_parts.append(" ) )?")
+                else:
+                    # All properties are optional
+                    rule_parts.append("( ")
+                    rule_parts.append(" | ".join(opt_alternatives))
+                    rule_parts.append(" )?")
+
+            combined_args = "".join(rule_parts)
             arguments_rule = args_template.format(arg_rules=combined_args)
 
             # Add the function call rule and its arguments rule
