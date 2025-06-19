@@ -847,6 +847,23 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
+
+    def close_and_unlink_shm(name):
+        from multiprocessing import shared_memory
+
+        try:
+            shm = shared_memory.SharedMemory(name=name)
+            shm.close()
+            shm.unlink()
+        except FileNotFoundError:
+            pass
+
+    # Clean up shared memory. If the scheduler's code crashes or be killed,
+    # the POSIX shared memory will leak globally, causing DPBalance to fail to init.
+    shm_names = ["sglang_dp_balance_onfly_info", "sglang_dp_balance_local_tokens"]
+    for shm_name in shm_names:
+        close_and_unlink_shm(shm_name)
+
     # Remove sigchld handler to avoid spammy logs.
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)
