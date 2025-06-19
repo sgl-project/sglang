@@ -1,19 +1,22 @@
 /3rdparty/amd @HaiShaw
-/docker @zhyncs @HaiShaw @merrymercy @Ying1123
+/docker @zhyncs @HaiShaw @ByronHsu
 /docs @zhaochenyang20
 /python/sglang/lang @merrymercy @Ying1123 @hnyls2002 @ByronHsu
 /python/sglang/srt @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu
 /python/sglang/srt/constrained @hnyls2002
-/python/sglang/srt/layers @merrymercy @Ying1123 @zhyncs @ispobock @HaiShaw @ch-wan
+/python/sglang/srt/disaggregation @hnyls2002 @ByronHsu
+/python/sglang/srt/distributed @yizhang2077
+/python/sglang/srt/entrypoints @zhaochenyang20
+/python/sglang/srt/layers @merrymercy @Ying1123 @zhyncs @ispobock @HaiShaw @ch-wan @BBuf
 /python/sglang/srt/lora @Ying1123 @Fridge003
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 /python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
 /python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock
-/python/sglang/srt/models @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu
+/python/sglang/srt/models @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu @zhaochenyang20
 /python/sglang/srt/openai_api @merrymercy @Ying1123 @hnyls2002 @zhyncs @ispobock @ByronHsu @CatherineSue
 /python/sglang/srt/sampling @merrymercy @hnyls2002
 /python/sglang/srt/speculative @Ying1123 @merrymercy @rkooo567 @kssteven418
 /test/lang @merrymercy @Ying1123 @ByronHsu
 /test/srt @merrymercy @Ying1123 @zhyncs
 /sgl-router @ByronHsu @Ying1123 @slin1237
-/sgl-kernel @zhyncs @ispobock @HandH1998 @BBuf @yizhang2077 @merrymercy @yinfan98
+/sgl-kernel @zhyncs @ispobock @HandH1998 @BBuf @yizhang2077 @merrymercy @yinfan98 @HaiShaw

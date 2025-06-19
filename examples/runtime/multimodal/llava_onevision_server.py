@@ -150,7 +150,7 @@ def video_stream_request_test(client, video_path):
 
 def image_speed_test(client):
     print("----------------------Image Speed Test----------------------")
-    start_time = time.time()
+    start_time = time.perf_counter()
     request = client.chat.completions.create(
         model="default",
         messages=[
@@ -173,7 +173,7 @@ def image_speed_test(client):
         temperature=0,
         max_tokens=1024,
     )
-    end_time = time.time()
+    end_time = time.perf_counter()
     response = request.choices[0].message.content
     print(response)
     print("-" * 30)
@@ -184,14 +184,14 @@ def video_speed_test(client, video_path):
     print("------------------------Video Speed Test------------------------")
     messages = prepare_video_messages(video_path)
 
-    start_time = time.time()
+    start_time = time.perf_counter()
     video_request = client.chat.completions.create(
         model="default",
         messages=messages,
         temperature=0,
         max_tokens=1024,
     )
-    end_time = time.time()
+    end_time = time.perf_counter()
     video_response = video_request.choices[0].message.content
     print(video_response)
     print("-" * 30)

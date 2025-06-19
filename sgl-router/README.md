@@ -81,6 +81,18 @@ router = Router(
 
 Use the `--verbose` flag with the CLI for more detailed logs.
 
+### Metrics
+
+SGL Router exposes a Prometheus HTTP scrape endpoint for monitoring, which by default listens at 127.0.0.1:29000.
+
+To change the endpoint to listen on all network interfaces and set the port to 9000, configure the following options when launching the router:
+```
+python -m sglang_router.launch_router \
+  --worker-urls http://localhost:8080 http://localhost:8081 \
+  --prometheus-host 0.0.0.0 \
+  --prometheus-port 9000
+```
+
 ### Kubernetes Service Discovery
 
 SGL Router supports automatic service discovery for worker nodes in Kubernetes environments. When enabled, the router will automatically:

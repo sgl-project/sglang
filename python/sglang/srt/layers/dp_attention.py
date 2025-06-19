@@ -98,11 +98,12 @@ def initialize_dp_attention(
         ],
         local_rank,
         torch.distributed.get_backend(tp_group.device_group),
-        SYNC_TOKEN_IDS_ACROSS_TP,
-        False,
-        False,
-        False,
-        False,
+        use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
+        use_pymscclpp=False,
+        use_custom_allreduce=False,
+        use_hpu_communicator=False,
+        use_xpu_communicator=False,
+        use_npu_communicator=False,
         group_name="attention_tp",
     )
 
@@ -130,16 +131,6 @@ def get_attention_dp_rank():
 def get_attention_dp_size():
     assert _ATTN_DP_SIZE is not None, "dp attention not initialized!"
     return _ATTN_DP_SIZE
-
-
-def get_local_attention_dp_rank():
-    assert _LOCAL_ATTN_DP_RANK is not None, "dp attention not initialized!"
-    return _LOCAL_ATTN_DP_RANK
-
-
-def get_local_attention_dp_size():
-    assert _LOCAL_ATTN_DP_SIZE is not None, "dp attention not initialized!"
-    return _LOCAL_ATTN_DP_SIZE
 
 
 def get_local_attention_dp_rank():
@@ -247,6 +238,10 @@ def _dp_gather(
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
+        if forward_batch.forward_mode.is_draft_extend():
+            shape_tensor = local_num_tokens.new_full((), local_tokens.shape[0])
+            local_num_tokens = torch.minimum(local_num_tokens, shape_tensor)
+
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
         )
@@ -297,6 +292,10 @@ def dp_scatter(
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
+        if forward_batch.forward_mode.is_draft_extend():
+            shape_tensor = local_num_tokens.new_full((), local_tokens.shape[0])
+            local_num_tokens = torch.minimum(local_num_tokens, shape_tensor)
+
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
