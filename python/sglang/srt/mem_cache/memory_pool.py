@@ -45,6 +45,13 @@ GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
+if is_npu():
+    try:
+        import torch_npu
+    except ImportError:
+        logger.warning("torch_npu is not installed. NPU support will be disabled.")
+        _is_npu = False
+
 
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
@@ -490,9 +497,7 @@ class MHATokenToKVPool(KVCache):
                 self.v_buffer[layer_id - self.start_layer][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
         else:
-            if _is_npu:
-                import torch_npu
-                assert loc.size() > 0, f"expect loc.size() > 0, but got {loc.size()}"
+            if _is_npu and loc.size() > 0 and loc.ndim == 1:
                 torch_npu.scatter_update_(self.k_buffer[layer_id - self.start_layer].unsqueeze(0), loc[0], cache_k.unsqueeze(0))
                 torch_npu.scatter_update_(self.v_buffer[layer_id - self.start_layer].unsqueeze(0), loc[0], cache_v.unsqueeze(0))
             else:

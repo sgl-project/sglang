@@ -1526,19 +1526,15 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     return major, minor
 
 npu_compile_config = {}
-def set_npu_compiler_config():
+def set_npu_compiler_config(compile_config: Dict[str, Any] = None):
     global npu_compile_config
-    npu_compile_config = {
-        "experimental_config": {
-            "frozen_parameter": True,
-            "tiling_schedule_optimize": True,
-            "topology_sorting_strategy": "StableRDFS",
-        },
-        "inference_config": {
-            "dynamic_gears_merge_policy": "zip"  # 移入配置字典
-        },
-        # add compile here
-    }
+    for key, value in compile_config.items():
+        if key in npu_compile_config and value != npu_compile_config[key]:
+            raise ValueError(
+                f"Cannot set {key} to {value} in npu_compile_config, it is already set to {npu_compile_config[key]}. "
+                f"Please ensure consistent configuration."
+            )
+        npu_compile_config[key] = value
 
 
 def get_compiler_backend() -> str:
@@ -1559,7 +1555,7 @@ def get_compiler_backend() -> str:
         for config_group, config_dict in npu_compile_config.items():
             config_obj = getattr(compiler_config, config_group, None)
             if config_obj is None:
-                continue
+                raise ValueError(f"Invalid config group for torch.compile with npu: {config_group}")
             for key, value in config_dict.items():
                 setattr(config_obj, key, value)
         npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
