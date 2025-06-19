@@ -339,7 +339,7 @@ class SWARadixCache(BasePrefixCache):
 
     def inc_lock_ref(self, node: TreeNode) -> Tuple[int, int]:
         if self.disable:
-            return 0
+            return 0, 0
 
         full_delta = 0
         swa_delta = 0
@@ -358,7 +358,7 @@ class SWARadixCache(BasePrefixCache):
 
     def dec_lock_ref(self, node: TreeNode) -> Tuple[int, int]:
         if self.disable:
-            return 0
+            return 0, 0
 
         full_delta = 0
         swa_delta = 0
