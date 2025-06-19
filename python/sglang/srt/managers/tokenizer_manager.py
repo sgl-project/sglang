@@ -418,6 +418,20 @@ class TokenizerManager:
 
         obj.normalize_batch_and_arguments()
 
+        if isinstance(obj, GenerateReqInput):
+            return_hidden_states = obj.return_hidden_states
+            has_return_hidden_states = return_hidden_states == True or (
+                isinstance(return_hidden_states, list) and any(return_hidden_states)
+            )
+            if (
+                not self.server_args.enable_return_hidden_states
+                and has_return_hidden_states
+            ):
+                raise ValueError(
+                    "return_hidden_states=True requires the server to be started "
+                    "with --enable-return-hidden-states (ServerArgs.enable_return_hidden_states)."
+                )
+
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
             logger.info(
@@ -425,7 +439,8 @@ class TokenizerManager:
             )
 
         async with self.model_update_lock.reader_lock:
-            if obj.is_single:
+            is_single = obj.is_single
+            if is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
                 state = self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj, state, request):
@@ -466,19 +481,6 @@ class TokenizerManager:
                     "accept text prompts. Please provide input_ids or re-initialize "
                     "the engine with skip_tokenizer_init=False."
                 )
-
-            if (
-                isinstance(obj, EmbeddingReqInput)
-                and isinstance(input_text, list)
-                and input_text
-            ):
-                # Handle batch of texts in a single embedding request
-                # This path avoids issues with _validate_token_len expecting a flat list
-                tokenized_objs = await self._batch_tokenize_and_process(
-                    len(input_text), obj
-                )
-                return tokenized_objs
-
             encoded = self.tokenizer(
                 input_text, return_token_type_ids=is_cross_encoder_request
             )

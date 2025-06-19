@@ -508,25 +508,6 @@ class EmbeddingReqInput:
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
 
-    def __getitem__(self, i):
-        if self.is_cross_encoder_request:
-            return EmbeddingReqInput(
-                text=[self.text[i]] if self.text is not None else None,
-                input_ids=None,
-                image_data=None,
-                sampling_params=self.sampling_params[i],
-                rid=self.rid[i],
-                is_cross_encoder_request=True,
-            )
-
-        return EmbeddingReqInput(
-            text=self.text[i] if self.text is not None else None,
-            input_ids=self.input_ids[i] if self.input_ids is not None else None,
-            image_data=self.image_data[i] if self.image_data is not None else None,
-            sampling_params=self.sampling_params[i],
-            rid=self.rid[i],
-        )
-
     def contains_mm_input(self) -> bool:
         return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
 
@@ -570,13 +551,10 @@ class EmbeddingReqInput:
                 self.sampling_params = {}
             self.sampling_params["max_new_tokens"] = 0
         else:
-            if not isinstance(self.rid, list):
+            if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
             else:
-                assert len(self.rid) == self.batch_size, (
-                    f"The length of rid list ({len(self.rid)}) should be equal to "
-                    f"the batch size ({self.batch_size})."
-                )
+                assert isinstance(self.rid, list), "The rid should be a list."
 
             if self.sampling_params is None:
                 self.sampling_params = [{}] * self.batch_size
@@ -586,6 +564,25 @@ class EmbeddingReqInput:
     def regenerate_rid(self):
         self.rid = uuid.uuid4().hex
         return self.rid
+
+    def __getitem__(self, i):
+        if self.is_cross_encoder_request:
+            return EmbeddingReqInput(
+                text=[self.text[i]] if self.text is not None else None,
+                input_ids=None,
+                image_data=None,
+                sampling_params=self.sampling_params[i],
+                rid=self.rid[i],
+                is_cross_encoder_request=True,
+            )
+
+        return EmbeddingReqInput(
+            text=self.text[i] if self.text is not None else None,
+            input_ids=self.input_ids[i] if self.input_ids is not None else None,
+            image_data=self.image_data[i] if self.image_data is not None else None,
+            sampling_params=self.sampling_params[i],
+            rid=self.rid[i],
+        )
 
 
 @dataclass
