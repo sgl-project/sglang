@@ -2,6 +2,8 @@ ARG CUDA_VERSION=12.6.1
 
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
 
+ARG BUILD_TYPE=all
+
 ENV DEBIAN_FRONTEND=noninteractive
 ENV CUDA_HOME=/usr/local/cuda
 
