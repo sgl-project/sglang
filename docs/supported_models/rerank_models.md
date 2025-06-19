@@ -15,7 +15,7 @@ python3 -m sglang.launch_server \
   --disable-radix-cache \
   --chunked-prefill-size -1 \
   --attention-backend triton \
-  --is-embedding
+  --is-embedding \
   --port 30000
 ```
 
