@@ -1257,10 +1257,7 @@ def get_nvgpu_memory_capacity():
                         return mem_total_kb / 1024
             raise ValueError("Could not find MemTotal in /proc/meminfo on Jetson device.")
         except Exception as e:
-            raise RuntimeError(
-                "Failed to read system memory from /proc/meminfo on a Jetson device."
-            ) from e
-
+            raise RuntimeError("Failed to read system memory from /proc/meminfo on a Jetson device.")
     # -----------------------------------------------------------------------
     # 2. If not a Jetson, assume a discrete GPU and use nvidia-smi
     # -----------------------------------------------------------------------
