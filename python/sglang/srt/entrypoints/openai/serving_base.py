@@ -51,7 +51,7 @@ class OpenAIServingBase(ABC):
                 )
 
         except Exception as e:
-            logger.error(f"Error in request: {e}")
+            logger.exception(f"Error in request: {e}")
             return self.create_error_response(
                 message=f"Internal server error: {str(e)}",
                 err_type="InternalServerError",
@@ -110,7 +110,7 @@ class OpenAIServingBase(ABC):
             status_code=501,
         )
 
-    def _validate_request(self, request: OpenAIServingRequest) -> Optional[str]:
+    def _validate_request(self, _: OpenAIServingRequest) -> Optional[str]:
         """Validate request"""
         pass
 
