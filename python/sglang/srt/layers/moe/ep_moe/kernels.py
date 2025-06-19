@@ -1207,7 +1207,8 @@ def moe_ep_deepgemm_preprocess(
         BLOCK_SIZE=256,
     )
 
-    assert block_shape is not None, "block_shape is not None"
+    if block_shape is None:
+        block_shape = [128, 128]
     assert len(block_shape) == 2
     block_n, block_k = block_shape[0], block_shape[1]
     hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)

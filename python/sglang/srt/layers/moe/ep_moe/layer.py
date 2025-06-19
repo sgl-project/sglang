@@ -270,6 +270,42 @@ class EPMoE(torch.nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
         )
 
+        if not self.use_block_quant:
+            # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm
+            scale_block_size = 128
+            w13_weight_scale_n = 2 * (
+                (self.intermediate_size + scale_block_size - 1) // scale_block_size
+            )
+            w13_weight_scale_k = (
+                hidden_states_shape[-1] + scale_block_size - 1
+            ) // scale_block_size
+            w13_weight_scale = (
+                self.w13_weight_scale.unsqueeze(1)
+                .repeat_interleave(w13_weight_scale_n, dim=1)
+                .unsqueeze(2)
+                .repeat_interleave(w13_weight_scale_k, dim=2)
+            )
+            self.w13_weight_fp8 = (
+                self.w13_weight,
+                w13_weight_scale,
+            )
+            w2_weight_scale_n = (
+                hidden_states_shape[-1] + scale_block_size - 1
+            ) // scale_block_size
+            w2_weight_scale_k = (
+                self.intermediate_size + scale_block_size - 1
+            ) // scale_block_size
+            w2_weight_scale = (
+                self.w2_weight_scale.unsqueeze(1)
+                .repeat_interleave(w2_weight_scale_n, dim=1)
+                .unsqueeze(2)
+                .repeat_interleave(w2_weight_scale_k, dim=2)
+            )
+            self.w2_weight_fp8 = (
+                self.w2_weight,
+                w2_weight_scale,
+            )
+
         # PreReorder
         m_max, masked_m, expected_m, src2dst, gateup_input, gateup_input_scale = (
             moe_ep_deepgemm_preprocess(
