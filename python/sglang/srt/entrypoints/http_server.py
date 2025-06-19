@@ -827,7 +827,8 @@ def _wait_and_warmup(
     for _ in range(120):
         time.sleep(1)
         try:
-            res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
+            res = requests.get(url + "/get_model_info", timeout=5, headers=headers,
+                               proxies={"http": None, "https": None, "all": None})
             assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break
@@ -879,6 +880,7 @@ def _wait_and_warmup(
                 json=json_data,
                 headers=headers,
                 timeout=600,
+                proxies={"http": None, "https": None, "all": None}
             )
             assert res.status_code == 200, f"{res}"
         else:
