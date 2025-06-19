@@ -7,6 +7,7 @@ import sentencepiece as spm
 from transformers import (
     TOKENIZER_MAPPING,
     LlamaConfig,
+    Qwen2Config,
     PretrainedConfig,
     PreTrainedTokenizer,
 )
@@ -309,6 +310,8 @@ class InternVLChatConfig(PretrainedConfig):
             self.llm_config = LlamaConfig(**llm_config)
         elif llm_config.get("architectures")[0] == "InternLM2ForCausalLM":
             self.llm_config = InternLM2Config(**llm_config)
+        elif llm_config.get("architectures")[0] == "Qwen2ForCausalLM":
+            self.llm_config = Qwen2Config(**llm_config)
         else:
             raise ValueError(
                 "Unsupported architecture: {}".format(
