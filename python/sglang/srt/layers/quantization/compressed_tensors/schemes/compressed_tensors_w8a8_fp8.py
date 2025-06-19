@@ -50,6 +50,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                     input_scale = getattr(layer, "input_scale", None)
 
                     if input_scale is not None:
+                        input_scale = input_scale * 2.0
                         layer.input_scale = Parameter(input_scale, requires_grad=False)
 
             # INPUT SCALE
@@ -74,13 +75,15 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 )
 
                 if is_fp8_fnuz():
-                    input_scale = getattr(layer, "input_scale", None)
+                    # input_scale = getattr(layer, "input_scale", None)
 
+                    # NOTE (yiakwy) : for fused kv parameter, this function is exclusive to ROCm to load NV fp8 data correctly
+                    # but it does not make sense to double (2*input_scale) a shared input scale twice for different weight shards
                     rectified_weight, max_w_scale, input_scale = (
                         normalize_e4m3fn_to_e4m3fnuz(
                             weight=rectified_weight,
                             weight_scale=max_w_scale,
-                            input_scale=input_scale,
+                            input_scale=None,
                         )
                     )
 
@@ -90,13 +93,14 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             # If channelwise, scales are already lined up, so just transpose.
             elif self.strategy == QuantizationStrategy.CHANNEL:
                 if is_fp8_fnuz():
-                    input_scale = getattr(layer, "input_scale", None)
+                    # input_scale = getattr(layer, "input_scale", None)
 
+                    # NOTE (yiakwy) : the same issue as above
                     rectified_weight, rectified_weight_scale, input_scale = (
                         normalize_e4m3fn_to_e4m3fnuz(
                             weight=weight,
                             weight_scale=weight_scale,
-                            input_scale=input_scale,
+                            input_scale=None,
                         )
                     )
                 else:
@@ -113,10 +117,9 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
 
             return rectified_weight, rectified_weight_scale
 
-        if "model.layers.52.self_attn.fused_qkv_a_proj_with_mqa" in layer.prefix:
-            from remote_pdb import set_trace
-
-            set_trace()
+        # if "model.layers.52.self_attn.fused_qkv_a_proj_with_mqa" in layer.prefix:
+        if "fused_qkv_a_proj_with_mqa" in layer.prefix:
+            # from remote_pdb import set_trace
 
             # See DeepSeek V2
             assert layer.fused_parameters == 2
@@ -130,29 +133,34 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
 
             rectified_q_a_proj_w_t, rectified_q_a_proj_w_t_scale = (
                 _process_weights_after_loading(
-                    q_a_proj_w, q_a_proj_w_scale, layer.fused_shapes[0]
+                    q_a_proj_w, q_a_proj_w_scale, [layer.fused_shapes[0]]
                 )
             )
             rectified_kv_a_proj_with_mqa_w_t, rectified_kv_a_proj_with_mqa_w_t_scale = (
                 _process_weights_after_loading(
                     kv_a_proj_with_mqa_w,
                     kv_a_proj_with_mqa_w_scale,
-                    layer.fused_shapes[1],
+                    [layer.fused_shapes[1]],
                 )
             )
+
+            # set_trace()
 
             # assigned merged weights back
             merged_weight = torch.cat(
                 [rectified_q_a_proj_w_t.data, rectified_kv_a_proj_with_mqa_w_t.data],
                 dim=1,
             )
+
             merged_weight_scale = torch.cat(
-                [rectified_q_a_proj_w_t_scale, rectified_kv_a_proj_with_mqa_w_t_scale],
-                dim=0,
+                [
+                    rectified_q_a_proj_w_t_scale.data.unsqueeze(0),
+                    rectified_kv_a_proj_with_mqa_w_t_scale.data.unsqueeze(0),
+                ],
             )
 
             layer.weight = Parameter(merged_weight, requires_grad=False)
-            layer.weight_scale = Parameter(merged_weight_scale, required_grad=False)
+            layer.weight_scale = Parameter(merged_weight_scale, requires_grad=False)
         else:
             rectified_weight, rectified_weight_scale = _process_weights_after_loading(
                 layer.weight, layer.weight_scale, layer.logical_widths
@@ -239,7 +247,6 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
     ) -> torch.Tensor:
 
         if hasattr(layer, "fused_parameters") and layer.fused_parameters > 0:
-            # split tensor
             if "model.layers.52.self_attn.fused_qkv_a_proj_with_mqa" in layer.prefix:
                 from remote_pdb import set_trace
 
@@ -252,12 +259,53 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 set_trace()
                 pass
 
-        return apply_fp8_linear(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            input_scale=layer.input_scale,
-            bias=bias,
-            use_per_token_if_dynamic=True,
-            compressed_tensor_quant=True,
-        )
+        # NOTE (fallback to non-fused solution) : concat([input * w[:shard1] * w_shard1_scale, input * w[shart1:shart1+shart2] * w_shard2_scale], dim=1)
+        # Will write kernel to improve it later
+
+        if False and hasattr(layer, "fused_parameters") and layer.fused_parameters > 0:
+            if "fused_qkv_a_proj_with_mqa" in layer.prefix:
+                assert layer.fused_parameters == 2
+
+                q_a_proj_w, kv_a_proj_with_mqa_w = layer.weight.split(
+                    layer.fused_shapes, dim=1
+                )
+                q_a_proj_w_scale, kv_a_proj_with_mqa_w_scale = layer.weight_scale.split(
+                    [1, 1], dim=0
+                )
+
+                partial_out_q = apply_fp8_linear(
+                    input=x,
+                    weight=Parameter(q_a_proj_w, requires_grad=False),
+                    weight_scale=Parameter(q_a_proj_w_scale, requires_grad=False),
+                    input_scale=layer.input_scale,
+                    bias=bias,
+                    use_per_token_if_dynamic=True,
+                    compressed_tensor_quant=True,
+                )
+                partial_out_kv_latent_cache = apply_fp8_linear(
+                    input=x,
+                    weight=Parameter(kv_a_proj_with_mqa_w, requires_grad=False),
+                    weight_scale=Parameter(
+                        kv_a_proj_with_mqa_w_scale, requires_grad=False
+                    ),
+                    input_scale=layer.input_scale,
+                    bias=bias,
+                    use_per_token_if_dynamic=True,
+                    compressed_tensor_quant=True,
+                )
+
+                return torch.concat([partial_out_q, partial_out_kv_latent_cache], dim=1)
+            else:
+                raise Exception(
+                    f"fused_parameters for this type of layer#{layer.prefix}: {type(layer)} is not supported yet."
+                )
+        else:
+            return apply_fp8_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+                bias=bias,
+                use_per_token_if_dynamic=True,
+                compressed_tensor_quant=True,
+            )
