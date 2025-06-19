@@ -226,11 +226,11 @@ class GenerateReqInput:
 
         # Expand input based on type
         self._expand_inputs(num)
+        self._normalize_rid(num)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
-        self._normalize_rid(num)
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
 
@@ -481,7 +481,7 @@ class TokenizedGenerateReqInput:
 @dataclass
 class EmbeddingReqInput:
     # The input prompt. It can be a single prompt or a batch of prompts.
-    text: Optional[Union[List[str], str]] = None
+    text: Optional[Union[List[List[str]], List[str], str]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
     # Can be formatted as:
     # - Single image for a single request
@@ -505,6 +505,8 @@ class EmbeddingReqInput:
     log_metrics: bool = True
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
+    # For cross-encoder requests
+    is_cross_encoder_request: bool = False
 
     def contains_mm_input(self) -> bool:
         return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
@@ -564,6 +566,16 @@ class EmbeddingReqInput:
         return self.rid
 
     def __getitem__(self, i):
+        if self.is_cross_encoder_request:
+            return EmbeddingReqInput(
+                text=[self.text[i]] if self.text is not None else None,
+                input_ids=None,
+                image_data=None,
+                sampling_params=self.sampling_params[i],
+                rid=self.rid[i],
+                is_cross_encoder_request=True,
+            )
+
         return EmbeddingReqInput(
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
@@ -583,6 +595,8 @@ class TokenizedEmbeddingReqInput:
     input_ids: List[int]
     # The image inputs
     image_inputs: dict
+    # The token type ids
+    token_type_ids: List[int]
     # Dummy sampling params for compatibility
     sampling_params: SamplingParams
 
@@ -798,7 +812,9 @@ class GetWeightsByNameReqOutput:
 
 @dataclass
 class ReleaseMemoryOccupationReqInput:
-    pass
+    # Optional tags to identify the memory region, which is primarily used for RL
+    # Currently we only support `weights` and `kv_cache`
+    tags: Optional[List[str]] = None
 
 
 @dataclass
@@ -808,7 +824,9 @@ class ReleaseMemoryOccupationReqOutput:
 
 @dataclass
 class ResumeMemoryOccupationReqInput:
-    pass
+    # Optional tags to identify the memory region, which is primarily used for RL
+    # Currently we only support `weights` and `kv_cache`
+    tags: Optional[List[str]] = None
 
 
 @dataclass
@@ -845,6 +863,12 @@ class GetInternalStateReqOutput:
 @dataclass
 class SetInternalStateReq:
     server_args: Dict[str, Any]
+
+
+@dataclass
+class V1RerankReqInput:
+    query: str
+    documents: List[str]
 
 
 @dataclass

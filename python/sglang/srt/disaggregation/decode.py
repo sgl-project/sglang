@@ -31,6 +31,7 @@ import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVPoll
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -45,11 +46,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    ScheduleBatch,
-    global_server_args_dict,
-)
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
@@ -94,7 +91,7 @@ class DecodeReqToTokenPool:
         self.max_context_len = max_context_len
         self.device = device
         self.pre_alloc_size = pre_alloc_size
-        with memory_saver_adapter.region():
+        with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
                 (size + pre_alloc_size, max_context_len),
                 dtype=torch.int32,
@@ -158,6 +155,7 @@ class DecodePreallocQueue:
         bootstrap_port: int,
         max_total_num_tokens: int,
         prefill_pp_size: int,
+        num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
     ):
         self.req_to_token_pool = req_to_token_pool
@@ -178,9 +176,7 @@ class DecodePreallocQueue:
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
         self.prefill_pp_size = prefill_pp_size
-        self.num_reserved_decode_tokens = int(
-            os.environ.get("SGLANG_NUM_RESERVED_DECODE_TOKENS", "512")
-        )
+        self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
@@ -249,6 +245,7 @@ class DecodePreallocQueue:
                 mgr=self.kv_manager,
                 bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
                 bootstrap_room=req.bootstrap_room,
+                data_parallel_rank=req.data_parallel_rank,
             )
 
             self.queue.append(
@@ -404,7 +401,6 @@ class DecodePreallocQueue:
                 ]
                 .cpu()
                 .numpy()
-                .astype(np.int64)
             )
 
             decode_req.metadata_buffer_index = (
@@ -545,6 +541,7 @@ class DecodeTransferQueue:
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.tree_cache = tree_cache
+        self.spec_algorithm = scheduler.spec_algorithm
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -586,6 +583,7 @@ class DecodeTransferQueue:
                 idx = decode_req.metadata_buffer_index
                 (
                     output_id,
+                    output_hidden_states,
                     output_token_logprobs_val,
                     output_token_logprobs_idx,
                     output_top_logprobs_val,
@@ -593,7 +591,8 @@ class DecodeTransferQueue:
                 ) = self.metadata_buffers.get_buf(idx)
 
                 decode_req.req.output_ids.append(output_id[0].item())
-
+                if not self.spec_algorithm.is_none():
+                    decode_req.req.hidden_states_tensor = output_hidden_states
                 if decode_req.req.return_logprob:
                     decode_req.req.output_token_logprobs_val.append(
                         output_token_logprobs_val[0].item()
@@ -637,15 +636,6 @@ class DecodeTransferQueue:
 
 
 class SchedulerDisaggregationDecodeMixin:
-
-    def _prepare_idle_batch_and_run(self, batch, delay_process=False):
-        batch, _ = self.prepare_dp_attn_batch(batch)
-        result = None
-        if batch:
-            result = self.run_batch(batch)
-            if not delay_process:
-                self.process_batch_result(batch, result)
-        return batch, result
 
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
@@ -774,6 +764,15 @@ class SchedulerDisaggregationDecodeMixin:
 
             self.last_batch = batch
             self.last_batch_in_queue = last_batch_in_queue
+
+    def _prepare_idle_batch_and_run(self, batch, delay_process=False):
+        batch, _ = self.prepare_dp_attn_batch(batch)
+        result = None
+        if batch:
+            result = self.run_batch(batch)
+            if not delay_process:
+                self.process_batch_result(batch, result)
+        return batch, result
 
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,

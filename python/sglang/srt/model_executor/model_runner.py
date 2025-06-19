@@ -30,6 +30,7 @@ from sglang.srt import debug_utils
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import (
     get_tp_group,
     get_world_group,
@@ -93,6 +94,7 @@ from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     cpu_has_amx_support,
+    dynamic_import,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -110,6 +112,7 @@ from sglang.srt.utils import (
 )
 
 _is_hip = is_hip()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 # Use a small KV cache pool size for tests in CI
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
@@ -162,6 +165,7 @@ class ModelRunner:
             logger.addFilter(RankZeroFilter(tp_rank == 0))
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.dp_size = server_args.dp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.dist_port = nccl_port
@@ -195,6 +199,7 @@ class ModelRunner:
             | {
                 # TODO it is indeed not a "server args"
                 "use_mla_backend": self.use_mla_backend,
+                "speculative_algorithm": self.spec_algorithm,
             }
         )
 
@@ -218,6 +223,7 @@ class ModelRunner:
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
+
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
@@ -299,7 +305,7 @@ class ModelRunner:
         if (
             server_args.attention_backend == "intel_amx"
             and server_args.device == "cpu"
-            and not cpu_has_amx_support()
+            and not _is_cpu_amx_available
         ):
             logger.info(
                 "The current platform does not support Intel AMX, will fallback to torch_native backend."
@@ -543,7 +549,7 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
-        with self.memory_saver_adapter.region():
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
@@ -761,6 +767,9 @@ class ModelRunner:
         ]
         if load_format == "direct":
             _model_load_weights_direct(self.model, named_tensors)
+        elif load_format in self.server_args.custom_weight_loader:
+            custom_loader = dynamic_import(load_format)
+            custom_loader(self.model, named_tensors)
         elif load_format is None:
             self.model.load_weights(named_tensors)
         else:

@@ -160,13 +160,17 @@ def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
-def is_cpu() -> bool:
+def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (
         machine in ("x86_64", "amd64", "i386", "i686")
         and hasattr(torch, "cpu")
         and torch.cpu.is_available()
     )
+
+
+def is_cpu() -> bool:
+    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
 
 
 def is_flashinfer_available():
@@ -1291,6 +1295,15 @@ def get_hpu_memory_capacity():
         )
 
 
+def get_npu_memory_capacity():
+    try:
+        import torch_npu
+
+        return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+    except ImportError as e:
+        raise ImportError("torch_npu is required when run on npu device.")
+
+
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
@@ -1298,6 +1311,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_amdgpu_memory_capacity()
     elif device == "hpu":
         gpu_mem = get_hpu_memory_capacity()
+    elif device == "npu":
+        gpu_mem = get_npu_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -1423,6 +1438,11 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "xpu"
         return "xpu:{}".format(device_id)
 
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        if device_id == None:
+            return "npu"
+        return "npu:{}".format(device_id)
+
     if is_habana_available():
         try:
             import habana_frameworks.torch.hpu
@@ -1435,6 +1455,15 @@ def get_device(device_id: Optional[int] = None) -> str:
             raise ImportError(
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
+
+    if is_cpu():
+        if cpu_has_amx_support():
+            logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
+        else:
+            logger.warning(
+                "CPU device enabled, using torch native backend, low performance expected."
+            )
+        return "cpu"
 
     raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
 
@@ -1497,15 +1526,35 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     return major, minor
 
 
+def get_npu_compiler_config():
+    config = {
+        "frozen_parameter": True,
+        "tiling_schedule_optimize": True,
+        "topology_sorting_strategy": "StableRDFS",
+    }
+    return config
+
+
 def get_compiler_backend() -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
 
     if hasattr(torch, "npu") and torch.npu.is_available():
-        import torchair
+        try:
+            import torchair
+            import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
+            from torchair.configs.compiler_config import CompilerConfig
+        except ImportError as e:
+            raise ImportError(
+                "NPU detected, but torchair package is not installed. "
+                "Please install torchair for torch.compile support on NPU."
+            )
+        compiler_config = CompilerConfig()
+        predefined_config = get_npu_compiler_config()
+        for k, v in predefined_config.items():
+            setattr(compiler_config.experimental_config, k, v)
 
-        config = torchair.CompilerConfig()
-        npu_backend = torchair.get_npu_backend(compiler_config=config)
+        npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
         return npu_backend
 
     return "inductor"
@@ -2105,6 +2154,44 @@ def get_free_port():
             return s.getsockname()[1]
 
 
+def get_local_ip_auto() -> str:
+    interface = os.environ.get("SGLANG_LOCAL_IP_NIC", None)
+    return (
+        get_local_ip_by_nic(interface)
+        if interface is not None
+        else get_local_ip_by_remote()
+    )
+
+
+def get_local_ip_by_nic(interface: str) -> str:
+    try:
+        import netifaces
+    except ImportError as e:
+        raise ImportError(
+            "Environment variable SGLANG_LOCAL_IP_NIC requires package netifaces, please install it through 'pip install netifaces'"
+        ) from e
+
+    try:
+        addresses = netifaces.ifaddresses(interface)
+        if netifaces.AF_INET in addresses:
+            for addr_info in addresses[netifaces.AF_INET]:
+                ip = addr_info.get("addr")
+                if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+                    return ip
+        if netifaces.AF_INET6 in addresses:
+            for addr_info in addresses[netifaces.AF_INET6]:
+                ip = addr_info.get("addr")
+                if ip and not ip.startswith("fe80::") and ip != "::1":
+                    return ip.split("%")[0]
+    except (ValueError, OSError) as e:
+        raise ValueError(
+            "Can not get local ip from NIC. Please verify whether SGLANG_LOCAL_IP_NIC is set correctly."
+        )
+
+    # Fallback
+    return get_local_ip_by_remote()
+
+
 def get_local_ip_by_remote() -> str:
     # try ipv4
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -2340,3 +2427,16 @@ class LazyValue:
             self._value = self._creator()
             self._creator = None
         return self._value
+
+
+def dynamic_import(func_path: str):
+    parts = func_path.split(".")
+    if len(parts) < 2:
+        raise ValueError(
+            "func_path should contain both module name and func name (such as 'module.func')"
+        )
+    module_path = ".".join(parts[:-1])
+    func_name = parts[-1]
+    module = importlib.import_module(module_path)
+    func = getattr(module, func_name)
+    return func
