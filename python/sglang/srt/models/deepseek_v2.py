@@ -366,7 +366,9 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             shared_output = self._forward_shared_experts(hidden_states)
-            with get_global_expert_distribution_recorder().with_current_layer(self.layer_id):
+            with get_global_expert_distribution_recorder().with_current_layer(
+                self.layer_id
+            ):
                 topk_weights, topk_idx = select_experts(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
