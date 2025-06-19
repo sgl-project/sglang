@@ -29,9 +29,10 @@ logger = logging.getLogger(__name__)
 
 def get_token_num_per_batch(
     forward_mode: ForwardMode,
-    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
 ):
     if forward_mode.is_target_verify():
+        assert spec_info is not None
         return spec_info.draft_token_num
     elif forward_mode.is_decode():
         return 1
