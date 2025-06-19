@@ -90,7 +90,7 @@ RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libm
 
 WORKDIR /sgl-workspace
 
-# Sgl
+# SGLang
 RUN python3 -m pip install --upgrade pip setuptools wheel html5lib six  --ignore-installed \
     && git clone --depth=1 https://github.com/sgl-project/sglang.git \
     && if [ "$CUDA_VERSION" = "12.1.1" ]; then \
