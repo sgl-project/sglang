@@ -1,4 +1,4 @@
-FROM nvcr.io/nvidia/tritonserver:25.05-py3-min
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -10,25 +10,21 @@ RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && apt install software-properties-common -y \
     && apt install python3 python3-pip -y \
     && apt install curl git sudo libibverbs-dev -y \
-    && apt install rdma-core infiniband-diags openssh-server perftest -y \
-    && apt install lsof  zsh ccache tmux htop git-lfs tree -y \
+    && apt install rdma-core infiniband-diags openssh-server perftest libnuma1 -y \
+    && apt install lsof  zsh ccache tmux htop git-lfs tree unzip -y \
     && python3 --version \
     && python3 -m pip --version \
+    && pip3 install --upgrade pip \
     && rm -rf /var/lib/apt/lists/* \
     && apt clean
 
-
-RUN pip3 install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128 --break-system-packages
-
-RUN pip3 install https://github.com/sgl-project/whl/releases/download/v0.1.9/sgl_kernel-0.1.9+cu128-cp39-abi3-manylinux2014_x86_64.whl --break-system-packages \
-    && pip3 install setuptools==75.0.0 wheel scikit-build-core --break-system-packages
+RUN pip3 install https://github.com/sgl-project/whl/releases/download/v0.1.9/sgl_kernel-0.1.9+cu128-cp39-abi3-manylinux2014_x86_64.whl \
+    && pip3 install setuptools==75.0.0 wheel scikit-build-core
 
 RUN git clone --depth=1 https://github.com/sgl-project/sglang.git \
-    && cd sglang && pip3 install -e "python[blackwell]" --break-system-packages
+    && cd sglang && pip3 install -e "python[blackwell]" --extra-index-url https://download.pytorch.org/whl/cu128
 
-RUN pip3 install flashinfer_python==0.2.6.post1 --break-system-packages
-
-RUN pip3 install nvidia-nccl-cu12==2.27.3 --force-reinstall --no-deps --break-system-packages
+RUN pip3 install nvidia-nccl-cu12==2.27.3 --force-reinstall --no-deps
 
 ENV DEBIAN_FRONTEND=interactive
 
@@ -39,7 +35,7 @@ RUN pip3 install --no-cache-dir \
     isort \
     icdiff \
     uv \
-    pre-commit --break-system-packages
+    pre-commit
 
 # Install diff-so-fancy
 RUN curl -LSso /usr/local/bin/diff-so-fancy https://github.com/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
