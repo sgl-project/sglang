@@ -35,14 +35,12 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
-from python.sglang.srt.entrypoints.openai.serving_embedding import (
-    OpenAIServingEmbedding,
-)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     register_disaggregation_server,
 )
 from sglang.srt.entrypoints.engine import Engine, _launch_subprocesses
+from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
 from sglang.srt.openai_api.protocol import EmbeddingRequest, ModelCard, ModelList
