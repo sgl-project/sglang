@@ -92,7 +92,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
 
         for tp_size in [1, 2]:
 
-            print(f"Testing tp_size={tp_size}")
+            print(f"Testing tp_size={tp_size} for test_release_and_resume_occupation")
             engine = self._setup_engine(
                 model_name=model_name, mem_fraction_static=0.6, tp_size=tp_size
             )
@@ -154,7 +154,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
             if tp_size == 2 and torch.cuda.device_count() < 2:
                 continue
 
-            print(f"Testing tp_size={tp_size}")
+            print(f"Testing tp_size={tp_size} for test_multi_stage_release_and_resume")
             engine = sgl.Engine(
                 model_path=model_name,
                 random_seed=42,
