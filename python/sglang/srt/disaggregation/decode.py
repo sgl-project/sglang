@@ -541,6 +541,7 @@ class DecodeTransferQueue:
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.tree_cache = tree_cache
+        self.spec_algorithm = scheduler.spec_algorithm
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -582,6 +583,7 @@ class DecodeTransferQueue:
                 idx = decode_req.metadata_buffer_index
                 (
                     output_id,
+                    output_hidden_states,
                     output_token_logprobs_val,
                     output_token_logprobs_idx,
                     output_top_logprobs_val,
@@ -589,7 +591,8 @@ class DecodeTransferQueue:
                 ) = self.metadata_buffers.get_buf(idx)
 
                 decode_req.req.output_ids.append(output_id[0].item())
-
+                if not self.spec_algorithm.is_none():
+                    decode_req.req.hidden_states_tensor = output_hidden_states
                 if decode_req.req.return_logprob:
                     decode_req.req.output_token_logprobs_val.append(
                         output_token_logprobs_val[0].item()
