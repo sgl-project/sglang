@@ -1,9 +1,17 @@
 import logging
 
+from typing import Any, Dict, List, Optional, Union
+
 import jinja2.nodes
 import transformers.utils.chat_template_utils as hf_chat_utils
 
-from sglang.srt.entrypoints.openai.protocol import LogProbs
+
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    LogProbs,
+    UsageInfo,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +216,14 @@ def to_openai_style_logprobs(
 
 
 def process_hidden_states_from_ret(
-    ret_item: Dict[str, Any], request: Any, idx: int
+    ret_item: Dict[str, Any],
+    request: Union[
+        ChatCompletionRequest,
+        CompletionRequest,
+        List[ChatCompletionRequest],
+        List[CompletionRequest],
+    ],
+    idx: int,
 ) -> Optional[List]:
     """Process hidden states from a ret item in non-streaming response.
 
