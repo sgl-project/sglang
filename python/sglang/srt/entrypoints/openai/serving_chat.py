@@ -142,10 +142,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
 
             # Use chat template
-            if (
-                hasattr(self.tokenizer_manager, "chat_template_name")
-                and self.tokenizer_manager.chat_template_name is None
-            ):
+            if chat_template_name is None:
                 prompt, prompt_ids, image_data, audio_data, modalities, stop = (
                     self._apply_jinja_template(request, tools, is_multimodal)
                 )
@@ -263,6 +260,7 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
         stop = request.stop or []
+        
         return prompt, prompt_ids, image_data, audio_data, modalities, stop
 
     def _apply_conversation_template(
@@ -645,10 +643,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle reasoning content
             reasoning_text = None
-            enable_thinking = getattr(request, "chat_template_kwargs", {}).get(
-                "enable_thinking", True
-            )
-            reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+            chat_template_kwargs = getattr(request, "chat_template_kwargs", {})
+            if chat_template_kwargs:
+                enable_thinking = chat_template_kwargs.get(
+                    "enable_thinking", True
+                )
             if reasoning_parser and request.separate_reasoning and enable_thinking:
                 try:
                     parser = ReasoningParser(

@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Union
 from fastapi import Request
 
 from sglang.srt.conversation import generate_embedding_convs
+from sglang.srt.entrypoints.openai.utils import chat_template_name
 from sglang.srt.entrypoints.openai.protocol import (
     EmbeddingObject,
     EmbeddingRequest,
