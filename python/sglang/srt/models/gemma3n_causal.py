@@ -942,31 +942,31 @@ class Gemma3nForCausalLM(PreTrainedModel):
         ".o_proj.",
     ]
     bitsandbytes_stacked_params_mapping = {
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
+        ".q_proj": (".qkv_proj", 0),
+        ".k_proj": (".qkv_proj", 1),
+        ".v_proj": (".qkv_proj", 2),
+        ".gate_proj": (".gate_up_proj", 0),
+        ".up_proj": (".gate_up_proj", 1),
     }
 
     packed_modules_mapping = {
-        "qkv_proj": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
+        ".qkv_proj": [
+            ".q_proj",
+            ".k_proj",
+            ".v_proj",
         ],
-        "gate_up_proj": [
-            "gate_proj",
-            "up_proj",
+        ".gate_up_proj": [
+            ".gate_proj",
+            ".up_proj",
         ],
     }
 
     # LoRA specific attributes
     supported_lora_modules = [
-        "qkv_proj",
-        "o_proj",
-        "gate_up_proj",
-        "down_proj",
+        ".qkv_proj",
+        ".o_proj",
+        ".gate_up_proj",
+        ".down_proj",
     ]
     # Gemma does not apply LoRA to the embedding layer
     embedding_modules = {}
@@ -1035,22 +1035,26 @@ class Gemma3nForCausalLM(PreTrainedModel):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
+            name = name.replace("model.language_model.", "model.")
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:
                     continue
                 name = name.replace(shard_name, param_name)
                 # Skip loading extra bias for GPTQ models
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
+                    # Skip loading weights that are not in the model
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -1066,6 +1070,9 @@ class Gemma3nForCausalLM(PreTrainedModel):
                 # Remapping the name of FP8 kv-scale
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
+                    continue
+                if name not in params_dict:
+                    # Skip loading weights that are not in the model
                     continue
 
                 param = params_dict[name]
