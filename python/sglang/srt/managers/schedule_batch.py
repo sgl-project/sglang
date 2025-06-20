@@ -84,6 +84,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_dp_lm_head",
     "enable_deepep_moe",
     "deepep_mode",
+    "enable_pplx_moe",
     "enable_ep_moe",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
