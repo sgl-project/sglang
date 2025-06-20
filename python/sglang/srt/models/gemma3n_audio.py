@@ -601,7 +601,7 @@ class Gemma3nAudioSubSampleConvProjection(nn.Module):
             prefix=add_prefix("input_proj_linear", prefix),
         )
 
-    def forward(self, audio_encodings: torch.Tensor) -> Tuple[torch.Tensor, None]:
+    def forward(self, audio_encodings: torch.Tensor) -> torch.Tensor:
         audio_encodings_reshaped = audio_encodings.unsqueeze(1)
         x = self.conv_0(audio_encodings_reshaped)
         x = self.conv_1(x)
