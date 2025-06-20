@@ -48,12 +48,12 @@ def compute_split_seq_index(
     extend_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> Optional[int]:
+    if forward_mode == ForwardMode.EXTEND:
+        assert extend_lens is not None
+        return _split_array_by_half_sum(extend_lens)
     if forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
         return (num_tokens // token_num_per_seq) // 2
-    if forward_mode.is_extend():
-        assert extend_lens is not None
-        return _split_array_by_half_sum(extend_lens)
     elif forward_mode.is_idle():
         assert num_tokens == 0
         return 0
@@ -86,12 +86,12 @@ def compute_split_token_index(
     extend_seq_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> int:
-    if forward_mode.is_target_verify() or forward_mode.is_decode():
-        assert token_num_per_seq is not None
-        return split_seq_index * token_num_per_seq
-    elif forward_mode.is_extend():
+    if forward_mode == ForwardMode.EXTEND:
         assert extend_seq_lens is not None
         return sum(extend_seq_lens[:split_seq_index])
+    elif forward_mode.is_target_verify() or forward_mode.is_decode():
+        assert token_num_per_seq is not None
+        return split_seq_index * token_num_per_seq
     elif forward_mode.is_idle():
         assert split_seq_index == 0
         return 0
