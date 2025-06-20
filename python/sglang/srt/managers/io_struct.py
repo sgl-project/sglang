@@ -226,11 +226,11 @@ class GenerateReqInput:
 
         # Expand input based on type
         self._expand_inputs(num)
+        self._normalize_rid(num)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
-        self._normalize_rid(num)
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
 
@@ -812,7 +812,9 @@ class GetWeightsByNameReqOutput:
 
 @dataclass
 class ReleaseMemoryOccupationReqInput:
-    pass
+    # Optional tags to identify the memory region, which is primarily used for RL
+    # Currently we only support `weights` and `kv_cache`
+    tags: Optional[List[str]] = None
 
 
 @dataclass
@@ -822,7 +824,9 @@ class ReleaseMemoryOccupationReqOutput:
 
 @dataclass
 class ResumeMemoryOccupationReqInput:
-    pass
+    # Optional tags to identify the memory region, which is primarily used for RL
+    # Currently we only support `weights` and `kv_cache`
+    tags: Optional[List[str]] = None
 
 
 @dataclass
