@@ -922,11 +922,16 @@ class TokenizerManager:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for init parameter update group"
-        result = (await self.init_weights_update_group_communicator(obj))[0]
-        return result.success, result.message
+
+        results = await self.init_weights_update_group_communicator(obj)
+        if self.server_args.dp_size == 1:
+            result = results[0]
+            return result.success, result.message
+        else:
+            all_success = all([r.success for r in results])
+            all_message = [r.message for r in results]
+            all_message = " | ".join(all_message)
+            return all_success, all_message
 
     async def update_weights_from_distributed(
         self,
@@ -934,15 +939,19 @@ class TokenizerManager:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
-        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         # This means that weight sync
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
-            result = (await self.update_weights_from_distributed_communicator(obj))[0]
-            return result.success, result.message
+            results = await self.update_weights_from_distributed_communicator(obj)
+            if self.server_args.dp_size == 1:
+                result = results[0]
+                return result.success, result.message
+            else:
+                all_success = all([r.success for r in results])
+                all_message = [r.message for r in results]
+                all_message = " | ".join(all_message)
+                return all_success, all_message
 
     async def update_weights_from_tensor(
         self,
