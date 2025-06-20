@@ -4,7 +4,7 @@
 import contextlib
 import logging
 from abc import ABC
-from typing import Iterable, Iterator, Tuple, Type
+from typing import Iterable, Tuple, Type
 
 import torch
 import transformers
@@ -141,6 +141,6 @@ class SupportsPP(ABC):
 
     def filter_weights_by_layers(
         self, weights: Iterable[Tuple[str, torch.Tensor]]
-    ) -> Iterator[Tuple[str, torch.Tensor]]:
+    ) -> Iterable[Tuple[str, torch.Tensor]]:
         """Lazily filter weights based on pipeline stage"""
         return filter(lambda item: not self.should_skip_layer(item[0]), weights)
