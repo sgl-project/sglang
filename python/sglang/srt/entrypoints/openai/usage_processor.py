@@ -21,9 +21,9 @@ class UsageProcessor:
         n_choices: int = 1,
         enable_cache_report: bool = False,
     ):
-        completion = sum(r["meta_info"]["completion_tokens"] for r in responses)
+        completion_tokens = sum(r["meta_info"]["completion_tokens"] for r in responses)
 
-        prompt = sum(
+        prompt_tokens = sum(
             responses[i]["meta_info"]["prompt_tokens"]
             for i in range(0, len(responses), n_choices)
         )
@@ -36,8 +36,8 @@ class UsageProcessor:
             cached_details = _details_if_cached(cached_total)
 
         return calculate_token_usage(
-            prompt_tokens=prompt,
-            completion_tokens=completion,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
             cached_tokens=cached_details,
         )
 
@@ -52,9 +52,11 @@ class UsageProcessor:
         enable_cache_report: bool = False,
     ):
         # index % n_choices==0 marks the first choice of a prompt
-        prompt = sum(tok for idx, tok in prompt_tokens.items() if idx % n_choices == 0)
+        total_prompt_tokens = sum(
+            tok for idx, tok in prompt_tokens.items() if idx % n_choices == 0
+        )
 
-        completion = sum(completion_tokens.values())
+        total_completion_tokens = sum(completion_tokens.values())
 
         cached_details = (
             _details_if_cached(sum(cached_tokens.values()))
@@ -63,7 +65,7 @@ class UsageProcessor:
         )
 
         return calculate_token_usage(
-            prompt_tokens=prompt,
-            completion_tokens=completion,
+            prompt_tokens=total_prompt_tokens,
+            completion_tokens=total_completion_tokens,
             cached_tokens=cached_details,
         )
