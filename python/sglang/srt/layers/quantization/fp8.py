@@ -1096,7 +1096,9 @@ class Fp8MoEMethod:
                     w1_scale=layer.w13_weight_scale1,
                     w2_scale=layer.w2_weight_scale1,
                     activation=(
-                        ActivationType.Silu if activation == "silu" else ActivationType.Gelu
+                        ActivationType.Silu
+                        if activation == "silu"
+                        else ActivationType.Gelu
                     ),
                 )
         return None
