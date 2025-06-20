@@ -389,14 +389,19 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming chat completion response"""
+        # Parsers for tool calls and reasoning
         parser_dict = {}
         reasoning_parser_dict = {}
-        is_first = True
-        stream_buffer = ""
-        n_prev_token = 0
-        prompt_tokens = 0
-        completion_tokens = 0
-        cached_tokens = 0
+
+        # State tracking for streaming
+        is_firsts = {}
+        stream_buffers = {}
+        n_prev_tokens = {}
+
+        # Usage tracking
+        prompt_tokens = {}
+        completion_tokens = {}
+        cached_tokens = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -404,24 +409,26 @@ class OpenAIServingChat(OpenAIServingBase):
             ):
                 index = content.get("index", 0)
 
-                prompt_tokens = content["meta_info"]["prompt_tokens"]
-                completion_tokens = content["meta_info"]["completion_tokens"]
-                cached_tokens = content["meta_info"].get("cached_tokens", 0)
+                prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
+                completion_tokens[index] = content["meta_info"]["completion_tokens"]
+                cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
 
                 # Handle logprobs
                 choice_logprobs = None
                 if request.logprobs:
                     choice_logprobs = self._process_streaming_logprobs(
-                        content, n_prev_token
+                        content, n_prev_tokens.get(index, 0)
                     )
-                    n_prev_token = len(content["meta_info"]["output_token_logprobs"])
+                    n_prev_tokens[index] = len(
+                        content["meta_info"]["output_token_logprobs"]
+                    )
 
                 finish_reason = content["meta_info"]["finish_reason"]
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # First chunk with role
-                if is_first:
-                    is_first = False
+                if is_firsts.get(index, True):
+                    is_firsts[index] = False
                     delta = DeltaMessage(role="assistant")
                     choice_data = ChatCompletionResponseStreamChoice(
                         index=index,
@@ -443,8 +450,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     yield f"data: {chunk.model_dump_json()}\n\n"
 
                 # Process content delta
+                stream_buffer = stream_buffers.get(index, "")
                 delta = content["text"][len(stream_buffer) :]
-                new_stream_buffer = stream_buffer + delta
+                stream_buffers[index] = stream_buffer + delta
 
                 # Handle reasoning content
                 enable_thinking = getattr(request, "chat_template_kwargs", {}).get(
@@ -472,8 +480,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
-                    # Always update stream_buffer to maintain correct state
-                    stream_buffer = new_stream_buffer
                     if not delta:
                         continue
 
@@ -517,8 +523,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
-                stream_buffer = new_stream_buffer
-
             # Final chunk with finish_reason
             finish_reason_chunk = ChatCompletionStreamResponse(
                 id=content["meta_info"]["id"],
@@ -543,9 +547,9 @@ class OpenAIServingChat(OpenAIServingBase):
             # Additional usage chunk
             if request.stream_options and request.stream_options.include_usage:
                 usage = self._calculate_streaming_usage_base(
-                    {0: prompt_tokens},
-                    {0: completion_tokens},
-                    {0: cached_tokens},
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_tokens,
                     request.n,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
