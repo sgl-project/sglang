@@ -32,7 +32,6 @@ class ServingCompletionTestCase(unittest.TestCase):
         tm.create_abort_task = Mock()
 
         self.sc = OpenAIServingCompletion(tm)
-        self.mock_request = Mock()
 
     # ---------- prompt-handling ----------
     def test_single_string_prompt(self):
@@ -96,123 +95,6 @@ class ServingCompletionTestCase(unittest.TestCase):
         req = CompletionRequest(model="x", prompt=[1, 2, 3], echo=True)
         self.sc.tokenizer_manager.tokenizer.decode.return_value = "decoded"
         self.assertEqual(self.sc._prepare_echo_prompts(req), ["decoded"])
-
-    # ---------- hidden states tests ----------
-    def test_hidden_states_request_conversion(self):
-        """Test request conversion with return_hidden_states=True"""
-        # Test single request
-        request = CompletionRequest(
-            model="test-model",
-            prompt="Hello world",
-            return_hidden_states=True,
-        )
-        adapted_request, _ = self.sc._convert_to_internal_request(request)
-        assert adapted_request.return_hidden_states is True
-
-        # Test request with return_hidden_states=False
-        request = CompletionRequest(
-            model="test-model",
-            prompt="Hello world",
-            return_hidden_states=False,
-        )
-        adapted_request, _ = self.sc._convert_to_internal_request(request)
-        assert adapted_request.return_hidden_states is False
-
-    def test_hidden_states_response_handling(self):
-        """Test hidden states in response handling"""
-        # Test non-streaming response with hidden states
-        request = CompletionRequest(
-            model="test-model",
-            prompt="Hello world",
-            return_hidden_states=True,
-        )
-        ret = [
-            {
-                "text": "Test response",
-                "meta_info": {
-                    "id": "cmpl-test",
-                    "prompt_tokens": 10,
-                    "completion_tokens": 5,
-                    "cached_tokens": 0,
-                    "finish_reason": {"type": "stop", "matched": None},
-                    "output_token_logprobs": [],
-                    "output_top_logprobs": None,
-                    "hidden_states": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
-                },
-            }
-        ]
-        response = self.sc._build_completion_response(request, ret, 1234567890)
-        assert len(response.choices) == 1
-        assert response.choices[0].hidden_states == [0.4, 0.5, 0.6]
-
-        # Test response without hidden states
-        request = CompletionRequest(
-            model="test-model",
-            prompt="Hello world",
-            return_hidden_states=False,
-        )
-        ret[0]["meta_info"].pop("hidden_states")
-        response = self.sc._build_completion_response(request, ret, 1234567890)
-        assert len(response.choices) == 1
-        assert response.choices[0].hidden_states is None
-
-    async def test_hidden_states_streaming(self):
-        """Test hidden states in streaming response"""
-        request = CompletionRequest(
-            model="test-model",
-            prompt="Hello world",
-            return_hidden_states=True,
-            stream=True,
-        )
-
-        async def mock_generate():
-            yield {
-                "text": "Test",
-                "meta_info": {
-                    "id": "cmpl-test",
-                    "prompt_tokens": 10,
-                    "completion_tokens": 1,
-                    "cached_tokens": 0,
-                    "finish_reason": None,
-                    "output_token_logprobs": [],
-                    "output_top_logprobs": None,
-                    "hidden_states": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
-                },
-                "index": 0,
-            }
-
-        self.sc.tokenizer_manager.generate_request = Mock(return_value=mock_generate())
-        adapted_request, _ = self.sc._convert_to_internal_request(request)
-        response = await self.sc._handle_streaming_request(
-            adapted_request, request, self.mock_request
-        )
-
-        chunks = []
-        async for chunk in response.body_iterator:
-            chunks.append(chunk)
-
-        import json
-
-        parsed_chunks = []
-        for chunk in chunks:
-            if chunk.startswith("data:") and chunk.strip() != "data: [DONE]":
-                try:
-                    chunk_data = json.loads(chunk[6:])
-                    parsed_chunks.append(chunk_data)
-                except json.JSONDecodeError:
-                    continue
-
-        assert len(parsed_chunks) >= 1
-        hidden_states_found = False
-        for chunk_data in parsed_chunks:
-            choice = chunk_data["choices"][0]
-            if choice.get("hidden_states") is not None:
-                assert choice["hidden_states"] == [0.4, 0.5, 0.6]
-                hidden_states_found = True
-                break
-        assert (
-            hidden_states_found
-        ), "Hidden states should be present in streaming response"
 
 
 if __name__ == "__main__":

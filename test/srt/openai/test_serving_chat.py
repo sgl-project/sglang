@@ -62,8 +62,6 @@ class ServingChatTestCase(unittest.TestCase):
     def setUp(self):
         self.tm = _MockTokenizerManager()
         self.chat = OpenAIServingChat(self.tm)
-        self.mock_request = Mock(spec=Request)
-        self.mock_request.headers = {}
 
         # frequently reused requests
         self.basic_req = ChatCompletionRequest(
