@@ -1704,6 +1704,7 @@ class FlashAttentionBackend(AttentionBackend):
                     0,
                     self.page_size,
                 )
+                # set metadata for local attention if needed
                 if self.is_hybrid is not None:
                     page_indices_local = self.req_to_token_local[
                         req_pool_indices[:, None],

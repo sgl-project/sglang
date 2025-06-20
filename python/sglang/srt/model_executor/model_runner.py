@@ -990,7 +990,7 @@ class ModelRunner:
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     is_hybrid=self.is_hybrid,
-            )
+                )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker

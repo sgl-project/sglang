@@ -320,29 +320,39 @@ class MHATokenToKVPool(KVCache):
                     self.k_buffer = []
                     self.v_buffer = []
                     for i in range(self.layer_num):
-                        temp_size = self.local_size if int((i + 1) % 4 != 0) else self.size
+                        temp_size = (
+                            self.local_size if int((i + 1) % 4 != 0) else self.size
+                        )
                         self.k_buffer.append(
                             torch.zeros(
-                                (temp_size + self.page_size, self.head_num, self.head_dim),
+                                (
+                                    temp_size + self.page_size,
+                                    self.head_num,
+                                    self.head_dim,
+                                ),
                                 dtype=self.store_dtype,
                                 device=self.device,
                             )
                         )
                         self.v_buffer.append(
                             torch.zeros(
-                                (temp_size + self.page_size, self.head_num, self.head_dim),
+                                (
+                                    temp_size + self.page_size,
+                                    self.head_num,
+                                    self.head_dim,
+                                ),
                                 dtype=self.store_dtype,
                                 device=self.device,
                             )
                         )
                 else:
                     self.k_buffer = [
-                            torch.zeros(
-                                (self.size + self.page_size, self.head_num, self.head_dim),
-                                dtype=self.store_dtype,
-                                device=self.device,
-                            )
-                            for _ in range(self.layer_num)
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
                     ]
                     self.v_buffer = [
                         torch.zeros(
