@@ -10,7 +10,6 @@ from pplx_kernels.nvshmem import (nvshmem_alloc_empty_unique_id,
 
 import torch
 
-import sglang.srt.layers.moe.ep_moe.modular_kernel as mk
 from sglang.srt.layers.moe.ep_moe.utils import (
     moe_kernel_quantize_input)
 from sglang.srt.utils import run_once
