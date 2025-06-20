@@ -340,7 +340,7 @@ class PrefillAdder:
     def _update_prefill_budget(
         self, prefix_len: int, extend_input_len: int, max_new_tokens: int
     ):
-        # TODO(lsyin): check this workaround logic
+        # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
         self.rem_total_token_offset += extend_input_len + max_new_tokens
@@ -379,6 +379,12 @@ class PrefillAdder:
             self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool):
+        # Early exit if no enough tokens for the input tokens
+        if self.ceil_paged_tokens(req.extend_input_len) > min(
+            self.cur_rem_tokens, self.rem_total_tokens
+        ):
+            return AddReqResult.NO_TOKEN
+
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
                 1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
@@ -412,9 +418,7 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
-        # TODO(lsyin): this only ensure the prefill will not out of memory
-        cur_input_tokens = self.ceil_paged_tokens(len(req.origin_input_ids))
-        cur_rem_tokens = self.cur_rem_tokens - cur_input_tokens
+        cur_rem_tokens = self.cur_rem_tokens - len(req.origin_input_ids)
         tokens_freed = 0
         for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
             # tokens_left gives a reservative calculation as the last token is not stored
