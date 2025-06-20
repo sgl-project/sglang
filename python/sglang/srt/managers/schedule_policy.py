@@ -51,6 +51,9 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 )
 
 
+IGNORE_EOS_RESERVE_TOKENS = 1
+
+
 class CacheAwarePolicy(Enum):
     """Scheduling policies that are aware of the tree cache."""
 
@@ -403,12 +406,16 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
-        cur_rem_tokens = self.cur_rem_tokens - len(req.origin_input_ids)
+        # TODO(lsyin): this only ensure the prefill will not out of memory
+        cur_input_tokens = self.ceil_paged_tokens(len(req.origin_input_ids))
+        cur_rem_tokens = self.cur_rem_tokens - cur_input_tokens
         tokens_freed = 0
         for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
             # tokens_left gives a reservative calculation as the last token is not stored
             bs = len(self.req_states) - i
-            if cur_rem_tokens + tokens_freed - tokens_left * bs <= 0:
+            min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
+            # reserve tokens for corner cases
+            if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
                 return AddReqResult.NO_TOKEN
             tokens_freed += tokens_occupied
 
