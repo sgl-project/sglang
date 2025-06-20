@@ -1,10 +1,8 @@
 import logging
-
 from typing import Any, Dict, List, Optional, Union
 
 import jinja2.nodes
 import transformers.utils.chat_template_utils as hf_chat_utils
-
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -220,8 +218,6 @@ def process_hidden_states_from_ret(
     request: Union[
         ChatCompletionRequest,
         CompletionRequest,
-        List[ChatCompletionRequest],
-        List[CompletionRequest],
     ],
     idx: int,
 ) -> Optional[List]:
@@ -241,7 +237,5 @@ def process_hidden_states_from_ret(
     elif not isinstance(request, list) and request.return_hidden_states:
         hidden_states = ret_item["meta_info"].get("hidden_states", None)
     if hidden_states is not None:
-        hidden_states = (
-            hidden_states[-1] if hidden_states and len(hidden_states) > 1 else []
-        )
+        hidden_states = hidden_states[-1] if len(hidden_states) > 1 else []
     return hidden_states

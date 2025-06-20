@@ -19,7 +19,10 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
-from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
+from sglang.srt.entrypoints.openai.utils import (
+    process_hidden_states_from_ret,
+    to_openai_style_logprobs,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 logger = logging.getLogger(__name__)
@@ -211,14 +214,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
-            
-            
+
             if request.return_hidden_states and hidden_states:
                 for index, choice_hidden_states in hidden_states.items():
                     if choice_hidden_states:
                         last_token_hidden_states = (
                             choice_hidden_states[-1]
-                            if choice_hidden_states and len(choice_hidden_states) > 1
+                            if len(choice_hidden_states) > 1
                             else []
                         )
                         hidden_states_chunk = CompletionStreamResponse(
@@ -332,15 +334,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 )
 
             # Handle hidden states
-            hidden_states = None
-            if isinstance(request, list) and request[idx].return_hidden_states:
-                hidden_states = ret_item["meta_info"].get("hidden_states", None)
-            elif (not isinstance(request, list)) and request.return_hidden_states:
-                hidden_states = ret_item["meta_info"].get("hidden_states", None)
-            if hidden_states is not None:
-                hidden_states = (
-                    hidden_states[-1] if hidden_states and len(hidden_states) > 1 else []
-                )
+            hidden_states = process_hidden_states_from_ret(ret_item, request, idx)
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
 

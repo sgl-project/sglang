@@ -244,24 +244,15 @@ class ServingChatTestCase(unittest.TestCase):
                 None,
             )
 
-            adapted_request, _ = self.chat._convert_to_internal_request(
-                [request], ["test-id"]
-            )
+            adapted_request, _ = self.chat._convert_to_internal_request(request)
             assert adapted_request.return_hidden_states is True
 
-        # Test multiple requests
-        requests = [
-            ChatCompletionRequest(
-                model="test-model",
-                messages=[{"role": "user", "content": "Hello"}],
-                return_hidden_states=True,
-            ),
-            ChatCompletionRequest(
-                model="test-model",
-                messages=[{"role": "user", "content": "World"}],
-                return_hidden_states=False,
-            ),
-        ]
+        # Test request with return_hidden_states=False
+        request_false = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            return_hidden_states=False,
+        )
 
         with patch.object(self.chat, "_process_messages") as mock_process:
             mock_process.return_value = (
@@ -274,10 +265,8 @@ class ServingChatTestCase(unittest.TestCase):
                 None,
             )
 
-            adapted_request, _ = self.chat._convert_to_internal_request(
-                requests, ["test-id-1", "test-id-2"]
-            )
-            assert adapted_request.return_hidden_states == [True, False]
+            adapted_request, _ = self.chat._convert_to_internal_request(request_false)
+            assert adapted_request.return_hidden_states is False
 
     def test_hidden_states_response_handling(self):
         """Test hidden states in response handling"""
@@ -379,9 +368,7 @@ class ServingChatTestCase(unittest.TestCase):
                 None,
             )
 
-            adapted_request, _ = self.chat._convert_to_internal_request(
-                [request], ["test-id"]
-            )
+            adapted_request, _ = self.chat._convert_to_internal_request(request)
 
             response = await self.chat._handle_streaming_request(
                 adapted_request, request, self.mock_request

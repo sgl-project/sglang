@@ -106,28 +106,17 @@ class ServingCompletionTestCase(unittest.TestCase):
             prompt="Hello world",
             return_hidden_states=True,
         )
-        adapted_request, _ = self.sc._convert_to_internal_request(
-            [request], ["test-id"]
-        )
+        adapted_request, _ = self.sc._convert_to_internal_request(request)
         assert adapted_request.return_hidden_states is True
 
-        # Test multiple requests
-        requests = [
-            CompletionRequest(
-                model="test-model",
-                prompt="Hello",
-                return_hidden_states=True,
-            ),
-            CompletionRequest(
-                model="test-model",
-                prompt="World",
-                return_hidden_states=False,
-            ),
-        ]
-        adapted_request, _ = self.sc._convert_to_internal_request(
-            requests, ["test-id-1", "test-id-2"]
+        # Test request with return_hidden_states=False
+        request = CompletionRequest(
+            model="test-model",
+            prompt="Hello world",
+            return_hidden_states=False,
         )
-        assert adapted_request.return_hidden_states == [True, False]
+        adapted_request, _ = self.sc._convert_to_internal_request(request)
+        assert adapted_request.return_hidden_states is False
 
     def test_hidden_states_response_handling(self):
         """Test hidden states in response handling"""
@@ -193,9 +182,7 @@ class ServingCompletionTestCase(unittest.TestCase):
             }
 
         self.sc.tokenizer_manager.generate_request = Mock(return_value=mock_generate())
-        adapted_request, _ = self.sc._convert_to_internal_request(
-            [request], ["test-id"]
-        )
+        adapted_request, _ = self.sc._convert_to_internal_request(request)
         response = await self.sc._handle_streaming_request(
             adapted_request, request, self.mock_request
         )
