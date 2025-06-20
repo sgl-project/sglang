@@ -1,11 +1,5 @@
 """CUTLASS based Fused MoE kernels."""
 
-import functools
-import json
-import logging
-import os
-from typing import Any, Callable, Dict, List, Optional, Tuple
-
 import torch
 
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
@@ -155,8 +149,10 @@ def cutlass_fused_experts_fp8(
     rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
     rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
 
-    c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
-    c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
+    c_buffer = torch.empty((m * topk, n * 2 + k), device=device, dtype=out_dtype)
+    c1 = c_buffer[:, : n * 2]
+    c2 = c_buffer[:, n * 2:]
+    intermediate = c_buffer[:, : n]
 
     fp8_blockwise_scaled_grouped_mm(
         c1,
@@ -179,7 +175,6 @@ def cutlass_fused_experts_fp8(
         workspace,
     )
 
-    intermediate = torch.empty((m * topk, n), device=device, dtype=out_dtype)
     silu_and_mul(c1, intermediate)
 
     intemediate_q, a2_scale = sglang_per_token_group_quant_fp8(intermediate, 128)
