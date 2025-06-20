@@ -406,13 +406,9 @@ class PrefillAdder:
         cur_rem_tokens = self.cur_rem_tokens - len(req.origin_input_ids)
         tokens_freed = 0
         for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
-            decode_steps = (
-                self.req_states[i + 1][0]
-                if i + 1 < len(self.req_states)
-                else tokens_left
-            )
+            # tokens_left gives a reservative calculation as the last token is not stored
             bs = len(self.req_states) - i
-            if cur_rem_tokens + tokens_freed - decode_steps * bs <= 0:
+            if cur_rem_tokens + tokens_freed - tokens_left * bs <= 0:
                 return AddReqResult.NO_TOKEN
             tokens_freed += tokens_occupied
 
