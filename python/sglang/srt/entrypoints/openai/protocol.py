@@ -211,9 +211,12 @@ class CompletionResponseChoice(BaseModel):
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
 
-    @model_serializer
-    def _serialize(self):
-        return exclude_if_none(self, ["hidden_states"])
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.hidden_states is None:
+            data.pop("hidden_states", None)
+        return data
 
 
 class CompletionResponse(BaseModel):
@@ -233,9 +236,12 @@ class CompletionResponseStreamChoice(BaseModel):
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
 
-    @model_serializer
-    def _serialize(self):
-        return exclude_if_none(self, ["hidden_states"])
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.hidden_states is None:
+            data.pop("hidden_states", None)
+        return data
 
 
 class CompletionStreamResponse(BaseModel):
@@ -457,9 +463,12 @@ class ChatCompletionResponseChoice(BaseModel):
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
 
-    @model_serializer
-    def _serialize(self):
-        return exclude_if_none(self, ["hidden_states"])
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.hidden_states is None:
+            data.pop("hidden_states", None)
+        return data
 
 
 class ChatCompletionResponse(BaseModel):
@@ -478,9 +487,12 @@ class DeltaMessage(BaseModel):
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
 
-    @model_serializer
-    def _serialize(self):
-        return exclude_if_none(self, ["hidden_states"])
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.hidden_states is None:
+            data.pop("hidden_states", None)
+        return data
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
