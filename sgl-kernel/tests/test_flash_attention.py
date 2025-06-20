@@ -1,5 +1,4 @@
 # Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/hopper/test_flash_attn.py
-import functools
 import itertools
 import math
 import os
