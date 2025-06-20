@@ -235,7 +235,8 @@ def _run_subprocess(
     output_writer.send(execution_ok)
     output_writer.close()
 
-    engine.shutdown()
+    if "engine" in locals() and engine is not None:
+        engine.shutdown()
     print(f"subprocess[{rank=}] end", flush=True)
 
 
