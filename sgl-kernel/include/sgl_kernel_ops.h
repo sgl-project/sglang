@@ -74,6 +74,18 @@ std::tuple<std::vector<int64_t>, std::vector<int64_t>> get_graph_buffer_ipc_meta
 void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs);
 void register_graph_buffers(
     fptr_t _fa, const std::vector<std::vector<int64_t>>& handles, const std::vector<std::vector<int64_t>>& offsets);
+torch::Tensor mscclpp_generate_unique_id();
+fptr_t mscclpp_init_context(
+    const torch::Tensor& unique_id,
+    const int64_t rank,
+    const int64_t world_size,
+    torch::Tensor& scratch,
+    torch::Tensor& put_buffer,
+    const int64_t nranks_per_node,
+    const std::vector<int64_t>& rank_to_node,
+    const std::vector<int64_t>& rank_to_ib,
+    const int64_t context_selection);
+void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out, int64_t nthreads, int64_t nblocks);
 #endif
 
 /*
@@ -93,12 +105,19 @@ void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void cutlass_mla_decode(
     torch::Tensor const& out,
-    torch::Tensor const& q_nope_and_q_pe,
+    torch::Tensor const& q_nope,
+    torch::Tensor const& q_pe,
     torch::Tensor const& kv_c_and_k_pe_cache,
     torch::Tensor const& seq_lens,
     torch::Tensor const& page_table,
-    torch::Tensor const& workspace);
-int64_t cutlass_mla_get_workspace_size(int64_t max_seq_len, int64_t num_batches, int64_t sm_count = 0);
+    torch::Tensor const& workspace,
+    double sm_scale,
+    int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
+int64_t cutlass_mla_get_workspace_size(
+    int64_t max_seq_len,
+    int64_t num_batches,
+    int64_t sm_count = 0,
+    int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
 /*
  * From csrc/elementwise
  */
@@ -160,7 +179,8 @@ void sgl_per_token_group_quant_fp8(
     int64_t group_size,
     double eps,
     double fp8_min,
-    double fp8_max);
+    double fp8_max,
+    bool scale_ue8m0);
 void sgl_per_token_group_quant_int8(
     at::Tensor input,
     at::Tensor output_q,
@@ -252,7 +272,31 @@ void ep_moe_pre_reorder(
     int64_t topk,
     bool use_per_token_if_dynamic);
 
+void ep_moe_silu_and_mul(
+    torch::Tensor gateup_output,
+    torch::Tensor down_input,
+    torch::Tensor reorder_topk_ids,
+    torch::Tensor scales,
+    int64_t start_expert_id,
+    int64_t end_expert_id);
+
+void ep_moe_post_reorder(
+    torch::Tensor down_output,
+    torch::Tensor output,
+    torch::Tensor src2dst,
+    torch::Tensor topk_ids,
+    torch::Tensor topk_weights,
+    int64_t start_expert_id,
+    int64_t end_expert_id,
+    int64_t topk);
+
 void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2src_map, torch::Tensor& output_tensor);
+
+void apply_shuffle_mul_sum(
+    const torch::Tensor& input,
+    torch::Tensor& output,
+    const torch::Tensor& permutation,
+    const std::optional<torch::Tensor>& factors);
 
 void cutlass_fp4_group_mm(
     torch::Tensor& output,
@@ -287,6 +331,7 @@ void tree_speculative_sampling_target_only(
     at::Tensor retrive_next_token,
     at::Tensor retrive_next_sibling,
     at::Tensor uniform_samples,
+    at::Tensor uniform_samples_for_final_sampling,
     at::Tensor target_probs,
     at::Tensor draft_probs,
     double threshold_single = 1,
@@ -319,7 +364,12 @@ void build_tree_kernel_efficient(
     int64_t draft_token_num);
 
 void segment_packbits(
-    at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr, at::Tensor y, int64_t cuda_stream);
+    at::Tensor x,
+    at::Tensor input_indptr,
+    at::Tensor output_indptr,
+    at::Tensor y,
+    int64_t batch_size,
+    int64_t cuda_stream = 0);
 
 /*
  * From FlashInfer
