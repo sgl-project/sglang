@@ -23,7 +23,7 @@ struct HiCacheMemoryPool {
 
   at::Tensor alloc(std::size_t needed) {
     const auto size = this->available_size();
-    _assert(needed < size, "Requested size exceeds host size");
+    _assert(needed <= size, "Requested size exceeds host size");
     const auto remain = size - needed;
     auto values = m_free_slots.split_with_sizes({int64_t(needed), int64_t(remain)});
     m_free_slots = std::move(values[1]);
