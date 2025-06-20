@@ -1,8 +1,8 @@
-import os
-import unittest
-import traceback
-import subprocess
 import multiprocessing
+import os
+import subprocess
+import traceback
+import unittest
 from multiprocessing import Process
 from typing import Iterable, Tuple
 
@@ -12,19 +12,28 @@ from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.engine import Engine as SglangEngine
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE, CustomTestCase, find_available_port
-
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
+    CustomTestCase,
+    find_available_port,
+)
 
 MODEL_INFO = dict(
     model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     mem_fraction_static=0.7,
     dp_size=2,
-    tp_size=2
+    tp_size=2,
 )
 
 
 def get_gpu_memory_gb(gpu_id=0):
-    cmd_list = ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits", f"--id={gpu_id}"]
+    cmd_list = [
+        "nvidia-smi",
+        "--query-gpu=memory.used",
+        "--format=csv,noheader,nounits",
+        f"--id={gpu_id}",
+    ]
     result = subprocess.check_output(cmd_list, text=True, shell=False).strip()
     return int(result) / 1024
 
@@ -52,16 +61,15 @@ class TestMultiInstanceReleaseMemoryOccupation(CustomTestCase):
                     model_path=MODEL_INFO["model_path"],
                     master_port=master_port,
                     output_writer=output_writer,
-                    mem_fraction_static=MODEL_INFO["mem_fraction_static"]
-                )
+                    mem_fraction_static=MODEL_INFO["mem_fraction_static"],
+                ),
             )
             p.start()
             processes.append(p)
 
         for _ in range(world_size):
             self.assertTrue(
-                output_reader.recv(),
-                f"Subprocess fail. Check the logs above."
+                output_reader.recv(), f"Subprocess fail. Check the logs above."
             )
         for p in processes:
             p.join()
@@ -74,13 +82,17 @@ def _run_sglang_subprocess(
     model_path: str,
     master_port: int,
     output_writer,
-    mem_fraction_static: float
+    mem_fraction_static: float,
 ):
     engine = None
     try:
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(master_port)
-        dist.init_process_group(rank=rank, device_id=torch.device(f"cuda:{rank}"), world_size=dp_size * tp_size)
+        dist.init_process_group(
+            rank=rank,
+            device_id=torch.device(f"cuda:{rank}"),
+            world_size=dp_size * tp_size,
+        )
         torch.cuda.set_device(rank)
 
         base_gpu_id = rank // tp_size * tp_size
@@ -101,7 +113,7 @@ def _run_sglang_subprocess(
             random_seed=42,
             mem_fraction_static=mem_fraction_static,
             device_mesh_cpu=inference_device_mesh_cpu["tp"],
-            base_gpu_id=base_gpu_id
+            base_gpu_id=base_gpu_id,
         )
         print(f"subprocess[{rank=}] {engine=}", flush=True)
 
@@ -110,7 +122,9 @@ def _run_sglang_subprocess(
         print(f"GPU{rank} Memory usage before releasing Sgl KV cache: {_mem_usage}")
         engine.release_memory_occupation(tags=["kv_cache"])
         _curr_usage = get_gpu_memory_gb(rank)
-        assert _curr_usage < _mem_usage, f"Memory usage after releasing KV cache must be reduced! before: {_mem_usage} vs after: {_curr_usage}"
+        assert (
+            _curr_usage < _mem_usage
+        ), f"Memory usage after releasing KV cache must be reduced! before: {_mem_usage} vs after: {_curr_usage}"
 
         # 2 - release sglang weights
         _mem_usage = get_gpu_memory_gb(rank)
@@ -118,19 +132,25 @@ def _run_sglang_subprocess(
         engine.release_memory_occupation(tags=["weights"])
 
         _curr_usage = get_gpu_memory_gb(rank)
-        assert _curr_usage < _mem_usage, f"Memory usage after releasing weights must be reduced! before: {_mem_usage} vs after: {_curr_usage}"
+        assert (
+            _curr_usage < _mem_usage
+        ), f"Memory usage after releasing weights must be reduced! before: {_mem_usage} vs after: {_curr_usage}"
 
         # 3 - load hf model
         _mem_usage = get_gpu_memory_gb(rank)
-        print(f"GPU{rank} Memory usage after releasing Sgl weights and kv cache: {_mem_usage}")
+        print(
+            f"GPU{rank} Memory usage after releasing Sgl weights and kv cache: {_mem_usage}"
+        )
         hf_model = AutoModelForCausalLM.from_pretrained(
             DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
             torch_dtype="bfloat16",
             device_map=f"cuda:{rank}",
-            trust_remote_code=True
+            trust_remote_code=True,
         ).cuda()
         _curr_usage = get_gpu_memory_gb(rank)
-        assert _curr_usage > _mem_usage, f"Memory usage after loading hf model must be increased! before: {_mem_usage} vs after: {_curr_usage}"
+        assert (
+            _curr_usage > _mem_usage
+        ), f"Memory usage after loading hf model must be increased! before: {_mem_usage} vs after: {_curr_usage}"
 
         # 4 - resume sglang weights and update the weights
         _mem_usage = get_gpu_memory_gb(rank)
@@ -146,14 +166,18 @@ def _run_sglang_subprocess(
         del hf_model
         torch.cuda.empty_cache()
         _curr_usage = get_gpu_memory_gb(rank)
-        assert _curr_usage < _mem_usage, f"Memory usage after releasing hf model must be reduced! before: {_mem_usage} vs after: {_curr_usage}"
+        assert (
+            _curr_usage < _mem_usage
+        ), f"Memory usage after releasing hf model must be reduced! before: {_mem_usage} vs after: {_curr_usage}"
 
         # 6 - resume slgang kv cache
         _mem_usage = get_gpu_memory_gb(rank)
         print(f"GPU{rank} Memory usage after releasing hf model: {_mem_usage}")
         engine.resume_memory_occupation(tags=["kv_cache"])
         _curr_usage = get_gpu_memory_gb(rank)
-        assert _curr_usage > _mem_usage, f"Memory usage after resuming kv cache must be increased! before: {_mem_usage} vs after: {_curr_usage}"
+        assert (
+            _curr_usage > _mem_usage
+        ), f"Memory usage after resuming kv cache must be increased! before: {_mem_usage} vs after: {_curr_usage}"
 
         # 7 - Final checking!
         _mem_usage = get_gpu_memory_gb(rank)
@@ -171,18 +195,15 @@ def _run_sglang_subprocess(
     if engine:
         engine.shutdown()
 
-class EngineWrapper():
+
+class EngineWrapper:
     """
     A wrapper around Sglang engine to mock multi instance cases such as RL traing.
 
     """
+
     def __init__(
-        self,
-        model_path,
-        random_seed,
-        mem_fraction_static,
-        device_mesh_cpu,
-        base_gpu_id
+        self, model_path, random_seed, mem_fraction_static, device_mesh_cpu, base_gpu_id
     ):
         self._device_mesh_cpu = device_mesh_cpu
         self._tp_rank = device_mesh_cpu.get_local_rank()
@@ -197,8 +218,9 @@ class EngineWrapper():
             mem_fraction_static=mem_fraction_static,
             base_gpu_id=base_gpu_id,
             enable_memory_saver=True,
-            tp_size=self._tp_size, node_rank=node_rank,
-            nnodes=1
+            tp_size=self._tp_size,
+            node_rank=node_rank,
+            nnodes=1,
         )
         self._engine = None
         if first_rank_in_node:
@@ -207,8 +229,9 @@ class EngineWrapper():
 
         dist.barrier(group=self._device_mesh_cpu.get_group())
 
-
-    def update_weights_from_tensor(self, named_tensors: Iterable[Tuple[str, torch.Tensor]]):
+    def update_weights_from_tensor(
+        self, named_tensors: Iterable[Tuple[str, torch.Tensor]]
+    ):
         if self._tp_rank == 0:
             self._engine.update_weights_from_tensor(list(named_tensors))
             self._engine.flush_cache()
@@ -228,6 +251,7 @@ class EngineWrapper():
         if self._tp_rank == 0:
             self._engine.shutdown()
         dist.barrier(group=self._device_mesh_cpu.get_group())
+
 
 if __name__ == "__main__":
     unittest.main()
