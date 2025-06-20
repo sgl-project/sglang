@@ -4,7 +4,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from tqdm import tqdm
 from tqdm.std import EMA
 import torch
-
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from torch.nn.parameter import Parameter
 
 try:
@@ -24,7 +24,6 @@ except ImportError:
 
     apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import LinearMethodBase
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -51,6 +50,7 @@ from sglang.srt.utils import (
 )
 
 _is_hip = is_hip()
+
 
 if _is_hip:
     from aiter import ActivationType, QuantType
@@ -333,6 +333,8 @@ class QuarkInt4Fp8MoEMethod:
 
         self.online_quant_progress_bar = self.quant_config.online_quant_progress_bar
 
+        self.tp_rank = get_tensor_model_parallel_rank()
+
         if not _is_hip:
             raise NotImplementedError("The int4fp8_moe online quantization scheme is only supported on AMD GPUs.")
 
@@ -344,46 +346,56 @@ class QuarkInt4Fp8MoEMethod:
             shard_id: str,
             expert_id: int,
         ):
-            fp8_w, fp8_scale = quantize_fp8_scale_tensorwise(loaded_weight)
+            _, fp8_scale = quantize_fp8_scale_tensorwise(loaded_weight)
+
+            # The original weight loader handles the sharding of int4_w, so we can't shard it
+            # ahead here.
             int4_w, int4_scale = quantize_int4_scale_columnwise(loaded_weight)
+
+            if shard_id in ["w1", "w3"]:
+                shard_size = self.w13_shard_size
+                shard_dim = 0
+
+                int4_scale = int4_scale.narrow(
+                    shard_dim, shard_size * self.tp_rank, shard_size
+                )
 
             int4_w = pack_int4_to_int32(int4_w)
             int4_scale /= fp8_scale
 
             if shard_id in ["w1", "w3"]:
                 if shard_id == "w1":
-                    shard_slice = slice(0, param.shape[1] // 2)
+                    shard_slice = slice(0, shard_size)
                     idx = 0
                 else:
-                    shard_slice = slice(param.shape[1] // 2, None)
+                    shard_slice = slice(shard_size,  2 * shard_size)
                     idx = 1
-                
-                assert param[expert_id][shard_slice].shape == int4_w.shape
+
                 assert param[expert_id][shard_slice].dtype == int4_w.dtype
 
                 assert layer.w13_int4_scale[expert_id][shard_slice].shape == int4_scale.shape
                 assert layer.w13_int4_scale[expert_id][shard_slice].dtype == int4_scale.dtype
 
-                layer.w13_int4_scale.data[expert_id][shard_slice].copy_(int4_scale)
+                layer.w13_int4_scale[expert_id][shard_slice].copy_(int4_scale)
                 
                 assert layer.w13_fp8_scale[expert_id][idx].shape == fp8_scale.shape
                 assert layer.w13_fp8_scale[expert_id][idx].dtype == fp8_scale.dtype
 
-                layer.w13_fp8_scale.data[expert_id][idx].copy_(fp8_scale)
+                layer.w13_fp8_scale[expert_id][idx].copy_(fp8_scale)
             else:
-                assert param[expert_id].shape == int4_w.shape
                 assert param[expert_id].dtype == int4_w.dtype
 
                 assert layer.w2_int4_scale[expert_id].shape == int4_scale.shape
                 assert layer.w2_int4_scale[expert_id].dtype == int4_scale.dtype
 
-                layer.w2_int4_scale.data.copy_(int4_scale)
+                layer.w2_int4_scale[expert_id].copy_(int4_scale)
 
                 assert layer.w2_fp8_scale[expert_id].shape == fp8_scale.shape
                 assert layer.w2_fp8_scale[expert_id].dtype == fp8_scale.dtype
 
-                layer.w2_fp8_scale.data.copy_(fp8_scale)
+                layer.w2_fp8_scale[expert_id].copy_(fp8_scale)
 
+            # TODO: shard loaded_weight before quantization, and use use_presharded_weights=True.
             original_weight_loader(param, int4_w, shard_id=shard_id, weight_name=weight_name, expert_id=expert_id)
 
             self.online_quant_progress_bar.update(1)
@@ -402,6 +414,9 @@ class QuarkInt4Fp8MoEMethod:
         # TODO: fix circular imports issues in sglang forcing us to import here instead of at
         # the top of file.
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        # fused moe logic already hands TP logic.
+        self.w13_shard_size = intermediate_size
 
         assert "weight_loader" in extra_weight_attrs
         original_weight_loader = extra_weight_attrs.get("weight_loader")
