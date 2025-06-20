@@ -823,6 +823,36 @@ class Scheduler(
                             all_gather_group=self.attn_tp_group,
                         )
 
+                # (not last rank)
+                if not self.pp_group.is_last_rank:
+                    if self.cur_batch:
+                        bids[mb_id] = result.bid
+                    # carry the outputs to the next stage
+                    # send the outputs from the last round to let the next stage worker run post processing
+                    if pp_outputs:
+                        self.pp_group.send_tensor_dict(
+                            pp_outputs.tensors,
+                            all_gather_group=self.attn_tp_group,
+                        )
+
+                    # send out reqs to the next stage
+                    dp_offset = self.attn_dp_rank * self.attn_tp_size
+                    if self.attn_tp_rank == 0:
+                        point_to_point_pyobj(
+                            recv_reqs,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            self.world_group.device_group,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            (self.pp_rank + 1) * self.tp_size + dp_offset,
+                        )
+
+                    # send out proxy tensors to the next stage
+                    if self.cur_batch:
+                        self.pp_group.send_tensor_dict(
+                            result.pp_hidden_states_proxy_tensors,
+                            all_gather_group=self.attn_tp_group,
+                        )
+
                 # receive outputs and post-process (filter finished reqs) the coming microbatch
                 next_mb_id = (mb_id + 1) % self.pp_size
                 next_pp_outputs = None
@@ -844,36 +874,6 @@ class Scheduler(
                     )
                     self.process_batch_result(mbs[next_mb_id], output_result)
                     last_mbs[next_mb_id] = mbs[next_mb_id]
-
-                # (not last rank)
-                if not self.pp_group.is_last_rank:
-                    if self.cur_batch:
-                        bids[mb_id] = result.bid
-                    # carry the outputs to the next stage
-                    # send the outputs from the last round to let the next stage worker run post processing
-                    if pp_outputs:
-                        self.pp_group.send_tensor_dict(
-                            pp_outputs.tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
-
-                    # send out reqs to the next stage
-                    dp_offset = self.attn_dp_rank * self.attn_tp_size
-                    if self.attn_tp_rank == 0:
-                        point_to_point_pyobj(
-                            recv_reqs,
-                            self.pp_rank * self.tp_size + dp_offset,
-                            self.world_group.cpu_group,
-                            self.pp_rank * self.tp_size + dp_offset,
-                            (self.pp_rank + 1) * self.tp_size + dp_offset,
-                        )
-
-                    # send out proxy tensors to the next stage
-                    if self.cur_batch:
-                        self.pp_group.send_tensor_dict(
-                            result.pp_hidden_states_proxy_tensors,
-                            all_gather_group=self.attn_tp_group,
-                        )
 
                 pp_outputs = next_pp_outputs
 
@@ -910,7 +910,7 @@ class Scheduler(
                 recv_reqs = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
-                    self.world_group.cpu_group,
+                    self.world_group.device_group,
                     (self.pp_rank - 1) * self.tp_size + dp_offset,
                     self.pp_rank * self.tp_size + dp_offset,
                 )
