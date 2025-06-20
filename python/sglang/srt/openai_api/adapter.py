@@ -1109,17 +1109,7 @@ def v1_chat_generate_request(
                                 logger.warning(f"Failed to parse tool call arguments as JSON: {e}")
                                 # Decide whether to continue or raise the exception based on desired behavior
                                 continue # Or raise e if strict parsing is required
-                    if isinstance(processed_msg.get("content"), list):
-                        for chunk in processed_msg["content"]:
-                            if isinstance(chunk, dict) and chunk.get("type") == "text":
-                                new_msg = processed_msg.copy()
-                                new_msg["content"] = chunk["text"]
-                                new_msg = {
-                                    k: v for k, v in new_msg.items() if v is not None
-                                }
-                                openai_compatible_messages.append(new_msg)
-                    else:
-                        openai_compatible_messages.append(processed_msg)
+                    openai_compatible_messages.append(processed_msg)
                 
                 # Handle assistant prefix for continue_final_message
                 if (
