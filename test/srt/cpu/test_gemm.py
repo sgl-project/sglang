@@ -14,6 +14,8 @@ from utils import (
 
 from sglang.test.test_utils import CustomTestCase
 
+torch.manual_seed(0)
+
 
 class Mod(nn.Module):
     def __init__(self, input_channel, output_channel, has_bias):

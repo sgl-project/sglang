@@ -38,7 +38,7 @@ import logging
 import threading
 from enum import Enum, auto
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -436,7 +436,7 @@ class Req:
         self,
         rid: str,
         origin_input_text: str,
-        origin_input_ids: Tuple[int],
+        origin_input_ids: List[int],
         sampling_params: SamplingParams,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
@@ -467,7 +467,7 @@ class Req:
         # Each decode stage's output ids
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
-        self.fill_ids = None
+        self.fill_ids = []
         self.session_id = session_id
         self.input_embeds = input_embeds
 
@@ -519,13 +519,14 @@ class Req:
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
-        self.prefix_indices = []
+        self.prefix_indices: torch.Tensor = []
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
-        self.last_node = None
-        self.last_node_global = None
+        self.last_node: Any = None
+        self.last_host_node: Any = None
+        self.host_hit_length = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -583,6 +584,7 @@ class Req:
                 self.output_token_ids_logprobs_idx
             ) = None
         self.hidden_states: List[List[float]] = []
+        self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
 
         # Embedding (return values)
         self.embedding = None
@@ -644,21 +646,17 @@ class Req:
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
-        enable_hierarchical_cache=False,
     ):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
-            # tree cache is None if the prefix is not computed with tree cache.
-            if enable_hierarchical_cache:
-                self.prefix_indices, self.last_node, self.last_node_global = (
-                    tree_cache.match_prefix(
-                        key=self.adjust_max_prefix_ids(), include_evicted=True
-                    )
-                )
-            else:
-                self.prefix_indices, self.last_node = tree_cache.match_prefix(
-                    rid=self.rid, key=self.adjust_max_prefix_ids()
-                )
+            (
+                self.prefix_indices,
+                self.last_node,
+                self.last_host_node,
+                self.host_hit_length,
+            ) = tree_cache.match_prefix(
+                key=self.adjust_max_prefix_ids(),
+            )
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
