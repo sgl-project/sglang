@@ -18,8 +18,8 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
-    aggregate_token_usage,
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -322,7 +322,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         # Calculate usage
         cache_report = self.tokenizer_manager.server_args.enable_cache_report
-        usage = aggregate_token_usage(ret, request.n, cache_report)
+        usage = UsageProcessor.calculate_response_usage(
+            ret, n_choices=request.n, enable_cache_report=cache_report
+        )
 
         return CompletionResponse(
             id=ret[0]["meta_info"]["id"],
