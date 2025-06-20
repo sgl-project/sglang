@@ -105,7 +105,7 @@ class ServingChatTestCase(unittest.TestCase):
             )
 
             adapted, processed = self.chat._convert_to_internal_request(
-                [self.basic_req], ["rid"]
+                self.basic_req, "rid"
             )
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
@@ -133,7 +133,7 @@ class ServingChatTestCase(unittest.TestCase):
             "_process_messages",
             return_value=("Prompt", [1, 2, 3], None, None, [], ["</s>"], None),
         ):
-            adapted, _ = self.chat._convert_to_internal_request([req], ["rid"])
+            adapted, _ = self.chat._convert_to_internal_request(req, "rid")
             self.assertEqual(adapted.rid, "rid")
 
     def test_tool_choice_none(self):
@@ -148,7 +148,7 @@ class ServingChatTestCase(unittest.TestCase):
             "_process_messages",
             return_value=("Prompt", [1, 2, 3], None, None, [], ["</s>"], None),
         ):
-            adapted, _ = self.chat._convert_to_internal_request([req], ["rid"])
+            adapted, _ = self.chat._convert_to_internal_request(req, "rid")
             self.assertEqual(adapted.rid, "rid")
 
     # ------------- multimodal branch -------------
