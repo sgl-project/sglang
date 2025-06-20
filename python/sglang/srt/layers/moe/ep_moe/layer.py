@@ -8,7 +8,6 @@ from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import get_int_env_var
 from sglang.srt.layers.moe.ep_moe.modular_kernel import _moe_problem_size
 
 try:
@@ -1430,7 +1429,7 @@ class PPlxMoE(EPMoE):
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
-        attn_tp_size: int = 1,
+        dp_size: int = 1,
         max_tokens: int = 1024
     ):
         if params_dtype == None:
@@ -1466,7 +1465,7 @@ class PPlxMoE(EPMoE):
 
         self._fused_experts = BatchedTritonExperts(
             max_num_tokens=max_tokens,
-            attn_tp_size=attn_tp_size,
+            dp_size=dp_size,
             use_fp8_w8a8=False,
             use_int8_w8a8=False,
             use_int8_w8a16=False,
@@ -1475,14 +1474,16 @@ class PPlxMoE(EPMoE):
         )
 
     def forward(self,
-           hidden_states: torch.Tensor,
-           topk_idx: torch.Tensor,
-           topk_weights: torch.Tensor,
-           expert_x: torch.Tensor,
-           expert_x_scale: torch.Tensor,
-           expert_num_tokens: torch.Tensor,
-           forward_mode: ForwardMode,
-           global_num_experts: int = -1,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        expert_x: torch.Tensor,
+        expert_x_scale: torch.Tensor,
+        expert_num_tokens: torch.Tensor,
+        global_num_experts: int = -1,
+        inplace:bool = False,
+        no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
         ):
         # unpack
         a1 = hidden_states
@@ -1527,7 +1528,7 @@ class PPlxMoE(EPMoE):
         )
 
         return fused_out
-
+        
     '''
     def forward(self, full_hidden_states: torch.Tensor,
                              full_router_logits: torch.Tensor):

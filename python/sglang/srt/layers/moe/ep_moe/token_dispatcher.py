@@ -811,8 +811,9 @@ class PplxDispatcher:
                  a1_scale: Optional[torch.Tensor] = None,
                  a2_scale: Optional[torch.Tensor] = None,
                  ):
-        # TODO 后期再做循环，需要把global_num_tokens_cpu传进去，进行循环
-        assert max(forward_batch.global_num_tokens_cpu) <= self.pplx_max_tokens
+        if forward_batch.forward_mode is not None and \
+            (not forward_batch.forward_mode.is_decode() and not forward_batch.forward_mode.is_idle()):
+            assert max(forward_batch.global_num_tokens_cpu) <= self.pplx_max_tokens
         topk_ids = topk_idx.type(torch.uint32)
 
         expert_x, expert_x_scale, expert_num_tokens = self.pplx_prepare_and_finalize.prepare(

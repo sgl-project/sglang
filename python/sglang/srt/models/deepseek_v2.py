@@ -43,6 +43,7 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_attention_dp_size,
     get_local_attention_dp_size,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -276,7 +277,7 @@ class DeepseekV2MoE(nn.Module):
                 else {}
             ),
             **(
-                dict(attn_tp_size=get_attention_tp_size(),
+                dict(dp_size=get_attention_dp_size(),
                      max_tokens=get_int_env_var("SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK", global_server_args_dict["chunked_prefill_size"])
                      )
                 if global_server_args_dict["enable_pplx_moe"]
@@ -341,7 +342,7 @@ class DeepseekV2MoE(nn.Module):
                     attn_tp_size=get_attention_tp_size(),
                     pplx_max_tokens=get_int_env_var("SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK", global_server_args_dict["chunked_prefill_size"]),
                     num_experts=self.num_experts,
-                    hidden_size=self.hidden_size,
+                    hidden_size=config.hidden_size,
                     params_dtype=torch.bfloat16,
                 )
 
