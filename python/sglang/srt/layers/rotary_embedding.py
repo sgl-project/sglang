@@ -1,6 +1,7 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/refs/tags/v0.6.6.post1/vllm/model_executor/layers/rotary_embedding.py
 
 """Rotary Positional Embeddings."""
+import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -19,6 +20,14 @@ _is_cpu = is_cpu()
 if _is_cuda:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
 
+logger = logging.getLogger(__name__)
+
+if _is_npu:
+    try:
+        import torch_npu
+    except ImportError:
+        logger.warning("torch_npu is not installed. NPU support will be disabled.")
+        _is_npu = False
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
@@ -151,6 +160,27 @@ class RotaryEmbedding(CustomOp):
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
+
+    def forward_npu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """A PyTorch-npu implementation of forward()."""
+        import os
+        if os.environ["SGLANG_ENABEL_TORCH_COMPILE"] == "1":
+            return self.forward_native(positions, query, key, offsets)
+        else:
+            rotary_mode = 'half'
+            if self.is_neox_style:
+                rotary_mode = 'half'
+            else:
+                rotary_mode = 'interleave'
+            mrope_section = [0, 0, 0]
+            query_out, key_out = torch_npu.npu_mrope(positions, query, key, self.cos_sin_cache, self.head_size, mrope_section=mrope_section, rotary_mode=rotary_mode)
+            return query_out, key_out
 
     def forward_cpu(
         self,
