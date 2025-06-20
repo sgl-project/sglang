@@ -393,7 +393,6 @@ class OpenAIServingChat(OpenAIServingBase):
         """Generate streaming chat completion response"""
         parser_dict = {}
         reasoning_parser_dict = {}
-        tool_call_first = True
         is_first = True
         stream_buffer = ""
         n_prev_token = 0
@@ -579,7 +578,6 @@ class OpenAIServingChat(OpenAIServingBase):
         except ValueError as e:
             return self.create_error_response(str(e))
 
-        # Tokenizer manager should always return a list for chat requests
         if not isinstance(ret, list):
             ret = [ret]
 

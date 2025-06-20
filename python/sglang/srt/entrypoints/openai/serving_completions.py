@@ -245,7 +245,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
         except ValueError as e:
             return self.create_error_response(str(e))
 
-        # Tokenizer manager should always return a list for completion requests
         if not isinstance(ret, list):
             ret = [ret]
 

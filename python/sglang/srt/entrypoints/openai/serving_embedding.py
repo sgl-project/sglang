@@ -54,19 +54,6 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                         return f"All items in input list must be integers"
                     if item < 0:
                         return f"Token ID at index {i} must be non-negative"
-            elif isinstance(first_item, list):
-                # List of lists (multiple token sequences)
-                for i, item in enumerate(input):
-                    if not isinstance(item, list):
-                        return f"Input at index {i} must be a list"
-                    if not item:
-                        return f"Input at index {i} cannot be empty"
-                    if not all(isinstance(token, int) for token in item):
-                        return f"Input at index {i} must contain only integers"
-                    if any(token < 0 for token in item):
-                        return f"Input at index {i} contains negative token IDs"
-            # Note: MultimodalEmbeddingInput validation would be handled by Pydantic
-
         return None
 
     def _convert_to_internal_request(
