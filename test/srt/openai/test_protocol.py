@@ -643,14 +643,14 @@ class TestModelSerialization(unittest.TestCase):
             finish_reason="stop",
             hidden_states=None,
         )
-        
+
         response = ChatCompletionResponse(
             id="test-id",
             model="test-model",
             choices=[choice],
             usage=UsageInfo(prompt_tokens=5, completion_tokens=1, total_tokens=6),
         )
-        
+
         # Test exclude_none serialization (should exclude None hidden_states)
         data = response.model_dump(exclude_none=True)
         self.assertNotIn("hidden_states", data["choices"][0])
@@ -663,14 +663,14 @@ class TestModelSerialization(unittest.TestCase):
             finish_reason="stop",
             hidden_states=[0.1, 0.2, 0.3],
         )
-        
+
         response = ChatCompletionResponse(
             id="test-id",
             model="test-model",
             choices=[choice],
             usage=UsageInfo(prompt_tokens=5, completion_tokens=1, total_tokens=6),
         )
-        
+
         # Test exclude_none serialization (should include non-None hidden_states)
         data = response.model_dump(exclude_none=True)
         self.assertIn("hidden_states", data["choices"][0])
