@@ -53,6 +53,7 @@ from sglang.srt.model_loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
     set_runai_streamer_env,
+    prefetch_weight_files,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -256,7 +257,7 @@ class DefaultModelLoader(BaseModelLoader):
         use_safetensors = False
         index_file = SAFE_WEIGHTS_INDEX_NAME
         # Some quantized models use .pt files for storing the weights.
-        if load_format == LoadFormat.AUTO:
+        if load_format == LoadFormat.AUTO or load_format == LoadFormat.PREFETCH_AUTO:
             allow_patterns = ["*.safetensors", "*.bin"]
         elif load_format == LoadFormat.SAFETENSORS:
             use_safetensors = True
@@ -337,8 +338,12 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
+            if self.load_config.load_format == LoadFormat.PREFETCH_AUTO:
+                prefetch_weight_files(hf_weights_files)
             weights_iterator = safetensors_weights_iterator(hf_weights_files)
         else:
+            if self.load_config.load_format == LoadFormat.PREFETCH_AUTO:
+                prefetch_weight_files(hf_weights_files)
             weights_iterator = pt_weights_iterator(hf_weights_files)
 
         # Apply the prefix.
