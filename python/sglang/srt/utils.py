@@ -1208,10 +1208,9 @@ def get_nvgpu_memory_capacity():
     if is_cuda():
         num_devices = torch.cuda.device_count()
         memory_values = []
-        
         for i in range(num_devices):
             device = torch.cuda.get_device_properties(i)
-            total_vram = device.total_memory / (1024 ** 3)  # Convert bytes to GB
+            total_vram = device.total_memory / (1024**3)  # Convert bytes to GB
             memory_values.append(total_vram)
         return min(memory_values)
     else:
