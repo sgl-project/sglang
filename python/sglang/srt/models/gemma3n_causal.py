@@ -27,8 +27,7 @@ from transformers import (
 )
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -144,7 +143,8 @@ class Gemma3nMLP(nn.Module):
                 "function. Please set `hidden_activation` to "
                 "`gelu_pytorch_tanh`."
             )
-        self.act_fn = SiluAndMul()  # Using SiLU for compatibility
+        # Use proper GELU with tanh approximation as specified
+        self.act_fn = GeluAndMul()
         self.activation_sparsity = activation_sparsity
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -157,8 +157,9 @@ class Gemma3nMLP(nn.Module):
         if self.activation_sparsity > 0.0 and self.training:
             gate_proj = self._gaussian_topk(gate_proj)
 
-        # Combine with up_proj after activation
-        x = self.act_fn(torch.cat([gate_proj, up_proj], dim=-1))
+        # Apply GELU activation to gate projection and multiply with up projection
+        activated_gate = self.act_fn(gate_proj)
+        x = activated_gate * up_proj
         x, _ = self.down_proj(x)
         return x
 
@@ -420,7 +421,7 @@ class Gemma3nAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            logit_cap=0.0,
+            logit_cap=getattr(config, "attn_logit_softcapping", 0.0) or 0.0,
             sliding_window_size=self.sliding_window,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),

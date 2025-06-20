@@ -111,9 +111,12 @@ class ModelConfig:
             if self.hf_config.architectures[0] in mm_to_causal_mapping:
                 old_arch = self.hf_config.architectures[0]
                 new_arch = mm_to_causal_mapping[old_arch]
-                
+
                 # Extract text config if this is a multimodal config
-                if hasattr(self.hf_config, 'text_config') and self.hf_config.text_config is not None:
+                if (
+                    hasattr(self.hf_config, "text_config")
+                    and self.hf_config.text_config is not None
+                ):
                     # Replace the full multimodal config with just the text config
                     text_config = self.hf_config.text_config
                     # Preserve the model_type and architectures on the text config
