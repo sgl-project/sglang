@@ -119,14 +119,14 @@ class TboAttnBackend(AttentionBackend):
         replay_seq_lens_sum: int = None,
         replay_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
-        token_num_per_batch = two_batch_overlap.get_token_num_per_batch(
+        token_num_per_seq = two_batch_overlap.get_token_num_per_seq(
             forward_mode=forward_mode, spec_info=spec_info
         )
         if fn_name == "init_forward_metadata_capture_cuda_graph":
             assert (
-                capture_num_tokens == bs * token_num_per_batch
-            ), "For target-verify or decode mode, num_tokens should be equal to token_num_per_batch * bs"
-        num_tokens = bs * token_num_per_batch
+                capture_num_tokens == bs * token_num_per_seq
+            ), "For target-verify or decode mode, num_tokens should be equal to token_num_per_seq * bs"
+        num_tokens = bs * token_num_per_seq
 
         tbo_split_seq_index, tbo_split_token_index = (
             two_batch_overlap.compute_split_indices_for_cuda_graph_replay(
@@ -217,15 +217,15 @@ def _init_forward_metadata_cuda_graph_split(
     )
 
     if fn_name == "init_forward_metadata_capture_cuda_graph":
-        token_num_per_batch = two_batch_overlap.get_token_num_per_batch(
+        token_num_per_seq = two_batch_overlap.get_token_num_per_seq(
             forward_mode=forward_mode, spec_info=spec_info
         )
         assert (
-            capture_num_tokens == bs * token_num_per_batch
-        ), "Only support num_tokens==bs * token_num_per_batch for target-verify or decode mode"
+            capture_num_tokens == bs * token_num_per_seq
+        ), "Only support num_tokens==bs * token_num_per_seq for target-verify or decode mode"
         ans.update(
             dict(
-                num_tokens=output_bs * token_num_per_batch,
+                num_tokens=output_bs * token_num_per_seq,
             )
         )
     elif fn_name == "init_forward_metadata_replay_cuda_graph":
