@@ -1144,7 +1144,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-pplx-moe",
             action="store_true",
-            help="Enabling PPlx MoE implementation for EP MoE."
+            help="Enabling PPlx MoE implementation for EP MoE.",
         )
         parser.add_argument(
             "--deepep-mode",

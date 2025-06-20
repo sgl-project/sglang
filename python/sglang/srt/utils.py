@@ -96,7 +96,7 @@ time_infos = {}
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
 _warned_bool_env_var_keys = set()
-P = ParamSpec('P')
+P = ParamSpec("P")
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
@@ -170,7 +170,8 @@ def is_cpu() -> bool:
         and torch.cpu.is_available()
     )
 
-#From: https://stackoverflow.com/a/4104188/2749989
+
+# From: https://stackoverflow.com/a/4104188/2749989
 def run_once(f: Callable[P, None]) -> Callable[P, None]:
 
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> None:
@@ -180,6 +181,7 @@ def run_once(f: Callable[P, None]) -> Callable[P, None]:
 
     wrapper.has_run = False  # type: ignore[attr-defined]
     return wrapper
+
 
 def is_flashinfer_available():
     """

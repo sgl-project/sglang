@@ -28,15 +28,16 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_reduce_scatter,
     dp_gather_partial,
     dp_scatter,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
-    get_attention_tp_group,
     get_local_attention_dp_size,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
+
 
 class ScatterMode(Enum):
     """
@@ -347,7 +348,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
         if (
             (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
-            and (residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL])
+            and (
+                residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
+            )
             and (hidden_states_output_mode == ScatterMode.TP_ATTN_FULL)
             and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
         ):

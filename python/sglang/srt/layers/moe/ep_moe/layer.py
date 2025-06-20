@@ -4,11 +4,11 @@ from typing import Callable, List, Optional, Tuple
 import torch
 from torch.nn import Module
 
+from sglang.srt.layers.moe.ep_moe.modular_kernel import _moe_problem_size
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.layers.moe.ep_moe.modular_kernel import _moe_problem_size
 
 try:
     from deep_gemm import (
@@ -43,6 +43,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     silu_and_mul_triton_kernel,
     tma_align_input_scale,
 )
+from sglang.srt.layers.moe.ep_moe.modular_kernel import BatchedTritonExperts
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE, FusedMoEMethodBase
 from sglang.srt.layers.moe.topk import select_experts
@@ -57,7 +58,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import DeepEPMode, dispose_tensor, is_hip, set_weight_attrs
-from sglang.srt.layers.moe.ep_moe.modular_kernel import BatchedTritonExperts
 
 _is_hip = is_hip()
 
@@ -1263,11 +1263,13 @@ def get_moe_impl_class():
         return PPlxMoE
     return FusedMoE
 
+
 # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/f9c069c85e029830094ff9abb926ffbf37b7c7e7/vllm/model_executor/layers/fused_moe/layer.py#L722
 class PPlxMoE(EPMoE):
     """
     MoE Expert based on pplx-kernels
     """
+
     def __init__(
         self,
         num_experts: int,
@@ -1289,7 +1291,7 @@ class PPlxMoE(EPMoE):
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
         dp_size: int = 1,
-        max_tokens: int = 1024
+        max_tokens: int = 1024,
     ):
         if params_dtype == None:
             params_dtype = torch.bfloat16
@@ -1332,7 +1334,8 @@ class PPlxMoE(EPMoE):
             block_shape=None,
         )
 
-    def forward(self,
+    def forward(
+        self,
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -1340,32 +1343,34 @@ class PPlxMoE(EPMoE):
         expert_x_scale: torch.Tensor,
         expert_num_tokens: torch.Tensor,
         global_num_experts: int = -1,
-        inplace:bool = False,
+        inplace: bool = False,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
-        ):
+    ):
         # unpack
         a1 = hidden_states
         a1q = expert_x
         a1q_scale = expert_x_scale
         topk_ids = topk_idx.type(torch.uint32)
-        E, M, N, K, top_k = _moe_problem_size(a1, self.w13_weight, self.w2_weight, topk_ids)
+        E, M, N, K, top_k = _moe_problem_size(
+            a1, self.w13_weight, self.w2_weight, topk_ids
+        )
 
         if global_num_experts == -1:
             global_num_experts = E
 
         workspace13_shape, workspace2_shape, workspace_dtype = (
-            self._fused_experts.workspace_shapes(a1, M, N, K, top_k,
-                                                 global_num_experts))
+            self._fused_experts.workspace_shapes(a1, M, N, K, top_k, global_num_experts)
+        )
 
         # We can reuse the memory between cache1 and cache3 because by the time
         # we need cache3, we're done with cache1
-        workspace13 = torch.zeros(workspace13_shape,
-                                  device=a1.device,
-                                  dtype=workspace_dtype)
-        workspace2 = torch.zeros(workspace2_shape,
-                                 device=a1.device,
-                                 dtype=workspace_dtype)
+        workspace13 = torch.zeros(
+            workspace13_shape, device=a1.device, dtype=workspace_dtype
+        )
+        workspace2 = torch.zeros(
+            workspace2_shape, device=a1.device, dtype=workspace_dtype
+        )
 
         fused_out = self._fused_experts.apply(
             a1q,

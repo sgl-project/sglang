@@ -7,23 +7,26 @@ import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
-    scaled_fp8_quant
+    scaled_fp8_quant,
 )
 from sglang.srt.layers.quantization.int8_kernel import (
-    per_token_group_quant_int8, per_token_quant_int8)
+    per_token_group_quant_int8,
+    per_token_quant_int8,
+)
+
 
 def cdiv(a: int, b: int) -> int:
     """Ceiling division."""
     return -(a // -b)
+
 
 def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
     """
     Shrink the given tensor and apply the given view to it.  This is
     used to resize the intermediate fused_moe caches.
     """
-    assert prod(
-        v) <= x.numel(), f"{prod(v)} <= {x.numel()}"  # CUDAGRAPH unfriendly?
-    return x.flatten()[:prod(v)].view(*v)
+    assert prod(v) <= x.numel(), f"{prod(v)} <= {x.numel()}"  # CUDAGRAPH unfriendly?
+    return x.flatten()[: prod(v)].view(*v)
 
 
 def _fp8_quantize(
@@ -38,7 +41,8 @@ def _fp8_quantize(
     """
     if block_shape is None:
         A, A_scale = scaled_fp8_quant(
-            A, A_scale, use_per_token_if_dynamic=per_act_token)
+            A, A_scale, use_per_token_if_dynamic=per_act_token
+        )
     else:
         assert len(block_shape) == 2
         _, block_k = block_shape[0], block_shape[1]
@@ -63,8 +67,7 @@ def _int8_quantize(
     # activations apply per-token quantization. Otherwise, assume
     # activation tensor-wise fp8/int8 quantization, dynamic or static
     if block_shape is None:
-        assert per_act_token, \
-            "int8 quantization only supports block or channel-wise"
+        assert per_act_token, "int8 quantization only supports block or channel-wise"
         A, A_scale = per_token_quant_int8(A)
     else:
         assert len(block_shape) == 2
