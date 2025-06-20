@@ -1,6 +1,8 @@
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
+from tqdm import tqdm
+from tqdm.std import EMA
 import torch
 
 from torch.nn.parameter import Parameter
@@ -24,16 +26,13 @@ except ImportError:
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import LinearMethodBase
-from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter, PerTensorScaleParameter
+from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
 
-from sglang.srt.layers.quantization.fp8_kernel import (
-    per_token_group_quant_fp8,
-    scaled_fp8_quant,
-)
+from sglang.srt.layers.quark_utils import quantize_fp8_scale_tensorwise, quantize_int4_scale_columnwise, pack_int4_to_int32
 
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
@@ -42,39 +41,39 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    all_close_1d,
     convert_to_channelwise,
-    per_tensor_dequantize,
     requantize_with_max_scale,
 )
 from sglang.srt.utils import (
     get_bool_env_var,
     is_hip,
-    is_cuda,
-    permute_weight,
-    print_warning_once,
     set_weight_attrs,
 )
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 _is_hip = is_hip()
-_is_cuda = is_cuda()
-
-
-if is_cuda:
-    from sgl_kernel import int8_scaled_mm
 
 if _is_hip:
     from aiter import ActivationType, QuantType
-    from aiter.fused_moe_bf16_asm import asm_moe, ck_moe_2stages
+    from aiter.fused_moe_bf16_asm import ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
 
-if not _is_cuda:
-    from vllm._custom_ops import scaled_fp8_quant
+    ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
 
 logger = logging.getLogger(__name__)
 
+def tqdm_reset_no_print(tqdm_bar: tqdm, total=None):
+    tqdm_bar.n = 0
+    if total is not None:
+        tqdm_bar.total = total
+    if tqdm_bar.disable:
+        return
+    tqdm_bar.last_print_n = 0
+    tqdm_bar.last_print_t = tqdm_bar.start_t = tqdm_bar._time()
+    tqdm_bar._ema_dn = EMA(tqdm_bar.smoothing)
+    tqdm_bar._ema_dt = EMA(tqdm_bar.smoothing)
+    tqdm_bar._ema_miniters = EMA(tqdm_bar.smoothing)
 
 class QuarkInt4Fp8Config(QuantizationConfig):
     """Config class for Quark Quantization.
@@ -107,6 +106,9 @@ class QuarkInt4Fp8Config(QuantizationConfig):
                     f"The block-wise quantization only supports dynamic activation scheme for now, but got {activation_scheme} activation scheme."
                 )
         self.weight_block_size = weight_block_size
+
+        self.num_quant_layers = 0
+        self.online_quant_progress_bar = tqdm(total=0, desc="Online int4fp8_moe quantization")
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -143,11 +145,15 @@ class QuarkInt4Fp8Config(QuantizationConfig):
     ) -> Optional["QuantizeMethodBase"]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-
         if isinstance(layer, LinearBase):
+            self.num_quant_layers += 1
+            tqdm_reset_no_print(self.online_quant_progress_bar, total=self.num_quant_layers)
             return QuarkInt4Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            self.num_quant_layers += 1
+            tqdm_reset_no_print(self.online_quant_progress_bar, total=self.num_quant_layers)
             return QuarkInt4Fp8MoEMethod(self)
+        
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -159,6 +165,8 @@ class QuarkInt4Fp8LinearMethod(LinearMethodBase):
     def __init__(self, quantization_config: QuarkInt4Fp8Config):
         self.cutlass_fp8_supported = cutlass_fp8_supported()
         self.quant_config = quantization_config
+
+        self.online_quant_progress_bar = quantization_config.online_quant_progress_bar
 
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
@@ -220,6 +228,47 @@ class QuarkInt4Fp8LinearMethod(LinearMethodBase):
                 layer.input_scale.max(), requires_grad=False
             )
 
+    def get_weight_loader(self, layer, original_weight_loader):
+        def online_fp8_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            shard_id: Optional[Union[str, int]] = None,
+        ):
+            fp8_w, fp8_scale = quantize_fp8_scale_tensorwise(loaded_weight)
+
+            if shard_id is not None:                
+                original_weight_loader(
+                    param,
+                    fp8_w,
+                    loaded_shard_id=shard_id
+                    # weight_name,
+                    # shard_id=shard_id,
+                    # expert_id=expert_id
+                )
+
+                # TODO: this is ugly?
+                if isinstance(shard_id, str):
+                    shard_id = ["q", "k", "v"].index(shard_id)
+
+                assert layer.weight_scale[shard_id].shape == fp8_scale.shape
+                assert layer.weight_scale[shard_id].dtype == fp8_scale.dtype
+
+                layer.weight_scale[shard_id] = fp8_scale
+            else:
+                original_weight_loader(param, fp8_w)
+
+                fp8_scale = fp8_scale[None]
+
+                assert layer.weight_scale.shape == fp8_scale.shape
+                assert layer.weight_scale.dtype == fp8_scale.dtype
+
+                layer.weight_scale.data.copy_(fp8_scale)
+            
+            self.online_quant_progress_bar.update(1)
+
+        return online_fp8_weight_loader
+
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -231,14 +280,15 @@ class QuarkInt4Fp8LinearMethod(LinearMethodBase):
         **extra_weight_attrs
     ):
         output_size_per_partition = sum(output_partition_sizes)
-        weight_loader = extra_weight_attrs.get("weight_loader")
-
-        tp_size = get_tensor_model_parallel_world_size()
-
+        
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
+
+        assert "weight_loader" in extra_weight_attrs
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        online_fp8_weight_loader = self.get_weight_loader(layer, weight_loader)
 
         weight = ModelWeightParameter(
             data=torch.empty(
@@ -248,13 +298,13 @@ class QuarkInt4Fp8LinearMethod(LinearMethodBase):
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
+            weight_loader=online_fp8_weight_loader,
         )
         layer.register_parameter("weight", weight)
 
         scale = PerTensorScaleParameter(
             data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-            weight_loader=weight_loader,
+            weight_loader=online_fp8_weight_loader,
         )
         scale[:] = torch.finfo(torch.float32).min
         layer.register_parameter("weight_scale", scale)
@@ -310,6 +360,65 @@ class QuarkInt4Fp8MoEMethod:
     def __init__(self, quant_config):
         self.quant_config = quant_config
 
+        self.online_quant_progress_bar = self.quant_config.online_quant_progress_bar
+
+        if not _is_hip:
+            raise NotImplementedError("The int4fp8_moe online quantization scheme is only supported on AMD GPUs.")
+
+    def get_weight_loader(self, layer, original_weight_loader):
+        def online_int4_fp8_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: int,
+        ):
+            fp8_w, fp8_scale = quantize_fp8_scale_tensorwise(loaded_weight)
+            int4_w, int4_scale = quantize_int4_scale_columnwise(loaded_weight)
+
+            int4_w = pack_int4_to_int32(int4_w)
+            int4_scale /= fp8_scale
+
+            if shard_id in ["w1", "w3"]:
+                if shard_id == "w1":
+                    shard_slice = slice(0, param.shape[1] // 2)
+                    idx = 0
+                else:
+                    shard_slice = slice(param.shape[1] // 2, None)
+                    idx = 1
+                
+                assert param[expert_id][shard_slice].shape == int4_w.shape
+                assert param[expert_id][shard_slice].dtype == int4_w.dtype
+
+                assert layer.w13_int4_scale[expert_id][shard_slice].shape == int4_scale.shape
+                assert layer.w13_int4_scale[expert_id][shard_slice].dtype == int4_scale.dtype
+
+                layer.w13_int4_scale.data[expert_id][shard_slice].copy_(int4_scale)
+                
+                assert layer.w13_fp8_scale[expert_id][idx].shape == fp8_scale.shape
+                assert layer.w13_fp8_scale[expert_id][idx].dtype == fp8_scale.dtype
+
+                layer.w13_fp8_scale.data[expert_id][idx].copy_(fp8_scale)
+            else:
+                assert param[expert_id].shape == int4_w.shape
+                assert param[expert_id].dtype == int4_w.dtype
+
+                assert layer.w2_int4_scale[expert_id].shape == int4_scale.shape
+                assert layer.w2_int4_scale[expert_id].dtype == int4_scale.dtype
+
+                layer.w2_int4_scale.data.copy_(int4_scale)
+
+                assert layer.w2_fp8_scale[expert_id].shape == fp8_scale.shape
+                assert layer.w2_fp8_scale[expert_id].dtype == fp8_scale.dtype
+
+                layer.w2_fp8_scale.data.copy_(fp8_scale)
+
+            original_weight_loader(param, int4_w, shard_id=shard_id, weight_name=weight_name, expert_id=expert_id)
+
+            self.online_quant_progress_bar.update(1)
+
+        return online_int4_fp8_weight_loader
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -321,7 +430,11 @@ class QuarkInt4Fp8MoEMethod:
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        tp_size = get_tensor_model_parallel_world_size()
+        assert "weight_loader" in extra_weight_attrs
+        original_weight_loader = extra_weight_attrs.get("weight_loader")
+
+        online_int4fp8_weight_loader = self.get_weight_loader(layer, original_weight_loader)
+        extra_weight_attrs["weight_loader"] = online_int4fp8_weight_loader
 
         params_dtype = torch.uint32
         # WEIGHTS
@@ -350,36 +463,33 @@ class QuarkInt4Fp8MoEMethod:
 
         # Allocate 2 scales for w1 and w3 respectively.
         # They will be combined to a single scale after weight loading.
-        w13_weight_scale = torch.nn.Parameter(
+        w13_fp8_scale = torch.nn.Parameter(
             torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
         )
-        w2_weight_scale = torch.nn.Parameter(
+        w2_fp8_scale = torch.nn.Parameter(
             torch.ones(num_experts, dtype=torch.float32), requires_grad=False
         )
-        layer.register_parameter("w13_weight_scale", w13_weight_scale)
-        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        layer.register_parameter("w13_fp8_scale", w13_fp8_scale)
+        layer.register_parameter("w2_fp8_scale", w2_fp8_scale)
 
-        if (
-            _is_hip
-        ):  # and get_bool_env_var("CK_MOE"): TODO: add check back after triton kernel
-            # ROCm - using column scaling, duplicate scaling numbers in case per tensor scaling
-            w13_weight_scale1 = torch.nn.Parameter(
+        if _is_hip:
+            w13_int4_scale = torch.nn.Parameter(
                 torch.ones(num_experts, 2 * intermediate_size, dtype=torch.float32),
                 requires_grad=False,
             )
-            w2_weight_scale1 = torch.nn.Parameter(
+            w2_int4_scale = torch.nn.Parameter(
                 torch.ones(num_experts, hidden_size, dtype=torch.float32),
                 requires_grad=False,
             )
-            layer.register_parameter("w13_weight_scale1", w13_weight_scale1)
-            layer.register_parameter("w2_weight_scale1", w2_weight_scale1)
+            layer.register_parameter("w13_int4_scale", w13_int4_scale)
+            layer.register_parameter("w2_int4_scale", w2_int4_scale)
 
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
 
-        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w13_fp8_scale, extra_weight_attrs)
+        set_weight_attrs(w2_fp8_scale, extra_weight_attrs)
 
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
@@ -387,8 +497,8 @@ class QuarkInt4Fp8MoEMethod:
             {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
         )
 
-        set_weight_attrs(w13_weight_scale1, extra_weight_attrs)
-        set_weight_attrs(w2_weight_scale1, extra_weight_attrs)
+        set_weight_attrs(w13_int4_scale, extra_weight_attrs)
+        set_weight_attrs(w2_int4_scale, extra_weight_attrs)
 
         w13_input_scale = None
         layer.register_parameter("w13_input_scale", w13_input_scale)
@@ -397,13 +507,14 @@ class QuarkInt4Fp8MoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _is_hip: 
-            layer.w13_weight_scale1 *= 0.5
-            layer.w2_weight_scale1 *= 0.5
+        if _is_hip and not ON_GFX950:
+            # CDNA3 does not support OCP FP8E4M3FN, but uses FP8E4M3FNUZ.
+            # CDNA4 supports OCP FP8E4M3FN.
+            layer.w13_int4_scale *= 0.5
+            layer.w2_int4_scale *= 0.5
 
-            layer.w13_weight_scale *= 2.0
-            layer.w2_weight_scale *= 2.0
-
+            layer.w13_fp8_scale *= 2.0
+            layer.w2_fp8_scale *= 2.0
 
         # TODO: and use_aiter_moe: add after triton kernel added
         # INT4-FP8 (INT4 MoE Weight, FP8 Compute)
@@ -419,33 +530,33 @@ class QuarkInt4Fp8MoEMethod:
         )
         torch.cuda.empty_cache()
 
-        # INT4-FP8 : offset INT4 w13_weight_scale1 to single w13_weight_scale
-        # Fp8 moe kernel needs single fp8 w13_weight_scale for w13 per expert.
+        # INT4-FP8 : offset INT4 w13_int4_scale to single w13_fp8_scale
+        # Fp8 moe kernel needs single fp8 w13_fp8_scale for w13 per expert.
         # We won't do requant each expert's fp8 weight (not direct available),
-        # instead we adjust half of INT4 w13_weight_scale1 numbers
-        assert layer.w13_weight_scale is not None
+        # instead we adjust half of INT4 w13_int4_scale numbers
+        assert layer.w13_fp8_scale is not None
         shard_size = layer.intermediate_size_per_partition
-        max_w13_scales = layer.w13_weight_scale.max(dim=1).values
+        max_w13_scales = layer.w13_fp8_scale.max(dim=1).values
         for expert_id in range(layer.num_experts):
             start = 0
             max_w13_scale_fp8 = max_w13_scales[expert_id]
             for shard_id in range(2):
-                if layer.w13_weight_scale[expert_id][shard_id] != max_w13_scale_fp8:
+                if layer.w13_fp8_scale[expert_id][shard_id] != max_w13_scale_fp8:
                     int4_rescale = (
-                        layer.w13_weight_scale[expert_id][shard_id] / max_w13_scale_fp8
+                        layer.w13_fp8_scale[expert_id][shard_id] / max_w13_scale_fp8
                     )
-                    layer.w13_weight_scale1[expert_id][
+                    layer.w13_int4_scale[expert_id][
                         start : start + shard_size
                     ] *= int4_rescale
                 start += shard_size
 
-        layer.w13_weight_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
+        layer.w13_fp8_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
 
-        # special hack to asm_moe, which takes (weight_scale1 * weight_scale) as post GEMM scaling
-        # optimal design - shall apply per-column weight_scale1 before GEMM, and weight_scale post
+        # special hack to asm_moe, which takes (weight_int4_scale * weight_scale) as post GEMM scaling
+        # optimal design - shall apply per-column weight_int4_scale before GEMM, and weight_scale post
         for expert_id in range(layer.num_experts):
-            layer.w13_weight_scale1[expert_id] *= max_w13_scales[expert_id]
-            layer.w2_weight_scale1[expert_id] *= layer.w2_weight_scale[expert_id]
+            layer.w13_int4_scale[expert_id] *= max_w13_scales[expert_id]
+            layer.w2_int4_scale[expert_id] *= layer.w2_fp8_scale[expert_id]
 
     def apply(
         self,
@@ -491,8 +602,8 @@ class QuarkInt4Fp8MoEMethod:
                 topk_weights,
                 topk_ids,
                 QuantType.per_Token,
-                layer.w13_weight_scale1,
-                layer.w2_weight_scale1,
+                layer.w13_int4_scale,
+                layer.w2_int4_scale,
                 activation=(
                     ActivationType.Silu if activation == "silu" else ActivationType.Gelu
                 ),
@@ -510,12 +621,12 @@ class QuarkInt4Fp8MoEMethod:
             apply_router_weight_on_input=apply_router_weight_on_input,
             use_fp8_w8a8=True,
             w1_scale=(
-                layer.w13_weight_scale_inv
+                layer.w13_fp8_scale_inv
                 if self.block_quant
-                else layer.w13_weight_scale
+                else layer.w13_fp8_scale
             ),
             w2_scale=(
-                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
+                layer.w2_fp8_scale_inv if self.block_quant else layer.w2_fp8_scale
             ),
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,

@@ -167,7 +167,6 @@ class ServerArgs:
     torch_compile_max_bs: int = 32
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
-    quark_config: str = ""
     torchao_config: str = ""
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
@@ -550,6 +549,7 @@ class ServerArgs:
                 "w8a8_int8",
                 "w8a8_fp8",
                 "moe_wna16",
+                "int4fp8_moe"
             ],
             help="The quantization method.",
         )
@@ -1094,12 +1094,6 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="Set the list of batch sizes for cuda graph.",
-        )
-        parser.add_argument(
-            "--quark-config",
-            type=str,
-            default=ServerArgs.quark_config,
-            help="Optimize the model with quark. Experimental feature. Current choices are: int4fp8_moe",
         )
         parser.add_argument(
             "--torchao-config",

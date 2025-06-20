@@ -78,7 +78,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "w8a8_fp8": W8A8Fp8Config,
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
-    "quark_int4fp8_moe": QuarkInt4Fp8Config,
+    "int4fp8_moe": QuarkInt4Fp8Config,
 }
 
 # VLLM-dependent quantization methods
