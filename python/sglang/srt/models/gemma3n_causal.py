@@ -428,7 +428,17 @@ class Gemma3nAttention(nn.Module):
         )
 
         # Gemma3n adds normalization for q, k, v
-        self.qkv_norm = Gemma3nRMSNorm(
+        self.q_norm = Gemma3nRMSNorm(
+            dim=config.head_dim,
+            eps=config.rms_norm_eps,
+            scale_shift=0.0,
+        )
+        self.k_norm = Gemma3nRMSNorm(
+            dim=config.head_dim,
+            eps=config.rms_norm_eps,
+            scale_shift=0.0,
+        )
+        self.v_norm = Gemma3nRMSNorm(
             dim=config.head_dim,
             eps=config.rms_norm_eps,
             scale_shift=0.0,
@@ -448,7 +458,7 @@ class Gemma3nAttention(nn.Module):
         # Apply normalization to q, k, v
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
         q = q.transpose(0, 1).unsqueeze(0)
-        q = self.qkv_norm(q)
+        q = self.q_norm(q)
 
         # Check if we should use shared KV cache
         if self.is_kv_shared_layer and self.kv_shared_layer_index is not None:
@@ -459,11 +469,11 @@ class Gemma3nAttention(nn.Module):
         else:
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
             k = k.transpose(0, 1).unsqueeze(0)
-            k = self.qkv_norm(k)
+            k = self.k_norm(k)
 
             v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
             v = v.transpose(0, 1).unsqueeze(0)
-            v = self.qkv_norm(v)
+            v = self.v_norm(v)
 
         # Apply rotary embeddings
         cos, sin = position_embeddings
