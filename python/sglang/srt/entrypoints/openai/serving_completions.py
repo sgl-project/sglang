@@ -130,22 +130,28 @@ class OpenAIServingCompletion(OpenAIServingBase):
     ) -> AsyncGenerator[str, None]:
         """Generate streaming completion response"""
         created = int(time.time())
-        stream_buffer = ""
-        n_prev_token = 0
-        prompt_tokens = 0
-        completion_tokens = 0
-        cached_tokens = 0
+
+        # State tracking for streaming
+        stream_buffers = {}
+        n_prev_tokens = {}
+
+        # Usage tracking
+        prompt_tokens = {}
+        completion_tokens = {}
+        cached_tokens = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
-                text = content["text"]
-                prompt_tokens = content["meta_info"]["prompt_tokens"]
-                completion_tokens = content["meta_info"]["completion_tokens"]
-                cached_tokens = content["meta_info"].get("cached_tokens", 0)
 
+                text = content["text"]
+                prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
+                completion_tokens[index] = content["meta_info"]["completion_tokens"]
+                cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+
+                stream_buffer = stream_buffers.get(index, "")
                 # Handle echo for first chunk
                 if not stream_buffer:  # The first chunk
                     if request.echo:
@@ -165,6 +171,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         input_token_logprobs = None
                         input_top_logprobs = None
 
+                    n_prev_token = n_prev_tokens.get(index, 0)
                     logprobs = to_openai_style_logprobs(
                         input_token_logprobs=input_token_logprobs,
                         input_top_logprobs=input_top_logprobs,
@@ -175,11 +182,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
                             n_prev_token:
                         ],
                     )
-                    n_prev_token = len(content["meta_info"]["output_token_logprobs"])
+                    n_prev_tokens[index] = len(
+                        content["meta_info"]["output_token_logprobs"]
+                    )
 
                 # Generate delta
                 delta = text[len(stream_buffer) :]
-                stream_buffer = stream_buffer + delta
+                stream_buffers[index] = stream_buffer + delta
                 finish_reason = content["meta_info"]["finish_reason"]
 
                 choice_data = CompletionResponseStreamChoice(
@@ -206,9 +215,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
             # Handle final usage chunk
             if request.stream_options and request.stream_options.include_usage:
                 usage = self._calculate_streaming_usage_base(
-                    {0: prompt_tokens},
-                    {0: completion_tokens},
-                    {0: cached_tokens},
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_tokens,
                     request.n,
                 )
                 final_usage_chunk = CompletionStreamResponse(
