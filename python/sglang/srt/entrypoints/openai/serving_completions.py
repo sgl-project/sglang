@@ -19,9 +19,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
-from sglang.srt.entrypoints.openai.utils import (
-    to_openai_style_logprobs,
-)
+from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 logger = logging.getLogger(__name__)
