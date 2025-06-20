@@ -1,29 +1,67 @@
 # Usage (to build SGLang ROCm docker image):
+<<<<<<< HEAD
 #   docker build --build-arg SGL_BRANCH=v0.4.9.post1 -t v0.4.9.post1-rocm630 -f Dockerfile.rocm .
+=======
+#   docker build --build-arg SGL_BRANCH=v0.4.7.post1 --build-arg ARG_PYTORCH_ROCM_ARCH=gfx950 -t v0.4.7.post1-rocm700 -f Dockerfile.rocm .
+>>>>>>> aa0c914e7 (Add ROCm7.0 to support gfx950)
 
 # default base image
-ARG BASE_IMAGE="rocm/sgl-dev:vllm20250114"
+ARG BASE_IMAGE="rocm/sgl-dev:rocm7.0_preview_ubuntu_22.04"
 
 FROM $BASE_IMAGE AS base
 USER root
 
+ARG ARG_PYTORCH_ROCM_ARCH
+ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
+
+# Install some basic utilities
+RUN rm -rf /etc/apt/sources.list.d/*
+RUN apt-get update -q -y && apt-get install -q -y \
+    sqlite3 libsqlite3-dev libfmt-dev libmsgpack-dev libsuitesparse-dev \
+    apt-transport-https ca-certificates wget curl
+RUN python3 -m pip install --upgrade pip && pip install setuptools_scm
+RUN apt-get purge -y sccache; python3 -m pip uninstall -y sccache; rm -f "$(which sccache)"
+
 WORKDIR /sgl-workspace
+
+# -----------------------
+# Build vLLM
+ARG VLLM_REPO="https://github.com/ROCm/vllm.git"
+ARG VLLM_BRANCH="9f6b92db47c3444b7a7d67451ba0c3a2d6af4c2c"
+RUN git clone ${VLLM_REPO} \
+	    && cd vllm \
+	    && git checkout ${VLLM_BRANCH}
+
+RUN cd vllm \
+    && python3 -m pip install -r requirements/rocm.txt \
+    && python3 setup.py clean --all  \
+    && python3 setup.py develop
+
+
+# -----------------------
+# Build SGLang
 ARG BUILD_TYPE=all
-ARG SGL_REPO="https://github.com/sgl-project/sglang"
-ENV SGL_DEFAULT="main"
+#ARG SGL_REPO="https://github.com/sgl-project/sglang"
+#ENV SGL_DEFAULT="main"
+# NEED TO FIX
+ARG SGL_REPO="https://github.com/sogalin/sglang"
+ENV SGL_DEFAULT="v0.4.7.post1-gfx950"
 ARG SGL_BRANCH=${SGL_DEFAULT}
 
 ARG TRITON_REPO="https://github.com/ROCm/triton.git"
-ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
-
+ARG TRITON_COMMIT="e2f87c4c681ce3611e82232ecb5856987651d88a"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
-ARG AITER_COMMIT="v0.1.3"
+ARG AITER_COMMIT="v0.1.2-gfx950"
 
+ARG AMDGPU_TARGET=$PYTORCH_ROCM_ARCH
+
+WORKDIR /sgl-workspace/
 RUN git clone ${SGL_REPO} \
     && cd sglang \
     && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
          echo "Using ${SGL_DEFAULT}, default branch."; \
+         git checkout ${SGL_DEFAULT}; \
        else \
          echo "Using ${SGL_BRANCH} branch."; \
          git checkout ${SGL_BRANCH}; \
@@ -39,7 +77,6 @@ RUN git clone ${SGL_REPO} \
          python -m pip --no-cache-dir install -e "python[all_hip]"; \
        fi
 
-RUN cp -r /sgl-workspace/sglang /sglang
 RUN python -m pip cache purge
 
 RUN pip install IPython \
@@ -48,18 +85,21 @@ RUN pip install IPython \
     && pip install torchao \
     && pip install pybind11
 
-RUN pip uninstall -y triton
+WORKDIR /sgl-workspace/
 RUN git clone ${TRITON_REPO} \
     && cd triton \
     && git checkout ${TRITON_COMMIT} \
-    && cd python \
+    && pip3 uninstall -y triton \
     && python3 setup.py install
 
-RUN git clone ${AITER_REPO} \
-    && cd aiter \
-    && git checkout ${AITER_COMMIT} \
+WORKDIR /sgl-workspace/
+RUN pip uninstall -y aiter
+RUN git clone ${AITER_REPO}
+WORKDIR /sgl-workspace/aiter
+RUN git checkout ${AITER_COMMIT} \
     && git submodule update --init --recursive \
-    && PREBUILD_KERNELS=1 GPU_ARCHS=gfx942 python3 setup.py develop
+    && PREBUILD_KERNELS=1 GPU_ARCHS=$AMDGPU_TARGET python3 setup.py develop
+
 
 # Copy config files to support MI300X in virtualized environments (MI300X_VF).  Symlinks will not be created in image build.
 RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
@@ -67,7 +107,6 @@ RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
          -type f -name '*MI300X*' | xargs -I {} sh -c 'vf_config=$(echo "$1" | sed "s/MI300X/MI300X_VF/"); cp "$1" "$vf_config"' -- {}
 
 # Performance environment variable.
-
 ENV HIP_FORCE_DEV_KERNARG=1
 ENV HSA_NO_SCRATCH_RECLAIM=1
 ENV SGLANG_SET_CPU_AFFINITY=1
@@ -83,3 +122,4 @@ ENV TORCHINDUCTOR_MAX_AUTOTUNE=1
 ENV TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1
 
 CMD ["/bin/bash"]
+
