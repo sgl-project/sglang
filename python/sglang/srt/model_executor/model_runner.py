@@ -80,6 +80,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+from sglang.srt.model_executor.npu_graph_runner import NpuGraphRunner
 from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
@@ -100,6 +101,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     init_custom_process_group,
     is_cuda,
+    is_npu,
     is_fa3_default_architecture,
     is_flashinfer_available,
     is_hip,
@@ -287,13 +289,14 @@ class ModelRunner:
             server_args.max_running_requests,
             server_args.max_total_tokens,
         )
+        self.init_attention_backend()
         if self.device == "cuda":
             self.init_cublas()
-            self.init_attention_backend()
             self.init_cuda_graphs()
+        elif self.device == "npu":
+            self.init_npu_graphs()
         else:
             self.cuda_graph_runner = None
-            self.init_attention_backend()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
@@ -1151,6 +1154,26 @@ class ModelRunner:
             f"mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
+    def init_npu_graphs(self):
+        """Enable torch.compile and graph engine with Npu."""
+        self.cuda_graph_runner = None
+
+        if not self.is_generation:
+            # TODO: Currently, npu graph only captures decode steps, which only exists for generation models
+            return
+
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"Compile graph with npu begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+        )
+        self.npu_graph_runner = NpuGraphRunner(self)
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"Compile graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+            f"mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+        )
+
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
         from sglang.srt.model_parallel import tensor_parallel
@@ -1245,7 +1268,11 @@ class ModelRunner:
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         elif forward_batch.forward_mode.is_decode():
-            ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+            if is_npu():
+                with self.npu_graph_runner.compile_context(forward_batch) as forward_decode:
+                    ret = forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+            else:
+                ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         elif forward_batch.forward_mode.is_extend():
             ret = self.forward_extend(
                 forward_batch,
