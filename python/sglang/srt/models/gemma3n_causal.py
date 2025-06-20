@@ -275,7 +275,7 @@ class Gemma3nAltUp(nn.Module):
         )
         # router_inputs : [num_tokens, hidden_size]
         routed, _ = self.modality_router(router_inputs)
-        print("L277", routed.shape)
+
         # routed : [num_tokens, altup_num_inputs]
         return torch.tanh(
             routed
@@ -298,7 +298,7 @@ class Gemma3nAltUp(nn.Module):
         all_coefs, _ = self.prediction_coefs(
             modalities
         )  # (n_tokens, altup_num_inputs) -> (n_tokens, altup_num_inputs**2)
-        print("L288", all_coefs.shape)
+
         all_coefs = all_coefs.reshape(
             *modalities.shape[:-1],
             self.config.altup_num_inputs,
@@ -328,7 +328,6 @@ class Gemma3nAltUp(nn.Module):
         innovation = innovation.repeat(
             self.config.altup_num_inputs, 1, 1
         )  # (self.config.altup_num_inputs, num_tokens, hidden_size)
-        print("L316", innovation.shape)
 
         if self.config.altup_coef_clip is not None:
             self.correction_coefs.weight.data.clamp_(
@@ -356,7 +355,7 @@ class Gemma3nAltUp(nn.Module):
 
         hidden_states: [num_altup_inputs, num_tokens, hidden_size]
         """
-        print("L331", hidden_states.shape)
+
         predictions = self.predict(hidden_states)
         corrected = self.correct(predictions=predictions, activated=activated)
         output = corrected[self.config.altup_active_idx]
@@ -766,10 +765,10 @@ class Gemma3nDecoderLayer(nn.Module):
         )  # prediction : [num_altup_inputs, num_tokens, hidden_size]
         # attn_ffw_laurel_gated: [num_tokens, hidden_size]
         first_prediction = corrected_predictions[self.config.altup_active_idx]
-        print("L709", first_prediction.dtype)
+
         if self.config.altup_correct_scale:
             first_prediction = self.altup.scale_corrected_output(first_prediction)
-        print("L712", first_prediction.dtype)
+
         # per_layer_input_gate
         first_prediction = first_prediction.to(self.per_layer_input_gate.weight.dtype)
         first_prediction, _ = self.per_layer_input_gate(first_prediction)
