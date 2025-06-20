@@ -523,29 +523,63 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Final chunk with usage
             if request.stream_options and request.stream_options.include_usage:
+                # First send a chunk with finish_reason but no usage (matching OpenAI behavior)
+                finish_reason_chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=int(time.time()),
+                    choices=[
+                        ChatCompletionResponseStreamChoice(
+                            index=index,
+                            delta=DeltaMessage(),
+                            finish_reason=finish_reason_type,
+                            matched_stop=(
+                                finish_reason["matched"]
+                                if finish_reason and "matched" in finish_reason
+                                else None
+                            ),
+                        )
+                    ],
+                    model=request.model,
+                    usage=None,
+                )
+                yield f"data: {finish_reason_chunk.model_dump_json()}\n\n"
+
+                # Then send the final chunk with usage but empty choices
                 usage = self._calculate_streaming_usage_base(
                     {0: prompt_tokens},
                     {0: completion_tokens},
                     {0: cached_tokens},
                     request.n,
                 )
+                usage_chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=int(time.time()),
+                    choices=[],  # Empty choices array as per OpenAI spec
+                    model=request.model,
+                    usage=usage,
+                )
+                yield f"data: {usage_chunk.model_dump_json()}\n\n"
             else:
-                usage = None
-
-            final_chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
-                created=int(time.time()),
-                choices=[
-                    ChatCompletionResponseStreamChoice(
-                        index=index,
-                        delta=DeltaMessage(),
-                        finish_reason=finish_reason_type,
-                    )
-                ],
-                model=request.model,
-                usage=usage,
-            )
-            yield f"data: {final_chunk.model_dump_json()}\n\n"
+                # Standard behavior when not including usage
+                final_chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=int(time.time()),
+                    choices=[
+                        ChatCompletionResponseStreamChoice(
+                            index=index,
+                            delta=DeltaMessage(),
+                            finish_reason=finish_reason_type,
+                            matched_stop=(
+                                finish_reason["matched"]
+                                if finish_reason and "matched" in finish_reason
+                                else None
+                            ),
+                        )
+                    ],
+                    model=request.model,
+                    usage=None,
+                )
+                yield f"data: {final_chunk.model_dump_json()}\n\n"
 
         except Exception as e:
             error = self.create_streaming_error_response(str(e))
