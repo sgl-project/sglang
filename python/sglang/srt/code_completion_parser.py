@@ -20,7 +20,7 @@ import logging
 import os
 from enum import auto
 
-from sglang.srt.openai_api.protocol import ChatCompletionRequest
+from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 
 logger = logging.getLogger(__name__)
 completion_template_name = None
@@ -116,7 +116,7 @@ def is_completion_template_defined() -> bool:
     return completion_template_name is not None
 
 
-def generate_completion_prompt_from_request(request: ChatCompletionRequest) -> str:
+def generate_completion_prompt_from_request(request: CompletionRequest) -> str:
     global completion_template_name
     if request.suffix == "":
         return request.prompt
