@@ -584,6 +584,7 @@ class Req:
                 self.output_token_ids_logprobs_idx
             ) = None
         self.hidden_states: List[List[float]] = []
+        self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
 
         # Embedding (return values)
         self.embedding = None
