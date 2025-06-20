@@ -820,8 +820,15 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Yield tool calls
         for call_item in calls:
-            # Fix tool call ID handling for streaming
-            tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+            # Tool call ID should be generated only once per tool call
+            if call_item.name:
+                # First chunk: include ID and function name
+                tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+                function_name = call_item.name
+            else:
+                # Subsequent chunks: null ID and name for argument deltas
+                tool_call_id = None
+                function_name = None
 
             if finish_reason_type == "stop":
                 # Handle remaining arguments
@@ -844,7 +851,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 id=tool_call_id,
                 index=call_item.tool_index,
                 function=FunctionResponse(
-                    name=call_item.name,
+                    name=function_name,
                     arguments=call_item.parameters,
                 ),
             )
