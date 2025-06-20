@@ -295,7 +295,7 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         hidden_states = process_hidden_states_from_ret(
-            ret_item_with_hidden, request_with_hidden, 0
+            ret_item_with_hidden, request_with_hidden
         )
         assert hidden_states == [
             0.4,
@@ -324,7 +324,7 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         hidden_states = process_hidden_states_from_ret(
-            ret_item_without_hidden, request_without_hidden, 0
+            ret_item_without_hidden, request_without_hidden
         )
         assert hidden_states is None
 

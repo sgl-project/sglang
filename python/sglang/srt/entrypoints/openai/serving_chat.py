@@ -638,7 +638,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 choice_logprobs = self._process_response_logprobs(ret_item)
 
             # Handle hidden states
-            hidden_states = process_hidden_states_from_ret(ret_item, request, idx)
+            hidden_states = process_hidden_states_from_ret(ret_item, request)
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]

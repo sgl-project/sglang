@@ -219,23 +219,20 @@ def process_hidden_states_from_ret(
         ChatCompletionRequest,
         CompletionRequest,
     ],
-    idx: int,
 ) -> Optional[List]:
     """Process hidden states from a ret item in non-streaming response.
 
     Args:
         ret_item: Response item containing meta_info
         request: The original request object
-        idx: Index of the current item
 
     Returns:
         Processed hidden states for the last token, or None
     """
-    hidden_states = None
-    if isinstance(request, list) and request[idx].return_hidden_states:
-        hidden_states = ret_item["meta_info"].get("hidden_states", None)
-    elif not isinstance(request, list) and request.return_hidden_states:
-        hidden_states = ret_item["meta_info"].get("hidden_states", None)
+    if not request.return_hidden_states:
+        return None
+
+    hidden_states = ret_item["meta_info"].get("hidden_states", None)
     if hidden_states is not None:
         hidden_states = hidden_states[-1] if len(hidden_states) > 1 else []
     return hidden_states
