@@ -546,11 +546,12 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Additional usage chunk
             if request.stream_options and request.stream_options.include_usage:
-                usage = self._calculate_streaming_usage_base(
+                usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
                     completion_tokens,
                     cached_tokens,
-                    request.n,
+                    n_choices=request.n,
+                    enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
