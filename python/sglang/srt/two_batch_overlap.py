@@ -51,7 +51,7 @@ def compute_split_seq_index(
     if forward_mode == ForwardMode.EXTEND:
         assert extend_lens is not None
         return _split_array_by_half_sum(extend_lens)
-    if forward_mode.is_target_verify() or forward_mode.is_decode():
+    elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
         return (num_tokens // token_num_per_seq) // 2
     elif forward_mode.is_idle():
