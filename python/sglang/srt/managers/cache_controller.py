@@ -610,38 +610,44 @@ class HiCacheController:
                         start_index = key_len // self.tp_size * self.tp_rank
                         end_index = key_len // self.tp_size * (self.tp_rank + 1)
                     else:
-                        start_index = (key_len // self.tp_size + 1) * self.tp_rank
+                        start_index = min(
+                            (key_len // self.tp_size + 1) * self.tp_rank, key_len
+                        )
                         end_index = min(
                             (key_len // self.tp_size + 1) * (self.tp_rank + 1), key_len
                         )
 
                     fragment_keys = keys[start_index:end_index]
-                batch_data = self.mooncake_l3_kv_pool.batch_get(fragment_keys)
 
-                # last rank need to pad
+                fragment_key_len = len(fragment_keys)
+                batch_data = None
+                if fragment_key_len > 0:
+                    batch_data = self.mooncake_l3_kv_pool.batch_get(fragment_keys)
+
+                # last few rank need to pad
                 if (
                     self.l3_fragment_load
-                    and self.tp_rank == self.tp_size - 1
                     and key_len % self.tp_size != 0
                 ):
-                    last_fragment_key_len = len(fragment_keys)
                     fragment_keys_pad_size = key_len // self.tp_size + 1
-                    token_tensor_shape = self.mooncake_l3_kv_pool.page_tensor_shape
-                    token_tensor_shape_pad = torch.Size(
-                        [
-                            token_tensor_shape[0],
-                            fragment_keys_pad_size * self.page_size,
-                            token_tensor_shape[2],
-                            token_tensor_shape[3],
-                        ]
-                    )
-                    batch_data_pad = torch.zeros(
-                        token_tensor_shape_pad, dtype=batch_data.dtype
-                    )
-                    batch_data_pad[:, : last_fragment_key_len * self.page_size] = (
-                        batch_data
-                    )
-                    batch_data = batch_data_pad
+                    if fragment_key_len < fragment_keys_pad_size:
+                        token_tensor_shape = self.mooncake_l3_kv_pool.page_tensor_shape
+                        token_tensor_shape_pad = torch.Size(
+                            [
+                                token_tensor_shape[0],
+                                fragment_keys_pad_size * self.page_size,
+                                token_tensor_shape[2],
+                                token_tensor_shape[3],
+                            ]
+                        )
+                        batch_data_pad = torch.zeros(
+                            token_tensor_shape_pad, dtype=self.mooncake_l3_kv_pool.dtype
+                        )
+                        if fragment_key_len > 0:
+                            batch_data_pad[:, : fragment_key_len * self.page_size] = (
+                                batch_data
+                            )
+                        batch_data = batch_data_pad
 
                 batch_data = self._fragment_cache_all_gather(
                     batch_data, key_len * self.page_size
