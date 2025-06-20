@@ -94,50 +94,42 @@ class ServingEmbeddingTestCase(unittest.TestCase):
     def test_convert_single_string_request(self):
         """Test converting single string request to internal format."""
         adapted_request, processed_request = (
-            self.serving_embedding._convert_to_internal_request(
-                self.basic_req, "test-id"
-            )
+            self.serving_embedding._convert_to_internal_request(self.basic_req)
         )
 
         self.assertIsInstance(adapted_request, EmbeddingReqInput)
         self.assertEqual(adapted_request.text, "Hello, how are you?")
-        self.assertEqual(adapted_request.rid, "test-id")
+        # self.assertEqual(adapted_request.rid, "test-id")
         self.assertEqual(processed_request, self.basic_req)
 
     def test_convert_list_string_request(self):
         """Test converting list of strings request to internal format."""
         adapted_request, processed_request = (
-            self.serving_embedding._convert_to_internal_request(
-                self.list_req, "test-id"
-            )
+            self.serving_embedding._convert_to_internal_request(self.list_req)
         )
 
         self.assertIsInstance(adapted_request, EmbeddingReqInput)
         self.assertEqual(
             adapted_request.text, ["Hello, how are you?", "I am fine, thank you!"]
         )
-        self.assertEqual(adapted_request.rid, "test-id")
+        # self.assertEqual(adapted_request.rid, "test-id")
         self.assertEqual(processed_request, self.list_req)
 
     def test_convert_token_ids_request(self):
         """Test converting token IDs request to internal format."""
         adapted_request, processed_request = (
-            self.serving_embedding._convert_to_internal_request(
-                self.token_ids_req, "test-id"
-            )
+            self.serving_embedding._convert_to_internal_request(self.token_ids_req)
         )
 
         self.assertIsInstance(adapted_request, EmbeddingReqInput)
         self.assertEqual(adapted_request.input_ids, [1, 2, 3, 4, 5])
-        self.assertEqual(adapted_request.rid, "test-id")
+        # self.assertEqual(adapted_request.rid, "test-id")
         self.assertEqual(processed_request, self.token_ids_req)
 
     def test_convert_multimodal_request(self):
         """Test converting multimodal request to internal format."""
         adapted_request, processed_request = (
-            self.serving_embedding._convert_to_internal_request(
-                self.multimodal_req, "test-id"
-            )
+            self.serving_embedding._convert_to_internal_request(self.multimodal_req)
         )
 
         self.assertIsInstance(adapted_request, EmbeddingReqInput)
@@ -147,7 +139,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         self.assertIn("World", adapted_request.text)
         self.assertEqual(adapted_request.image_data[0], "base64_image_data")
         self.assertIsNone(adapted_request.image_data[1])
-        self.assertEqual(adapted_request.rid, "test-id")
+        # self.assertEqual(adapted_request.rid, "test-id")
 
     def test_build_single_embedding_response(self):
         """Test building response for single embedding."""
