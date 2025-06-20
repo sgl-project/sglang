@@ -470,7 +470,6 @@ class ModelRunner:
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
-                enable_pplx_moe=self.server_args.enable_pplx_moe,
             )
             initialize_dp_attention(
                 enable_dp_attention=self.server_args.enable_dp_attention,
