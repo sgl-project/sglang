@@ -88,6 +88,8 @@ class MetadataBuffers:
     def __init__(
         self,
         size: int,
+        hidden_size: int,
+        dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
@@ -104,6 +106,10 @@ class MetadataBuffers:
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
             self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
+
+            self.output_hidden_states = torch.zeros(
+                (size, hidden_size), dtype=dtype, device=device
+            )
             self.output_token_logprobs_val = torch.zeros(
                 (size, 16), dtype=torch.float32, device=device
             )
@@ -120,6 +126,7 @@ class MetadataBuffers:
     def get_buf_infos(self):
         ptrs = [
             self.output_ids.data_ptr(),
+            self.output_hidden_states.data_ptr(),  # TODO: set None to avoid transfer hidden_states when spec_algorithm is None
             self.output_token_logprobs_val.data_ptr(),
             self.output_token_logprobs_idx.data_ptr(),
             self.output_top_logprobs_val.data_ptr(),
@@ -127,6 +134,7 @@ class MetadataBuffers:
         ]
         data_lens = [
             self.output_ids.nbytes,
+            self.output_hidden_states.nbytes,
             self.output_token_logprobs_val.nbytes,
             self.output_token_logprobs_idx.nbytes,
             self.output_top_logprobs_val.nbytes,
@@ -134,6 +142,7 @@ class MetadataBuffers:
         ]
         item_lens = [
             self.output_ids[0].nbytes,
+            self.output_hidden_states[0].nbytes,
             self.output_token_logprobs_val[0].nbytes,
             self.output_token_logprobs_idx[0].nbytes,
             self.output_top_logprobs_val[0].nbytes,
@@ -144,6 +153,7 @@ class MetadataBuffers:
     def get_buf(self, idx: int):
         return (
             self.output_ids[idx],
+            self.output_hidden_states[idx],
             self.output_token_logprobs_val[idx],
             self.output_token_logprobs_idx[idx],
             self.output_top_logprobs_val[idx],
@@ -153,6 +163,10 @@ class MetadataBuffers:
     def set_buf(self, req: Req):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        if req.hidden_states_tensor is not None:
+            self.output_hidden_states[req.metadata_buffer_index].copy_(
+                req.hidden_states_tensor
+            )
         if req.return_logprob:
             if req.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
