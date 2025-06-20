@@ -50,8 +50,6 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 
-ACTIVATION_SCHEMES = ["static", "dynamic"]
-
 _is_hip = is_hip()
 
 if _is_hip:
@@ -82,30 +80,9 @@ class QuarkInt4Fp8Config(QuantizationConfig):
     - Activation: dynamic, per-token, symmetric
     """
 
-    def __init__(self,
-        is_checkpoint_fp8_serialized: bool = False,
-        activation_scheme: str = "dynamic",
-        ignored_layers: Optional[List[str]] = None,
-        weight_block_size: List[int] = None,):
-        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
-        if activation_scheme not in ACTIVATION_SCHEMES:
-            raise ValueError(f"Unsupported activation scheme {activation_scheme}")
-        self.activation_scheme = activation_scheme
-        self.ignored_layers = ignored_layers or []
-        if weight_block_size is not None:
-            if not is_checkpoint_fp8_serialized:
-                raise ValueError(
-                    f"The block-wise quantization only supports fp8-serialized checkpoint for now."
-                )
-            if len(weight_block_size) != 2:
-                raise ValueError(
-                    f"The quantization block size of weight must have 2 dimensions, but got {len(weight_block_size)} dimensions."
-                )
-            if activation_scheme != "dynamic":
-                raise ValueError(
-                    f"The block-wise quantization only supports dynamic activation scheme for now, but got {activation_scheme} activation scheme."
-                )
-        self.weight_block_size = weight_block_size
+    def __init__(self):
+        self.activation_scheme = "dynamic"
+        self.weight_block_size = None
 
         self.num_quant_layers = 0
         self.online_quant_progress_bar = tqdm(total=0, desc="Online int4fp8_moe quantization")
@@ -128,30 +105,21 @@ class QuarkInt4Fp8Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "QuarkInt4Fp8Config":
-        quant_method = cls.get_from_keys(config, ["quant_method"])
-        activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
-        ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
-        weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
-        return cls(
-            activation_scheme=activation_scheme,
-            ignored_layers=ignored_layers,
-            weight_block_size=weight_block_size,
-        )
+        return cls()
 
     def get_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
+        # TODO: fix circular imports issues in sglang forcing us to import here instead of at
+        # the top of file.
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
         if isinstance(layer, LinearBase):
-            self.num_quant_layers += 1
-            tqdm_reset_no_print(self.online_quant_progress_bar, total=self.num_quant_layers)
             return QuarkInt4Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            self.num_quant_layers += 1
-            tqdm_reset_no_print(self.online_quant_progress_bar, total=self.num_quant_layers)
             return QuarkInt4Fp8MoEMethod(self)
         
         return None
@@ -204,8 +172,9 @@ class QuarkInt4Fp8LinearMethod(LinearMethodBase):
             # Dequant -> Quant with max scale so we can run per tensor.
             weight = layer.weight
             weight_scale = layer.weight_scale
-            # If ROCm, normalize the weights and scales to e4m3fnuz
-            if _is_hip:
+            
+            # Normalize the weights and scales to e4m3fnuz.
+            if _is_hip and not ON_GFX950:
                 weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
                     weight=weight,
                     weight_scale=weight_scale,
@@ -241,12 +210,8 @@ class QuarkInt4Fp8LinearMethod(LinearMethodBase):
                     param,
                     fp8_w,
                     loaded_shard_id=shard_id
-                    # weight_name,
-                    # shard_id=shard_id,
-                    # expert_id=expert_id
                 )
 
-                # TODO: this is ugly?
                 if isinstance(shard_id, str):
                     shard_id = ["q", "k", "v"].index(shard_id)
 
@@ -311,6 +276,10 @@ class QuarkInt4Fp8LinearMethod(LinearMethodBase):
 
         layer.register_parameter("input_scale", None)
 
+        # For example for QKVParallelLinear, we load from q_proj, k_proj, v_proj.
+        total = self.online_quant_progress_bar.total + len(output_partition_sizes)
+        tqdm_reset_no_print(self.online_quant_progress_bar, total=total)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -340,6 +309,8 @@ class QuarkInt4Fp8MoEMethod:
     """
 
     def __new__(cls, *args, **kwargs):
+        # TODO: fix circular imports issues in sglang forcing us to import here instead of at
+        # the top of file.
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
 
         if not hasattr(cls, "_initialized"):
@@ -428,6 +399,8 @@ class QuarkInt4Fp8MoEMethod:
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        # TODO: fix circular imports issues in sglang forcing us to import here instead of at
+        # the top of file.
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         assert "weight_loader" in extra_weight_attrs
@@ -459,7 +432,6 @@ class QuarkInt4Fp8MoEMethod:
 
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
-
 
         # Allocate 2 scales for w1 and w3 respectively.
         # They will be combined to a single scale after weight loading.
@@ -505,6 +477,10 @@ class QuarkInt4Fp8MoEMethod:
 
         w2_input_scale = None
         layer.register_parameter("w2_input_scale", w2_input_scale)
+
+        # Loading from the checkpoint w1, w2, w3 times the number of experts.
+        total = self.online_quant_progress_bar.total + num_experts * 3
+        tqdm_reset_no_print(self.online_quant_progress_bar, total=total)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_hip and not ON_GFX950:
@@ -576,6 +552,8 @@ class QuarkInt4Fp8MoEMethod:
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
+        # TODO: fix circular imports issues in sglang forcing us to import here instead of at
+        # the top of file.
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
 
