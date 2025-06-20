@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <source_location>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -14,15 +15,14 @@ using token_slice = std::span<const token_t>;
 using NodeHandle = std::size_t;
 using IOTicket = std::uint32_t;
 
-inline void _assert(bool condition, const char* message = "Assertion failed") {
-  if (!condition) {
-    [[unlikely]] throw std::runtime_error(message);
-  }
-}
-
-inline void _assert(bool condition, const std::string& message) {
-  if (!condition) {
-    [[unlikely]] throw std::runtime_error(message);
+inline void _assert(
+    bool condition,
+    const char* message = "Assertion failed",
+    std::source_location loc = std::source_location::current()) {
+  if (!condition) [[unlikely]] {
+    std::string msg = message;
+    msg = msg + " at " + loc.file_name() + ":" + std::to_string(loc.line()) + " in " + loc.function_name();
+    throw std::runtime_error(msg);
   }
 }
 
