@@ -26,12 +26,11 @@ import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
 
-from srt.distributed import get_tensor_model_parallel_rank
-from srt.layers.moe.ep_moe.token_dispatcher import PplxDispatcher
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
@@ -56,6 +55,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
+from sglang.srt.layers.moe.ep_moe.token_dispatcher import PplxDispatcher
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
