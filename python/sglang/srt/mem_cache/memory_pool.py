@@ -284,12 +284,10 @@ class MHATokenToKVPool(KVCache):
             "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
         )
         if self.enable_custom_mem_pool:
-            from sglang.srt.disaggregation.mooncake.memory_pool import (
-                MooncakeNVLinkAllocator,
-            )
-
             # TODO(shangming): abstract custom allocator class for more backends
-            allocator = MooncakeNVLinkAllocator.get_allocator(self.device)
+            from mooncake.allocator import NVLinkAllocator
+
+            allocator = NVLinkAllocator.get_allocator(self.device)
             self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
         else:
             self.custom_mem_pool = None
@@ -646,12 +644,10 @@ class MLATokenToKVPool(KVCache):
             "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
         )
         if self.enable_custom_mem_pool:
-            from sglang.srt.disaggregation.mooncake.memory_pool import (
-                MooncakeNVLinkAllocator,
-            )
-
             # TODO(shangming): abstract custom allocator class for more backends
-            allocator = MooncakeNVLinkAllocator.get_allocator(self.device)
+            from mooncake.allocator import NVLinkAllocator
+
+            allocator = NVLinkAllocator.get_allocator(self.device)
             self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
         else:
             self.custom_mem_pool = None
