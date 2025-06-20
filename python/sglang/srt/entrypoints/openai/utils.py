@@ -8,7 +8,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     LogProbs,
 )
 
-
 logger = logging.getLogger(__name__)
 
 

@@ -290,9 +290,9 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             prompt = conv.get_prompt()
 
-        image_data = conv.image_data
-        audio_data = conv.audio_data
-        modalities = conv.modalities
+        image_data = conv.image_data if conv.image_data else None
+        audio_data = conv.audio_data if conv.audio_data else None
+        modalities = conv.modalities if conv.modalities else []
         stop = conv.stop_str or [] if not request.ignore_eos else []
 
         if request.stop:
@@ -456,9 +456,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 stream_buffers[index] = stream_buffer + delta
 
                 # Handle reasoning content
-                enable_thinking = getattr(request, "chat_template_kwargs", {}).get(
-                    "enable_thinking", True
-                )
+                enable_thinking = False
+                if request.chat_template_kwargs is not None:
+                    enable_thinking = request.chat_template_kwargs.get(
+                        "enable_thinking", False
+                    )
                 if (
                     self.tokenizer_manager.server_args.reasoning_parser
                     and request.separate_reasoning
@@ -588,7 +590,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
-        except Exception as e:
+        except ValueError as e:
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
 
@@ -642,10 +644,12 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle reasoning content
             reasoning_text = None
+            enable_thinking = False
             if request.chat_template_kwargs is not None:
                 enable_thinking = request.chat_template_kwargs.get(
-                    "enable_thinking", True
+                    "enable_thinking", False
                 )
+            reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
             if reasoning_parser and request.separate_reasoning and enable_thinking:
                 try:
                     parser = ReasoningParser(
@@ -688,9 +692,10 @@ class OpenAIServingChat(OpenAIServingBase):
             choices.append(choice_data)
 
         # Calculate usage
-        cache_report = self.tokenizer_manager.server_args.enable_cache_report
         usage = UsageProcessor.calculate_response_usage(
-            ret, n_choices=request.n, enable_cache_report=cache_report
+            ret,
+            n_choices=request.n,
+            enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
         )
 
         return ChatCompletionResponse(

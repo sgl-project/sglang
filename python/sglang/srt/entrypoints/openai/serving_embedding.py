@@ -95,7 +95,9 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 generate_prompts = []
                 # Check if we have a chat template for multimodal embeddings
                 if self.template_manager.chat_template_name is not None:
-                    convs = generate_embedding_convs(texts, images, self.template_manager.chat_template_nam)
+                    convs = generate_embedding_convs(
+                        texts, images, self.template_manager.chat_template_name
+                    )
                     for conv in convs:
                         generate_prompts.append(conv.get_prompt())
                 else:
