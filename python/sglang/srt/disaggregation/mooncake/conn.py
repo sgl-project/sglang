@@ -742,11 +742,11 @@ class MooncakeKVSender(BaseKVSender):
             self.kv_mgr.request_status.pop(self.bootstrap_room)
 
     def failure_exception(self):
-        self.clear()
-
         # Explicitly set the status to failure since this request has failed in another rank
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
+
+        self.clear()
 
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(
@@ -1003,11 +1003,11 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.kv_mgr.request_status.pop(self.bootstrap_room)
 
     def failure_exception(self):
-        self.clear()
-
         # Explicitly set the status to failure since this request has failed in another rank
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
+
+        self.clear()
 
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(

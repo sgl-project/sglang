@@ -8,6 +8,8 @@ from utils import precision
 
 from sglang.test.test_utils import CustomTestCase
 
+torch.manual_seed(0)
+
 
 class TestMLA(CustomTestCase):
     def _run_sdpa_forward_decode(

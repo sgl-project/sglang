@@ -62,6 +62,11 @@ suites = {
         TestFile("test_openai_adapter.py", 1),
         TestFile("test_openai_function_calling.py", 60),
         TestFile("test_openai_server.py", 149),
+        TestFile("openai/test_server.py", 120),
+        TestFile("openai/test_protocol.py", 60),
+        TestFile("openai/test_serving_chat.py", 120),
+        TestFile("openai/test_serving_completions.py", 120),
+        TestFile("openai/test_serving_embedding.py", 120),
         TestFile("test_openai_server_hidden_states.py", 240),
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
@@ -69,7 +74,6 @@ suites = {
         TestFile("test_radix_attention.py", 105),
         TestFile("test_reasoning_content.py", 89),
         TestFile("test_regex_constrained.py", 64),
-        TestFile("test_release_memory_occupation.py", 44),
         TestFile("test_request_length_validation.py", 31),
         TestFile("test_retract_decode.py", 54),
         TestFile("test_server_args.py", 1),
@@ -140,7 +144,7 @@ suites = {
         TestFile("test_moe_ep.py", 181),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_update_weights_from_distributed.py", 103),
-        TestFile("test_verl_engine_2_gpu.py", 64),
+        TestFile("test_release_memory_occupation.py", 44),
     ],
     "per-commit-2-gpu-amd": [
         TestFile("models/lora/test_lora_tp.py", 116),
@@ -152,7 +156,6 @@ suites = {
     "per-commit-4-gpu": [
         TestFile("test_local_attn.py", 250),
         TestFile("test_pp_single_node.py", 150),
-        TestFile("test_verl_engine_4_gpu.py", 64),
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
