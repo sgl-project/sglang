@@ -292,6 +292,7 @@ class PrefillAdder:
         self.can_run_list = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
+        # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
 
         if running_batch is not None:
@@ -336,9 +337,12 @@ class PrefillAdder:
 
         return AddReqResult.CONTINUE
 
-    def _prefill_one_req(
+    def _update_prefill_budget(
         self, prefix_len: int, extend_input_len: int, max_new_tokens: int
     ):
+        # TODO(lsyin): check this workaround logic
+        extend_input_len = self.ceil_paged_tokens(extend_input_len)
+
         self.rem_total_token_offset += extend_input_len + max_new_tokens
         self.cur_rem_token_offset += extend_input_len
         self.rem_input_tokens -= extend_input_len
@@ -353,7 +357,7 @@ class PrefillAdder:
         req.extend_input_len = min(req.extend_input_len, self.rem_chunk_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
-        self._prefill_one_req(
+        self._update_prefill_budget(
             0,
             req.extend_input_len,
             (
@@ -384,15 +388,17 @@ class PrefillAdder:
             )
             tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
 
-            if tokens_left > 0:
-                if not insert_sort:
-                    self.req_states.append((tokens_left, tokens_occupied))
-                else:
-                    i = 0
-                    for i in range(len(self.req_states)):
-                        if tokens_left <= self.req_states[i][0]:
-                            break
-                    self.req_states.insert(i, (tokens_left, tokens_occupied))
+            if tokens_left <= 0:
+                return
+
+            if not insert_sort:
+                self.req_states.append((tokens_left, tokens_occupied))
+            else:
+                i = 0
+                for i in range(len(self.req_states)):
+                    if tokens_left <= self.req_states[i][0]:
+                        break
+                self.req_states.insert(i, (tokens_left, tokens_occupied))
 
         if self.req_states is None:
             self.req_states = []
@@ -425,7 +431,7 @@ class PrefillAdder:
         ):
             # Non-chunked prefill
             self.can_run_list.append(req)
-            self._prefill_one_req(
+            self._update_prefill_budget(
                 0,
                 req.extend_input_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION),
@@ -441,7 +447,7 @@ class PrefillAdder:
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
             self.new_chunked_req = req
-            self._prefill_one_req(0, trunc_len, 0)
+            self._update_prefill_budget(0, trunc_len, 0)
 
         return self.budget_state()
 
@@ -486,7 +492,7 @@ class PrefillAdder:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
                 self.tree_cache.inc_lock_ref(req.last_node)
-                self._prefill_one_req(
+                self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
                     min(
@@ -507,6 +513,6 @@ class PrefillAdder:
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
                 self.tree_cache.inc_lock_ref(req.last_node)
-                self._prefill_one_req(prefix_len, trunc_len, 0)
+                self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()
