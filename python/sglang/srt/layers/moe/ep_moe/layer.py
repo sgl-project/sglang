@@ -1,29 +1,10 @@
 import logging
 from typing import Callable, List, Optional, Tuple
 
+import einops
 import torch
+from sgl_kernel import silu_and_mul
 from torch.nn import Module
-
-from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
-from sglang.srt.managers.expert_location import get_global_expert_location_metadata
-from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.managers.schedule_batch import global_server_args_dict
-
-try:
-    from deep_gemm import (
-        get_col_major_tma_aligned_tensor,
-        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous,
-        m_grouped_gemm_fp8_fp8_bf16_nt_masked,
-    )
-    from sgl_kernel import silu_and_mul
-
-    from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
-    )
-
-    use_deep_gemm = True
-except ImportError:
-    use_deep_gemm = False
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
@@ -45,19 +26,33 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE, FusedMoEMethodBase
 from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import (
+    is_fp8_fnuz,
     scaled_fp8_quant,
+    sglang_per_token_group_quant_fp8,
     sglang_per_token_quant_fp8,
 )
+from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
+from sglang.srt.managers.expert_location import get_global_expert_location_metadata
+from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import DeepEPMode, dispose_tensor, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    DeepEPMode,
+    dispose_tensor,
+    get_bool_env_var,
+    is_hip,
+    set_weight_attrs,
+)
 
 _is_hip = is_hip()
+_is_fp8_fnuz = is_fp8_fnuz()
 
 if _is_hip:
     from vllm._custom_ops import scaled_fp8_quant
@@ -156,6 +151,7 @@ class EPMoE(torch.nn.Module):
         renormalize: bool = True,
         use_grouped_topk: bool = False,
         num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
         topk_group: Optional[int] = None,
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
@@ -179,6 +175,9 @@ class EPMoE(torch.nn.Module):
         self.layer_id = layer_id
         self.num_experts = num_experts
         assert self.num_experts % self.tp_size == 0
+        assert (
+            num_fused_shared_experts == 0
+        ), "num_fused_shared_experts is not supported in EP"
         self.num_experts_per_partition = self.num_experts // self.tp_size
         self.start_expert_id = self.tp_rank * self.num_experts_per_partition
         self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1
@@ -676,7 +675,6 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.float8_e4m3fn
 
@@ -848,6 +846,33 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                     torch.max(layer.w13_weight_scale, dim=1).values,
                     requires_grad=False,
                 )
+            if self.block_quant:
+                # If ROCm, normalize the weights and scales to e4m3fnuz
+                if _is_fp8_fnuz:
+                    # activation_scheme: dynamic
+                    w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                        weight=layer.w13_weight,
+                        weight_scale=layer.w13_weight_scale_inv,
+                        input_scale=None,
+                    )
+                    w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                        weight=layer.w2_weight,
+                        weight_scale=layer.w2_weight_scale_inv,
+                        input_scale=None,
+                    )
+                    # Reset the parameter
+                    layer.w13_weight = torch.nn.Parameter(
+                        w13_weight, requires_grad=False
+                    )
+                    layer.w13_weight_scale_inv = torch.nn.Parameter(
+                        w13_weight_scale, requires_grad=False
+                    )
+                    layer.w13_input_scale = None
+                    layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+                    layer.w2_weight_scale_inv = torch.nn.Parameter(
+                        w2_weight_scale, requires_grad=False
+                    )
+                    layer.w2_input_scale = None
             return
 
     def apply(
@@ -883,6 +908,7 @@ class DeepEPMoE(EPMoE):
         renormalize: bool = True,
         use_grouped_topk: bool = False,
         num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
         topk_group: Optional[int] = None,
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
@@ -894,27 +920,30 @@ class DeepEPMoE(EPMoE):
         deepep_mode: DeepEPMode = DeepEPMode.auto,
     ):
         super().__init__(
-            num_experts,
-            top_k,
-            hidden_size,
-            intermediate_size,
-            layer_id,
-            params_dtype,
-            renormalize,
-            use_grouped_topk,
-            num_expert_group,
-            topk_group,
-            quant_config,
-            tp_size,
-            prefix,
-            correction_bias,
-            custom_routing_function,
-            activation,
-            routed_scaling_factor,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            layer_id=layer_id,
+            params_dtype=params_dtype,
+            renormalize=renormalize,
+            use_grouped_topk=use_grouped_topk,
+            num_expert_group=num_expert_group,
+            num_fused_shared_experts=num_fused_shared_experts,
+            topk_group=topk_group,
+            quant_config=quant_config,
+            tp_size=tp_size,
+            prefix=prefix,
+            correction_bias=correction_bias,
+            custom_routing_function=custom_routing_function,
+            activation=activation,
+            routed_scaling_factor=routed_scaling_factor,
         )
         self.deepep_mode = deepep_mode
         if self.deepep_mode.enable_low_latency():
-            assert use_deep_gemm, f"DeepEP {self.deepep_mode} mode requires deep_gemm"
+            assert (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
         self.w13_weight_fp8 = (
             self.w13_weight,
             (
@@ -942,7 +971,7 @@ class DeepEPMoE(EPMoE):
     ):
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
-            if _ENABLE_JIT_DEEPGEMM:
+            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
                 return self.forward_deepgemm_contiguous(
                     hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
                 )
@@ -1139,7 +1168,7 @@ class DeepEPMoE(EPMoE):
             dtype=torch.bfloat16,
         )
         input_tensor[1] = tma_align_input_scale(input_tensor[1])
-        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             input_tensor, self.w13_weight_fp8, gateup_output, m_indices
         )
         del input_tensor
@@ -1163,7 +1192,7 @@ class DeepEPMoE(EPMoE):
         )
         del down_input
         down_input_scale = tma_align_input_scale(down_input_scale)
-        m_grouped_gemm_fp8_fp8_bf16_nt_contiguous(
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
             self.w2_weight_fp8,
             down_output,
@@ -1196,8 +1225,13 @@ class DeepEPMoE(EPMoE):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_fp8[0].device, dtype=torch.bfloat16
         )
-        m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-            hidden_states_fp8, self.w13_weight_fp8, gateup_output, masked_m, expected_m
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+            hidden_states_fp8,
+            self.w13_weight_fp8,
+            gateup_output,
+            masked_m,
+            expected_m,
+            recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_BLACKWELL else None,
         )
         dispose_tensor(hidden_states_fp8[0])
 
@@ -1227,6 +1261,7 @@ class DeepEPMoE(EPMoE):
             down_input_scale,
             scale_block_size,
             masked_m,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
         del gateup_output
 
@@ -1234,13 +1269,24 @@ class DeepEPMoE(EPMoE):
         n = self.w2_weight.size(1)
         down_input_fp8 = (
             down_input,
-            get_col_major_tma_aligned_tensor(down_input_scale),
+            (
+                down_input_scale
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                else deep_gemm_wrapper.get_col_major_tma_aligned_tensor(
+                    down_input_scale
+                )
+            ),
         )
         down_output = torch.empty(
             (num_groups, m, n), device=down_input.device, dtype=torch.bfloat16
         )
-        m_grouped_gemm_fp8_fp8_bf16_nt_masked(
-            down_input_fp8, self.w2_weight_fp8, down_output, masked_m, expected_m
+        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+            down_input_fp8,
+            self.w2_weight_fp8,
+            down_output,
+            masked_m,
+            expected_m,
+            recipe=(1, 128, 128) if deep_gemm_wrapper.DEEPGEMM_BLACKWELL else None,
         )
 
         return down_output
