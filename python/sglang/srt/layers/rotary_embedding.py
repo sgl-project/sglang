@@ -22,7 +22,7 @@ if _is_cuda:
 
 logger = logging.getLogger(__name__)
 
-if _is_npu:
+if is_npu():
     try:
         import torch_npu
     except ImportError:
@@ -170,7 +170,7 @@ class RotaryEmbedding(CustomOp):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
         import os
-        if os.environ["SGLANG_ENABEL_TORCH_COMPILE"] == "1":
+        if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
             return self.forward_native(positions, query, key, offsets)
         else:
             rotary_mode = 'half'

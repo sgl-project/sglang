@@ -48,7 +48,7 @@ if _is_cuda:
 
 logger = logging.getLogger(__name__)
 
-if _is_npu:
+if is_npu():
     try:
         import torch_npu
     except ImportError:
