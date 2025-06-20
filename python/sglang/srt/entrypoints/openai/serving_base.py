@@ -2,7 +2,7 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -37,7 +37,7 @@ class OpenAIServingBase(ABC):
 
             # Convert to internal format
             adapted_request, processed_request = self._convert_to_internal_request(
-                request, self._generate_request_id_base(request)
+                request
             )
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
@@ -74,10 +74,7 @@ class OpenAIServingBase(ABC):
     def _convert_to_internal_request(
         self,
         request: OpenAIServingRequest,
-        request_id: str,
-    ) -> tuple[
-        GenerateReqInput, Union[OpenAIServingRequest, List[OpenAIServingRequest]]
-    ]:
+    ) -> tuple[GenerateReqInput, OpenAIServingRequest]:
         """Convert OpenAI request to internal format"""
         pass
 
