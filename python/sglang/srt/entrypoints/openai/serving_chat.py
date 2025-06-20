@@ -55,7 +55,6 @@ class OpenAIServingChat(OpenAIServingBase):
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
-        request_id: str,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
         """Convert OpenAI chat completion request to internal format"""
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
@@ -95,7 +94,6 @@ class OpenAIServingChat(OpenAIServingBase):
             top_logprobs_num=request.top_logprobs or 0,
             stream=request.stream,
             return_text_in_logprobs=True,
-            rid=request_id,
             modalities=modalities,
             lora_path=request.lora_path,
             bootstrap_host=request.bootstrap_host,

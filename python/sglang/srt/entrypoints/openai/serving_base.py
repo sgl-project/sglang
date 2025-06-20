@@ -37,7 +37,7 @@ class OpenAIServingBase(ABC):
 
             # Convert to internal format
             adapted_request, processed_request = self._convert_to_internal_request(
-                request, self._generate_request_id_base(request)
+                request
             )
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
@@ -74,7 +74,6 @@ class OpenAIServingBase(ABC):
     def _convert_to_internal_request(
         self,
         request: OpenAIServingRequest,
-        request_id: str,
     ) -> tuple[GenerateReqInput, OpenAIServingRequest]:
         """Convert OpenAI request to internal format"""
         pass

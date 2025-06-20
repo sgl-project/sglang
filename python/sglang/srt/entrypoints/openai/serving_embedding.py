@@ -59,7 +59,6 @@ class OpenAIServingEmbedding(OpenAIServingBase):
     def _convert_to_internal_request(
         self,
         request: EmbeddingRequest,
-        request_id: str,
     ) -> tuple[EmbeddingReqInput, EmbeddingRequest]:
         """Convert OpenAI embedding request to internal format"""
         prompt = request.input
@@ -113,7 +112,6 @@ class OpenAIServingEmbedding(OpenAIServingBase):
             prompt_kwargs = {"input_ids": prompt}
 
         adapted_request = EmbeddingReqInput(
-            rid=request_id,
             **prompt_kwargs,
         )
 
