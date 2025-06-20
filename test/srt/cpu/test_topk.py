@@ -13,6 +13,8 @@ from sglang.srt.layers.moe.topk import grouped_topk_gpu as native_grouped_topk
 from sglang.srt.models.llama4 import Llama4MoE
 from sglang.test.test_utils import CustomTestCase
 
+torch.manual_seed(0)
+
 
 # This is used by the Deepseek-V2 model
 class TestGroupedTopK(CustomTestCase):
