@@ -474,8 +474,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
+                    # Always update stream_buffer to maintain correct state
+                    stream_buffer = new_stream_buffer
                     if not delta:
-                        stream_buffer = new_stream_buffer
                         continue
 
                 # Handle tool calls
