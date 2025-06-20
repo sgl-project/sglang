@@ -72,7 +72,7 @@ from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import get_rope, get_rope_wrapper
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -95,8 +95,10 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     bind_or_assign,
+    cpu_has_amx_support,
     get_bool_env_var,
     get_int_env_var,
+    is_cpu,
     is_cuda,
     is_hip,
     is_non_idle_and_non_empty,
@@ -107,9 +109,13 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8, merge_state_v2
+elif _is_cpu and _is_cpu_amx_available:
+    pass
 else:
     from vllm._custom_ops import awq_dequantize
 
@@ -665,13 +671,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
 
-        self.rotary_emb = get_rope(
+        self.rotary_emb = get_rope_wrapper(
             qk_rope_head_dim,
             rotary_dim=qk_rope_head_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=False,
+            device=global_server_args_dict["device"],
         )
 
         if rope_scaling:
@@ -1399,7 +1406,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
+        self.speculative_algorithm = global_server_args_dict["speculative_algorithm"]
         self.layer_id = layer_id
+        self.is_nextn = is_nextn
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
             hidden_size=self.hidden_size,
@@ -1499,6 +1508,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+
+        if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
+            # NOTE: this line resolves the degradation of MTP reception rate for non-zero DP ranks.
+            # See discussion here (https://github.com/sgl-project/sglang/pull/6081#discussion_r2147452251).
+            hidden_states = hidden_states.clone()
 
         return hidden_states, residual
 
@@ -1717,12 +1731,12 @@ class DeepseekV2ForCausalLM(nn.Module):
         disable_reason = None
         if (
             not _is_cuda
-            or torch.cuda.get_device_capability("cuda") < (9, 0)
+            or torch.cuda.get_device_capability("cuda") < (8, 0)
             or self.config.architectures[0] != architecture
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
         ):
-            disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 90 can use shared experts fusion optimization."
+            disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         elif (
             global_server_args_dict["enable_deepep_moe"]
             or global_server_args_dict["enable_ep_moe"]
@@ -1829,8 +1843,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                         and weight_block_size[1] == 128
                         and model_dtype == torch.bfloat16
                     ):
-                        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and get_bool_env_var(
-                            "SGL_USE_DEEPGEMM_BMM", "false"
+                        if (
+                            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                            and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+                            and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
                         ):
                             block_scale = weight_scale
                             use_deep_gemm_bmm = True
@@ -1917,10 +1933,14 @@ class DeepseekV2ForCausalLM(nn.Module):
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and hasattr(self.quant_config, "weight_block_size")
+            and self.quant_config.weight_block_size is not None
         ):
             self._weight_requant_ue8m0()
 
     def _weight_requant_ue8m0(self):
+        if self.config.architectures[0] == "DeepseekV3ForCausalLMNextN":
+            return
         weight_block_size = self.quant_config.weight_block_size
 
         moe_layers = list(
@@ -2020,7 +2040,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
-            logger.info("Shared experts fusion optimization enabled.")
+            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
         params_dict = dict(self.named_parameters())
         weight_names = []
@@ -2126,8 +2146,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                         ):
                             q_a_proj_weight = cached_a_proj[q_a_proj_name]
                             kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+                            cat_dim = 0
+                            if (
+                                self.quant_config.get_name() == "awq"
+                                or self.quant_config.get_name() == "moe_wna16"
+                            ):
+                                cat_dim = 1
                             fused_weight = torch.cat(
-                                [q_a_proj_weight, kv_a_proj_weight], dim=0
+                                [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
                             )
                             param_name = (
                                 name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
@@ -2149,12 +2175,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                             "k_scale" in name or "v_scale" in name
                         ) and name not in params_dict:
                             # modelopt attn kv scale is named differently
-                            if any(scale in name for scale in ["k_scale", "v_scale"]):
-                                name = name.replace("_proj", "attn_mqa")
-                            else:
-                                logger.warning(
-                                    f"Unknown scale found in checkpoint: {name}"
-                                )
+                            for scale in ["k_scale", "v_scale"]:
+                                if scale in name:
+                                    name = name.replace(f"{scale[0]}_proj", "attn_mqa")
                         param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
