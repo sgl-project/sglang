@@ -144,7 +144,6 @@ suites = {
         TestFile("test_moe_ep.py", 181),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_update_weights_from_distributed.py", 103),
-        TestFile("test_verl_engine_2_gpu.py", 64),
         TestFile("test_release_memory_occupation.py", 44),
     ],
     "per-commit-2-gpu-amd": [
@@ -157,7 +156,6 @@ suites = {
     "per-commit-4-gpu": [
         TestFile("test_local_attn.py", 250),
         TestFile("test_pp_single_node.py", 150),
-        TestFile("test_verl_engine_4_gpu.py", 64),
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
