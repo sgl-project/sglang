@@ -68,14 +68,14 @@ class OpenAIServingRerank(OpenAIServingBase):
                 adapted_request, raw_request
             ).__anext__()
 
-            if not isinstance(ret, list):
-                ret = [ret]
-
-            response = self._build_rerank_response(ret, request)
-            return response
-
-        except Exception as e:
+        except ValueError as e:
             return self.create_error_response(str(e))
+
+        if not isinstance(ret, list):
+            ret = [ret]
+
+        response = self._build_rerank_response(ret, request)
+        return response
 
     def _build_rerank_response(
         self, ret: List[Dict[str, Any]], request: V1RerankReqInput

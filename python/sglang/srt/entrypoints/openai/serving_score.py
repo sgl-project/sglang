@@ -50,9 +50,9 @@ class OpenAIServingScore(OpenAIServingBase):
             # Create response with just the scores, without usage info
             response = ScoringResponse(
                 scores=scores,
-                model=self.tokenizer_manager.model_path,
+                model=request.model,
             )
             return response
 
-        except Exception as e:
+        except ValueError as e:
             return self.create_error_response(str(e))
