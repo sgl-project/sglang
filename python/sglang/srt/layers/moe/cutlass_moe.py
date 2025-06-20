@@ -46,6 +46,8 @@ def cutlass_fused_experts_fp8(
     expert_offsets: torch.Tensor,
     problem_sizes1: torch.Tensor,
     problem_sizes2: torch.Tensor,
+    a_sf_layout: torch.Tensor,
+    w_sf_layout: torch.Tensor,
     use_fp8_blockscale: bool = True,
 ) -> torch.Tensor:
     """Performs Fused MoE computation using CUTLASS-like kernels with FP8 weights and activations.
@@ -97,6 +99,8 @@ def cutlass_fused_experts_fp8(
         out_ptrs (torch.Tensor): Pointers container for calculating offsets of the output activations for each expert.
         a_scales_ptrs (torch.Tensor): Pointers container for calculating offsets of the input scales for each expert.
         b_scales_ptrs (torch.Tensor): Pointers container for calculating offsets of the input scales for each expert.
+        a_sf_layout (torch.Tensor): Layout tensor for activation scales.
+        w_sf_layout (torch.Tensor): Layout tensor for weight scales.
         use_fp8_blockscale (bool, optional): Flag indicating usage of FP8 with
             block scaling. Currently, only `True` is supported. Defaults to `True`.
 
@@ -153,9 +157,6 @@ def cutlass_fused_experts_fp8(
 
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
     c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
-
-    a_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
-    w_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
 
     fp8_blockwise_scaled_grouped_mm(
         c1,

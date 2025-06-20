@@ -675,6 +675,12 @@ class Fp8MoEMethod:
                 self.problem_sizes2 = torch.empty(
                     num_experts, 3, device=w13_weight.device, dtype=torch.int32
                 )
+                self.a_sf_layout = torch.empty(
+                    num_experts, 5, device=w13_weight.device, dtype=torch.int32
+                )
+                self.w_sf_layout = torch.empty(
+                    num_experts, 5, device=w13_weight.device, dtype=torch.int32
+                )
 
         else:
             # Allocate 2 scales for w1 and w3 respectively.
@@ -1077,6 +1083,8 @@ class Fp8MoEMethod:
                 self.expert_offsets,
                 self.problem_sizes1,
                 self.problem_sizes2,
+                self.a_sf_layout,
+                self.w_sf_layout,
                 use_fp8_blockscale=True,
             )
         # Expert fusion with FP8 quantization
