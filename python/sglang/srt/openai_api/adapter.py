@@ -1120,6 +1120,8 @@ def v1_chat_generate_request(
                                 openai_compatible_messages.append(new_msg)
                     else:
                         openai_compatible_messages.append(processed_msg)
+                
+                # Handle assistant prefix for continue_final_message
                 if (
                     openai_compatible_messages
                     and openai_compatible_messages[-1]["role"] == "assistant"
