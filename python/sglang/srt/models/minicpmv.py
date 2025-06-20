@@ -823,15 +823,23 @@ class MiniCPMV:
 
     def __getattr__(self, name):
         if name == "minicpmv":
-            return None
-        return getattr(self.minicpmv, name)
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            )
+        attr = getattr(self.minicpmv, name)
+
+        if callable(attr):
+            def wrapper(*args, **kwargs):
+                result = attr(*args, **kwargs)
+                if result is self.minicpmv:
+                    return self
+                return result
+            return wrapper
+        else:
+            return attr
 
     def __call__(self, *args, **kwargs):
         return self.minicpmv(*args, **kwargs)
-
-    def eval(self):
-        self.minicpmv.eval()
-        return self
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
