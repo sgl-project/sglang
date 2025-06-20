@@ -114,33 +114,6 @@ class OpenAIServingBase(ABC):
         """Validate request"""
         pass
 
-    def _calculate_streaming_usage_base(
-        self,
-        prompt_tokens: Dict[int, int],
-        completion_tokens: Dict[int, int],
-        cached_tokens: Dict[int, int],
-        n_choices: int,
-    ) -> UsageInfo:
-        """Calculate usage information for streaming responses (common logic)"""
-        total_prompt_tokens = sum(
-            tokens for i, tokens in prompt_tokens.items() if i % n_choices == 0
-        )
-        total_completion_tokens = sum(tokens for tokens in completion_tokens.values())
-
-        cache_report = self.tokenizer_manager.server_args.enable_cache_report
-        prompt_tokens_details = None
-        if cache_report:
-            cached_tokens_sum = sum(tokens for tokens in cached_tokens.values())
-            if cached_tokens_sum > 0:
-                prompt_tokens_details = {"cached_tokens": cached_tokens_sum}
-
-        return UsageInfo(
-            prompt_tokens=total_prompt_tokens,
-            completion_tokens=total_completion_tokens,
-            total_tokens=total_prompt_tokens + total_completion_tokens,
-            prompt_tokens_details=prompt_tokens_details,
-        )
-
     def create_error_response(
         self,
         message: str,
