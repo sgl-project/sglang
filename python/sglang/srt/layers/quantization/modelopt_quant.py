@@ -527,9 +527,7 @@ class ModelOptNvFp4FusedMoEMethod:
                 " quantization. Please use Blackwell and"
                 " above."
             )
-        self.enable_flashinfer_moe = get_bool_env_var(
-            "SGLANG_FLASHINFER_MOE", default="True"
-        )
+        self.enable_flashinfer_moe = False
 
     def create_weights(
         self,

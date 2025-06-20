@@ -1295,8 +1295,8 @@ class DeepEPMoE(EPMoE):
 def get_moe_impl_class():
     if global_server_args_dict["enable_deepep_moe"]:
         return DeepEPMoE
-    if global_server_args_dict["enable_flashinfer_ep_moe"]:
-        # Must come before enable_ep_moe
+    if global_server_args_dict["enable_flashinfer_moe"]:
+        # Must come before EPMoE because FusedMoE also supports enable_ep_moe
         return FusedMoE
     if global_server_args_dict["enable_ep_moe"]:
         return EPMoE

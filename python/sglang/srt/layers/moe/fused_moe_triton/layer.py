@@ -314,6 +314,7 @@ class FusedMoE(torch.nn.Module):
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
+        enable_flashinfer_moe: Optional[bool] = False,
         enable_ep_moe: Optional[bool] = False,
     ):
         super().__init__()
@@ -329,14 +330,13 @@ class FusedMoE(torch.nn.Module):
         self.num_experts = num_experts
         self.reduce_results = reduce_results
         self.expert_map = None
-        self.enable_flashinfer_moe = get_bool_env_var(
-            "SGLANG_FLASHINFER_MOE", default="True"
-        )
+        self.enable_flashinfer_moe = enable_flashinfer_moe
+        if self.enable_flashinfer_moe:
+            self.reduce_results = True
         if enable_ep_moe:
             assert (
                 self.enable_flashinfer_moe
             ), "FusedMoE only supports EP with --enable-flashinfer-moe"
-            self.reduce_results = True  # combine needed
             self.ep_size = self.tp_size
             self.ep_rank = self.tp_rank
             self.tp_size = 1
@@ -391,6 +391,8 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix)
+            if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod":
+                self.quant_method.enable_flashinfer_moe = self.enable_flashinfer_moe
         assert self.quant_method is not None
 
         self.quant_method.create_weights(
