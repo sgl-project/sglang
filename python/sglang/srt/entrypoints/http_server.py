@@ -55,6 +55,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ModelCard,
     ModelList,
     ScoringRequest,
+    V1RerankReqInput,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
@@ -81,7 +82,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
-    V1RerankReqInput,
     VertexGenerateReqInput,
 )
 from sglang.srt.managers.template_manager import TemplateManager
