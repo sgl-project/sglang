@@ -37,7 +37,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
+from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb, get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -154,12 +154,13 @@ class Gemma3nMLP(nn.Module):
         gate_proj, up_proj = gate_up.chunk(2, dim=-1)
 
         # Apply activation sparsity if needed
-        if self.activation_sparsity > 0.0 and self.training:
+        if self.activation_sparsity > 0.0:
             gate_proj = self._gaussian_topk(gate_proj)
 
+        gate_up = torch.cat([gate_proj, up_proj], dim=-1)
+
         # Apply GELU activation to gate projection and multiply with up projection
-        activated_gate = self.act_fn(gate_proj)
-        x = activated_gate * up_proj
+        x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -210,6 +211,7 @@ class Gemma3nLaurelBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [num_tokens, hidden_size]
         laurel_x, _ = self.linear_left(x)
         laurel_x, _ = self.linear_right(laurel_x)
         normed_laurel_x = self.post_laurel_norm(laurel_x)
@@ -267,51 +269,77 @@ class Gemma3nAltUp(nn.Module):
         )
 
     def compute_router_modalities(self, x: torch.Tensor) -> torch.Tensor:
-        router_inputs = self.router_norm(x) * self.router_input_scale.type(
+        # x  : [num_tokens, hidden_size]
+        router_inputs = self.router_norm(x) * self.router_input_scale.to(
             self.router_norm.weight.dtype
         )
+        # router_inputs : [num_tokens, hidden_size]
         routed, _ = self.modality_router(router_inputs)
-        return torch.tanh(routed.float())
+        print("L277", routed.shape)
+        # routed : [num_tokens, altup_num_inputs]
+        return torch.tanh(
+            routed
+        )  # TODO: MAYBE NEED TO CHANGE TO torch.tanh(routed.float())
 
     def predict(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Predicts the output of a layer using a trainable map."""
+        """Predicts the output of a layer using a trainable map.
+        hidden_states: [num_altup_inputs, num_tokens, hidden_size]
+        """
         modalities = self.compute_router_modalities(
             hidden_states[self.config.altup_active_idx]
-        )
+        )  # (n_tokens, altup_num_inputs)
+        # TODO: CHECK DO WE NEED THIS: self.prediction_coefs.float()  # Force computation in float32, in-place operation
 
         if self.config.altup_coef_clip is not None:
             self.prediction_coefs.weight.data.clamp_(
                 -self.config.altup_coef_clip, self.config.altup_coef_clip
             )
 
-        all_coefs, _ = self.prediction_coefs(modalities)
+        all_coefs, _ = self.prediction_coefs(
+            modalities
+        )  # (n_tokens, altup_num_inputs) -> (n_tokens, altup_num_inputs**2)
+        print("L288", all_coefs.shape)
         all_coefs = all_coefs.reshape(
             *modalities.shape[:-1],
             self.config.altup_num_inputs,
             self.config.altup_num_inputs,
-        ).permute(0, 1, 3, 2)
+        ).permute(0, 2, 1)
 
-        # permute hidden_states to [batch_size, num_tokens, hidden_size, altup_num_inputs]
-        predictions = torch.matmul(hidden_states.float().permute(1, 2, 3, 0), all_coefs)
-        predictions = predictions.permute(3, 0, 1, 2)  # undo the permute
+        # permute hidden_states from [num_altup_inputs, num_tokens, hidden_size] to [num_tokens, hidden_size, altup_num_inputs]
+        predictions = torch.matmul(hidden_states.permute(1, 2, 0), all_coefs)
+        predictions = predictions.permute(2, 0, 1)  # undo the permute
         predictions += hidden_states  # add the original input
-        return predictions.contiguous().type_as(hidden_states)
+        return predictions.contiguous().type_as(
+            hidden_states
+        )  # [num_altup_inputs, num_tokens, hidden_size]
 
     def correct(
         self, predictions: torch.Tensor, activated: torch.Tensor
     ) -> torch.Tensor:
         """Corrects the predictions relative to the activated inputs."""
-        modalities = self.compute_router_modalities(activated)
-        innovation = activated - predictions[self.config.altup_active_idx]
-        innovation = innovation.repeat(self.config.altup_num_inputs, 1, 1, 1)
+        # prediction : [num_altup_inputs, num_tokens, hidden_size]
+        # activated  : [num_tokens, hidden_size]
+        modalities = self.compute_router_modalities(
+            activated
+        )  # [num_tokens, altup_num_inputs]
+        innovation = (
+            activated - predictions[self.config.altup_active_idx]
+        )  # [num_tokens, hidden_size]
+        innovation = innovation.repeat(
+            self.config.altup_num_inputs, 1, 1
+        )  # (self.config.altup_num_inputs, num_tokens, hidden_size)
+        print("L316", innovation.shape)
 
         if self.config.altup_coef_clip is not None:
             self.correction_coefs.weight.data.clamp_(
                 -self.config.altup_coef_clip, self.config.altup_coef_clip
             )
 
-        all_coefs, _ = self.correction_coefs(modalities)
-        all_coefs = (all_coefs + 1.0).permute(2, 0, 1).unsqueeze(-1)
+        all_coefs, _ = self.correction_coefs(
+            modalities
+        )  # [num_tokens, altup_num_inputs]
+        all_coefs = (all_coefs + 1.0).permute(1, 0).unsqueeze(-1)
+        # # [num_tokens, altup_num_inputs, 1]
 
         corrected = torch.mul(innovation, all_coefs)
         corrected += predictions
@@ -319,12 +347,16 @@ class Gemma3nAltUp(nn.Module):
 
     def scale_corrected_output(self, corrected: torch.Tensor) -> torch.Tensor:
         """Scales the provided 3D tensor."""
-        return corrected * self.correct_output_scale
+        return corrected * self.correct_output_scale.to(corrected.dtype)
 
     def forward(
         self, hidden_states: torch.Tensor, activated: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predicts, correct, and optionally scales the output of a layer using trainable maps."""
+        """Predicts, correct, and optionally scales the output of a layer using trainable maps.
+
+        hidden_states: [num_altup_inputs, num_tokens, hidden_size]
+        """
+        print("L331", hidden_states.shape)
         predictions = self.predict(hidden_states)
         corrected = self.correct(predictions=predictions, activated=activated)
         output = corrected[self.config.altup_active_idx]
@@ -369,7 +401,8 @@ class Gemma3nAttention(nn.Module):
 
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = config.query_rescale_scalar / config.query_pre_attn_scalar
+        # self.scaling = config.query_rescale_scalar / config.query_pre_attn_scalar
+        self.scaling = 1.0
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -387,6 +420,9 @@ class Gemma3nAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
+
+        # self.is_causal = True
+        # self.attention_dropout = self.config.attention_dropout
 
         # Determine if layer uses sliding window based on pattern
         self.is_sliding = config.layer_types[layer_id] == "sliding_attention"
@@ -406,21 +442,63 @@ class Gemma3nAttention(nn.Module):
             self.kv_shared_layer_index = first_kv_shared_layer_idx - 1
 
         # Initialize the rotary embedding
+        # if self.is_sliding:
+        #     self.rope_theta = config.rope_local_base_freq
+        #     self.rope_scaling = {"rope_type": "default"}
+        #     self.sliding_window = get_attention_sliding_window_size(config)
+        # else:
+        #     self.rope_theta = config.rope_theta
+        #     self.rope_scaling = config.rope_scaling
+        #     self.sliding_window = None
+
+        # self.rotary_emb = Gemma3nRotaryEmbedding(config=config)
+        # self.rotary_emb = get_rope(
+        #     self.head_dim,
+        #     rotary_dim=self.head_dim,
+        #     max_position=config.max_position_embeddings,
+        #     base=config.rope_theta,
+        #     rope_scaling=config.rope_scaling
+        # )
+        # Local RoPE layer with different theta
+        # config_local = copy.deepcopy(config)
+        # config_local.rope_theta = config.rope_local_base_freq
+        # config_local.rope_scaling = {"rope_type": "default"}
+        # self.rotary_emb_local = Gemma3nRotaryEmbedding(config=config_local)
+        # self.rotary_emb_local = get_rope(
+        #     self.head_dim,
+        #     rotary_dim=self.head_dim,
+        #     max_position=config.max_position_embeddings,
+        #     base=config.rope_local_base_freq,
+        #     rope_scaling={"rope_type": "default"}
+        # )
         if self.is_sliding:
-            self.rope_theta = config.rope_local_base_freq
-            self.rope_scaling = {"rope_type": "default"}
-            self.sliding_window = get_attention_sliding_window_size(config)
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=config.max_position_embeddings,
+                base=config.rope_local_base_freq,
+                rope_scaling={"rope_type": "default"},
+            )
         else:
-            self.rope_theta = config.rope_theta
-            self.rope_scaling = config.rope_scaling
-            self.sliding_window = None
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=config.max_position_embeddings,
+                base=config.rope_theta,
+                rope_scaling=config.rope_scaling,
+            )
+
+        self.attn_logit_softcapping = self.config.attn_logit_softcapping
+        self.sliding_window = config.sliding_window if self.is_sliding else None
 
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
+            layer_id=(
+                layer_id if not self.is_kv_shared_layer else self.kv_shared_layer_index
+            ),
             logit_cap=getattr(config, "attn_logit_softcapping", 0.0) or 0.0,
             sliding_window_size=self.sliding_window,
             quant_config=quant_config,
@@ -448,16 +526,18 @@ class Gemma3nAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        positions: Tuple[torch.Tensor, torch.Tensor],
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> torch.Tensor:
+
         qkv, _ = self.qkv_proj(hidden_states)
+        # TODO: for first 20 layers, we use QKVParallelLinear
+        #       for others, we only calc Q.
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Apply normalization to q, k, v
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
-        q = q.transpose(0, 1).unsqueeze(0)
         q = self.q_norm(q)
 
         # Check if we should use shared KV cache
@@ -468,107 +548,104 @@ class Gemma3nAttention(nn.Module):
             v = None
         else:
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            k = k.transpose(0, 1).unsqueeze(0)
             k = self.k_norm(k)
-
+            
             v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            v = v.transpose(0, 1).unsqueeze(0)
             v = self.v_norm(v)
 
-        # Apply rotary embeddings
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-        # Reshape for attention
-        q = q.permute(0, 2, 1, 3)
+        # Flatten back for rotary embedding
+        q = q.flatten(-2, -1)
+        
+        # Apply rotary embedding
         if k is not None:
-            k = k.permute(0, 2, 1, 3)
-        if v is not None:
-            v = v.permute(0, 2, 1, 3)
+            k = k.flatten(-2, -1)
+            q, k = self.rotary_emb(positions, q, k)
+            # Reshape k back to head format for attention
+            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+        else:
+            # For shared KV layers, create a dummy key for rotary embedding and discard it
+            dummy_k = torch.zeros_like(q[:, :self.kv_size])  # Create dummy key with same shape as needed
+            q, _ = self.rotary_emb(positions, q, dummy_k)
+        
+        # Reshape q back to head format for attention
+        q = q.unflatten(-1, (self.num_heads, self.head_dim))
 
         attn_output = self.attn(
             q,
             k,
             v,
             forward_batch=forward_batch,
-            kv_shared_layer_idx=(
-                self.kv_shared_layer_index if self.is_kv_shared_layer else None
-            ),
+            save_kv_cache=not self.is_kv_shared_layer,
         )
-
-        # Compatible with triton backend which returns [1, s, h, head_dim]
-        if attn_output.dim() == 4 and attn_output.shape[0] == 1:
-            attn_output = attn_output.squeeze(0)
-            attn_output = attn_output.flatten(-2, -1)
 
         output, _ = self.o_proj(attn_output)
         return output
 
 
-class Gemma3nRotaryEmbedding(nn.Module):
-    def __init__(self, config: Gemma3nTextConfig, device=None):
-        super().__init__()
-        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get(
-                "rope_type", config.rope_scaling.get("type")
-            )
-        else:
-            self.rope_type = "default"
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
+# class Gemma3nRotaryEmbedding(nn.Module):
+#     def __init__(self, config: Gemma3nTextConfig, device=None):
+#         super().__init__()
+#         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+#             self.rope_type = config.rope_scaling.get(
+#                 "rope_type", config.rope_scaling.get("type")
+#             )
+#         else:
+#             self.rope_type = "default"
+#         self.max_seq_len_cached = config.max_position_embeddings
+#         self.original_max_seq_len = config.max_position_embeddings
 
-        self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+#         self.config = config
+#         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
+#         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+#         self.register_buffer("inv_freq", inv_freq, persistent=False)
+#         self.original_inv_freq = self.inv_freq
 
-    def _dynamic_frequency_update(self, position_ids, device):
-        """Dynamic RoPE frequency update."""
-        seq_len = torch.max(position_ids) + 1
-        if seq_len > self.max_seq_len_cached:
-            inv_freq, self.attention_scaling = self.rope_init_fn(
-                self.config, device, seq_len=seq_len
-            )
-            self.register_buffer("inv_freq", inv_freq, persistent=False)
-            self.max_seq_len_cached = seq_len
+#     def _dynamic_frequency_update(self, position_ids, device):
+#         """Dynamic RoPE frequency update."""
+#         seq_len = torch.max(position_ids) + 1
+#         if seq_len > self.max_seq_len_cached:
+#             inv_freq, self.attention_scaling = self.rope_init_fn(
+#                 self.config, device, seq_len=seq_len
+#             )
+#             self.register_buffer("inv_freq", inv_freq, persistent=False)
+#             self.max_seq_len_cached = seq_len
 
-        if (
-            seq_len < self.original_max_seq_len
-            and self.max_seq_len_cached > self.original_max_seq_len
-        ):
-            self.original_inv_freq = self.original_inv_freq.to(device)
-            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
-            self.max_seq_len_cached = self.original_max_seq_len
+#         if (
+#             seq_len < self.original_max_seq_len
+#             and self.max_seq_len_cached > self.original_max_seq_len
+#         ):
+#             self.original_inv_freq = self.original_inv_freq.to(device)
+#             self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
+#             self.max_seq_len_cached = self.original_max_seq_len
 
-    @torch.no_grad()
-    def forward(self, x, position_ids):
-        if "dynamic" in self.rope_type:
-            self._dynamic_frequency_update(position_ids, device=x.device)
+#     @torch.no_grad()
+#     def forward(self, x, position_ids):
+#         if "dynamic" in self.rope_type:
+#             self._dynamic_frequency_update(position_ids, device=x.device)
 
-        inv_freq_expanded = (
-            self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        )
-        position_ids_expanded = position_ids[:, None, :].float()
-        device_type = x.device.type
-        device_type = (
-            device_type
-            if isinstance(device_type, str) and device_type != "mps"
-            else "cpu"
-        )
-        with torch.autocast(device_type=device_type, enabled=False):
-            freqs = (
-                inv_freq_expanded.float().to(x.device) @ position_ids_expanded.float()
-            ).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos()
-            sin = emb.sin()
+#         inv_freq_expanded = (
+#             self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+#         )
+#         position_ids_expanded = position_ids[:, None, :].float()
+#         device_type = x.device.type
+#         device_type = (
+#             device_type
+#             if isinstance(device_type, str) and device_type != "mps"
+#             else "cpu"
+#         )
+#         with torch.autocast(device_type=device_type, enabled=False):
+#             freqs = (
+#                 inv_freq_expanded.float().to(x.device) @ position_ids_expanded.float()
+#             ).transpose(1, 2)
+#             emb = torch.cat((freqs, freqs), dim=-1)
+#             cos = emb.cos()
+#             sin = emb.sin()
 
-        cos = cos * self.attention_scaling
-        sin = sin * self.attention_scaling
+#         cos = cos * self.attention_scaling
+#         sin = sin * self.attention_scaling
 
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+#         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 class Gemma3nDecoderLayer(nn.Module):
@@ -583,6 +660,7 @@ class Gemma3nDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
         self.attention_type = config.layer_types[layer_id]
+        self.config = config
 
         self.self_attn = Gemma3nAttention(
             layer_id=layer_id,
@@ -647,47 +725,51 @@ class Gemma3nDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        position_embeddings_global: torch.Tensor,
-        position_embeddings_local: torch.Tensor,
         per_layer_input: torch.Tensor,
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> torch.Tensor:
-        predictions = self.altup.predict(hidden_states)
+        predictions = self.altup.predict(
+            hidden_states
+        )  # [num_altup_inputs, num_tokens, hidden_size]
         active_prediction = predictions[self.config.altup_active_idx]
 
         active_prediction_normed = self.input_layernorm(active_prediction)
-        laurel_output = self.laurel(active_prediction_normed)
-
-        # apply global RoPE to non-sliding layer only
-        if self.self_attn.is_sliding:
-            position_embeddings = position_embeddings_local
-        else:
-            position_embeddings = position_embeddings_global
+        laurel_output = self.laurel(
+            active_prediction_normed
+        )  # laurel_output: [num_tokens, hidden_size]
+        # active_prediction: [num_tokens, hidden_size]
 
         attn = self.self_attn(
             positions=positions,
             hidden_states=active_prediction_normed,
-            position_embeddings=position_embeddings,
             forward_batch=forward_batch,
             **kwargs,
         )
-        attn = self.post_attention_layernorm(attn)
+        attn = self.post_attention_layernorm(attn)  # [num_tokens, hidden_size]
 
-        attn_gated = active_prediction + attn
+        attn_gated = active_prediction + attn  # [num_tokens, hidden_size]
         attn_laurel = (attn_gated + laurel_output) / torch.sqrt(torch.tensor(2.0))
 
-        attn_norm = self.pre_feedforward_layernorm(attn_laurel)
-        attn_ffw = self.mlp(attn_norm)
-        attn_ffw_norm = self.post_feedforward_layernorm(attn_ffw)
-        attn_ffw_laurel_gated = attn_laurel + attn_ffw_norm
-        corrected_predictions = self.altup.correct(predictions, attn_ffw_laurel_gated)
-
+        attn_norm = self.pre_feedforward_layernorm(
+            attn_laurel
+        )  # [num_tokens, hidden_size]
+        attn_ffw = self.mlp(attn_norm)  # [num_tokens, hidden_size]
+        attn_ffw_norm = self.post_feedforward_layernorm(
+            attn_ffw
+        )  # [num_tokens, hidden_size]
+        attn_ffw_laurel_gated = attn_laurel + attn_ffw_norm  # [num_tokens, hidden_size]
+        corrected_predictions = self.altup.correct(
+            predictions, attn_ffw_laurel_gated
+        )  # prediction : [num_altup_inputs, num_tokens, hidden_size]
+        # attn_ffw_laurel_gated: [num_tokens, hidden_size]
         first_prediction = corrected_predictions[self.config.altup_active_idx]
+        print("L709", first_prediction.dtype)
         if self.config.altup_correct_scale:
             first_prediction = self.altup.scale_corrected_output(first_prediction)
-
+        print("L712", first_prediction.dtype)
         # per_layer_input_gate
+        first_prediction = first_prediction.to(self.per_layer_input_gate.weight.dtype)
         first_prediction, _ = self.per_layer_input_gate(first_prediction)
         first_prediction = F.gelu(first_prediction, approximate="tanh")
         first_prediction = torch.multiply(first_prediction, per_layer_input)
@@ -727,15 +809,6 @@ class Gemma3nTextModel(PreTrainedModel):
             scale_shift=0.0,
             with_scale=True,
         )
-
-        self.rotary_emb = Gemma3nRotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
-
-        # Local RoPE layer with different theta
-        config_local = copy.deepcopy(config)
-        config_local.rope_theta = config.rope_local_base_freq
-        config_local.rope_scaling = {"rope_type": "default"}
-        self.rotary_emb_local = Gemma3nRotaryEmbedding(config=config_local)
 
         self.layers = make_layers(
             config.num_hidden_layers,
@@ -875,10 +948,6 @@ class Gemma3nTextModel(PreTrainedModel):
         if positions.dim() == 1:
             positions = positions.unsqueeze(0)
 
-        # Initialize RoPE embeddings
-        position_embeddings_global = self.rotary_emb(hidden_states, positions)
-        position_embeddings_local = self.rotary_emb_local(hidden_states, positions)
-
         # Expand hidden_states to support per-layer inputs
         target_magnitude = torch.mean(hidden_states**2, dim=-1, keepdim=True) ** 0.5
         epsilon_tensor = torch.tensor(torch.finfo(hidden_states.dtype).min)
@@ -897,14 +966,12 @@ class Gemma3nTextModel(PreTrainedModel):
 
         hidden_states = torch.stack(
             hidden_states_list, dim=0
-        )  # [num_altup_inputs, batch, seq_len, hidden_size]
+        )  # [num_altup_inputs, n_tokens, hidden_size]
 
         for layer_idx, layer in enumerate(self.layers):
-            per_layer_input = per_layer_inputs[:, :, layer_idx, :]
+            per_layer_input = per_layer_inputs[:, layer_idx, :]
             hidden_states = layer(
                 positions=positions,
-                position_embeddings_global=position_embeddings_global,
-                position_embeddings_local=position_embeddings_local,
                 per_layer_input=per_layer_input,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
