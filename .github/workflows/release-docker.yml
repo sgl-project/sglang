@@ -62,7 +62,7 @@ jobs:
           elif [ "${{ matrix.build_type }}" = "srt" ]; then
             tag_suffix="-srt"
           elif [ "${{ matrix.build_type }}" = "blackwell" ]; then
-            tag_suffix="-blackwell"
+            tag_suffix="-b200"
           else
             echo "Unsupported build type"
             exit 1
