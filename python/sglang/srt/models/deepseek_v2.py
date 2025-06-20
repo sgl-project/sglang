@@ -2147,7 +2147,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                             q_a_proj_weight = cached_a_proj[q_a_proj_name]
                             kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
                             cat_dim = 0
-                            if (
+                            if self.quant_config is not None and (
                                 self.quant_config.get_name() == "awq"
                                 or self.quant_config.get_name() == "moe_wna16"
                             ):
@@ -2178,6 +2178,13 @@ class DeepseekV2ForCausalLM(nn.Module):
                             for scale in ["k_scale", "v_scale"]:
                                 if scale in name:
                                     name = name.replace(f"{scale[0]}_proj", "attn_mqa")
+                                    break
+                        if name not in params_dict:
+                            # modelopt ckpt contains not needed weights for MTP module:
+                            # model.decoder.self_attn.attn_mqa.v_scale and
+                            # model.decoder.self_attn.attn_mqa.k_scale
+                            logger.warning(f"{name} not found in params_dict.")
+                            continue
                         param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
