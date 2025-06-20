@@ -147,6 +147,15 @@ class TpModelWorker:
         # A reference make this class has the same member as TpModelWorkerClient
         self.worker = self
 
+        self.hicache_layer_transfer_counter = None
+
+    def register_hicache_layer_transfer_counter(self, counter):
+        self.hicache_layer_transfer_counter = counter
+
+    def set_hicache_consumer(self, consumer_index):
+        if self.hicache_layer_transfer_counter is not None:
+            self.hicache_layer_transfer_counter.set_consumer(consumer_index)
+
     def get_worker_info(self):
         return (
             self.max_total_num_tokens,

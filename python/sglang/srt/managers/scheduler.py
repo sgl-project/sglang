@@ -36,6 +36,7 @@ from torch.distributed import barrier
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
@@ -179,6 +180,27 @@ class EmbeddingBatchResult:
     bid: int
 
 
+class IdleSleeper:
+    """
+    In setups which have long inactivity periods it is desirable to reduce
+    system power consumption when sglang does nothing. This would lead not only
+    to power savings, but also to more CPU thermal headroom when a request
+    eventually comes. This is important in cases when multiple GPUs are connected
+    as each GPU would otherwise pin one thread at 100% CPU usage.
+
+    The simplest solution is to use zmq.Poller on all sockets that may receive
+    data that needs handling immediately.
+    """
+
+    def __init__(self, sockets):
+        self.poller = zmq.Poller()
+        for s in sockets:
+            self.poller.register(s, zmq.POLLIN)
+
+    def maybe_sleep(self):
+        self.poller.poll(1000)
+
+
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerDisaggregationDecodeMixin,
@@ -228,6 +250,8 @@ class Scheduler(
 
         # Init inter-process communication
         context = zmq.Context(2)
+        self.idle_sleeper = None
+
         if self.pp_rank == 0 and self.attn_tp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -250,6 +274,13 @@ class Scheduler(
             self.recv_from_rpc = get_zmq_socket(
                 context, zmq.DEALER, port_args.rpc_ipc_name, False
             )
+            if self.server_args.sleep_on_idle:
+                self.idle_sleeper = IdleSleeper(
+                    [
+                        self.recv_from_tokenizer,
+                        self.recv_from_rpc,
+                    ]
+                )
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
@@ -361,7 +392,7 @@ class Scheduler(
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
-        self.num_prefill_tokens = 0
+        self.last_prefill_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
         self.return_health_check_ct = 0
@@ -420,8 +451,6 @@ class Scheduler(
         t = threading.Thread(target=self.watchdog_thread, daemon=True)
         t.start()
         self.parent_process = psutil.Process().parent()
-
-        # Init memory saver
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
@@ -477,6 +506,10 @@ class Scheduler(
             self.server_args.disaggregation_mode
         )
         self.init_disaggregation()
+
+    def maybe_sleep_on_idle(self):
+        if self.idle_sleeper is not None:
+            self.idle_sleeper.maybe_sleep()
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -539,6 +572,10 @@ class Scheduler(
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
                 )
+                self.tp_worker.register_hicache_layer_transfer_counter(
+                    self.tree_cache.cache_controller.layer_done_counter
+                )
+
             else:
                 self.tree_cache = RadixCache(
                     req_to_token_pool=self.req_to_token_pool,
@@ -593,15 +630,21 @@ class Scheduler(
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
             buffer_size = (self.req_to_token_pool.size) * 2
-            req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
+            self.disagg_metadata_buffers = MetadataBuffers(
+                buffer_size,
+                hidden_size=self.model_config.hf_text_config.hidden_size,
+                dtype=self.model_config.dtype,
+                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+            )
 
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
                 gloo_group=self.attn_tp_cpu_group,
-                req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
+                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
+                tp_rank=self.tp_rank,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 tree_cache=self.tree_cache,
@@ -616,7 +659,7 @@ class Scheduler(
                     if self.draft_worker is None
                     else self.draft_worker.model_runner.token_to_kv_pool
                 ),
-                req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
+                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 transfer_queue=self.disagg_decode_transfer_queue,
@@ -624,7 +667,12 @@ class Scheduler(
                 gloo_group=self.attn_tp_cpu_group,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
+                dp_size=self.server_args.dp_size,
+                gpu_id=self.gpu_id,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
+                max_total_num_tokens=self.max_total_num_tokens,
+                prefill_pp_size=self.server_args.disaggregation_prefill_pp,
+                num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
 
@@ -634,10 +682,15 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
-            req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
+            self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
+            self.disagg_metadata_buffers = MetadataBuffers(
+                buffer_size,
+                hidden_size=self.model_config.hf_text_config.hidden_size,
+                dtype=self.model_config.dtype,
+                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+            )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
@@ -646,14 +699,20 @@ class Scheduler(
                     if self.draft_worker is None
                     else self.draft_worker.model_runner.token_to_kv_pool
                 ),
-                req_to_metadata_buffer_idx_allocator=req_to_metadata_buffer_idx_allocator,
+                req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
+                gpu_id=self.gpu_id,
                 bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 gloo_group=self.attn_tp_cpu_group,
-                transfer_backend=self.transfer_backend,
+                max_total_num_tokens=self.max_total_num_tokens,
+                decode_tp_size=self.server_args.disaggregation_decode_tp,
+                decode_dp_size=self.server_args.disaggregation_decode_dp,
                 scheduler=self,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                transfer_backend=self.transfer_backend,
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
@@ -675,6 +734,7 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
+                self.maybe_sleep_on_idle()
 
             self.last_batch = batch
 
@@ -719,6 +779,7 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
+                self.maybe_sleep_on_idle()
 
             self.last_batch = batch
 
@@ -824,6 +885,7 @@ class Scheduler(
             if server_is_idle:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
+                self.maybe_sleep_on_idle()
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
@@ -957,6 +1019,7 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                data_parallel_rank=recv_req.data_parallel_rank,
             )
             req.tokenizer = self.tokenizer
 
@@ -1080,18 +1143,22 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.disagg_prefill_bootstrap_queue.add(req)
+            self.disagg_prefill_bootstrap_queue.add(
+                req, self.model_config.num_key_value_heads
+            )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req)
         else:
             self.waiting_queue.append(req)
 
-    def _extend_requests_to_queue(self, reqs: List[Req]):
+    def _extend_requests_to_queue(self, reqs: List[Req], is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.disagg_prefill_bootstrap_queue.extend(reqs)
+            self.disagg_prefill_bootstrap_queue.extend(
+                reqs, self.model_config.num_key_value_heads
+            )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # If this is a decode server, we put the request to the decode pending prealloc queue
-            self.disagg_decode_prealloc_queue.extend(reqs)
+            self.disagg_decode_prealloc_queue.extend(reqs, is_retracted)
         else:
             self.waiting_queue.extend(reqs)
 
@@ -1104,6 +1171,7 @@ class Scheduler(
             recv_req.input_text,
             recv_req.input_ids,
             recv_req.sampling_params,
+            token_type_ids=recv_req.token_type_ids,
         )
         req.tokenizer = self.tokenizer
 
@@ -1148,8 +1216,8 @@ class Scheduler(
     ):
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = time.perf_counter()
-        self.last_input_throughput = self.num_prefill_tokens / gap_latency
-        self.num_prefill_tokens = 0
+        self.last_input_throughput = self.last_prefill_tokens / gap_latency
+        self.last_prefill_tokens = adder.log_input_tokens
 
         num_used = self.max_total_num_tokens - (
             self.token_to_kv_pool_allocator.available_size()
@@ -1181,15 +1249,15 @@ class Scheduler(
                 f"#new-token: {adder.log_input_tokens}, "
                 f"#cached-token: {adder.log_hit_tokens}, "
                 f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                f"#running-req: {running_bs}, "
-            )
+                )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
             f += f"#transferring-req: {len(self.disagg_prefill_inflight_queue)}, "
-            f += f"time: {gap_latency:.2f} "
+            f += f"input throughput (token/s): {self.last_input_throughput:.2f} "
         else:
+            f += f"#running-req: {running_bs}, "
             f += f"#queue-req: {len(self.waiting_queue)}"
 
         logger.info(f)
@@ -1266,6 +1334,7 @@ class Scheduler(
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
+            msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         msg += (
             f"cuda graph: {can_run_cuda_graph}, "
@@ -1340,6 +1409,29 @@ class Scheduler(
             self.metrics_collector.log_stats(self.stats)
         self._publish_kv_events()
 
+    def coordinate_spec_dp_attn_batch(self, new_batch: Optional[ScheduleBatch]):
+        """Coordinate the DP attention batch."""
+
+        local_info = torch.tensor(
+            [
+                (new_batch is not None),
+            ],
+            dtype=torch.int64,
+        )
+        global_info = torch.empty(
+            (self.server_args.dp_size, self.attn_tp_size, 1),
+            dtype=torch.int64,
+        )
+        torch.distributed.all_gather_into_tensor(
+            global_info.flatten(),
+            local_info,
+            group=self.tp_cpu_group,
+        )
+        any_new_batch = any(
+            global_info[:, 0, 0].tolist()
+        )  # Any DP worker has forward batch
+        return any_new_batch
+
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
@@ -1373,7 +1465,14 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
-        if new_batch is not None:
+
+        # TODO(ch-wan): minor refactor is needed here to improve readability
+        any_new_batch = (
+            self.server_args.enable_dp_attention
+            and not self.spec_algorithm.is_none()
+            and self.coordinate_spec_dp_attn_batch(new_batch)
+        )
+        if new_batch is not None or any_new_batch:
             # Run prefill first if possible
             ret = new_batch
         else:
@@ -1418,15 +1517,14 @@ class Scheduler(
             return None
 
         if self.enable_hierarchical_cache:
-            # check for completion of hierarchical cache activities to release memory
-            self.tree_cache.writing_check()
-            self.tree_cache.loading_check()
+            self.tree_cache.check_hicache_events()
 
         # Get priority queue
-        prefix_computed = self.policy.calc_priority(self.waiting_queue)
+        self.policy.calc_priority(self.waiting_queue)
 
         # Prefill policy
         adder = PrefillAdder(
+            self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
@@ -1469,14 +1567,8 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
                     break
 
-            req.init_next_round_input(
-                None if prefix_computed else self.tree_cache,
-                self.enable_hierarchical_cache,
-            )
-
-            res = adder.add_one_req(
-                req, self.chunked_req, self.enable_hierarchical_cache
-            )
+            req.init_next_round_input(self.tree_cache)
+            res = adder.add_one_req(req, has_chunked_req=(self.chunked_req is not None))
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
@@ -1503,9 +1595,6 @@ class Scheduler(
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
 
-        if self.enable_hierarchical_cache:
-            self.tree_cache.ready_to_load_cache()
-
         if adder.new_chunked_req is not None:
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
@@ -1530,6 +1619,12 @@ class Scheduler(
             chunked_req=self.chunked_req,
             token_to_kv_pool_allocator_local=self.token_to_kv_pool_allocator_local,
         )
+        if self.enable_hierarchical_cache:
+            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+            new_batch.hicache_consumer_index = (
+                self.tree_cache.ready_to_load_host_cache()
+            )
+
         new_batch.prepare_for_extend()
 
         # Mixed-style chunked prefill
@@ -1575,7 +1670,7 @@ class Scheduler(
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
-            self._extend_requests_to_queue(retracted_reqs)
+            self._extend_requests_to_queue(retracted_reqs, is_retracted=True)
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
@@ -1605,6 +1700,11 @@ class Scheduler(
         if self.is_generation:
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
+
+                # update the consumer index of hicache to the running batch
+                self.tp_worker.set_hicache_consumer(
+                    model_worker_batch.hicache_consumer_index
+                )
                 if self.pp_group.is_last_rank:
                     logits_output, next_token_ids, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
@@ -1622,10 +1722,9 @@ class Scheduler(
                     num_accepted_tokens,
                     can_run_cuda_graph,
                 ) = self.draft_worker.forward_batch_speculative_generation(batch)
-                self.spec_num_total_accepted_tokens += (
-                    num_accepted_tokens + batch.batch_size()
-                )
-                self.spec_num_total_forward_ct += batch.batch_size()
+                bs = batch.batch_size()
+                self.spec_num_total_accepted_tokens += num_accepted_tokens + bs
+                self.spec_num_total_forward_ct += bs
                 self.num_generated_tokens += num_accepted_tokens
 
             if self.pp_group.is_last_rank:
@@ -1634,13 +1733,15 @@ class Scheduler(
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
-            if batch.return_logprob:
+            if batch.return_logprob or self.spec_algorithm.is_eagle():
                 extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
+            else:
+                extend_input_len_per_req = None
+            if batch.return_logprob:
                 extend_logprob_start_len_per_req = [
                     req.extend_logprob_start_len for req in batch.reqs
                 ]
             else:
-                extend_input_len_per_req = None
                 extend_logprob_start_len_per_req = None
 
             ret = GenerationBatchResult(
@@ -1725,8 +1826,6 @@ class Scheduler(
             num_tokens_for_logprob = 0
         elif local_batch.forward_mode.is_decode():
             num_tokens = local_batch.batch_size()
-            if not spec_algorithm.is_none() and spec_algorithm.is_eagle():
-                num_tokens = num_tokens * speculative_num_draft_tokens
             num_tokens_for_logprob = num_tokens
         else:
             num_tokens = local_batch.extend_num_tokens
@@ -1802,6 +1901,7 @@ class Scheduler(
                 local_batch.global_num_tokens_for_logprob = (
                     global_num_tokens_for_logprob
                 )
+            local_batch.is_extend_in_batch = any(is_extend_in_batch)
             local_batch.tbo_split_seq_index = tbo_split_seq_index
             local_batch.global_forward_mode = global_forward_mode
 
@@ -1809,6 +1909,7 @@ class Scheduler(
             if not disable_cuda_graph:
                 local_batch.can_run_dp_cuda_graph = can_cuda_graph
 
+        # TODO(ch-wan): refactor: any(is_extend_in_batch) now is a part of local_batch. Remove it from here.
         return local_batch, any(is_extend_in_batch)
 
     def get_idle_batch(self):
@@ -2105,7 +2206,8 @@ class Scheduler(
             # In this case, we change the input_ids to be only one token to make this prefill cheap.
             if req.rid.startswith(recv_req.rid):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
-                req.grammar.cancel()
+                if req.grammar:
+                    req.grammar.cancel()
                 req.set_finish_with_abort("Aborted by AbortReq.")
 
         # Delete requests in the running batch
@@ -2170,23 +2272,40 @@ class Scheduler(
         return GetWeightsByNameReqOutput(parameter)
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
-        self.memory_saver_adapter.check_validity(
-            caller_name="release_memory_occupation"
-        )
-        self.stashed_model_static_state = _export_static_state(
-            self.tp_worker.worker.model_runner.model
-        )
-        self.memory_saver_adapter.pause()
-        self.flush_cache()
+        tags = recv_req.tags
+        import subprocess
+
+        if tags is None:
+            tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
+
+        if GPU_MEMORY_TYPE_KV_CACHE in tags:
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            self.flush_cache()
+
+        if GPU_MEMORY_TYPE_WEIGHTS in tags:
+            self.stashed_model_static_state = _export_static_state(
+                self.tp_worker.worker.model_runner.model
+            )
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
+
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
-        self.memory_saver_adapter.check_validity(caller_name="resume_memory_occupation")
-        self.memory_saver_adapter.resume()
-        _import_static_state(
-            self.tp_worker.worker.model_runner.model, self.stashed_model_static_state
-        )
-        del self.stashed_model_static_state
+        tags = recv_req.tags
+        if tags is None or len(tags) == 0:
+            tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
+
+        if GPU_MEMORY_TYPE_WEIGHTS in tags:
+            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
+            _import_static_state(
+                self.tp_worker.worker.model_runner.model,
+                self.stashed_model_static_state,
+            )
+            del self.stashed_model_static_state
+
+        if GPU_MEMORY_TYPE_KV_CACHE in tags:
+            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+
         return ResumeMemoryOccupationReqOutput()
 
     def slow_down(self, recv_req: SlowDownReqInput):
@@ -2415,8 +2534,10 @@ class Scheduler(
                 if self.profiler_decode_ct > self.profiler_target_decode_ct:
                     if self.profile_in_progress:
                         self.stop_profile(stage=ForwardMode.DECODE)
+            elif batch.forward_mode.is_idle():
+                pass
             else:
-                raise RuntimeError("unsupported profile stage")
+                raise RuntimeError(f"unsupported profile stage: {batch.forward_mode}")
         else:
             # Check profiler
             if (

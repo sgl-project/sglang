@@ -56,7 +56,7 @@ class TestTwoBatchOverlap(unittest.TestCase):
             },
         )
         print(f"{response.json()=}")
-        self.assertEquals(response.json()["text"], "5, 1+5=6")
+        self.assertEqual(response.json()["text"], "5, 1+5=6")
 
     def test_mmlu(self):
         args = SimpleNamespace(
