@@ -660,6 +660,7 @@ class Gemma3ForCausalLM(PreTrainedModel):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
+            name = name.replace("language_model.", "")
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 # if param_name in name:
                 # print(f"{param_name} is already in {name}")
@@ -668,6 +669,9 @@ class Gemma3ForCausalLM(PreTrainedModel):
                 name = name.replace(shard_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
+                    # Skip loading weights that are not in the model
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -683,6 +687,9 @@ class Gemma3ForCausalLM(PreTrainedModel):
                     continue
                 # Remapping the name of FP8 kv-scale.
                 name = maybe_remap_kv_scale_name(name, params_dict)
+                if name not in params_dict:
+                    # Skip loading weights that are not in the model
+                    continue
                 if name is None:
                     continue
 
