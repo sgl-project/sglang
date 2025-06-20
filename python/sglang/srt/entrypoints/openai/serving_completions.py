@@ -3,7 +3,7 @@ import time
 from typing import Any, AsyncGenerator, Dict, List, Union
 
 from fastapi import Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.code_completion_parser import generate_completion_prompt_from_request
 from sglang.srt.entrypoints.openai.protocol import (
@@ -276,7 +276,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
-    ) -> Union[CompletionResponse, ErrorResponse]:
+    ) -> Union[CompletionResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming completion request"""
         try:
             generator = self.tokenizer_manager.generate_request(

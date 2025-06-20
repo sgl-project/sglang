@@ -6,7 +6,7 @@ import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.conversation import generate_chat_conv
 from sglang.srt.entrypoints.openai.protocol import (
@@ -259,7 +259,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         request: ChatCompletionRequest,
         is_multimodal: bool,
-    ) -> tuple[str, Optional[Any], Optional[Any], List[str], List[str]]:
+    ) -> tuple[str, Optional[Any], Optional[Any], List[str], List[str], List[str]]:
         """Apply conversation template"""
         prompt = ""
         prompt_ids = []
@@ -601,7 +601,7 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
         raw_request: Request,
-    ) -> Union[ChatCompletionResponse, ErrorResponse]:
+    ) -> Union[ChatCompletionResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming chat completion request"""
         try:
             ret = await self.tokenizer_manager.generate_request(
@@ -626,7 +626,7 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         ret: List[Dict[str, Any]],
         created: int,
-    ) -> ChatCompletionResponse:
+    ) -> Union[ChatCompletionResponse, ORJSONResponse]:
         """Build chat completion response from generation results"""
         choices = []
 

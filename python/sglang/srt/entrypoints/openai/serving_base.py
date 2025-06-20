@@ -87,7 +87,7 @@ class OpenAIServingBase(ABC):
         adapted_request: GenerateReqInput,
         request: OpenAIServingRequest,
         raw_request: Request,
-    ) -> StreamingResponse:
+    ) -> Union[StreamingResponse, ErrorResponse, ORJSONResponse]:
         """Handle streaming request
 
         Override this method in child classes that support streaming requests.
@@ -103,7 +103,7 @@ class OpenAIServingBase(ABC):
         adapted_request: GenerateReqInput,
         request: OpenAIServingRequest,
         raw_request: Request,
-    ) -> Union[Any, ErrorResponse]:
+    ) -> Union[Any, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming request
 
         Override this method in child classes that support non-streaming requests.
@@ -126,6 +126,7 @@ class OpenAIServingBase(ABC):
         param: Optional[str] = None,
     ) -> ORJSONResponse:
         """Create an error response"""
+        # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
         error = ErrorResponse(
             object="error",
             message=message,

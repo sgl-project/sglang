@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, Union
 
 from fastapi import Request
+from fastapi.responses import ORJSONResponse
 
 from sglang.srt.conversation import generate_embedding_convs
 from sglang.srt.entrypoints.openai.protocol import (
@@ -131,7 +132,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         adapted_request: EmbeddingReqInput,
         request: EmbeddingRequest,
         raw_request: Request,
-    ) -> Union[EmbeddingResponse, ErrorResponse]:
+    ) -> Union[EmbeddingResponse, ErrorResponse, ORJSONResponse]:
         """Handle the embedding request"""
         try:
             ret = await self.tokenizer_manager.generate_request(
