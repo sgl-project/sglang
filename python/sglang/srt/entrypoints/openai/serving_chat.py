@@ -26,8 +26,8 @@ from sglang.srt.entrypoints.openai.protocol import (
     TopLogprob,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
-    aggregate_token_usage,
     detect_template_content_format,
     process_content_for_template_format,
     to_openai_style_logprobs,
@@ -546,11 +546,12 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Additional usage chunk
             if request.stream_options and request.stream_options.include_usage:
-                usage = self._calculate_streaming_usage_base(
+                usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
                     completion_tokens,
                     cached_tokens,
-                    request.n,
+                    n_choices=request.n,
+                    enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -658,7 +659,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Calculate usage
         cache_report = self.tokenizer_manager.server_args.enable_cache_report
-        usage = aggregate_token_usage(ret, request.n, cache_report)
+        usage = UsageProcessor.calculate_response_usage(
+            ret, n_choices=request.n, enable_cache_report=cache_report
+        )
 
         return ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
