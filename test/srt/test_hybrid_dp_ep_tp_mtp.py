@@ -1,4 +1,5 @@
-# Large-scale test for dp attention. These tests are not run by default but can be launched on demand.
+# Comprehensive test for hybrid parallelism (DP/TP attention, DP/TP Dense FFN, TP/EP Sparse FFN, DP/VP LM head) plus speculative decoding.
+# These tests are not run by default but can be launched on demand.
 
 import unittest
 from types import SimpleNamespace
