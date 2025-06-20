@@ -109,7 +109,6 @@ CI_MULTI_LORA_MODELS = [
         ],
         max_loras_per_batch=2,
     ),
-
 ]
 
 LORA_MODELS_QWEN3 = [
@@ -126,7 +125,7 @@ LORA_MODELS_QWEN3 = [
             ),
         ],
         max_loras_per_batch=2,
-    ),    
+    ),
 ]
 
 ALL_OTHER_MULTI_LORA_MODELS = [
