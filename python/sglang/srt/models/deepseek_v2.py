@@ -1733,12 +1733,12 @@ class DeepseekV2ForCausalLM(nn.Module):
         disable_reason = None
         if (
             not _is_cuda
-            or torch.cuda.get_device_capability("cuda") < (9, 0)
+            or torch.cuda.get_device_capability("cuda") < (8, 0)
             or self.config.architectures[0] != architecture
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
         ):
-            disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 90 can use shared experts fusion optimization."
+            disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         elif (
             global_server_args_dict["enable_deepep_moe"]
             or global_server_args_dict["enable_ep_moe"]
@@ -2042,7 +2042,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
-            logger.info("Shared experts fusion optimization enabled.")
+            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
         params_dict = dict(self.named_parameters())
         weight_names = []
