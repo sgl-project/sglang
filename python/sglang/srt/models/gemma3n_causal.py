@@ -549,13 +549,13 @@ class Gemma3nAttention(nn.Module):
         else:
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
             k = self.k_norm(k)
-            
+
             v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
             v = self.v_norm(v)
 
         # Flatten back for rotary embedding
         q = q.flatten(-2, -1)
-        
+
         # Apply rotary embedding
         if k is not None:
             k = k.flatten(-2, -1)
@@ -564,9 +564,11 @@ class Gemma3nAttention(nn.Module):
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
         else:
             # For shared KV layers, create a dummy key for rotary embedding and discard it
-            dummy_k = torch.zeros_like(q[:, :self.kv_size])  # Create dummy key with same shape as needed
+            dummy_k = torch.zeros_like(
+                q[:, : self.kv_size]
+            )  # Create dummy key with same shape as needed
             q, _ = self.rotary_emb(positions, q, dummy_k)
-        
+
         # Reshape q back to head format for attention
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
 
