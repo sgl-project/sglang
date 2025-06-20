@@ -22,8 +22,8 @@ from sglang.srt.utils import (
     _process_weight_after_loading,
     cpu_has_amx_support,
     get_bool_env_var,
+    is_cpu,
     is_hip,
-    prepack_weight_if_needed,
     set_weight_attrs,
 )
 
@@ -35,6 +35,8 @@ else:
 import logging
 
 _is_hip = is_hip()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
@@ -125,7 +127,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             torch.cuda.empty_cache()
 
         # Pack weight for get better performance on CPU
-        _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+        if _is_cpu and _is_cpu_amx_available:
+            _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 
         return
 

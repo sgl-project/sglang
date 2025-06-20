@@ -20,9 +20,17 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
-from sglang.srt.utils import PackWeightMethod, set_weight_attrs
+from sglang.srt.utils import (
+    PackWeightMethod,
+    cpu_has_amx_support,
+    is_cpu,
+    set_weight_attrs,
+)
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
+
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -551,7 +559,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         self.quant_config = quant_config
 
         # We only support pack LMHead if it's not quantized. For LMHead with quant_config, the weight_name will be "qweight"
-        if self.quant_config is None:
+        if self.quant_config is None and _is_cpu and _is_cpu_amx_available:
             self.quant_method = PackWeightMethod(weight_names=["weight"])
 
         if bias:

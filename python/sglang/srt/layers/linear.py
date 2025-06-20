@@ -33,7 +33,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.utils import (
     _process_weight_after_loading,
     cpu_has_amx_support,
-    prepack_weight_if_needed,
+    is_cpu,
     set_weight_attrs,
 )
 
@@ -56,6 +56,9 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "ModelOptFp4LinearMethod",
     "IPEXAWQLinearMethod",
 ]
+
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 
 def adjust_marlin_shard(param, shard_size, shard_offset):
@@ -171,7 +174,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        _process_weight_after_loading(layer, ["weight"])
+        if _is_cpu and _is_cpu_amx_available:
+            _process_weight_after_loading(layer, ["weight"])
 
     def apply(
         self,
