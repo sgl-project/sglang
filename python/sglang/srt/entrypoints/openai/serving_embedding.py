@@ -116,6 +116,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         )
 
         return adapted_request, request
+        return adapted_request, request
 
     async def _handle_non_streaming_request(
         self,
@@ -134,14 +135,10 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
-        response = self._build_embedding_response(
-            ret, self.tokenizer_manager.model_path
-        )
+        response = self._build_embedding_response(ret)
         return response
 
-    def _build_embedding_response(
-        self, ret: List[Dict[str, Any]], model_path: str
-    ) -> EmbeddingResponse:
+    def _build_embedding_response(self, ret: List[Dict[str, Any]]) -> EmbeddingResponse:
         """Build the embedding response"""
         embedding_objects = []
         prompt_tokens = 0
@@ -159,7 +156,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
 
         return EmbeddingResponse(
             data=embedding_objects,
-            model=model_path,
+            model=self.tokenizer_manager.model_path,
             usage=UsageInfo(
                 prompt_tokens=prompt_tokens,
                 total_tokens=prompt_tokens,

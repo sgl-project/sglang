@@ -150,9 +150,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             }
         ]
 
-        response = self.serving_embedding._build_embedding_response(
-            ret_data, "test-model"
-        )
+        response = self.serving_embedding._build_embedding_response(ret_data)
 
         self.assertIsInstance(response, EmbeddingResponse)
         self.assertEqual(response.model, "test-model")
@@ -177,9 +175,7 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             },
         ]
 
-        response = self.serving_embedding._build_embedding_response(
-            ret_data, "test-model"
-        )
+        response = self.serving_embedding._build_embedding_response(ret_data)
 
         self.assertIsInstance(response, EmbeddingResponse)
         self.assertEqual(len(response.data), 2)
