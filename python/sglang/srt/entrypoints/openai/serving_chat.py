@@ -429,7 +429,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # First chunk with role
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
-                    delta = DeltaMessage(role="assistant")
+                    delta = DeltaMessage(role="assistant", content="")
                     choice_data = ChatCompletionResponseStreamChoice(
                         index=index,
                         delta=delta,
