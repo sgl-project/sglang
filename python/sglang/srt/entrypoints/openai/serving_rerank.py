@@ -3,9 +3,13 @@ from typing import Any, Dict, List, Optional, Union
 
 from fastapi import Request
 
-from sglang.srt.entrypoints.openai.protocol import ErrorResponse, RerankResponse
+from sglang.srt.entrypoints.openai.protocol import (
+    ErrorResponse,
+    RerankResponse,
+    V1RerankReqInput,
+)
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
-from sglang.srt.managers.io_struct import EmbeddingReqInput, V1RerankReqInput
+from sglang.srt.managers.io_struct import EmbeddingReqInput
 
 logger = logging.getLogger(__name__)
 
