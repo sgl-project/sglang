@@ -110,14 +110,19 @@ class BaseFormatDetector(ABC):
 
         # The current_text has tool_call if it is the start of a new tool call sequence
         # or it is the start of a new tool call after a tool call separator, when there is a previous tool call
-        if not (
-            self.bot_token in current_text
-            or current_text.startswith("{")
-            or (
-                self.current_tool_id > 0
-                and current_text.startswith(self.tool_call_separator + "{")
-            )
-        ):
+        # FIXED: More strict checking to avoid parsing LaTeX or other text with braces
+        has_bot_token = self.bot_token in current_text
+        has_valid_json_start = (
+            current_text.startswith("{") and 
+            self.bot_token and 
+            (self.current_tool_id >= 0 or current_text.startswith(self.bot_token))
+        )
+        has_separator_json = (
+            self.current_tool_id > 0
+            and current_text.startswith(self.tool_call_separator + "{")
+        )
+        
+        if not (has_bot_token or has_valid_json_start or has_separator_json):
             # Only clear buffer if we're sure no tool call is starting
             if not self._ends_with_partial_token(self._buffer, self.bot_token):
                 normal_text = self._buffer
@@ -180,6 +185,12 @@ class BaseFormatDetector(ABC):
                 current_tool_call = obj
 
             except MalformedJSON:
+                # If we get MalformedJSON and we don't have a valid bot_token context,
+                # this is likely not a tool call (e.g., LaTeX braces)
+                if not has_bot_token:
+                    normal_text = self._buffer
+                    self._buffer = ""
+                    return StreamingParseResult(normal_text=normal_text)
                 return StreamingParseResult()
 
             if not current_tool_call:
@@ -286,6 +297,13 @@ class BaseFormatDetector(ABC):
             return res
 
         except Exception as e:
+            # If we get any other exception and we don't have a valid bot_token context,
+            # this is likely not a tool call (e.g., LaTeX braces)
+            if not has_bot_token:
+                normal_text = self._buffer
+                self._buffer = ""
+                return StreamingParseResult(normal_text=normal_text)
+            
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult()
 
