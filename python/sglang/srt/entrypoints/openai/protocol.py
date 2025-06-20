@@ -593,8 +593,3 @@ OpenAIServingRequest = Union[
     ScoringRequest,
     V1RerankReqInput,
 ]
-
-
-def exclude_if_none(obj, field_names: List[str]):
-    omit_if_none_fields = {k for k, v in obj.model_fields.items() if k in field_names}
-    return {k: v for k, v in obj if k not in omit_if_none_fields or v is not None}
