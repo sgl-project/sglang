@@ -534,7 +534,7 @@ class ScoringResponse(BaseModel):
     object: str = "scoring"
 
 
-class V1RerankReqInput:
+class V1RerankReqInput(BaseModel):
     query: str
     documents: List[str]
 
