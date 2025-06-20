@@ -38,17 +38,15 @@ RadixTree::match_prefix(const token_vec_t& _key) {
   const auto [host_node, _] = m_impl->tree_walk(key);
 
   // walk up to the first non-evicted node
-  std::size_t host_length = 0;
-  const auto device_node = m_impl->walk_to_device(host_node, [&](TreeNode* n) {
-    host_length += n->length();  // accumulate the length of the host indices
-  });
+  std::size_t host_hit_length = 0;
+  const auto device_node = walk_to_device(host_node, [&](TreeNode* n) { host_hit_length += n->length(); });
 
   // collect all the device indices
   std::vector<at::Tensor> indices{};
-  m_impl->walk_to_root(device_node, [&](TreeNode* n) { indices.push_back(n->device_indices()); });
+  walk_to_root(device_node, [&](TreeNode* n) { indices.push_back(n->device_indices()); });
   std::reverse(indices.begin(), indices.end());
 
-  return {std::move(indices), host_length, node2id(device_node), node2id(host_node)};
+  return {std::move(indices), host_hit_length, node2id(device_node), node2id(host_node)};
 }
 
 std::vector<at::Tensor> RadixTree::evict(std::size_t num_tokens) {
@@ -156,13 +154,13 @@ RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
   }
 
   std::size_t offset = host_prefix_length;
-  const auto device_node = m_impl->walk_to_device(host_node, [&](TreeNode* n) {
+  const auto device_node = walk_to_device(host_node, [&](TreeNode* n) {
     m_impl->update_device(n, value.slice(/*dim=*/0, offset - n->length(), offset));
     offset = offset - n->length();
   });
 
   std::size_t device_prefix_length = 0;
-  m_impl->walk_to_root(device_node, [&](TreeNode* n) {
+  walk_to_root(device_node, [&](TreeNode* n) {
     device_prefix_length += n->length();
     n->hit_count++;
     if (m_impl->need_write_through(n)) {
@@ -201,7 +199,7 @@ std::tuple<IOTicket, std::vector<at::Tensor>> RadixTree::loading_onboard(NodeHan
 
   std::vector<at::Tensor> indices;
   std::size_t offset = value.size(0);
-  m_impl->walk_to_device(old_host_node, [&](TreeNode* n) {
+  walk_to_device(old_host_node, [&](TreeNode* n) {
     indices.push_back(n->host_indices());
     m_impl->update_device(n, value.slice(/*dim=*/0, offset - n->length(), offset));
     offset = offset - n->length();

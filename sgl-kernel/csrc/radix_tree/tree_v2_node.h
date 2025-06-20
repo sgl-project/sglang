@@ -7,7 +7,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <span>
 #include <unordered_map>
 
 #include "common.h"
@@ -25,8 +24,6 @@ struct std_vector_hash {
   }
 };
 
-using token_slice = std::span<const token_t>;
-
 /**
  * Every node is a host node, which means either it is on the host or on the device (or both).
  * A device node stands for a node that is on the device, and it may have a backup on the host.
@@ -34,8 +31,9 @@ using token_slice = std::span<const token_t>;
  */
 struct TreeNode {
  public:
-  using map_t = std::unordered_map<token_vec_t, std::unique_ptr<TreeNode>, std_vector_hash>;
-  using iterator_t = typename map_t::iterator;
+  using childern_map_t = std::unordered_map<token_vec_t, std::unique_ptr<TreeNode>, std_vector_hash>;
+  using iterator_t = typename childern_map_t::iterator;
+  using const_iterator_t = typename childern_map_t::const_iterator;
   using timestamp_t = std::chrono::steady_clock::time_point;
 
   TreeNode(std::size_t node_id_)
@@ -124,6 +122,14 @@ struct TreeNode {
     return m_children.end();
   }
 
+  const_iterator_t begin() const {
+    return m_children.begin();
+  }
+
+  const_iterator_t end() const {
+    return m_children.end();
+  }
+
   TreeNode* parent() {
     return m_parent;
   }
@@ -160,11 +166,12 @@ struct TreeNode {
     new_node->m_io_ticket = old_node->m_io_ticket;
   }
 
+  /// @return The first index in `m_tokens` that differs from `key`.
   std::size_t diff_key(token_slice key, std::size_t offset) const {
     auto a = m_tokens;
     auto b = key;
     auto it = std::mismatch(a.begin() + offset, a.end(), b.begin() + offset, b.end());
-    return it.first - a.begin();  // >= offset
+    return it.first - a.begin() - offset;
   }
 
   at::Tensor device_indices() const {
@@ -244,7 +251,7 @@ struct TreeNode {
   }
 
   void root_reset() {
-    _assert(is_root(), "Only root node can be reset");
+    _assert(is_root(), "Only root node can call root_reset");
     _assert(
         m_io_status == IOStatus::None && m_io_locked == std::nullopt,
         "IO operation in progress, cannot reset root node");
@@ -272,14 +279,32 @@ struct TreeNode {
   IOTicket m_io_ticket;
 
   token_vec_t m_tokens;
-  at::Tensor m_device_indices;
-  at::Tensor m_host_indices;  // indices of host value, if applicable
+  at::Tensor m_device_indices;  // indices of device value
+  at::Tensor m_host_indices;    // indices of host value
   TreeNode* m_parent;
-  std::unordered_map<token_vec_t, std::unique_ptr<TreeNode>, std_vector_hash> m_children;
+  childern_map_t m_children;
   timestamp_t m_last_access_time;
 
  public:
   const std::size_t node_id;  // unique ID for the node
 };
+
+template <typename F>
+inline TreeNode* walk_to_root(TreeNode* t, const F& f) {
+  while (!t->is_root()) {
+    f(t);
+    t = t->parent();
+  }
+  return t;  // return the root node
+}
+
+template <typename F>
+inline TreeNode* walk_to_device(TreeNode* t, const F& f) {
+  while (!t->is_root() && !t->on_gpu()) {
+    f(t);
+    t = t->parent();
+  }
+  return t;  // return the first non-evicted node or the root node
+}
 
 }  // namespace radix_tree_v2

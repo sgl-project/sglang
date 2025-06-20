@@ -126,11 +126,10 @@ struct RadixTree::Impl {
       const auto it = node->find_child(get_key(key));
       if (it == node->end()) break;
       node = it->second.get();
-      node->access(now);
 
       // at least `page_size` tokens are matched, and there may be more tokens to match
       // the return value prefix_length is no less than `page_size`
-      const auto prefix_length = align(node->diff_key(key, page_size));
+      const auto prefix_length = align(node->diff_key(key, page_size) + page_size);
       total_prefix_length += prefix_length;
 
       // split the node if the prefix is not the whole token vector
@@ -139,17 +138,21 @@ struct RadixTree::Impl {
       }
 
       // we have matched the whole key, continue to the next node
+      node->access(now);
       key = key.subspan(prefix_length);
     }
 
     return {node, total_prefix_length};
   }
 
-  std::vector<TreeNode*> collect_leaves_host() {
+  std::vector<TreeNode*> collect_leaves_host() const {
     std::vector<TreeNode*> leaves;
-    std::vector<TreeNode*> stack = {&m_root};
+    std::vector<TreeNode*> stack = {};
+    for (const auto& [_, child] : m_root) {
+      stack.push_back(child.get());
+    }
     while (!stack.empty()) {
-      auto* node = stack.back();
+      const auto node = stack.back();
       stack.pop_back();
       if (node->is_leaf_host()) {
         if (node->ref_count == 0) {
@@ -164,47 +167,29 @@ struct RadixTree::Impl {
     return leaves;
   }
 
-  std::vector<TreeNode*> collect_leaves_device() {
+  std::vector<TreeNode*> collect_leaves_device() const {
     // for non-hicache, every leaf device node is a leaf host node (since no backup on host)
     if (!use_hicache) return collect_leaves_host();
     std::vector<TreeNode*> leaves;
     std::vector<TreeNode*> stack = {};
-    // because root is not on GPU, we start from its children
     for (const auto& [_, child] : m_root) {
       stack.push_back(child.get());
     }
     while (!stack.empty()) {
-      auto* node = stack.back();
+      const auto node = stack.back();
       stack.pop_back();
       if (!node->on_gpu()) continue;  // skip nodes that are not on GPU
       if (node->is_leaf_device()) {
-        if (node->ref_count == 0) leaves.push_back(node);
-      } else {  // if node is not on GPU, don't
+        if (node->ref_count == 0) {
+          leaves.push_back(node);
+        }
+      } else {
         for (const auto& [_, child] : *node) {
           stack.push_back(child.get());
         }
       }
     }
     return leaves;
-  }
-
-  template <typename F>
-  void walk_to_root(TreeNode* t, const F& f) {
-    _assert(t != nullptr, "Cannot walk to root from a null node");
-    while (!t->is_root()) {
-      f(t);
-      t = t->parent();
-    }
-  }
-
-  template <typename F>
-  TreeNode* walk_to_device(TreeNode* t, const F& f) {
-    _assert(t != nullptr, "Cannot walk to root from a null node");
-    while (!t->is_root() && !t->on_gpu()) {
-      f(t);
-      t = t->parent();
-    }
-    return t;  // return the first non-evicted node or the root node
   }
 
   void lock_ref(TreeNode* node, bool increment) {
@@ -241,9 +226,9 @@ struct RadixTree::Impl {
     return lock_ref(node, /*increment=*/false);
   }
 
-  std::size_t total_size() {
+  std::size_t total_size() const {
     std::size_t size = 0;
-    std::vector<TreeNode*> stack = {&m_root};
+    std::vector<const TreeNode*> stack = {&m_root};
     while (!stack.empty()) {
       auto* node = stack.back();
       stack.pop_back();
@@ -266,7 +251,7 @@ struct RadixTree::Impl {
     return (size / page_size) * page_size;  // align to page size
   }
 
-  TreeNode* id2node(NodeHandle node_id) {
+  TreeNode* id2node(NodeHandle node_id) const {
     auto it = m_node_map.find(node_id);
     _assert(it != m_node_map.end(), "Node not found in the map");
     return it->second;
