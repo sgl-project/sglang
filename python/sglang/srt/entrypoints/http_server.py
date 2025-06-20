@@ -39,6 +39,7 @@ import requests
 import uvicorn
 import uvloop
 from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
@@ -165,6 +166,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Custom exception handlers to change validation error status codes
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Override FastAPI's default 422 validation error with 400"""
+    return ORJSONResponse(
+        status_code=400,
+        content={
+            "detail": exc.errors(),
+            "body": exc.body,
+        },
+    )
+
 
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 
