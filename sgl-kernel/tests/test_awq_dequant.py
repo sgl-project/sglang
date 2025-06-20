@@ -5,6 +5,13 @@ import pytest
 import torch
 from sgl_kernel import awq_dequantize
 
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.xpu.is_available():
+    device = torch.device("xpu")
+else:
+    device = torch.device("cpu")
+
 
 def reverse_awq_order(t: torch.Tensor):
     bits = 4
@@ -76,7 +83,6 @@ def sglang_awq_dequantize(
 def test_awq_dequant_compare_implementations(
     qweight_row: int, qweight_col: int, is_bf16_act: bool
 ):
-    device = torch.device("cuda")
     qweight = torch.randint(
         0,
         torch.iinfo(torch.int32).max,
