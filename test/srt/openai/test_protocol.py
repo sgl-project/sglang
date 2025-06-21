@@ -632,6 +632,51 @@ class TestStreamingModels(unittest.TestCase):
         self.assertEqual(response.choices[0].delta.content, "Hello")
 
 
+class TestModelSerialization(unittest.TestCase):
+    """Test model serialization with hidden states"""
+
+    def test_hidden_states_excluded_when_none(self):
+        """Test that None hidden_states are excluded with exclude_none=True"""
+        choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content="Hello"),
+            finish_reason="stop",
+            hidden_states=None,
+        )
+
+        response = ChatCompletionResponse(
+            id="test-id",
+            model="test-model",
+            choices=[choice],
+            usage=UsageInfo(prompt_tokens=5, completion_tokens=1, total_tokens=6),
+        )
+
+        # Test exclude_none serialization (should exclude None hidden_states)
+        data = response.model_dump(exclude_none=True)
+        self.assertNotIn("hidden_states", data["choices"][0])
+
+    def test_hidden_states_included_when_not_none(self):
+        """Test that non-None hidden_states are included"""
+        choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content="Hello"),
+            finish_reason="stop",
+            hidden_states=[0.1, 0.2, 0.3],
+        )
+
+        response = ChatCompletionResponse(
+            id="test-id",
+            model="test-model",
+            choices=[choice],
+            usage=UsageInfo(prompt_tokens=5, completion_tokens=1, total_tokens=6),
+        )
+
+        # Test exclude_none serialization (should include non-None hidden_states)
+        data = response.model_dump(exclude_none=True)
+        self.assertIn("hidden_states", data["choices"][0])
+        self.assertEqual(data["choices"][0]["hidden_states"], [0.1, 0.2, 0.3])
+
+
 class TestValidationEdgeCases(unittest.TestCase):
     """Test edge cases and validation scenarios"""
 
