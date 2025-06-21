@@ -18,14 +18,16 @@ import random
 from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
 # This can prevent the server from being too conservative.
@@ -265,7 +267,7 @@ class PrefillAdder:
         self,
         page_size: int,
         tree_cache: BasePrefixCache,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         running_batch: ScheduleBatch,
         new_token_ratio: float,
         rem_input_tokens: int,

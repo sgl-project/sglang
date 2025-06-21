@@ -26,7 +26,6 @@ KVCache actually holds the physical kv cache.
 
 import abc
 import logging
-import os
 from contextlib import nullcontext
 from typing import List, Optional, Tuple, Union
 
@@ -156,84 +155,6 @@ class KVCache(abc.ABC):
 
     def register_layer_transfer_counter(self, layer_transfer_counter):
         self.layer_transfer_counter = layer_transfer_counter
-
-
-class TokenToKVPoolAllocator:
-    """An allocator managing the indices to kv cache data."""
-
-    def __init__(
-        self,
-        size: int,
-        dtype: torch.dtype,
-        device: str,
-        kvcache: KVCache,
-    ):
-        self.size = size
-        self.dtype = dtype
-        self.device = device
-        self.page_size = 1
-
-        self.free_slots = None
-        self.is_not_in_free_group = True
-        self.free_group = []
-        self.clear()
-
-        self._kvcache = kvcache
-
-    def available_size(self):
-        return len(self.free_slots)
-
-    def debug_print(self) -> str:
-        return ""
-
-    def get_kvcache(self):
-        return self._kvcache
-
-    def alloc(self, need_size: int):
-        if need_size > len(self.free_slots):
-            return None
-
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
-        return select_index
-
-    def free(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
-            return
-
-        if self.is_not_in_free_group:
-            self.free_slots = torch.cat((self.free_slots, free_index))
-        else:
-            self.free_group.append(free_index)
-
-    def free_group_begin(self):
-        self.is_not_in_free_group = False
-        self.free_group = []
-
-    def free_group_end(self):
-        self.is_not_in_free_group = True
-        if self.free_group:
-            self.free(torch.cat(self.free_group))
-
-    def backup_state(self):
-        return self.free_slots
-
-    def restore_state(self, free_slots):
-        self.free_slots = free_slots
-
-    def clear(self):
-        # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.free_slots = torch.arange(
-            1, self.size + 1, dtype=torch.int64, device=self.device
-        )
-        self.is_not_in_free_group = True
-        self.free_group = []
-
-    def get_cpu_copy(self, indices):
-        return self._kvcache.get_cpu_copy(indices)
-
-    def load_cpu_copy(self, kv_cache_cpu, indices):
-        return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
 
 
 class MHATokenToKVPool(KVCache):
