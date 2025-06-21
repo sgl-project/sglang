@@ -23,7 +23,9 @@ static NodeHandle node2id(TreeNode* node) {
 }
 
 // compare function for the TreeNode pointers based on their time
-static constexpr auto cmp = [](TreeNode* lhs, TreeNode* rhs) { return lhs->time() < rhs->time(); };
+// we use LRU, so we want to evict the least recently used nodes
+// since std::priority_queue is a max-heap, we need to reverse the comparison
+static constexpr auto cmp = [](TreeNode* lhs, TreeNode* rhs) { return lhs->time() > rhs->time(); };
 
 RadixTree::RadixTree(bool disabled, std::optional<std::size_t> host_size, std::size_t page_size, std::size_t threshold)
     : m_impl(std::make_unique<Impl>(disabled, host_size.has_value(), page_size, host_size.value_or(0), threshold)) {}
