@@ -21,7 +21,7 @@ class BaseReasoningFormatDetector:
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
-        self._in_reasoning = self._force_in_reasoning = force_reasoning
+        self._in_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
 
         self._buffer = ""
@@ -32,9 +32,7 @@ class BaseReasoningFormatDetector:
         One-time parsing: Detects and parses reasoning sections in the provided text.
         Returns both reasoning content and normal text separately.
         """
-        in_reasoning = self._force_in_reasoning or text.startswith(
-            self.think_start_token
-        )
+        in_reasoning = self._in_reasoning or text.startswith(self.think_start_token)
 
         if not in_reasoning:
             return StreamingParseResult(normal_text=text)
@@ -75,9 +73,7 @@ class BaseReasoningFormatDetector:
             self._in_reasoning = True
 
         # Handle end of reasoning block
-        if (
-            self._force_in_reasoning or self._in_reasoning
-        ) and self.think_end_token in current_text:
+        if self._in_reasoning and self.think_end_token in current_text:
             end_idx = current_text.find(self.think_end_token)
 
             reasoning_text = current_text[:end_idx]
@@ -100,7 +96,7 @@ class BaseReasoningFormatDetector:
                 return StreamingParseResult()
 
         # If we're not in a reasoning block return as normal text
-        if not self._force_in_reasoning:
+        if not self._in_reasoning:
             self._buffer = ""
             return StreamingParseResult(normal_text=new_text)
 
