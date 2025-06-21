@@ -1,5 +1,4 @@
 import itertools
-import random
 
 import pytest
 import torch
