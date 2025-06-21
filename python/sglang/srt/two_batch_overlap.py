@@ -34,7 +34,7 @@ def get_token_num_per_seq(
     if forward_mode.is_target_verify():
         assert spec_info is not None
         return spec_info.draft_token_num
-    elif forward_mode.is_decode():
+    elif forward_mode.is_decode() or forward_mode.is_idle():
         return 1
     else:
         # For extend, we should not use `token_num_per_seq`.
