@@ -192,6 +192,17 @@ async def v1_score_request(raw_request: Request):
     pass
 
 
+@app.api_route("/v1/models/{model_id}", methods=["GET"])
+async def show_model_detail(model_id: str):
+    served_model_name = app.state.tokenizer_manager.served_model_name
+
+    return ModelCard(
+        id=served_model_name,
+        root=served_model_name,
+        max_model_len=app.state.tokenizer_manager.model_config.context_len,
+    )
+
+
 # Additional API endpoints will be implemented in separate serving_*.py modules
 # and mounted as APIRouters in future PRs
 
