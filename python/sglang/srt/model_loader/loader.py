@@ -145,20 +145,11 @@ def _initialize_model(
     load_config: LoadConfig,
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
-    model_class, model_arch = get_model_architecture(model_config)
+    model_class, _ = get_model_architecture(model_config)
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
     quant_config = _get_quantization_config(
         model_config, load_config, packed_modules_mapping
     )
-    if (
-        quant_config is not None
-        and quant_config.get_name() == "modelopt_fp4"
-        and model_arch == "DeepseekV3ForCausalLMNextN"
-    ):
-        logger.warning(
-            "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
-        )
-        quant_config = None
     return model_class(
         config=model_config.hf_config,
         quant_config=quant_config,
