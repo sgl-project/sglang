@@ -96,6 +96,12 @@ __global__ void moe_align_block_size_kernel(
       expert_ids[i / block_size] = threadIdx.x;
     }
   }
+
+  int32_t fill_val = static_cast<int32_t>(numel);
+  int32_t total = *total_tokens_post_pad;
+  for (int32_t idx = tid; idx < total; idx += stride) {
+    sorted_token_ids[idx] = fill_val;
+  }
 }
 
 template <typename scalar_t>
@@ -148,6 +154,14 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
       expert_ids[i / block_size] = threadIdx.x;
     }
   }
+
+  int32_t fill_val = static_cast<int32_t>(numel);
+  int32_t total = *total_tokens_post_pad;
+  for (int32_t idx = tid; idx < total; idx += stride) {
+    sorted_token_ids[idx] = fill_val;
+  }
+
+  __syncthreads();
 
   for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i];
