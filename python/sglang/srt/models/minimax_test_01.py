@@ -270,7 +270,3 @@ class MiniMaxText01MoE(nn.Module):
             hidden_states, router_logits_fp32.to(hidden_states.dtype))
         final_hidden = final_hidden_states.view(num_tokens, hidden_size)
         return final_hidden 
-    
-
-
-    
