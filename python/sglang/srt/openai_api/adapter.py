@@ -1481,6 +1481,12 @@ def v1_chat_generate_response(
 
         choices.append(choice_data)
 
+    meta_info = {
+        "spec_verify_ct": [
+            ret_item["meta_info"].get("spec_verify_ct", 0) for ret_item in ret
+        ]
+    }
+
     if to_file:
         responses = []
 
@@ -1504,6 +1510,7 @@ def v1_chat_generate_response(
                         + ret[i]["meta_info"]["completion_tokens"],
                     },
                     "system_fingerprint": None,
+                    "meta_info": meta_info,
                 },
             }
             responses.append(response)
@@ -1527,6 +1534,7 @@ def v1_chat_generate_response(
                     {"cached_tokens": cached_tokens} if cache_report else None
                 ),
             ),
+            meta_info=meta_info,
         )
         return response
 
