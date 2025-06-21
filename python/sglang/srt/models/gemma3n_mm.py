@@ -331,6 +331,9 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             prefix=add_prefix("language_model", prefix),
         )
 
+        # Create logits processor for the multimodal model
+        self.logits_processor = LogitsProcessor(config.text_config)
+
         # if self.language_model.logits_processor.logit_scale:
         #     logit_scale = getattr(config, "logit_scale", 1.0)
         #     self.language_model.logits_processor.logit_scale *= logit_scale
@@ -402,8 +405,10 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
                 pixel_value = pixel_value.to(
                     device=self.vision_tower.device, dtype=self.language_model.dtype()
                 )
-                vision_output = self.vision_tower(pixel_values=pixel_value)
-                vision_outputs_list.append(vision_output)
+                vision_outputs = self.vision_tower(
+                    pixel_values=pixel_value, do_pooling=False, return_dict=True
+                ).last_hidden_state
+                vision_outputs_list.append(vision_outputs)
 
         # Concatenate all vision outputs
         vision_outputs = torch.cat(vision_outputs_list, dim=0)
@@ -508,41 +513,22 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         if per_layer_inputs is None and input_ids is not None:
             per_layer_inputs = self.get_per_layer_inputs(input_ids)
 
-        # Handle multimodal embeddings
-        if input_embeds is None:
-            # Text embeddings
-            text_input_ids = torch.where(input_ids < self.vocab_size, input_ids, 0)
-            inputs_embeds = self.get_input_embeddings()(text_input_ids)
-
-            # Vision embeddings
-            vision_embeds = self.embed_vision(input_ids=input_ids)
-            inputs_embeds = torch.where(
-                input_ids[..., None] < self.embed_vision.vocab_offset,
-                inputs_embeds,
-                vision_embeds,
-            )
-
-            # Audio embeddings
-            audio_embeds = self.embed_audio(input_ids=input_ids)
-            inputs_embeds = torch.where(
-                input_ids[..., None] < self.embed_audio.vocab_offset,
-                inputs_embeds,
-                audio_embeds,
-            )
-
         # Use general_mm_embed_routine for handling multimodal data
-        hs = general_mm_embed_routine(
-            input_ids=None,  # We already handled embeddings above
+        # This will automatically handle text, image, and audio embeddings
+        hidden_states = general_mm_embed_routine(
+            input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
             image_data_embedding_func=self.get_image_feature,
             audio_data_embedding_func=self.get_audio_feature,
             positions=positions,
-            input_embeds=inputs_embeds,
             per_layer_inputs=per_layer_inputs,
         )
 
-        return hs
+        # Process hidden states through logits processor
+        return self.logits_processor(
+            input_ids, hidden_states, self.language_model.embed_tokens, forward_batch
+        )
 
     def tie_weights(self):
         return self.language_model.tie_weights()

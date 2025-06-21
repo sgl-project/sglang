@@ -45,7 +45,7 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
             r"<start_of_audio>(?:(?:<audio_soft_token>)*<end_of_audio>)?"
         )
 
-        self.IMAGE_TOKEN_ID = hf_config.image_token_id
+        self.IM_TOKEN_ID = hf_config.image_token_id
         self.IM_START_TOKEN_ID = hf_config.boi_token_id
         self.IM_END_TOKEN_ID = hf_config.eoi_token_id
 
@@ -78,6 +78,7 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
             prompt=input_text,
             image_data=image_data,
             audio_data=audio_data,
+            max_req_input_len=max_req_input_len,
             multimodal_tokens=MultimodalSpecialTokens(
                 image_token=self.IMAGE_TOKEN,
                 image_token_regex=self.IMAGE_TOKEN_REGEX,

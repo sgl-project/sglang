@@ -884,6 +884,12 @@ class Gemma3nTextModel(PreTrainedModel):
 
         self.post_init()
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
+
+    def dtype(self) -> torch.dtype:
+        return next(self.parameters()).dtype
+
     def get_per_layer_inputs(self, input_ids: torch.LongTensor) -> torch.Tensor:
         per_layer_inputs_mask = torch.logical_and(
             input_ids >= 0, input_ids < self.vocab_size
