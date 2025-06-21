@@ -349,7 +349,7 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-        if not _is_cuda:
+        if not _is_cuda and not _use_aiter:
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
