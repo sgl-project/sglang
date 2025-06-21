@@ -38,7 +38,7 @@ import orjson
 import requests
 import uvicorn
 import uvloop
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import Depends, FastAPI, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -179,6 +179,22 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "body": exc.body,
         },
     )
+
+
+async def validate_json_request(raw_request: Request):
+    """Validate that the request content-type is application/json."""
+    content_type = raw_request.headers.get("content-type", "").lower()
+    media_type = content_type.split(";", maxsplit=1)[0]
+    if media_type != "application/json":
+        raise RequestValidationError(
+            errors=[
+                {
+                    "loc": ["header", "content-type"],
+                    "msg": "Unsupported Media Type: Only 'application/json' is allowed",
+                    "type": "value_error",
+                }
+            ]
+        )
 
 
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
@@ -363,7 +379,9 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         return _create_error_response(e)
 
 
-@app.api_route("/v1/rerank", methods=["POST", "PUT"])
+@app.api_route(
+    "/v1/rerank", methods=["POST", "PUT"], dependencies=[Depends(validate_json_request)]
+)
 async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
     """Endpoint for reranking documents based on query relevance."""
     return await raw_request.app.state.openai_serving_rerank.handle_request(
@@ -651,7 +669,7 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
 ##### OpenAI-compatible API endpoints #####
 
 
-@app.post("/v1/completions")
+@app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
     return await raw_request.app.state.openai_serving_completion.handle_request(
@@ -659,7 +677,7 @@ async def openai_v1_completions(request: CompletionRequest, raw_request: Request
     )
 
 
-@app.post("/v1/chat/completions")
+@app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
@@ -669,7 +687,11 @@ async def openai_v1_chat_completions(
     )
 
 
-@app.post("/v1/embeddings", response_class=ORJSONResponse)
+@app.post(
+    "/v1/embeddings",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
 async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     """OpenAI-compatible embeddings endpoint."""
     return await raw_request.app.state.openai_serving_embedding.handle_request(
@@ -738,7 +760,7 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     return ORJSONResponse({"predictions": ret})
 
 
-@app.post("/v1/score")
+@app.post("/v1/score", dependencies=[Depends(validate_json_request)])
 async def v1_score_request(request: ScoringRequest, raw_request: Request):
     """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
     return await raw_request.app.state.openai_serving_score.handle_request(
