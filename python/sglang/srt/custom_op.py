@@ -1,9 +1,10 @@
 from torch import nn
 
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_hpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_hpu = is_hpu()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
@@ -77,6 +78,8 @@ class CustomOp(nn.Module):
             return self.forward_cuda
         elif _is_hip:
             return self.forward_hip
+        elif _is_hpu:
+            return self.forward_hpu
         elif _is_cpu and _is_cpu_amx_available:
             return self.forward_cpu
         else:

@@ -26,11 +26,13 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_hpu,
     is_npu,
 )
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_hpu = is_hpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -214,7 +216,9 @@ class Gemma3RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-if not (_is_cuda or _is_hip or _is_npu or (_is_cpu and _is_cpu_amx_available)):
+if not (
+    _is_cuda or _is_hip or _is_hpu or _is_npu or (_is_cpu and _is_cpu_amx_available)
+):
     logger.info(
         "sgl-kernel layernorm implementation is not available on current platform. Fallback to other kernel libraries."
     )

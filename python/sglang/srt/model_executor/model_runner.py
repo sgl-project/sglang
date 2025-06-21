@@ -78,10 +78,14 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.paged_allocator import (
+    HeapPagedTokenToKVPoolAllocator,
+    PagedTokenToKVPoolAllocator,
+)
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.hpu_graph_runner import HPUGraphRunner
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -104,6 +108,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
+    is_hpu,
     is_no_spec_infer_or_topk_one,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
@@ -111,6 +116,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
 )
 
+_is_hpu = is_hpu()
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 
@@ -291,6 +297,9 @@ class ModelRunner:
             self.init_cublas()
             self.init_attention_backend()
             self.init_cuda_graphs()
+        elif self.device == "hpu":
+            self.init_attention_backend()
+            self.cuda_graph_runner = HPUGraphRunner(self)
         else:
             self.cuda_graph_runner = None
             self.init_attention_backend()
@@ -1003,13 +1012,22 @@ class ModelRunner:
                     kvcache=self.token_to_kv_pool,
                 )
             else:
-                self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
-                    device=self.device,
-                    kvcache=self.token_to_kv_pool,
-                )
+                if _is_hpu:
+                    self.token_to_kv_pool_allocator = HeapPagedTokenToKVPoolAllocator(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                    )
+                else:
+                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                    )
         else:
             assert self.is_draft_worker
 
@@ -1077,6 +1095,10 @@ class ModelRunner:
             )
 
             return TorchNativeAttnBackend(self)
+        elif self.server_args.attention_backend == "hpu_attn_backend":
+            from sglang.srt.layers.attention.hpu_attn_backend import HPUAttnBackend
+
+            return HPUAttnBackend(self)
         elif self.server_args.attention_backend == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
