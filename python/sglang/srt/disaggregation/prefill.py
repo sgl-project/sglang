@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import require_mlp_sync
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -274,12 +275,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
 
-            # Handle DP attention
-            if (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            ):
-                batch, _ = self.prepare_dp_attn_batch(batch)
+            if require_mlp_sync(self.server_args):
+                batch, _ = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
 
             if batch:
@@ -312,12 +309,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
 
-            # Handle DP attention
-            if (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            ):
-                batch, _ = self.prepare_dp_attn_batch(batch)
+            if require_mlp_sync(self.server_args):
+                batch, _ = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
             if batch:
                 result = self.run_batch(batch)

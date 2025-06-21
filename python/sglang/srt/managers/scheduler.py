@@ -149,6 +149,8 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
+    require_mlp_sync,
+    require_mlp_tp_gather,
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
@@ -558,7 +560,11 @@ class Scheduler(
                 self.tree_cache = HiRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_cache_group=self.tp_cpu_group,
+                    tp_cache_group=(
+                        self.attn_tp_cpu_group
+                        if self.server_args.enable_dp_attention
+                        else self.tp_cpu_group
+                    ),
                     page_size=self.page_size,
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
@@ -808,11 +814,28 @@ class Scheduler(
                             result.next_token_ids,
                             result.bid,
                         )
-                        pp_outputs = PPProxyTensors(
-                            {
-                                "next_token_ids": next_token_ids,
-                            }
-                        )
+                        if self.cur_batch.return_logprob:
+                            pp_outputs = PPProxyTensors(
+                                {
+                                    "next_token_ids": next_token_ids,
+                                    "extend_input_len_per_req": result.extend_input_len_per_req,
+                                    "extend_logprob_start_len_per_req": result.extend_logprob_start_len_per_req,
+                                }
+                                | (
+                                    {
+                                        f"logits_output.{k}": v
+                                        for k, v in result.logits_output.__dict__.items()
+                                    }
+                                    if result.logits_output is not None
+                                    else {}
+                                )
+                            )
+                        else:
+                            pp_outputs = PPProxyTensors(
+                                {
+                                    "next_token_ids": next_token_ids,
+                                }
+                            )
                         # send the output from the last round to let the next stage worker run post processing
                         self.pp_group.send_tensor_dict(
                             pp_outputs.tensors,
@@ -829,12 +852,25 @@ class Scheduler(
                         )
                     )
                     mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
+                    logits_output_args = {
+                        k[len("logits_output.") :]: v
+                        for k, v in next_pp_outputs.tensors.items()
+                        if k.startswith("logits_output.")
+                    }
+                    if len(logits_output_args) > 0:
+                        logits_output = LogitsProcessorOutput(**logits_output_args)
+                    else:
+                        logits_output = None
                     output_result = GenerationBatchResult(
-                        logits_output=None,
+                        logits_output=logits_output,
                         pp_hidden_states_proxy_tensors=None,
                         next_token_ids=next_pp_outputs["next_token_ids"],
-                        extend_input_len_per_req=None,
-                        extend_logprob_start_len_per_req=None,
+                        extend_input_len_per_req=next_pp_outputs.tensors.get(
+                            "extend_input_len_per_req", None
+                        ),
+                        extend_logprob_start_len_per_req=next_pp_outputs.tensors.get(
+                            "extend_logprob_start_len_per_req", None
+                        ),
                         bid=bids[next_mb_id],
                         can_run_cuda_graph=result.can_run_cuda_graph,
                     )
@@ -1363,29 +1399,6 @@ class Scheduler(
             self.metrics_collector.log_stats(self.stats)
         self._publish_kv_events()
 
-    def coordinate_spec_dp_attn_batch(self, new_batch: Optional[ScheduleBatch]):
-        """Coordinate the DP attention batch."""
-
-        local_info = torch.tensor(
-            [
-                (new_batch is not None),
-            ],
-            dtype=torch.int64,
-        )
-        global_info = torch.empty(
-            (self.server_args.dp_size, self.attn_tp_size, 1),
-            dtype=torch.int64,
-        )
-        torch.distributed.all_gather_into_tensor(
-            global_info.flatten(),
-            local_info,
-            group=self.tp_cpu_group,
-        )
-        any_new_batch = any(
-            global_info[:, 0, 0].tolist()
-        )  # Any DP worker has forward batch
-        return any_new_batch
-
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
@@ -1420,13 +1433,15 @@ class Scheduler(
 
         new_batch = self.get_new_batch_prefill()
 
-        # TODO(ch-wan): minor refactor is needed here to improve readability
-        any_new_batch = (
-            self.server_args.enable_dp_attention
-            and not self.spec_algorithm.is_none()
-            and self.coordinate_spec_dp_attn_batch(new_batch)
-        )
-        if new_batch is not None or any_new_batch:
+        need_dp_attn_preparation = require_mlp_sync(self.server_args)
+
+        if need_dp_attn_preparation and not self.spec_algorithm.is_none():
+            # In speculative decoding, prefill batches and decode batches cannot be processed in the same DP attention group.
+            # We prepare idle batches in advance to skip preparing decode batches when there are prefill batches in the group.
+            new_batch, _ = self.prepare_mlp_sync_batch(new_batch)
+            need_dp_attn_preparation = new_batch is None
+
+        if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
         else:
@@ -1438,8 +1453,8 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention
-        if self.server_args.enable_dp_attention or self.server_args.enable_sp_layernorm:
-            ret, _ = self.prepare_dp_attn_batch(ret)
+        if need_dp_attn_preparation:
+            ret, _ = self.prepare_mlp_sync_batch(ret)
 
         return ret
 
@@ -1741,12 +1756,11 @@ class Scheduler(
             self.return_health_check_ct -= 1
             self.send_to_tokenizer.send_pyobj(HealthCheckOutput())
 
-    def prepare_dp_attn_batch(self, local_batch: ScheduleBatch):
-        return self.prepare_dp_attn_batch_raw(
+    def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
+        return self.prepare_mlp_sync_batch_raw(
             local_batch,
             dp_size=self.server_args.dp_size,
             attn_tp_size=self.attn_tp_size,
-            moe_dense_tp_size=self.server_args.moe_dense_tp_size,
             tp_cpu_group=self.tp_cpu_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
@@ -1755,14 +1769,14 @@ class Scheduler(
             enable_two_batch_overlap=self.server_args.enable_two_batch_overlap,
             enable_deepep_moe=self.server_args.enable_deepep_moe,
             deepep_mode=DeepEPMode[self.server_args.deepep_mode],
+            require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
         )
 
     @staticmethod
-    def prepare_dp_attn_batch_raw(
+    def prepare_mlp_sync_batch_raw(
         local_batch: ScheduleBatch,
         dp_size,
         attn_tp_size: int,
-        moe_dense_tp_size: Optional[int],
         tp_cpu_group,
         get_idle_batch,
         disable_cuda_graph: bool,
@@ -1771,6 +1785,7 @@ class Scheduler(
         enable_two_batch_overlap: bool,
         enable_deepep_moe: bool,
         deepep_mode: DeepEPMode,
+        require_mlp_tp_gather: bool,
     ):
         # Check if other DP workers have running batches
         if local_batch is None:
@@ -1845,7 +1860,7 @@ class Scheduler(
 
         if local_batch is not None:
             # TODO: handle the case when moe_dense_tp_size != 1
-            if moe_dense_tp_size == 1 and global_server_args_dict["enable_dp_lm_head"]:
+            if not require_mlp_tp_gather:
                 local_batch.global_num_tokens = [num_tokens]
                 local_batch.global_num_tokens_for_logprob = [num_tokens_for_logprob]
             else:
