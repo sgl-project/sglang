@@ -2,7 +2,7 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -37,7 +37,7 @@ class OpenAIServingBase(ABC):
 
             # Convert to internal format
             adapted_request, processed_request = self._convert_to_internal_request(
-                request, self._generate_request_id_base(request)
+                request
             )
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
@@ -74,10 +74,7 @@ class OpenAIServingBase(ABC):
     def _convert_to_internal_request(
         self,
         request: OpenAIServingRequest,
-        request_id: str,
-    ) -> tuple[
-        GenerateReqInput, Union[OpenAIServingRequest, List[OpenAIServingRequest]]
-    ]:
+    ) -> tuple[GenerateReqInput, OpenAIServingRequest]:
         """Convert OpenAI request to internal format"""
         pass
 
@@ -116,33 +113,6 @@ class OpenAIServingBase(ABC):
     def _validate_request(self, request: OpenAIServingRequest) -> Optional[str]:
         """Validate request"""
         pass
-
-    def _calculate_streaming_usage_base(
-        self,
-        prompt_tokens: Dict[int, int],
-        completion_tokens: Dict[int, int],
-        cached_tokens: Dict[int, int],
-        n_choices: int,
-    ) -> UsageInfo:
-        """Calculate usage information for streaming responses (common logic)"""
-        total_prompt_tokens = sum(
-            tokens for i, tokens in prompt_tokens.items() if i % n_choices == 0
-        )
-        total_completion_tokens = sum(tokens for tokens in completion_tokens.values())
-
-        cache_report = self.tokenizer_manager.server_args.enable_cache_report
-        prompt_tokens_details = None
-        if cache_report:
-            cached_tokens_sum = sum(tokens for tokens in cached_tokens.values())
-            if cached_tokens_sum > 0:
-                prompt_tokens_details = {"cached_tokens": cached_tokens_sum}
-
-        return UsageInfo(
-            prompt_tokens=total_prompt_tokens,
-            completion_tokens=total_completion_tokens,
-            total_tokens=total_prompt_tokens + total_completion_tokens,
-            prompt_tokens_details=prompt_tokens_details,
-        )
 
     def create_error_response(
         self,

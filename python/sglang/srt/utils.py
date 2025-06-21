@@ -2303,6 +2303,51 @@ class Withable(Generic[T]):
             self._value = None
 
 
+def require_mlp_tp_gather(server_args):
+    """
+    Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
+    """
+    if server_args.enable_dp_attention:
+        assert server_args.dp_size > 1, "dp_size must be greater than 1"
+        if (
+            server_args.moe_dense_tp_size is None
+        ):  # TODO(ch-wan): some MoE models do not have dense layers
+            return True
+        elif not server_args.enable_dp_lm_head:
+            return True
+        elif not server_args.enable_deepep_moe:
+            return True
+        else:
+            return (
+                server_args.moe_dense_tp_size
+                > server_args.tp_size // server_args.dp_size
+            )
+    else:
+        return False
+
+
+def require_attn_tp_gather(server_args):
+    """
+    Check if the input of attention is scattered.
+    """
+    assert server_args.moe_dense_tp_size in [1, None]
+    if server_args.enable_deepep_moe or server_args.moe_dense_tp_size == 1:
+        if server_args.enable_dp_attention:
+            return server_args.dp_size < server_args.tp_size
+        else:
+            return True
+    else:
+        return False
+
+
+def require_gathered_buffer(server_args):
+    return require_mlp_tp_gather(server_args) or require_attn_tp_gather(server_args)
+
+
+def require_mlp_sync(server_args):
+    return server_args.enable_dp_attention or require_gathered_buffer(server_args)
+
+
 def merge_bias_tensor(
     lhs: Optional[torch.Tensor],
     rhs: Optional[torch.Tensor],
