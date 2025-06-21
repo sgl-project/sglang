@@ -87,7 +87,7 @@ _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT")
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_hip:
-    from aiter import ActivationType, QuantType
+    from aiter import ActivationType, QuantType, biased_grouped_topk
     from aiter.fused_moe import fused_moe
     from aiter.fused_moe_bf16_asm import asm_moe, ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
@@ -957,19 +957,40 @@ class Fp8MoEMethod:
         from sglang.srt.layers.moe.topk import select_experts
 
         # Expert selection
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
+        if (
+            _use_aiter
+            and correction_bias is not None
+            and hasattr(layer, "non_shared_topk_weights")
+            and hasattr(layer, "non_shared_topk_ids")
+        ):
+            token = x.shape[0]
+            biased_grouped_topk(
+                router_logits,
+                correction_bias,
+                layer.non_shared_topk_weights[:token],
+                layer.non_shared_topk_ids[:token],
+                num_expert_group,
+                topk_group,
+                renormalize,
+            )
+
+            topk_ids = layer.non_shared_topk_ids[:token]
+            topk_weights = layer.non_shared_topk_weights[:token]
+
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                num_fused_shared_experts=num_fused_shared_experts,
+                custom_routing_function=custom_routing_function,
+                correction_bias=correction_bias,
+                routed_scaling_factor=routed_scaling_factor,
+            )
 
         if _is_hip:
             ret = self.maybe_apply_hip_fused_experts(
