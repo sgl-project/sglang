@@ -455,15 +455,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 stream_buffers[index] = stream_buffer + delta
 
                 # Handle reasoning content
-                enable_thinking = False
-                if request.chat_template_kwargs is not None:
-                    enable_thinking = request.chat_template_kwargs.get(
-                        "enable_thinking", False
-                    )
                 if (
                     self.tokenizer_manager.server_args.reasoning_parser
                     and request.separate_reasoning
-                    and enable_thinking
                 ):
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
@@ -643,13 +637,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle reasoning content
             reasoning_text = None
-            enable_thinking = False
-            if request.chat_template_kwargs is not None:
-                enable_thinking = request.chat_template_kwargs.get(
-                    "enable_thinking", False
-                )
             reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
-            if reasoning_parser and request.separate_reasoning and enable_thinking:
+            if reasoning_parser and request.separate_reasoning:
                 try:
                     parser = ReasoningParser(
                         model_type=reasoning_parser, stream_reasoning=False
@@ -821,6 +810,25 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
+
+    def _get_enable_thinking_from_request(request: ChatCompletionRequest) -> bool:
+        """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
+
+        NOTE: This parameter is only useful for models that support enable_thinking
+        flag, such as Qwen3.
+
+        Args:
+            request_obj: The request object (or an item from a list of requests).
+        Returns:
+            The boolean value of 'enable_thinking' if found and not True, otherwise True.
+        """
+        if (
+            hasattr(request, "chat_template_kwargs")
+            and request.chat_template_kwargs
+            and request.chat_template_kwargs.get("enable_thinking") is not None
+        ):
+            return request.chat_template_kwargs.get("enable_thinking")
+        return True
 
     async def _process_tool_call_stream(
         self,
