@@ -114,7 +114,7 @@ class BaseFormatDetector(ABC):
             self.has_tool_call(current_text)
             or (
                 self.current_tool_id > 0
-                and current_text.startswith(self.tool_call_separator + "{")
+                and current_text.startswith(self.tool_call_separator)
             )
         ):
             # Only clear buffer if we're sure no tool call is starting
