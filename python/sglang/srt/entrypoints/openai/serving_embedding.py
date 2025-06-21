@@ -79,11 +79,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
             prompt_kwargs = {"text": prompt}
         elif isinstance(prompt, list):
             if len(prompt) > 0 and isinstance(prompt[0], str):
-                # List of strings - if it's a single string in a list, treat as single string
-                if len(prompt) == 1:
-                    prompt_kwargs = {"text": prompt[0]}
-                else:
-                    prompt_kwargs = {"text": prompt}
+                prompt_kwargs = {"text": prompt}
             elif len(prompt) > 0 and isinstance(prompt[0], MultimodalEmbeddingInput):
                 # Handle multimodal embedding inputs
                 texts = []

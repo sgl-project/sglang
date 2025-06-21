@@ -535,6 +535,31 @@ class TestOpenAIEmbedding(CustomTestCase):
         self.assertTrue(len(response.data[0].embedding) > 0)
         self.assertTrue(len(response.data[1].embedding) > 0)
 
+    def test_embedding_single_batch_str(self):
+        """Test embedding with a List[str] and length equals to 1"""
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response = client.embeddings.create(model=self.model, input=["Hello world"])
+        self.assertEqual(len(response.data), 1)
+        self.assertTrue(len(response.data[0].embedding) > 0)
+
+    def test_embedding_single_int_list(self):
+        """Test embedding with a List[int] or List[List[int]]]"""
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response = client.embeddings.create(
+            model=self.model,
+            input=[[15339, 314, 703, 284, 612, 262, 10658, 10188, 286, 2061]],
+        )
+        self.assertEqual(len(response.data), 1)
+        self.assertTrue(len(response.data[0].embedding) > 0)
+
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response = client.embeddings.create(
+            model=self.model,
+            input=[15339, 314, 703, 284, 612, 262, 10658, 10188, 286, 2061],
+        )
+        self.assertEqual(len(response.data), 1)
+        self.assertTrue(len(response.data[0].embedding) > 0)
+
     def test_empty_string_embedding(self):
         """Test embedding an empty string."""
 
