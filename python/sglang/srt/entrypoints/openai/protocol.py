@@ -16,7 +16,13 @@
 import time
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 from typing_extensions import Literal
 
 
@@ -167,6 +173,7 @@ class CompletionRequest(BaseModel):
     temperature: float = 1.0
     top_p: float = 1.0
     user: Optional[str] = None
+    return_hidden_states: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -202,6 +209,14 @@ class CompletionResponseChoice(BaseModel):
     logprobs: Optional[LogProbs] = None
     finish_reason: Literal["stop", "length", "content_filter", "abort"]
     matched_stop: Union[None, int, str] = None
+    hidden_states: Optional[object] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.hidden_states is None:
+            data.pop("hidden_states", None)
+        return data
 
 
 class CompletionResponse(BaseModel):
@@ -219,6 +234,14 @@ class CompletionResponseStreamChoice(BaseModel):
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[Literal["stop", "length", "content_filter"]] = None
     matched_stop: Union[None, int, str] = None
+    hidden_states: Optional[object] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.hidden_states is None:
+            data.pop("hidden_states", None)
+        return data
 
 
 class CompletionStreamResponse(BaseModel):
@@ -376,6 +399,7 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
+    return_hidden_states: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -437,6 +461,14 @@ class ChatCompletionResponseChoice(BaseModel):
         "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
     ]
     matched_stop: Union[None, int, str] = None
+    hidden_states: Optional[object] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.hidden_states is None:
+            data.pop("hidden_states", None)
+        return data
 
 
 class ChatCompletionResponse(BaseModel):
@@ -453,6 +485,14 @@ class DeltaMessage(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    hidden_states: Optional[object] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.hidden_states is None:
+            data.pop("hidden_states", None)
+        return data
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
@@ -534,6 +574,22 @@ class ScoringResponse(BaseModel):
     object: str = "scoring"
 
 
+class V1RerankReqInput(BaseModel):
+    query: str
+    documents: List[str]
+
+
+class RerankResponse(BaseModel):
+    score: float
+    document: str
+    index: int
+    meta_info: Optional[dict] = None
+
+
 OpenAIServingRequest = Union[
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, ScoringRequest
+    ChatCompletionRequest,
+    CompletionRequest,
+    EmbeddingRequest,
+    ScoringRequest,
+    V1RerankReqInput,
 ]
