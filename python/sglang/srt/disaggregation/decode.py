@@ -766,7 +766,7 @@ class SchedulerDisaggregationDecodeMixin:
         if batch:
             result = self.run_batch(batch)
             if not delay_process:
-                self.prepare_mlp_sync_batch(batch, result)
+                self.process_batch_result(batch, result)
         return batch, result
 
     def get_next_disagg_decode_batch_to_run(
