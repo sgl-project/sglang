@@ -896,7 +896,7 @@ def _wait_and_warmup(
                     i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
                     for i in range(server_args.dp_size)
                 ],
-                "input_ids": [[0, 1, 2, 3], [4,5,6,7]]
+                "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
             }
             res = requests.post(
                 url + request_name,
