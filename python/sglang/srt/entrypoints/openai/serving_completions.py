@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 class OpenAIServingCompletion(OpenAIServingBase):
-    """Handler for completion requests"""
+    """Handler for /v1/completion requests"""
 
     def __init__(
         self,

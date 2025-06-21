@@ -2,16 +2,12 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
-from sglang.srt.entrypoints.openai.protocol import (
-    ErrorResponse,
-    OpenAIServingRequest,
-    UsageInfo,
-)
+from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 

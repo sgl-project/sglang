@@ -1,4 +1,3 @@
-import base64
 import json
 import logging
 import time
@@ -43,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 
 class OpenAIServingChat(OpenAIServingBase):
-    """Handler for chat completion requests"""
+    """Handler for /v1/chat/completions requests"""
 
     def __init__(
         self, tokenizer_manager: TokenizerManager, template_manager: TemplateManager

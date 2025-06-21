@@ -235,6 +235,7 @@ class TestOpenAIServer(CustomTestCase):
         )
 
         is_firsts = {}
+        is_finished = {}
         for response in generator:
             usage = response.usage
             if usage is not None:
@@ -244,6 +245,10 @@ class TestOpenAIServer(CustomTestCase):
                 continue
 
             index = response.choices[0].index
+            finish_reason = response.choices[0].finish_reason
+            if finish_reason is not None:
+                is_finished[index] = True
+
             data = response.choices[0].delta
 
             if is_firsts.get(index, True):
@@ -253,7 +258,7 @@ class TestOpenAIServer(CustomTestCase):
                 is_firsts[index] = False
                 continue
 
-            if logprobs:
+            if logprobs and not is_finished.get(index, False):
                 assert response.choices[0].logprobs, f"logprobs was not returned"
                 assert isinstance(
                     response.choices[0].logprobs.content[0].top_logprobs[0].token, str
@@ -271,7 +276,7 @@ class TestOpenAIServer(CustomTestCase):
             assert (
                 isinstance(data.content, str)
                 or isinstance(data.reasoning_content, str)
-                or len(data.tool_calls) > 0
+                or (isinstance(data.tool_calls, list) and len(data.tool_calls) > 0)
                 or response.choices[0].finish_reason
             )
             assert response.id

@@ -19,7 +19,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 
 class OpenAIServingEmbedding(OpenAIServingBase):
-    """Handler for embedding requests"""
+    """Handler for v1/embeddings requests"""
 
     def __init__(
         self,

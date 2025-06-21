@@ -16,7 +16,10 @@ logger = logging.getLogger(__name__)
 
 
 class OpenAIServingRerank(OpenAIServingBase):
-    """Handler for rerank requests"""
+    """Handler for /v1/rerank requests"""
+
+    # NOTE: /v1/rerank is not an official OpenAI endpoint. This module may be moved
+    # to another module in the future.
 
     def _request_id_prefix(self) -> str:
         return "rerank-"
