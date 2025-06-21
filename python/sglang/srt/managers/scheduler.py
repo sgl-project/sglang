@@ -2204,8 +2204,9 @@ class Scheduler(
         """Update the online model parameter."""
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
-            flash_cache_success = self.flush_cache()
-            assert flash_cache_success, "Cache flush failed after updating weights"
+            if recv_req.flush_cache:
+                flash_cache_success = self.flush_cache()
+                assert flash_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
         return UpdateWeightsFromDistributedReqOutput(success, message)
