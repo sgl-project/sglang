@@ -26,9 +26,11 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt import debug_utils
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import (
     get_tp_group,
     get_world_group,
@@ -45,13 +47,13 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base_layer
-from sglang.srt.layers.quantization.deep_gemm import (
-    _ENABLE_JIT_DEEPGEMM,
-    update_deep_gemm_config,
+from sglang.srt.layers.quantization import (
+    deep_gemm_wrapper,
+    monkey_patch_isinstance_for_vllm_base_layer,
 )
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_distribution import (
@@ -92,6 +94,7 @@ from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     cpu_has_amx_support,
+    dynamic_import,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -109,6 +112,7 @@ from sglang.srt.utils import (
 )
 
 _is_hip = is_hip()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 # Use a small KV cache pool size for tests in CI
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
@@ -161,6 +165,7 @@ class ModelRunner:
             logger.addFilter(RankZeroFilter(tp_rank == 0))
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.dp_size = server_args.dp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.dist_port = nccl_port
@@ -194,6 +199,7 @@ class ModelRunner:
             | {
                 # TODO it is indeed not a "server args"
                 "use_mla_backend": self.use_mla_backend,
+                "speculative_algorithm": self.spec_algorithm,
             }
         )
 
@@ -204,8 +210,8 @@ class ModelRunner:
         min_per_gpu_memory = self.init_torch_distributed()
 
         # Update deep gemm configure
-        if _ENABLE_JIT_DEEPGEMM:
-            update_deep_gemm_config(gpu_id, server_args)
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
 
         # If it is a draft model, tp_group can be different
         self.initialize(min_per_gpu_memory)
@@ -217,6 +223,7 @@ class ModelRunner:
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
+
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
@@ -298,7 +305,7 @@ class ModelRunner:
         if (
             server_args.attention_backend == "intel_amx"
             and server_args.device == "cpu"
-            and not cpu_has_amx_support()
+            and not _is_cpu_amx_available
         ):
             logger.info(
                 "The current platform does not support Intel AMX, will fallback to torch_native backend."
@@ -314,7 +321,8 @@ class ModelRunner:
                 1.2 In other cases, we will use flashinfer if available, otherwise use triton.
             2. Models with MLA Architecture and using FA3
                 2.1 We will use FA3 backend on hopper.
-                2.2 Otherwise, we will use triton backend.
+                2.2 We will use Flashinfer backend on blackwell.
+                2.3 Otherwise, we will use triton backend.
             """
 
             if not self.use_mla_backend:
@@ -335,6 +343,8 @@ class ModelRunner:
                 # MLA architecture
                 if is_hopper_with_cuda_12_3():
                     server_args.attention_backend = "fa3"
+                elif is_sm100_supported():
+                    server_args.attention_backend = "flashinfer"
                 elif _is_hip:
                     head_num = self.model_config.get_num_kv_heads(self.tp_size)
                     # TODO current aiter only support head number 16 or 128 head number
@@ -539,7 +549,7 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
-        with self.memory_saver_adapter.region():
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
@@ -757,6 +767,9 @@ class ModelRunner:
         ]
         if load_format == "direct":
             _model_load_weights_direct(self.model, named_tensors)
+        elif load_format in self.server_args.custom_weight_loader:
+            custom_loader = dynamic_import(load_format)
+            custom_loader(self.model, named_tensors)
         elif load_format is None:
             self.model.load_weights(named_tensors)
         else:
@@ -912,12 +925,26 @@ class ModelRunner:
             )
 
         if self.req_to_token_pool is None:
-            self.req_to_token_pool = ReqToTokenPool(
-                size=max_num_reqs,
-                max_context_len=self.model_config.context_len + 4,
-                device=self.device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-            )
+            if self.server_args.disaggregation_mode == "decode":
+                from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+
+                # subscribe memory for pre-allocated requests
+                # if max_num_reqs <= 32, we pre-allocate 2x requests
+                pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
+                self.req_to_token_pool = DecodeReqToTokenPool(
+                    size=max_num_reqs,
+                    max_context_len=self.model_config.context_len + 4,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    pre_alloc_size=pre_alloc_size,
+                )
+            else:
+                self.req_to_token_pool = ReqToTokenPool(
+                    size=max_num_reqs,
+                    max_context_len=self.model_config.context_len + 4,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker

@@ -4,9 +4,11 @@ from typing import Optional, Tuple, Union
 
 import sgl_kernel
 import torch
-from utils import precision
+from utils import make_non_contiguous, precision
 
 from sglang.test.test_utils import CustomTestCase
+
+torch.manual_seed(0)
 
 
 class TestNorm(CustomTestCase):
@@ -38,6 +40,7 @@ class TestNorm(CustomTestCase):
     def _norm_test(self, m, n, dtype):
 
         x = torch.randn([m, n], dtype=dtype)
+        x = make_non_contiguous(x)
         hidden_size = x.size(-1)
         weight = torch.randn(hidden_size, dtype=dtype)
         variance_epsilon = 1e-6
@@ -46,10 +49,10 @@ class TestNorm(CustomTestCase):
         ref_out = self._forward_native(x, weight, variance_epsilon)
 
         atol = rtol = precision[ref_out.dtype]
-        self.assertTrue(torch.allclose(ref_out, out, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
         ref_x = x.clone()
-        residual = torch.randn([m, n], dtype=dtype)
+        residual = torch.randn([m, hidden_size], dtype=dtype)
         ref_residual = residual.clone()
 
         torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(
@@ -60,8 +63,8 @@ class TestNorm(CustomTestCase):
             ref_x, weight, variance_epsilon, ref_residual
         )
 
-        self.assertTrue(torch.allclose(x, ref_x, atol=atol, rtol=rtol))
-        self.assertTrue(torch.allclose(residual, ref_residual, atol=atol, rtol=rtol))
+        torch.testing.assert_close(x, ref_x, atol=atol, rtol=rtol)
+        torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
 
     def _l2norm_test(self, m, n, dtype):
 
@@ -74,7 +77,7 @@ class TestNorm(CustomTestCase):
         ref_out = self._forward_native(x, fake_ones_weight, variance_epsilon)
 
         atol = rtol = precision[ref_out.dtype]
-        self.assertTrue(torch.allclose(ref_out, out, atol=atol, rtol=rtol))
+        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
     def test_norm(self):
         for params in itertools.product(self.M, self.N, self.dtype):

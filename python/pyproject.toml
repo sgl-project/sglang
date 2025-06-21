@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.6.post5"
+version = "0.4.7.post1"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -49,10 +49,11 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.1.6.post1",
-    "flashinfer_python==0.2.5",
-    "torch==2.6.0",
-    "torchvision==0.21.0",
+    "sgl-kernel==0.1.9",
+    "flashinfer_python==0.2.6.post1",
+    "torch==2.7.1",
+    "torchaudio==2.7.1",
+    "torchvision==0.22.1",
     "cuda-python",
     "outlines>=0.0.44,<=0.1.11",
     "einops",
@@ -61,12 +62,13 @@ srt = [
 blackwell = [
     "sglang[runtime_common]",
     "sgl-kernel",
-    "torch==2.7.0",
-    "torchvision==0.22.0",
+    "torch==2.7.1",
+    "torchaudio==2.7.1",
+    "torchvision==0.22.1",
     "cuda-python",
     "outlines>=0.0.44,<=0.1.11",
     "einops",
-    "flashinfer_python==0.2.5",
+    "flashinfer_python==0.2.6.post1",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
@@ -96,7 +98,7 @@ srt_npu = ["sglang[runtime_common]", "outlines>=0.0.44,<=0.1.11"]
 openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
 litellm = ["litellm>=1.0.0"]
-torch_memory_saver = ["torch_memory_saver>=0.0.4"]
+torch_memory_saver = ["torch_memory_saver>=0.0.8"]
 decord = ["decord"]
 test = [
     "accelerate",
@@ -126,7 +128,7 @@ dev_cpu = ["sglang[all_cpu]", "sglang[test]"]
 
 [tool.setuptools.package-data]
 "sglang" = [
-    "srt/layers/moe/fused_moe_triton/configs/*.json",
+    "srt/layers/moe/fused_moe_triton/configs/*/*.json",
     "srt/layers/quantization/configs/*.json",
 ]
 

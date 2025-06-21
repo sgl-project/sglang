@@ -12,6 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.math_utils import ceil_div
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -24,9 +25,11 @@ from sglang.srt.layers.quantization.int8_kernel import (
     sglang_per_token_group_quant_int8,
 )
 from sglang.srt.utils import (
+    cpu_has_amx_support,
     direct_register_custom_op,
     get_bool_env_var,
     get_device_name,
+    is_cpu,
     is_cuda,
     is_hip,
     log_info_on_rank0,
@@ -35,9 +38,13 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
+elif _is_cpu and _is_cpu_amx_available:
+    pass
 else:
     from vllm import _custom_ops as vllm_ops
     from vllm._custom_ops import scaled_fp8_quant
@@ -518,10 +525,6 @@ def fused_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-def ceil_div(a, b):
-    return (a + b - 1) // b
-
-
 @triton.jit
 def moe_align_block_size_stage1(
     topk_ids_ptr,
@@ -983,6 +986,8 @@ def get_moe_configs(
     kernel on a given batch size bs, the closest batch size in the grid should
     be picked and the associated configuration chosen to invoke the kernel.
     """
+    # Supported Triton versions, should be sorted from the newest to the oldest
+    supported_triton_versions = ["3.3.1", "3.2.0", "3.1.0"]
 
     # First look up if an optimized configuration is available in the configs
     # directory
@@ -1005,11 +1010,27 @@ def get_moe_configs(
             # For example, updating the Triton version might cause all old configs to become suboptimal.
             # To achieve the best performance, consider re-tuning the Triton fused MOE kernel in your environment.
             # For the tuning method, refer to: https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
-            log_info_on_rank0(
-                logger, f"Using MoE kernel config from {config_file_path}."
-            )
+            logger.info(f"Using MoE kernel config from {config_file_path}.")
             # If a configuration has been found, return it
             return {int(key): val for key, val in json.load(f).items()}
+
+    # Searching for other triton versions that supports the same config
+    for try_triton_version in supported_triton_versions:
+        if try_triton_version == triton_version:
+            continue
+        try_config_file_path = os.path.join(
+            os.path.dirname(os.path.realpath(__file__)),
+            "configs",
+            f"triton_{try_triton_version.replace('.', '_')}",
+            json_file_name,
+        )
+        if os.path.exists(try_config_file_path):
+            with open(try_config_file_path) as f:
+                logger.warning(
+                    f"Config file not found at {config_file_path}. Fallback to triton version {try_triton_version} and use MoE kernel config from {try_config_file_path}. Performance might be sub-optimal!",
+                )
+                # If a configuration has been found, return it
+                return {int(key): val for key, val in json.load(f).items()}
 
     # If no optimized configuration is available, we will use the default
     # configuration
