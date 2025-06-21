@@ -148,6 +148,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         prompt_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
+        hidden_states = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -159,6 +160,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                hidden_states[index] = content["meta_info"].get("hidden_states", None)
 
                 stream_buffer = stream_buffers.get(index, "")
                 # Handle echo for first chunk
@@ -199,7 +201,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 delta = text[len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
                 finish_reason = content["meta_info"]["finish_reason"]
-                hidden_states = content["meta_info"].get("hidden_states", None)
 
                 choice_data = CompletionResponseStreamChoice(
                     index=index,
