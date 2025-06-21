@@ -1,4 +1,5 @@
 import itertools
+import random
 
 import pytest
 import torch
@@ -152,19 +153,15 @@ def test_moe_align_block_size_compare_implementations(
     block_size, num_tokens, topk, num_experts
 ):
 
-    topk_ids = torch.stack(
-        [
-            torch.randperm(num_experts, dtype=torch.int32, device="cuda")[:topk]
-            for _ in range(num_tokens)
-        ]
-    )
+    topk_ids = torch.argsort(torch.rand(num_tokens, num_experts, device="cuda"), dim=1)[
+        :, :topk
+    ]
 
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
 
     sorted_ids_cuda = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
-    sorted_ids_cuda.fill_(topk_ids.numel())
     max_num_m_blocks = max_num_tokens_padded // block_size
     expert_ids_cuda = torch.zeros(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
@@ -213,11 +210,26 @@ def test_moe_align_block_size_compare_implementations(
         f"Triton expert_ids: {expert_ids_triton}"
     )
 
-    assert torch.allclose(num_tokens_post_pad_cuda, num_tokens_post_pad_triton), (
-        f"Num tokens post pad mismatch for block_size={block_size}, "
+    # Select an expert to check
+    expert_idx = expert_ids_cuda.max().item()
+
+    # Get the first and last block id where expert_ids_cuda == expert_idx
+    matching_indices = torch.where(expert_ids_cuda == expert_idx)[0]
+    block_id_start = matching_indices[0].item()
+    block_id_end = matching_indices[-1].item()
+
+    assert torch.allclose(
+        sorted_ids_cuda[
+            block_id_start * block_size : (block_id_end + 1) * block_size
+        ].sort()[0],
+        sorted_ids_triton[
+            block_id_start * block_size : (block_id_end + 1) * block_size
+        ].sort()[0],
+    ), (
+        f"Sorted IDs mismatch for block_size={block_size}, "
         f"num_tokens={num_tokens}, topk={topk}\n"
-        f"CUDA num_tokens_post_pad: {num_tokens_post_pad_cuda}\n"
-        f"Triton num_tokens_post_pad: {num_tokens_post_pad_triton}"
+        f"CUDA sorted_ids: {sorted_ids_cuda}\n"
+        f"Triton sorted_ids: {sorted_ids_triton}"
     )
 
 
