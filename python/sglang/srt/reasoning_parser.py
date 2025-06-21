@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple, Type
 
 
 class StreamingParseResult:
@@ -21,7 +21,7 @@ class BaseReasoningFormatDetector:
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
-        self._in_reasoning = force_reasoning
+        self._force_in_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
 
         self._buffer = ""
@@ -32,17 +32,28 @@ class BaseReasoningFormatDetector:
         One-time parsing: Detects and parses reasoning sections in the provided text.
         Returns both reasoning content and normal text separately.
         """
-        text = text.replace(self.think_start_token, "").strip()
-        if self.think_end_token not in text:
+        in_reasoning = self._force_in_reasoning or text.startswith(
+            self.think_start_token
+        )
+
+        if not in_reasoning:
+            return StreamingParseResult(normal_text=text)
+
+        # The text is considered to be in a reasoning block.
+        processed_text = text.replace(self.think_start_token, "").strip()
+
+        if self.think_end_token not in processed_text:
             # Assume reasoning was truncated before `</think>` token
-            return StreamingParseResult(reasoning_text=text)
+            return StreamingParseResult(reasoning_text=processed_text)
 
         # Extract reasoning content
-        splits = text.split(self.think_end_token, maxsplit=1)
+        splits = processed_text.split(self.think_end_token, maxsplit=1)
         reasoning_text = splits[0]
-        text = splits[1].strip()
+        normal_text = splits[1].strip()
 
-        return StreamingParseResult(normal_text=text, reasoning_text=reasoning_text)
+        return StreamingParseResult(
+            normal_text=normal_text, reasoning_text=reasoning_text
+        )
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         """
@@ -63,13 +74,13 @@ class BaseReasoningFormatDetector:
             self.stripped_think_start = True
 
         # Handle end of reasoning block
-        if self._in_reasoning and self.think_end_token in current_text:
+        if self._force_in_reasoning and self.think_end_token in current_text:
             end_idx = current_text.find(self.think_end_token)
 
             reasoning_text = current_text[:end_idx]
 
             self._buffer = ""
-            self._in_reasoning = False
+            self._force_in_reasoning = False
             normal_text = current_text[end_idx + len(self.think_end_token) :]
 
             return StreamingParseResult(
@@ -77,7 +88,7 @@ class BaseReasoningFormatDetector:
             )
 
         # Continue with reasoning content
-        if self._in_reasoning:
+        if self._force_in_reasoning:
             if self.stream_reasoning:
                 # Stream the content immediately
                 self._buffer = ""
@@ -86,7 +97,7 @@ class BaseReasoningFormatDetector:
                 return StreamingParseResult()
 
         # If we're not in a reasoning block return as normal text
-        if not self._in_reasoning:
+        if not self._force_in_reasoning:
             self._buffer = ""
             return StreamingParseResult(normal_text=new_text)
 
@@ -131,11 +142,11 @@ class Qwen3Detector(BaseReasoningFormatDetector):
     """
 
     def __init__(self, stream_reasoning: bool = True):
-        # Qwen3 is assumed to be reasoning until `</think>` token
+        # Qwen3 won't be in reasoning mode when user passes `enable_thinking=False`
         super().__init__(
             "<think>",
             "</think>",
-            force_reasoning=True,
+            force_reasoning=False,
             stream_reasoning=stream_reasoning,
         )
 
@@ -151,12 +162,12 @@ class ReasoningParser:
             If True, streams reasoning content as it arrives.
     """
 
-    DetectorMap: Dict[str, BaseReasoningFormatDetector] = {
+    DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
         "qwen3": Qwen3Detector,
     }
 
-    def __init__(self, model_type: str = None, stream_reasoning: bool = True):
+    def __init__(self, model_type: Optional[str] = None, stream_reasoning: bool = True):
         if not model_type:
             raise ValueError("Model type must be specified")
 
