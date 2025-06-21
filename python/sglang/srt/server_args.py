@@ -65,6 +65,7 @@ class ServerArgs:
     # Port for the HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
+    worker_num: int = 1
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -574,6 +575,9 @@ class ServerArgs:
             type=int,
             default=ServerArgs.port,
             help="The port of the HTTP server.",
+        )
+        parser.add_argument(
+            "--worker-num", type=int, default=ServerArgs.worker_num, help="The worker num of the server."
         )
         parser.add_argument(
             "--tokenizer-mode",
