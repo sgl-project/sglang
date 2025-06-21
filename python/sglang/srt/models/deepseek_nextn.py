@@ -101,10 +101,14 @@ class DeepseekModelNextN(nn.Module):
                 )
             )
 
+        logging.info(f"before decoder {hidden_states.shape=}")
+
         residual = None
         hidden_states, residual = self.decoder(
             positions, hidden_states, forward_batch, residual, zero_allocator
         )
+
+        logging.info(f"after decoder {hidden_states.shape=}")
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
