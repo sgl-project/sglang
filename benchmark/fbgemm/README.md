@@ -5,7 +5,7 @@ Benchmark FBGEMM Grouped GEMM in both Triton and CUDA version and SGLang Triton 
 ### Requirements
 
 ```shell
-pip install fbgemm-gpu-genai 
+pip install fbgemm-gpu-genai
 ```
 
 ### Usage
@@ -27,4 +27,3 @@ grouped-gemm-performance:
 ```
 
 The theoretical peak bandwidth of H200 is 4.8 TB/s. Taking batch_size 256 as an example, the bandwidth of FBGEMM Triton Grouped GEMM FP8 is 3704.841339 GB/s, the bandwidth of FBGEMM CUTLASS F8F8BF16 Rowwise is 3042.626402 GB/s, and the bandwidth of SGLang Grouped GEMM FP8 is 2254.725030 GB/s. Therefore, FBGEMM Triton Grouped GEMM FP8 achieves 77.9% of H200's theoretical peak bandwidth, FBGEMM CUTLASS F8F8BF16 Rowwise achieves 63.4% of H200's theoretical peak bandwidth, and SGLang Grouped GEMM FP8 achieves 46.9% of H200's theoretical peak bandwidth.
-
