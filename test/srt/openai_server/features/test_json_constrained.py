@@ -1,7 +1,7 @@
 """
-python3 -m unittest test_json_constrained.TestJSONConstrainedOutlinesBackend.test_json_generate
-python3 -m unittest test_json_constrained.TestJSONConstrainedXGrammarBackend.test_json_generate
-python3 -m unittest test_json_constrained.TestJSONConstrainedLLGuidanceBackend.test_json_generate
+python3 -m unittest openai_server.features.test_json_constrained.TestJSONConstrainedOutlinesBackend.test_json_generate
+python3 -m unittest openai_server.features.test_json_constrained.TestJSONConstrainedXGrammarBackend.test_json_generate
+python3 -m unittest openai_server.features.test_json_constrained.TestJSONConstrainedLLGuidanceBackend.test_json_generate
 """
 
 import json

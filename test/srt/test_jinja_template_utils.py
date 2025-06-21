@@ -1,5 +1,5 @@
 """
-Unit tests for OpenAI adapter utils.
+Unit tests for Jinja chat template utils.
 """
 
 import unittest

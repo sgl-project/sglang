@@ -1,5 +1,5 @@
 """
-python3 -m unittest test_large_max_new_tokens.TestLargeMaxNewTokens.test_chat_completion
+python3 -m unittest openai_server.validation.test_large_max_new_tokens.TestLargeMaxNewTokens.test_chat_completion
 """
 
 import os
