@@ -23,6 +23,7 @@ from sglang.test.test_utils import CustomTestCase
 MODELS = [
     ("LxzGordon/URM-LLaMa-3.1-8B", 1, 4e-2),
     ("Skywork/Skywork-Reward-Llama-3.1-8B-v0.2", 1, 4e-2),
+    ("bzantium/qwen3-0.6b-imdb", 1, 4e-2),
 ]
 TORCH_DTYPES = [torch.float16]
 
