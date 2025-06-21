@@ -222,6 +222,7 @@ class DecodePreallocQueue:
             DisaggregationMode.DECODE,
             self.scheduler.server_args,
             self.is_mla_backend,
+            self.scheduler.metrics_collector if self.scheduler.enable_metrics and self.scheduler.attn_tp_rank == 0 else None,
         )
         return kv_manager
 
@@ -578,6 +579,8 @@ class DecodeTransferQueue:
                 # unlock the kv cache or it will have memory leak
                 self.tree_cache.cache_finished_req(decode_req.req)
                 indices_to_remove.add(i)
+                if self.scheduler.metrics_collector is not None:
+                    self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
 
