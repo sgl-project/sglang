@@ -187,6 +187,7 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "cutlass_mla",
     "trtllm_mla",
     "ascend",
+    "hip_attention"
 ]
 
 
@@ -206,12 +207,14 @@ class AttnForwardMethod(IntEnum):
     # Use multi-head attention, but with KV cache chunked.
     # This method can avoid OOM when prefix lengths are long.
     MHA_CHUNKED_KV = auto()
-
+    
     # Use MLA but with fused RoPE
     MLA_FUSED_ROPE = auto()
 
     # Use MLA with fused RoPE kernel for CPU
     MLA_FUSED_ROPE_CPU = auto()
+
+    MHA_FROM_CACHE = auto()
 
 
 def _dispatch_mla_subtype(attn, forward_batch):
@@ -294,6 +297,25 @@ def handle_flashinfer(attn, forward_batch):
 
 def handle_fa3(attn, forward_batch):
     return _handle_backend(attn, forward_batch, "fa3")
+
+def handle_hip_attention(attn, forward_batch):
+    if forward_batch.extend_prefix_lens_cpu is not None:
+        sum_extend_prefix_lens = sum(forward_batch.extend_prefix_lens_cpu)
+    if (
+        forward_batch.forward_mode.is_extend()
+        and not forward_batch.forward_mode.is_target_verify()
+        and not forward_batch.forward_mode.is_draft_extend()
+        and (
+            sum_extend_prefix_lens >= 32768
+            or sum_extend_prefix_lens == 0
+        )
+    ):
+        return AttnForwardMethod.MHA_FROM_CACHE
+    else:
+        if forward_batch.forward_mode.is_extend():
+            # FIXME: this should be MLA, but bug.
+            return AttnForwardMethod.MHA_FROM_CACHE
+        return AttnForwardMethod.MLA
 
 
 def handle_flashmla(attn, forward_batch):
@@ -1273,7 +1295,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
-
+        
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
@@ -1904,6 +1926,106 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         return output
 
+    def forward_normal_from_cache(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if self.q_lora_rank is not None:
+            q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
+            )
+            q = self.q_a_layernorm(q)
+            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+        else:
+            q = self.q_proj(hidden_states)[0].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
+            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        latent_cache = latent_cache.unsqueeze(1)
+        kv_a = self.kv_a_layernorm(kv_a.contiguous())
+        kv = self.kv_b_proj(kv_a)[0]
+        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope = kv[..., : self.qk_nope_head_dim]
+        v = kv[..., self.qk_nope_head_dim :]
+        k_pe = latent_cache[:, :, self.kv_lora_rank :]
+
+        if not (
+            forward_batch.hip_metadata_cache_pool is not None
+            and forward_batch.hip_metadata_cache_pool.hip_config.using_extend
+        ):
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        
+        q[..., self.qk_nope_head_dim :] = q_pe
+        k = torch.empty_like(q)
+        k[..., : self.qk_nope_head_dim] = k_nope
+        k[..., self.qk_nope_head_dim :] = k_pe
+
+        latent_cache[:, :, : self.kv_lora_rank] = kv_a.unsqueeze(1)
+        latent_cache[:, :, self.kv_lora_rank :] = k_pe
+
+        # Save latent cache
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+        )
+        
+        # Fetch latent cache from memory pool with precomputed chunked kv indices
+        latent_cache_buf = forward_batch.token_to_kv_pool.get_key_buffer(
+            self.attn_mha.layer_id
+        )
+        block_table = forward_batch.req_to_token_pool.req_to_token.index_select(
+            dim=0, index=forward_batch.req_pool_indices
+        )
+        batch_size = block_table.shape[0]
+        
+        outputs = []
+        acc_chunk_len = 0
+        for ibatch in range(batch_size):
+            prefix_len = forward_batch.extend_prefix_lens_cpu[ibatch]
+            chunk_len = forward_batch.extend_seq_lens_cpu[ibatch]
+            
+            q_chunk = q[acc_chunk_len:acc_chunk_len+chunk_len][None, ...]
+            
+            acc_chunk_len += chunk_len
+            
+            latent_cache = latent_cache_buf[
+                block_table[ibatch:ibatch+1, :prefix_len+chunk_len]
+            ]
+
+            kv_a_normed, k_pe = latent_cache.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+            kv_a_normed = kv_a_normed.squeeze(1).contiguous()
+            kv = self.kv_b_proj(kv_a_normed)[0]
+            kv = kv.view(
+                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            v = kv[..., self.qk_nope_head_dim :]
+            k_nope = kv[..., : self.qk_nope_head_dim]
+
+            k = torch.empty(
+                (
+                    k_nope.shape[0],
+                    self.num_local_heads,
+                    self.qk_nope_head_dim + self.qk_rope_head_dim,
+                ),
+                dtype=v.dtype,
+                device=v.device,
+            )
+            k[..., : self.qk_nope_head_dim] = k_nope
+            k[..., self.qk_nope_head_dim :] = k_pe
+
+            output = self.attn_mha(q_chunk, k, v, forward_batch, save_kv_cache=False)
+            
+            outputs.append(output)
+        attn_output = torch.cat(outputs, dim=0)
+        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        output, _ = self.o_proj(attn_output)
+        return output
+    
     def forward_absorb_fused_mla_rope_cpu_core(
         self, q_input, k_input, v_input, forward_batch, zero_allocator
     ):
@@ -3121,6 +3243,7 @@ BackendRegistry.register("fa4", handle_fa4)
 BackendRegistry.register("trtllm_mla", handle_trtllm_mla)
 BackendRegistry.register("aiter", handle_aiter)
 BackendRegistry.register("triton", handle_triton)
+BackendRegistry.register("hip_attention", handle_hip_attention)
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):

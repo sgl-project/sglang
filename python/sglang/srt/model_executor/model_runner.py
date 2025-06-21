@@ -159,6 +159,7 @@ MLA_ATTENTION_BACKENDS = [
     "cutlass_mla",
     "trtllm_mla",
     "ascend",
+    "hip_attention",
 ]
 
 
