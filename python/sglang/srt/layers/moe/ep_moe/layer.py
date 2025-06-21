@@ -3,6 +3,7 @@ from typing import Callable, List, Optional, Tuple
 
 import einops
 import torch
+import triton
 from sgl_kernel import silu_and_mul
 from torch.nn import Module
 
@@ -11,14 +12,24 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.moe.ep_moe.fbgemm_grouped_gemm import (
+    grouped_gemm as fbgemm_grouped_gemm,
+)
+from sglang.srt.layers.moe.ep_moe.fbgemm_grouped_gemm import (
+    grouped_gemm_fp8_rowwise as fbgemm_grouped_gemm_fp8_rowwise,
+)
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
+    extract_base_kernel,
     gelu_and_mul_triton_kernel,
+    get_base_gpu,
     grouped_gemm_triton,
+    make_a_aligned,
     post_reorder_triton_kernel,
     pre_reorder_triton_kernel,
-    run_moe_ep_preproess,
+    run_moe_ep_preprocess,
+    scatter_rows_kernel,
     silu_and_mul_masked_post_quant_fwd,
     silu_and_mul_triton_kernel,
     tma_align_input_scale,
@@ -60,20 +71,65 @@ if _is_hip:
 logger = logging.getLogger(__name__)
 
 
+def prepare_fbgemm_inputs_ep(
+    a: torch.Tensor,  # [M , K]  (K == K_full)
+    b: torch.Tensor,  # [G_local , N , K]
+    seg_indptr: torch.Tensor,  # [G_local+1]  token row-offset
+    *,
+    weight_indices: Optional[torch.Tensor] = None,
+    scale_b: Optional[torch.Tensor] = None,  # [G_local] / None
+    base: Optional[int] = None,
+) -> Tuple[
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    int,
+    Optional[torch.Tensor],
+]:
+    """
+    Return:
+        a_aligned : [M, K]
+        b_fbgemm  : [G_local*N , K]
+        m_sizes   : [G_local]
+        base
+        scale_b   : [G_local] / None
+    """
+    G_local, N, K_w = b.shape
+    assert K_w == a.shape[1], "K dim mismatch in EP mode!"
+
+    m_sizes = seg_indptr[1:] - seg_indptr[:-1]  # [G_local]
+
+    base_tensor = get_base_gpu(seg_indptr)
+    a_aligned = make_a_aligned(a, base_tensor)
+
+    assert (
+        b.ndim == 3 and b.shape[2] == a.shape[1]
+    ), f"b.shape = {b.shape}, expected [G_local, N, {a.shape[1]}]"
+    b_fbgemm = b.contiguous().view(-1, b.shape[-1])  # [G_local * N, K]
+
+    if weight_indices is not None:
+        if scale_b is not None:
+            scale_b = scale_b.index_select(0, weight_indices)
+
+    return a_aligned, b_fbgemm, m_sizes, base, scale_b
+
+
 class GroupedGemmRunner(torch.nn.Module):
-    flashinfer_gemm_warpper = None
+    flashinfer_gemm_wrapper = None
 
     def __init__(
         self,
         device,
         use_flashinfer: bool = False,
+        use_fbgemm: bool = False,
         use_per_token_if_dynamic: bool = True,
     ):
         super().__init__()
         self.device = device
         self.use_flashinfer = use_flashinfer
+        self.use_fbgemm = use_fbgemm
         self.use_per_token_if_dynamic = use_per_token_if_dynamic
-        if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_warpper is None:
+        if self.use_flashinfer and GroupedGemmRunner.flashinfer_gemm_wrapper is None:
             GroupedGemmRunner._init_flashinfer_wrapper(device)
 
     @classmethod
@@ -83,7 +139,7 @@ class GroupedGemmRunner(torch.nn.Module):
         workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.int8, device=device
         )
-        cls.flashinfer_gemm_warpper = SegmentGEMMWrapper(workspace_buffer)
+        cls.flashinfer_gemm_wrapper = SegmentGEMMWrapper(workspace_buffer)
 
     # c = a * b
     def forward(
@@ -104,8 +160,8 @@ class GroupedGemmRunner(torch.nn.Module):
         if self.use_flashinfer:
             # TODO: flashinfer
             assert False
-            assert GroupedGemmRunner.flashinfer_gemm_warpper is not None
-            c = GroupedGemmRunner.flashinfer_gemm_warpper.run(
+            assert GroupedGemmRunner.flashinfer_gemm_wrapper is not None
+            c = GroupedGemmRunner.flashinfer_gemm_wrapper.run(
                 x=a,
                 weights=b,
                 batch_size=batch_size,
@@ -113,6 +169,55 @@ class GroupedGemmRunner(torch.nn.Module):
                 seg_indptr=seg_indptr,
                 weight_indices=weight_indices,
             )
+        elif self.use_fbgemm:
+            assert seg_indptr is not None, "FBGemm needs seg_indptr"
+            base = (seg_indptr[0]).to(torch.int)
+            a_aligned, b_fbgemm, m_sizes, base, scale_b = prepare_fbgemm_inputs_ep(
+                a=a,
+                b=b,
+                seg_indptr=seg_indptr,
+                weight_indices=weight_indices,
+                scale_b=scale_b,
+                base=base,
+            )
+
+            if c is None:
+                assert c_dtype is not None
+                c = torch.empty(a.shape[0], b.shape[1], device=a.device, dtype=c_dtype)
+            if m_sizes is None:
+                return c
+
+            if use_fp8_w8a8:
+                # TODO: Currently fbgemm only supports rowwise fp8. We need to
+                # change it to blockwise fp8 to fully support the replacement of
+                # quant.
+                assert scale_a is not None and scale_b is not None
+                c = grouped_gemm_triton(
+                    a,
+                    b,
+                    c,
+                    batch_size,
+                    weight_column_major,
+                    seg_indptr,
+                    weight_indices,
+                    use_fp8_w8a8,
+                    scale_a,
+                    scale_b,
+                    block_shape=block_shape,
+                    c_dtype=c_dtype,
+                    use_per_token_if_dynamic=self.use_per_token_if_dynamic,
+                )
+            else:
+                c_local = fbgemm_grouped_gemm(
+                    a_aligned,
+                    b_fbgemm,
+                    m_sizes=m_sizes,
+                    use_fast_accum=True,
+                )
+                c.zero_()
+                M, N = a.shape[0], c.shape[1]
+                grid = (triton.cdiv(M, 128),)
+                scatter_rows_kernel[grid](c_local, c, seg_indptr, M, N)
         else:
             assert weight_column_major == True
             c = grouped_gemm_triton(
@@ -234,10 +339,12 @@ class EPMoE(torch.nn.Module):
 
         assert self.quant_method is not None
 
+        use_fbgemm = global_server_args_dict.get("use_fbgemm_grouped_gemm", False)
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
                 hidden_states.device,
                 use_flashinfer=False,  # TODO: use flashinfer
+                use_fbgemm=use_fbgemm,
                 use_per_token_if_dynamic=self.use_per_token_if_dynamic,
             )
 
@@ -257,7 +364,7 @@ class EPMoE(torch.nn.Module):
             ),
         )
 
-        reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preproess(
+        reorder_topk_ids, src2dst, seg_indptr = run_moe_ep_preprocess(
             topk_ids, self.num_experts
         )
 
@@ -995,7 +1102,9 @@ class DeepEPMoE(EPMoE):
         assert self.activation == "silu"
         if self.grouped_gemm_runner is None:
             self.grouped_gemm_runner = GroupedGemmRunner(
-                hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
+                hidden_states.device,
+                use_flashinfer=False,  # TODO: use flashinfer
+                use_fbgemm=False,  # TODO: DeepEPMoE support FBGEMM
             )
 
         if self.activation_scheme == "dynamic" and not self.use_block_quant:

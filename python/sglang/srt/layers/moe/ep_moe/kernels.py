@@ -145,7 +145,7 @@ def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
     tl.store(seg_indptr + expert + 1, target_location + 1)
 
 
-def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
+def run_moe_ep_preprocess(topk_ids: torch.Tensor, num_experts: int):
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
     seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
@@ -1086,3 +1086,99 @@ def tma_align_input_scale(input_scale: torch.Tensor):
         BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
     return output.t()[:m]
+
+
+@triton.jit
+def extract_base_kernel(seg_ptr, output_ptr):
+    if tl.program_id(0) == 0:
+        tl.store(output_ptr + 0, tl.load(seg_ptr + 0))
+
+
+def get_base_gpu(seg_indptr: torch.Tensor) -> torch.Tensor:
+    base_tensor = torch.empty(1, dtype=seg_indptr.dtype, device=seg_indptr.device)
+
+    extract_base_kernel[(1,)](
+        seg_indptr,
+        base_tensor,
+    )
+    return base_tensor
+
+
+@triton.jit
+def slice_rows_kernel(
+    a_ptr,
+    out_ptr,
+    base_ptr,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr = 128,
+    BLOCK_K: tl.constexpr = 32,
+):
+    base = tl.load(base_ptr + 0).to(tl.int32)
+    pid = tl.program_id(0)
+
+    num_tiles = (M - base + BLOCK_M - 1) // BLOCK_M
+    if pid >= num_tiles:
+        return
+
+    row_start = pid * BLOCK_M
+
+    offs_m = row_start + tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    valid_m = offs_m < (M - base)
+
+    # pointers into a / out
+    a_ptrs = a_ptr + (offs_m + base)[:, None] * K + offs_k[None, :]
+    o_ptrs = out_ptr + offs_m[:, None] * K + offs_k[None, :]
+
+    for k_off in range(0, K, BLOCK_K):
+        a_tile = tl.load(a_ptrs, mask=valid_m[:, None])
+        tl.store(o_ptrs, a_tile, mask=valid_m[:, None])
+        a_ptrs += BLOCK_K
+        o_ptrs += BLOCK_K
+
+
+def make_a_aligned(a: torch.Tensor, base_tensor: torch.Tensor) -> torch.Tensor:
+    M, K = a.shape
+    out = torch.empty((M, K), dtype=a.dtype, device=a.device)
+
+    grid = (triton.cdiv(M, 128),)  # 128 = BLOCK_M
+    slice_rows_kernel[grid](a, out, base_tensor, M, K)
+    return out
+
+
+@triton.jit
+def scatter_rows_kernel(
+    src_ptr,
+    dst_ptr,
+    base_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr = 128,
+    BLOCK_N: tl.constexpr = 32,
+):
+    base = tl.load(base_ptr + 0).to(tl.int32)
+
+    pid = tl.program_id(0)
+
+    num_tiles = (M - base + BLOCK_M - 1) // BLOCK_M
+    if pid >= num_tiles:
+        return
+
+    row_start = pid * BLOCK_M
+
+    offs_m = row_start + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    valid_m = offs_m < (M - base)
+    valid_d = (offs_m + base) < M
+    valid = valid_m & valid_d
+
+    s_ptrs = src_ptr + offs_m[:, None] * N + offs_n[None, :]
+    d_ptrs = dst_ptr + (offs_m + base)[:, None] * N + offs_n[None, :]
+
+    for _ in range(0, N, BLOCK_N):
+        tile = tl.load(s_ptrs, mask=valid_m[:, None])
+        tl.store(d_ptrs, tile, mask=valid[:, None])
+        s_ptrs += BLOCK_N
+        d_ptrs += BLOCK_N
