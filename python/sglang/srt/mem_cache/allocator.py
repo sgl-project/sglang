@@ -77,15 +77,19 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         if self.free_group:
             self.free(torch.cat(self.free_group))
 
-    @abc.abstractmethod
-    def get_cpu_copy(self, indices):
+    def get_cpu_copy(self, *args, **kwargs):
         # FIXME: reuse the get_cpu_copy after paged allocator is implemented
         raise NotImplementedError()
 
-    @abc.abstractmethod
-    def load_cpu_copy(self, kv_cache_cpu, indices):
+    def load_cpu_copy(self, *args, **kwargs):
         # FIXME: reuse the load_cpu_copy after paged allocator is implemented
         raise NotImplementedError()
+
+    def alloc_extend(self, *args, **kwargs):
+        raise NotImplementedError("alloc_extend is only for paged allocator")
+
+    def alloc_decode(self, *args, **kwargs):
+        raise NotImplementedError("alloc_decode is only for paged allocator")
 
     @abc.abstractmethod
     def clear(self):
@@ -94,14 +98,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
     def alloc(self, need_size: int):
         raise NotImplementedError()
-
-    @abc.abstractmethod
-    def alloc_extend(self, *args, **kwargs):
-        raise NotImplementedError("alloc_extend is only for paged allocator")
-
-    @abc.abstractmethod
-    def alloc_decode(self, *args, **kwargs):
-        raise NotImplementedError("alloc_decode is only for paged allocator")
 
     @abc.abstractmethod
     def free(self, free_index: torch.Tensor):
