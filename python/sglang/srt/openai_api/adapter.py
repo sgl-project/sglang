@@ -15,6 +15,7 @@
 
 import asyncio
 import base64
+import copy
 import json
 import logging
 import os
@@ -1182,7 +1183,7 @@ def v1_chat_generate_request(
                 image_data = conv.image_data
                 audio_data = conv.audio_data
                 modalities = conv.modalities
-                stop = conv.stop_str or [] if not request.ignore_eos else []
+                stop = copy.copy(conv.stop_str or [] if not request.ignore_eos else [])
 
                 if request.stop:
                     if isinstance(request.stop, str):
