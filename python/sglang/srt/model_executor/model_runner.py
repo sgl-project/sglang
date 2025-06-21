@@ -463,6 +463,7 @@ class ModelRunner:
                     "triton",
                     "flashmla",
                     "cutlass_mla",
+                    "hip_attention",
                     "trtllm_mla",
                     "ascend",
                 ]:

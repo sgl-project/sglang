@@ -14,6 +14,7 @@ import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 if TYPE_CHECKING:
     from hip_attn.v1_2 import HiPAttentionConfig
@@ -44,7 +45,9 @@ def get_local_rank():
     else:
         return 0
 
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend, FlashAttentionMetadata
+from sglang.srt.configs.model_config import AttentionArch
+from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 class HiPAttentionBackend(AttentionBackend):
 
@@ -53,8 +56,12 @@ class HiPAttentionBackend(AttentionBackend):
 
         from hip_attn.v1_2.paged_hip import PagedHiPStateful
 
+        self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self.page_size = model_runner.page_size
+        assert self.page_size == 1
+        
         self.forward_paged_hip = PagedHiPStateful()
-
+        
         self.hip_config: HiPAttentionConfig = (
             model_runner.server_args.hip_attention_config
         )
@@ -138,6 +145,9 @@ class HiPAttentionBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        # For multi-head latent attention
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ):
         cache_loc = (
             forward_batch.out_cache_loc
@@ -174,8 +184,8 @@ class HiPAttentionBackend(AttentionBackend):
             end_event = torch.cuda.Event(True)
             start_event.record()
             
-        if need_dense_prefill:
-            o = self.flashattention_backend.forward_extend(
+        if need_dense_prefill or False:
+            return self.flashattention_backend.forward_extend(
                 q=q,
                 k=k,
                 v=v,
@@ -183,34 +193,50 @@ class HiPAttentionBackend(AttentionBackend):
                 forward_batch=forward_batch,
                 save_kv_cache=save_kv_cache,
                 # For multi-head latent attention
-                q_rope = None,
-                k_rope = None,
+                q_rope = q_rope,
+                k_rope = k_rope,
             )
         else:
             if not self.is_kv_cache_offload_enabled:
                 if k is not None:
                     assert v is not None
                     if save_kv_cache:
-                        forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                        if not self.use_mla:
+                            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                        else:
+                            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                                layer,
+                                cache_loc,
+                                k,
+                                k_rope,
+                            )
 
-                k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                    layer.layer_id
-                )
+                if not self.use_mla:
+                    k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                        layer.layer_id
+                    )
+                    k_chunk = k.reshape(-1, layer.tp_k_head_num, layer.head_dim)
+                    v_chunk = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
+                else:
+                    kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                
                 offload_cache = None
-                k_chunk = k.reshape(-1, layer.tp_k_head_num, layer.head_dim)
-                v_chunk = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
                 offloading_metadata = None
 
             else:  # Offloading enabled
+                assert not self.use_mla
                 assert isinstance(
                     forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool
                 )
                 if k is not None:
                     assert v is not None
                     if save_kv_cache:
-                        forward_batch.token_to_kv_pool.set_kv_buffer(
-                            layer, cache_loc, k, v, async_copy=True, push_to_gpu_cache=False
-                        )
+                        if not self.use_mla:
+                            forward_batch.token_to_kv_pool.set_kv_buffer(
+                                layer, cache_loc, k, v, async_copy=True, push_to_gpu_cache=False
+                            )
+                        else:
+                            raise Exception()
 
                 k_cache = v_cache = offload_cache = None
                 k_chunk, v_chunk, offloading_metadata = (
@@ -223,43 +249,89 @@ class HiPAttentionBackend(AttentionBackend):
                     )
                 )
             
-            q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-            
-            o, _ = self.forward_paged_hip(
-                query=q_reshaped,
-                sm_scale=layer.scaling,
-                batch_size=forward_batch.batch_size,
-                k=k_chunk,
-                v=v_chunk,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                offload_cache=offload_cache,
-                positions=forward_batch.positions,
-                seq_lens=forward_batch.seq_lens,
-                req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
-                req_pool_indices=forward_batch.req_pool_indices,
-                rope_cos=layer.rope_cos,
-                rope_sin=layer.rope_sin,
-                rope_range=layer.rope_range,
-                rope_is_neox_style=layer.rope_is_neox_style,
-                layer_id=layer.layer_id,
-                logit_cap=layer.logit_cap,
-                orig_context_len=layer.orig_context_len,
-                max_context_len=self.max_context_len,
-                extend_seq_lens=forward_batch.extend_seq_lens,
-                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-                hip_config=self.hip_config,
-                is_kv_cache_offload_enabled=self.is_kv_cache_offload_enabled,
-                online_update_cache=(
-                    forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
-                    if self.is_kv_cache_offload_enabled
-                    else None
-                ),
-                is_decode=False,
-                offloading_metadata=offloading_metadata,
-                sliding_window_size=sw_size,
-                using_chunked_sliding_window=using_chunked_sw,
+            use_cascade_attn = (
+                forward_batch.forward_mode.is_target_verify() and self.topk > 1
             )
+            
+            if not self.use_mla:
+                q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+                
+                o, _ = self.forward_paged_hip(
+                    query=q_reshaped,
+                    sm_scale=layer.scaling,
+                    batch_size=forward_batch.batch_size,
+                    k=k_chunk,
+                    v=v_chunk,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    offload_cache=offload_cache,
+                    positions=forward_batch.positions,
+                    seq_lens=forward_batch.seq_lens,
+                    req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    rope_cos=layer.rope_cos,
+                    rope_sin=layer.rope_sin,
+                    rope_range=layer.rope_range,
+                    rope_is_neox_style=layer.rope_is_neox_style,
+                    layer_id=layer.layer_id,
+                    logit_cap=layer.logit_cap,
+                    orig_context_len=layer.orig_context_len,
+                    max_context_len=self.max_context_len,
+                    extend_seq_lens=forward_batch.extend_seq_lens,
+                    extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                    hip_config=self.hip_config,
+                    is_kv_cache_offload_enabled=self.is_kv_cache_offload_enabled,
+                    online_update_cache=(
+                        forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
+                        if self.is_kv_cache_offload_enabled
+                        else None
+                    ),
+                    is_decode=False,
+                    offloading_metadata=offloading_metadata,
+                    sliding_window_size=sw_size,
+                    using_chunked_sliding_window=using_chunked_sw,
+                )
+            else:
+                assert q.shape[0] == 1, f'{q.shape=}'
+                k_reshaped = k.reshape(1, -1, layer.tp_k_head_num, layer.head_dim)
+                v_reshaped = v.reshape(1, -1, layer.tp_v_head_num, layer.v_head_dim)
+                
+                assert not use_cascade_attn
+                
+                o, metadata = self.forward_paged_hip(
+                    query=q,
+                    sm_scale=layer.scaling,
+                    batch_size=forward_batch.batch_size,
+                    k=k_reshaped,
+                    v=v_reshaped,
+                    k_cache=None,
+                    v_cache=None,
+                    offload_cache=offload_cache,
+                    positions=forward_batch.positions,
+                    seq_lens=forward_batch.seq_lens,
+                    req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    rope_cos=layer.rope_cos,
+                    rope_sin=layer.rope_sin,
+                    rope_range=layer.rope_range,
+                    rope_is_neox_style=layer.rope_is_neox_style,
+                    layer_id=layer.layer_id,
+                    logit_cap=layer.logit_cap,
+                    orig_context_len=layer.orig_context_len,
+                    max_context_len=self.max_context_len,
+                    hip_config=self.hip_config,
+                    is_kv_cache_offload_enabled=self.is_kv_cache_offload_enabled,
+                    cached_metadata=None,
+                    online_update_cache=(
+                        forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
+                        if self.is_kv_cache_offload_enabled
+                        else None
+                    ),
+                    is_decode=False,
+                    offloading_metadata=offloading_metadata,
+                    sliding_window_size=sw_size,
+                    using_chunked_sliding_window=using_chunked_sw,
+                )
 
         if run_benchmark:
             from hip_attn.v1_2.utils import capture
@@ -282,6 +354,9 @@ class HiPAttentionBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        # For multi-head latent attention
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
     ):
         
         cache_loc = (
@@ -308,7 +383,7 @@ class HiPAttentionBackend(AttentionBackend):
         need_dense_prefill = using_chunked_sw or using_dense_prefill
         need_dense_decode = using_chunked_sw or delta_dense_decode or force_dense_decode
         
-        if need_dense_decode:
+        if need_dense_decode or False:
             o = self.flashattention_backend.forward_decode(
                 q=q,
                 k=k,
@@ -317,8 +392,8 @@ class HiPAttentionBackend(AttentionBackend):
                 forward_batch=forward_batch,
                 save_kv_cache=save_kv_cache,
                 # For multi-head latent attention
-                q_rope = None,
-                k_rope = None,
+                q_rope = q_rope,
+                k_rope = k_rope,
             )
         else:
             metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache(
@@ -332,12 +407,25 @@ class HiPAttentionBackend(AttentionBackend):
                 if k is not None:
                     assert v is not None
                     if save_kv_cache:
-                        forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
-                k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                    layer.layer_id
-                )
+                        if not self.use_mla:
+                            forward_batch.token_to_kv_pool.set_kv_buffer(
+                                layer, cache_loc, k, v
+                            )
+                        else:
+                            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                                layer,
+                                cache_loc,
+                                k,
+                                k_rope,
+                            )
+                if not self.use_mla:
+                    k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                        layer.layer_id
+                    )
+                else:
+                    kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                
                 offload_cache = offloading_metadata = None
-
             else:  # Offloading enabled
                 assert isinstance(
                     forward_batch.token_to_kv_pool, MHATokenToHiPOffloadKVPool
@@ -345,57 +433,132 @@ class HiPAttentionBackend(AttentionBackend):
                 if k is not None:
                     assert v is not None
                     if save_kv_cache:
-                        forward_batch.token_to_kv_pool.set_kv_buffer(
-                            layer, cache_loc, k, v, async_copy=False, push_to_gpu_cache=True
-                        )
+                        if not self.use_mla:
+                            forward_batch.token_to_kv_pool.set_kv_buffer(
+                                layer, cache_loc, k, v, async_copy=False, push_to_gpu_cache=True
+                            )
+                        else:
+                            raise Exception()
 
                 k_cache = v_cache = None
                 offload_cache, offloading_metadata = (
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
                 )
 
-            q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-            k_reshaped = k.reshape(-1, layer.tp_k_head_num, layer.head_dim)
-            v_reshaped = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
-            
-            if k_cache is not None:
-                if k_cache.dtype not in [torch.float32, torch.float16, torch.bfloat16]:
-                    assert layer.k_scale is not None, "fp8 scale should be handled"
+            if not self.use_mla:
+                if k_cache is not None:
+                    if k_cache.dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+                        assert layer.k_scale is not None, "fp8 scale should be handled"
+                
+                q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+                k_reshaped = k.reshape(-1, layer.tp_k_head_num, layer.head_dim)
+                v_reshaped = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
+                
+                o, metadata = self.forward_paged_hip(
+                    query=q_reshaped,
+                    sm_scale=layer.scaling,
+                    batch_size=forward_batch.batch_size,
+                    k=k_reshaped,
+                    v=v_reshaped,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    offload_cache=offload_cache,
+                    positions=forward_batch.positions,
+                    seq_lens=forward_batch.seq_lens,
+                    req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    rope_cos=layer.rope_cos,
+                    rope_sin=layer.rope_sin,
+                    rope_range=layer.rope_range,
+                    rope_is_neox_style=layer.rope_is_neox_style,
+                    layer_id=layer.layer_id,
+                    logit_cap=layer.logit_cap,
+                    orig_context_len=layer.orig_context_len,
+                    max_context_len=self.max_context_len,
+                    hip_config=self.hip_config,
+                    is_kv_cache_offload_enabled=self.is_kv_cache_offload_enabled,
+                    cached_metadata=metadata,
+                    online_update_cache=(
+                        forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
+                        if self.is_kv_cache_offload_enabled
+                        else None
+                    ),
+                    is_decode=True,
+                    offloading_metadata=offloading_metadata,
+                    sliding_window_size=sw_size,
+                    using_chunked_sliding_window=using_chunked_sw,
+                )
+            else:
+                # print(q.shape, k.shape, q_rope.shape, k_rope.shape)
+                # torch.Size([1, 16, 512]) torch.Size([1, 1, 512]) torch.Size([1, 16, 64]) torch.Size([1, 1, 64])
+                
+                k_rope = kv_cache[:, :, layer.v_head_dim :]
+                c_kv = kv_cache[:, :, : layer.v_head_dim]
+                k_rope_cache = k_rope.view(
+                    -1,
+                    self.page_size,
+                    layer.tp_k_head_num,
+                    layer.head_dim - layer.v_head_dim,
+                )
+                c_kv_cache = c_kv.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
 
-            o, metadata = self.forward_paged_hip(
-                query=q_reshaped,
-                sm_scale=layer.scaling,
-                batch_size=forward_batch.batch_size,
-                k=k_reshaped,
-                v=v_reshaped,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                offload_cache=offload_cache,
-                positions=forward_batch.positions,
-                seq_lens=forward_batch.seq_lens,
-                req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
-                req_pool_indices=forward_batch.req_pool_indices,
-                rope_cos=layer.rope_cos,
-                rope_sin=layer.rope_sin,
-                rope_range=layer.rope_range,
-                rope_is_neox_style=layer.rope_is_neox_style,
-                layer_id=layer.layer_id,
-                logit_cap=layer.logit_cap,
-                orig_context_len=layer.orig_context_len,
-                max_context_len=self.max_context_len,
-                hip_config=self.hip_config,
-                is_kv_cache_offload_enabled=self.is_kv_cache_offload_enabled,
-                cached_metadata=metadata,
-                online_update_cache=(
-                    forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
-                    if self.is_kv_cache_offload_enabled
-                    else None
-                ),
-                is_decode=True,
-                offloading_metadata=offloading_metadata,
-                sliding_window_size=sw_size,
-                using_chunked_sliding_window=using_chunked_sw,
-            )
+                if q_rope is not None:
+                    q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                    q_rope = q_rope.view(
+                        -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                    )
+                else:
+                    q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                    q_nope = q_all[:, :, : layer.v_head_dim]
+                    q_rope = q_all[:, :, layer.v_head_dim :]
+                max_seqlen_q = self.flashattention_backend.forward_metadata.max_seq_len_q
+                
+                # print(q_rope.shape, k_rope_cache.shape, c_kv_cache.shape, q_nope.shape)
+                # torch.Size([1, 16, 64]) torch.Size([320001, 1, 1, 64]) torch.Size([320001, 1, 1, 512]) torch.Size([1, 16, 512])
+                
+                assert q_nope.shape[-1] == layer.rope_range[0]
+                assert (q_rope.shape[-1] + q_nope.shape[-1]) == layer.rope_range[1]
+                q_merged = torch.cat([q_nope, q_rope], dim=-1)
+                # TODO FIXME
+                k_cache = torch.cat([c_kv_cache, k_rope_cache], dim=-1)
+                v_cache = c_kv_cache
+                
+                o, metadata = self.forward_paged_hip(
+                    query=q_merged,
+                    sm_scale=layer.scaling,
+                    batch_size=forward_batch.batch_size,
+                    k=None,
+                    v=None,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    offload_cache=offload_cache,
+                    positions=forward_batch.positions,
+                    seq_lens=forward_batch.seq_lens,
+                    req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    rope_cos=layer.rope_cos,
+                    rope_sin=layer.rope_sin,
+                    rope_range=layer.rope_range,
+                    rope_is_neox_style=layer.rope_is_neox_style,
+                    layer_id=layer.layer_id,
+                    logit_cap=layer.logit_cap,
+                    orig_context_len=layer.orig_context_len,
+                    max_context_len=self.max_context_len,
+                    hip_config=self.hip_config,
+                    is_kv_cache_offload_enabled=self.is_kv_cache_offload_enabled,
+                    cached_metadata=metadata,
+                    online_update_cache=(
+                        forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
+                        if self.is_kv_cache_offload_enabled
+                        else None
+                    ),
+                    is_decode=True,
+                    offloading_metadata=offloading_metadata,
+                    sliding_window_size=sw_size,
+                    using_chunked_sliding_window=using_chunked_sw,
+                )
 
             if metadata is not None:
                 forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
