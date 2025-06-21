@@ -36,12 +36,12 @@ class ServingCompletionTestCase(unittest.TestCase):
     # ---------- prompt-handling ----------
     def test_single_string_prompt(self):
         req = CompletionRequest(model="x", prompt="Hello world", max_tokens=100)
-        internal, _ = self.sc._convert_to_internal_request([req], ["id"])
+        internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.text, "Hello world")
 
     def test_single_token_ids_prompt(self):
         req = CompletionRequest(model="x", prompt=[1, 2, 3, 4], max_tokens=100)
-        internal, _ = self.sc._convert_to_internal_request([req], ["id"])
+        internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.input_ids, [1, 2, 3, 4])
 
     def test_completion_template_handling(self):
@@ -55,7 +55,7 @@ class ServingCompletionTestCase(unittest.TestCase):
             "sglang.srt.entrypoints.openai.serving_completions.generate_completion_prompt_from_request",
             return_value="processed_prompt",
         ):
-            internal, _ = self.sc._convert_to_internal_request([req], ["id"])
+            internal, _ = self.sc._convert_to_internal_request(req)
             self.assertEqual(internal.text, "processed_prompt")
 
     # ---------- echo-handling ----------
