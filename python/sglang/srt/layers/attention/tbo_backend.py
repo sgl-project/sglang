@@ -119,21 +119,27 @@ class TboAttnBackend(AttentionBackend):
         replay_seq_lens_sum: int = None,
         replay_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
+        token_num_per_seq = two_batch_overlap.get_token_num_per_seq(
+            forward_mode=forward_mode, spec_info=spec_info
+        )
         if fn_name == "init_forward_metadata_capture_cuda_graph":
-            assert capture_num_tokens == bs, "Only support num_tokens==bs currently"
-        num_tokens = bs
+            assert (
+                capture_num_tokens == bs * token_num_per_seq
+            ), "For target-verify or decode mode, num_tokens should be equal to token_num_per_seq * bs"
+        num_tokens = bs * token_num_per_seq
 
         tbo_split_seq_index, tbo_split_token_index = (
             two_batch_overlap.compute_split_indices_for_cuda_graph_replay(
                 forward_mode=forward_mode,
                 cuda_graph_num_tokens=num_tokens,
+                spec_info=spec_info,
             )
         )
 
         num_tokens_child_left = tbo_split_token_index
         num_tokens_child_right = num_tokens - tbo_split_token_index
-        bs_child_left = num_tokens_child_left
-        bs_child_right = num_tokens_child_right
+        bs_child_left = tbo_split_seq_index
+        bs_child_right = bs - bs_child_left
 
         assert (
             num_tokens_child_left > 0 and num_tokens_child_right > 0
@@ -198,7 +204,6 @@ def _init_forward_metadata_cuda_graph_split(
     replay_seq_lens_cpu: Optional[torch.Tensor] = None,
 ):
     assert encoder_lens is None, "encoder_lens is not supported yet"
-    assert spec_info is None, "spec_info is not supported yet"
 
     ans = dict(
         bs=output_bs,
@@ -208,14 +213,19 @@ def _init_forward_metadata_cuda_graph_split(
         forward_mode=forward_mode,
         # ignore
         encoder_lens=None,
-        spec_info=None,
+        spec_info=spec_info,
     )
 
     if fn_name == "init_forward_metadata_capture_cuda_graph":
-        assert capture_num_tokens == bs, "Only support num_tokens==bs currently"
+        token_num_per_seq = two_batch_overlap.get_token_num_per_seq(
+            forward_mode=forward_mode, spec_info=spec_info
+        )
+        assert (
+            capture_num_tokens == bs * token_num_per_seq
+        ), "Only support num_tokens==bs * token_num_per_seq for target-verify or decode mode"
         ans.update(
             dict(
-                num_tokens=output_bs,
+                num_tokens=output_bs * token_num_per_seq,
             )
         )
     elif fn_name == "init_forward_metadata_replay_cuda_graph":
