@@ -77,7 +77,8 @@ srt_hip = [
     "sglang[runtime_common]",
     "torch",
     "vllm==0.6.7.dev2",
-    "outlines==0.1.11"
+    "outlines==0.1.11",
+    "petit_kernel==0.0.1"
 ]
 
 # xpu is not enabled in public vllm and torch whl,
