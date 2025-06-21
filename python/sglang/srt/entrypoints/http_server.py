@@ -616,6 +616,20 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     return ORJSONResponse(content=response_data, status_code=200)
 
 
+@app.post("/pause_generation")
+async def pause_generation(request: Request):
+    """Pause generation."""
+    await _global_state.tokenizer_manager.pause_generation()
+    return ORJSONResponse(content="Generation paused.", status_code=200)
+
+
+@app.post("/continue_generation")
+async def continue_generation(request: Request):
+    """Continue generation."""
+    await _global_state.tokenizer_manager.continue_generation()
+    return ORJSONResponse(content="Generation continued.", status_code=200)
+
+
 ##### OpenAI-compatible API endpoints #####
 
 

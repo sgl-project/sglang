@@ -199,6 +199,8 @@ class TokenizerManager:
         self.is_image_gen = self.model_config.is_image_gen
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
+        self._updating = False
+        self._cond = asyncio.Condition()
 
         if self.model_config.is_multimodal:
             import_processors()
@@ -407,6 +409,8 @@ class TokenizerManager:
         request: Optional[fastapi.Request] = None,
     ):
         created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
 
         self.auto_create_handle_loop()
 
@@ -870,6 +874,16 @@ class TokenizerManager:
     async def dump_expert_distribution_record(self):
         self.auto_create_handle_loop()
         await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
+
+    async def pause_generation(self):
+        async with self._cond:
+            self._updating = True
+            self.abort_request("")
+
+    async def continue_generation(self):
+        async with self._cond:
+            self._updating = False
+            self._cond.notify_all()
 
     async def update_weights_from_disk(
         self,
