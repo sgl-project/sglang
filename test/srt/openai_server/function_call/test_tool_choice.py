@@ -7,8 +7,8 @@ Tests: required, auto, and specific function choices in both streaming and non-s
 # python3 -m unittest openai_server.function_call.test_tool_choice
 """
 
-import unittest
 import json
+import unittest
 
 import openai
 
