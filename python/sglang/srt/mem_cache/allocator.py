@@ -51,7 +51,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.free_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
-        self.clear()
 
     def debug_print(self) -> str:
         return ""
@@ -109,6 +108,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def __init__(self, size: int, dtype: torch.dtype, device: str, kvcache: KVCache):
         super().__init__(size, 1, dtype, device, kvcache)
+        self.clear()
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
@@ -297,6 +297,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self.ret_values = torch.empty((), dtype=torch.int64, device=self.device)
+        self.clear()
 
     def alloc(self, need_size: int):
         # page-aligned allocation, returning contiguous indices of pages
