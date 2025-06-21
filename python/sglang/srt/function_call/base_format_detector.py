@@ -111,8 +111,7 @@ class BaseFormatDetector(ABC):
         # The current_text has tool_call if it is the start of a new tool call sequence
         # or it is the start of a new tool call after a tool call separator, when there is a previous tool call
         if not (
-            self.bot_token in current_text
-            or current_text.startswith("{")
+            self.has_tool_call(current_text)
             or (
                 self.current_tool_id > 0
                 and current_text.startswith(self.tool_call_separator + "{")
