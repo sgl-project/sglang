@@ -257,9 +257,9 @@ class SchedulerOutputProcessorMixin:
                         logits_output.next_token_token_ids_logprobs_idx[i]
                     )
 
-            if req.return_hidden_states and logits_output.hidden_states is not None:
+            if req.return_hidden_states and logits_output.hd_to_return is not None:
                 req.hidden_states.append(
-                    logits_output.hidden_states[i].cpu().clone().tolist()
+                    logits_output.hd_to_return[i].cpu().clone().tolist()
                 )
 
             if req.grammar is not None and batch.spec_algorithm.is_none():
