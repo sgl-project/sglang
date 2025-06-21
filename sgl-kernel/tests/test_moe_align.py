@@ -210,6 +210,13 @@ def test_moe_align_block_size_compare_implementations(
         f"Triton expert_ids: {expert_ids_triton}"
     )
 
+    assert torch.allclose(num_tokens_post_pad_cuda, num_tokens_post_pad_triton), (
+        f"Num tokens post pad mismatch for block_size={block_size}, "
+        f"num_tokens={num_tokens}, topk={topk}\n"
+        f"CUDA num_tokens_post_pad: {num_tokens_post_pad_cuda}\n"
+        f"Triton num_tokens_post_pad: {num_tokens_post_pad_triton}"
+    )
+
     # Select an expert to check
     expert_idx = expert_ids_cuda.max().item()
 

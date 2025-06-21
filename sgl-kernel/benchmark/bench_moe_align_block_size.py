@@ -5,7 +5,11 @@ import torch
 import triton
 import triton.language as tl
 from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
-from vllm import _custom_ops as ops
+
+try:
+    from vllm import _custom_ops as ops
+except ImportError:
+    ops = None
 
 USE_RANDOM_PERM = False
 
@@ -208,7 +212,7 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
         )
         print(f"✅ VLLM implementation works with {num_experts} experts!")
         vllm_works = True
-    except RuntimeError as e:
+    except Exception as e:
         print(f"❌ VLLM implementation failed with {num_experts} experts: {e}")
         vllm_works = False
 
@@ -288,7 +292,6 @@ def benchmark(num_tokens, num_experts, topk, provider):
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
-    sorted_ids.fill_(topk_ids.numel())
     max_num_m_blocks = max_num_tokens_padded // block_size
     expert_ids = torch.empty(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
@@ -338,6 +341,7 @@ def benchmark(num_tokens, num_experts, topk, provider):
             quantiles=quantiles,
         )
     elif provider == "triton":
+        sorted_ids.fill_(topk_ids.numel())
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: moe_align_block_size_triton(
                 topk_ids,
@@ -351,6 +355,7 @@ def benchmark(num_tokens, num_experts, topk, provider):
         )
     else:  # vllm
         try:
+            sorted_ids.fill_(topk_ids.numel())
             ms, min_ms, max_ms = triton.testing.do_bench(
                 lambda: ops.moe_align_block_size(
                     topk_ids,
@@ -362,7 +367,7 @@ def benchmark(num_tokens, num_experts, topk, provider):
                 ),
                 quantiles=quantiles,
             )
-        except RuntimeError as e:
+        except Exception as e:
             print(f"❌ VLLM benchmark failed with {num_experts} experts: {e}")
             # Return extreme values to indicate failure in the chart
             return float("inf"), float("inf"), float("inf")
