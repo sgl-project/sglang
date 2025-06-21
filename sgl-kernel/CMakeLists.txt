@@ -162,15 +162,17 @@ if (ENABLE_BELOW_SM90)
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0" OR SGL_KERNEL_ENABLE_SM100A)
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_100,code=sm_110"
-        "-gencode=arch=compute_100a,code=sm_110a"
-    )
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_110,code=sm_110"
+            "-gencode=arch=compute_110a,code=sm_110a"
+            "-gencode=arch=compute_121,code=sm_121"
+            "-gencode=arch=compute_121a,code=sm_121a"
+        )
+    endif()
 elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100,code=sm_100"
-        "-gencode=arch=compute_100,code=sm_101"
-        "-gencode=arch=compute_100,code=sm_101a"
         "-gencode=arch=compute_100a,code=sm_100a"
         "-gencode=arch=compute_120,code=sm_120"
     )
@@ -328,6 +330,7 @@ if (SGL_KERNEL_ENABLE_FA3)
         list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS
             "-gencode=arch=compute_80,code=sm_80"
             "-gencode=arch=compute_86,code=sm_86"
+            "-gencode=arch=compute_87,code=sm_87"
         )
         # SM8X Logic
         file(GLOB FA3_SM8X_GEN_SRCS
