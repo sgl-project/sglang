@@ -49,7 +49,10 @@ if _is_cuda:
 if _is_cuda or _is_hip:
     from sgl_kernel import topk_softmax
 if _use_aiter:
-    from aiter import biased_grouped_topk as aiter_biased_grouped_topk
+    try:
+        from aiter import biased_grouped_topk as aiter_biased_grouped_topk
+    except ImportError:
+        raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 
 
 def fused_topk_torch_native(
@@ -356,7 +359,7 @@ def biased_grouped_topk_gpu(
         device = gating_output.device
         assert (
             hidden_states.shape[0] == gating_output.shape[0]
-        ), "Number of tokens mismatch"
+        ), f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
         aiter_biased_grouped_topk(
