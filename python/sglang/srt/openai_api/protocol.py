@@ -216,7 +216,7 @@ class CompletionResponseStreamChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Optional[Literal["stop", "length", "content_filter"]] = None
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
 
@@ -468,7 +468,9 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     delta: DeltaMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
-        Literal["stop", "length", "tool_calls", "content_filter", "function_call"]
+        Literal[
+            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+        ]
     ] = None
     matched_stop: Union[None, int, str] = None
 
