@@ -221,21 +221,24 @@ def test_moe_align_block_size_compare_implementations(
 
     # Get the first and last block id where expert_ids_cuda == expert_idx
     matching_indices = torch.where(expert_ids_cuda == expert_idx)[0]
-    block_id_start = matching_indices[0].item()
-    block_id_end = matching_indices[-1].item()
+    block_sorted_start = matching_indices[0].item() * block_size
+    block_sorted_end = (matching_indices[-1].item() + 1) * block_size
+
+    selected_sorted_ids_cuda = sorted_ids_cuda[
+        block_sorted_start:block_sorted_end
+    ].sort()[0]
+    selected_sorted_ids_triton = sorted_ids_triton[
+        block_sorted_start:block_sorted_end
+    ].sort()[0]
 
     assert torch.allclose(
-        sorted_ids_cuda[
-            block_id_start * block_size : (block_id_end + 1) * block_size
-        ].sort()[0],
-        sorted_ids_triton[
-            block_id_start * block_size : (block_id_end + 1) * block_size
-        ].sort()[0],
+        selected_sorted_ids_cuda,
+        selected_sorted_ids_triton,
     ), (
         f"Sorted IDs mismatch for block_size={block_size}, "
         f"num_tokens={num_tokens}, topk={topk}\n"
-        f"CUDA sorted_ids: {sorted_ids_cuda}\n"
-        f"Triton sorted_ids: {sorted_ids_triton}"
+        f"CUDA sorted_ids: {selected_sorted_ids_cuda}\n"
+        f"Triton sorted_ids: {selected_sorted_ids_triton}"
     )
 
 
