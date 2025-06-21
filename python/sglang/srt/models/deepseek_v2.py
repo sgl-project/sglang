@@ -1435,7 +1435,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
+            num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
         )
@@ -1488,27 +1488,28 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        logging.info(f"before prepare_atnn {hidden_states.shape=}")
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
-
+        logging.info(f"after prepare_attn {hidden_states.shape=}")
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
-
+        logging.info(f"before prepare_mlp {hidden_states.shape=}")
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-
+        logging.info(f"after prepare_mlp {hidden_states.shape=}")
         hidden_states = self.mlp(hidden_states, forward_batch)
-
+        logging.info(f"before postprocess {hidden_states.shape=}")
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
-
+        logging.info(f"after postprocess {hidden_states.shape=}")
         if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
             # NOTE: this line resolves the degradation of MTP reception rate for non-zero DP ranks.
             # See discussion here (https://github.com/sgl-project/sglang/pull/6081#discussion_r2147452251).
