@@ -175,7 +175,7 @@ class Engine(EngineBase):
         """
         if self.server_args.enable_dp_attention:
             if data_parallel_rank is None:
-                logger.info("data_parallel_rank not provided, using default dispatch")
+                logger.debug("data_parallel_rank not provided, using default dispatch")
             elif data_parallel_rank < 0:
                 raise ValueError("data_parallel_rank must be non-negative")
             elif data_parallel_rank >= self.server_args.dp_size:
@@ -258,7 +258,7 @@ class Engine(EngineBase):
 
         if self.server_args.enable_dp_attention:
             if data_parallel_rank is None:
-                logger.info("data_parallel_rank not provided, using default dispatch")
+                logger.debug("data_parallel_rank not provided, using default dispatch")
             elif data_parallel_rank < 0:
                 raise ValueError("data_parallel_rank must be non-negative")
             elif data_parallel_rank >= self.server_args.dp_size:
@@ -326,6 +326,20 @@ class Engine(EngineBase):
         obj = EmbeddingReqInput(text=prompt, image_data=image_data)
         generator = self.tokenizer_manager.generate_request(obj, None)
         return await generator.__anext__()
+
+    def rerank(
+        self,
+        prompt: Union[List[List[str]]],
+    ) -> Dict:
+        """
+        The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
+        Please refer to `EmbeddingReqInput` for the documentation.
+        """
+        obj = EmbeddingReqInput(text=prompt, is_cross_encoder_request=True)
+        loop = asyncio.get_event_loop()
+        generator = self.tokenizer_manager.generate_request(obj, None)
+        ret = loop.run_until_complete(generator.__anext__())
+        return ret
 
     def shutdown(self):
         """Shutdown the engine"""
@@ -465,17 +479,15 @@ class Engine(EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
-    def release_memory_occupation(self):
-        """Release GPU occupation temporarily."""
-        obj = ReleaseMemoryOccupationReqInput()
+    def release_memory_occupation(self, tags: Optional[List[str]] = None):
+        obj = ReleaseMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.release_memory_occupation(obj, None)
         )
 
-    def resume_memory_occupation(self):
-        """Resume GPU occupation."""
-        obj = ResumeMemoryOccupationReqInput()
+    def resume_memory_occupation(self, tags: Optional[List[str]] = None):
+        obj = ResumeMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.resume_memory_occupation(obj, None)
@@ -605,7 +617,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda:
         assert_pkg_version(
             "sgl-kernel",
-            "0.1.7",
+            "0.1.9",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
@@ -656,11 +668,9 @@ def _launch_subprocesses(
 
     scheduler_procs = []
     if server_args.dp_size == 1:
-        # Launch tensor parallel scheduler processes
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
-
         scheduler_pipe_readers = []
 
         nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
@@ -696,6 +706,7 @@ def _launch_subprocesses(
                         writer,
                     ),
                 )
+
                 with memory_saver_adapter.configure_subprocess():
                     proc.start()
                 scheduler_procs.append(proc)
