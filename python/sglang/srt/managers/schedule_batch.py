@@ -1682,6 +1682,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             or global_server_args_dict["attention_backend"] == "flashmla"
             or global_server_args_dict["attention_backend"] == "cutlass_mla"
+            or global_server_args_dict["attention_backend"] == "aiter"
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
             seq_lens_cpu = (
