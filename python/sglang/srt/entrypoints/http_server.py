@@ -817,107 +817,108 @@ def _wait_and_warmup(
     image_token_text: str,
     launch_callback: Optional[Callable[[], None]] = None,
 ):
-    headers = {}
-    url = server_args.url()
-    if server_args.api_key:
-        headers["Authorization"] = f"Bearer {server_args.api_key}"
+    if not server_args.skip_warmup:
+        headers = {}
+        url = server_args.url()
+        if server_args.api_key:
+            headers["Authorization"] = f"Bearer {server_args.api_key}"
 
-    # Wait until the server is launched
-    success = False
-    for _ in range(120):
-        time.sleep(1)
-        try:
-            res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
-            assert res.status_code == 200, f"{res=}, {res.text=}"
-            success = True
-            break
-        except (AssertionError, requests.exceptions.RequestException):
-            last_traceback = get_exception_traceback()
-            pass
+        # Wait until the server is launched
+        success = False
+        for _ in range(120):
+            time.sleep(1)
+            try:
+                res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
+                assert res.status_code == 200, f"{res=}, {res.text=}"
+                success = True
+                break
+            except (AssertionError, requests.exceptions.RequestException):
+                last_traceback = get_exception_traceback()
+                pass
 
-    if not success:
-        if pipe_finish_writer is not None:
-            pipe_finish_writer.send(last_traceback)
-        logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_process_tree(os.getpid())
-        return
+        if not success:
+            if pipe_finish_writer is not None:
+                pipe_finish_writer.send(last_traceback)
+            logger.error(f"Initialization failed. warmup error: {last_traceback}")
+            kill_process_tree(os.getpid())
+            return
 
-    model_info = res.json()
+        model_info = res.json()
 
-    # Send a warmup request
-    request_name = "/generate" if model_info["is_generation"] else "/encode"
-    max_new_tokens = 8 if model_info["is_generation"] else 1
-    json_data = {
-        "sampling_params": {
-            "temperature": 0,
-            "max_new_tokens": max_new_tokens,
-        },
-    }
-    if server_args.skip_tokenizer_init:
-        json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
-        # TODO Workaround the bug that embedding errors for list of size 1
-        if server_args.dp_size == 1:
-            json_data["input_ids"] = json_data["input_ids"][0]
-    else:
-        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
-        # TODO Workaround the bug that embedding errors for list of size 1
-        if server_args.dp_size == 1:
-            json_data["text"] = json_data["text"][0]
-
-    # Debug dumping
-    if server_args.debug_tensor_dump_input_file:
-        json_data.pop("text", None)
-        json_data["input_ids"] = np.load(
-            server_args.debug_tensor_dump_input_file
-        ).tolist()
-        json_data["sampling_params"]["max_new_tokens"] = 0
-
-    try:
-        if server_args.disaggregation_mode == "null":
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=600,
-            )
-            assert res.status_code == 200, f"{res}"
+        # Send a warmup request
+        request_name = "/generate" if model_info["is_generation"] else "/encode"
+        max_new_tokens = 8 if model_info["is_generation"] else 1
+        json_data = {
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": max_new_tokens,
+            },
+        }
+        if server_args.skip_tokenizer_init:
+            json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
+            # TODO Workaround the bug that embedding errors for list of size 1
+            if server_args.dp_size == 1:
+                json_data["input_ids"] = json_data["input_ids"][0]
         else:
-            logger.info(f"Start of prefill warmup ...")
-            json_data = {
-                "sampling_params": {
-                    "temperature": 0.0,
-                    "max_new_tokens": 8,
-                    "ignore_eos": True,
-                },
-                "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
-                # This is a hack to ensure fake transfer is enabled during prefill warmup
-                # ensure each dp rank has a unique bootstrap_room during prefill warmup
-                "bootstrap_room": [
-                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
-                    for i in range(server_args.dp_size)
-                ],
-                "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
-            }
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=1800,  # because of deep gemm precache is very long if not precache.
-            )
-            logger.info(
-                f"End of prefill warmup with status {res.status_code}, resp: {res.json()}"
-            )
+            json_data["text"] = ["The capital city of France is"] * server_args.dp_size
+            # TODO Workaround the bug that embedding errors for list of size 1
+            if server_args.dp_size == 1:
+                json_data["text"] = json_data["text"][0]
 
-    except Exception:
-        last_traceback = get_exception_traceback()
-        if pipe_finish_writer is not None:
-            pipe_finish_writer.send(last_traceback)
-        logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_process_tree(os.getpid())
-        return
+        # Debug dumping
+        if server_args.debug_tensor_dump_input_file:
+            json_data.pop("text", None)
+            json_data["input_ids"] = np.load(
+                server_args.debug_tensor_dump_input_file
+            ).tolist()
+            json_data["sampling_params"]["max_new_tokens"] = 0
 
-    # Debug print
-    # logger.info(f"{res.json()=}")
+        try:
+            if server_args.disaggregation_mode == "null":
+                res = requests.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=headers,
+                    timeout=600,
+                )
+                assert res.status_code == 200, f"{res}"
+            else:
+                logger.info(f"Start of prefill warmup ...")
+                json_data = {
+                    "sampling_params": {
+                        "temperature": 0.0,
+                        "max_new_tokens": 8,
+                        "ignore_eos": True,
+                    },
+                    "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
+                    # This is a hack to ensure fake transfer is enabled during prefill warmup
+                    # ensure each dp rank has a unique bootstrap_room during prefill warmup
+                    "bootstrap_room": [
+                        i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
+                        for i in range(server_args.dp_size)
+                    ],
+                    "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
+                }
+                res = requests.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=headers,
+                    timeout=1800,  # because of deep gemm precache is very long if not precache.
+                )
+                logger.info(
+                    f"End of prefill warmup with status {res.status_code}, resp: {res.json()}"
+                )
+
+        except Exception:
+            last_traceback = get_exception_traceback()
+            if pipe_finish_writer is not None:
+                pipe_finish_writer.send(last_traceback)
+            logger.error(f"Initialization failed. warmup error: {last_traceback}")
+            kill_process_tree(os.getpid())
+            return
+
+        # Debug print
+        # logger.info(f"{res.json()=}")
 
     logger.info("The server is fired up and ready to roll!")
     if pipe_finish_writer is not None:
