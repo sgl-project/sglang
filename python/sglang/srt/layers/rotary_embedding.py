@@ -21,9 +21,16 @@ if _is_cuda:
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
+
+
+# Copied from transformers
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half the hidden dims of the input tensor."""
+    return _rotate_neox(x)
 
 
 def _rotate_gptj(x: torch.Tensor) -> torch.Tensor:
@@ -1092,6 +1099,92 @@ class MRotaryEmbedding(RotaryEmbedding):
         )
 
 
+class MiniCPMScaledRotaryEmbedding(RotaryEmbedding):
+    """RotaryEmbedding implementing MiniCPM-V's LongRoPE scaling."""
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,  # Scaled max sequence length
+        base: int,
+        # MiniCPM specific params from rope_scaling
+        short_factor: List[float],
+        long_factor: List[float],
+        original_max_position_embeddings: int,
+        dtype: Optional[torch.dtype] = None,
+        is_neox_style: bool = True,
+    ) -> None:
+        self.max_seq_len_cached = 0
+        self.original_max_position_embeddings = original_max_position_embeddings
+        self.short_factor = short_factor
+        self.long_factor = long_factor
+        scale = float(max_position_embeddings) / original_max_position_embeddings
+        self.scaling_factor = math.sqrt(
+            1 + math.log(scale) / math.log(original_max_position_embeddings)
+        )
+        self.inv_freq = 1.0 / (
+            base ** (torch.arange(0, rotary_dim, 2).float() / rotary_dim)
+        )
+        super().__init__(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+        )
+
+        self._compute_cos_sin_cache(
+            seq_len=max_position_embeddings,
+        )
+
+    def _compute_cos_sin_cache(self, seq_len=0) -> torch.Tensor:
+        if seq_len <= self.max_seq_len_cached:
+            if hasattr(self, "cos_sin_cache"):
+                return self.cos_sin_cache
+            return None
+        self.max_seq_len_cached = max(self.max_seq_len_cached, seq_len)
+
+        if seq_len > self.original_max_position_embeddings:
+            ext_factors = torch.tensor(self.long_factor, dtype=torch.float32)
+        else:
+            ext_factors = torch.tensor(self.short_factor, dtype=torch.float32)
+        t = torch.arange(self.max_seq_len_cached, dtype=self.inv_freq.dtype)
+        freqs = torch.mul(
+            torch.outer(t, 1.0 / ext_factors),
+            self.inv_freq.to(self.dtype),
+        )
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos().to(self.dtype) * self.scaling_factor
+        sin = emb.sin().to(self.dtype) * self.scaling_factor
+        # Return cache as float32 for numerical stability, consistent with base.
+        cache = torch.cat((cos, sin), dim=-1).to(torch.float32)
+        self.register_buffer("cos_sin_cache", cache, persistent=False)
+        return cache
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        seq_len: int = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if seq_len is not None and seq_len > self.max_seq_len_cached:
+            self._compute_cos_sin_cache(seq_len=seq_len)
+
+        def apply_rotary_pos_emb(q, k, cos, sin, positions):
+            assert q.dim() == 3
+            cos = cos[positions].unsqueeze(1)
+            sin = sin[positions].unsqueeze(1)
+            q_embed = (q * cos) + (rotate_half(q) * sin)
+            k_embed = (k * cos) + (rotate_half(k) * sin)
+            return q_embed, k_embed
+
+        cos, sin = self.cos_sin_cache[:seq_len].split(
+            [self.cos_sin_cache.shape[-1] // 2] * 2, dim=-1
+        )
+        q, k = apply_rotary_pos_emb(query, key, cos, sin, positions)
+
+        return q, k
+
+
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
 
 
@@ -1271,14 +1364,6 @@ def get_rope(
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
-
-
-# Copied from transformers
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
 
 
 def apply_rotary_pos_emb(
