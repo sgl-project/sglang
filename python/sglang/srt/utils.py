@@ -160,13 +160,17 @@ def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
-def is_cpu() -> bool:
+def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (
         machine in ("x86_64", "amd64", "i386", "i686")
         and hasattr(torch, "cpu")
         and torch.cpu.is_available()
     )
+
+
+def is_cpu() -> bool:
+    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
 
 
 def is_flashinfer_available():
@@ -1452,6 +1456,15 @@ def get_device(device_id: Optional[int] = None) -> str:
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
 
+    if is_cpu():
+        if cpu_has_amx_support():
+            logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
+        else:
+            logger.warning(
+                "CPU device enabled, using torch native backend, low performance expected."
+            )
+        return "cpu"
+
     raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
 
 
@@ -2141,6 +2154,44 @@ def get_free_port():
             return s.getsockname()[1]
 
 
+def get_local_ip_auto() -> str:
+    interface = os.environ.get("SGLANG_LOCAL_IP_NIC", None)
+    return (
+        get_local_ip_by_nic(interface)
+        if interface is not None
+        else get_local_ip_by_remote()
+    )
+
+
+def get_local_ip_by_nic(interface: str) -> str:
+    try:
+        import netifaces
+    except ImportError as e:
+        raise ImportError(
+            "Environment variable SGLANG_LOCAL_IP_NIC requires package netifaces, please install it through 'pip install netifaces'"
+        ) from e
+
+    try:
+        addresses = netifaces.ifaddresses(interface)
+        if netifaces.AF_INET in addresses:
+            for addr_info in addresses[netifaces.AF_INET]:
+                ip = addr_info.get("addr")
+                if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+                    return ip
+        if netifaces.AF_INET6 in addresses:
+            for addr_info in addresses[netifaces.AF_INET6]:
+                ip = addr_info.get("addr")
+                if ip and not ip.startswith("fe80::") and ip != "::1":
+                    return ip.split("%")[0]
+    except (ValueError, OSError) as e:
+        raise ValueError(
+            "Can not get local ip from NIC. Please verify whether SGLANG_LOCAL_IP_NIC is set correctly."
+        )
+
+    # Fallback
+    return get_local_ip_by_remote()
+
+
 def get_local_ip_by_remote() -> str:
     # try ipv4
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -2250,6 +2301,51 @@ class Withable(Generic[T]):
         finally:
             assert self._value is new_value
             self._value = None
+
+
+def require_mlp_tp_gather(server_args):
+    """
+    Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
+    """
+    if server_args.enable_dp_attention:
+        assert server_args.dp_size > 1, "dp_size must be greater than 1"
+        if (
+            server_args.moe_dense_tp_size is None
+        ):  # TODO(ch-wan): some MoE models do not have dense layers
+            return True
+        elif not server_args.enable_dp_lm_head:
+            return True
+        elif not server_args.enable_deepep_moe:
+            return True
+        else:
+            return (
+                server_args.moe_dense_tp_size
+                > server_args.tp_size // server_args.dp_size
+            )
+    else:
+        return False
+
+
+def require_attn_tp_gather(server_args):
+    """
+    Check if the input of attention is scattered.
+    """
+    assert server_args.moe_dense_tp_size in [1, None]
+    if server_args.enable_deepep_moe or server_args.moe_dense_tp_size == 1:
+        if server_args.enable_dp_attention:
+            return server_args.dp_size < server_args.tp_size
+        else:
+            return True
+    else:
+        return False
+
+
+def require_gathered_buffer(server_args):
+    return require_mlp_tp_gather(server_args) or require_attn_tp_gather(server_args)
+
+
+def require_mlp_sync(server_args):
+    return server_args.enable_dp_attention or require_gathered_buffer(server_args)
 
 
 def merge_bias_tensor(

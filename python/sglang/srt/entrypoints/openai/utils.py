@@ -1,10 +1,14 @@
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import jinja2.nodes
 import transformers.utils.chat_template_utils as hf_chat_utils
 
-from sglang.srt.entrypoints.openai.protocol import LogProbs, UsageInfo
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    LogProbs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -171,62 +175,6 @@ def process_content_for_template_format(
         return new_msg
 
 
-def calculate_token_usage(
-    prompt_tokens: int,
-    completion_tokens: int,
-    cached_tokens: Optional[Dict[str, int]] = None,
-) -> UsageInfo:
-    """Calculate token usage information"""
-    return UsageInfo(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=prompt_tokens + completion_tokens,
-        prompt_tokens_details=cached_tokens,
-    )
-
-
-def aggregate_token_usage(
-    responses: List[Dict[str, Any]],
-    n_choices: int = 1,
-    enable_cache_report: bool = False,
-) -> UsageInfo:
-    """Aggregate token usage from multiple responses
-
-    Args:
-        responses: List of response dictionaries with meta_info
-        n_choices: Number of choices per request (for prompt token counting)
-        enable_cache_report: Whether to include cached token details
-
-    Returns:
-        Aggregated UsageInfo
-    """
-    # Sum completion tokens from all responses
-    completion_tokens = sum(
-        response["meta_info"]["completion_tokens"] for response in responses
-    )
-
-    # For prompt tokens, only count every n_choices-th response to avoid double counting
-    prompt_tokens = sum(
-        responses[i]["meta_info"]["prompt_tokens"]
-        for i in range(0, len(responses), n_choices)
-    )
-
-    # Handle cached tokens if cache reporting is enabled
-    cached_tokens_details = None
-    if enable_cache_report:
-        cached_tokens_sum = sum(
-            response["meta_info"].get("cached_tokens", 0) for response in responses
-        )
-        if cached_tokens_sum > 0:
-            cached_tokens_details = {"cached_tokens": cached_tokens_sum}
-
-    return calculate_token_usage(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        cached_tokens=cached_tokens_details,
-    )
-
-
 def to_openai_style_logprobs(
     input_token_logprobs=None,
     output_token_logprobs=None,
@@ -262,3 +210,28 @@ def to_openai_style_logprobs(
         append_top_logprobs(output_top_logprobs)
 
     return ret_logprobs
+
+
+def process_hidden_states_from_ret(
+    ret_item: Dict[str, Any],
+    request: Union[
+        ChatCompletionRequest,
+        CompletionRequest,
+    ],
+) -> Optional[List]:
+    """Process hidden states from a ret item in non-streaming response.
+
+    Args:
+        ret_item: Response item containing meta_info
+        request: The original request object
+
+    Returns:
+        Processed hidden states for the last token, or None
+    """
+    if not request.return_hidden_states:
+        return None
+
+    hidden_states = ret_item["meta_info"].get("hidden_states", None)
+    if hidden_states is not None:
+        hidden_states = hidden_states[-1] if len(hidden_states) > 1 else []
+    return hidden_states
