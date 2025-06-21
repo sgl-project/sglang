@@ -22,21 +22,16 @@ class LoRAMemoryPool:
         self,
         base_hf_config: AutoConfig,
         max_loras_per_batch: int,
-        max_lora_dim: int,
         dtype: torch.dtype,
         tp_size: int,
         tp_rank: int,
-        lora_modules: Dict[int, List[Tuple[str, BaseLayerWithLoRA]]],
     ):
-
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
         self.max_loras_per_batch: int = max_loras_per_batch
-        self.max_lora_dim: int = max_lora_dim
         self.dtype: torch.dtype = dtype
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
-        self.lora_modules: Dict[int, List[Tuple[str, BaseLayerWithLoRA]]] = lora_modules
 
         # Both A_buffer and B_buffer maps lora weight names to its buffer space.
         # A_buffer contains num_layer number of row-major tensors with shape
@@ -55,53 +50,51 @@ class LoRAMemoryPool:
         self.buffer_id_to_uid: List[Optional[str]] = [""] * self.max_loras_per_batch
 
     def get_lora_A_shape(
-        self, module_name: str, base_model: torch.nn.Module
+        self, module_name: str, base_model: torch.nn.Module, max_lora_dim: int
     ) -> Tuple[int]:
         """
         Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
         """
         input_dim, _ = get_hidden_dim(module_name, self.base_hf_config, base_model)
         c = get_stacked_multiply(module_name)
-        if self.tp_size > 1:
-            if module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-                input_dim = divide(input_dim, self.tp_size)
+        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+            input_dim = divide(input_dim, self.tp_size)
         return (
             self.max_loras_per_batch,
-            self.max_lora_dim * c,
+            max_lora_dim * c,
             input_dim,
         )
 
     def get_lora_B_shape(
-        self, module_name: str, base_model: torch.nn.Module
+        self, module_name: str, base_model: torch.nn.Module, max_lora_dim: int
     ) -> Tuple[int]:
         """
         Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
         """
         _, output_dim = get_hidden_dim(module_name, self.base_hf_config, base_model)
         c = get_stacked_multiply(module_name)
-        if self.tp_size > 1:
-            if module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-                output_dim = divide(output_dim, self.tp_size)
+        if self.tp_size > 1 and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
+            output_dim = divide(output_dim, self.tp_size)
         return (
             c,
             self.max_loras_per_batch,
             output_dim,
-            self.max_lora_dim,
+            max_lora_dim,
         )
 
     def init_buffers(
         self,
         lora_weight_names: Tuple[Set[str]],
         base_model: torch.nn.Module,
+        max_lora_dim: int,
     ):
-
         # lora_weight_names is a set of name pairs indicating each pair of lora modules to load
         #   e.g., {("qkv_proj", "q_proj"), ("qkv_proj", "kv_proj"), ("o_proj", "o_proj")}
         self.lora_weight_names: Tuple[Set[str]] = lora_weight_names
         device = next(base_model.parameters()).device
         # Init A tensor, column_major=False
         for module_A in lora_weight_names[0]:
-            lora_A_shape = self.get_lora_A_shape(module_A, base_model)
+            lora_A_shape = self.get_lora_A_shape(module_A, base_model, max_lora_dim)
             self.A_buffer[module_A] = [
                 torch.empty(
                     lora_A_shape,
@@ -112,7 +105,7 @@ class LoRAMemoryPool:
             ]
         # Init B tensor, column_major=True
         for module_B in lora_weight_names[1]:
-            lora_B_shape = self.get_lora_B_shape(module_B, base_model)
+            lora_B_shape = self.get_lora_B_shape(module_B, base_model, max_lora_dim)
             self.B_buffer[module_B] = [
                 torch.empty(
                     lora_B_shape,
@@ -126,8 +119,8 @@ class LoRAMemoryPool:
         self,
         cur_uids: Set[Optional[str]],
         lora_adapters: Dict[str, LoRAAdapter],
+        lora_modules: Dict[int, Dict[str, BaseLayerWithLoRA]],
     ):
-
         def get_available_buffer_slot():
             for buffer_id in range(self.max_loras_per_batch):
                 # Prioritize empty slots
@@ -147,14 +140,19 @@ class LoRAMemoryPool:
         for uid in cur_uids:
             if uid not in self.uid_to_buffer_id:
                 buffer_id = get_available_buffer_slot()
+                lora_adapter = lora_adapters.get(uid, None)
                 self.load_lora_weight_to_buffer(
-                    uid, buffer_id, lora_adapters.get(uid, None)
+                    uid, buffer_id, lora_adapter, lora_modules
                 )
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
 
     def load_lora_weight_to_buffer(
-        self, uid: str, buffer_id: int, lora_adapter: LoRAAdapter = None
+        self,
+        uid: str,
+        buffer_id: int,
+        lora_adapter: LoRAAdapter,
+        lora_modules: Dict[int, Dict[str, BaseLayerWithLoRA]],
     ):
         def check_lora_weight_shape(buffer_view: torch.Tensor, weight: torch.Tensor):
             assert (
@@ -186,8 +184,8 @@ class LoRAMemoryPool:
                     temp_B_buffer[lora_weight_name] = weights
 
             if self.tp_size > 1:
-                cur_layer_modules = self.lora_modules[layer_id]
-                for module_name, module in cur_layer_modules:
+                cur_layer_modules = lora_modules[layer_id]
+                for module_name, module in cur_layer_modules.items():
                     if "qkv_proj" in module_name:
                         temp_A_buffer["qkv_proj"] = module.slice_lora_a_weights(
                             temp_A_buffer["qkv_proj"], self.tp_rank
@@ -236,7 +234,6 @@ class LoRAMemoryPool:
     def get_tensor(
         self, weight_name: str, layer_id: int, lora_type: LoRAType
     ) -> torch.Tensor:
-
         if lora_type == LoRAType.LORA_A:
             return self.A_buffer[weight_name][layer_id]
 
