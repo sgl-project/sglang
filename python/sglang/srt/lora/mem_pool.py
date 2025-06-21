@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -92,28 +92,35 @@ class LoRAMemoryPool:
         #   e.g., {("qkv_proj", "q_proj"), ("qkv_proj", "kv_proj"), ("o_proj", "o_proj")}
         self.lora_weight_names: Tuple[Set[str]] = lora_weight_names
         device = next(base_model.parameters()).device
-        # Init A tensor, column_major=False
-        for module_A in lora_weight_names[0]:
-            lora_A_shape = self.get_lora_A_shape(module_A, base_model, max_lora_dim)
-            self.A_buffer[module_A] = [
-                torch.empty(
-                    lora_A_shape,
-                    dtype=self.dtype,
-                    device=device,
-                )
-                for _ in range(self.num_layer)
-            ]
-        # Init B tensor, column_major=True
-        for module_B in lora_weight_names[1]:
-            lora_B_shape = self.get_lora_B_shape(module_B, base_model, max_lora_dim)
-            self.B_buffer[module_B] = [
-                torch.empty(
-                    lora_B_shape,
-                    dtype=self.dtype,
-                    device=device,
-                )
-                for _ in range(self.num_layer)
-            ]
+
+        def update_buffer(
+            buffer: Dict[str, List[torch.Tensor]],
+            lora_weight_names: Set[str],
+            get_lora_shape_fn: Callable[[str, torch.nn.Module, int], Tuple[int]],
+        ):
+            new_weight_names = lora_weight_names - buffer.keys()
+            for module_name in new_weight_names:
+                lora_shape = get_lora_shape_fn(module_name, base_model, max_lora_dim)
+                buffer[module_name] = [
+                    torch.empty(
+                        lora_shape,
+                        dtype=self.dtype,
+                        device=device,
+                    )
+                    for _ in range(self.num_layer)
+                ]
+
+        update_buffer(
+            self.A_buffer,
+            lora_weight_names[0],
+            self.get_lora_A_shape,
+        )
+
+        update_buffer(
+            self.B_buffer,
+            lora_weight_names[1],
+            self.get_lora_B_shape,
+        )
 
     def prepare_lora_batch(
         self,

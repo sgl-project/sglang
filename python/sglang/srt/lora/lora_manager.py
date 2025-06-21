@@ -65,6 +65,9 @@ class LoRAManager:
         # Configs of all active LoRA adapters.
         self.configs: Dict[str, LoRAConfig] = {}
 
+        # Supported weight names (e.g., qkv_proj) for LoRA A and B respectively.
+        self.lora_weight_names: Tuple[Set[str]] = (set(), set())
+
         # LoRA weights cached in CPU memory.
         self.loras: Dict[str, LoRAAdapter] = {}
 
@@ -296,13 +299,13 @@ class LoRAManager:
 
     def update_state_from_configs(self):
         """
-        Update the state of the LoRAManager based on the current `self.configs`. This method should be called whenever
-        the `self.configs` dictionary is modified (e.g., when new LoRA adapters).
+        Update the internal state of the LoRAManager based on the current `self.configs`. This method
+        should be called whenever `self.configs` is modified (e.g., when new LoRA adapters are loaded).
 
         This includes:
-        - Updating the LoRA weight names based on the current configs.
         - Initializing LoRA adapters if they are not already loaded.
-        - Monkey-patching the base model to use LoRA layers where applicable.
+        - Collect all LoRA weight names based on the current loaded adapters.
+        - Lazily monkey-patching the base model to use LoRA layers where applicable.
         - Preparing the GPU buffer pool for active LoRA weights.
         """
 
@@ -311,28 +314,28 @@ class LoRAManager:
         hf_target_module_names: Set[str] = set()
         for config in self.configs.values():
             hf_target_module_names.update(config.target_modules)
-
-        # Misc lora configs
         max_lora_dim: int = max([x.hf_config["r"] for x in self.configs.values()])
 
-        ### State updates ###
-        # 1. Update LoRA weight names based on the current configs.
-        self.update_lora_weight_names(hf_target_module_names)
-        # 2. Update LoRA adapters based on the current configs.
+        # Loads / unloads LoRA adapters based on the latest configs.
         self.update_lora_adapters()
-        # 3. Lazily monkey-patch model layers to layers with LoRA when needed.
+
+        # Lazily update states for new LoRA weight name (e.g., qkv_proj) as needed.
+        #
+        # Please note that the following update operations are "monotonic" by design, meaning that we update
+        # multiple places to support the new weight names when the first adapter targeting such weight names
+        # is loaded. However, we never "rollback" the support (e.g., convert LoRA layer back to base layer)
+        # even if the associated adapters are unloaded later for both simplicity and practicality reasons: the
+        # list of LoRA weight names is expected to be extremely finite and stable.
+        self.update_lora_weight_names(hf_target_module_names)
         self.update_lora_layers(hf_target_module_names)
-        # 4. Prepare LoRA memory buffer based on the latest loaded adapters.
         self.update_memory_buffers(max_lora_dim)
 
     def update_lora_weight_names(self, hf_target_names: Set[str]):
         """
-        Update the LoRA weight names based on the current `self.configs`. This method should be called whenever
-        the `self.configs` dictionary is modified (e.g., when new LoRA adapters are loaded).
+        Add new LoRA weight names if needed based on the current `self.configs`.
         """
 
         # Target lora weight names for lora_a and lora_b modules respectively.
-        self.lora_weight_names: Tuple[Set[str]] = (set(), set())
         for module in hf_target_names:
             lora_A, lora_B = get_normalized_lora_weight_names(module)
             self.lora_weight_names[0].update(lora_A)
