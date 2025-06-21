@@ -964,7 +964,7 @@ class DeepEPMoE(EPMoE):
             # the extra 1 is for invalid rank_id (in original deepep, the invalid rank_id is -1, but aiter does not allow -1, we use a mask to make those ids invalid)
             # for instance, if we have 4 experts on this rank, we would have a expert_mask like:
             #     self.expert_mask = [1, 1, 1, 1, 0]
-            # idx from 0-3 is valid and will be process, which idx == 4 will be masked out
+            # idx from 0-3 is valid and will be processed, while idx == 4 will be masked out
             self.expert_mask = torch.zeros(
                 (self.num_experts_per_partition + 1),
                 device=torch.cuda.current_device(),
