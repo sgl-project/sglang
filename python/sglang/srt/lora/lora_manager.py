@@ -62,33 +62,13 @@ class LoRAManager:
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
 
-        # Configs of all active LoRA adapters.
-        self.configs: Dict[str, LoRAConfig] = {}
-
-        # Supported weight names (e.g., qkv_proj) for LoRA A and B respectively.
-        self.lora_weight_names: Tuple[Set[str]] = (set(), set())
-
-        # LoRA weights cached in CPU memory.
-        self.loras: Dict[str, LoRAAdapter] = {}
-
-        # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
-        self.lora_modules: Dict[int, Dict[str, BaseLayerWithLoRA]] = {
-            i: {} for i in range(self.base_hf_config.num_hidden_layers)
-        }
-
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
         backend_type = get_backend_from_name(lora_backend)
         self.lora_backend: BaseLoRABackend = backend_type(lora_backend)
 
-        # Initialize memory pool
-        self.memory_pool = LoRAMemoryPool(
-            self.base_hf_config,
-            self.max_loras_per_batch,
-            self.dtype,
-            self.tp_size,
-            self.tp_rank,
-        )
+        # Initialize mutable internal state of the LoRAManager.
+        self.init_state()
 
     def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
@@ -297,6 +277,36 @@ class LoRAManager:
                         ),
                     )
 
+    def init_state(self):
+        """
+        Initialize the internal (mutable) state of the LoRAManager.
+
+        These states are mutable via the `update_state_from_configs` as LoRA adapters are loaded and unloaded dynamically.
+        """
+
+        # Configs of all active LoRA adapters.
+        self.configs: Dict[str, LoRAConfig] = {}
+
+        # LoRA adapter weights cached in CPU memory.
+        self.loras: Dict[str, LoRAAdapter] = {}
+
+        # Supported weight names (e.g., qkv_proj) for LoRA A and B respectively.
+        self.lora_weight_names: Tuple[Set[str]] = (set(), set())
+
+        # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
+        self.lora_modules: Dict[int, Dict[str, BaseLayerWithLoRA]] = {
+            i: {} for i in range(self.base_hf_config.num_hidden_layers)
+        }
+
+        # Initialize memory pool
+        self.memory_pool = LoRAMemoryPool(
+            self.base_hf_config,
+            self.max_loras_per_batch,
+            self.dtype,
+            self.tp_size,
+            self.tp_rank,
+        )
+
     def update_state_from_configs(self):
         """
         Update the internal state of the LoRAManager based on the current `self.configs`. This method
@@ -327,7 +337,7 @@ class LoRAManager:
         # even if the associated adapters are unloaded later for both simplicity and practicality reasons: the
         # list of LoRA weight names is expected to be extremely finite and stable.
         self.update_lora_weight_names(hf_target_module_names)
-        self.update_lora_layers(hf_target_module_names)
+        self.update_lora_modules(hf_target_module_names)
         self.update_memory_buffers(max_lora_dim)
 
     def update_lora_weight_names(self, hf_target_names: Set[str]):
@@ -393,7 +403,7 @@ class LoRAManager:
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
-    def update_lora_layers(self, hf_target_names: Set[str]):
+    def update_lora_modules(self, hf_target_names: Set[str]):
         # Target module names of customized layers defined in python/sglang/srt/layers
         # e.g., {"qkv_proj", "o_proj"}
         customized_target_names = get_customized_names_from_hf_names(
