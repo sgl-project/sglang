@@ -873,7 +873,7 @@ def ep_scatter(
 
     scale_hidden_size = hidden_size // BLOCK_D
     if scale_ue8m0:
-        # ue8m0 scales might be packed (e.g., 4 scales per int32) or have a different layout,
+        # ue8m0 scales are packed here (4 scales per int32),
         # hence the effective size of this dimension is divided by 4.
         scale_hidden_size = ceil_div(scale_hidden_size, 4)
 
