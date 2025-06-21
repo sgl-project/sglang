@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
+from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
@@ -16,7 +17,6 @@ from sglang.srt.function_call.utils import (
     _is_complete_json,
     _partial_json_loads,
 )
-from sglang.srt.openai_api.protocol import Tool
 
 logger = logging.getLogger(__name__)
 
