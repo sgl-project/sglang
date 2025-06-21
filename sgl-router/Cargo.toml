@@ -35,6 +35,7 @@ metrics = "0.24.2"
 metrics-exporter-prometheus = "0.17.0"
 # Added for request tracing
 uuid = { version = "1.10", features = ["v4", "serde"] }
+thiserror = "2.0.12"
 [profile.release]
 lto = "thin"
 codegen-units = 1

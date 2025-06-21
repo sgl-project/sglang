@@ -55,6 +55,10 @@ class RouterArgs:
     selector: Dict[str, str] = dataclasses.field(default_factory=dict)
     service_discovery_port: int = 80
     service_discovery_namespace: Optional[str] = None
+    # PD service discovery configuration
+    prefill_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
+    decode_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
+    bootstrap_port_annotation: str = "sglang.ai/mooncake.bootstrap-port"
     # Prometheus configuration
     prometheus_port: Optional[int] = None
     prometheus_host: Optional[str] = None
@@ -207,6 +211,18 @@ class RouterArgs:
             type=str,
             help="Kubernetes namespace to watch for pods. If not provided, watches all namespaces (requires cluster-wide permissions)",
         )
+        parser.add_argument(
+            f"--{prefix}prefill-selector",
+            type=str,
+            nargs="+",
+            help="Label selector for prefill server pods in PD mode (format: key1=value1 key2=value2)",
+        )
+        parser.add_argument(
+            f"--{prefix}decode-selector",
+            type=str,
+            nargs="+",
+            help="Label selector for decode server pods in PD mode (format: key1=value1 key2=value2)",
+        )
         # Prometheus configuration
         parser.add_argument(
             f"--{prefix}prometheus-port",
@@ -267,6 +283,13 @@ class RouterArgs:
             service_discovery_namespace=getattr(
                 args, f"{prefix}service_discovery_namespace", None
             ),
+            prefill_selector=cls._parse_selector(
+                getattr(args, f"{prefix}prefill_selector", None)
+            ),
+            decode_selector=cls._parse_selector(
+                getattr(args, f"{prefix}decode_selector", None)
+            ),
+            bootstrap_port_annotation="sglang.ai/mooncake.bootstrap-port",  # Mooncake-specific annotation
             prometheus_port=getattr(args, f"{prefix}prometheus_port", None),
             prometheus_host=getattr(args, f"{prefix}prometheus_host", None),
         )

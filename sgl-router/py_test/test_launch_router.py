@@ -214,6 +214,79 @@ class TestLaunchRouter(unittest.TestCase):
         )
         # This should not raise (though it may fail to connect)
 
+    def test_pd_service_discovery_args_parsing(self):
+        """Test PD service discovery CLI argument parsing."""
+        import argparse
+
+        from sglang_router.launch_router import RouterArgs
+
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+
+        args = parser.parse_args(
+            [
+                "--pd-disaggregated",
+                "--service-discovery",
+                "--prefill-selector",
+                "app=sglang",
+                "component=prefill",
+                "--decode-selector",
+                "app=sglang",
+                "component=decode",
+                "--service-discovery-port",
+                "8000",
+                "--service-discovery-namespace",
+                "production",
+                "--policy",
+                "cache_aware",
+            ]
+        )
+
+        router_args = RouterArgs.from_cli_args(args)
+
+        self.assertTrue(router_args.pd_disaggregated)
+        self.assertTrue(router_args.service_discovery)
+        self.assertEqual(
+            router_args.prefill_selector, {"app": "sglang", "component": "prefill"}
+        )
+        self.assertEqual(
+            router_args.decode_selector, {"app": "sglang", "component": "decode"}
+        )
+        self.assertEqual(router_args.service_discovery_port, 8000)
+        self.assertEqual(router_args.service_discovery_namespace, "production")
+
+    def test_regular_service_discovery_args_parsing(self):
+        """Test regular mode service discovery CLI argument parsing."""
+        import argparse
+
+        from sglang_router.launch_router import RouterArgs
+
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+
+        args = parser.parse_args(
+            [
+                "--service-discovery",
+                "--selector",
+                "app=sglang-worker",
+                "environment=staging",
+                "--service-discovery-port",
+                "8000",
+                "--policy",
+                "round_robin",
+            ]
+        )
+
+        router_args = RouterArgs.from_cli_args(args)
+
+        self.assertFalse(router_args.pd_disaggregated)
+        self.assertTrue(router_args.service_discovery)
+        self.assertEqual(
+            router_args.selector, {"app": "sglang-worker", "environment": "staging"}
+        )
+        self.assertEqual(router_args.prefill_selector, {})
+        self.assertEqual(router_args.decode_selector, {})
+
 
 if __name__ == "__main__":
     unittest.main()
