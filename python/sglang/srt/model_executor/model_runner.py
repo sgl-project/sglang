@@ -32,6 +32,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import (
+    get_pp_indices,
     get_tp_group,
     get_world_group,
     init_distributed_environment,
@@ -83,8 +84,13 @@ from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
-from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    device_loading_context,
+    get_model_loader,
+    initialize_model,
+)
+from sglang.srt.model_loader.utils import SupportsPP, set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -215,11 +221,6 @@ class ModelRunner:
 
         # If it is a draft model, tp_group can be different
         self.initialize(min_per_gpu_memory)
-
-        # temporary cached values
-        self.support_pp = (
-            "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
-        )
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -549,11 +550,29 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
+        device_config = DeviceConfig(self.device)
+        target_device = torch.device(device_config.device)
+        with set_default_torch_dtype(self.model_config.dtype):
+            with target_device:
+                model_class = initialize_model(self.model_config, self.load_config)
+
+        # check model support pipeline parallelism
+        if isinstance(model_class, SupportsPP):
+            self.support_pp = True
+        else:
+            self.support_pp = False
+            if self.pp_size > 1:
+                raise RuntimeError(
+                    "model %s does not support pipeline parallelism now.",
+                    model_class,
+                )
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
-                device_config=DeviceConfig(self.device),
+                device_config=device_config,
+                model_class=model_class,
             )
         monkey_patch_vllm_parallel_state(reverse=True)
         monkey_patch_isinstance_for_vllm_base_layer(reverse=True)
