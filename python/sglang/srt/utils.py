@@ -2485,3 +2485,12 @@ def dynamic_import(func_path: str):
     module = importlib.import_module(module_path)
     func = getattr(module, func_name)
     return func
+
+
+def is_shm_available(dtype, world_size, local_size):
+    return (
+        cpu_has_amx_support()
+        and dtype in [torch.bfloat16, torch.float]
+        and world_size >= 1
+        and world_size == local_size
+    )
