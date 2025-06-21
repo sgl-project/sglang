@@ -18,7 +18,13 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cpu,
+    is_hip,
+    narrow_padded_param_and_loaded_weight,
+    set_weight_attrs,
+)
 
 if torch.cuda.is_available():
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
@@ -34,6 +40,8 @@ if _use_aiter:
     from aiter import ActivationType
     from aiter.fused_moe_bf16_asm import ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
+
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
@@ -443,19 +451,36 @@ class FusedMoE(torch.nn.Module):
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         shard_size = expert_data.shape[shard_dim] // 2
 
-        if not self.use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
-            )
+        if _is_cpu:
+            if shard_id == "w1":
+                param_data_start = 0
+            else:
+                assert shard_id == "w3"
+                param_data_start = shard_size
 
-        # Narrow parameter and load.
-        # w1, gate_proj: Load into first logical weight of w13.
-        if shard_id == "w1":
-            expert_data = expert_data.narrow(shard_dim, 0, shard_size)
-        # w3, up_proj: Load into second logical weight of w13.
+            expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                expert_data,
+                loaded_weight,
+                param_data_start,
+                shard_size * tp_rank,
+                shard_dim,
+                shard_size,
+                not self.use_presharded_weights,
+            )
         else:
-            assert shard_id == "w3"
-            expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+            if not self.use_presharded_weights:
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, shard_size * tp_rank, shard_size
+                )
+            # Narrow parameter and load.
+            # w1, gate_proj: Load into first logical weight of w13.
+            if shard_id == "w1":
+                expert_data = expert_data.narrow(shard_dim, 0, shard_size)
+            # w3, up_proj: Load into second logical weight of w13.
+            else:
+                assert shard_id == "w3"
+                expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
@@ -472,10 +497,21 @@ class FusedMoE(torch.nn.Module):
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
 
-        if not self.use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
+        if _is_cpu:
+            expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                expert_data,
+                loaded_weight,
+                0,  # param_data_start
+                shard_size * tp_rank,
+                shard_dim,
+                shard_size,
+                not self.use_presharded_weights,
             )
+        else:
+            if not self.use_presharded_weights:
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, shard_size * tp_rank, shard_size
+                )
 
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
