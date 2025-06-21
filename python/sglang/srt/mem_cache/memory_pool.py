@@ -35,6 +35,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import debug_timing, get_bool_env_var, is_cuda, next_power_of_2
 
@@ -54,6 +55,7 @@ class ReqToTokenPool:
         device: str,
         enable_memory_saver: bool,
     ):
+
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -61,7 +63,7 @@ class ReqToTokenPool:
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        with memory_saver_adapter.region():
+        with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
@@ -268,12 +270,10 @@ class MHATokenToKVPool(KVCache):
             "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
         )
         if self.enable_custom_mem_pool:
-            from sglang.srt.disaggregation.mooncake.memory_pool import (
-                MooncakeNVLinkAllocator,
-            )
-
             # TODO(shangming): abstract custom allocator class for more backends
-            allocator = MooncakeNVLinkAllocator.get_allocator(self.device)
+            from mooncake.allocator import NVLinkAllocator
+
+            allocator = NVLinkAllocator.get_allocator(self.device)
             self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
         else:
             self.custom_mem_pool = None
@@ -292,7 +292,7 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
-        with self.memory_saver_adapter.region():
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.enable_custom_mem_pool
@@ -600,17 +600,15 @@ class MLATokenToKVPool(KVCache):
             "SGLANG_MOONCAKE_CUSTOM_MEM_POOL", "false"
         )
         if self.enable_custom_mem_pool:
-            from sglang.srt.disaggregation.mooncake.memory_pool import (
-                MooncakeNVLinkAllocator,
-            )
-
             # TODO(shangming): abstract custom allocator class for more backends
-            allocator = MooncakeNVLinkAllocator.get_allocator(self.device)
+            from mooncake.allocator import NVLinkAllocator
+
+            allocator = NVLinkAllocator.get_allocator(self.device)
             self.custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
         else:
             self.custom_mem_pool = None
 
-        with self.memory_saver_adapter.region():
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.custom_mem_pool
@@ -753,7 +751,7 @@ class DoubleSparseTokenToKVPool(KVCache):
             end_layer,
         )
 
-        with self.memory_saver_adapter.region():
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # [size, head_num, head_dim] for each layer
             self.k_buffer = [
                 torch.zeros(

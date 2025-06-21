@@ -534,6 +534,22 @@ class ScoringResponse(BaseModel):
     object: str = "scoring"
 
 
+class V1RerankReqInput(BaseModel):
+    query: str
+    documents: List[str]
+
+
+class RerankResponse(BaseModel):
+    score: float
+    document: str
+    index: int
+    meta_info: Optional[dict] = None
+
+
 OpenAIServingRequest = Union[
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, ScoringRequest
+    ChatCompletionRequest,
+    CompletionRequest,
+    EmbeddingRequest,
+    ScoringRequest,
+    V1RerankReqInput,
 ]
