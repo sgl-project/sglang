@@ -754,7 +754,6 @@ class ModelOptNvFp4FusedMoEMethod:
 
         assert activation == "silu", "Only SiLU activation is supported."
 
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
 
         topk_weights, topk_ids = select_experts(
@@ -771,6 +770,35 @@ class ModelOptNvFp4FusedMoEMethod:
             routed_scaling_factor=routed_scaling_factor,
         )
 
+        # Check if FlashInfer CUTLASS should be used
+        from sglang.srt.layers.moe.cutlass_moe import (
+            should_use_flashinfer_cutlass,
+            _valid_flashinfer_fused_moe,
+            cutlass_moe_nvfp4_with_flashinfer
+        )
+        
+        # Try FlashInfer CUTLASS first if available and suitable (B200+ with NVFP4)
+        if (should_use_flashinfer_cutlass() and 
+            _valid_flashinfer_fused_moe(x, layer.w13_weight, layer.w2_weight) and
+            layer.w13_weight.dtype == torch.uint8 and layer.w2_weight.dtype == torch.uint8):
+            return cutlass_moe_nvfp4_with_flashinfer(
+                hidden_states=x,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                w1_scale=layer.w13_blockscale_swizzled,
+                w2_scale=layer.w2_blockscale_swizzled,
+                a1_scale=layer.w13_input_scale_quant,
+                a2_scale=layer.w2_input_scale_quant,
+                g1_alphas=layer.g1_alphas,
+                g2_alphas=layer.g2_alphas,
+                inplace=inplace,
+                activation=activation,
+                global_num_experts=layer.num_experts,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            ).to(x.dtype)
+    
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 
         return cutlass_moe_fp4(

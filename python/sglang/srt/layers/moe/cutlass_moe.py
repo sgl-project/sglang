@@ -11,6 +11,18 @@ import torch
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
 from sglang.srt.utils import is_cuda
 
+# FlashInfer integration
+from typing import TYPE_CHECKING
+try:
+    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
+    from flashinfer import fp4_quantize as fp4_quantize
+except ImportError:
+    if not TYPE_CHECKING:
+        flashinfer_cutlass_fused_moe = None
+        fp4_quantize = None
+
+has_flashinfer_cutlass_fused_moe = flashinfer_cutlass_fused_moe is not None
+
 _is_cuda = is_cuda()
 if _is_cuda:
     import sgl_kernel
@@ -368,3 +380,77 @@ def cutlass_moe_fp4(
     if not apply_router_weight_on_input:
         c2 = c2 * topk_weights.view(m_a, num_topk, 1).to(out_dtype)
     return c2.sum(dim=1).to(out_dtype)
+
+
+def _valid_flashinfer_fused_moe(hidden_states: torch.Tensor, w1: torch.Tensor,
+                     w2: torch.Tensor) -> bool:
+    """
+    Check if the given problem size is supported by the FlashInfer cutlass
+    fused moe kernel.
+    """
+    if not has_flashinfer_cutlass_fused_moe:
+        return False
+    # Add specific validation logic here if needed
+    return True
+
+
+def should_use_flashinfer_cutlass() -> bool:
+    """Determine if FlashInfer CUTLASS MoE should be used (B200+ only)."""
+    # Import here to avoid circular imports
+    from sglang.srt.layers.moe.flashinfer_cutlass_moe import is_b200_or_later
+    return is_b200_or_later()
+
+
+def cutlass_moe_nvfp4_with_flashinfer(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    a1_scale: torch.Tensor,
+    a2_scale: torch.Tensor,
+    g1_alphas: torch.Tensor,
+    g2_alphas: torch.Tensor,
+    inplace: bool = False,
+    activation: str = "silu",
+    global_num_experts: int = -1,
+    ep_rank: Optional[int] = 0,
+    ep_size: Optional[int] = 1,
+    tp_rank: Optional[int] = 0,
+    tp_size: Optional[int] = 1,
+    apply_router_weight_on_input: bool = False,
+) -> torch.Tensor:
+    """
+    MoE implementation using FlashInfer CUTLASS kernel for NVFP4 quantization.
+    This function wraps the FlashInfer cutlass fused moe implementation.
+    """
+    if not has_flashinfer_cutlass_fused_moe:
+        raise RuntimeError("FlashInfer cutlass fused moe is not available")
+    
+    from sglang.srt.layers.moe.flashinfer_cutlass_moe import (
+        flashinfer_cutlass_fused_moe_nvfp4
+    )
+    
+    return flashinfer_cutlass_fused_moe_nvfp4(
+        hidden_states=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        w1=w1,
+        w2=w2,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        g1_alphas=g1_alphas,
+        g2_alphas=g2_alphas,
+        inplace=inplace,
+        activation=activation,
+        global_num_experts=global_num_experts,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
