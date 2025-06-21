@@ -15,6 +15,10 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.managers.io_struct import (
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
+)
 from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     get_last_loc,
@@ -26,6 +30,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.build_eagle_tree import build_tree_kernel_efficient
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -45,6 +50,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
+    MultiprocessingSerializer,
     empty_context,
     get_available_gpu_memory,
     is_cuda,
@@ -904,6 +910,25 @@ class EAGLEWorker(TpModelWorker):
             if torch.any(torch.isnan(logits)):
                 logger.error("Detected errors during sampling! NaN in the logits.")
                 raise ValueError("Detected errors during sampling! NaN in the logits.")
+
+    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        monkey_patch_torch_reductions()
+        named_tensors = MultiprocessingSerializer.deserialize(
+            recv_req.serialized_named_tensors[self.tp_rank]
+        )
+        success, message = self.model_runner.update_weights_from_tensor(
+            named_tensors=named_tensors,
+            load_format=recv_req.load_format,
+        )
+        if not success:
+            return success, message
+
+        success, message = self.target_worker.model_runner.update_weights_from_tensor(
+            named_tensors=named_tensors,
+            load_format=recv_req.load_format,
+        )
+
+        return success, message
 
 
 def load_token_map(token_map_path: str) -> List[int]:
