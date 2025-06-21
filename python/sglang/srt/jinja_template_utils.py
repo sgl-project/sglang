@@ -7,7 +7,7 @@ including content format detection and message processing.
 import logging
 
 import jinja2
-from transformers import utils as hf_chat_utils
+import transformers.utils.chat_template_utils as hf_chat_utils
 
 logger = logging.getLogger(__name__)
 
