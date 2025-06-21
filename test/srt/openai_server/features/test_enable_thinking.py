@@ -1,9 +1,9 @@
 """
 Usage:
-python3 -m unittest test_enable_thinking.TestEnableThinking.test_chat_completion_with_reasoning
-python3 -m unittest test_enable_thinking.TestEnableThinking.test_chat_completion_without_reasoning
-python3 -m unittest test_enable_thinking.TestEnableThinking.test_stream_chat_completion_with_reasoning
-python3 -m unittest test_enable_thinking.TestEnableThinking.test_stream_chat_completion_without_reasoning
+python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_chat_completion_with_reasoning
+python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_chat_completion_without_reasoning
+python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_stream_chat_completion_with_reasoning
+python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_stream_chat_completion_without_reasoning
 """
 
 import asyncio
@@ -14,6 +14,7 @@ import time
 import unittest
 
 import requests
+import openai
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -23,6 +24,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+from sglang.srt.hf_transformers_utils import get_tokenizer
 
 
 class TestEnableThinking(CustomTestCase):

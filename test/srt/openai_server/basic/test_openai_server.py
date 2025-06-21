@@ -1,8 +1,8 @@
 """
-python3 -m unittest test_openai_server.TestOpenAIServer.test_completion
-python3 -m unittest test_openai_server.TestOpenAIServer.test_completion_stream
-python3 -m unittest test_openai_server.TestOpenAIServer.test_chat_completion
-python3 -m unittest test_openai_server.TestOpenAIServer.test_chat_completion_stream
+python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test_completion
+python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test_completion_stream
+python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test_chat_completion
+python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test_chat_completion_stream
 """
 
 import json
