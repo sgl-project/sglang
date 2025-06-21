@@ -960,11 +960,14 @@ class DeepEPMoE(EPMoE):
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
         if _use_aiter:
+            # expert_mask is of size (self.num_experts_per_partition + 1),
+            # the extra 1 is for invalid rank_id (in original deepep, the invalid rank_id is -1, but aiter does not allow -1, we use a mask to make those id invalid)
             self.expert_mask = torch.zeros(
                 (self.num_experts_per_partition + 1),
                 device=torch.cuda.current_device(),
                 dtype=torch.int,
             )
+            # the last one is invalid rank_id
             self.expert_mask[:-1] = 1
         else:
             self.w13_weight_fp8 = (
@@ -997,6 +1000,7 @@ class DeepEPMoE(EPMoE):
         forward_mode: ForwardMode,
     ):
         if _use_aiter:
+            # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
             return self.forward_aiter(hidden_states, topk_idx, topk_weights)
         resolved_deepep_mode = self.deepep_mode.resolve(forward_mode)
         if resolved_deepep_mode == DeepEPMode.normal:
@@ -1138,6 +1142,8 @@ class DeepEPMoE(EPMoE):
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states
+        # in original deepep, idx == -1 meaning invalid and will not be processed.
+        # aiter does not accept -1, we use a expert mask to make these idx invalid
         # (idx == num_experts_per_partition) meaning not used in aiter fused_moe
         topk_idx_copy = topk_idx.to(torch.int32)
         topk_idx_copy[topk_idx_copy == -1] = self.num_experts_per_partition
