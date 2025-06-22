@@ -83,6 +83,8 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    LoadLoRAAdapterReqInput,
+    LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -99,6 +101,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UnloadLoRAAdapterReqInput,
+    UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -311,6 +315,12 @@ class TokenizerManager:
         self.expert_distribution_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.load_lora_adapter_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.unload_lora_adapter_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher = TypeBasedDispatcher(
             [
@@ -377,6 +387,14 @@ class TokenizerManager:
                     ExpertDistributionReqOutput,
                     self.expert_distribution_communicator.handle_recv,
                 ),
+                (
+                    LoadLoRAAdapterReqOutput,
+                    self.load_lora_adapter_communicator.handle_recv,
+                ),
+                {
+                    UnloadLoRAAdapterReqOutput,
+                    self.unload_lora_adapter_communicator.handle_recv,
+                }
                 (HealthCheckOutput, lambda x: None),
             ]
         )
@@ -958,6 +976,43 @@ class TokenizerManager:
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
             result = (await self.update_weights_from_tensor_communicator(obj))[0]
+            return result.success, result.message
+
+    async def load_lora_adapter(
+        self,
+        obj: LoadLoRAAdapterReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be 1 for dynamic lora loading"
+        logger.info(
+            "Start load Lora adapter. Lora name=%s, path=%s",
+            obj.lora_name,
+            obj.lora_path,
+        )
+
+        async with self.model_update_lock.writer_lock:
+            result = (await self.load_lora_adapter_communicator(obj))[0]
+            return result.success, result.message
+
+    async def unload_lora_adapter(
+        self,
+        obj: UnloadLoRAAdapterReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be 1 for dynamic lora loading"
+        logger.info(
+            "Start unload Lora adapter. Lora name=%s",
+            obj.lora_name,
+        )
+
+        async with self.model_update_lock.writer_lock:
+            result = (await self.unload_lora_adapter_communicator(obj))[0]
             return result.success, result.message
 
     async def get_weights_by_name(

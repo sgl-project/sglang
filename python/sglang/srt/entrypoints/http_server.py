@@ -71,6 +71,7 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
     ProfileReqInput,
@@ -79,6 +80,7 @@ from sglang.srt.managers.io_struct import (
     SeparateReasoningReqInput,
     SetInternalStateReq,
     SlowDownReqInput,
+    UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -581,6 +583,43 @@ async def slow_down(obj: SlowDownReqInput, request: Request):
         await _global_state.tokenizer_manager.slow_down(obj, request)
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.api_route("/load_lora_adapter", methods=["POST"])
+async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
+    """Load a new LoRA adapter without re-launching the server."""
+    success, message = await _global_state.tokenizer_manager.load_lora_adapter(
+        obj, request
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(
+            content,
+            status_code=HTTPStatus.OK,
+        )
+    else:
+        return ORJSONResponse(
+            content,
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+@app.api_route("/unload_lora_adapter", methods=["POST"])
+async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
+    """Load a new LoRA adapter without re-launching the server."""
+    success, message = await _global_state.tokenizer_manager.unload_lora_adapter(
+        obj, request
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(
+            content,
+            status_code=HTTPStatus.OK,
+        )
+    else:
+        return ORJSONResponse(
+            content,
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])

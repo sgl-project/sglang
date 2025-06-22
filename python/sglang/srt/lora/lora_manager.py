@@ -16,7 +16,7 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
-from typing import Dict, Set, Tuple
+from typing import Dict, Iterable, Set, Tuple
 
 import torch
 
@@ -98,35 +98,51 @@ class LoRAManager:
                 ],
             )
 
-    def load_lora_adapters(self, lora_paths: Dict[str, str]):
+    def load_lora_adapters(
+        self, lora_paths: Dict[str, str]
+    ) -> Dict[str, Tuple[bool, str]]:
         """
         Load LoRA adapters from the specified paths.
-        TODO (lifuhuang): This method should be exposed to the server/engine API to support dynamic LoRA loading.
 
         Args:
             lora_paths (Dict[str, str]): A dictionary mapping LoRA adapter names to their file paths.
             If a LoRA adapter is already loaded, it will be skipped with a warning.
+
+        Returns:
+            Dict[str, Tuple[bool, str]]: A dictionary mapping LoRA adapter names to a tuple of
+            (success, message). If loading is successful, success is True and message is an empty string.
+            If loading fails, success is False and message contains the error message.
         """
 
+        results = {}
         for lora_name, lora_path in lora_paths.items():
             if lora_name in self.loras:
-                logger.warning(
-                    f"LoRA adapter {lora_name} is already loaded."
-                    "If you want to reload it, please unload it first."
+                error_msg = (
+                    f"LoRA adapter {lora_name} is skipped as it is already loaded. "
                 )
+                "If you want to reload it, please unload it first."
+                results[lora_name] = (False, error_msg)
                 continue
 
-            self.configs[lora_name] = LoRAConfig(lora_path)
+            try:
+                self.configs[lora_name] = LoRAConfig(lora_path)
+                results[lora_name] = (True, "")
+            except Exception as e:
+                error_msg = f"Failed to load LoRA adapter {lora_name} from {lora_path}: {str(e)}"
+                results[lora_name] = (False, error_msg)
+                logger.error(error_msg)
+                continue
 
         self.update_state_from_configs()
+        return results
 
-    def unload_lora_adapters(self, lora_names: Set[str]):
+    def unload_lora_adapters(self, lora_names: Iterable[str]):
         """
         Unload LoRA adapters by their names. This will remove the adapters from the memory pool and
         delete the corresponding LoRA modules.
 
         Args:
-            lora_names (Set[str]): A set of LoRA adapter names to unload.
+            lora_names (Iterable[str]): A list of LoRA adapter names to unload.
         """
         for lora_name in lora_names:
             if lora_name in self.loras:

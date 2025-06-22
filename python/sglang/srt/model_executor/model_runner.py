@@ -814,6 +814,40 @@ class ModelRunner:
         self.lora_manager.load_lora_adapters(self.server_args.lora_paths)
         logger.info("LoRA manager ready.")
 
+    def load_lora_adapter(self, lora_name: str, lora_path: str) -> tuple[bool, str]:
+        """Load a new lora adapter from disk or huggingface."""
+
+        logger.info(
+            f"LoRA adapter loading starts: name={lora_name}, path={lora_path}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        result = self.lora_manager.load_lora_adapters({lora_name: lora_path})
+
+        logger.info(
+            f"LoRA adapter loading completes: name={lora_name}, path={lora_path}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        return result[lora_name]
+
+    def unload_lora_adapter(self, lora_name: str, lora_path: str) -> tuple[bool, str]:
+        """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
+
+        logger.info(
+            f"LoRA adapter unloading starts: name={lora_name}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        result = self.lora_manager.unload_lora_adapters({lora_name})
+
+        logger.info(
+            f"LoRA adapter unloading completes: name={lora_name}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        return result[lora_name]
+
     def profile_max_num_token(self, total_gpu_memory: int):
         available_gpu_memory = get_available_gpu_memory(
             self.device,
