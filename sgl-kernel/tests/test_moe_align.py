@@ -222,7 +222,9 @@ def test_moe_align_block_size_compare_implementations(
     # Get the first and last block id where expert_ids_cuda == expert_idx
     matching_indices = torch.where(expert_ids_cuda == expert_idx)[0]
     block_sorted_start = matching_indices[0].item() * block_size
-    block_sorted_end = (matching_indices[-1].item() + 1) * block_size
+    block_sorted_end = min(
+        (matching_indices[-1].item() + 1) * block_size, max_num_tokens_padded
+    )
 
     selected_sorted_ids_cuda = sorted_ids_cuda[
         block_sorted_start:block_sorted_end
