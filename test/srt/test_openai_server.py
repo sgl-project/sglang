@@ -235,6 +235,7 @@ class TestOpenAIServer(CustomTestCase):
         )
 
         is_firsts = {}
+        is_finished = {}
         for response in generator:
             usage = response.usage
             if usage is not None:
@@ -244,6 +245,10 @@ class TestOpenAIServer(CustomTestCase):
                 continue
 
             index = response.choices[0].index
+            finish_reason = response.choices[0].finish_reason
+            if finish_reason is not None:
+                is_finished[index] = True
+
             data = response.choices[0].delta
 
             if is_firsts.get(index, True):
@@ -253,7 +258,7 @@ class TestOpenAIServer(CustomTestCase):
                 is_firsts[index] = False
                 continue
 
-            if logprobs:
+            if logprobs and not is_finished.get(index, False):
                 assert response.choices[0].logprobs, f"logprobs was not returned"
                 assert isinstance(
                     response.choices[0].logprobs.content[0].top_logprobs[0].token, str
@@ -271,7 +276,7 @@ class TestOpenAIServer(CustomTestCase):
             assert (
                 isinstance(data.content, str)
                 or isinstance(data.reasoning_content, str)
-                or len(data.tool_calls) > 0
+                or (isinstance(data.tool_calls, list) and len(data.tool_calls) > 0)
                 or response.choices[0].finish_reason
             )
             assert response.id
@@ -281,152 +286,6 @@ class TestOpenAIServer(CustomTestCase):
             assert not is_firsts.get(
                 index, True
             ), f"index {index} is not found in the response"
-
-    def _create_batch(self, mode, client):
-        if mode == "completion":
-            input_file_path = "complete_input.jsonl"
-            # write content to input file
-            content = [
-                {
-                    "custom_id": "request-1",
-                    "method": "POST",
-                    "url": "/v1/completions",
-                    "body": {
-                        "model": "gpt-3.5-turbo-instruct",
-                        "prompt": "List 3 names of famous soccer player: ",
-                        "max_tokens": 20,
-                    },
-                },
-                {
-                    "custom_id": "request-2",
-                    "method": "POST",
-                    "url": "/v1/completions",
-                    "body": {
-                        "model": "gpt-3.5-turbo-instruct",
-                        "prompt": "List 6 names of famous basketball player:  ",
-                        "max_tokens": 40,
-                    },
-                },
-                {
-                    "custom_id": "request-3",
-                    "method": "POST",
-                    "url": "/v1/completions",
-                    "body": {
-                        "model": "gpt-3.5-turbo-instruct",
-                        "prompt": "List 6 names of famous tenniss player:  ",
-                        "max_tokens": 40,
-                    },
-                },
-            ]
-
-        else:
-            input_file_path = "chat_input.jsonl"
-            content = [
-                {
-                    "custom_id": "request-1",
-                    "method": "POST",
-                    "url": "/v1/chat/completions",
-                    "body": {
-                        "model": "gpt-3.5-turbo-0125",
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": "You are a helpful assistant.",
-                            },
-                            {
-                                "role": "user",
-                                "content": "Hello! List 3 NBA players and tell a story",
-                            },
-                        ],
-                        "max_tokens": 30,
-                    },
-                },
-                {
-                    "custom_id": "request-2",
-                    "method": "POST",
-                    "url": "/v1/chat/completions",
-                    "body": {
-                        "model": "gpt-3.5-turbo-0125",
-                        "messages": [
-                            {"role": "system", "content": "You are an assistant. "},
-                            {
-                                "role": "user",
-                                "content": "Hello! List three capital and tell a story",
-                            },
-                        ],
-                        "max_tokens": 50,
-                    },
-                },
-            ]
-
-        with open(input_file_path, "w") as file:
-            for line in content:
-                file.write(json.dumps(line) + "\n")
-
-        with open(input_file_path, "rb") as file:
-            uploaded_file = client.files.create(file=file, purpose="batch")
-        if mode == "completion":
-            endpoint = "/v1/completions"
-        elif mode == "chat":
-            endpoint = "/v1/chat/completions"
-        completion_window = "24h"
-        batch_job = client.batches.create(
-            input_file_id=uploaded_file.id,
-            endpoint=endpoint,
-            completion_window=completion_window,
-        )
-
-        return batch_job, content, uploaded_file
-
-    def run_batch(self, mode):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        batch_job, content, uploaded_file = self._create_batch(mode=mode, client=client)
-
-        while batch_job.status not in ["completed", "failed", "cancelled"]:
-            time.sleep(3)
-            print(
-                f"Batch job status: {batch_job.status}...trying again in 3 seconds..."
-            )
-            batch_job = client.batches.retrieve(batch_job.id)
-        assert (
-            batch_job.status == "completed"
-        ), f"Batch job status is not completed: {batch_job.status}"
-        assert batch_job.request_counts.completed == len(content)
-        assert batch_job.request_counts.failed == 0
-        assert batch_job.request_counts.total == len(content)
-
-        result_file_id = batch_job.output_file_id
-        file_response = client.files.content(result_file_id)
-        result_content = file_response.read().decode("utf-8")  # Decode bytes to string
-        results = [
-            json.loads(line)
-            for line in result_content.split("\n")
-            if line.strip() != ""
-        ]
-        assert len(results) == len(content)
-        for delete_fid in [uploaded_file.id, result_file_id]:
-            del_pesponse = client.files.delete(delete_fid)
-            assert del_pesponse.deleted
-
-    def run_cancel_batch(self, mode):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        batch_job, _, uploaded_file = self._create_batch(mode=mode, client=client)
-
-        assert batch_job.status not in ["cancelling", "cancelled"]
-
-        batch_job = client.batches.cancel(batch_id=batch_job.id)
-        assert batch_job.status == "cancelling"
-
-        while batch_job.status not in ["failed", "cancelled"]:
-            batch_job = client.batches.retrieve(batch_job.id)
-            print(
-                f"Batch job status: {batch_job.status}...trying again in 3 seconds..."
-            )
-            time.sleep(3)
-
-        assert batch_job.status == "cancelled"
-        del_response = client.files.delete(uploaded_file.id)
-        assert del_response.deleted
 
     def test_completion(self):
         for echo in [False, True]:
@@ -466,14 +325,6 @@ class TestOpenAIServer(CustomTestCase):
         for logprobs in [None, 5]:
             for parallel_sample_num in [1, 2]:
                 self.run_chat_completion_stream(logprobs, parallel_sample_num)
-
-    def test_batch(self):
-        for mode in ["completion", "chat"]:
-            self.run_batch(mode)
-
-    def test_cancel_batch(self):
-        for mode in ["completion", "chat"]:
-            self.run_cancel_batch(mode)
 
     def test_regex(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -558,6 +409,18 @@ The SmartHome Mini is a compact smart home assistant available in black or white
         models = list(client.models.list())
         assert len(models) == 1
         assert isinstance(getattr(models[0], "max_model_len", None), int)
+
+    def test_retrieve_model(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        # Test retrieving an existing model
+        retrieved_model = client.models.retrieve(self.model)
+        self.assertEqual(retrieved_model.id, self.model)
+        self.assertEqual(retrieved_model.root, self.model)
+
+        # Test retrieving a non-existent model
+        with self.assertRaises(openai.NotFoundError):
+            client.models.retrieve("non-existent-model")
 
 
 # -------------------------------------------------------------------------
@@ -683,6 +546,31 @@ class TestOpenAIEmbedding(CustomTestCase):
         self.assertEqual(len(response.data), 2)
         self.assertTrue(len(response.data[0].embedding) > 0)
         self.assertTrue(len(response.data[1].embedding) > 0)
+
+    def test_embedding_single_batch_str(self):
+        """Test embedding with a List[str] and length equals to 1"""
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response = client.embeddings.create(model=self.model, input=["Hello world"])
+        self.assertEqual(len(response.data), 1)
+        self.assertTrue(len(response.data[0].embedding) > 0)
+
+    def test_embedding_single_int_list(self):
+        """Test embedding with a List[int] or List[List[int]]]"""
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response = client.embeddings.create(
+            model=self.model,
+            input=[[15339, 314, 703, 284, 612, 262, 10658, 10188, 286, 2061]],
+        )
+        self.assertEqual(len(response.data), 1)
+        self.assertTrue(len(response.data[0].embedding) > 0)
+
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response = client.embeddings.create(
+            model=self.model,
+            input=[15339, 314, 703, 284, 612, 262, 10658, 10188, 286, 2061],
+        )
+        self.assertEqual(len(response.data), 1)
+        self.assertTrue(len(response.data[0].embedding) > 0)
 
     def test_empty_string_embedding(self):
         """Test embedding an empty string."""

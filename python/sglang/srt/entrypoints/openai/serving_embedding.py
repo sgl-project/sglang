@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, Union
 
 from fastapi import Request
+from fastapi.responses import ORJSONResponse
 
 from sglang.srt.conversation import generate_embedding_convs
 from sglang.srt.entrypoints.openai.protocol import (
@@ -13,10 +14,20 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.managers.io_struct import EmbeddingReqInput
+from sglang.srt.managers.template_manager import TemplateManager
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 
 class OpenAIServingEmbedding(OpenAIServingBase):
-    """Handler for embedding requests"""
+    """Handler for v1/embeddings requests"""
+
+    def __init__(
+        self,
+        tokenizer_manager: TokenizerManager,
+        template_manager: TemplateManager,
+    ):
+        super().__init__(tokenizer_manager)
+        self.template_manager = template_manager
 
     def _request_id_prefix(self) -> str:
         return "embd-"
@@ -68,11 +79,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
             prompt_kwargs = {"text": prompt}
         elif isinstance(prompt, list):
             if len(prompt) > 0 and isinstance(prompt[0], str):
-                # List of strings - if it's a single string in a list, treat as single string
-                if len(prompt) == 1:
-                    prompt_kwargs = {"text": prompt[0]}
-                else:
-                    prompt_kwargs = {"text": prompt}
+                prompt_kwargs = {"text": prompt}
             elif len(prompt) > 0 and isinstance(prompt[0], MultimodalEmbeddingInput):
                 # Handle multimodal embedding inputs
                 texts = []
@@ -84,11 +91,10 @@ class OpenAIServingEmbedding(OpenAIServingBase):
 
                 generate_prompts = []
                 # Check if we have a chat template for multimodal embeddings
-                chat_template_name = getattr(
-                    self.tokenizer_manager, "chat_template_name", None
-                )
-                if chat_template_name is not None:
-                    convs = generate_embedding_convs(texts, images, chat_template_name)
+                if self.template_manager.chat_template_name is not None:
+                    convs = generate_embedding_convs(
+                        texts, images, self.template_manager.chat_template_name
+                    )
                     for conv in convs:
                         generate_prompts.append(conv.get_prompt())
                 else:
@@ -122,7 +128,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         adapted_request: EmbeddingReqInput,
         request: EmbeddingRequest,
         raw_request: Request,
-    ) -> Union[EmbeddingResponse, ErrorResponse]:
+    ) -> Union[EmbeddingResponse, ErrorResponse, ORJSONResponse]:
         """Handle the embedding request"""
         try:
             ret = await self.tokenizer_manager.generate_request(
