@@ -4,10 +4,8 @@ import torch
 from sgl_kernel.radix_tree import IOHandle, RadixTreeCpp, TreeNodeCpp
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
-from sglang.srt.mem_cache.memory_pool import (
-    ReqToTokenPool,
-    TokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 else:
@@ -16,6 +14,7 @@ else:
 import logging
 
 logger = logging.getLogger(__name__)
+
 
 def _make_cpp_tree(
     disabled: bool,
@@ -30,6 +29,7 @@ def _make_cpp_tree(
         page_size=page_size,
         write_through_threshold=write_through_threshold,
     )
+
 
 class HiRadixCacheCpp(BasePrefixCache):
     def _merge_tensor(self, l: List[torch.Tensor]) -> torch.Tensor:
