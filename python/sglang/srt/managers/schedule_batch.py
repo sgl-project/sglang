@@ -985,7 +985,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         extend_num_tokens: int,
         backup_state: bool = False,
     ):
-        # TODO(lsyin): fix the type of token_to_kv_pool_allocator
         if (
             self.token_to_kv_pool_allocator.available_size()
             < extend_num_tokens
