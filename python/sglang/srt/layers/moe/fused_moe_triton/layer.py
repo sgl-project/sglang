@@ -32,6 +32,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
     from aiter import ActivationType
+    from aiter.fused_moe import fused_moe
     from aiter.fused_moe_bf16_asm import ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
 
@@ -204,7 +205,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     topk_weights, dtype=torch.float32
                 )  # topk_weights must be FP32 (float32)
 
-            return ck_moe_2stages(
+            return fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
