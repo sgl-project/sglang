@@ -68,7 +68,7 @@ class BaseReasoningFormatDetector:
 
         # If the current text is a prefix of the think token, keep buffering
         if any(
-            token.startswith(current_text)
+            token.startswith(current_text) and token != current_text
             for token in [self.think_start_token, self.think_end_token]
         ):
             return StreamingParseResult()
