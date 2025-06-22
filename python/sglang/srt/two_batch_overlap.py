@@ -34,8 +34,10 @@ def get_token_num_per_seq(
     if forward_mode.is_target_verify():
         assert spec_info is not None
         return spec_info.draft_token_num
-    elif forward_mode.is_decode() or forward_mode.is_idle():
+    elif forward_mode.is_decode():
         return 1
+    elif forward_mode.is_idle():
+        return 0
     else:
         # For extend, we should not use `token_num_per_seq`.
         return None
@@ -91,6 +93,8 @@ def compute_split_token_index(
         return sum(extend_seq_lens[:split_seq_index])
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
+        if token_num_per_seq == 0:
+            return 0
         return split_seq_index * token_num_per_seq
     elif forward_mode.is_idle():
         assert split_seq_index == 0
