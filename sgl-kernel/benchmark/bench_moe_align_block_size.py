@@ -261,6 +261,40 @@ def get_topk_ids(num_tokens: int, num_experts: int, topk: int) -> torch.Tensor:
     return topk_ids
 
 
+def sgl_moe_align_block_size_with_empty(
+    topk_ids,
+    num_experts,
+    block_size,
+    sorted_ids,
+    expert_ids,
+    num_tokens_post_pad,
+    pad_sorted_token_ids=False,
+):
+    if not pad_sorted_token_ids:
+        sorted_ids.fill_(topk_ids.numel())
+
+    token_cnts_buffer = torch.empty(
+        (num_experts + 1) * num_experts,
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    cumsum_buffer = torch.empty(
+        num_experts + 1, dtype=torch.int32, device=topk_ids.device
+    )
+
+    sgl_moe_align_block_size(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_ids.clone(),
+        expert_ids.clone(),
+        num_tokens_post_pad.clone(),
+        token_cnts_buffer,
+        cumsum_buffer,
+        pad_sorted_token_ids,
+    )
+
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["num_tokens", "num_experts", "topk"],
@@ -300,36 +334,6 @@ def benchmark(num_tokens, num_experts, topk, provider):
 
     quantiles = [0.5, 0.2, 0.8]
     if provider == "sgl":
-
-        def sgl_moe_align_block_size_with_empty(
-            topk_ids,
-            num_experts,
-            block_size,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-        ):
-            sorted_ids.fill_(topk_ids.numel())
-            token_cnts_buffer = torch.empty(
-                (num_experts + 1) * num_experts,
-                dtype=torch.int32,
-                device=topk_ids.device,
-            )
-            cumsum_buffer = torch.empty(
-                num_experts + 1, dtype=torch.int32, device=topk_ids.device
-            )
-
-            sgl_moe_align_block_size(
-                topk_ids,
-                num_experts,
-                block_size,
-                sorted_ids.clone(),
-                expert_ids.clone(),
-                num_tokens_post_pad.clone(),
-                token_cnts_buffer,
-                cumsum_buffer,
-            )
-
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: sgl_moe_align_block_size_with_empty(
                 topk_ids,
@@ -342,44 +346,15 @@ def benchmark(num_tokens, num_experts, topk, provider):
             quantiles=quantiles,
         )
     elif provider == "sgl_fusion":
-
-        def sgl_moe_align_block_size_with_empty_fusion(
-            topk_ids,
-            num_experts,
-            block_size,
-            sorted_ids,
-            expert_ids,
-            num_tokens_post_pad,
-        ):
-            token_cnts_buffer = torch.empty(
-                (num_experts + 1) * num_experts,
-                dtype=torch.int32,
-                device=topk_ids.device,
-            )
-            cumsum_buffer = torch.empty(
-                num_experts + 1, dtype=torch.int32, device=topk_ids.device
-            )
-
-            sgl_moe_align_block_size(
-                topk_ids,
-                num_experts,
-                block_size,
-                sorted_ids.clone(),
-                expert_ids.clone(),
-                num_tokens_post_pad.clone(),
-                token_cnts_buffer,
-                cumsum_buffer,
-                True,
-            )
-
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: sgl_moe_align_block_size_with_empty_fusion(
+            lambda: sgl_moe_align_block_size_with_empty(
                 topk_ids,
                 num_experts,
                 block_size,
                 sorted_ids,
                 expert_ids,
                 num_tokens_post_pad,
+                pad_sorted_token_ids=True,
             ),
             quantiles=quantiles,
         )
