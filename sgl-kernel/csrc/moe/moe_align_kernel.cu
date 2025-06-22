@@ -50,7 +50,8 @@ __global__ void moe_align_block_size_kernel(
     int32_t experts_per_warp,
     int32_t block_size,
     size_t numel,
-    int32_t* __restrict__ cumsum) {
+    int32_t* __restrict__ cumsum,
+    bool pad_sorted_token_ids) {
   extern __shared__ int32_t shared_counts[];
 
   const int warp_id = threadIdx.x / WARP_SIZE;
@@ -97,10 +98,12 @@ __global__ void moe_align_block_size_kernel(
     }
   }
 
-  int32_t fill_val = static_cast<int32_t>(numel);
-  int32_t total = *total_tokens_post_pad;
-  for (int32_t idx = tid; idx < total; idx += stride) {
-    sorted_token_ids[idx] = fill_val;
+  if (pad_sorted_token_ids) {
+    int32_t fill_val = static_cast<int32_t>(numel);
+    int32_t total = *total_tokens_post_pad;
+    for (int32_t idx = tid; idx < total; idx += stride) {
+      sorted_token_ids[idx] = fill_val;
+    }
   }
 }
 
@@ -112,7 +115,8 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     int32_t* __restrict__ total_tokens_post_pad,
     int32_t num_experts,
     int32_t block_size,
-    size_t numel) {
+    size_t numel,
+    bool pad_sorted_token_ids) {
   const size_t tid = threadIdx.x;
   const size_t stride = blockDim.x;
 
@@ -155,10 +159,12 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     }
   }
 
-  int32_t fill_val = static_cast<int32_t>(numel);
-  int32_t total = *total_tokens_post_pad;
-  for (int32_t idx = tid; idx < total; idx += stride) {
-    sorted_token_ids[idx] = fill_val;
+  if (pad_sorted_token_ids) {
+    int32_t fill_val = static_cast<int32_t>(numel);
+    int32_t total = *total_tokens_post_pad;
+    for (int32_t idx = tid; idx < total; idx += stride) {
+      sorted_token_ids[idx] = fill_val;
+    }
   }
 
   __syncthreads();
@@ -179,7 +185,8 @@ void moe_align_block_size(
     torch::Tensor experts_ids,
     torch::Tensor num_tokens_post_pad,
     torch::Tensor token_cnts_buffer,
-    torch::Tensor cumsum_buffer) {
+    torch::Tensor cumsum_buffer,
+    bool pad_sorted_token_ids) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   int64_t padded_num_experts = ((num_experts + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
@@ -204,7 +211,8 @@ void moe_align_block_size(
           num_tokens_post_pad.data_ptr<int32_t>(),
           num_experts,
           block_size,
-          topk_ids.numel());
+          topk_ids.numel(),
+          pad_sorted_token_ids);
     } else {
       auto align_kernel = moe_align_block_size_kernel<scalar_t>;
 
@@ -221,7 +229,8 @@ void moe_align_block_size(
           experts_per_warp,
           block_size,
           topk_ids.numel(),
-          cumsum_buffer.data_ptr<int32_t>());
+          cumsum_buffer.data_ptr<int32_t>(),
+          pad_sorted_token_ids);
 
       const int block_threads = std::min(256, (int)threads);
       const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;

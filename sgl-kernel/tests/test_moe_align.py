@@ -138,18 +138,19 @@ def moe_align_block_size_triton(
 
 
 @pytest.mark.parametrize(
-    "block_size,num_tokens,topk,num_experts",
+    "block_size,num_tokens,topk,num_experts,pad_sorted_token_ids",
     list(
         itertools.product(
             [32, 64, 128, 256],  # block_size
             [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],  # num_tokens
             [1, 2, 4, 8, 16, 32, 64],  # topk
             [64, 160, 256, 257, 260, 264],  #  num_experts
+            [True, False],  # pad_sorted_token_ids
         )
     ),
 )
 def test_moe_align_block_size_compare_implementations(
-    block_size, num_tokens, topk, num_experts
+    block_size, num_tokens, topk, num_experts, pad_sorted_token_ids
 ):
 
     topk_ids = torch.argsort(torch.rand(num_tokens, num_experts, device="cuda"), dim=1)[
@@ -161,6 +162,8 @@ def test_moe_align_block_size_compare_implementations(
     sorted_ids_cuda = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
+    if not pad_sorted_token_ids:
+        sorted_ids_cuda.fill_(topk_ids.numel())
     max_num_m_blocks = max_num_tokens_padded // block_size
     expert_ids_cuda = torch.zeros(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
@@ -191,6 +194,7 @@ def test_moe_align_block_size_compare_implementations(
         num_tokens_post_pad_cuda,
         token_cnts_buffer,
         cumsum_buffer,
+        pad_sorted_token_ids,
     )
 
     moe_align_block_size_triton(
