@@ -80,8 +80,13 @@ class HiPAttentionBackend(AttentionBackend):
         )
         
         self._last_tick = 0
+        
+        self._block_table: torch.Tensor = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        self._block_table = forward_batch.req_to_token_pool.req_to_token\
+            .index_select(dim=0, index=forward_batch.req_pool_indices)
+        
         self.flashattention_backend.init_forward_metadata(
             forward_batch=forward_batch
         )
@@ -184,7 +189,7 @@ class HiPAttentionBackend(AttentionBackend):
             end_event = torch.cuda.Event(True)
             start_event.record()
             
-        if need_dense_prefill or False:
+        if (need_dense_prefill and (not is_decode)) or False:
             return self.flashattention_backend.forward_extend(
                 q=q,
                 k=k,
@@ -269,6 +274,7 @@ class HiPAttentionBackend(AttentionBackend):
                     seq_lens=forward_batch.seq_lens,
                     req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
                     req_pool_indices=forward_batch.req_pool_indices,
+                    block_table=self._block_table,
                     rope_cos=layer.rope_cos,
                     rope_sin=layer.rope_sin,
                     rope_range=layer.rope_range,
@@ -311,6 +317,7 @@ class HiPAttentionBackend(AttentionBackend):
                     seq_lens=forward_batch.seq_lens,
                     req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
                     req_pool_indices=forward_batch.req_pool_indices,
+                    block_table=self._block_table,
                     rope_cos=layer.rope_cos,
                     rope_sin=layer.rope_sin,
                     rope_range=layer.rope_range,
@@ -319,6 +326,8 @@ class HiPAttentionBackend(AttentionBackend):
                     logit_cap=layer.logit_cap,
                     orig_context_len=layer.orig_context_len,
                     max_context_len=self.max_context_len,
+                    extend_seq_lens=forward_batch.extend_seq_lens,
+                    extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
                     hip_config=self.hip_config,
                     is_kv_cache_offload_enabled=self.is_kv_cache_offload_enabled,
                     cached_metadata=None,
@@ -342,7 +351,7 @@ class HiPAttentionBackend(AttentionBackend):
             elapsed_layer = (time.time() - self._last_tick) * 1000
             self._last_tick = time.time()
             capture.report()
-            print(f'[hip] layer {layer.layer_id} took {elapsed:.2f} ms (layer: {elapsed_layer:.2f} ms)')
+            print(f'[hip] layer {layer.layer_id} took {elapsed:.2f} ms (from last tick: {elapsed_layer:.2f} ms)')
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -467,6 +476,7 @@ class HiPAttentionBackend(AttentionBackend):
                     seq_lens=forward_batch.seq_lens,
                     req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
                     req_pool_indices=forward_batch.req_pool_indices,
+                    block_table=self._block_table,
                     rope_cos=layer.rope_cos,
                     rope_sin=layer.rope_sin,
                     rope_range=layer.rope_range,
@@ -522,7 +532,8 @@ class HiPAttentionBackend(AttentionBackend):
                 assert (q_rope.shape[-1] + q_nope.shape[-1]) == layer.rope_range[1]
                 q_merged = torch.cat([q_nope, q_rope], dim=-1)
                 # TODO FIXME
-                k_cache = torch.cat([c_kv_cache, k_rope_cache], dim=-1)
+                # k_cache = torch.cat([c_kv_cache, k_rope_cache], dim=-1)
+                k_cache = kv_cache
                 v_cache = c_kv_cache
                 
                 o, metadata = self.forward_paged_hip(
@@ -538,6 +549,7 @@ class HiPAttentionBackend(AttentionBackend):
                     seq_lens=forward_batch.seq_lens,
                     req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
                     req_pool_indices=forward_batch.req_pool_indices,
+                    block_table=self._block_table,
                     rope_cos=layer.rope_cos,
                     rope_sin=layer.rope_sin,
                     rope_range=layer.rope_range,
