@@ -1435,7 +1435,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
+            num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
         )
@@ -1488,6 +1488,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -1621,8 +1622,6 @@ class DeepseekV2Model(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.dp_size = get_local_attention_dp_size()
-
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
@@ -1706,7 +1705,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
         )
         self.logits_processor = LogitsProcessor(config)
-        self.dp_size = get_local_attention_dp_size()
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
@@ -1731,12 +1729,12 @@ class DeepseekV2ForCausalLM(nn.Module):
         disable_reason = None
         if (
             not _is_cuda
-            or torch.cuda.get_device_capability("cuda") < (9, 0)
+            or torch.cuda.get_device_capability("cuda") < (8, 0)
             or self.config.architectures[0] != architecture
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
         ):
-            disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 90 can use shared experts fusion optimization."
+            disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         elif (
             global_server_args_dict["enable_deepep_moe"]
             or global_server_args_dict["enable_ep_moe"]
@@ -2040,7 +2038,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
-            logger.info("Shared experts fusion optimization enabled.")
+            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
         params_dict = dict(self.named_parameters())
         weight_names = []
