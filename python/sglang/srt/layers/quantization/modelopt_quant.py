@@ -818,7 +818,7 @@ class ModelOptNvFp4FusedMoEMethod:
                 ep_rank=ep_rank,
                 tp_size=tp_size,
                 tp_rank=tp_rank,
-                tune_max_num_tokens=next_power_of_2(x.shape[0])
+                tune_max_num_tokens=next_power_of_2(x.shape[0]),
             )
             return output[0]
 
