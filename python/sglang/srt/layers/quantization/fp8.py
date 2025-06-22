@@ -1058,10 +1058,10 @@ class Fp8MoEMethod:
 
             return cutlass_fused_experts_fp8(
                 x,
-                layer.w13_weight.transpose(1, 2),
-                layer.w2_weight.transpose(1, 2),
-                layer.w13_weight_scale_inv.transpose(1, 2),
-                layer.w2_weight_scale_inv.transpose(1, 2),
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
                 topk_weights,
                 topk_ids,
                 self.ab_strides1,
