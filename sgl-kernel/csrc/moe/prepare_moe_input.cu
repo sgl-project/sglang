@@ -255,37 +255,37 @@ void shuffle_rows(const torch::Tensor& input_tensor, const torch::Tensor& dst2sr
 
 template <typename scalar_t>
 __global__ void apply_shuffle_mul_sum_kernel(
-    const scalar_t* __restrict__ input_tensor,  // [m * topk, row_stride]
-    scalar_t* __restrict__ output_tensor,       // [m, row_stride]
-    const int32_t* __restrict__ permutation,    // [m * topk]
+    const scalar_t* __restrict__ input_tensor,  // [m * topk, k] (expert-major layout)
+    scalar_t* __restrict__ output_tensor,       // [m, k] (token-major layout)
+    const int32_t* __restrict__ permutation,    // [m * topk] (c_map: token-major-idx -> expert-major-idx)
     int m,
     int topk,
     int row_stride,
-    const scalar_t* __restrict__ factors)  // [m * topk] or nullptr
+    const scalar_t* __restrict__ factors)  // [m * topk] (topk_weights, token-major layout)
 {
-  int i = blockIdx.x;   // [0, m * topk)
-  int d = threadIdx.x;  // [0, row_stride)
-
-  if (i >= m || d >= row_stride) return;
-
-  scalar_t sum_val = 0.0;
-
-  for (int j = 0; j < topk; ++j) {
-    int index_2d = i * topk + j;
-    int src_row = permutation[index_2d];
-    if (src_row >= m) continue;
-
-    scalar_t val = input_tensor[src_row * row_stride + d];
-
-    scalar_t factor = 1.0;
-    if (factors != nullptr) {
-      factor = factors[index_2d];
-    }
-
-    sum_val += factor * val;
+  int i = blockIdx.x;
+  if (i >= m) {
+    return;
   }
 
-  output_tensor[i * row_stride + d] = sum_val;
+  // Grid-stride loop to ensure each thread handles multiple feature dimensions
+  // if row_stride > blockDim.x..
+  for (int d = threadIdx.x; d < row_stride; d += blockDim.x) {
+    scalar_t sum_val = 0.0;
+
+    for (int j = 0; j < topk; ++j) {
+      int token_major_idx = i * topk + j;
+      int src_row = permutation[token_major_idx];
+      scalar_t val = input_tensor[src_row * row_stride + d];
+      scalar_t factor = 1.0;
+      if (factors != nullptr) {
+        factor = factors[token_major_idx];
+      }
+      sum_val += factor * val;
+    }
+
+    output_tensor[i * row_stride + d] = sum_val;
+  }
 }
 
 void get_apply_shuffle_mul_sum_caller(
