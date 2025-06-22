@@ -41,9 +41,9 @@ def replace_weight_name(
         name.replace(key, to, count) 
     return name
 
-def weight_loader_with_alias(alias:str): 
+def wegith_loader_with_alias(alias:str): 
     def wrapper(func:callable): 
-        def wrapper_weight_loader(
+        def inner_func(
             param: torch.Tensor, 
             loaded_weights: torch.Tensor, 
             *args, 
@@ -52,6 +52,7 @@ def weight_loader_with_alias(alias:str):
             value = func(param, loaded_weights, *args, **kwargs)
             return value
         return wrapper_weight_loader
+        return inner_func
     return wrapper
 
 
