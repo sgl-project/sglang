@@ -9,7 +9,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 def main():
     parser = argparse.ArgumentParser(description="sglang data gen")
     parser.add_argument("--start", type=int, default=0)
-    parser.add_argument("--end", type=int, default=100)
+    parser.add_argument("--end", type=int, default=2)
     parser.add_argument("--index", type=int, default=1)
     parser.add_argument("--gpu_index", type=int, nargs="+", default=list(range(8)))
     parser.add_argument("--outdir", type=str, default="/root/.cache/hidden_states_dump")
