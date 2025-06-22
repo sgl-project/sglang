@@ -41,22 +41,22 @@ struct RadixTree::Impl {
     m_node_map[m_root.node_id] = &m_root;  // add root to the map
   }
 
-  TreeNode* split_node(node_iterator_t it, std::size_t prefix) {
+  TreeNode* split_node(node_iterator_t iterator, std::size_t prefix_length) {
     // from `parent -> old_node` to `parent-> new_node -> old_node`
     // the prefix part of the old node is moved to the new node
-    auto old_node_ptr = std::move(it->second);
+    auto old_node_ptr = std::move(iterator->second);
     auto new_node_ptr = std::make_unique<TreeNode>(m_node_counter++);
     auto* old_node = old_node_ptr.get();
     auto* new_node = new_node_ptr.get();
     auto* parent = old_node->parent();
     // set up data structures
-    TreeNode::split_prefix(new_node, old_node, prefix);
+    split_prefix(new_node, old_node, prefix_length);
     if (auto ticket = new_node->io_ticket()) {
       register_io_ticket(new_node, *ticket);
     }
     // set up parent-child relationship
     add_child(new_node, std::move(old_node_ptr));
-    add_child(parent, std::move(new_node_ptr), it);
+    add_child(parent, std::move(new_node_ptr), iterator);
     m_node_map[new_node->node_id] = new_node;  // add to the map
     return new_node;
   }
@@ -90,21 +90,21 @@ struct RadixTree::Impl {
   }
 
   // node: [CPU] -> [CPU + GPU]
-  void update_device(TreeNode* node, at::Tensor new_indices) {
+  void copy_device_indices(TreeNode* node, at::Tensor new_indices) {
     _assert(node->on_cpu_only() && node->ref_count == 0);
     node->_unsafe_device_indices() = std::move(new_indices);
     m_evictable_size += node->length();
   }
 
   // node: [CPU + GPU] -> [CPU]
-  void free_device(TreeNode* node) {
+  void free_device_indices(TreeNode* node) {
     _assert(node->on_both() && node->ref_count == 0 && node->is_io_free());
     node->_unsafe_device_indices().reset();
     m_evictable_size -= node->length();
   }
 
-  // increase the hit count of a node
-  bool need_write_through(TreeNode* node) const {
+  /** @return Whether the node need write through.  */
+  bool need_write_through(const TreeNode* node) const {
     _assert(node->on_gpu());
     return use_hicache && node->hit_count >= threshold && !node->on_cpu();
   }
@@ -113,9 +113,13 @@ struct RadixTree::Impl {
   // this will make some nodes: [GPU] -> [CPU + GPU]
   std::size_t try_write_through(const std::vector<TreeNode*>& nodes);
 
-  /// @return (last node on cpu, matched prefix length on cpu)
+  /**
+   * @brief Walk the tree to find the node that matches the key.
+   * If the key partially matches a node, it will split that node.
+   * @return A pair containing the last node that matches the key and
+   * the total prefix length matched (on gpu and cpu) so far.
+   */
   std::pair<TreeNode*, std::size_t> tree_walk(token_slice key) {
-    // Some helper functions
     _assert(key.size() % page_size == 0, "Key should be page-aligned");
 
     std::size_t total_prefix_length = 0;
@@ -123,9 +127,11 @@ struct RadixTree::Impl {
 
     const auto now = std::chrono::steady_clock::now();
     while (key.size() > 0) {
-      const auto it = node->find_child(get_key(key));
-      if (it == node->end()) break;
-      node = it->second.get();
+      const auto iterator = node->find_child(get_key(key));
+      if (iterator == node->end()) break;
+
+      // walk to the child node
+      node = iterator->second.get();
 
       // at least `page_size` tokens are matched, and there may be more tokens to match
       // the return value prefix_length is no less than `page_size`
@@ -134,7 +140,7 @@ struct RadixTree::Impl {
 
       // split the node if the prefix is not the whole token vector
       if (prefix_length < node->length()) {
-        return {split_node(it, prefix_length), total_prefix_length};
+        return {split_node(iterator, prefix_length), total_prefix_length};
       }
 
       // we have matched the whole key, continue to the next node
@@ -145,7 +151,7 @@ struct RadixTree::Impl {
     return {node, total_prefix_length};
   }
 
-  std::vector<TreeNode*> collect_leaves_host() const {
+  std::vector<TreeNode*> collect_leaves() const {
     std::vector<TreeNode*> leaves;
     std::vector<TreeNode*> stack = {};
     for (const auto& [_, child] : m_root) {
@@ -154,7 +160,7 @@ struct RadixTree::Impl {
     while (!stack.empty()) {
       const auto node = stack.back();
       stack.pop_back();
-      if (node->is_leaf_host()) {
+      if (node->is_leaf()) {
         if (node->ref_count == 0) {
           leaves.push_back(node);
         }
@@ -168,8 +174,8 @@ struct RadixTree::Impl {
   }
 
   std::vector<TreeNode*> collect_leaves_device() const {
-    // for non-hicache, every leaf device node is a leaf host node (since no backup on host)
-    if (!use_hicache) return collect_leaves_host();
+    // for non-hicache, every leaf device node is a leaf node (since no backup on host)
+    if (!use_hicache) return collect_leaves();
     std::vector<TreeNode*> leaves;
     std::vector<TreeNode*> stack = {};
     for (const auto& [_, child] : m_root) {
@@ -252,9 +258,9 @@ struct RadixTree::Impl {
   }
 
   TreeNode* id2node(NodeHandle node_id) const {
-    auto it = m_node_map.find(node_id);
-    _assert(it != m_node_map.end(), "Node not found in the map");
-    return it->second;
+    const auto iterator = m_node_map.find(node_id);
+    _assert(iterator != m_node_map.end(), "Node not found in the map");
+    return iterator->second;
   }
 
   void reset() {
@@ -282,47 +288,48 @@ struct RadixTree::Impl {
   }
 
   void register_io_ticket(TreeNode* node, IOTicket ticket) {
-    auto it = m_io_map.find(ticket);
-    _assert(it != m_io_map.end(), "IO ticket not found in the map");
-    it->second.push_back(node);
+    const auto iterator = m_io_map.find(ticket);
+    _assert(iterator != m_io_map.end(), "IO ticket not found in the map");
+    iterator->second.push_back(node);
   }
 
   // this function aims at improving the performance of register IO ticket
-  void register_io_ticket(TreeNode* node, IOiterator_t it) {
-    it->second.push_back(node);
+  void register_io_ticket(TreeNode* node, IOiterator_t iterator) {
+    iterator->second.push_back(node);
   }
 
   void complete_io_writing_through(IOTicket ticket, bool success) {
-    auto it = m_io_map.find(ticket);
-    _assert(it != m_io_map.end(), "IO ticket not found in the map");
+    const auto iterator = m_io_map.find(ticket);
+    _assert(iterator != m_io_map.end(), "IO ticket not found in the map");
     if (success) {
-      for (const auto node : it->second) {
+      for (const auto node : iterator->second) {
         if (node->is_io_locked()) unlock(node);
         node->hit_count = 0;
         node->complete_device_to_host(ticket);
       }
-    } else {
-      for (const auto node : it->second) {
+    } else {  // IO write through failed
+      for (const auto node : iterator->second) {
         if (node->is_io_locked()) unlock(node);
         node->complete_device_to_host(ticket);
-        // free the host part of the node
         // [CPU + GPU] -> [GPU]
+        // we must free the host part of the node right now,
+        // because the CPU part is no longer valid
         m_host_pool.free(node->host_indices());
         node->_unsafe_host_indices().reset();
       }
     }
-    m_io_map.erase(it);  // remove the ticket from the map
+    m_io_map.erase(iterator);  // remove the ticket from the map
   }
 
   void complete_io_loading_onboard(IOTicket ticket, bool success) {
     _assert(success, "We cannot handle IO loading failure in the current implementation");
-    auto it = m_io_map.find(ticket);
-    _assert(it != m_io_map.end(), "IO ticket not found in the map");
-    for (const auto node : it->second) {
+    const auto iterator = m_io_map.find(ticket);
+    _assert(iterator != m_io_map.end(), "IO ticket not found in the map");
+    for (const auto node : iterator->second) {
       if (node->is_io_locked()) unlock(node);
       node->complete_host_to_device(ticket);
     }
-    m_io_map.erase(it);  // remove the ticket from the map
+    m_io_map.erase(iterator);  // remove the ticket from the map
   }
 
   void debug_print(std::ostream& os) const;
@@ -336,6 +343,7 @@ struct RadixTree::Impl {
     return m_cached_vec;
   }
 
+  // justify for _unsafe call: we need to read the key part of the tokens
   token_vec_t& get_key(TreeNode* node) {
     return get_key(node->_unsafe_tokens());
   }

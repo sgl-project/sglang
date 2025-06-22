@@ -1,12 +1,14 @@
 #pragma once
 #include <ATen/core/TensorBody.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <unordered_map>
 
 #include "common.h"
@@ -24,11 +26,6 @@ struct std_vector_hash {
   }
 };
 
-/**
- * Every node is a host node, which means either it is on the host or on the device (or both).
- * A device node stands for a node that is on the device, and it may have a backup on the host.
- * A host node stands for a node that is on the host, and it may be on device as well.
- */
 struct TreeNode {
  public:
   using childern_map_t = std::unordered_map<token_vec_t, std::unique_ptr<TreeNode>, std_vector_hash>;
@@ -86,7 +83,7 @@ struct TreeNode {
     return m_tokens.size();
   }
 
-  bool is_leaf_host() const {
+  bool is_leaf() const {
     return m_children.empty();
   }
 
@@ -135,13 +132,14 @@ struct TreeNode {
   }
 
   // set up all data structures except for parent-child relationship
-  static void split_prefix(TreeNode* new_node, TreeNode* old_node, std::size_t prefix) {
+  friend void split_prefix(TreeNode* new_node, TreeNode* old_node, std::size_t prefix_length) {
     auto tokens = std::move(old_node->m_tokens);
-    _assert(0 < prefix && prefix < tokens.size(), "Invalid prefix size for split");
+    _assert(0 < prefix_length && prefix_length < tokens.size(), "Invalid prefix size for split");
 
-    old_node->m_tokens = token_vec_t(tokens.begin() + prefix, tokens.end());
+    // set up tokens
+    old_node->m_tokens = token_vec_t(tokens.begin() + prefix_length, tokens.end());
     new_node->m_tokens = std::move(tokens);
-    new_node->m_tokens.resize(prefix);
+    new_node->m_tokens.resize(prefix_length);
 
     // set up values
     const int64_t new_size = new_node->length();
@@ -161,17 +159,21 @@ struct TreeNode {
     new_node->ref_count = old_node->ref_count;
     new_node->hit_count = old_node->hit_count;
 
-    if (old_node->m_io_locked.has_value()) new_node->m_io_locked = false;  // keep the IO status
-    new_node->m_io_status = old_node->m_io_status;
-    new_node->m_io_ticket = old_node->m_io_ticket;
+    // If the old node (child) was locked for IO, the new node (parent) does not need
+    // to be locked, since it is naturally protected by the child node's lock.
+    if (old_node->m_io_locked.has_value()) {
+      new_node->m_io_locked = false;
+      new_node->m_io_status = old_node->m_io_status;
+      new_node->m_io_ticket = old_node->m_io_ticket;
+    }
   }
 
   /// @return The first index in `m_tokens` that differs from `key`.
   std::size_t diff_key(token_slice key, std::size_t offset) const {
-    auto a = m_tokens;
-    auto b = key;
-    auto it = std::mismatch(a.begin() + offset, a.end(), b.begin() + offset, b.end());
-    return it.first - a.begin() - offset;
+    const auto a = token_slice{key}.subspan(offset);
+    const auto b = token_slice{m_tokens}.subspan(offset);
+    const auto [it_a, it_b] = std::ranges::mismatch(a, b);
+    return it_a - a.begin();  // return the index of the first differing token
   }
 
   at::Tensor device_indices() const {

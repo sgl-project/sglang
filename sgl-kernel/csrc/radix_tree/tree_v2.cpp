@@ -69,7 +69,7 @@ std::vector<at::Tensor> RadixTree::evict(std::size_t num_tokens) {
     if (!node->on_cpu()) {
       m_impl->remove_device_node(node);
     } else {
-      m_impl->free_device(node);
+      m_impl->free_device_indices(node);
     }
     if (parent->is_leaf_device() && parent->ref_count == 0)
       heap.push(parent);  // push parent to the heap if it is now a free leaf
@@ -79,9 +79,11 @@ std::vector<at::Tensor> RadixTree::evict(std::size_t num_tokens) {
 }
 
 std::size_t RadixTree::Impl::try_write_through(const std::vector<TreeNode*>& nodes) {
-  if (!use_hicache) return 0;  // no write-through if hierarchical cache is not used
+  // no write-through if hierarchical cache is not used or no nodes to write through
+  if (!use_hicache || nodes.empty()) return 0;
+
   std::size_t remain_size = m_host_pool.available_size();
-  std::vector<std::size_t> sizes(nodes.size());
+  std::vector<std::size_t> sizes(nodes.size(), 0);
 
   for (const auto i : c10::irange(nodes.size())) {
     const auto node = nodes[i];
@@ -90,18 +92,14 @@ std::size_t RadixTree::Impl::try_write_through(const std::vector<TreeNode*>& nod
       sizes[i] = needed - remain_size;
       remain_size = 0;  // no more space left
     } else {
-      sizes[i] = 0;
       remain_size -= needed;
     }
   }
 
-  _assert(sizes.size() == nodes.size(), "sizes and nodes must have the same size");
-  _assert(use_hicache, "evict_host_batch called without hicache enabled");
-
-  if (sizes.empty()) return 0;
+  const bool need_eviction = sizes.back() > 0;
 
   // The following code, similar to `evict`, evicts nodes from the host memory in a batch manner.
-  auto heap = std::priority_queue{cmp, this->collect_leaves_host()};
+  auto heap = std::priority_queue{cmp, need_eviction ? this->collect_leaves() : std::vector<TreeNode*>{}};
   std::size_t num_evict = 0;
   for (const auto i : c10::irange(sizes.size())) {
     const auto num_tokens = sizes[i];
@@ -111,11 +109,13 @@ std::size_t RadixTree::Impl::try_write_through(const std::vector<TreeNode*>& nod
       // skip nodes that are on the GPU or are undergoing IO (i.e. indices protected)
       // the first condition is our policy, which can be changed in the future
       // while the second one ensures the correctness of the eviction
+      // (in fact, io node are all protected, will will not be pushed to the heap
+      //  since their ref_count > 0, so we may skip this check in the future)
       if (node->on_gpu() || !node->is_io_free()) continue;
       num_evict += node->length();
       const auto parent = node->parent();
       this->remove_host_node(node);
-      if (parent->is_leaf_host() && parent->ref_count == 0)
+      if (parent->is_leaf() && parent->ref_count == 0)
         heap.push(parent);  // push parent to the heap if it is now a free leaf
     }
 
@@ -137,6 +137,8 @@ std::tuple<std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>>, std::size_
 RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
   if (m_impl->disabled) return {};
   _assert(_key.size() == std::size_t(value.size(0)), "Key and value must have the same size");
+
+  // just align the key to the page size, clip the unaligned tail
   const auto key = token_slice{_key.data(), m_impl->align(_key.size())};
 
   // the nodes that are potentially written through to the host
@@ -145,6 +147,7 @@ RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
   // walk the tree to find the right place to insert
   const auto [host_node, host_prefix_length] = m_impl->tree_walk(key);
 
+  // insert and create a new node if the remaining part of the key is not empty
   if (host_prefix_length != key.size()) {
     const auto new_node = m_impl->create_device_node(
         host_node,
@@ -155,12 +158,14 @@ RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
     }
   }
 
+  // update the host node device indices with the newly-inserted device indices
   std::size_t offset = host_prefix_length;
   const auto device_node = walk_to_device(host_node, [&](TreeNode* n) {
-    m_impl->update_device(n, value.slice(/*dim=*/0, offset - n->length(), offset));
+    m_impl->copy_device_indices(n, value.slice(/*dim=*/0, offset - n->length(), offset));
     offset = offset - n->length();
   });
 
+  // add the hit count for the device node
   std::size_t device_prefix_length = 0;
   walk_to_root(device_node, [&](TreeNode* n) {
     device_prefix_length += n->length();
@@ -172,6 +177,7 @@ RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
   _assert(device_prefix_length == offset, "Something goes wrong...");
 
   std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>> result;
+
   // don't write through if hicache is disabled (no host memory), fast path
   if (!m_impl->use_hicache) return {std::move(result), device_prefix_length};
 
@@ -186,7 +192,7 @@ RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
     const auto node = potential_write_nodes[i];
     const auto ticket = node->io_ticket();
     _assert(ticket.has_value(), "Ticket should be valid for the node");
-    result[i] = {ticket.value(), node->device_indices(), node->host_indices()};
+    result[i] = {*ticket, node->device_indices(), node->host_indices()};
   }
 
   return {std::move(result), device_prefix_length};
@@ -203,7 +209,7 @@ std::tuple<IOTicket, std::vector<at::Tensor>> RadixTree::loading_onboard(NodeHan
   std::size_t offset = value.size(0);
   walk_to_device(old_host_node, [&](TreeNode* n) {
     indices.push_back(n->host_indices());
-    m_impl->update_device(n, value.slice(/*dim=*/0, offset - n->length(), offset));
+    m_impl->copy_device_indices(n, value.slice(/*dim=*/0, offset - n->length(), offset));
     offset = offset - n->length();
     // we only lock the furthermost host node, since it will automatically lock all the parent nodes
     const bool locked = (n == old_host_node);
