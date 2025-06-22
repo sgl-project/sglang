@@ -1435,7 +1435,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
+            num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
         )
@@ -1488,6 +1488,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )

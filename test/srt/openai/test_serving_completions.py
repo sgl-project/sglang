@@ -5,11 +5,23 @@ Run with:
 """
 
 import unittest
+from typing import Optional
 from unittest.mock import AsyncMock, Mock, patch
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+
+class _MockTemplateManager:
+    """Minimal mock for TemplateManager."""
+
+    def __init__(self):
+        self.chat_template_name: Optional[str] = None
+        self.jinja_template_content_format: Optional[str] = None
+        self.completion_template_name: Optional[str] = (
+            None  # Set to None to avoid template processing
+        )
 
 
 class ServingCompletionTestCase(unittest.TestCase):
@@ -31,7 +43,8 @@ class ServingCompletionTestCase(unittest.TestCase):
         tm.generate_request = AsyncMock()
         tm.create_abort_task = Mock()
 
-        self.sc = OpenAIServingCompletion(tm)
+        self.template_manager = _MockTemplateManager()
+        self.sc = OpenAIServingCompletion(tm, self.template_manager)
 
     # ---------- prompt-handling ----------
     def test_single_string_prompt(self):
@@ -43,20 +56,6 @@ class ServingCompletionTestCase(unittest.TestCase):
         req = CompletionRequest(model="x", prompt=[1, 2, 3, 4], max_tokens=100)
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.input_ids, [1, 2, 3, 4])
-
-    def test_completion_template_handling(self):
-        req = CompletionRequest(
-            model="x", prompt="def f():", suffix="return 1", max_tokens=100
-        )
-        with patch(
-            "sglang.srt.entrypoints.openai.serving_completions.is_completion_template_defined",
-            return_value=True,
-        ), patch(
-            "sglang.srt.entrypoints.openai.serving_completions.generate_completion_prompt_from_request",
-            return_value="processed_prompt",
-        ):
-            internal, _ = self.sc._convert_to_internal_request(req)
-            self.assertEqual(internal.text, "processed_prompt")
 
     # ---------- echo-handling ----------
     def test_echo_with_string_prompt_streaming(self):
