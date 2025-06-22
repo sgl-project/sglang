@@ -278,6 +278,10 @@ class ModelRunner:
             self.apply_torch_tp()
 
         # Init lora
+        # TODO (lifuhuang): when we support dynamic LoRA loading / unloading, we should add
+        # a new server arg `enable_lora` to control whether to init LoRA manager to be more
+        # explicit, as it is perfectly valid to start a server with an empty lora_paths and
+        # load LoRA adapters dynamically later.
         if server_args.lora_paths is not None:
             self.init_lora_manager()
 
@@ -796,7 +800,6 @@ class ModelRunner:
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
             base_model=self.model,
-            lora_paths=self.server_args.lora_paths,
             base_hf_config=self.model_config.hf_config,
             max_loras_per_batch=self.server_args.max_loras_per_batch,
             load_config=self.load_config,
@@ -805,6 +808,7 @@ class ModelRunner:
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
         )
+        self.lora_manager.load_lora_adapters(self.server_args.lora_paths)
         logger.info("LoRA manager ready.")
 
     def profile_max_num_token(self, total_gpu_memory: int):
