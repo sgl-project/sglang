@@ -349,7 +349,7 @@ class DeepseekV2MoE(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
     ) -> torch.Tensor:
         if not self._enable_deepep_moe:
-            DUAL_STREAM_TOKEN_THRESHOLD = 2048
+            DUAL_STREAM_TOKEN_THRESHOLD = 1024
             if (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
