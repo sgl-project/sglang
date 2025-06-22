@@ -63,6 +63,8 @@ spec:
             value: "3"
           - name: NVSHMEM_ENABLE_NIC_PE_MAPPING
             value: "1"
+          - name: NVSHMEM_HCA_PE_MAPPING
+            value: "mlx5_bond_0:1:2,mlx5_bond_1:1:2,mlx5_bond_2:1:2,mlx5_bond_3:1:2"
           - name:  NCCL_IB_QPS_PER_CONNECTION
             value: "8"
           - name: NCCL_IB_SPLIT_DATA_ON_QPS
@@ -163,7 +165,6 @@ spec:
           - "64"
           - --enable-dp-attention
           - --enable-dp-lm-head
-            #- --enable-two-batch-overlap
           - --dp-size
           - "16"
           - --enable-deepep-moe
@@ -195,16 +196,14 @@ spec:
           - --moe-dense-tp-size
           - "1"
           env:
-          - name: SGLANG_HACK_DEEPEP_NUM_SMS
-            value: "24"
-          - name: SGLANG_HACK_DEEPEP_NEW_MODE
-            value: "0"
           - name: NVSHMEM_IB_TRAFFIC_CLASS
             value: "16"
           - name: NVSHMEM_IB_GID_INDEX
             value: "3"
           - name: NVSHMEM_ENABLE_NIC_PE_MAPPING
             value: "1"
+          - name: NVSHMEM_HCA_PE_MAPPING
+            value: "mlx5_bond_0:1:2,mlx5_bond_1:1:2,mlx5_bond_2:1:2,mlx5_bond_3:1:2"
           - name:  NCCL_IB_QPS_PER_CONNECTION
             value: "8"
           - name: NCCL_IB_SPLIT_DATA_ON_QPS
