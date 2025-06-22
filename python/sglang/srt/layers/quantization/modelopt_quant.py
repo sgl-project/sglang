@@ -29,7 +29,7 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_bool_env_var, is_cuda
+from sglang.srt.utils import is_cuda, next_power_of_2
 
 if is_cuda():
     from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
@@ -681,7 +681,10 @@ class ModelOptNvFp4FusedMoEMethod:
         w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
         layer.w13_weight_scale_2 = Parameter(w13_weight_scale_2, requires_grad=False)
 
-        w13_input_scale = layer.w13_input_scale.max(dim=1).values.to(torch.float32)
+        if self.enable_flashinfer_moe:
+            w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
+        else:
+            w13_input_scale = layer.w13_input_scale.max(dim=1).values.to(torch.float32)
         layer.g1_alphas = Parameter(
             (w13_input_scale * w13_weight_scale_2).to(torch.float32),
             requires_grad=False,
@@ -707,14 +710,19 @@ class ModelOptNvFp4FusedMoEMethod:
         layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
 
         # GEMM 2
+        if self.enable_flashinfer_moe:
+            w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
+        else:
+            w2_input_scale = layer.w2_input_scale
+
         layer.g2_alphas = Parameter(
-            (layer.w2_input_scale * layer.w2_weight_scale_2).to(torch.float32),
+            (w2_input_scale * layer.w2_weight_scale_2).to(torch.float32),
             requires_grad=False,
         )
 
         # This is for quantization, so we need to invert it.
         layer.w2_input_scale_quant = Parameter(
-            (1 / layer.w2_input_scale).to(torch.float32), requires_grad=False
+            (1 / w2_input_scale).to(torch.float32), requires_grad=False
         )
 
         assert (
@@ -769,8 +777,6 @@ class ModelOptNvFp4FusedMoEMethod:
     ) -> torch.Tensor:
 
         assert activation == "silu", "Only SiLU activation is supported."
-
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
 
         topk_weights, topk_ids = select_experts(
@@ -791,39 +797,28 @@ class ModelOptNvFp4FusedMoEMethod:
             assert (
                 not apply_router_weight_on_input
             ), "apply_router_weight_on_input is not supported for Flashinfer"
-            a1_gs = torch.min(layer.w13_input_scale_quant)
-            a2_gs = torch.min(layer.w2_input_scale_quant)
-            w1_blockscale = layer.w13_blockscale_swizzled
-            w2_blockscale = layer.w2_blockscale_swizzled
-            g1_alphas = layer.g1_alphas
-            g2_alphas = layer.g2_alphas
-
-            quant_scales = [
-                a1_gs,
-                w1_blockscale.view(torch.int32),
-                g1_alphas,
-                a2_gs,
-                w2_blockscale.view(torch.int32),
-                g2_alphas,
-            ]
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
-            out_dtype = x.dtype
-            output = x if inplace else torch.zeros_like(x)
-            x, x_sf = fp4_quantize(x, a1_gs)
             output = flashinfer_cutlass_fused_moe(
                 x,
                 topk_ids.to(torch.int),
                 topk_weights,
                 layer.w13_weight.view(torch.long),
                 layer.w2_weight.view(torch.long),
-                out_dtype,
-                quant_scales=quant_scales,
-                input_sf=x_sf,
+                x.dtype,
+                quant_scales=[
+                    layer.w13_input_scale_quant,
+                    layer.w13_blockscale_swizzled.view(torch.int32),
+                    layer.g1_alphas,
+                    layer.w2_input_scale_quant,
+                    layer.w2_blockscale_swizzled.view(torch.int32),
+                    layer.g2_alphas,
+                ],
                 ep_size=ep_size,
                 ep_rank=ep_rank,
                 tp_size=tp_size,
                 tp_rank=tp_rank,
+                tune_max_num_tokens=next_power_of_2(x.shape[0])
             )
             return output[0]
 

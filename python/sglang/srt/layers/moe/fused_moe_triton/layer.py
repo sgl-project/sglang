@@ -328,11 +328,8 @@ class FusedMoE(torch.nn.Module):
         )
         self.tp_rank = get_tensor_model_parallel_rank()
         self.num_experts = num_experts
-        self.reduce_results = reduce_results
         self.expert_map = None
         self.enable_flashinfer_moe = enable_flashinfer_moe
-        if self.enable_flashinfer_moe:
-            self.reduce_results = True
         if enable_ep_moe:
             assert (
                 self.enable_flashinfer_moe
@@ -344,27 +341,22 @@ class FusedMoE(torch.nn.Module):
             # Create a tensor of size num_experts filled with -1
             self.expert_map = torch.full((self.num_experts,), -1, dtype=torch.int32)
             # Create a expert map for the local experts
-            local_num_experts = num_experts // self.ep_size
-            if self.ep_rank < (self.ep_size - 1):
-                # Each non-last rank gets local_num_experts experts.
-                self.expert_map[
-                    self.ep_rank
-                    * local_num_experts : (self.ep_rank + 1)
-                    * local_num_experts
-                ] = torch.arange(0, local_num_experts, dtype=torch.int32)
-            else:
-                # All remaining experts are assigned to the last rank.
-                local_num_experts = num_experts - self.ep_rank * local_num_experts
-                self.expert_map[-local_num_experts:] = torch.arange(
-                    0, local_num_experts, dtype=torch.int32
-                )
+            assert num_experts % self.ep_size == 0
+            self.local_num_experts = num_experts // self.ep_size
+            self.expert_map[
+                self.ep_rank
+                * self.local_num_experts : (self.ep_rank + 1)
+                * self.local_num_experts
+            ] = torch.arange(0, self.local_num_experts, dtype=torch.int32, device="cpu")
         else:
             self.ep_size = 1
             self.ep_rank = 0
+            self.local_num_experts = num_experts
         self.routed_scaling_factor = routed_scaling_factor
         self.top_k = top_k
         assert intermediate_size % self.tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
+        self.reduce_results = reduce_results
         self.renormalize = renormalize
         self.use_grouped_topk = use_grouped_topk
         if self.use_grouped_topk:
@@ -379,11 +371,6 @@ class FusedMoE(torch.nn.Module):
         self.use_presharded_weights = use_presharded_weights
         self.inplace = inplace
         self.no_combine = no_combine
-        self.local_num_experts = (
-            torch.sum(self.expert_map != -1)
-            if self.expert_map is not None
-            else num_experts
-        )
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
