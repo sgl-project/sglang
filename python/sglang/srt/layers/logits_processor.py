@@ -342,9 +342,9 @@ class LogitsProcessor(nn.Module):
         hidden_states_to_store: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
-                if aux_hidden_states is not None:
-                    aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
-                    hidden_states_to_store = aux_hidden_states
+                if hd_to_return is not None:
+                    hd_to_return = torch.cat(hd_to_return, dim=-1)
+                    hidden_states_to_store = hd_to_return
                 else:
                     hidden_states_to_store = hidden_states
             elif logits_metadata.capture_hidden_mode.is_last():
