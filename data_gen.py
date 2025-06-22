@@ -185,11 +185,17 @@ def main():
         tgt_hs = torch.tensor(hs_all[0], dtype=torch.float16).cpu().numpy()  # (S, D)
         hs = torch.tensor(hs_all[1:], dtype=torch.float16).cpu().numpy()     # (N, S, D)
 
+        def _to_np16_nested(arr):
+            return [[ [np.float16(v) for v in seq] for seq in layer ] for layer in arr]
+
+        def _to_np16_2d(arr):
+            return [[np.float16(v) for v in seq] for seq in arr]
+
         buffer.append({
             "input_ids": row["input_ids"].tolist(),
             "loss_mask": row["loss_mask"].tolist(),
-            "hidden_state": hs.tolist(),
-            "target_hidden_states": tgt_hs.tolist(),
+            "hidden_state": _to_np16_nested(hs),
+            "target_hidden_states": _to_np16_2d(tgt_hs),
         })
 
         if len(buffer) >= chunk_size:
