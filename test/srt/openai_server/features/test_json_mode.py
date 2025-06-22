@@ -1,12 +1,12 @@
 """
-python3 -m unittest test_json_mode.TestJSONModeOutlines.test_json_mode_response
-python3 -m unittest test_json_mode.TestJSONModeOutlines.test_json_mode_with_streaming
+python3 -m unittest openai_server.features.test_json_mode.TestJSONModeOutlines.test_json_mode_response
+python3 -m unittest openai_server.features.test_json_mode.TestJSONModeOutlines.test_json_mode_with_streaming
 
-python3 -m unittest test_json_mode.TestJSONModeXGrammar.test_json_mode_response
-python3 -m unittest test_json_mode.TestJSONModeXGrammar.test_json_mode_with_streaming
+python3 -m unittest openai_server.features.test_json_mode.TestJSONModeXGrammar.test_json_mode_response
+python3 -m unittest openai_server.features.test_json_mode.TestJSONModeXGrammar.test_json_mode_with_streaming
 
-python3 -m unittest test_json_mode.TestJSONModeLLGuidance.test_json_mode_response
-python3 -m unittest test_json_mode.TestJSONModeLLGuidance.test_json_mode_with_streaming
+python3 -m unittest openai_server.features.test_json_mode.TestJSONModeLLGuidance.test_json_mode_response
+python3 -m unittest openai_server.features.test_json_mode.TestJSONModeLLGuidance.test_json_mode_with_streaming
 """
 
 import json

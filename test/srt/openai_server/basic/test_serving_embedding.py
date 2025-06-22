@@ -1,8 +1,5 @@
 """
 Unit tests for the OpenAIServingEmbedding class from serving_embedding.py.
-
-These tests ensure that the embedding serving implementation maintains compatibility
-with the original adapter.py functionality and follows OpenAI API specifications.
 """
 
 import unittest
