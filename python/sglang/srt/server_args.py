@@ -249,6 +249,7 @@ class ServerArgs:
             assert (
                 self.quantization == "modelopt_fp4"
             ), "modelopt_fp4 quantization is required for Flashinfer MOE"
+            os.environ["TRTLLM_ENABLE_PDL"] = "1"
             self.disable_shared_experts_fusion = True
             logger.warning(
                 f"Flashinfer MoE is enabled. Shared expert fusion is disabled."
