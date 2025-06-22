@@ -1889,6 +1889,26 @@ class ServerArgs:
         )
 
         # Kernel backend
+        ATTN_BACKENDS = [
+            # Common
+            "triton",
+            "torch_native",
+            "hip_attention",
+            # NVIDIA specific
+            "cutlass_mla",
+            "fa3",
+            "flashinfer",
+            "flashmla",
+            "trtllm_mla",
+            "trtllm_mha",
+            "dual_chunk_flash_attn",
+            # AMD specific
+            "aiter",
+            "wave",
+            # Other platforms
+            "intel_amx",
+            "ascend",
+        ]
         parser.add_argument(
             "--attention-backend",
             type=str,
@@ -2750,6 +2770,9 @@ class ServerArgs:
         args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
+        
+        if args.attention_backend == 'hip_attention':
+            args.enable_hip_attention = True
 
         if args.enable_hip_attention:
             from hip_attn.v1_2 import HiPAttentionConfig
