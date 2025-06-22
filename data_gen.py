@@ -24,7 +24,7 @@ def main():
     )
     args = parser.parse_args()
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_index)[1:-1]
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, args.gpu_index))
     MAX_TOKEN_LENGTH = 2048
 
     # ------------------------ 1. Dataset ------------------------
@@ -145,6 +145,8 @@ def main():
         skip_tokenizer_init=True,
         enable_return_hidden_states=True,
         tp_size=8,
+        context_length=65536,
+        disable_cuda_graph=True
     )
     sampling_params = {
         "temperature": 0,
@@ -174,7 +176,7 @@ def main():
     for idx, row in tqdm(enumerate(dataset), total=len(dataset)):
         # 推理得到 hidden_states / target_hidden_states
         outputs = llm.generate(
-            input_ids=[row["input_ids"]],
+            input_ids=[row["input_ids"].tolist()],
             sampling_params=sampling_params,
             return_hidden_states=True,
         )

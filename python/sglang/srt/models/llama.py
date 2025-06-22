@@ -463,7 +463,7 @@ class LlamaForCausalLM(nn.Module):
         )
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        if self.capture_aux_hidden_states or isinstance(hidden_states, tuple):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:

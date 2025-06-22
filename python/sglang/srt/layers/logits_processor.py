@@ -237,7 +237,11 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[List[torch.Tensor]] = None,
     ) -> LogitsProcessorOutput:
         if aux_hidden_states is not None:
-            hd_to_return = torch.cat([hidden_states.unsqueeze(0)] + aux_hidden_states, dim=0)
+            hd_to_return = torch.cat(
+                [hidden_states.unsqueeze(0)]
+                + [aux.unsqueeze(0) for aux in aux_hidden_states],
+                dim=0,
+            )
         else:
             hd_to_return = hidden_states
 
