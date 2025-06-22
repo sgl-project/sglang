@@ -3,12 +3,9 @@ import time
 from typing import Any, AsyncGenerator, Dict, List, Union
 
 from fastapi import Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 
-from sglang.srt.code_completion_parser import (
-    generate_completion_prompt_from_request,
-    is_completion_template_defined,
-)
+from sglang.srt.code_completion_parser import generate_completion_prompt_from_request
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -24,12 +21,22 @@ from sglang.srt.entrypoints.openai.utils import (
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.template_manager import TemplateManager
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
 
 
 class OpenAIServingCompletion(OpenAIServingBase):
-    """Handler for completion requests"""
+    """Handler for /v1/completion requests"""
+
+    def __init__(
+        self,
+        tokenizer_manager: TokenizerManager,
+        template_manager: TemplateManager,
+    ):
+        super().__init__(tokenizer_manager)
+        self.template_manager = template_manager
 
     def _request_id_prefix(self) -> str:
         return "cmpl-"
@@ -47,7 +54,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             )
         # Process prompt
         prompt = request.prompt
-        if is_completion_template_defined():
+        if self.template_manager.completion_template_name is not None:
             prompt = generate_completion_prompt_from_request(request)
 
         # Set logprob start length based on echo and logprobs
@@ -141,6 +148,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         prompt_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
+        hidden_states = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -152,6 +160,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                hidden_states[index] = content["meta_info"].get("hidden_states", None)
 
                 stream_buffer = stream_buffers.get(index, "")
                 # Handle echo for first chunk
@@ -192,7 +201,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 delta = text[len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
                 finish_reason = content["meta_info"]["finish_reason"]
-                hidden_states = content["meta_info"].get("hidden_states", None)
 
                 choice_data = CompletionResponseStreamChoice(
                     index=index,
@@ -269,7 +277,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
-    ) -> Union[CompletionResponse, ErrorResponse]:
+    ) -> Union[CompletionResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming completion request"""
         try:
             generator = self.tokenizer_manager.generate_request(
