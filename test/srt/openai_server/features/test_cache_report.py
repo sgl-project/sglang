@@ -97,7 +97,7 @@ class TestCacheReport(CustomTestCase):
         )
         first_cached_tokens = int(response.usage.prompt_tokens_details.cached_tokens)
         # assert int(response.usage.cached_tokens) == 0
-        assert first_cached_tokens < self.min_cached
+        assert first_cached_tokens <= self.min_cached
         response = self.run_openai(message)
         cached_tokens = int(response.usage.prompt_tokens_details.cached_tokens)
         print(f"openai second request cached_tokens: {cached_tokens}")

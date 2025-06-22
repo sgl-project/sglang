@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
+from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
@@ -16,7 +17,6 @@ from sglang.srt.function_call.utils import (
     _is_complete_json,
     _partial_json_loads,
 )
-from sglang.srt.openai_api.protocol import Tool
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +114,7 @@ class BaseFormatDetector(ABC):
             self.has_tool_call(current_text)
             or (
                 self.current_tool_id > 0
-                and current_text.startswith(self.tool_call_separator + "{")
+                and current_text.startswith(self.tool_call_separator)
             )
         ):
             # Only clear buffer if we're sure no tool call is starting
