@@ -1058,12 +1058,7 @@ class TokenizerManager:
                         "lora_path",
                     ]
                 )
-                out_skip_names = set(
-                    [
-                        "text",
-                        "output_ids",
-                    ]
-                )
+                out_skip_names = set(["text", "output_ids", "embedding"])
             elif self.log_requests_level == 1:
                 max_length = 2048
             elif self.log_requests_level == 2:

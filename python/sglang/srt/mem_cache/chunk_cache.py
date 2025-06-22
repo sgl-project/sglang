@@ -6,8 +6,9 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -17,7 +18,7 @@ class ChunkCache(BasePrefixCache):
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         token_to_kv_pool_allocator_local: Optional[TokenToKVPoolAllocator] = None,
     ):
