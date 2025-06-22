@@ -435,6 +435,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.alpha = Parameter(
             layer.input_scale * layer.weight_scale_2, requires_grad=False
         )
+        layer.input_scale_inv = Parameter(
+            (1 / input_scale_2).to(torch.float32), requires_grad=False
+        )
 
         # Pad and blockwise interleave weight_scale
         scales = layer.weight_scale
@@ -473,7 +476,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         output_shape = [x_m, w_n]
 
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        x_fp4, x_scale_interleaved = scaled_fp4_quant(x, 1 / layer.input_scale)
+        x_fp4, x_scale_interleaved = scaled_fp4_quant(x, layer.input_scale_inv)
 
         assert x_fp4.dtype == torch.uint8
         assert x_scale_interleaved.dtype == torch.float8_e4m3fn
