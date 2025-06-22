@@ -16,7 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/v0.8.2/vllm/model_executor/models/opt.py
 
 from collections.abc import Iterable
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 from torch import nn
@@ -33,6 +33,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -40,15 +41,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
-
-from .interfaces import SupportsPP
-from .utils import (
-    AutoWeightsLoader,
-    WeightsMapper,
-    is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
-    maybe_prefix,
-)
 
 
 class OPTLearnedPositionalEmbedding(nn.Embedding):
@@ -337,24 +329,37 @@ class OPTModel(nn.Module):
     ) -> torch.Tensor:
         return self.decoder(input_ids, positions, forward_batch, input_embeds)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
         ]
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
+
+        params_dict = dict(self.named_parameters())
+
         for name, loaded_weight in weights:
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self, "start_layer")
+                and (layer_id < self.start_layer or layer_id >= self.end_layer)
+            ):
+                continue
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                continue
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if is_pp_missing_parameter(name, self):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -364,26 +369,26 @@ class OPTModel(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+                if name in params_dict.keys():
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
 
 
-class OPTForCausalLM(nn.Module, SupportsPP):
+class OPTForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={
-            "decoder.": "model.decoder.",
-        }
-    )
+    stacked_params_mapping = [
+        # (param_name, shard_name, shard_id)
+        (".qkv_proj", ".q_proj", "q"),
+        (".qkv_proj", ".k_proj", "k"),
+        (".qkv_proj", ".v_proj", "v"),
+    ]
 
     def __init__(
         self,
@@ -436,14 +441,55 @@ class OPTForCausalLM(nn.Module, SupportsPP):
         else:
             return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(
-                ["lm_head.weight"] if self.config.tie_word_embeddings else None
-            ),
-        )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+        ]
+
+        params_dict = dict(self.named_parameters())
+
+        for name, loaded_weight in weights:
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
+            if "rotary_emb.inv_freq" in name:
+                continue
+            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                continue
+            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+                continue
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name in params_dict.keys():
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
 
 
 EntryClass = [OPTForCausalLM]

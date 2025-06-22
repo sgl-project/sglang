@@ -156,9 +156,9 @@ def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None
     res = requests.post(url, json=data)
     assert res.status_code == 200
     if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
+        pred = res.json()["choices"][0]["text"]
     else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
+        pred = [choice["text"] for choice in res.json()["choices"]]
     return pred
 
 
@@ -357,11 +357,13 @@ def _get_call_generate(args: argparse.Namespace):
     if args.backend == "lightllm":
         return partial(call_generate_lightllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "vllm":
-        return partial(call_generate_vllm, url=f"{args.host}:{args.port}/generate")
+        return partial(
+            call_generate_vllm, url=f"{args.host}:{args.port}/v1/completions"
+        )
     elif args.backend == "srt-raw":
         return partial(call_generate_srt_raw, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "gserver":
-        return partial(call_generate_gserver, url=f"{args.host}:{args.port}")
+        raise NotImplementedError("gserver backend is not implemented")
     elif args.backend == "outlines":
         return partial(call_generate_outlines, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "guidance":
