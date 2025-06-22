@@ -68,11 +68,9 @@ def cutlass_fused_experts_fp8(
             (up-projection part of SwiGLU). Expected shape: `(E, n*2, k)`, where
             `E` is the number of experts, `k` is the hidden size, and `n*2` is the
             intermediate size (`I`). Expected dtype: `torch.float8_e4m3fn`.
-            Note: This shape implies weights are stored as (num_experts, hidden_size, intermediate_size).
         w2_q (torch.Tensor): Pre-quantized FP8 weight tensor for the second GEMM
             (down-projection). Expected shape: `(E, k, n)`, where `n` is half the
             intermediate size (`I // 2`). Expected dtype: `torch.float8_e4m3fn`.
-            Note: This shape implies weights are stored as (num_experts, intermediate_size // 2, hidden_size).
         w1_scale (torch.Tensor): Scales corresponding to `w1_q` (per-block scales).
             Shape: `(E, num_blocks_n, num_blocks_k)`. Dtype: `torch.float32`.
         w2_scale (torch.Tensor): Scales corresponding to `w2_q` (per-block scales).
