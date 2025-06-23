@@ -23,7 +23,6 @@ import time
 from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass
-from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
@@ -141,6 +140,7 @@ from sglang.srt.utils import (
     DeepEPMode,
     DynamicGradMode,
     broadcast_pyobj,
+    configure_gc_logger,
     configure_logger,
     disable_request_logging,
     get_available_gpu_memory,
@@ -508,6 +508,9 @@ class Scheduler(
             self.server_args.disaggregation_mode
         )
         self.init_disaggregation()
+
+        if get_bool_env_var("SGLANG_GC_LOG"):
+            configure_gc_logger()
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
