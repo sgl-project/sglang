@@ -924,7 +924,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_algorithm: SpeculativeAlgorithm,
         enable_custom_logit_processor: bool,
         chunked_req: Optional[Req] = None,
-        token_to_kv_pool_allocator_local: Optional[TokenToKVPoolAllocator] = None,
+        token_to_kv_pool_allocator_local: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
