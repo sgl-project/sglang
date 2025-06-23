@@ -45,7 +45,7 @@ kind: Service
 metadata:
   name: deepseekr10528-lb-service
 spec:
-  type: NodePort
+  type: NodePort # NodePort is easy to test, you can also specify `ClusterIP`
   selector:
     app: deepseekr10528-lb
   ports:

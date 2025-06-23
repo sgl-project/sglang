@@ -43,6 +43,7 @@ spec:
           - --model-path
           - /work/models
           - --disaggregation-ib-device
+          # should modify according your rdma env
           - mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3
           - --chunked-prefill-size
           - "524288"
@@ -50,14 +51,14 @@ spec:
           - "32768"
           - --page-size
           - "64"
-#          - --init-expert-location
-#          - /home/aiges/tuned/attachment_ep_statistics/prefill_in1024.json
+          #          - --init-expert-location
+          #          - /home/aiges/tuned/attachment_ep_statistics/prefill_in1024.json
           - --ep-dispatch-algorithm
           - dynamic
           - --eplb-algorithm
           - deepseek
-#          - --deepep-config
-#          -  /home/aiges/tuned/tuned_8sms.json
+          #          - --deepep-config
+          #          -  /home/aiges/tuned/tuned_8sms.json
           - --enable-dp-lm-head
           - --enable-dp-attention
           - --dp-size
@@ -163,15 +164,18 @@ spec:
             medium: Memory
           name: dshm
         - hostPath:
+            # modify according to you deployment env
             path: /data1/maas_hosted_models/models/DeepSeek-R1-0528/deepseek_r1_0528
           name: model
         - hostPath:
             path: /dev/infiniband
           name: ib
         - hostPath:
+            # modify according to you deployment env
             path: /data1/maas_hosted_models/models/fused_moe_triton/configs
           name: cf
         - hostPath:
+            # modify according to you deployment env
             path: /data1/sgl_cache
             type: DirectoryOrCreate
           name: sgl-cache
@@ -316,9 +320,6 @@ spec:
         - emptyDir:
             medium: Memory
           name: dshm
-        - hostPath:
-            path: /mnt/nvme0n1/maas_hosted_models/models/DeepSeek-V3-0324-NextN
-          name: draft
         - hostPath:
             path: /dev/infiniband
           name: ib
@@ -481,9 +482,6 @@ spec:
             path: /data1/maas_hosted_models/models/DeepSeek-R1-0528/deepseek_r1_0528
           name: model
         - hostPath:
-            path: /mnt/nvme0n1/maas_hosted_models/models/DeepSeek-V3-0324-NextN
-          name: draft
-        - hostPath:
             path: /dev/infiniband
           name: ib
         - hostPath:
@@ -520,6 +518,7 @@ spec:
           - --context-length
           - "32768"
           - --disaggregation-ib-device
+          # should modify according your rdma env
           - "mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3"
           - --cuda-graph-max-bs
           - "64"
@@ -615,15 +614,14 @@ spec:
             medium: Memory
           name: dshm
         - hostPath:
-            path: /mnt/nvme0n1/maas_hosted_models/models/DeepSeek-V3-0324-NextN
-          name: draft
-        - hostPath:
             path: /dev/infiniband
           name: ib
         - hostPath:
+            # modify according to you deployment env
             path: /data1/maas_hosted_models/models/DeepSeek-R1-0528/deepseek_r1_0528
           name: model
         - hostPath:
+            # modify according to you deployment env
             path: /data1/maas_hosted_models/models/fused_moe_triton/configs
           name: cf
   networkConfig:

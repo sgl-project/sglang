@@ -21,6 +21,7 @@ spec:
           - --model-path
           - /work/models
           - --disaggregation-ib-device
+          # should modify according your rdma env
           - mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3
           - --chunked-prefill-size
           - "524288"
@@ -63,6 +64,7 @@ spec:
           - "1024"
           env:
           - name: NVSHMEM_HCA_PE_MAPPING
+            # should modify according your rdma env
             value: "mlx5_bond_0:1:2,mlx5_bond_1:1:2,mlx5_bond_2:1:2,mlx5_bond_3:1:2"
           - name: NVSHMEM_IB_GID_INDEX
             value: "3"
@@ -92,7 +94,7 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']
-          image: artifacts.iflytek.com/docker-private/maas/sglang:047dev
+          image: lmsysorg/sglang:latest
           name: sglang-leader
           ports:
           - containerPort: 30000
@@ -124,8 +126,10 @@ spec:
         hostIPC: true
         hostNetwork: true
         nodeSelector:
+        # should modify according your deployment env
           pd: "yes"
         tolerations:
+        # should modify according your deployment env
         - key: bopd
           operator: Exists
         - key: node-role
@@ -160,6 +164,7 @@ spec:
           - --model-path
           - /work/models
           - --disaggregation-ib-device
+          # should modify according your rdma env
           - mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3
           - --chunked-prefill-size
           - "524288"
@@ -167,14 +172,13 @@ spec:
           - "32768"
           - --page-size
           - "64"
-          #- --init-expert-location
-          #- /home/aiges/tuned/attachment_ep_statistics/prefill_in1024.json
           - --ep-dispatch-algorithm
           - dynamic
           - --eplb-algorithm
           - deepseek
-#          - --deepep-config
-#          -  /home/aiges/tuned/tuned_8sms.json
+          #          - --deepep-config
+          #          -  /home/aiges/tuned/tuned_8sms.json
+          # can be tuned using deepep test scripts
           - --enable-dp-lm-head
           - --enable-dp-attention
           - --dp-size
@@ -208,6 +212,7 @@ spec:
           - name: SGLANG_SET_CPU_AFFINITY
             value: "true"
           - name: NVSHMEM_HCA_PE_MAPPING
+            # should modify according your rdma env
             value: "mlx5_bond_0:1:2,mlx5_bond_1:1:2,mlx5_bond_2:1:2,mlx5_bond_3:1:2"
           - name: NCCL_IB_HCA
             value: ^=mlx5_0,mlx5_5,mlx5_6
@@ -243,7 +248,7 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']
-          image: artifacts.iflytek.com/docker-private/maas/sglang:047dev
+          image: lmsysorg/sglang:latest
           name: sglang-worker
           ports:
           - containerPort: 30001
@@ -271,8 +276,10 @@ spec:
         hostIPC: true
         hostNetwork: true
         nodeSelector:
+        # should modify according your deployment env
           pd: "yes"
         tolerations:
+        # should modify according your deployment env
         - key: bopd
           operator: Exists
         - key: node-role
@@ -282,18 +289,18 @@ spec:
             medium: Memory
           name: dshm
         - hostPath:
-            path: /mnt/nvme0n1/maas_hosted_models/models/DeepSeek-V3-0324-NextN
-          name: draft
-        - hostPath:
             path: /dev/infiniband
           name: ib
         - hostPath:
+            # modify according to you deployment env
             path: /data1/maas_hosted_models/models/DeepSeek-R1-0528/deepseek_r1_0528
           name: model
         - hostPath:
+            # modify according to you deployment env
             path: /data1/maas_hosted_models/models/fused_moe_triton/configs
           name: cf
         - hostPath:
+            # modify according to you deployment env
             path: /data1/sgl_cache
             type: DirectoryOrCreate
           name: sgl-cache

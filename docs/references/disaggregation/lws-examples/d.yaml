@@ -89,7 +89,7 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']
-          image: artifacts.iflytek.com/docker-private/maas/sglang:047dev
+          image: lmsysorg/sglang:latest
           name: sglang-leader
           ports:
           - containerPort: 30000
@@ -121,8 +121,10 @@ spec:
         hostIPC: true
         hostNetwork: true
         nodeSelector:
+        # should modify according your deployment env
           pd: "yes"
         tolerations:
+        # should modify according your deployment env
         - key: bopd
           operator: Exists
         - key: node-role
@@ -138,9 +140,6 @@ spec:
         - hostPath:
             path: /data1/maas_hosted_models/models/DeepSeek-R1-0528/deepseek_r1_0528
           name: model
-        - hostPath:
-            path: /mnt/nvme0n1/maas_hosted_models/models/DeepSeek-V3-0324-NextN
-          name: draft
         - hostPath:
             path: /dev/infiniband
           name: ib
@@ -228,7 +227,7 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.labels['leaderworkerset.sigs.k8s.io/worker-index']
-          image: artifacts.iflytek.com/docker-private/maas/sglang:047dev
+          image: lmsysorg/sglang:latest
           name: sglang-worker
           ports:
           - containerPort: 30001
@@ -255,8 +254,10 @@ spec:
         hostIPC: true
         hostNetwork: true
         nodeSelector:
+        # should modify according your deployment env
           pd: "yes"
         tolerations:
+        # should modify according your deployment env
         - key: bopd
           operator: Exists
         - key: node-role
@@ -270,15 +271,14 @@ spec:
             medium: Memory
           name: dshm
         - hostPath:
-            path: /mnt/nvme0n1/maas_hosted_models/models/DeepSeek-V3-0324-NextN
-          name: draft
-        - hostPath:
             path: /dev/infiniband
           name: ib
         - hostPath:
+            # modify according to you deployment env
             path: /data1/maas_hosted_models/models/DeepSeek-R1-0528/deepseek_r1_0528
           name: model
         - hostPath:
+            # modify according to you deployment env
             path: /data1/maas_hosted_models/models/fused_moe_triton/configs
           name: cf
   networkConfig:
