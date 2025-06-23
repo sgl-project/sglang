@@ -122,6 +122,10 @@ class PyNcclCommunicator:
         # when we are using CUDA graph.
         self.disabled = True
 
+    def __del__(self):
+        with torch.cuda.device(self.device):
+            self.nccl.ncclCommDestroy(self.comm)
+
     def all_reduce(
         self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM, stream=None
     ):
