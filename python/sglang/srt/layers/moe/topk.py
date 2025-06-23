@@ -30,11 +30,11 @@ from sglang.srt.managers.expert_location_dispatch import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    get_bool_env_var,
     get_compiler_backend,
     is_cpu,
     is_cuda,
     is_hip,
-    get_bool_env_var,
 )
 
 _is_cuda = is_cuda()
