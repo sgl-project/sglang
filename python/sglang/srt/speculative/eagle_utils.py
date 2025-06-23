@@ -88,6 +88,7 @@ class EagleDraftInput:
     def create_idle_input(
         cls,
         device: torch.device,
+        dtype: torch.dtype,
         hidden_size: int,
         topk: int,
         capture_hidden_mode: CaptureHiddenMode,
@@ -95,11 +96,15 @@ class EagleDraftInput:
         return cls(
             verified_id=None,
             hidden_states=torch.empty(
-                (0, hidden_size), device=device, dtype=torch.float32
+                (0, hidden_size),
+                device=device,
+                dtype=dtype,
             ),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
+            accept_length=torch.empty((0,), device=device, dtype=torch.int32),
+            accept_length_cpu=[],
         )
 
     def prepare_extend_after_decode(
@@ -333,6 +338,7 @@ class EagleVerifyInput:
             return EagleVerifyOutput(
                 draft_input=EagleDraftInput.create_idle_input(
                     device=batch.device,
+                    dtype=batch.model_config.dtype,
                     hidden_size=batch.model_config.hidden_size,
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
