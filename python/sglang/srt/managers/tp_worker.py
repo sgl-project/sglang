@@ -190,9 +190,6 @@ class TpModelWorker:
             self.model_runner.token_to_kv_pool_allocator,
         )
 
-    def get_memory_pool_local(self):
-        return self.worker.model_runner.token_to_kv_pool_allocator_local
-
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,

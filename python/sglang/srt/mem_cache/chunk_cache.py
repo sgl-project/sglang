@@ -6,7 +6,10 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
@@ -20,12 +23,10 @@ class ChunkCache(BasePrefixCache):
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
-        token_to_kv_pool_allocator_local: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
-        self.token_to_kv_pool_allocator_local = token_to_kv_pool_allocator_local
 
     def reset(self):
         pass
@@ -45,14 +46,6 @@ class ChunkCache(BasePrefixCache):
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool_allocator.free(kv_indices)
-        if self.token_to_kv_pool_allocator_local is not None:
-            kv_indices_local = self.req_to_token_pool.req_to_token_local[
-                req.req_pool_idx,
-                req.evicted_seqlen_local : len(req.origin_input_ids)
-                + len(req.output_ids)
-                - 1,
-            ]
-            self.token_to_kv_pool_allocator_local.free(kv_indices_local)
 
     def cache_unfinished_req(self, req: Req):
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -61,11 +54,6 @@ class ChunkCache(BasePrefixCache):
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices
-        if self.token_to_kv_pool_allocator_local is not None:
-            kv_indices_local = self.req_to_token_pool.req_to_token_local[
-                req.req_pool_idx, : len(req.fill_ids)
-            ]
-            req.prefix_indices_local = kv_indices_local
 
     def evict_hybrid(
         self,
@@ -77,10 +65,10 @@ class ChunkCache(BasePrefixCache):
             new_evicted_seqlen_local = attention_chunk_size * (
                 prelen // attention_chunk_size
             )
-            free_slots = self.req_to_token_pool.req_to_token_local[
+            free_slots = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
             ]
-            self.token_to_kv_pool_allocator_local.free(free_slots)
+            self.token_to_kv_pool_allocator.free_swa(free_slots)
             req.evicted_seqlen_local = new_evicted_seqlen_local
 
     def evict(self, num_tokens: int):

@@ -549,13 +549,6 @@ class Scheduler(
             self.tp_worker.get_memory_pool()
         )
 
-        if self.tp_worker.worker.model_runner.is_hybrid is not None:
-            self.token_to_kv_pool_allocator_local = (
-                self.tp_worker.get_memory_pool_local()
-            )
-        else:
-            self.token_to_kv_pool_allocator_local = None
-
         if (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
@@ -564,7 +557,6 @@ class Scheduler(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 page_size=self.page_size,
-                token_to_kv_pool_allocator_local=self.token_to_kv_pool_allocator_local,
             )
         else:
             if self.enable_hierarchical_cache:
@@ -1263,32 +1255,14 @@ class Scheduler(
             + self.tree_cache.evictable_size()
         )
 
-        if self.token_to_kv_pool_allocator_local is not None:
-            self.local_max_total_num_tokens = self.token_to_kv_pool_allocator_local.size
-            num_used_local = self.local_max_total_num_tokens - (
-                self.token_to_kv_pool_allocator_local.available_size()
-                + self.tree_cache.evictable_size()
-            )
-
         num_new_seq = len(can_run_list)
-        if self.token_to_kv_pool_allocator_local is not None:
-            f = (
-                f"Prefill batch. "
-                f"#new-seq: {num_new_seq}, "
-                f"#new-token: {adder.log_input_tokens}, "
-                f"#cached-token: {adder.log_hit_tokens}, "
-                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                f"token usage local: {num_used_local / self.local_max_total_num_tokens:.2f}, "
-                f"#running-req: {running_bs}, "
-            )
-        else:
-            f = (
-                f"Prefill batch. "
-                f"#new-seq: {num_new_seq}, "
-                f"#new-token: {adder.log_input_tokens}, "
-                f"#cached-token: {adder.log_hit_tokens}, "
-                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-            )
+        f = (
+            f"Prefill batch. "
+            f"#new-seq: {num_new_seq}, "
+            f"#new-token: {adder.log_input_tokens}, "
+            f"#cached-token: {adder.log_hit_tokens}, "
+            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+        )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
@@ -1333,32 +1307,18 @@ class Scheduler(
             self.token_to_kv_pool_allocator.available_size()
             + self.tree_cache.evictable_size()
         )
-        if self.token_to_kv_pool_allocator_local is not None:
-            num_used_local = self.local_max_total_num_tokens - (
-                self.token_to_kv_pool_allocator_local.available_size()
-                + self.tree_cache.evictable_size()
-            )
 
         if RECORD_STEP_TIME:
             self.step_time_dict[num_running_reqs].append(
                 gap_latency / self.server_args.decode_log_interval
             )
 
-        if self.token_to_kv_pool_allocator_local is not None:
-            msg = (
-                f"Decode batch. "
-                f"#running-req: {num_running_reqs}, "
-                f"#token: {num_used}, "
-                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-                f"token usage local: {num_used_local / self.local_max_total_num_tokens:.2f}, "
-            )
-        else:
-            msg = (
-                f"Decode batch. "
-                f"#running-req: {num_running_reqs}, "
-                f"#token: {num_used}, "
-                f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-            )
+        msg = (
+            f"Decode batch. "
+            f"#running-req: {num_running_reqs}, "
+            f"#token: {num_used}, "
+            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+        )
 
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
@@ -1428,13 +1388,7 @@ class Scheduler(
             and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
-            if self.token_to_kv_pool_allocator is not None:
-                available_size = min(
-                    self.token_to_kv_pool_allocator.available_size(),
-                    self.token_to_kv_pool_allocator_local.available_size(),
-                )
-            else:
-                available_size = self.token_to_kv_pool_allocator.available_size()
+            available_size = self.token_to_kv_pool_allocator.available_size()
             num_used = self.max_total_num_tokens - (
                 available_size + self.tree_cache.evictable_size()
             )
@@ -1550,7 +1504,6 @@ class Scheduler(
             self.max_prefill_tokens,
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
-            self.token_to_kv_pool_allocator_local,
         )
 
         if self.chunked_req is not None:
@@ -1635,7 +1588,6 @@ class Scheduler(
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
             chunked_req=self.chunked_req,
-            token_to_kv_pool_allocator_local=self.token_to_kv_pool_allocator_local,
         )
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
@@ -2068,8 +2020,6 @@ class Scheduler(
                 self.grammar_backend.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
-            if self.token_to_kv_pool_allocator_local is not None:
-                self.token_to_kv_pool_allocator_local.clear()
 
             if not self.spec_algorithm.is_none():
                 self.draft_worker.model_runner.req_to_token_pool.clear()

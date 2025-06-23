@@ -275,12 +275,10 @@ class PrefillAdder:
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
-        token_to_kv_pool_allocator_local: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.token_to_kv_pool_allocator_local = token_to_kv_pool_allocator_local
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
@@ -311,13 +309,7 @@ class PrefillAdder:
 
     @property
     def rem_total_tokens(self):
-        if self.token_to_kv_pool_allocator_local is not None:
-            available_size = min(
-                self.token_to_kv_pool_allocator_local.available_size(),
-                self.token_to_kv_pool_allocator.available_size(),
-            )
-        else:
-            available_size = self.token_to_kv_pool_allocator.available_size()
+        available_size = self.token_to_kv_pool_allocator.available_size()
         return (
             available_size
             + self.tree_cache.evictable_size()
@@ -326,13 +318,7 @@ class PrefillAdder:
 
     @property
     def cur_rem_tokens(self):
-        if self.token_to_kv_pool_allocator_local is not None:
-            available_size = min(
-                self.token_to_kv_pool_allocator_local.available_size(),
-                self.token_to_kv_pool_allocator.available_size(),
-            )
-        else:
-            available_size = self.token_to_kv_pool_allocator.available_size()
+        available_size = self.token_to_kv_pool_allocator.available_size()
         return (
             available_size
             + self.tree_cache.evictable_size()

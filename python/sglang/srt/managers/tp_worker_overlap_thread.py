@@ -118,9 +118,6 @@ class TpModelWorkerClient:
             self.worker.model_runner.token_to_kv_pool_allocator,
         )
 
-    def get_memory_pool_local(self):
-        return self.worker.model_runner.token_to_kv_pool_allocator_local
-
     def get_kv_cache(self):
         return self.worker.model_runner.token_to_kv_pool
 

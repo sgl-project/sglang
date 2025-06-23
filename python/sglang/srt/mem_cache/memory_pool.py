@@ -54,7 +54,6 @@ class ReqToTokenPool:
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
-        is_hybrid: Optional[float] = None,
     ):
 
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -64,17 +63,10 @@ class ReqToTokenPool:
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        self.is_hybrid = is_hybrid
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
-            if self.is_hybrid is not None:
-                self.req_to_token_local = torch.zeros(
-                    (size, max_context_len), dtype=torch.int32, device=device
-                )
-            else:
-                self.req_to_token_local = None
 
         self.free_slots = list(range(size))
 
@@ -489,7 +481,7 @@ class SWAKVPool(KVCache):
             device=device,
             enable_memory_saver=False,
         )
-        self.layers_mapping: Dict[int, List[int]] = {}
+        self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
             self.layers_mapping[global_layer_id] = (full_attn_layer_id, False)
         for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
