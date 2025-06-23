@@ -2,16 +2,12 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
-from sglang.srt.entrypoints.openai.protocol import (
-    ErrorResponse,
-    OpenAIServingRequest,
-    UsageInfo,
-)
+from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
@@ -51,7 +47,7 @@ class OpenAIServingBase(ABC):
                 )
 
         except Exception as e:
-            logger.error(f"Error in request: {e}")
+            logger.exception(f"Error in request: {e}")
             return self.create_error_response(
                 message=f"Internal server error: {str(e)}",
                 err_type="InternalServerError",
@@ -63,8 +59,12 @@ class OpenAIServingBase(ABC):
         """Generate request ID based on request type"""
         pass
 
-    def _generate_request_id_base(self, request: OpenAIServingRequest) -> str:
+    def _generate_request_id_base(self, request: OpenAIServingRequest) -> Optional[str]:
         """Generate request ID based on request type"""
+        return None
+
+        # TODO(chang): the rid is used in io_strcut check and often violates `The rid should be a list` AssertionError
+        # Temporarily return None in this function until the rid logic is clear.
         if rid := getattr(request, "rid", None):
             return rid
 
@@ -83,7 +83,7 @@ class OpenAIServingBase(ABC):
         adapted_request: GenerateReqInput,
         request: OpenAIServingRequest,
         raw_request: Request,
-    ) -> StreamingResponse:
+    ) -> Union[StreamingResponse, ErrorResponse, ORJSONResponse]:
         """Handle streaming request
 
         Override this method in child classes that support streaming requests.
@@ -99,7 +99,7 @@ class OpenAIServingBase(ABC):
         adapted_request: GenerateReqInput,
         request: OpenAIServingRequest,
         raw_request: Request,
-    ) -> Union[Any, ErrorResponse]:
+    ) -> Union[Any, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming request
 
         Override this method in child classes that support non-streaming requests.
@@ -110,7 +110,7 @@ class OpenAIServingBase(ABC):
             status_code=501,
         )
 
-    def _validate_request(self, request: OpenAIServingRequest) -> Optional[str]:
+    def _validate_request(self, _: OpenAIServingRequest) -> Optional[str]:
         """Validate request"""
         pass
 
@@ -122,6 +122,7 @@ class OpenAIServingBase(ABC):
         param: Optional[str] = None,
     ) -> ORJSONResponse:
         """Create an error response"""
+        # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
         error = ErrorResponse(
             object="error",
             message=message,
