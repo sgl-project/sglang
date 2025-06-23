@@ -1,14 +1,12 @@
 """
-python3 -m unittest test_openai_server.TestOpenAIServer.test_batch
-python3 -m unittest test_openai_server.TestOpenAIServer.test_completion
-python3 -m unittest test_openai_server.TestOpenAIServer.test_completion_stream
-python3 -m unittest test_openai_server.TestOpenAIServer.test_chat_completion
-python3 -m unittest test_openai_server.TestOpenAIServer.test_chat_completion_stream
+python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test_completion
+python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test_completion_stream
+python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test_chat_completion
+python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test_chat_completion_stream
 """
 
 import json
 import re
-import time
 import unittest
 
 import numpy as np
@@ -20,7 +18,6 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS
 from sglang.test.test_utils import (
     DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST,
-    DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -508,87 +505,6 @@ class TestOpenAIServerEBNF(CustomTestCase):
         )
 
 
-class TestOpenAIEmbedding(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-
-        # Configure embedding-specific args
-        other_args = ["--is-embedding", "--enable-metrics"]
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=other_args,
-        )
-        cls.base_url += "/v1"
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_embedding_single(self):
-        """Test single embedding request"""
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        response = client.embeddings.create(model=self.model, input="Hello world")
-        self.assertEqual(len(response.data), 1)
-        self.assertTrue(len(response.data[0].embedding) > 0)
-
-    def test_embedding_batch(self):
-        """Test batch embedding request"""
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        response = client.embeddings.create(
-            model=self.model, input=["Hello world", "Test text"]
-        )
-        self.assertEqual(len(response.data), 2)
-        self.assertTrue(len(response.data[0].embedding) > 0)
-        self.assertTrue(len(response.data[1].embedding) > 0)
-
-    def test_embedding_single_batch_str(self):
-        """Test embedding with a List[str] and length equals to 1"""
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        response = client.embeddings.create(model=self.model, input=["Hello world"])
-        self.assertEqual(len(response.data), 1)
-        self.assertTrue(len(response.data[0].embedding) > 0)
-
-    def test_embedding_single_int_list(self):
-        """Test embedding with a List[int] or List[List[int]]]"""
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        response = client.embeddings.create(
-            model=self.model,
-            input=[[15339, 314, 703, 284, 612, 262, 10658, 10188, 286, 2061]],
-        )
-        self.assertEqual(len(response.data), 1)
-        self.assertTrue(len(response.data[0].embedding) > 0)
-
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        response = client.embeddings.create(
-            model=self.model,
-            input=[15339, 314, 703, 284, 612, 262, 10658, 10188, 286, 2061],
-        )
-        self.assertEqual(len(response.data), 1)
-        self.assertTrue(len(response.data[0].embedding) > 0)
-
-    def test_empty_string_embedding(self):
-        """Test embedding an empty string."""
-
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-
-        # Text embedding example with empty string
-        text = ""
-        # Expect a BadRequestError for empty input
-        with self.assertRaises(openai.BadRequestError) as cm:
-            client.embeddings.create(
-                model=self.model,
-                input=text,
-            )
-        # check the status code
-        self.assertEqual(cm.exception.status_code, 400)
-
-
 class TestOpenAIV1Rerank(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -658,79 +574,6 @@ class TestOpenAIV1Rerank(CustomTestCase):
         self.assertTrue(isinstance(response[1]["document"], str))
         self.assertTrue(isinstance(response[0]["index"], int))
         self.assertTrue(isinstance(response[1]["index"], int))
-
-
-class TestOpenAIServerIgnoreEOS(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-        )
-        cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_ignore_eos(self):
-        """
-        Test that ignore_eos=True allows generation to continue beyond EOS token
-        and reach the max_tokens limit.
-        """
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-
-        max_tokens = 200
-
-        response_default = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "Count from 1 to 20."},
-            ],
-            temperature=0,
-            max_tokens=max_tokens,
-            extra_body={"ignore_eos": False},
-        )
-
-        response_ignore_eos = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "Count from 1 to 20."},
-            ],
-            temperature=0,
-            max_tokens=max_tokens,
-            extra_body={"ignore_eos": True},
-        )
-
-        default_tokens = len(
-            self.tokenizer.encode(response_default.choices[0].message.content)
-        )
-        ignore_eos_tokens = len(
-            self.tokenizer.encode(response_ignore_eos.choices[0].message.content)
-        )
-
-        # Check if ignore_eos resulted in more tokens or exactly max_tokens
-        # The ignore_eos response should either:
-        # 1. Have more tokens than the default response (if default stopped at EOS before max_tokens)
-        # 2. Have exactly max_tokens (if it reached the max_tokens limit)
-        self.assertTrue(
-            ignore_eos_tokens > default_tokens or ignore_eos_tokens >= max_tokens,
-            f"ignore_eos did not generate more tokens: {ignore_eos_tokens} vs {default_tokens}",
-        )
-
-        self.assertEqual(
-            response_ignore_eos.choices[0].finish_reason,
-            "length",
-            f"Expected finish_reason='length' for ignore_eos=True, got {response_ignore_eos.choices[0].finish_reason}",
-        )
 
 
 class TestOpenAIV1Score(CustomTestCase):
