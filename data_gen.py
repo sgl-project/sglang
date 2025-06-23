@@ -180,10 +180,32 @@ def main():
             sampling_params=sampling_params,
             return_hidden_states=True,
         )
-        hs_all = outputs[0]["meta_info"]["hidden_states"]   # (N+1, B, S, D)
+        hs_all = outputs[0]["meta_info"]["hidden_states"][0]   # List of length of input_ids, each element is 4*5120 concatenated
 
-        tgt_hs = torch.tensor(hs_all[0], dtype=torch.float16).cpu().numpy()  # (S, D)
-        hs = torch.tensor(hs_all[1:], dtype=torch.float16).cpu().numpy()     # (N, S, D)
+        import pdb; pdb.set_trace()
+
+        # 每个元素是 4*5120 维度的向量
+        # 前 5120 维度是 tgt_hs，后面 3*5120 维度分成 3 份是 hs
+        hidden_dim = 5120
+        tgt_hs_list = []
+        hs_list = [[], [], []]  # 3 layers
+        
+        for token_hiddens in hs_all:
+            # token_hiddens 是 4*5120 维度
+            token_hiddens = torch.tensor(token_hiddens, dtype=torch.float16)
+            
+            # 前 5120 维度是 tgt_hs
+            tgt_hs_list.append(token_hiddens[:hidden_dim])
+            
+            # 后面 3*5120 维度分成 3 份
+            remaining = token_hiddens[hidden_dim:]
+            for i in range(3):
+                start_idx = i * hidden_dim
+                end_idx = (i + 1) * hidden_dim
+                hs_list[i].append(remaining[start_idx:end_idx])
+        
+        tgt_hs = torch.stack(tgt_hs_list).cpu().numpy()  # (S, D)
+        hs = torch.stack([torch.stack(layer) for layer in hs_list]).cpu().numpy()  # (3, S, D)
 
         def _to_np16_nested(arr):
             return [[ [np.float16(v) for v in seq] for seq in layer ] for layer in arr]
