@@ -637,13 +637,6 @@ class FlashAttentionBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                if use_hybrid_loc:
-                    assert isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
-                    cache_loc = (
-                        forward_batch.token_to_kv_pool.full_to_swa_index_mapping[
-                            cache_loc
-                        ]
-                    )
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
@@ -910,13 +903,6 @@ class FlashAttentionBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                if use_hybrid_loc:
-                    assert isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
-                    cache_loc = (
-                        forward_batch.token_to_kv_pool.full_to_swa_index_mapping[
-                            cache_loc
-                        ]
-                    )
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
@@ -1598,6 +1584,7 @@ class FlashAttentionBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
+        forward_batch: ForwardBatch,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: torch.Tensor = None,
@@ -1685,7 +1672,7 @@ class FlashAttentionBackend(AttentionBackend):
                     self.page_size,
                 )
 
-                self._update_local_attn_metadata_for_replay(metadata, bs)
+                self._update_local_attn_metadata_for_replay(forward_batch,metadata, bs)
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
@@ -1841,11 +1828,10 @@ class FlashAttentionBackend(AttentionBackend):
 
         cu_seqlens_q = metadata.cu_seqlens_q
         cache_seqlens_int32 = metadata.cache_seqlens_int32
-        page_table = metadata.page_table
-        if self.is_hybrid is not None:
-            page_table = forwardbatch.token_to_kv_pool.full_to_swa_index_mapping[
-                page_table
-            ]
+        if self.is_hybrid:
+            page_table = forwardbatch.token_to_kv_pool.full_to_swa_index_mapping[metadata.page_table]
+        else:
+            page_table = metadata.page_table
         if cu_seqlens_q is None or cache_seqlens_int32 is None or page_table is None:
             metadata.local_attn_metadata = None
             return
@@ -1931,7 +1917,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
     def _update_local_attn_metadata_for_replay(
-        self, metadata: FlashAttentionMetadata, bs: int
+        self, forward_batch: ForwardBatch, metadata: FlashAttentionMetadata, bs: int
     ):
         """Update preallocated local attention metadata in-place before CUDA graph replay."""
         if self.attention_chunk_size is None:
@@ -1962,7 +1948,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Without this slicing, the pre-allocated page_table may contain zeros or invalid indices
         # beyond the actual sequence length, leading to incorrect attention calculations
         max_seq_len = int(seqlens.max().item())
-        sliced_page_table = metadata.page_table[:bs, :max_seq_len]
+        sliced_page_table = forward_batch.token_to_kv_pool.full_to_swa_index_mapping[metadata.page_table[:bs, :max_seq_len]]
 
         cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
         seqlens_np = seqlens.cpu().numpy()

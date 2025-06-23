@@ -115,7 +115,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
-            1, self.size + 1, dtype=torch.int64, device=self.device
+            1, self.size + 1, dtype=torch.int32, device=self.device
         )
         self.is_not_in_free_group = True
         self.free_group = []
@@ -177,7 +177,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.full_to_swa_index_mapping = torch.empty(
             size + size_swa + 1,
-            dtype=torch.int64,
+            dtype=torch.int32,
             device=device,
         )
         self.clear()

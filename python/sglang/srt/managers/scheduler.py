@@ -1363,7 +1363,7 @@ class Scheduler(
 
     def check_memory(self):
         available_size = (
-            self.token_to_kv_pool_allocator.available_size()
+            self.token_to_kv_pool_allocator.full_available_size()
             + self.tree_cache.evictable_size()
         )
         protected_size = self.tree_cache.protected_size()
@@ -1376,7 +1376,7 @@ class Scheduler(
             msg = (
                 "token_to_kv_pool_allocator memory leak detected! "
                 f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
-                f"{self.token_to_kv_pool_allocator.available_size()=}\n"
+                f"{self.token_to_kv_pool_allocator.full_available_size()=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
             raise ValueError(msg)

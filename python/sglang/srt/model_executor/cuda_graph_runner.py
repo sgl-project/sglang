@@ -685,6 +685,7 @@ class CudaGraphRunner:
             forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
             self.encoder_lens[:bs] if self.is_encoder_decoder else None,
             forward_batch.forward_mode,
+            forward_batch,
             forward_batch.spec_info,
             seq_lens_cpu=self.seq_lens_cpu[:bs],
         )
