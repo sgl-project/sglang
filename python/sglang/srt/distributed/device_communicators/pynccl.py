@@ -123,8 +123,12 @@ class PyNcclCommunicator:
         self.disabled = True
 
     def __del__(self):
-        with torch.cuda.device(self.device):
-            self.nccl.ncclCommDestroy(self.comm)
+        # ncclCommDestroy is a collective call. If not all ranks call it,
+        # it will hang. It is the user's responsibility to ensure that
+        # all ranks call this function.
+        if hasattr(self, "comm"):
+            with torch.cuda.device(self.device):
+                self.nccl.ncclCommDestroy(self.comm)
 
     def all_reduce(
         self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM, stream=None
