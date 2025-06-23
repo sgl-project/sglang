@@ -343,8 +343,7 @@ class LogitsProcessor(nn.Module):
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 if hd_to_return is not None:
-                    hd_to_return = torch.cat(hd_to_return, dim=-1)
-                    hidden_states_to_store = hd_to_return
+                    hidden_states_to_store = torch.cat(hd_to_return, dim=-1)
                 else:
                     hidden_states_to_store = hidden_states
             elif logits_metadata.capture_hidden_mode.is_last():
