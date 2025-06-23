@@ -81,6 +81,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
+    SWAKVPool,
 )
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
@@ -1034,19 +1035,35 @@ class ModelRunner:
                 end_layer=self.end_layer,
             )
         else:
-            self.token_to_kv_pool = MHATokenToKVPool(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
-                head_dim=self.model_config.head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-                local_size=self.local_max_total_num_tokens,
-            )
+            if self.is_hybrid is not None:
+                self.token_to_kv_pool = SWAKVPool(
+                    size=self.max_total_num_tokens,
+                    size_swa=self.local_max_total_num_tokens,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
+                    full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+                    enable_kvcache_transpose=False,
+                    device=self.device,
+                )
+            else:
+                self.token_to_kv_pool = MHATokenToKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
 
         if self.token_to_kv_pool_allocator is None:
             if self.page_size == 1:

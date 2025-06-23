@@ -145,62 +145,6 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
 
-class SWATokenToKVPoolAllocator(TokenToKVPoolAllocator):
-    """Allocator that manages both global and local KV cache."""
-
-    def __init__(
-        self,
-        size: int,
-        size_swa: int,
-        dtype: torch.dtype,
-        device: str,
-        kvcache: KVCache,
-    ):
-        super().__init__(size, dtype, device, kvcache)
-        self.local_allocator = TokenToKVPoolAllocator(
-            local_size, dtype=dtype, device=device, kvcache=kvcache
-        )
-
-    def available_size(self):
-        return min(super().available_size(), self.local_allocator.available_size())
-
-    def alloc(self, need_size: int):
-        global_idx = super().alloc(need_size)
-        local_idx = self.local_allocator.alloc(need_size)
-        if global_idx is None or local_idx is None:
-            if global_idx is not None:
-                super().free(global_idx)
-            if local_idx is not None:
-                self.local_allocator.free(local_idx)
-            return None
-        return global_idx, local_idx
-
-    def free(self, global_idx: torch.Tensor, local_idx: torch.Tensor):
-        super().free(global_idx)
-        self.local_allocator.free(local_idx)
-
-    def free_group_begin(self):
-        super().free_group_begin()
-        self.local_allocator.free_group_begin()
-
-    def free_group_end(self):
-        super().free_group_end()
-        self.local_allocator.free_group_end()
-
-    def backup_state(self):
-        return super().backup_state(), self.local_allocator.backup_state()
-
-    def restore_state(self, state):
-        global_state, local_state = state
-        super().restore_state(global_state)
-        self.local_allocator.restore_state(local_state)
-
-    def clear(self):
-        super().clear()
-        self.local_allocator.clear()
-
-
-
 
 @triton.jit
 def alloc_extend_kernel(

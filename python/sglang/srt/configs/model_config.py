@@ -246,6 +246,14 @@ class ModelConfig:
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.vocab_size = self.hf_text_config.vocab_size
 
+        if self.is_hybrid is not None:
+            self.swa_attention_layer_ids = [
+                i for i in range(self.num_hidden_layers) if (i + 1) % 4 != 0
+            ]
+            self.full_attention_layer_ids = [
+                i for i in range(self.num_hidden_layers) if (i + 1) % 4 == 0
+            ]
+
         # Verify quantization
         self._verify_quantization()
 

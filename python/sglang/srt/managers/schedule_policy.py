@@ -275,7 +275,7 @@ class PrefillAdder:
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
-        token_to_kv_pool_allocator_local: Optional[TokenToKVPoolAllocator] = None,
+        token_to_kv_pool_allocator_local: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
