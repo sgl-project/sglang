@@ -16,12 +16,16 @@ limitations under the License.
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cutlass/array.h>
 
 #include <THC/THCAtomics.cuh>
 
 #include "utils.h"
 
 #define WARP_SIZE 32
+
+#define VEC_SIZE 4
+using Vec = cutlass::AlignedArray<int32_t, VEC_SIZE>;
 
 template <typename scalar_t>
 __global__ void count_and_sort_expert_tokens_kernel(
@@ -101,8 +105,18 @@ __global__ void moe_align_block_size_kernel(
   if (pad_sorted_token_ids) {
     int32_t fill_val = static_cast<int32_t>(numel);
     int32_t total = *total_tokens_post_pad;
-    for (int32_t idx = tid; idx < total; idx += stride) {
-      sorted_token_ids[idx] = fill_val;
+
+    Vec fill_vec;
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      fill_vec[i] = fill_val;
+    }
+
+    int32_t total_vec_count = (total + VEC_SIZE - 1) / VEC_SIZE;
+    Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
+
+    for (int32_t idx = tid; idx < total_vec_count; idx += stride) {
+      out_ptr[idx] = fill_vec;
     }
   }
 }
@@ -162,8 +176,18 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   if (pad_sorted_token_ids) {
     int32_t fill_val = static_cast<int32_t>(numel);
     int32_t total = *total_tokens_post_pad;
-    for (int32_t idx = tid; idx < total; idx += stride) {
-      sorted_token_ids[idx] = fill_val;
+
+    Vec fill_vec;
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      fill_vec[i] = fill_val;
+    }
+
+    int32_t total_vec_count = (total + VEC_SIZE - 1) / VEC_SIZE;
+    Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
+
+    for (int32_t idx = tid; idx < total_vec_count; idx += stride) {
+      out_ptr[idx] = fill_vec;
     }
   }
 
