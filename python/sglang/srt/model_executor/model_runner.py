@@ -970,12 +970,11 @@ class ModelRunner:
         if self.is_hybrid is not None:
             self.get_num_token_hybrid()
 
-
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
                 "Not enough memory. Please try to increase --mem-fraction-static."
             )
-        
+
         if self.req_to_token_pool is None:
             if self.server_args.disaggregation_mode == "decode":
                 from sglang.srt.disaggregation.decode import DecodeReqToTokenPool

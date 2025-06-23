@@ -1672,7 +1672,7 @@ class FlashAttentionBackend(AttentionBackend):
                     self.page_size,
                 )
 
-                self._update_local_attn_metadata_for_replay(forward_batch,metadata, bs)
+                self._update_local_attn_metadata_for_replay(forward_batch, metadata, bs)
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
@@ -1829,7 +1829,9 @@ class FlashAttentionBackend(AttentionBackend):
         cu_seqlens_q = metadata.cu_seqlens_q
         cache_seqlens_int32 = metadata.cache_seqlens_int32
         if self.is_hybrid:
-            page_table = forwardbatch.token_to_kv_pool.full_to_swa_index_mapping[metadata.page_table]
+            page_table = forwardbatch.token_to_kv_pool.full_to_swa_index_mapping[
+                metadata.page_table
+            ]
         else:
             page_table = metadata.page_table
         if cu_seqlens_q is None or cache_seqlens_int32 is None or page_table is None:
@@ -1948,7 +1950,9 @@ class FlashAttentionBackend(AttentionBackend):
         # Without this slicing, the pre-allocated page_table may contain zeros or invalid indices
         # beyond the actual sequence length, leading to incorrect attention calculations
         max_seq_len = int(seqlens.max().item())
-        sliced_page_table = forward_batch.token_to_kv_pool.full_to_swa_index_mapping[metadata.page_table[:bs, :max_seq_len]]
+        sliced_page_table = forward_batch.token_to_kv_pool.full_to_swa_index_mapping[
+            metadata.page_table[:bs, :max_seq_len]
+        ]
 
         cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
         seqlens_np = seqlens.cpu().numpy()
