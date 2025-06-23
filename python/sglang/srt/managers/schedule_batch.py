@@ -100,6 +100,9 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "speculative_accept_threshold_single",
     "torchao_config",
     "triton_attention_reduce_in_fp32",
+    "ep_num_redundant_experts",
+    "mm_attention_backend",
+    "tp_size"
     "num_reserved_decode_tokens",
     "weight_loader_disable_mmap",
 ]

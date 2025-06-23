@@ -122,7 +122,7 @@ def _topk_ids_logical_to_physical_workload_heuristic(
     num_valid = info.partial_logical_to_all_physical_map_num_valid
 
     num_physical = int(info.num_physical_experts)
-    G = 16
+    G = global_server_args_dict["tp_size"]
     num_red = global_server_args_dict["ep_num_redundant_experts"]
     M = (num_physical + num_red) // G
 
