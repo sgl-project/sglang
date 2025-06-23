@@ -3,10 +3,23 @@ from typing import Optional
 import torch
 from torch import nn
 
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+if _is_hip:
+    if _use_aiter:
+        try:
+            from aiter import (  # v0.1.3
+                dynamic_per_tensor_quant,
+                dynamic_per_token_scaled_quant,
+                static_per_tensor_quant,
+            )
+        except ImportError:
+            raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+    else:
+        import vllm._C
 
 
 class CustomOp(nn.Module):
@@ -106,7 +119,6 @@ if _is_cuda:
         return output, scale
 
 elif _is_hip:
-    from aiter import dynamic_per_token_scaled_fp8_quant, static_scaled_fp8_quant
 
     def scaled_fp8_quant(
         input: torch.Tensor,
@@ -147,15 +159,26 @@ elif _is_hip:
                 scale = torch.empty(
                     (shape[0], 1), device=input.device, dtype=torch.float32
                 )
-                dynamic_per_token_scaled_fp8_quant(output, input, scale)
+                if _use_aiter:
+                    dynamic_per_token_scaled_quant(output, input, scale)
+                else:
+                    torch.ops._C.dynamic_per_token_scaled_fp8_quant(
+                        output, input.contiguous(), scale, None
+                    )
             else:
                 scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-                static_scaled_fp8_quant(output, input, scale)
+                if _use_aiter:
+                    dynamic_per_tensor_quant(output, input, scale)
+                else:
+                    torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
         else:
             # Static scaling
             assert (
                 scale.numel() == 1
             ), f"Expected scalar scale, got numel={scale.numel()}"
-            static_scaled_fp8_quant(output, input, scale)
+            if _use_aiter:
+                static_per_tensor_quant(output, input, scale)
+            else:
+                torch.ops._C.static_scaled_fp8_quant(output, input, scale)
 
         return output, scale
