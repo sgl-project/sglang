@@ -1,14 +1,12 @@
 """
-python3 -m unittest test_openai_server.TestOpenAIServer.test_batch
-python3 -m unittest test_openai_server.TestOpenAIServer.test_completion
-python3 -m unittest test_openai_server.TestOpenAIServer.test_completion_stream
-python3 -m unittest test_openai_server.TestOpenAIServer.test_chat_completion
-python3 -m unittest test_openai_server.TestOpenAIServer.test_chat_completion_stream
+python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test_completion
+python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test_completion_stream
+python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test_chat_completion
+python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test_chat_completion_stream
 """
 
 import json
 import re
-import time
 import unittest
 
 import numpy as np
@@ -20,7 +18,6 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS
 from sglang.test.test_utils import (
     DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST,
-    DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -235,6 +232,7 @@ class TestOpenAIServer(CustomTestCase):
         )
 
         is_firsts = {}
+        is_finished = {}
         for response in generator:
             usage = response.usage
             if usage is not None:
@@ -244,6 +242,10 @@ class TestOpenAIServer(CustomTestCase):
                 continue
 
             index = response.choices[0].index
+            finish_reason = response.choices[0].finish_reason
+            if finish_reason is not None:
+                is_finished[index] = True
+
             data = response.choices[0].delta
 
             if is_firsts.get(index, True):
@@ -253,7 +255,7 @@ class TestOpenAIServer(CustomTestCase):
                 is_firsts[index] = False
                 continue
 
-            if logprobs:
+            if logprobs and not is_finished.get(index, False):
                 assert response.choices[0].logprobs, f"logprobs was not returned"
                 assert isinstance(
                     response.choices[0].logprobs.content[0].top_logprobs[0].token, str
@@ -271,7 +273,7 @@ class TestOpenAIServer(CustomTestCase):
             assert (
                 isinstance(data.content, str)
                 or isinstance(data.reasoning_content, str)
-                or len(data.tool_calls) > 0
+                or (isinstance(data.tool_calls, list) and len(data.tool_calls) > 0)
                 or response.choices[0].finish_reason
             )
             assert response.id
@@ -281,152 +283,6 @@ class TestOpenAIServer(CustomTestCase):
             assert not is_firsts.get(
                 index, True
             ), f"index {index} is not found in the response"
-
-    def _create_batch(self, mode, client):
-        if mode == "completion":
-            input_file_path = "complete_input.jsonl"
-            # write content to input file
-            content = [
-                {
-                    "custom_id": "request-1",
-                    "method": "POST",
-                    "url": "/v1/completions",
-                    "body": {
-                        "model": "gpt-3.5-turbo-instruct",
-                        "prompt": "List 3 names of famous soccer player: ",
-                        "max_tokens": 20,
-                    },
-                },
-                {
-                    "custom_id": "request-2",
-                    "method": "POST",
-                    "url": "/v1/completions",
-                    "body": {
-                        "model": "gpt-3.5-turbo-instruct",
-                        "prompt": "List 6 names of famous basketball player:  ",
-                        "max_tokens": 40,
-                    },
-                },
-                {
-                    "custom_id": "request-3",
-                    "method": "POST",
-                    "url": "/v1/completions",
-                    "body": {
-                        "model": "gpt-3.5-turbo-instruct",
-                        "prompt": "List 6 names of famous tenniss player:  ",
-                        "max_tokens": 40,
-                    },
-                },
-            ]
-
-        else:
-            input_file_path = "chat_input.jsonl"
-            content = [
-                {
-                    "custom_id": "request-1",
-                    "method": "POST",
-                    "url": "/v1/chat/completions",
-                    "body": {
-                        "model": "gpt-3.5-turbo-0125",
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": "You are a helpful assistant.",
-                            },
-                            {
-                                "role": "user",
-                                "content": "Hello! List 3 NBA players and tell a story",
-                            },
-                        ],
-                        "max_tokens": 30,
-                    },
-                },
-                {
-                    "custom_id": "request-2",
-                    "method": "POST",
-                    "url": "/v1/chat/completions",
-                    "body": {
-                        "model": "gpt-3.5-turbo-0125",
-                        "messages": [
-                            {"role": "system", "content": "You are an assistant. "},
-                            {
-                                "role": "user",
-                                "content": "Hello! List three capital and tell a story",
-                            },
-                        ],
-                        "max_tokens": 50,
-                    },
-                },
-            ]
-
-        with open(input_file_path, "w") as file:
-            for line in content:
-                file.write(json.dumps(line) + "\n")
-
-        with open(input_file_path, "rb") as file:
-            uploaded_file = client.files.create(file=file, purpose="batch")
-        if mode == "completion":
-            endpoint = "/v1/completions"
-        elif mode == "chat":
-            endpoint = "/v1/chat/completions"
-        completion_window = "24h"
-        batch_job = client.batches.create(
-            input_file_id=uploaded_file.id,
-            endpoint=endpoint,
-            completion_window=completion_window,
-        )
-
-        return batch_job, content, uploaded_file
-
-    def run_batch(self, mode):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        batch_job, content, uploaded_file = self._create_batch(mode=mode, client=client)
-
-        while batch_job.status not in ["completed", "failed", "cancelled"]:
-            time.sleep(3)
-            print(
-                f"Batch job status: {batch_job.status}...trying again in 3 seconds..."
-            )
-            batch_job = client.batches.retrieve(batch_job.id)
-        assert (
-            batch_job.status == "completed"
-        ), f"Batch job status is not completed: {batch_job.status}"
-        assert batch_job.request_counts.completed == len(content)
-        assert batch_job.request_counts.failed == 0
-        assert batch_job.request_counts.total == len(content)
-
-        result_file_id = batch_job.output_file_id
-        file_response = client.files.content(result_file_id)
-        result_content = file_response.read().decode("utf-8")  # Decode bytes to string
-        results = [
-            json.loads(line)
-            for line in result_content.split("\n")
-            if line.strip() != ""
-        ]
-        assert len(results) == len(content)
-        for delete_fid in [uploaded_file.id, result_file_id]:
-            del_pesponse = client.files.delete(delete_fid)
-            assert del_pesponse.deleted
-
-    def run_cancel_batch(self, mode):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        batch_job, _, uploaded_file = self._create_batch(mode=mode, client=client)
-
-        assert batch_job.status not in ["cancelling", "cancelled"]
-
-        batch_job = client.batches.cancel(batch_id=batch_job.id)
-        assert batch_job.status == "cancelling"
-
-        while batch_job.status not in ["failed", "cancelled"]:
-            batch_job = client.batches.retrieve(batch_job.id)
-            print(
-                f"Batch job status: {batch_job.status}...trying again in 3 seconds..."
-            )
-            time.sleep(3)
-
-        assert batch_job.status == "cancelled"
-        del_response = client.files.delete(uploaded_file.id)
-        assert del_response.deleted
 
     def test_completion(self):
         for echo in [False, True]:
@@ -466,14 +322,6 @@ class TestOpenAIServer(CustomTestCase):
         for logprobs in [None, 5]:
             for parallel_sample_num in [1, 2]:
                 self.run_chat_completion_stream(logprobs, parallel_sample_num)
-
-    def test_batch(self):
-        for mode in ["completion", "chat"]:
-            self.run_batch(mode)
-
-    def test_cancel_batch(self):
-        for mode in ["completion", "chat"]:
-            self.run_cancel_batch(mode)
 
     def test_regex(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
@@ -558,6 +406,18 @@ The SmartHome Mini is a compact smart home assistant available in black or white
         models = list(client.models.list())
         assert len(models) == 1
         assert isinstance(getattr(models[0], "max_model_len", None), int)
+
+    def test_retrieve_model(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+
+        # Test retrieving an existing model
+        retrieved_model = client.models.retrieve(self.model)
+        self.assertEqual(retrieved_model.id, self.model)
+        self.assertEqual(retrieved_model.root, self.model)
+
+        # Test retrieving a non-existent model
+        with self.assertRaises(openai.NotFoundError):
+            client.models.retrieve("non-existent-model")
 
 
 # -------------------------------------------------------------------------
@@ -645,62 +505,6 @@ class TestOpenAIServerEBNF(CustomTestCase):
         )
 
 
-class TestOpenAIEmbedding(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-
-        # Configure embedding-specific args
-        other_args = ["--is-embedding", "--enable-metrics"]
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=other_args,
-        )
-        cls.base_url += "/v1"
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_embedding_single(self):
-        """Test single embedding request"""
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        response = client.embeddings.create(model=self.model, input="Hello world")
-        self.assertEqual(len(response.data), 1)
-        self.assertTrue(len(response.data[0].embedding) > 0)
-
-    def test_embedding_batch(self):
-        """Test batch embedding request"""
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        response = client.embeddings.create(
-            model=self.model, input=["Hello world", "Test text"]
-        )
-        self.assertEqual(len(response.data), 2)
-        self.assertTrue(len(response.data[0].embedding) > 0)
-        self.assertTrue(len(response.data[1].embedding) > 0)
-
-    def test_empty_string_embedding(self):
-        """Test embedding an empty string."""
-
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-
-        # Text embedding example with empty string
-        text = ""
-        # Expect a BadRequestError for empty input
-        with self.assertRaises(openai.BadRequestError) as cm:
-            client.embeddings.create(
-                model=self.model,
-                input=text,
-            )
-        # check the status code
-        self.assertEqual(cm.exception.status_code, 400)
-
-
 class TestOpenAIV1Rerank(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -770,79 +574,6 @@ class TestOpenAIV1Rerank(CustomTestCase):
         self.assertTrue(isinstance(response[1]["document"], str))
         self.assertTrue(isinstance(response[0]["index"], int))
         self.assertTrue(isinstance(response[1]["index"], int))
-
-
-class TestOpenAIServerIgnoreEOS(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-        )
-        cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_ignore_eos(self):
-        """
-        Test that ignore_eos=True allows generation to continue beyond EOS token
-        and reach the max_tokens limit.
-        """
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-
-        max_tokens = 200
-
-        response_default = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "Count from 1 to 20."},
-            ],
-            temperature=0,
-            max_tokens=max_tokens,
-            extra_body={"ignore_eos": False},
-        )
-
-        response_ignore_eos = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "Count from 1 to 20."},
-            ],
-            temperature=0,
-            max_tokens=max_tokens,
-            extra_body={"ignore_eos": True},
-        )
-
-        default_tokens = len(
-            self.tokenizer.encode(response_default.choices[0].message.content)
-        )
-        ignore_eos_tokens = len(
-            self.tokenizer.encode(response_ignore_eos.choices[0].message.content)
-        )
-
-        # Check if ignore_eos resulted in more tokens or exactly max_tokens
-        # The ignore_eos response should either:
-        # 1. Have more tokens than the default response (if default stopped at EOS before max_tokens)
-        # 2. Have exactly max_tokens (if it reached the max_tokens limit)
-        self.assertTrue(
-            ignore_eos_tokens > default_tokens or ignore_eos_tokens >= max_tokens,
-            f"ignore_eos did not generate more tokens: {ignore_eos_tokens} vs {default_tokens}",
-        )
-
-        self.assertEqual(
-            response_ignore_eos.choices[0].finish_reason,
-            "length",
-            f"Expected finish_reason='length' for ignore_eos=True, got {response_ignore_eos.choices[0].finish_reason}",
-        )
 
 
 class TestOpenAIV1Score(CustomTestCase):

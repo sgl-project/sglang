@@ -1,11 +1,12 @@
-"""
-Utility functions for OpenAI API adapter.
+"""Template utilities for Jinja template processing.
+
+This module provides utilities for analyzing and processing Jinja chat templates,
+including content format detection and message processing.
 """
 
 import logging
-from typing import Dict, List
 
-import jinja2.nodes
+import jinja2
 import transformers.utils.chat_template_utils as hf_chat_utils
 
 logger = logging.getLogger(__name__)
@@ -75,7 +76,7 @@ def _try_extract_ast(chat_template: str):
         return None
 
 
-def detect_template_content_format(chat_template: str) -> str:
+def detect_jinja_template_content_format(chat_template: str) -> str:
     """
     Detect whether a chat template expects 'string' or 'openai' content format.
 

@@ -54,9 +54,10 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.multimodal import gpu_tensor_hash
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.metrics.collector import TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -85,6 +86,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_deepep_moe",
     "deepep_mode",
     "enable_ep_moe",
+    "enable_flashinfer_moe",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
     "deepep_config",
@@ -810,7 +812,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Request, memory pool, and cache
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool = None
-    token_to_kv_pool_allocator: TokenToKVPoolAllocator = None
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
 
     # Batch configs
@@ -907,7 +909,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         cls,
         reqs: List[Req],
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
