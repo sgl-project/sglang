@@ -29,6 +29,7 @@ from torch.profiler import ProfilerActivity, profile
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -678,6 +679,13 @@ class CudaGraphRunner:
             )
 
         # Attention backend
+        kwargs = {}
+        if isinstance(self.model_runner.attn_backend, FlashAttentionBackend):
+            kwargs["out_cache_loc"] = forward_batch.out_cache_loc
+            if getattr(self.model_runner.attn_backend, "is_hybrid", False):
+                kwargs["full_to_swa_index_mapping"] = (
+                    forward_batch.token_to_kv_pool.full_to_swa_index_mapping
+                )
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             self.req_pool_indices[:bs],
@@ -685,9 +693,9 @@ class CudaGraphRunner:
             forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
             self.encoder_lens[:bs] if self.is_encoder_decoder else None,
             forward_batch.forward_mode,
-            forward_batch,
             forward_batch.spec_info,
             seq_lens_cpu=self.seq_lens_cpu[:bs],
+            **kwargs,
         )
 
         # Store fields

@@ -1584,10 +1584,10 @@ class FlashAttentionBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        forward_batch: ForwardBatch,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: torch.Tensor = None,
+        full_to_swa_index_mapping: Optional[torch.Tensor] = None,
     ):
         """Initialize forward metadata for replaying CUDA graph."""
         seq_lens = seq_lens[:bs]
@@ -1672,7 +1672,11 @@ class FlashAttentionBackend(AttentionBackend):
                     self.page_size,
                 )
 
-                self._update_local_attn_metadata_for_replay(forward_batch, metadata, bs)
+                self._update_local_attn_metadata_for_replay(
+                    metadata,
+                    bs,
+                    full_to_swa_index_mapping,
+                )
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
@@ -1919,7 +1923,10 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
     def _update_local_attn_metadata_for_replay(
-        self, forward_batch: ForwardBatch, metadata: FlashAttentionMetadata, bs: int
+        self,
+        metadata: FlashAttentionMetadata,
+        bs: int,
+        full_to_swa_index_mapping: Optional[torch.Tensor] = None,
     ):
         """Update preallocated local attention metadata in-place before CUDA graph replay."""
         if self.attention_chunk_size is None:
@@ -1950,9 +1957,12 @@ class FlashAttentionBackend(AttentionBackend):
         # Without this slicing, the pre-allocated page_table may contain zeros or invalid indices
         # beyond the actual sequence length, leading to incorrect attention calculations
         max_seq_len = int(seqlens.max().item())
-        sliced_page_table = forward_batch.token_to_kv_pool.full_to_swa_index_mapping[
-            metadata.page_table[:bs, :max_seq_len]
-        ]
+        page_table_slice = metadata.page_table[:bs, :max_seq_len]
+        if self.is_hybrid:
+            assert full_to_swa_index_mapping is not None
+            sliced_page_table = full_to_swa_index_mapping[page_table_slice]
+        else:
+            sliced_page_table = page_table_slice
 
         cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
         seqlens_np = seqlens.cpu().numpy()
