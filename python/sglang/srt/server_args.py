@@ -1723,9 +1723,8 @@ class PortArgs:
             dist_init_host, dist_init_port = dist_init_addr
             port_base = int(dist_init_port) + 1
             if dp_rank is None:
-                scheduler_input_port = (
-                    port_base + 3
-                )  # TokenizerManager to DataParallelController
+                # TokenizerManager to DataParallelController
+                scheduler_input_port = port_base + 3
             else:
                 scheduler_input_port = port_base + 3 + 1 + dp_rank
 
