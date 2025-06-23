@@ -1,10 +1,12 @@
 import argparse
 import os
 import re
+
 import torch
-from tqdm import tqdm
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 
 def main():
     parser = argparse.ArgumentParser(description="sglang data gen")
@@ -98,7 +100,9 @@ def main():
             row[col], tokenize=False, add_generation_prompt=False
         )
         encoding = tokenizer(
-            formatted_conversation, return_offsets_mapping=True, max_length=MAX_TOKEN_LENGTH
+            formatted_conversation,
+            return_offsets_mapping=True,
+            max_length=MAX_TOKEN_LENGTH,
         )
         input_ids = encoding.input_ids
         offsets = encoding.offset_mapping
@@ -142,37 +146,39 @@ def main():
     import sglang as sgl
 
     llm = sgl.Engine(
-        model_path="meta-llama/Llama-4-Scout-17B-16E-Instruct",
+        model_path=args.model_name,
         skip_tokenizer_init=True,
         enable_return_hidden_states=True,
         tp_size=8,
         context_length=65536,
-        disable_cuda_graph=True
+        disable_cuda_graph=True,
     )
     sampling_params = {
         "temperature": 0,
         "max_new_tokens": 0,
     }
 
+    import numpy as np
     import pyarrow as pa
     import pyarrow.parquet as pq
-    import numpy as np
 
     outdir = f"{args.outdir}/{args.index}"
     os.makedirs(outdir, exist_ok=True)
     parquet_file = f"{outdir}/hidden_states.parquet"
 
-    schema = pa.schema([
-        ("input_ids", pa.list_(pa.int32())),
-        ("loss_mask", pa.list_(pa.int8())),
-        ("hidden_state", pa.list_(pa.list_(pa.list_(pa.float16())))),
-        ("target_hidden_states", pa.list_(pa.list_(pa.float16()))),
-    ])
+    schema = pa.schema(
+        [
+            ("input_ids", pa.list_(pa.int32())),
+            ("loss_mask", pa.list_(pa.int8())),
+            ("hidden_state", pa.list_(pa.list_(pa.list_(pa.float16())))),
+            ("target_hidden_states", pa.list_(pa.list_(pa.float16()))),
+        ]
+    )
 
     writer = pq.ParquetWriter(parquet_file, schema)
 
     buffer = []
-    chunk_size = 5_000 
+    chunk_size = 5_000
 
     for idx, row in tqdm(enumerate(dataset), total=len(dataset)):
         # 推理得到 hidden_states / target_hidden_states
@@ -181,43 +187,53 @@ def main():
             sampling_params=sampling_params,
             return_hidden_states=True,
         )
-        hs_all = outputs[0]["meta_info"]["hidden_states"][0]   # List of length of input_ids, each element is 4*5120 concatenated
+        hs_all = outputs[0]["meta_info"]["hidden_states"][
+            0
+        ]  # List of length of input_ids, each element is 4*5120 concatenated
 
         # 每个元素是 4*5120 维度的向量
         # 前 5120 维度是 tgt_hs，后面 3*5120 维度分成 3 份是 hs
         hidden_dim = 5120
         tgt_hs_list = []
         hs_list = [[], [], []]  # 3 layers
-        
+
         for token_hiddens in hs_all:
             # token_hiddens 是 4*5120 维度
             token_hiddens = torch.tensor(token_hiddens, dtype=torch.float16)
-            
+
             # 前 5120 维度是 tgt_hs
             tgt_hs_list.append(token_hiddens[:hidden_dim])
-            
+
             # 后面 3*5120 维度分成 3 份
             remaining = token_hiddens[hidden_dim:]
             for i in range(3):
                 start_idx = i * hidden_dim
                 end_idx = (i + 1) * hidden_dim
                 hs_list[i].append(remaining[start_idx:end_idx])
-        
+
         tgt_hs = torch.stack(tgt_hs_list).cpu().numpy()  # (S, D)
-        hs = torch.stack([torch.stack(layer) for layer in hs_list]).cpu().numpy()  # (3, S, D)
+        hs = (
+            torch.stack([torch.stack(layer) for layer in hs_list]).cpu().numpy()
+        )  # (3, S, D)
 
         def _to_np16_nested(arr):
-            return [[ [np.float16(v) for v in seq] for seq in layer ] for layer in arr]
+            return [[[np.float16(v) for v in seq] for seq in layer] for layer in arr]
 
         def _to_np16_2d(arr):
             return [[np.float16(v) for v in seq] for seq in arr]
 
-        buffer.append({
-            "input_ids": row["input_ids"].tolist(),
-            "loss_mask": row["loss_mask"].tolist(),
-            "hidden_state": _to_np16_nested(hs), # 最后一层的 hidden_state，算 logit
-            "target_hidden_states": _to_np16_2d(tgt_hs), # hs_list = [[], [], []] 三个 hidden。 L,M,H
-        })
+        buffer.append(
+            {
+                "input_ids": row["input_ids"].tolist(),
+                "loss_mask": row["loss_mask"].tolist(),
+                "hidden_state": _to_np16_nested(
+                    hs
+                ),  # 最后一层的 hidden_state，算 logit
+                "target_hidden_states": _to_np16_2d(
+                    tgt_hs
+                ),  # hs_list = [[], [], []] 三个 hidden。 L,M,H
+            }
+        )
 
         if len(buffer) >= chunk_size:
             table = pa.Table.from_pylist(buffer, schema=schema)
@@ -231,7 +247,6 @@ def main():
     writer.close()
     llm.shutdown()
     print(f"✅ Done! 数据已写入 {parquet_file}")
-
 
 
 if __name__ == "__main__":
