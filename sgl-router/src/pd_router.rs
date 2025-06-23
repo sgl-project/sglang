@@ -1,7 +1,9 @@
 // PD (Prefill-Decode) Router Implementation
 // This module handles routing for disaggregated prefill-decode systems
 
-use crate::pd_types::{Bootstrap, ChatReqInput, EngineInfo, GenerateReqInput, PDSelectionPolicy};
+use crate::pd_types::{
+    Bootstrap, ChatReqInput, EngineInfo, GenerateReqInput, PDRouterError, PDSelectionPolicy,
+};
 use crate::tree::Tree;
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
@@ -65,12 +67,145 @@ impl Drop for LoadGuard<'_> {
 }
 
 impl PDRouter {
-    // TODO: Add methods for dynamic worker management to support /register endpoint:
-    // - add_prefill_server(url: String, bootstrap_port: Option<u16>)
-    // - add_decode_server(url: String)
-    // - remove_prefill_server(url: &str)
-    // - remove_decode_server(url: &str)
-    // These methods will be used when service discovery is implemented for PD mode
+    // Dynamic worker management methods for service discovery
+    pub async fn add_prefill_server(
+        &self,
+        url: String,
+        bootstrap_port: Option<u16>,
+    ) -> Result<String, PDRouterError> {
+        // Create EngineInfo for the new prefill server
+        let engine_info = EngineInfo::new_prefill(url.clone(), bootstrap_port);
+
+        // Wait for the new server to be healthy
+        crate::router::Router::wait_for_healthy_workers(
+            &[url.clone()],
+            self.timeout_secs,
+            self.interval_secs,
+        )
+        .map_err(|_| PDRouterError::HealthCheckFailed { url: url.clone() })?;
+
+        // Add to prefill workers list
+        let mut workers = self
+            .prefill_workers
+            .write()
+            .map_err(|_| PDRouterError::LockError {
+                operation: "prefill_workers write".to_string(),
+            })?;
+
+        // Check if already exists
+        if workers.iter().any(|w| w.url == url) {
+            return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+        }
+
+        workers.push(engine_info);
+
+        // Initialize load tracking
+        self.load_tracking
+            .insert(url.clone(), Arc::new(AtomicUsize::new(0)));
+
+        // Add to cache tree if using cache-aware policy
+        if let Some(ref tree) = self.prefill_tree {
+            tree.lock().unwrap().insert("", &url);
+        }
+
+        info!("Added prefill server: {}", url);
+        Ok(format!("Successfully added prefill server: {}", url))
+    }
+
+    pub async fn add_decode_server(&self, url: String) -> Result<String, PDRouterError> {
+        // Create EngineInfo for the new decode server
+        let engine_info = EngineInfo::new_decode(url.clone());
+
+        // Wait for the new server to be healthy
+        crate::router::Router::wait_for_healthy_workers(
+            &[url.clone()],
+            self.timeout_secs,
+            self.interval_secs,
+        )
+        .map_err(|_| PDRouterError::HealthCheckFailed { url: url.clone() })?;
+
+        // Add to decode workers list
+        let mut workers = self
+            .decode_workers
+            .write()
+            .map_err(|_| PDRouterError::LockError {
+                operation: "decode_workers write".to_string(),
+            })?;
+
+        // Check if already exists
+        if workers.iter().any(|w| w.url == url) {
+            return Err(PDRouterError::WorkerAlreadyExists { url: url.clone() });
+        }
+
+        workers.push(engine_info);
+
+        // Initialize load tracking
+        self.load_tracking
+            .insert(url.clone(), Arc::new(AtomicUsize::new(0)));
+
+        info!("Added decode server: {}", url);
+        Ok(format!("Successfully added decode server: {}", url))
+    }
+
+    pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
+        let mut workers = self
+            .prefill_workers
+            .write()
+            .map_err(|_| PDRouterError::LockError {
+                operation: "prefill_workers write".to_string(),
+            })?;
+
+        // Find and remove the server
+        let initial_len = workers.len();
+        workers.retain(|w| w.url != url);
+
+        if workers.len() == initial_len {
+            return Err(PDRouterError::WorkerNotFound {
+                url: url.to_string(),
+            });
+        }
+
+        // Remove from load tracking
+        self.load_tracking.remove(url);
+
+        // Remove from cache tree if using cache-aware policy
+        if let Some(ref tree) = self.prefill_tree {
+            // Note: Tree doesn't have a remove method, so we rebuild it
+            let mut tree_guard = tree.lock().unwrap();
+            *tree_guard = Tree::new();
+            for worker in workers.iter() {
+                tree_guard.insert("", &worker.url);
+            }
+        }
+
+        info!("Removed prefill server: {}", url);
+        Ok(format!("Successfully removed prefill server: {}", url))
+    }
+
+    pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
+        let mut workers = self
+            .decode_workers
+            .write()
+            .map_err(|_| PDRouterError::LockError {
+                operation: "decode_workers write".to_string(),
+            })?;
+
+        // Find and remove the server
+        let initial_len = workers.len();
+        workers.retain(|w| w.url != url);
+
+        if workers.len() == initial_len {
+            return Err(PDRouterError::WorkerNotFound {
+                url: url.to_string(),
+            });
+        }
+
+        // Remove from load tracking
+        self.load_tracking.remove(url);
+
+        info!("Removed decode server: {}", url);
+        Ok(format!("Successfully removed decode server: {}", url))
+    }
 
     pub fn new(
         prefill_urls: Vec<(String, Option<u16>)>,

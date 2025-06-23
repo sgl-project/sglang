@@ -30,9 +30,9 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     dp_gather_replicate,
     dp_scatter,
+    get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_size,
-    get_local_attention_dp_rank,
     get_local_attention_dp_size,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -171,7 +171,7 @@ class LogitsMetadata:
             return
 
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
-        dp_rank = get_local_attention_dp_rank()
+        dp_rank = get_attention_dp_rank()
         if dp_rank == 0:
             dp_local_start_pos = torch.zeros_like(
                 self.global_num_tokens_for_logprob_gpu[0]

@@ -21,13 +21,11 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
-import os
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
@@ -47,14 +45,12 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import (
-    KVCache,
-    ReqToTokenPool,
-    TokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils import require_mlp_sync
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +136,7 @@ class DecodePreallocQueue:
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         draft_token_to_kv_pool: Optional[KVCache],
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
@@ -649,10 +645,7 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
-            prepare_dp_attn_flag = (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            )
+            prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
 
             if batch:
                 # Generate fake extend output.
@@ -661,14 +654,14 @@ class SchedulerDisaggregationDecodeMixin:
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
-                    if prepare_dp_attn_flag:
+                    if prepare_mlp_sync_flag:
                         self._prepare_idle_batch_and_run(None)
                 else:
-                    if prepare_dp_attn_flag:
-                        self.prepare_dp_attn_batch(batch)
+                    if prepare_mlp_sync_flag:
+                        self.prepare_mlp_sync_batch(batch)
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
-            elif prepare_dp_attn_flag:
+            elif prepare_mlp_sync_flag:
                 batch, _ = self._prepare_idle_batch_and_run(None)
 
             if batch is None and (
@@ -699,10 +692,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.cur_batch = batch
             last_batch_in_queue = False
 
-            prepare_dp_attn_flag = (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            )
+            prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
 
             if batch:
                 # Generate fake extend output.
@@ -711,7 +701,7 @@ class SchedulerDisaggregationDecodeMixin:
                     self.stream_output(
                         batch.reqs, any(req.return_logprob for req in batch.reqs)
                     )
-                    if prepare_dp_attn_flag:
+                    if prepare_mlp_sync_flag:
                         batch_, result = self._prepare_idle_batch_and_run(
                             None, delay_process=True
                         )
@@ -719,8 +709,8 @@ class SchedulerDisaggregationDecodeMixin:
                             result_queue.append((batch_.copy(), result))
                             last_batch_in_queue = True
                 else:
-                    if prepare_dp_attn_flag:
-                        self.prepare_dp_attn_batch(batch)
+                    if prepare_mlp_sync_flag:
+                        self.prepare_mlp_sync_batch(batch)
                     result = self.run_batch(batch)
                     result_queue.append((batch.copy(), result))
 
@@ -735,7 +725,7 @@ class SchedulerDisaggregationDecodeMixin:
                         self.set_next_batch_sampling_info_done(tmp_batch)
                     last_batch_in_queue = True
 
-            elif prepare_dp_attn_flag:
+            elif prepare_mlp_sync_flag:
                 batch, result = self._prepare_idle_batch_and_run(
                     None, delay_process=True
                 )
@@ -765,8 +755,8 @@ class SchedulerDisaggregationDecodeMixin:
             self.last_batch = batch
             self.last_batch_in_queue = last_batch_in_queue
 
-    def _prepare_idle_batch_and_run(self, batch, delay_process=False):
-        batch, _ = self.prepare_dp_attn_batch(batch)
+    def _prepare_idle_batch_and_run(self: Scheduler, batch, delay_process=False):
+        batch, _ = self.prepare_mlp_sync_batch(batch)
         result = None
         if batch:
             result = self.run_batch(batch)
