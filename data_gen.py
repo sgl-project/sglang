@@ -158,27 +158,12 @@ def main():
         "max_new_tokens": 0,
     }
 
-    import numpy as np
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
     outdir = f"{args.outdir}/{args.index}"
     os.makedirs(outdir, exist_ok=True)
-    parquet_file = f"{outdir}/hidden_states.parquet"
-
-    schema = pa.schema(
-        [
-            ("input_ids", pa.list_(pa.int32())),
-            ("loss_mask", pa.list_(pa.int8())),
-            ("hidden_state", pa.list_(pa.list_(pa.list_(pa.float16())))),
-            ("target_hidden_states", pa.list_(pa.list_(pa.float16()))),
-        ]
-    )
-
-    writer = pq.ParquetWriter(parquet_file, schema)
 
     buffer = []
     chunk_size = 5_000
+    chunk_idx = 0
 
     for idx, row in tqdm(enumerate(dataset), total=len(dataset)):
         # 推理得到 hidden_states / target_hidden_states
@@ -199,7 +184,7 @@ def main():
 
         for token_hiddens in hs_all:
             # token_hiddens 是 4*5120 维度
-            token_hiddens = torch.tensor(token_hiddens, dtype=torch.float16)
+            token_hiddens = torch.tensor(token_hiddens, dtype=torch.bfloat16)
 
             # 前 5120 维度是 tgt_hs
             tgt_hs_list.append(token_hiddens[:hidden_dim])
@@ -211,42 +196,28 @@ def main():
                 end_idx = (i + 1) * hidden_dim
                 hs_list[i].append(remaining[start_idx:end_idx])
 
-        tgt_hs = torch.stack(tgt_hs_list).cpu().numpy()  # (S, D)
-        hs = (
-            torch.stack([torch.stack(layer) for layer in hs_list]).cpu().numpy()
-        )  # (3, S, D)
-
-        def _to_np16_nested(arr):
-            return [[[np.float16(v) for v in seq] for seq in layer] for layer in arr]
-
-        def _to_np16_2d(arr):
-            return [[np.float16(v) for v in seq] for seq in arr]
-
+        tgt_hs = torch.stack(tgt_hs_list).cpu()  # (S, D)
+        hs = torch.stack([torch.stack(layer) for layer in hs_list]).cpu()  # (3, S, D)
+        print("target shape ", hs.shape)
         buffer.append(
             {
-                "input_ids": row["input_ids"].tolist(),
-                "loss_mask": row["loss_mask"].tolist(),
-                "hidden_state": _to_np16_nested(
-                    hs
-                ),  # 最后一层的 hidden_state，算 logit
-                "target_hidden_states": _to_np16_2d(
-                    tgt_hs
-                ),  # hs_list = [[], [], []] 三个 hidden。 L,M,H
+                "input_ids": row["input_ids"],
+                "loss_mask": row["loss_mask"],
+                "hidden_state": hs,  # 最后一层的 hidden_state，算 logit
+                "target_hidden_states": tgt_hs,  # hs_list = [[], [], []] 三个 hidden。 L,M,H
             }
         )
 
         if len(buffer) >= chunk_size:
-            table = pa.Table.from_pylist(buffer, schema=schema)
-            writer.write_table(table)
+            torch.save(buffer, f"{outdir}/chunk_{chunk_idx}.pt")
             buffer.clear()
+            chunk_idx += 1
 
     if buffer:
-        table = pa.Table.from_pylist(buffer, schema=schema)
-        writer.write_table(table)
+        torch.save(buffer, f"{outdir}/chunk_{chunk_idx}.pt")
 
-    writer.close()
     llm.shutdown()
-    print(f"✅ Done! 数据已写入 {parquet_file}")
+    print(f"✅ Done! 数据已写入 {outdir}")
 
 
 if __name__ == "__main__":
