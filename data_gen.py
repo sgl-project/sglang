@@ -163,7 +163,7 @@ def main():
     os.makedirs(outdir, exist_ok=True)
 
     buffer = []
-    chunk_size = 5_000
+    chunk_size = 100
     chunk_idx = 0
 
     for idx, row in tqdm(enumerate(dataset), total=len(dataset)):
