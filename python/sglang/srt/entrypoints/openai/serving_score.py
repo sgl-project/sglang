@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Union
 
 from fastapi import Request
 
@@ -14,7 +14,10 @@ logger = logging.getLogger(__name__)
 
 
 class OpenAIServingScore(OpenAIServingBase):
-    """Handler for scoring requests"""
+    """Handler for /v1/score requests"""
+
+    # NOTE: /v1/rerank is not an official OpenAI endpoint. This module may be moved
+    # to another module in the future.
 
     def _request_id_prefix(self) -> str:
         return "score-"
