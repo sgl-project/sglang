@@ -23,7 +23,7 @@ spec:
           operator: Exists
       containers:
         - name: sgl-minilb
-          image: artifacts.iflytek.com/docker-private/maas/sglang:047dev
+          image: lmsysorg/sglang:latest
           command:
           - python
           - -m
