@@ -86,6 +86,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_deepep_moe",
     "deepep_mode",
     "enable_ep_moe",
+    "enable_flashinfer_moe",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
     "deepep_config",
@@ -787,6 +788,7 @@ class Req:
         self.multimodal_inputs = None
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
+        self.return_logprob = False
         self.finished_reason = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
