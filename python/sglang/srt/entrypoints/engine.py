@@ -37,7 +37,6 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 import torch
 import uvloop
 
-from sglang.srt.code_completion_parser import load_completion_template_for_openai_api
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
@@ -58,11 +57,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.openai_api.adapter import (
-    guess_chat_template_name_from_model_path,
-    load_chat_template_for_openai_api,
-)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
@@ -123,12 +119,13 @@ class Engine(EngineBase):
         logger.info(f"{server_args=}")
 
         # Launch subprocesses
-        tokenizer_manager, scheduler_info = _launch_subprocesses(
+        tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args,
             port_args=port_args,
         )
         self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
+        self.template_manager = template_manager
         self.scheduler_info = scheduler_info
 
         context = zmq.Context(2)
@@ -479,17 +476,15 @@ class Engine(EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
-    def release_memory_occupation(self):
-        """Release GPU occupation temporarily."""
-        obj = ReleaseMemoryOccupationReqInput()
+    def release_memory_occupation(self, tags: Optional[List[str]] = None):
+        obj = ReleaseMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.release_memory_occupation(obj, None)
         )
 
-    def resume_memory_occupation(self):
-        """Resume GPU occupation."""
-        obj = ResumeMemoryOccupationReqInput()
+    def resume_memory_occupation(self, tags: Optional[List[str]] = None):
+        obj = ResumeMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.resume_memory_occupation(obj, None)
@@ -649,7 +644,7 @@ def _set_envs_and_config(server_args: ServerArgs):
 
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: Optional[PortArgs] = None
-) -> Tuple[TokenizerManager, Dict]:
+) -> Tuple[TokenizerManager, TemplateManager, Dict]:
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """
@@ -670,11 +665,9 @@ def _launch_subprocesses(
 
     scheduler_procs = []
     if server_args.dp_size == 1:
-        # Launch tensor parallel scheduler processes
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
-
         scheduler_pipe_readers = []
 
         nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
@@ -710,6 +703,7 @@ def _launch_subprocesses(
                         writer,
                     ),
                 )
+
                 with memory_saver_adapter.configure_subprocess():
                     proc.start()
                 scheduler_procs.append(proc)
@@ -735,7 +729,7 @@ def _launch_subprocesses(
 
         if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
             # When using `Engine` as a Python API, we don't want to block here.
-            return None, None
+            return None, None, None
 
         launch_dummy_health_check_server(server_args.host, server_args.port)
 
@@ -744,7 +738,7 @@ def _launch_subprocesses(
             logger.error(
                 f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
             )
-        return None, None
+        return None, None, None
 
     # Launch detokenizer process
     detoken_proc = mp.Process(
@@ -758,15 +752,15 @@ def _launch_subprocesses(
 
     # Launch tokenizer process
     tokenizer_manager = TokenizerManager(server_args, port_args)
-    if server_args.chat_template:
-        load_chat_template_for_openai_api(
-            tokenizer_manager, server_args.chat_template, server_args.model_path
-        )
-    else:
-        guess_chat_template_name_from_model_path(server_args.model_path)
 
-    if server_args.completion_template:
-        load_completion_template_for_openai_api(server_args.completion_template)
+    # Initialize templates
+    template_manager = TemplateManager()
+    template_manager.initialize_templates(
+        tokenizer_manager=tokenizer_manager,
+        model_path=server_args.model_path,
+        chat_template=server_args.chat_template,
+        completion_template=server_args.completion_template,
+    )
 
     # Wait for the model to finish loading
     scheduler_infos = []
@@ -790,4 +784,4 @@ def _launch_subprocesses(
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
-    return tokenizer_manager, scheduler_info
+    return tokenizer_manager, template_manager, scheduler_info
