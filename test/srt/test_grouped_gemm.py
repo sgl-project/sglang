@@ -7,8 +7,10 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
-    from fbgemm_grouped_gemm import grouped_gemm as fbgemm_grouped_gemm
-    from fbgemm_grouped_gemm import (
+    from sglang.srt.layers.moe.ep_moe.fbgemm_grouped_gemm import (
+        grouped_gemm as fbgemm_grouped_gemm,
+    )
+    from sglang.srt.layers.moe.ep_moe.fbgemm_grouped_gemm import (
         grouped_gemm_fp8_rowwise as fbgemm_grouped_gemm_fp8_rowwise,
     )
 
