@@ -136,7 +136,8 @@ def main():
         ]
     )
     dataset.set_format(type="torch")
-
+    # 上面都是 BaldEagle 里面的。 下面是自己写的 sglang engine。
+    # python3 data_gen.py --start 0 --end 2 --index 1 --gpu_index 0 --outdir /root/.cache/hidden_states_dump --model_name meta-llama/Llama-4-Scout-17B-16E-Instruct --dataset sharegpt
     # ------------------------ 3. Compute hidden states ------------------------
     import sglang as sgl
 
@@ -182,8 +183,6 @@ def main():
         )
         hs_all = outputs[0]["meta_info"]["hidden_states"][0]   # List of length of input_ids, each element is 4*5120 concatenated
 
-        import pdb; pdb.set_trace()
-
         # 每个元素是 4*5120 维度的向量
         # 前 5120 维度是 tgt_hs，后面 3*5120 维度分成 3 份是 hs
         hidden_dim = 5120
@@ -216,8 +215,8 @@ def main():
         buffer.append({
             "input_ids": row["input_ids"].tolist(),
             "loss_mask": row["loss_mask"].tolist(),
-            "hidden_state": _to_np16_nested(hs),
-            "target_hidden_states": _to_np16_2d(tgt_hs),
+            "hidden_state": _to_np16_nested(hs), # 最后一层的 hidden_state，算 logit
+            "target_hidden_states": _to_np16_2d(tgt_hs), # hs_list = [[], [], []] 三个 hidden。 L,M,H
         })
 
         if len(buffer) >= chunk_size:
