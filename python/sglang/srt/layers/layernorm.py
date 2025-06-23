@@ -53,11 +53,7 @@ elif _is_hip:
 logger = logging.getLogger(__name__)
 
 if is_npu():
-    try:
-        import torch_npu
-    except ImportError:
-        logger.warning("torch_npu is not installed. NPU support will be disabled.")
-        _is_npu = False
+    import torch_npu
 
 
 class RMSNorm(CustomOp):

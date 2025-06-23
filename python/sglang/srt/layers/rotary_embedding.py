@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_npu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_npu, get_bool_env_var
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -23,11 +23,7 @@ if _is_cuda:
 logger = logging.getLogger(__name__)
 
 if is_npu():
-    try:
-        import torch_npu
-    except ImportError:
-        logger.warning("torch_npu is not installed. NPU support will be disabled.")
-        _is_npu = False
+    import torch_npu
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
@@ -170,7 +166,7 @@ class RotaryEmbedding(CustomOp):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
         import os
-        if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
+        if get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
             return self.forward_native(positions, query, key, offsets)
         else:
             rotary_mode = 'half'
