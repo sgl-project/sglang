@@ -48,8 +48,8 @@ from sglang.srt.utils import (
     rank0_log,
     require_attn_tp_gather,
     require_gathered_buffer,
-    require_mlp_tp_gather,
     require_mlp_sync,
+    require_mlp_tp_gather,
 )
 
 logger = logging.getLogger(__name__)
@@ -211,10 +211,10 @@ class CudaGraphRunner:
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
+        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
         )

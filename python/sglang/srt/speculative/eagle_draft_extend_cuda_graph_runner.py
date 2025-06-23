@@ -24,8 +24,8 @@ from sglang.srt.speculative.eagle_utils import EagleDraftInput, fast_topk
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
-    require_mlp_tp_gather,
     require_mlp_sync,
+    require_mlp_tp_gather,
 )
 
 if TYPE_CHECKING:
@@ -43,8 +43,8 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
-        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
+        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
         self.tp_size = self.model_runner.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
