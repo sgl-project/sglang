@@ -172,7 +172,7 @@ class TestCacheReport(CustomTestCase):
                     "first request, to start the inference and let the next two request be started in the same batch"
                 )
             )
-            await asyncio.sleep(0.05)  # to force the first request to be started first
+            await asyncio.sleep(1)  # to force the first request to be started first
             task1 = asyncio.create_task(
                 self.cache_report_openai_async(
                     "> can the same batch parallel request use the cache?"
@@ -199,7 +199,7 @@ class TestCacheReport(CustomTestCase):
                 f"Async request 2 - Cached tokens: {cached_tokens2}, Prompt tokens: {prompt_tokens2}"
             )
 
-            # Assert that no requests used the cache (becausefirst is alone, and the next two are in the same batch)
+            # Assert that no requests used the cache (because first is alone, and the next two are in the same batch)
             # If a new optimisation limiting starting request with same prefix at the same time was added
             # to maximise the cache hit, this would not be true
             assert cached_tokens1 == cached_tokens2 == cached_tokens0
