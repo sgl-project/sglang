@@ -175,7 +175,7 @@ def main():
         batch_input_ids.append(row["input_ids"].tolist())
 
         if len(batch_rows) < args.batch_size and idx + 1 < len(dataset):
-            continue        
+            continue
         # 推理得到 hidden_states / target_hidden_states
         outputs = llm.generate(
             input_ids=batch_input_ids,
@@ -200,7 +200,8 @@ def main():
                     start_idx = i * hidden_dim
                     end_idx = (i + 1) * hidden_dim
                     hs_list[i].append(remaining[start_idx:end_idx])
-
+            if len(tgt_hs) == 0:
+                continue
             tgt_hs = torch.stack(tgt_hs_list).cpu()  # (S, D)
             hs = torch.stack(
                 [torch.stack(layer) for layer in hs_list]
