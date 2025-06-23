@@ -18,12 +18,13 @@ import logging
 import math
 import threading
 from queue import Empty, Full, PriorityQueue, Queue
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +164,7 @@ class HiCacheController:
 
     def __init__(
         self,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         mem_pool_host: HostKVCache,
         page_size: int,
         load_cache_event: threading.Event = None,

@@ -5,7 +5,7 @@
 //! - Phase 2: Bootstrap injection and request handling
 //! - Phase 3: Cache-aware selection (when implemented)
 //!
-//! Note: PD mode is enabled via the pd_disaggregated flag, not as a policy type.
+//! Note: PD mode is enabled via the pd_disaggregation flag, not as a policy type.
 //! The policy type (Random, PowerOfTwo, CacheAware) determines the selection algorithm within PD mode.
 
 #[cfg(test)]
@@ -90,7 +90,7 @@ mod test_pd_routing {
     #[test]
     fn test_pd_selection_policies() {
         // Test all PD selection policy variants
-        // Note: These policies are only used when pd_disaggregated=true
+        // Note: These policies are only used when pd_disaggregation=true
         let policies = vec![
             PDSelectionPolicy::Random,
             PDSelectionPolicy::PowerOfTwo,
@@ -122,7 +122,7 @@ mod test_pd_routing {
     #[test]
     fn test_pd_router_configuration() {
         // Test PrefillDecodeConfig creation with various policies
-        // This config is used when pd_disaggregated=true
+        // This config is used when pd_disaggregation=true
         let configs = vec![
             PolicyConfig::PrefillDecodeConfig {
                 selection_policy: PDSelectionPolicy::Random,
@@ -878,7 +878,7 @@ mod test_pd_routing {
     #[test]
     fn test_policy_type_to_pd_selection_policy_mapping() {
         // Document the mapping from PolicyType to PDSelectionPolicy
-        // This mapping happens in lib.rs when pd_disaggregated=true
+        // This mapping happens in lib.rs when pd_disaggregation=true
 
         // PolicyType::Random -> PDSelectionPolicy::Random
         // PolicyType::PowerOfTwo -> PDSelectionPolicy::PowerOfTwo

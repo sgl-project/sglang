@@ -41,9 +41,13 @@ class Router:
             worker URLs using this port. Default: 80
         service_discovery_namespace: Kubernetes namespace to watch for pods. If not provided,
             watches pods across all namespaces (requires cluster-wide permissions). Default: None
+        prefill_selector: Dictionary mapping of label keys to values for Kubernetes pod selection
+            for prefill servers (PD mode only). Default: {}
+        decode_selector: Dictionary mapping of label keys to values for Kubernetes pod selection
+            for decode servers (PD mode only). Default: {}
         prometheus_port: Port to expose Prometheus metrics. Default: None
         prometheus_host: Host address to bind the Prometheus metrics server. Default: None
-        pd_disaggregated: Enable PD (Prefill-Decode) disaggregated mode. Default: False
+        pd_disaggregation: Enable PD (Prefill-Decode) disaggregated mode. Default: False
         prefill_urls: List of (url, bootstrap_port) tuples for prefill servers (PD mode only)
         decode_urls: List of URLs for decode servers (PD mode only)
     """
@@ -68,14 +72,20 @@ class Router:
         selector: Dict[str, str] = None,
         service_discovery_port: int = 80,
         service_discovery_namespace: Optional[str] = None,
+        prefill_selector: Dict[str, str] = None,
+        decode_selector: Dict[str, str] = None,
         prometheus_port: Optional[int] = None,
         prometheus_host: Optional[str] = None,
-        pd_disaggregated: bool = False,
+        pd_disaggregation: bool = False,
         prefill_urls: Optional[List[tuple]] = None,
         decode_urls: Optional[List[str]] = None,
     ):
         if selector is None:
             selector = {}
+        if prefill_selector is None:
+            prefill_selector = {}
+        if decode_selector is None:
+            decode_selector = {}
 
         self._router = _Router(
             worker_urls=worker_urls,
@@ -96,9 +106,11 @@ class Router:
             selector=selector,
             service_discovery_port=service_discovery_port,
             service_discovery_namespace=service_discovery_namespace,
+            prefill_selector=prefill_selector,
+            decode_selector=decode_selector,
             prometheus_port=prometheus_port,
             prometheus_host=prometheus_host,
-            pd_disaggregated=pd_disaggregated,
+            pd_disaggregation=pd_disaggregation,
             prefill_urls=prefill_urls,
             decode_urls=decode_urls,
         )
