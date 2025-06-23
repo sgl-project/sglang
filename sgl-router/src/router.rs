@@ -187,7 +187,7 @@ impl Router {
                 timeout_secs,
                 interval_secs,
                 ..
-            } => (*timeout_secs, *interval_secs),
+            } => (*timeout_secs, *interval_secs, false, &None),
         };
 
         // For PrefillDecode, we need to handle workers differently
@@ -345,6 +345,7 @@ impl Router {
             Router::RoundRobin { dp_awareness, .. } => *dp_awareness,
             Router::Random { dp_awareness, .. } => *dp_awareness,
             Router::CacheAware { dp_awareness, .. } => *dp_awareness,
+            _ => false,
         }
     }
 
@@ -939,9 +940,10 @@ impl Router {
             };
 
             // Parse the request body
-            let mut json_val = match serde_json::from_slice::<serde_json::Value>(&body) {
+            let mut json_val = match serde_json::to_value(typed_req) {
                 Ok(j) => j,
-                Err(e) => return HttpResponse::BadRequest().body(format!("Invalid JSON: {}", e)),
+                Err(e) => return HttpResponse::BadRequest()
+                    .body(format!("Convert into serde_json::Value failed: {}", e)),
             };
 
             // Insert the data_parallel_rank field
@@ -967,7 +969,7 @@ impl Router {
         } else {
             client
                 .post(format!("{}{}", worker_url, route))
-                .json(typed_req); // Use json() directly with typed request
+                .json(typed_req) // Use json() directly with typed request
         };
 
         // Copy all headers from original request
@@ -1267,7 +1269,11 @@ impl Router {
                         }
                         gauge!("sgl_router_active_workers").set(urls.len() as f64);
                     }
-                }
+                },
+                Router::PrefillDecode { .. } => {
+                    warn!("Removing workers from PrefillDecode router not supported via remove_worker. Use dedicated PD management methods.");
+                    return;
+                },
             }
 
             // if cache aware, remove the workers from the tree and queues
@@ -1316,7 +1322,11 @@ impl Router {
                         warn!("Worker {} not found, skipping removal", worker_url);
                         return;
                     }
-                }
+                },
+                Router::PrefillDecode { .. } => {
+                    warn!("Removing workers from PrefillDecode router not supported via remove_worker. Use dedicated PD management methods.");
+                    return;
+                },
             }
 
             // if cache aware, remove the worker from the tree
