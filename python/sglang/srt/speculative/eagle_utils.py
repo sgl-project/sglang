@@ -95,9 +95,7 @@ class EagleDraftInput:
     ):
         return cls(
             verified_id=None,
-            hidden_states=torch.empty(
-                (0, hidden_size), device=device, dtype=dtype
-            ),
+            hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
