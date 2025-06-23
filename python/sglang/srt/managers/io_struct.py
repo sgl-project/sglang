@@ -865,12 +865,6 @@ class SetInternalStateReq:
 
 
 @dataclass
-class V1RerankReqInput:
-    query: str
-    documents: List[str]
-
-
-@dataclass
 class SetInternalStateReqOutput:
     updated: bool
     server_args: Dict[str, Any]

@@ -1,12 +1,12 @@
 """
-Unit tests for OpenAI adapter utils.
+Unit tests for Jinja chat template utils.
 """
 
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.openai_api.utils import (
-    detect_template_content_format,
+from sglang.srt.jinja_template_utils import (
+    detect_jinja_template_content_format,
     process_content_for_template_format,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -33,7 +33,7 @@ class TestTemplateContentFormatDetection(CustomTestCase):
 {%- endfor %}
         """
 
-        result = detect_template_content_format(llama4_pattern)
+        result = detect_jinja_template_content_format(llama4_pattern)
         self.assertEqual(result, "openai")
 
     def test_detect_deepseek_string_format(self):
@@ -46,19 +46,19 @@ class TestTemplateContentFormatDetection(CustomTestCase):
 {%- endfor %}
         """
 
-        result = detect_template_content_format(deepseek_pattern)
+        result = detect_jinja_template_content_format(deepseek_pattern)
         self.assertEqual(result, "string")
 
     def test_detect_invalid_template(self):
         """Test handling of invalid template (should default to 'string')."""
         invalid_pattern = "{{{{ invalid jinja syntax }}}}"
 
-        result = detect_template_content_format(invalid_pattern)
+        result = detect_jinja_template_content_format(invalid_pattern)
         self.assertEqual(result, "string")
 
     def test_detect_empty_template(self):
         """Test handling of empty template (should default to 'string')."""
-        result = detect_template_content_format("")
+        result = detect_jinja_template_content_format("")
         self.assertEqual(result, "string")
 
     def test_process_content_openai_format(self):

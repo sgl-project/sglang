@@ -2,9 +2,12 @@
 Test script for tool_choice functionality in SGLang
 Tests: required, auto, and specific function choices in both streaming and non-streaming modes
 
-python3 -m unittest test_tool_choice.TestToolChoice
+# To run the tests, use the following command:
+#
+# python3 -m unittest openai_server.function_call.test_tool_choice
 """
 
+import json
 import unittest
 
 import openai

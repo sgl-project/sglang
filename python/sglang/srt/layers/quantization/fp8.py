@@ -1052,15 +1052,15 @@ class Fp8MoEMethod:
         if _use_hip_int4:
             # TODO: add triton kernel and add check _use_aiter
             assert not no_combine, f"{no_combine=} is not supported."
-            return ck_moe_2stages(
+            return fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                QuantType.per_Token,
-                layer.w13_weight_scale1,
-                layer.w2_weight_scale1,
+                quant_type=QuantType.per_Token,
+                w1_scale=layer.w13_weight_scale1,
+                w2_scale=layer.w2_weight_scale1,
                 activation=(
                     ActivationType.Silu if activation == "silu" else ActivationType.Gelu
                 ),
@@ -1086,15 +1086,15 @@ class Fp8MoEMethod:
                     expert_mask=None,
                 )
             else:
-                return ck_moe_2stages(
+                return fused_moe(
                     x,
                     layer.w13_weight,
                     layer.w2_weight,
                     topk_weights,
                     topk_ids,
-                    QuantType.per_Token,
-                    layer.w13_weight_scale1,
-                    layer.w2_weight_scale1,
+                    quant_type=QuantType.per_Token,
+                    w1_scale=layer.w13_weight_scale1,
+                    w2_scale=layer.w2_weight_scale1,
                     activation=(
                         ActivationType.Silu
                         if activation == "silu"
