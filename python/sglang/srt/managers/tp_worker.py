@@ -279,13 +279,11 @@ class TpModelWorker:
         return parameter
 
     def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
-        parameter = self.model_runner.load_lora_adapter(
+        result = self.model_runner.load_lora_adapter(
             recv_req.lora_name, recv_req.lora_path
         )
-        return parameter
+        return result
 
     def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
-        parameter = self.model_runner.unload_lora_adapter(
-            recv_req.lora_name
-        )
-        return parameter
+        result = self.model_runner.unload_lora_adapter(recv_req.lora_name)
+        return result

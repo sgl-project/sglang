@@ -85,6 +85,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    LoRAUpdateResult,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -315,10 +316,7 @@ class TokenizerManager:
         self.expert_distribution_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.load_lora_adapter_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.unload_lora_adapter_communicator = _Communicator(
+        self.update_lora_adapter_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
 
@@ -388,13 +386,9 @@ class TokenizerManager:
                     self.expert_distribution_communicator.handle_recv,
                 ),
                 (
-                    LoadLoRAAdapterReqOutput,
-                    self.load_lora_adapter_communicator.handle_recv,
+                    LoRAUpdateResult,
+                    self.update_lora_adapter_communicator.handle_recv,
                 ),
-                {
-                    UnloadLoRAAdapterReqOutput,
-                    self.unload_lora_adapter_communicator.handle_recv,
-                }
                 (HealthCheckOutput, lambda x: None),
             ]
         )
@@ -982,7 +976,7 @@ class TokenizerManager:
         self,
         obj: LoadLoRAAdapterReqInput,
         _: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str]:
+    ) -> LoadLoRAAdapterReqOutput:
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1
@@ -994,14 +988,14 @@ class TokenizerManager:
         )
 
         async with self.model_update_lock.writer_lock:
-            result = (await self.load_lora_adapter_communicator(obj))[0]
-            return result.success, result.message
+            result = (await self.update_lora_adapter_communicator(obj))[0]
+            return result
 
     async def unload_lora_adapter(
         self,
         obj: UnloadLoRAAdapterReqInput,
         _: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str]:
+    ) -> UnloadLoRAAdapterReqOutput:
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1
@@ -1012,8 +1006,8 @@ class TokenizerManager:
         )
 
         async with self.model_update_lock.writer_lock:
-            result = (await self.unload_lora_adapter_communicator(obj))[0]
-            return result.success, result.message
+            result = (await self.update_lora_adapter_communicator(obj))[0]
+            return result
 
     async def get_weights_by_name(
         self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None

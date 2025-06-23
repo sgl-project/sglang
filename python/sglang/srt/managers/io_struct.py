@@ -20,7 +20,7 @@ import copy
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
 from sglang.srt.mm_utils import has_valid_data
 
@@ -1005,18 +1005,16 @@ class LoadLoRAAdapterReqInput:
 
 
 @dataclass
-class LoadLoRAAdapterReqOutput:
-    success: bool
-    message: str
-
-
-@dataclass
 class UnloadLoRAAdapterReqInput:
     # The name of lora module to unload.
     lora_name: str
 
 
 @dataclass
-class UnloadLoRAAdapterReqOutput:
+class LoRAUpdateResult:
     success: bool
-    message: str
+    error_message: Optional[str] = None
+    loaded_adapters: Dict[str, str] = field(default_factory=dict)
+
+
+LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult

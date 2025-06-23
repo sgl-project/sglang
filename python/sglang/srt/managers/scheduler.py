@@ -84,8 +84,6 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
-    UnloadLoRAAdapterReqInput,
-    UnloadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -103,6 +101,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UnloadLoRAAdapterReqInput,
+    UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -2211,29 +2211,33 @@ class Scheduler(
             logger.error(message)
         return UpdateWeightFromDiskReqOutput(success, message, 0)
 
-    def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
-        """In-place loading a new lora adapater from disk or huggingface."""
+    def load_lora_adapter(
+        self, recv_req: LoadLoRAAdapterReqInput
+    ) -> LoadLoRAAdapterReqOutput:
+        """In-place loading a new lora adapter from disk or huggingface."""
 
-        success, message = self.tp_worker.load_lora_adapter(recv_req)
+        result = self.tp_worker.load_lora_adapter(recv_req)
 
-        if success:
+        if result.success:
             flash_cache_success = self.flush_cache()
             assert flash_cache_success, "Cache flush failed after updating weights"
         else:
-            logger.error(message)
-        return LoadLoRAAdapterReqOutput(success, message)
+            logger.error(result.error_message)
+        return result
 
-    def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
+    def unload_lora_adapter(
+        self, recv_req: UnloadLoRAAdapterReqInput
+    ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
-        success, message = self.tp_worker.unload_lora_adapter(recv_req)
+        result = self.tp_worker.unload_lora_adapter(recv_req)
 
-        if success:
+        if result.success:
             flash_cache_success = self.flush_cache()
             assert flash_cache_success, "Cache flush failed after updating weights"
         else:
-            logger.error(message)
-        return UnloadLoRAAdapterReqOutput(success, message)
+            logger.error(result.error_message)
+        return result
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
