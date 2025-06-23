@@ -55,7 +55,32 @@ class ChunkCache(BasePrefixCache):
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices
 
-    def evict_hybrid(
+    def evict(self, num_tokens: int):
+        pass
+
+    def inc_lock_ref(self, node: Any):
+        return 0
+
+    def dec_lock_ref(self, node: Any):
+        return 0
+
+    def pretty_print(self):
+        return ""
+
+
+class SWAChunkCache(ChunkCache):
+    """ChunkCache with support for hybrid KV cache operations."""
+
+    def __init__(
+        self,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: SWATokenToKVPoolAllocator,
+        page_size: int,
+    ):
+        super().__init__(req_to_token_pool, token_to_kv_pool_allocator, page_size)
+        assert isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+
+    def evict(
         self,
         req: Req,
         prelen: int,
@@ -70,15 +95,3 @@ class ChunkCache(BasePrefixCache):
             ]
             self.token_to_kv_pool_allocator.free_swa(free_slots)
             req.evicted_seqlen_local = new_evicted_seqlen_local
-
-    def evict(self, num_tokens: int):
-        pass
-
-    def inc_lock_ref(self, node: Any):
-        return 0
-
-    def dec_lock_ref(self, node: Any):
-        return 0
-
-    def pretty_print(self):
-        return ""

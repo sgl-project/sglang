@@ -54,12 +54,9 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.multimodal import gpu_tensor_hash
-from sglang.srt.mem_cache.allocator import (
-    BaseTokenToKVPoolAllocator,
-    SWATokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.metrics.collector import TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -1189,10 +1186,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_to_token_pool.write(
                     (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
                 )
-                if isinstance(
-                    self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
-                ):
-                    self.tree_cache.evict_hybrid(
+                if isinstance(self.tree_cache, SWAChunkCache):
+                    self.tree_cache.evict(
                         req, pre_len, self.model_config.attention_chunk_size
                     )
 
@@ -1568,9 +1563,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum += bs
 
         # free memory
-        if isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+        if isinstance(self.tree_cache, SWAChunkCache):
             for req in self.reqs:
-                self.tree_cache.evict_hybrid(
+                self.tree_cache.evict(
                     req, req.seqlen - 1, self.model_config.attention_chunk_size
                 )
 
