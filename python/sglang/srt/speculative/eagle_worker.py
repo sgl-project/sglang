@@ -498,6 +498,7 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info = EagleDraftInput.create_idle_input(
             device=self.device,
             hidden_size=self.model_config.hidden_size,
+            dtype=self.model_config.dtype,
             topk=self.topk,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
@@ -838,6 +839,7 @@ class EAGLEWorker(TpModelWorker):
                 batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
                     hidden_size=self.model_config.hidden_size,
+                    dtype=self.model_config.dtype,
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
