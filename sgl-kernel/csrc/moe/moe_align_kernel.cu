@@ -16,16 +16,21 @@ limitations under the License.
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <cutlass/array.h>
 
 #include <THC/THCAtomics.cuh>
 
 #include "utils.h"
 
+template <typename T, int N, int Alignment = sizeof(T) * N>
+class alignas(Alignment) AlignedArray {
+ public:
+  T data[N];
+};
+
 #define WARP_SIZE 32
 
 #define VEC_SIZE 4
-using Vec = cutlass::AlignedArray<int32_t, VEC_SIZE>;
+using Vec = AlignedArray<int32_t, VEC_SIZE>;
 
 template <typename scalar_t>
 __global__ void count_and_sort_expert_tokens_kernel(
@@ -109,7 +114,7 @@ __global__ void moe_align_block_size_kernel(
     Vec fill_vec;
 #pragma unroll
     for (int i = 0; i < VEC_SIZE; ++i) {
-      fill_vec[i] = fill_val;
+      fill_vec.data[i] = fill_val;
     }
 
     int32_t total_vec_count = (total + VEC_SIZE - 1) / VEC_SIZE;
@@ -180,7 +185,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     Vec fill_vec;
 #pragma unroll
     for (int i = 0; i < VEC_SIZE; ++i) {
-      fill_vec[i] = fill_val;
+      fill_vec.data[i] = fill_val;
     }
 
     int32_t total_vec_count = (total + VEC_SIZE - 1) / VEC_SIZE;
