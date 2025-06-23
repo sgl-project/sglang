@@ -41,9 +41,9 @@ def replace_weight_name(
         name.replace(key, to, count) 
     return name
 
-def wegith_loader_with_alias(alias:str): 
+def weight_loader_with_alias(alias:str): 
     def wrapper(func:callable): 
-        def inner_func(
+        def wrapper_weight_loader(
             param: torch.Tensor, 
             loaded_weights: torch.Tensor, 
             *args, 
@@ -52,7 +52,10 @@ def wegith_loader_with_alias(alias:str):
             value = func(param, loaded_weights, *args, **kwargs)
             return value
         return wrapper_weight_loader
+<<<<<<< HEAD
         return inner_func
+=======
+>>>>>>> added class MOE
     return wrapper
 
 
@@ -271,3 +274,10 @@ class MiniMaxText01MoE(nn.Module):
             hidden_states, router_logits_fp32.to(hidden_states.dtype))
         final_hidden = final_hidden_states.view(num_tokens, hidden_size)
         return final_hidden 
+<<<<<<< HEAD
+=======
+    
+
+
+    
+>>>>>>> added class MOE
