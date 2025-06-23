@@ -2,8 +2,9 @@ import argparse
 import os
 import re
 
+import numpy as np
 import torch
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -209,12 +210,41 @@ def main():
         )
 
         if len(buffer) >= chunk_size:
-            torch.save(buffer, f"{outdir}/chunk_{chunk_idx}.pt")
+            # 转为HF datasets支持的格式
+            records = []
+            for item in buffer:
+                records.append(
+                    {
+                        "input_ids": item["input_ids"].tolist(),
+                        "loss_mask": item["loss_mask"].tolist(),
+                        "hidden_state": item["hidden_state"].float().numpy().tolist(),
+                        "target_hidden_states": item["target_hidden_states"]
+                        .float()
+                        .numpy()
+                        .tolist(),
+                    }
+                )
+            ds = Dataset.from_dict({k: [rec[k] for rec in records] for k in records[0]})
+            ds.save_to_disk(f"{outdir}/chunk_{chunk_idx}")
             buffer.clear()
             chunk_idx += 1
 
     if buffer:
-        torch.save(buffer, f"{outdir}/chunk_{chunk_idx}.pt")
+        records = []
+        for item in buffer:
+            records.append(
+                {
+                    "input_ids": item["input_ids"].tolist(),
+                    "loss_mask": item["loss_mask"].tolist(),
+                    "hidden_state": item["hidden_state"].float().numpy().tolist(),
+                    "target_hidden_states": item["target_hidden_states"]
+                    .float()
+                    .numpy()
+                    .tolist(),
+                }
+            )
+        ds = Dataset.from_dict({k: [rec[k] for rec in records] for k in records[0]})
+        ds.save_to_disk(f"{outdir}/chunk_{chunk_idx}")
 
     llm.shutdown()
     print(f"✅ Done! 数据已写入 {outdir}")
