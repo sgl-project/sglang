@@ -206,14 +206,16 @@ def test_moe_align_block_size_compare_implementations(
         num_tokens_post_pad_triton,
     )
 
-    assert torch.allclose(expert_ids_cuda, expert_ids_triton), (
+    assert torch.allclose(expert_ids_cuda, expert_ids_triton, atol=0, rtol=0), (
         f"Expert IDs mismatch for block_size={block_size}, "
         f"num_tokens={num_tokens}, topk={topk}\n"
         f"CUDA expert_ids: {expert_ids_cuda}\n"
         f"Triton expert_ids: {expert_ids_triton}"
     )
 
-    assert torch.allclose(num_tokens_post_pad_cuda, num_tokens_post_pad_triton), (
+    assert torch.allclose(
+        num_tokens_post_pad_cuda, num_tokens_post_pad_triton, atol=0, rtol=0
+    ), (
         f"Num tokens post pad mismatch for block_size={block_size}, "
         f"num_tokens={num_tokens}, topk={topk}\n"
         f"CUDA num_tokens_post_pad: {num_tokens_post_pad_cuda}\n"
@@ -240,6 +242,8 @@ def test_moe_align_block_size_compare_implementations(
     assert torch.allclose(
         selected_sorted_ids_cuda,
         selected_sorted_ids_triton,
+        atol=0,
+        rtol=0,
     ), (
         f"Sorted IDs mismatch for block_size={block_size}, "
         f"num_tokens={num_tokens}, topk={topk}\n"
