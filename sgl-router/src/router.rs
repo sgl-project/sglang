@@ -345,7 +345,7 @@ impl Router {
             Router::RoundRobin { dp_awareness, .. } => *dp_awareness,
             Router::Random { dp_awareness, .. } => *dp_awareness,
             Router::CacheAware { dp_awareness, .. } => *dp_awareness,
-            _ => false,
+            Router::PrefillDecode { .. } => false,
         }
     }
 
@@ -1154,7 +1154,7 @@ impl Router {
                                     tree
                                         .lock()
                                         .unwrap()
-                                        .insert(&"".to_string(), &dp_url);
+                                        .insert("", &dp_url);
                                 }
                             }
                         } else {
