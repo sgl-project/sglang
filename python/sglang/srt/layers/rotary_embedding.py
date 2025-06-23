@@ -1,7 +1,6 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/refs/tags/v0.6.6.post1/vllm/model_executor/layers/rotary_embedding.py
 
 """Rotary Positional Embeddings."""
-import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -19,8 +18,6 @@ _is_cpu = is_cpu()
 
 if _is_cuda:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
-
-logger = logging.getLogger(__name__)
 
 if is_npu():
     import torch_npu
