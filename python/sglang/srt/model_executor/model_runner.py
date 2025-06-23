@@ -30,6 +30,7 @@ from sglang.srt import debug_utils
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import (
     get_tp_group,
     get_world_group,
@@ -70,14 +71,17 @@ from sglang.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
 )
+from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    PagedTokenToKVPoolAllocator,
+    TokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
-    TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -151,7 +155,7 @@ class ModelRunner:
         server_args: ServerArgs,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
-        token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
+        token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
         # Parse args
         self.model_config = model_config
@@ -222,6 +226,7 @@ class ModelRunner:
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
+
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
@@ -276,6 +281,10 @@ class ModelRunner:
             self.apply_torch_tp()
 
         # Init lora
+        # TODO (lifuhuang): when we support dynamic LoRA loading / unloading, we should add
+        # a new server arg `enable_lora` to control whether to init LoRA manager to be more
+        # explicit, as it is perfectly valid to start a server with an empty lora_paths and
+        # load LoRA adapters dynamically later.
         if server_args.lora_paths is not None:
             self.init_lora_manager()
 
@@ -547,7 +556,7 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
-        with self.memory_saver_adapter.region():
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
@@ -794,7 +803,6 @@ class ModelRunner:
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
             base_model=self.model,
-            lora_paths=self.server_args.lora_paths,
             base_hf_config=self.model_config.hf_config,
             max_loras_per_batch=self.server_args.max_loras_per_batch,
             load_config=self.load_config,
@@ -803,6 +811,7 @@ class ModelRunner:
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
         )
+        self.lora_manager.load_lora_adapters(self.server_args.lora_paths)
         logger.info("LoRA manager ready.")
 
     def profile_max_num_token(self, total_gpu_memory: int):
