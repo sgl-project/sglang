@@ -292,21 +292,17 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
 
     let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
         Some(logging::init_logging(LoggingConfig {
-            level: config.log_level
-                    .as_deref()
-                    .and_then(|s| {
-                        match s.to_uppercase().parse::<Level>() {
-                            Ok(l) => Some(l),
-                            Err(_) => {
-                                warn!(
-                                    "Invalid log level string: '{}'. Defaulting to INFO.",
-                                    s
-                                );
-                                None
-                            }
-                        }
-                    })
-                    .unwrap_or(Level::INFO),
+            level: config
+                .log_level
+                .as_deref()
+                .and_then(|s| match s.to_uppercase().parse::<Level>() {
+                    Ok(l) => Some(l),
+                    Err(_) => {
+                        warn!("Invalid log level string: '{}'. Defaulting to INFO.", s);
+                        None
+                    }
+                })
+                .unwrap_or(Level::INFO),
             json_format: false,
             log_dir: config.log_dir.clone(),
             colorize: true,
