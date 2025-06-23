@@ -461,7 +461,7 @@ class HiCacheController:
                 )
             )
         if self.enable_mooncake_store_l3_cache and load_back_size > len(host_indices):
-            l3_cache, l3_cache_len = self.l3_cache_pool.get(node_id)
+            l3_cache, l3_cache_len = self.l3_cache_pool.pop(node_id)
             assert load_back_size - len(host_indices) == l3_cache_len
             self.l3_load_queue.put(
                 L3LoadCacheOperation(
