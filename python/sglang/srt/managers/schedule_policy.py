@@ -309,18 +309,16 @@ class PrefillAdder:
 
     @property
     def rem_total_tokens(self):
-        available_size = self.token_to_kv_pool_allocator.available_size()
         return (
-            available_size
+            self.token_to_kv_pool_allocator.available_size()
             + self.tree_cache.evictable_size()
             - self.rem_total_token_offset
         )
 
     @property
     def cur_rem_tokens(self):
-        available_size = self.token_to_kv_pool_allocator.available_size()
         return (
-            available_size
+            self.token_to_kv_pool_allocator.available_size()
             + self.tree_cache.evictable_size()
             - self.cur_rem_token_offset
         )

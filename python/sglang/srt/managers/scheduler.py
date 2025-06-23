@@ -1395,9 +1395,9 @@ class Scheduler(
             and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
-            available_size = self.token_to_kv_pool_allocator.available_size()
             num_used = self.max_total_num_tokens - (
-                available_size + self.tree_cache.evictable_size()
+                self.token_to_kv_pool_allocator.available_size()
+                + self.tree_cache.evictable_size()
             )
             num_running_reqs = len(self.running_batch.reqs)
             self.stats.num_running_reqs = num_running_reqs
