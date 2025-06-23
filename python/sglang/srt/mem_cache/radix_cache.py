@@ -333,6 +333,10 @@ class RadixCache(BasePrefixCache):
     def dec_lock_ref(self, node: TreeNode):
         if self.disable:
             return 0
+        
+        if node is None:
+            warnings.warn('this should be not happend')
+            return 0
 
         delta = 0
         while node != self.root_node:
