@@ -226,11 +226,11 @@ class GenerateReqInput:
 
         # Expand input based on type
         self._expand_inputs(num)
+        self._normalize_rid(num)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
-        self._normalize_rid(num)
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
 
@@ -530,6 +530,7 @@ class EmbeddingReqInput:
         if self.text is not None:
             if isinstance(self.text, list):
                 self.batch_size += len(self.text)
+                self.is_single = False
             else:
                 self.batch_size += 1
 
@@ -537,11 +538,9 @@ class EmbeddingReqInput:
         if self.input_ids is not None:
             if isinstance(self.input_ids[0], list):
                 self.batch_size += len(self.input_ids)
+                self.is_single = False
             else:
                 self.batch_size += 1
-
-        if self.batch_size > 1:
-            self.is_single = False
 
         # Fill in default arguments
         if self.is_single:
@@ -863,12 +862,6 @@ class GetInternalStateReqOutput:
 @dataclass
 class SetInternalStateReq:
     server_args: Dict[str, Any]
-
-
-@dataclass
-class V1RerankReqInput:
-    query: str
-    documents: List[str]
 
 
 @dataclass
