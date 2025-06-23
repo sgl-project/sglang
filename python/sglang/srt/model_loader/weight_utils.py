@@ -445,7 +445,8 @@ def safetensors_weights_iterator(
         bar_format=_BAR_FORMAT,
     ):
         if disable_mmap:
-            result = safetensors.torch.load(open(st_file, "rb").read())
+            with open(st_file, "rb") as f:
+                result = safetensors.torch.load(f.read())
         else:
             result = safetensors.torch.load_file(st_file, device="cpu")
         for name, param in result.items():
