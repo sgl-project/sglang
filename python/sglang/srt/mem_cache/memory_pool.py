@@ -73,9 +73,6 @@ class ReqToTokenPool:
     def write(self, indices, values):
         self.req_to_token[indices] = values
 
-    def write_local(self, indices, values):
-        self.req_to_token_local[indices] = values
-
     def available_size(self):
         return len(self.free_slots)
 

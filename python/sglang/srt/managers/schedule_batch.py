@@ -850,7 +850,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     seq_lens: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
-    # The output locations of the KV cache for local allocator
     output_ids: torch.Tensor = None  # shape: [b], int64
 
     # For multimodal inputs
@@ -1388,16 +1387,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             * buf_multiplier
             * self.token_to_kv_pool_allocator.page_size
         )
-        if self.get_available_memory() >= tokens_required:
+        if self.token_to_kv_pool_allocator.available_size() >= tokens_required:
             return True
 
         self.tree_cache.evict(tokens_required)
 
-        return self.get_available_memory() >= tokens_required
-
-    def get_available_memory(self):
-        available_size = self.token_to_kv_pool_allocator.available_size()
-        return available_size
+        return self.token_to_kv_pool_allocator.available_size() >= tokens_required
 
     def retract_decode(self, server_args: ServerArgs):
         """Retract the decoding requests when there is not enough memory."""
@@ -1434,13 +1429,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         seq_lens_cpu = self.seq_lens.cpu().numpy()
         first_iter = True
         while (
-            self.get_available_memory() < get_required_tokens(len(sorted_indices))
+            self.token_to_kv_pool_allocator.available_size()
+            < get_required_tokens(len(sorted_indices))
             or first_iter
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
                 assert (
-                    self.get_available_memory() > 0
+                    self.token_to_kv_pool_allocator.available_size() > 0
                 ), "No space left for only one request"
                 break
 
@@ -1478,7 +1474,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # NOTE(lsyin): we should use the newly evictable memory instantly.
                 residual_size = (
                     len(sorted_indices) * global_config.retract_decode_steps
-                    - self.get_available_memory()
+                    - self.token_to_kv_pool_allocator.available_size()
                 )
                 residual_size = max(0, residual_size)
                 self.tree_cache.evict(residual_size)
