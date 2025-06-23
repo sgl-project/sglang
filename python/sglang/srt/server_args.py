@@ -152,6 +152,7 @@ class ServerArgs:
     ep_size: int = 1
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
+    enable_flashinfer_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -234,6 +235,9 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
 
+    # For model weight update
+    custom_weight_loader: Optional[List[str]] = None
+
     def __post_init__(self):
         # Expert parallelism
         if self.enable_ep_moe:
@@ -241,7 +245,15 @@ class ServerArgs:
             logger.warning(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
-
+        if self.enable_flashinfer_moe:
+            assert (
+                self.quantization == "modelopt_fp4"
+            ), "modelopt_fp4 quantization is required for Flashinfer MOE"
+            os.environ["TRTLLM_ENABLE_PDL"] = "1"
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                f"Flashinfer MoE is enabled. Shared expert fusion is disabled."
+            )
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -384,7 +396,6 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_attention. "
 
         # DeepEP MoE
-        self.enable_sp_layernorm = False
         if self.enable_deepep_moe:
             if self.deepep_mode == "auto":
                 assert (
@@ -394,9 +405,6 @@ class ServerArgs:
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
             self.ep_size = self.tp_size
-            self.enable_sp_layernorm = (
-                self.dp_size < self.tp_size if self.enable_dp_attention else True
-            )
             logger.warning(
                 f"DeepEP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
@@ -537,6 +545,9 @@ class ServerArgs:
         os.environ["SGLANG_DISABLE_OUTLINES_DISK_CACHE"] = (
             "1" if self.disable_outlines_disk_cache else "0"
         )
+
+        if self.custom_weight_loader is None:
+            self.custom_weight_loader = []
 
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
         larger_tp = max(decode_tp, prefill_tp)
@@ -1161,6 +1172,11 @@ class ServerArgs:
             help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
         )
         parser.add_argument(
+            "--enable-flashinfer-moe",
+            action="store_true",
+            help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP with --enable-ep-moe",
+        )
+        parser.add_argument(
             "--enable-deepep-moe",
             action="store_true",
             help="Enabling DeepEP MoE implementation for EP MoE.",
@@ -1575,6 +1591,13 @@ class ServerArgs:
             type=str,
             default=None,
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
+        )
+        parser.add_argument(
+            "--custom-weight-loader",
+            type=str,
+            nargs="*",
+            default=None,
+            help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
         )
 
     @classmethod
