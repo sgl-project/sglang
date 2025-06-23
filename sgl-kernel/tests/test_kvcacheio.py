@@ -32,6 +32,7 @@ def test_transfer_kv(
     Tests the per-layer transfer functions, treating tensors as memory pools.
     """
 
+    original_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     device = "cuda"
     torch.cuda.manual_seed(42)
@@ -41,6 +42,7 @@ def test_transfer_kv(
     total_pages_in_pool = total_items_in_pool // page_size
     num_pages_to_transfer = num_items_to_transfer // page_size
     if num_pages_to_transfer == 0:
+        torch.set_default_dtype(original_dtype)
         return
     page_indices = torch.randperm(total_pages_in_pool, dtype=torch.int64)
     src_indices_host = torch.cat(
@@ -229,6 +231,8 @@ def test_transfer_kv(
         torch.testing.assert_close(dst_v_pool_kernel, dst_v_pool_ref)
         torch.testing.assert_close(dst_k_pool_direct, dst_k_pool_ref)
         torch.testing.assert_close(dst_v_pool_direct, dst_v_pool_ref)
+
+    torch.set_default_dtype(original_dtype)
 
 
 if __name__ == "__main__":
