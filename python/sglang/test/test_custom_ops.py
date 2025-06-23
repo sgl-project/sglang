@@ -5,13 +5,13 @@ import os
 import pytest
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-
-fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
+_is_fp8_fnuz = is_fp8_fnuz()
+fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
 
 
 @pytest.mark.parametrize("use_rocm_aiter", [True, False] if _is_hip else [False])
@@ -25,10 +25,10 @@ def test_scaled_fp8_quant_per_tensor(dtype, use_rocm_aiter) -> None:
     def quantize_ref_per_tensor(tensor, inv_scale):
         # The reference implementation that fully aligns to
         # the kernel being tested.
-        finfo = torch.finfo(fp8_type_)
+        finfo = torch.finfo(fp8_dtype)
         scale = inv_scale.reciprocal()
         qweight = (tensor.to(torch.float32) * scale).clamp(min=finfo.min, max=finfo.max)
-        qweight = qweight.to(fp8_type_)
+        qweight = qweight.to(fp8_dtype)
         return qweight
 
     def dequantize_per_tensor(tensor, inv_scale, dtype):
@@ -73,12 +73,12 @@ if _is_cuda or _is_hip:
         def quantize_ref_per_token(tensor, inv_scale):
             # The reference implementation that fully aligns to
             # the kernel being tested.
-            finfo = torch.finfo(fp8_type_)
+            finfo = torch.finfo(fp8_dtype)
             scale = inv_scale.reciprocal()
             qweight = (tensor.to(torch.float32) * scale).clamp(
                 min=finfo.min, max=finfo.max
             )
-            qweight = qweight.to(fp8_type_)
+            qweight = qweight.to(fp8_dtype)
             return qweight
 
         def dequantize_per_token(tensor, inv_scale, dtype):
