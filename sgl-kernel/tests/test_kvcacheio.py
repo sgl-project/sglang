@@ -143,6 +143,7 @@ def test_transfer_kv(
                 src_layer_offset=total_items_in_pool * item_size,
                 dst_layer_offset=total_items_in_pool * item_size,
             )
+        torch.cuda.synchronize()
         torch.testing.assert_close(dst_pool_kernel, dst_pool_ref)
         torch.testing.assert_close(dst_pool_direct, dst_pool_ref)
     else:
@@ -223,6 +224,7 @@ def test_transfer_kv(
                 src_layer_offset=total_items_in_pool * item_size,
                 dst_layer_offset=total_items_in_pool * item_size,
             )
+        torch.cuda.synchronize()
         torch.testing.assert_close(dst_k_pool_kernel, dst_k_pool_ref)
         torch.testing.assert_close(dst_v_pool_kernel, dst_v_pool_ref)
         torch.testing.assert_close(dst_k_pool_direct, dst_k_pool_ref)
