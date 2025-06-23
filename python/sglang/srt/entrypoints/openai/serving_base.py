@@ -2,16 +2,12 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
-from sglang.srt.entrypoints.openai.protocol import (
-    ErrorResponse,
-    OpenAIServingRequest,
-    UsageInfo,
-)
+from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
@@ -37,7 +33,7 @@ class OpenAIServingBase(ABC):
 
             # Convert to internal format
             adapted_request, processed_request = self._convert_to_internal_request(
-                [request], [self._generate_request_id_base(request)]
+                request
             )
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
@@ -51,7 +47,7 @@ class OpenAIServingBase(ABC):
                 )
 
         except Exception as e:
-            logger.error(f"Error in request: {e}")
+            logger.exception(f"Error in request: {e}")
             return self.create_error_response(
                 message=f"Internal server error: {str(e)}",
                 err_type="InternalServerError",
@@ -63,8 +59,12 @@ class OpenAIServingBase(ABC):
         """Generate request ID based on request type"""
         pass
 
-    def _generate_request_id_base(self, request: OpenAIServingRequest) -> str:
+    def _generate_request_id_base(self, request: OpenAIServingRequest) -> Optional[str]:
         """Generate request ID based on request type"""
+        return None
+
+        # TODO(chang): the rid is used in io_strcut check and often violates `The rid should be a list` AssertionError
+        # Temporarily return None in this function until the rid logic is clear.
         if rid := getattr(request, "rid", None):
             return rid
 
@@ -73,11 +73,8 @@ class OpenAIServingBase(ABC):
     @abstractmethod
     def _convert_to_internal_request(
         self,
-        all_requests: List[OpenAIServingRequest],
-        request_ids: List[str],
-    ) -> tuple[
-        GenerateReqInput, Union[OpenAIServingRequest, List[OpenAIServingRequest]]
-    ]:
+        request: OpenAIServingRequest,
+    ) -> tuple[GenerateReqInput, OpenAIServingRequest]:
         """Convert OpenAI request to internal format"""
         pass
 
@@ -86,7 +83,7 @@ class OpenAIServingBase(ABC):
         adapted_request: GenerateReqInput,
         request: OpenAIServingRequest,
         raw_request: Request,
-    ) -> StreamingResponse:
+    ) -> Union[StreamingResponse, ErrorResponse, ORJSONResponse]:
         """Handle streaming request
 
         Override this method in child classes that support streaming requests.
@@ -102,7 +99,7 @@ class OpenAIServingBase(ABC):
         adapted_request: GenerateReqInput,
         request: OpenAIServingRequest,
         raw_request: Request,
-    ) -> Union[Any, ErrorResponse]:
+    ) -> Union[Any, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming request
 
         Override this method in child classes that support non-streaming requests.
@@ -113,36 +110,9 @@ class OpenAIServingBase(ABC):
             status_code=501,
         )
 
-    def _validate_request(self, request: OpenAIServingRequest) -> Optional[str]:
+    def _validate_request(self, _: OpenAIServingRequest) -> Optional[str]:
         """Validate request"""
         pass
-
-    def _calculate_streaming_usage_base(
-        self,
-        prompt_tokens: Dict[int, int],
-        completion_tokens: Dict[int, int],
-        cached_tokens: Dict[int, int],
-        n_choices: int,
-    ) -> UsageInfo:
-        """Calculate usage information for streaming responses (common logic)"""
-        total_prompt_tokens = sum(
-            tokens for i, tokens in prompt_tokens.items() if i % n_choices == 0
-        )
-        total_completion_tokens = sum(tokens for tokens in completion_tokens.values())
-
-        cache_report = self.tokenizer_manager.server_args.enable_cache_report
-        prompt_tokens_details = None
-        if cache_report:
-            cached_tokens_sum = sum(tokens for tokens in cached_tokens.values())
-            if cached_tokens_sum > 0:
-                prompt_tokens_details = {"cached_tokens": cached_tokens_sum}
-
-        return UsageInfo(
-            prompt_tokens=total_prompt_tokens,
-            completion_tokens=total_completion_tokens,
-            total_tokens=total_prompt_tokens + total_completion_tokens,
-            prompt_tokens_details=prompt_tokens_details,
-        )
 
     def create_error_response(
         self,
@@ -152,6 +122,7 @@ class OpenAIServingBase(ABC):
         param: Optional[str] = None,
     ) -> ORJSONResponse:
         """Create an error response"""
+        # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
         error = ErrorResponse(
             object="error",
             message=message,
