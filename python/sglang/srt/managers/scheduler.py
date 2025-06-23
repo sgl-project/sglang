@@ -1374,7 +1374,14 @@ class Scheduler(
             )
             raise ValueError(msg)
 
-        if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            req_total_size = (
+                self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
+            )
+        else:
+            req_total_size = self.req_to_token_pool.size
+
+        if len(self.req_to_token_pool.free_slots) != req_total_size:
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
