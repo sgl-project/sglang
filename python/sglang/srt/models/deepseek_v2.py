@@ -362,12 +362,14 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal_dual_stream(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # router_logits: (num_tokens, n_experts)
+        router_logits = self.gate(hidden_states)
+
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states)
+
         with torch.cuda.stream(self.alt_stream):
-            # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states)
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
@@ -1084,13 +1086,16 @@ class DeepseekV2AttentionMLA(nn.Module):
                 masked_m,
                 expected_m,
             )
-            attn_bmm_output = attn_bmm_output[:, :expected_m, :]
+            attn_bmm_output = (
+                attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
+            )
         elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),
                 self.w_vc.to(torch.bfloat16) * self.w_scale,
             )
+            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
                 attn_output.transpose(0, 1),
@@ -1103,10 +1108,21 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.w_scale,
                 torch.bfloat16,
             )
+            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
-            attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
-        attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
-        output, _ = self.o_proj(attn_output)
+            attn_bmm_output = torch.empty(
+                (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
+                dtype=attn_output.dtype,
+                device=attn_output.device,
+            )
+            torch.bmm(
+                attn_output.transpose(0, 1),
+                self.w_vc,
+                out=attn_bmm_output.view(
+                    -1, self.num_local_heads, self.v_head_dim
+                ).transpose(0, 1),
+            )
+        output, _ = self.o_proj(attn_bmm_output)
 
         return output
 
@@ -1972,11 +1988,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             and hasattr(self.quant_config, "weight_block_size")
             and self.quant_config.weight_block_size is not None
         ):
-            self._weight_requant_ue8m0()
+            self._weight_requant_ue8m0(is_nextn)
 
-    def _weight_requant_ue8m0(self):
-        if self.config.architectures[0] == "DeepseekV3ForCausalLMNextN":
-            return
+    def _weight_requant_ue8m0(self, is_nextn=False):
         weight_block_size = self.quant_config.weight_block_size
 
         moe_layers = list(
@@ -1987,8 +2001,12 @@ class DeepseekV2ForCausalLM(nn.Module):
             )
         )
 
-        for layer_id in range(self.config.num_hidden_layers):
-            layer = self.model.layers[layer_id]
+        num_hidden_layers = 1 if is_nextn else self.config.num_hidden_layers
+        for layer_id in range(num_hidden_layers):
+            if is_nextn:
+                layer = self.model.decoder
+            else:
+                layer = self.model.layers[layer_id]
 
             for module in [
                 layer.self_attn.fused_qkv_a_proj_with_mqa,
@@ -2000,7 +2018,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     module.weight, module.weight_scale_inv, weight_block_size
                 )
 
-            if layer_id in moe_layers:
+            if layer_id in moe_layers or is_nextn:
                 shared_experts = getattr(layer.mlp, "shared_experts", None)
                 if shared_experts is not None:
                     for module in [
