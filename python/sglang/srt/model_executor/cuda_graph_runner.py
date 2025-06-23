@@ -680,7 +680,7 @@ class CudaGraphRunner:
                 bs=bs,
                 num_token_non_padded=len(forward_batch.input_ids),
             )
-        if forward_batch.forward_mode.is_idle():
+        if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = self.custom_mask
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
