@@ -198,7 +198,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 audio_data,
                 modalities,
             )
-            
+
             if "tool_calls" in processed_msg and isinstance(
                 processed_msg.get("tool_calls"), list
             ):
