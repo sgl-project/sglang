@@ -29,7 +29,7 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import is_cuda, next_power_of_2
+from sglang.srt.utils import is_cuda, next_power_of_2, set_weight_attrs
 
 if is_cuda():
     from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
@@ -118,6 +118,12 @@ class ModelOptFp8Config(QuantizationConfig):
             return ModelOptFp8LinearMethod(self)
         if self.kv_cache_quant_method and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
+
+        # Add MoE support
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, FusedMoE):
+            return ModelOptFp8MoEMethod(self)
 
         return None
 
@@ -232,6 +238,269 @@ class ModelOptFp8KVCacheMethod(BaseKVCacheMethod):
 
     def __init__(self, quant_config: ModelOptFp8Config):
         super().__init__(quant_config)
+
+
+class ModelOptFp8MoEMethod:
+    """MoE method for ModelOpt FP8.
+    Supports loading FP8 checkpoints with static weight scale and
+    dynamic/static activation scale.
+
+    Args:
+        quant_config: The ModelOpt quantization config.
+    """
+
+    def __new__(cls, *args, **kwargs):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
+
+        if not hasattr(cls, "_initialized"):
+            original_init = cls.__init__
+            new_cls = type(
+                cls.__name__,
+                (FusedMoEMethodBase,),
+                {
+                    "__init__": original_init,
+                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
+                },
+            )
+            obj = super(new_cls, new_cls).__new__(new_cls)
+            obj.__init__(*args, **kwargs)
+            return obj
+        return super().__new__(cls)
+
+    def __init__(self, quant_config: ModelOptFp8Config):
+        self.quant_config = quant_config
+        self.cutlass_fp8_supported = cutlass_fp8_supported()
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        # Use FP8 dtype if checkpoint is serialized, otherwise use the default dtype
+        weight_dtype = (
+            torch.float8_e4m3fn
+            if self.quant_config.is_checkpoint_fp8_serialized
+            else params_dtype
+        )
+
+        weight_loader = extra_weight_attrs.get("weight_loader")
+
+        # WEIGHTS
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts, 2 * intermediate_size, hidden_size, dtype=weight_dtype
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts, hidden_size, intermediate_size, dtype=weight_dtype
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        if self.quant_config.is_checkpoint_fp8_serialized:
+            # WEIGHT SCALES - Per-tensor scaling for ModelOpt
+            w13_weight_scale = torch.nn.Parameter(
+                torch.full(
+                    (num_experts,),
+                    torch.finfo(torch.float32).min,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.full(
+                    (num_experts,),
+                    torch.finfo(torch.float32).min,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_scale", w13_weight_scale)
+            layer.register_parameter("w2_weight_scale", w2_weight_scale)
+
+            # Set weight loader attributes for scales
+            extra_weight_attrs.update(
+                {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+            )
+            set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+            set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+            # INPUT SCALES - Per-tensor scaling for ModelOpt
+            w13_input_scale = torch.nn.Parameter(
+                torch.full(
+                    (num_experts,),
+                    torch.finfo(torch.float32).min,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            w2_input_scale = torch.nn.Parameter(
+                torch.full(
+                    (num_experts,),
+                    torch.finfo(torch.float32).min,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_input_scale", w13_input_scale)
+            layer.register_parameter("w2_input_scale", w2_input_scale)
+            set_weight_attrs(w13_input_scale, extra_weight_attrs)
+            set_weight_attrs(w2_input_scale, extra_weight_attrs)
+        else:
+            # For non-serialized checkpoints, will be quantized during loading
+            layer.w13_weight_scale = None
+            layer.w2_weight_scale = None
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not self.quant_config.is_checkpoint_fp8_serialized:
+            # Quantize weights on-the-fly for non-serialized checkpoints
+            from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+
+            # Initialize weight scales
+            layer.w13_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    layer.num_experts,
+                    dtype=torch.float32,
+                    device=layer.w13_weight.device,
+                ),
+                requires_grad=False,
+            )
+            layer.w2_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    layer.num_experts,
+                    dtype=torch.float32,
+                    device=layer.w2_weight.device,
+                ),
+                requires_grad=False,
+            )
+
+            # Quantize weights per expert
+            w13_weight = torch.empty_like(
+                layer.w13_weight.data, dtype=torch.float8_e4m3fn
+            )
+            w2_weight = torch.empty_like(
+                layer.w2_weight.data, dtype=torch.float8_e4m3fn
+            )
+
+            for expert in range(layer.num_experts):
+                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
+                    scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                )
+                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
+                    scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+                )
+
+            layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+
+            # Set input scales to None for dynamic quantization
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
+        else:
+            # For serialized checkpoints, use requantize with max scale similar to linear layers
+            if (
+                hasattr(layer, "w13_weight_scale")
+                and layer.w13_weight_scale is not None
+            ):
+                # Apply max scale quantization and convert to per-channel if needed
+                max_w13_scale = layer.w13_weight_scale.max()
+                max_w2_scale = layer.w2_weight_scale.max()
+
+                # Convert to per-channel if cutlass is supported
+                if self.cutlass_fp8_supported:
+                    # For MoE, we need to handle per-expert per-channel scaling
+                    # This is more complex than linear layers
+                    pass  # TODO: Implement per-channel scaling for MoE if needed
+
+                layer.w13_weight_scale = torch.nn.Parameter(
+                    max_w13_scale.expand(layer.num_experts), requires_grad=False
+                )
+                layer.w2_weight_scale = torch.nn.Parameter(
+                    max_w2_scale.expand(layer.num_experts), requires_grad=False
+                )
+
+                # Process input scales
+                if (
+                    hasattr(layer, "w13_input_scale")
+                    and layer.w13_input_scale is not None
+                ):
+                    layer.w13_input_scale = torch.nn.Parameter(
+                        layer.w13_input_scale.max(), requires_grad=False
+                    )
+                if (
+                    hasattr(layer, "w2_input_scale")
+                    and layer.w2_input_scale is not None
+                ):
+                    layer.w2_input_scale = torch.nn.Parameter(
+                        layer.w2_input_scale.max(), requires_grad=False
+                    )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+        from sglang.srt.layers.moe.topk import select_experts
+
+        # Expert selection
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+
+        return fused_experts(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=inplace,
+            activation=activation,
+            use_fp8_w8a8=True,
+            per_channel_quant=False,  # ModelOpt uses per-tensor quantization
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a1_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            no_combine=no_combine,
+        )
 
 
 class ModelOptFp4Config(QuantizationConfig):
