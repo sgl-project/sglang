@@ -86,8 +86,16 @@ def scale_shape(shape, group_shape):
         x_vals=[1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
         x_log=False,
         line_arg="provider",
-        line_vals=["vllm", "sgl-kernel", "triton", "deepgemm"],
-        line_names=["vllm", "sgl-kernel", "sglang triton", "deepgemm"],
+        line_vals=(
+            ["vllm", "sgl-kernel", "triton", "deepgemm"]
+            if torch.cuda.get_device_capability()[0] >= 9
+            else ["sgl-kernel", "triton"]
+        ),
+        line_names=(
+            ["vllm", "sgl-kernel", "sglang triton", "deepgemm"]
+            if torch.cuda.get_device_capability()[0] >= 9
+            else ["sgl-kernel", "sglang triton"]
+        ),
         styles=[("blue", "-"), ("orange", "-"), ("red", "-"), ("yellow", "-")],
         ylabel="GB/s",
         plot_name="fp8 blockwise scaled matmul",
@@ -105,8 +113,9 @@ def benchmark(batch_size, provider, N, K):
     b_fp32 = (torch.rand(N, K, dtype=torch.float32, device="cuda") - 0.5) * 2 * fp8_max
     b_fp8 = b_fp32.clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
 
-    scale_a_group_shape = (1, 128)
-    scale_b_group_shape = (128, 128)
+    scale_ranularity_k = 128
+    scale_a_group_shape = (1, scale_ranularity_k)
+    scale_b_group_shape = (scale_ranularity_k, scale_ranularity_k)
     scale_a_shape = scale_shape(a_fp8.shape, scale_a_group_shape)
     scale_b_shape = scale_shape(b_fp8.shape, scale_b_group_shape)
 
@@ -133,7 +142,12 @@ def benchmark(batch_size, provider, N, K):
     if provider == "triton":
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: w8a8_block_fp8_matmul(
-                a_fp8, b_fp8, scale_a, scale_b, [128, 128], torch.float16
+                a_fp8,
+                b_fp8,
+                scale_a,
+                scale_b,
+                [scale_ranularity_k, scale_ranularity_k],
+                torch.float16,
             ),
             quantiles=quantiles,
         )
@@ -145,7 +159,10 @@ def benchmark(batch_size, provider, N, K):
             ),
             quantiles=quantiles,
         )
-    return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms
+    gbps = (
+        lambda ms: (2 * M * N * K + M * N) * a_fp8.element_size() * 1e-9 / (ms * 1e-3)
+    )
+    return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 
 if __name__ == "__main__":

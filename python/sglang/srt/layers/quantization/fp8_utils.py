@@ -115,7 +115,7 @@ def cutlass_block_fp8_supported() -> bool:
         major, minor = torch.cuda.get_device_capability()
         sm_version = major * 10 + minor
         cuda_version = tuple(map(int, torch.version.cuda.split(".")))
-        if cuda_version >= (12, 0) and sm_version >= 90:
+        if cuda_version >= (12, 0) and sm_version >= 89:
             return True
     return False
 
