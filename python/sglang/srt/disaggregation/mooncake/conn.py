@@ -678,7 +678,10 @@ class MooncakeKVManager(BaseKVManager):
                     arrived_prefill_num = len(
                         self.decode_kv_arrive_state[bootstrap_room]
                     )
-                    if arrived_prefill_num == expected_prefill_num:
+                    if (
+                        self.is_mla_backend
+                        or arrived_prefill_num == expected_prefill_num
+                    ):
                         self.update_status(bootstrap_room, KVPoll.Success)
                 elif status == KVPoll.Failed:
                     self.record_failure(
