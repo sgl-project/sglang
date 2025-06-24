@@ -182,6 +182,8 @@ class NixlKVManager(CommonKVManager):
                         "kv_data_ptrs": self.kv_args.kv_data_ptrs,
                         "aux_data_ptrs": self.kv_args.aux_data_ptrs,
                         "gpu_id": self.kv_args.gpu_id,
+                        "tp_size": self.tp_size,
+                        "dp_size": self.dp_size,
                     })
                 )
                 logger.debug(f"Register key: /decode/{self.model_name_hash}/{self.engine_id}/{self.engine_rank} to ETCD")
@@ -524,7 +526,8 @@ class NixlKVReceiver(CommonKVReceiver):
 
     def _start_send_to_queue_thread(self, event_loop):
         """Start a thread to send requests to the queue."""
-        if self.kv_mgr.engine_rank != 0:
+        per_dp_tp_rank = self.kv_mgr.tp_size // self.kv_mgr.dp_size
+        if self.kv_mgr.engine_rank % per_dp_tp_rank != 0:
             return
 
         def start_async_loop(loop):
@@ -534,7 +537,9 @@ class NixlKVReceiver(CommonKVReceiver):
         threading.Thread(target=start_async_loop, args=(event_loop,)).start()
 
     def _send_to_queue(self, req: Req, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
-        if self.kv_mgr.engine_rank != 0:
+        # only send the request to the queue if the engine rank per dp rank is 0
+        per_dp_tp_rank = self.kv_mgr.tp_size // self.kv_mgr.dp_size
+        if self.kv_mgr.engine_rank % per_dp_tp_rank != 0:
             logger.debug(f"rank {self.kv_mgr.engine_rank} start to transfer")
             self.started_transfer = True
             return
@@ -565,15 +570,25 @@ class NixlKVReceiver(CommonKVReceiver):
             logger.debug(f"Send request and kv indices to queue: {queue_name} with len: {len(remote_prefill_req_data)} and boostrap room: {req.bootstrap_room}")
             nats_endpoint = environ.get("NATS_ENDPOINT", "nats://127.0.0.1:4222")
             nats_client = await nats.connect(nats_endpoint)
+            js = nats_client.jetstream()
+            await js.add_stream(
+                name=queue_name,
+                subjects=[queue_name],
+                max_age=60 * 60 * 24,  # 1 day
+                max_bytes=1024 * 1024 * 1024,  # 1 GB
+                max_msgs=1000000,  # 1 million messages
+            )
 
-            await nats_client.publish(
+            ark = await js.publish(
                 queue_name,
                 remote_prefill_req_data
             )
 
+            self.started_transfer = True
+            logger.debug(f"Published request to NATS with ark: {ark}")
+
         asyncio.run_coroutine_threadsafe(send_to_nats(), self.send_to_queue_loop)
         logger.debug(f"Send request to queue succeed!")
-        self.started_transfer = True
 
     def init(self, req: Req, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
         if self.is_remote_prefill:
