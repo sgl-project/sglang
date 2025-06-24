@@ -171,6 +171,7 @@ class ServerArgs:
     enable_deepep_moe: bool = False
     enable_flashinfer_moe: bool = False
     enable_flashinfer_allreduce_fusion: bool = False
+    enable_flashinfer_fp4_allgather: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -571,6 +572,14 @@ class ServerArgs:
 
             self.disable_cuda_graph = True
             logger.warning("Cuda graph is disabled for prefill server")
+
+        if self.enable_flashinfer_fp4_allgather:
+            assert (
+                self.enable_flashinfer_moe
+                and self.enable_ep_moe
+                and self.dp_size > 1
+                and self.disable_cuda_graph
+            ), "FP4 all-gather requires --enable-flashinfer-moe, --enable-ep-moe, dp_size > 1, and --disable-cuda-graph"
 
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
@@ -1305,6 +1314,11 @@ class ServerArgs:
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-fp4-allgather",
+            action="store_true",
+            help="Quantize before all-gather when using DP with flashinfer MOE EP",
         )
         parser.add_argument(
             "--enable-deepep-moe",

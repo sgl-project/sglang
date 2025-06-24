@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed import parallel_state
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -42,6 +43,20 @@ try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
 except ImportError:
     flashinfer_cutlass_fused_moe = None
+
+# fp4_swizzle_blockscale was replaced with block_scale_interleave, which was
+# then renamed to nvfp4_block_scale_interleave. Remove this once we can expect only newer flashinfer version.
+try:
+    from flashinfer import nvfp4_block_scale_interleave as nvfp4_block_scale_interleave
+except ImportError:
+    try:
+        from flashinfer import block_scale_interleave as nvfp4_block_scale_interleave
+    except ImportError:
+        nvfp4_block_scale_interleave = None
+        try:
+            from flashinfer import fp4_swizzle_blockscale as fp4_swizzle_blockscale
+        except ImportError:
+            fp4_swizzle_blockscale = None
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
@@ -951,6 +966,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         ep_size: Optional[int] = None,
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
+        enable_flashinfer_fp4_allgather: Optional[bool] = None,
+        global_num_tokens_cpu: Optional[List[int]] = None,
     ) -> torch.Tensor:
 
         assert activation == "silu", "Only SiLU activation is supported."
@@ -962,13 +979,43 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
             topk_weights, topk_ids, _ = topk_output
+
+            output_dtype = x.dtype
+            x_sf = None
+            if enable_flashinfer_fp4_allgather:
+                # Quantize before comm, swizzle after.
+                x_col = x.shape[1]
+                if x.shape[0] > 0:
+                    x, x_sf = fp4_quantize(
+                        x, layer.w13_input_scale_quant, is_sf_swizzled_layout=False
+                    )
+                else:
+                    x = torch.zeros(0, x_col // 2, dtype=torch.uint8, device=x.device)
+                    x_sf = torch.zeros(
+                        0, x_col // 16, dtype=torch.uint8, device=x.device
+                    )
+                (
+                    topk_weights,
+                    topk_ids,
+                    x,
+                    x_sf,
+                ) = parallel_state.get_tp_group().all_gatherv(
+                    [topk_weights, topk_ids, x, x_sf], sizes=global_num_tokens_cpu
+                )
+                if nvfp4_block_scale_interleave is not None:
+                    x_sf = nvfp4_block_scale_interleave(x_sf)
+                else:
+                    x_row = x.shape[0]
+                    x_sf = fp4_swizzle_blockscale(x_sf, x_row, x_col)
+
             output = flashinfer_cutlass_fused_moe(
-                x,
-                topk_ids.to(torch.int),
-                topk_weights,
-                layer.w13_weight.view(torch.long),
-                layer.w2_weight.view(torch.long),
-                x.dtype,
+                input=x,
+                token_selected_experts=topk_ids.to(torch.int),
+                token_final_scales=topk_weights,
+                fc1_expert_weights=layer.w13_weight.view(torch.long),
+                fc2_expert_weights=layer.w2_weight.view(torch.long),
+                output_dtype=output_dtype,
+                input_sf=x_sf,
                 quant_scales=[
                     layer.w13_input_scale_quant,
                     layer.w13_blockscale_swizzled.view(torch.int32),
@@ -983,7 +1030,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_rank=tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
             )
-            return output[0]
+            output = output[0]
+
+            if enable_flashinfer_fp4_allgather:
+                output = parallel_state.get_tp_group().reduce_scatterv(
+                    output, sizes=global_num_tokens_cpu
+                )
+
+            return output
 
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 
