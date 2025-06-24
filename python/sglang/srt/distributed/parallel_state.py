@@ -508,6 +508,39 @@ class GroupCoordinator:
         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
         return output
 
+    def reduce_scatterv(
+        self,
+        input_: torch.Tensor,
+        output: Optional[torch.Tensor] = None,
+        sizes: Optional[List[int]] = None,
+    ) -> None:
+        world_size = self.world_size
+        pynccl_comm = self.pynccl_comm
+
+        with pynccl_comm.change_state(enable=True, stream=torch.cuda.current_stream()):
+            assert (
+                pynccl_comm is not None and not pynccl_comm.disabled
+            ), "pynccl is required for reduce_scatterv"
+
+            if sizes is not None:
+                assert len(sizes) == world_size
+                assert input_.shape[0] == sum(sizes)
+                chunk_size = sizes[self.rank_in_group]
+            else:
+                assert input_.shape[0] % world_size == 0
+                chunk_size = input_.shape[0] // world_size
+            output_shape = (chunk_size,) + input_.shape[1:]
+
+            if output is None:
+                output = torch.empty(
+                    output_shape, dtype=input_.dtype, device=input_.device
+                )
+            else:
+                assert output.shape == output_shape
+
+            pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
+            return output
+
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
@@ -595,6 +628,56 @@ class GroupCoordinator:
             input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
         )
         return output_tensor
+
+    def all_gatherv(
+        self,
+        input_: Union[torch.Tensor, List[torch.Tensor]],
+        dim: int = 0,
+        sizes: Optional[List[int]] = None,
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        """
+        Supports varying sizes per rank and input tensor list.
+        `sizes`: a list of len(world_size) with the number of items per rank to gather.
+        """
+        assert dim == 0, "only dim 0 all-gatherv is supported currently"
+        world_size = self.world_size
+        pynccl_comm = self.pynccl_comm
+
+        with pynccl_comm.change_state(enable=True, stream=torch.cuda.current_stream()):
+            assert (
+                pynccl_comm is not None and not pynccl_comm.disabled
+            ), "pynccl is required for all_gatherv"
+
+            def _all_gather_single(
+                input_: torch.Tensor, sizes: Optional[List[int]] = None
+            ):
+                input_size = input_.size()
+                if sizes is not None:
+                    assert len(sizes) == world_size
+                    assert input_.shape[dim] == sizes[self.rank_in_group]
+                    output_size = (sum(sizes),) + input_size[1:]
+                    # 'sizes' is not needed if all inputs in the same group have the same shape
+                    if all(s == sizes[0] for s in sizes):
+                        sizes = None
+                else:
+                    output_size = (input_size[0] * world_size,) + input_size[1:]
+                # Allocate output tensor.
+                output_tensor = torch.empty(
+                    output_size, dtype=input_.dtype, device=input_.device
+                )
+                pynccl_comm.all_gather(output_tensor, input_, sizes=sizes)
+                return output_tensor
+
+            if isinstance(input_, torch.Tensor):
+                return _all_gather_single(input_, sizes)
+
+            output_list = []
+            pynccl_comm.group_start()
+            for inp in input_:
+                output_list.append(_all_gather_single(inp, sizes=sizes))
+            pynccl_comm.group_end()
+
+            return output_list
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
