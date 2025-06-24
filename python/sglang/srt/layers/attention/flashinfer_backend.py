@@ -774,7 +774,7 @@ class FlashInferIndicesUpdaterCascadeDecode:
 
         # Buffers
         self.qo_indptr_arr_level_0 = torch.tensor([0, 0], dtype=torch.int32, device=model_runner.device)
-        self.qo_indptr_arr_level_1 = torch.zeros(self.max_bs+1, dtype=torch.int32, device=model_runner.device)
+        self.qo_indptr_arr_level_1 = torch.arange(self.max_bs+1, dtype=torch.int32, device=model_runner.device)
         self.shared_kv_page_indices = torch.zeros(self.max_context_len, dtype=torch.int32, device=model_runner.device)
         self.shared_kv_page_indptr = torch.tensor([0, 0], dtype=torch.int32, device=model_runner.device)
         self.shared_kv_last_page_len = torch.ones(1, dtype=torch.int32, device=model_runner.device)
@@ -790,8 +790,7 @@ class FlashInferIndicesUpdaterCascadeDecode:
         cascade_decode_wrapper: MultiLevelCascadeAttentionWrapper,
     ):
         bs = seq_lens.size(0)
-        self.qo_indptr_arr_level_0[1] = max_common_prefix_len
-        self.qo_indptr_arr_level_1[1:bs+1] = torch.cumsum(seq_lens, dim=0)
+        self.qo_indptr_arr_level_0[1] = bs
         self.shared_kv_page_indices[:max_common_prefix_len] = self.req_to_token[req_pool_indices[0]][:max_common_prefix_len]
         self.shared_kv_page_indptr[1] = max_common_prefix_len
         unique_prefix_lens = seq_lens - max_common_prefix_len

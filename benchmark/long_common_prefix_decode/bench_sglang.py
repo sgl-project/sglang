@@ -22,6 +22,8 @@ def generate_unique_suffix():
     for task in  tasks:
         for language in languages:
             suffixes.append(f"write a {task} program in {language}")
+    suffixes *= 10
+    return suffixes
 
 
 @sgl.function
@@ -46,9 +48,11 @@ def test_send_all(sys_prompt, user_prompts):
 if __name__ == "__main__":
     backend = RuntimeEndpoint("http://127.0.0.1:30000")
     set_default_backend(backend)
-    with open('claude_system_prompt', 'r') as file:
+    with open('claude_system_prompt.md', 'r') as file:
         prefix = file.read()
     suffixes = generate_unique_suffix()
-
+    print("Start warming up......")
+    cost = test_send_all(prefix, suffixes[:8])
+    print(f"Latency of warm up: {cost:.4f} s\n")
     cost = test_send_all(prefix, suffixes)
     print(f"Latency of test_send_all: {cost:.4f} s\n")
