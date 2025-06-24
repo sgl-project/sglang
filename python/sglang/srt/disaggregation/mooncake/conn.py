@@ -387,12 +387,14 @@ class MooncakeKVManager(BaseKVManager):
                 dst_offset,
                 slice_lens_per_page,
             ) = layer_params
+            src_addr_list = []
+            dst_addr_list = []
+            length_list = []
 
             # Calculate strides for a single token slot
             bytes_per_token_on_prefill = src_item_len // page_size
             bytes_per_token_on_decode = dst_item_len // page_size
 
-            tokens_processed = 0
             for i in range(len(prefill_kv_indices)):
                 prefill_page_idx = int(prefill_kv_indices[i])
                 decode_page_idx = int(dst_kv_indices[i])
@@ -417,23 +419,18 @@ class MooncakeKVManager(BaseKVManager):
                     src_slice_addr = src_token_slot_start_addr + src_offset
                     dst_slice_addr = dst_token_slot_start_addr + dst_offset
 
+                    src_addr_list.append(src_slice_addr)
+                    dst_addr_list.append(dst_slice_addr)
+                    length_list.append(slice_lens_per_page)
+                
                     logger.debug(
                         f"SYNC: sid={mooncake_session_id}, "
                         f"src={src_slice_addr}, dst={dst_slice_addr}, len={slice_lens_per_page}"
                     )
-                    status = self.engine.transfer_sync(
-                        mooncake_session_id,
-                        src_slice_addr,
-                        dst_slice_addr,
-                        slice_lens_per_page,
-                    )
-                    if status != 0:
-                        logger.error(
-                            f"transfer_sync failed with status {status} for session {mooncake_session_id}"
-                        )
-                        return status
 
-            return 0
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id, src_addr_list, dst_addr_list, length_list
+            )
 
         futures = [
             executor.submit(
