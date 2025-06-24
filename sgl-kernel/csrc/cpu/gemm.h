@@ -198,4 +198,5 @@ void tinygemm_kernel(
     int64_t ldb,
     int64_t ldc,
     bool brg,
-    int64_t block_size_K);
+    int64_t block_size_K,
+    bool do_unpack = true);
