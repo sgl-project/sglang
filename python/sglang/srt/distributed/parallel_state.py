@@ -42,6 +42,7 @@ from torch.distributed import Backend, ProcessGroup
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
+    get_int_env_var,
     is_cuda_alike,
     is_npu,
     is_shm_available,
@@ -223,7 +224,7 @@ class GroupCoordinator:
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
-        self.local_size = int(os.environ.get("LOCAL_SIZE", "0"))
+        self.local_size = get_int_env_var("LOCAL_SIZE", 0)
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend
