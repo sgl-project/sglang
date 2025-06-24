@@ -26,7 +26,7 @@ class Llama32Detector(BaseFormatDetector):
         self.bot_token = "<|python_tag|>"
         # NOTE: technically Llama3.2 doesn't support well with parallel tool calls
         # They need specific prompt engineering to support parallel tool calls
-        # Here we use ';' as the separator, which might have compatibility issues
+        # Here we use '; ' as the separator, which might have compatibility issues
         # if users define to use a different separator in their prompt
         self.tool_call_separator = "; "
 
