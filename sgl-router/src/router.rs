@@ -955,16 +955,9 @@ impl Router {
                     .body("Failed to insert the data_parallel_rank field into the request body")
             }
 
-            let body = match serde_json::to_vec(&json_val) {
-                Ok(body) => body,
-                Err(e) => {
-                    error!("Failed to serialize the altered JSON value: {}", e);
-                    return HttpResponse::InternalServerError().finish();
-                },
-            };
             client
                 .post(format!("{}{}", worker_url_prefix, route))
-                .body(body)
+                .json(&json_val)
         } else {
             client
                 .post(format!("{}{}", worker_url, route))
