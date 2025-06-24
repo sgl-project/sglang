@@ -978,6 +978,9 @@ class TokenizerManager:
         _: Optional[fastapi.Request] = None,
     ) -> LoadLoRAAdapterReqOutput:
         self.auto_create_handle_loop()
+
+        # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+        # with dp_size > 1.
         assert (
             self.server_args.dp_size == 1
         ), "dp_size must be 1 for dynamic lora loading"
@@ -997,6 +1000,9 @@ class TokenizerManager:
         _: Optional[fastapi.Request] = None,
     ) -> UnloadLoRAAdapterReqOutput:
         self.auto_create_handle_loop()
+
+        # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+        # with dp_size > 1.
         assert (
             self.server_args.dp_size == 1
         ), "dp_size must be 1 for dynamic lora loading"

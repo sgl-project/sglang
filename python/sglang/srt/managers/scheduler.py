@@ -2241,7 +2241,9 @@ class Scheduler(
 
         if result.success:
             flush_cache_success = self.flush_cache()
-            assert flush_cache_success, "Cache flush failed after unloading LoRA weights"
+            assert (
+                flush_cache_success
+            ), "Cache flush failed after unloading LoRA weights"
         else:
             logger.error(result.error_message)
         return result

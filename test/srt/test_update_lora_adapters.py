@@ -10,7 +10,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-
 LORA_ADAPTERS = [
     "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",
     "philschmid/code-llama-3-1-8b-text-to-sql-lora",
@@ -32,7 +31,8 @@ class TestUpdateLoRAAdapters(CustomTestCase):
                 "--disable-radix-cache",  # TODO: remove this after https://github.com/sgl-project/sglang/pull/7216 is merged.
                 "--lora-paths",
                 LORA_ADAPTERS[0],
-                "--cuda-graph-max-bs", "1",
+                "--cuda-graph-max-bs",
+                "1",
             ],
         )
 
@@ -68,7 +68,9 @@ class TestUpdateLoRAAdapters(CustomTestCase):
         print("=" * 100)
         print(f"Response: {response.json()}")
         self.assertTrue(response.ok)
-        self.assertEqual(set(response.json()["loaded_adapters"]), self.expected_adapters)
+        self.assertEqual(
+            set(response.json()["loaded_adapters"]), self.expected_adapters
+        )
 
     def try_unload_lora_adapter(self, lora_name):
         self.expected_adapters.remove(lora_name)
@@ -80,7 +82,9 @@ class TestUpdateLoRAAdapters(CustomTestCase):
         print("=" * 100)
         print(f"Response: {response.json()}")
         self.assertTrue(response.ok)
-        self.assertEqual(set(response.json()["loaded_adapters"]), self.expected_adapters)
+        self.assertEqual(
+            set(response.json()["loaded_adapters"]), self.expected_adapters
+        )
 
     def test_update_lora(self):
         # loaded adapters: 0
