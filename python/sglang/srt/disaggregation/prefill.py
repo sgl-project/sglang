@@ -223,7 +223,7 @@ class SchedulerDisaggregationPrefillMixin:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
 
         # only start the queue thread on rank 0
-        if self.is_remote_prefill and self.tp_rank == 0:
+        if self.is_remote_prefill and self.attn_tp_rank == 0:
             self._start_queue_thread()
 
         while True:
@@ -263,7 +263,7 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler):
         self.result_queue = deque()
-        if self.is_remote_prefill:
+        if self.is_remote_prefill and self.attn_tp_rank == 0:
             self._start_queue_thread()
 
         while True:
@@ -542,39 +542,99 @@ class SchedulerDisaggregationPrefillMixin:
         self.disagg_prefill_bootstrap_queue.add(req)
         kv_sender = REQ_KV_SENDR_MAP[req.rid]
         kv_indices = base64.b64decode(remote_prefill_req.kv_indices)
-        remote_agent_key = f"{engine_id}_{self.tp_rank}"
 
-        if self.remote_agent_map.get(remote_agent_key) is None:
+        if self.remote_engine_configs.get(engine_id) is None:
             # only load on first time
-            data = self.etcd_client.get(f"/decode/{self.model_name_hash}/{engine_id}/{self.tp_rank}")
-            agent_info = json.loads(data[0])
-            agent_info["agent_metadata"] = base64.b64decode(agent_info["agent_metadata"])
-            self.remote_agent_map[remote_agent_key] = agent_info
+            data = self.etcd_client.get(f"/decode/{self.model_name_hash}/{engine_id}")
+            engine_config = json.loads(data[0])
+            self.remote_engine_configs[engine_id] = engine_config
 
-        agent_info = self.remote_agent_map.get(remote_agent_key)
-        assert agent_info is not None, "Invalid remote agent"
+        engine_config = self.remote_engine_configs.get(engine_id)
+        prefill_per_dp_tp_size = self.tp_size // self.dp_size
+        decode_per_dp_tp_size = engine_config["tp_size"] // engine_config["dp_size"]
 
-        agent_name = agent_info["agent_name"]
+        # different tp rank per dp group is not allowed in non-MLA backend
+        if not self.disagg_prefill_bootstrap_queue.is_mla_backend:
+            assert prefill_per_dp_tp_size == decode_per_dp_tp_size, \
+                f"Prefill tp size {prefill_per_dp_tp_size} is not equal to decode tp size {decode_per_dp_tp_size} per dp group for non-MLA backend"
+            # calculate the target tp rank for the decode server
+            target_tp_rank = self.tp_rank % prefill_per_dp_tp_size + remote_prefill_req.engine_rank
+            remote_agent_key = f"{engine_id}_{target_tp_rank}"
+            if self.remote_agent_map.get(remote_agent_key) is None:
+                # only load on first time
+                data = self.etcd_client.get(f"/decode/{self.model_name_hash}/{engine_id}/{target_tp_rank}")
+                agent_info = json.loads(data[0])
+                agent_info["agent_metadata"] = base64.b64decode(agent_info["agent_metadata"])
+                self.remote_agent_map[remote_agent_key] = agent_info
 
-        logger.debug(f"rank {self.tp_rank} with agent name: {agent_name}")
-        if isinstance(kv_sender, NixlKVSender):
+            agent_info = self.remote_agent_map.get(remote_agent_key)
+            assert agent_info is not None, "Invalid remote agent"
+            assert isinstance(kv_sender, NixlKVSender), \
+                f"Expect NixlKVSender but got {type(kv_sender)} for remote prefill request {remote_prefill_req.rid}"
+
+            agent_name = agent_info["agent_name"]
+
+            logger.debug(f"rank {self.tp_rank} with agent name: {agent_name}")
             kv_mgr = kv_sender.kv_mgr
             if bootstrap_room not in kv_mgr.transfer_infos:
                 kv_mgr.transfer_infos[bootstrap_room] = {}
-                kv_mgr.transfer_infos[bootstrap_room][agent_name] = TransferInfo(
+            kv_mgr.transfer_infos[bootstrap_room][agent_name] = TransferInfo(
+                room =remote_prefill_req.bootstrap_room,
+                endpoint=remote_prefill_req.rank_ip,
+                dst_port=remote_prefill_req.rank_port,
+                agent_metadata= agent_info["agent_metadata"],
+                agent_name=agent_name,
+                dst_kv_ptrs=agent_info["kv_data_ptrs"],
+                dst_kv_indices= np.frombuffer(kv_indices, dtype=np.int64),
+                dst_aux_ptrs=agent_info["aux_data_ptrs"],
+                dst_aux_index=remote_prefill_req.aux_index,
+                dst_gpu_id=agent_info["gpu_id"],
+                required_dst_info_num=0,
+            )
+            kv_mgr.update_status(bootstrap_room, KVPoll.WaitingForInput)
+        else:
+            # first tp rank in each dp group will send kv chunk to all decode ranks
+            target_tp_ranks = [
+                offset + remote_prefill_req.engine_rank
+                for offset in range(decode_per_dp_tp_size)
+            ]
+            for target_tp_rank in target_tp_ranks:
+                remote_agent_key = f"{engine_id}_{target_tp_rank}"
+                if self.remote_agent_map.get(remote_agent_key) is None:
+                    # only load on first time
+                    data = self.etcd_client.get(f"/decode/{self.model_name_hash}/{engine_id}/{target_tp_rank}")
+                    agent_info = json.loads(data[0])
+                    agent_info["agent_metadata"] = base64.b64decode(agent_info["agent_metadata"])
+                    self.remote_agent_map[remote_agent_key] = agent_info
+
+                agent_info = self.remote_agent_map.get(remote_agent_key)
+                assert agent_info is not None, "Invalid remote agent"
+                assert isinstance(kv_sender, NixlKVSender), \
+                    f"Expect NixlKVSender but got {type(kv_sender)} for remote prefill request {remote_prefill_req.rid}"
+
+                dst_kv_indices = np.frombuffer(kv_indices, dtype=np.int64) \
+                    if self.attn_tp_rank == 0 else np.array([], dtype=np.int64)
+
+                agent_name = agent_info["agent_name"]
+                agent_key = f"{agent_name}_{target_tp_rank}"
+                logger.debug(f"rank {self.tp_rank} with agent name: {agent_name}")
+                kv_mgr = kv_sender.kv_mgr
+                if bootstrap_room not in kv_mgr.transfer_infos:
+                    kv_mgr.transfer_infos[bootstrap_room] = {}
+                kv_mgr.transfer_infos[bootstrap_room][agent_key] = TransferInfo(
                     room =remote_prefill_req.bootstrap_room,
                     endpoint=remote_prefill_req.rank_ip,
                     dst_port=remote_prefill_req.rank_port,
-                    agent_metadata= agent_info["agent_metadata"],
+                    agent_metadata=agent_info["agent_metadata"],
                     agent_name=agent_name,
                     dst_kv_ptrs=agent_info["kv_data_ptrs"],
-                    dst_kv_indices= np.frombuffer(kv_indices, dtype=np.int64),
+                    dst_kv_indices=dst_kv_indices,
                     dst_aux_ptrs=agent_info["aux_data_ptrs"],
                     dst_aux_index=remote_prefill_req.aux_index,
                     dst_gpu_id=agent_info["gpu_id"],
                     required_dst_info_num=0,
                 )
-            kv_mgr.update_status(bootstrap_room, KVPoll.WaitingForInput)
+                kv_mgr.update_status(bootstrap_room, KVPoll.WaitingForInput)
 
     def _start_queue_thread(self: Scheduler):
         """Start a thread to send requests to the queue."""
@@ -592,10 +652,21 @@ class SchedulerDisaggregationPrefillMixin:
             import nats
 
             nats_client = await nats.connect(self.nats_endpoint)
+            js = nats_client.jetstream()
 
-            sub = await nats_client.subscribe(queue_name)
+            await js.add_stream(
+                name=queue_name,
+                subjects=[queue_name],
+                max_age=60 * 60 * 24,  # 1 day
+                max_bytes=1024 * 1024 * 1024,  # 1 GB
+                max_msgs=1000000,  # 1 million messages
+            )
+
+            sub = await js.subscribe(queue_name, queue=queue_name)
+
             while True:
                 msg = await sub.next_msg(timeout=None)
+                await msg.ack()
                 remote_prefill_req: RemotePrefillReq = pickle.loads(msg.data)
                 logger.debug(f"Recv request {remote_prefill_req.rid} and bootstrap room: {remote_prefill_req.bootstrap_room}.")
                 self.remote_prefill_reqs.append(remote_prefill_req)

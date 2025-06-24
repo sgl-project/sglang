@@ -253,6 +253,9 @@ class DataParallelController:
                 self.workers
             )
         else:
+            if req.bootstrap_room is None:
+                import random
+                req.bootstrap_room = random.randint(0, 2**63 - 1)
             self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, input_requests):
