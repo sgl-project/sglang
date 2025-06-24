@@ -45,19 +45,6 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
 # Fix DeepEP IBGDA symlink
 RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
 
-# ep statistics
-WORKDIR /sgl-workspace
-RUN wget https://github.com/user-attachments/files/20036217/attachment_ep_statistics.zip \
-    && unzip attachment_ep_statistics.zip \
-    && rm attachment_ep_statistics.zip \
-    && mv attachment_ep_statistics /sgl-workspace/eps
-
-WORKDIR /sgl-workspace
-RUN git clone https://github.com/deepseek-ai/FlashMLA.git
-WORKDIR /sgl-workspace/FlashMLA
-RUN python3 setup.py install
-
-
 # Clone and install SGLang
 WORKDIR /sgl-workspace
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5lib six \
