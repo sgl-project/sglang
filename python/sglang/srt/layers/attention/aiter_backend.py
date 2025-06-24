@@ -324,7 +324,10 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
     def init_cuda_graph_state(
-        self, max_bs: int, kv_indices_buf: Optional[torch.Tensor] = None
+        self,
+        max_bs: int,
+        max_num_tokens: int,
+        kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         self.cuda_graph_kv_last_page_len = torch.ones(max_bs, dtype=torch.int)
         if kv_indices_buf is None:
@@ -338,7 +341,7 @@ class AiterAttnBackend(AttentionBackend):
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_bs * self.max_context_len),
+                (max_num_tokens * self.max_context_len),
                 dtype=torch.uint8,
                 device=self.device,
             )
