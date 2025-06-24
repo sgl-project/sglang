@@ -61,7 +61,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -366,7 +366,7 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_weight_block_size = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            # disable tp for shared experts when enable deepep moe
+            # disable tp for shared experts when enable deepep moe, or with fp4 allgather
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -377,6 +377,7 @@ class DeepseekV2MoE(nn.Module):
                 **(
                     dict(tp_rank=0, tp_size=1)
                     if global_server_args_dict["moe_a2a_backend"].is_deepep()
+                    or global_server_args_dict["enable_flashinfer_fp4_allgather"]
                     else {}
                 ),
             )
@@ -456,14 +457,15 @@ class DeepseekV2MoE(nn.Module):
             if (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
+                and hidden_states.shape[0] > 0
                 and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             ):
                 return self.forward_normal_dual_stream(
-                    hidden_states, can_fuse_mlp_allreduce, use_reduce_scatter
+                    hidden_states, forward_batch, can_fuse_mlp_allreduce, use_reduce_scatter,
                 )
             else:
                 return self.forward_normal(
-                    hidden_states, can_fuse_mlp_allreduce, use_reduce_scatter
+                    hidden_states, forward_batch, can_fuse_mlp_allreduce, use_reduce_scatter
                 )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
@@ -471,6 +473,7 @@ class DeepseekV2MoE(nn.Module):
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
         can_fuse_mlp_allreduce: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
@@ -490,6 +493,8 @@ class DeepseekV2MoE(nn.Module):
                 kwargs["topk_output"] = (self.topk, router_logits)
             else:
                 kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+            if global_server_args_dict["enable_flashinfer_fp4_allgather"]:
+                kwargs["forward_batch"] = forward_batch
 
             final_hidden_states = self.experts(**kwargs)
             if not _is_cuda:
@@ -500,13 +505,19 @@ class DeepseekV2MoE(nn.Module):
         torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
         final_hidden_states = final_hidden_states_out
         sm.tag(final_hidden_states)
-        if self.tp_size > 1 and not can_fuse_mlp_allreduce and not use_reduce_scatter:
+        if (
+            self.tp_size > 1
+            and not can_fuse_mlp_allreduce
+            and not use_reduce_scatter
+            and not global_server_args_dict["enable_flashinfer_fp4_allgather"]
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
         can_fuse_mlp_allreduce: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
@@ -515,18 +526,29 @@ class DeepseekV2MoE(nn.Module):
         ):
             return self.forward_cpu(hidden_states, can_fuse_mlp_allreduce)
 
-        shared_output = self._forward_shared_experts(hidden_states)
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states)
         kwargs = {"hidden_states": hidden_states}
-
-        # FlashInferFP4MoE (TRTLLM path) expects (TopK, router_logits) tuple
-        # Regular FusedMoE (CUTLASS path) expects StandardTopKOutput
-        if should_use_flashinfer_trtllm_moe():
-            kwargs["topk_output"] = (self.topk, router_logits)
+        if hidden_states.shape[0] > 0:
+            shared_output = self._forward_shared_experts(hidden_states)
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
+            # FlashInferFP4MoE (TRTLLM path) expects (TopK, router_logits) tuple
+            # Regular FusedMoE (CUTLASS path) expects StandardTopKOutput
+            if should_use_flashinfer_trtllm_moe():
+                kwargs["topk_output"] = (self.topk, router_logits)
+            else:
+                kwargs["topk_output"] = self.topk(hidden_states, router_logits)
         else:
-            kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+            shared_output = None
+            topk_weights = torch.empty(
+                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+            )
+            topk_ids = torch.full(
+                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+            )
+            kwargs["topk_output"] = StandardTopKOutput(topk_weights, topk_ids, None)
 
+        if global_server_args_dict["enable_flashinfer_fp4_allgather"]:
+            kwargs["forward_batch"] = forward_batch
         final_hidden_states = self.experts(**kwargs)
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
@@ -537,7 +559,12 @@ class DeepseekV2MoE(nn.Module):
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
             final_hidden_states = final_hidden_states_out
             sm.tag(final_hidden_states)
-        if self.tp_size > 1 and not can_fuse_mlp_allreduce and not use_reduce_scatter:
+        if (
+            self.tp_size > 1
+            and not can_fuse_mlp_allreduce
+            and not use_reduce_scatter
+            and not global_server_args_dict["enable_flashinfer_fp4_allgather"]
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
