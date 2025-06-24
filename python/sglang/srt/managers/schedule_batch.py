@@ -56,6 +56,8 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -790,6 +792,50 @@ class Req:
         self.finished_reason = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
+    
+    def _evict_tree_cache_if_needed(
+        self,
+        num_tokens: int,
+    ) -> None:
+        if self.is_hybrid:
+            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+
+            if full_available_size < num_tokens or swa_available_size < num_tokens:
+                if self.tree_cache is not None:
+                    full_num_tokens = max(0, num_tokens - full_available_size)
+                    swa_num_tokens = max(0, num_tokens - swa_available_size)
+                    self.tree_cache.evict(full_num_tokens, swa_num_tokens)
+        else:
+            if self.token_to_kv_pool_allocator.available_size() < num_tokens:
+                if self.tree_cache is not None:
+                    self.tree_cache.evict(num_tokens)
+
+    def _is_available_size_sufficient(self, num_tokens: int) -> bool:
+        if self.is_hybrid:
+            return (
+                self.token_to_kv_pool_allocator.full_available_size() >= num_tokens
+                and self.token_to_kv_pool_allocator.swa_available_size() >= num_tokens
+            )
+        else:
+            return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+
+    def _available_and_evictable_str(self) -> str:
+        if self.is_hybrid:
+            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+            full_evictable_size = self.tree_cache.full_evictable_size()
+            swa_evictable_size = self.tree_cache.swa_evictable_size()
+            return (
+                f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
+                f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
+                f"Full LRU list evictable size: {self.tree_cache.full_lru_list_evictable_size()}\n"
+                f"SWA LRU list evictable size: {self.tree_cache.swa_lru_list_evictable_size()}\n"
+            )
+        else:
+            available_size = self.token_to_kv_pool_allocator.available_size()
+            evictable_size = self.tree_cache.evictable_size()
+            return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
 
     def __repr__(self):
         return (
@@ -813,6 +859,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
+    is_hybrid: bool = False
 
     # Batch configs
     model_config: ModelConfig = None
@@ -918,11 +965,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
+        is_hybrid = False
+        if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+            assert isinstance(
+                tree_cache, SWARadixCache
+            ), "SWARadixCache is required for SWATokenToKVPoolAllocator"
+            is_hybrid = True
+
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
+            is_hybrid=is_hybrid,
             model_config=model_config,
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
@@ -953,9 +1008,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return req_pool_indices
 
     def alloc_token_slots(self, num_tokens: int, backup_state: bool = False):
-        if self.token_to_kv_pool_allocator.available_size() < num_tokens:
-            if self.tree_cache is not None:
-                self.tree_cache.evict(num_tokens)
+        self._evict_tree_cache_if_needed(num_tokens)
 
         if backup_state:
             state = self.token_to_kv_pool_allocator.backup_state()
@@ -966,7 +1019,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             error_msg = (
                 f"{phase_str} out of memory. Try to lower your batch size.\n"
                 f"Try to allocate {num_tokens} tokens.\n"
-                f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
+                f"{self._available_and_evictable_str()}"
             )
             logger.error(error_msg)
             if self.tree_cache is not None:
@@ -986,16 +1039,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         extend_num_tokens: int,
         backup_state: bool = False,
     ):
-        if (
-            self.token_to_kv_pool_allocator.available_size()
-            < extend_num_tokens
+        num_tokens = (
+            extend_num_tokens
             + len(seq_lens) * self.token_to_kv_pool_allocator.page_size
-        ):
-            if self.tree_cache is not None:
-                self.tree_cache.evict(
-                    extend_num_tokens
-                    + len(seq_lens) * self.token_to_kv_pool_allocator.page_size,
-                )
+        )
+        self._evict_tree_cache_if_needed(num_tokens)
 
         if backup_state:
             state = self.token_to_kv_pool_allocator.backup_state()
@@ -1007,9 +1055,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             error_msg = (
                 f"Prefill out of memory. Try to lower your batch size.\n"
                 f"Try to allocate {extend_num_tokens} tokens.\n"
-                f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
-                f"{self.token_to_kv_pool_allocator.available_size()=}\n"
-                f"{self.tree_cache.evictable_size()=}\n"
+                f"{self._available_and_evictable_str()}"
             )
             logger.error(error_msg)
             raise RuntimeError(error_msg)
@@ -1025,14 +1071,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         last_loc: torch.Tensor,
         backup_state: bool = False,
     ):
-        if self.tree_cache is not None:
-            if (
-                self.token_to_kv_pool_allocator.available_size()
-                < len(seq_lens) * self.token_to_kv_pool_allocator.page_size
-            ):
-                self.tree_cache.evict(
-                    len(seq_lens) * self.token_to_kv_pool_allocator.page_size,
-                )
+        num_tokens = len(seq_lens) * self.token_to_kv_pool_allocator.page_size
+
+        self._evict_tree_cache_if_needed(num_tokens)
 
         if backup_state:
             state = self.token_to_kv_pool_allocator.backup_state()
@@ -1042,9 +1083,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             error_msg = (
                 f"Decode out of memory. Try to lower your batch size.\n"
                 f"Try to allocate {len(seq_lens)} tokens.\n"
-                f"Available tokens: {self.token_to_kv_pool_allocator.available_size() + self.tree_cache.evictable_size()}\n"
-                f"{self.token_to_kv_pool_allocator.available_size()=}\n"
-                f"{self.tree_cache.evictable_size()=}\n"
+                f"{self._available_and_evictable_str()}"
             )
             logger.error(error_msg)
             raise RuntimeError(error_msg)
@@ -1371,17 +1410,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def check_decode_mem(self, buf_multiplier=1):
-        tokens_required = (
+        num_tokens = (
             self.new_page_count_next_decode()
             * buf_multiplier
             * self.token_to_kv_pool_allocator.page_size
         )
-        if self.token_to_kv_pool_allocator.available_size() >= tokens_required:
-            return True
 
-        self.tree_cache.evict(tokens_required)
-
-        return self.token_to_kv_pool_allocator.available_size() >= tokens_required
+        self._evict_tree_cache_if_needed(num_tokens)
+        return self._is_available_size_sufficient(num_tokens)
 
     def retract_decode(self, server_args: ServerArgs):
         """Retract the decoding requests when there is not enough memory."""
@@ -1461,12 +1497,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.tree_cache.dec_lock_ref(req.last_node)
 
                 # NOTE(lsyin): we should use the newly evictable memory instantly.
-                residual_size = (
-                    len(sorted_indices) * global_config.retract_decode_steps
-                    - self.token_to_kv_pool_allocator.available_size()
-                )
-                residual_size = max(0, residual_size)
-                self.tree_cache.evict(residual_size)
+                num_tokens = len(sorted_indices) * global_config.retract_decode_steps
+                self._evict_tree_cache_if_needed(num_tokens)
 
             req.reset_for_retract()
 
