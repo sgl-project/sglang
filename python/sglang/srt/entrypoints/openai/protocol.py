@@ -207,7 +207,7 @@ class CompletionResponseChoice(BaseModel):
     index: int
     text: str
     logprobs: Optional[LogProbs] = None
-    finish_reason: Literal["stop", "length", "content_filter", "abort"]
+    finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
 
@@ -404,20 +404,12 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def set_tool_choice_default(cls, values):
-        if isinstance(values, dict):
-            if values.get("tool_choice") is None:
-                if values.get("tools") is None:
-                    values["tool_choice"] = "none"
-                else:
-                    values["tool_choice"] = "auto"
+        if values.get("tool_choice") is None:
+            if values.get("tools") is None:
+                values["tool_choice"] = "none"
+            else:
+                values["tool_choice"] = "auto"
         return values
-
-    @field_validator("messages")
-    @classmethod
-    def validate_messages_not_empty(cls, v):
-        if not v:
-            raise ValueError("Messages cannot be empty")
-        return v
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -457,9 +449,11 @@ class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
-    finish_reason: Literal[
-        "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
-    ]
+    finish_reason: Optional[
+        Literal[
+            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+        ]
+    ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
 
@@ -530,7 +524,7 @@ class EmbeddingRequest(BaseModel):
     input: EmbeddingInput
     model: str
     encoding_format: str = "float"
-    dimensions: int = None
+    dimensions: Optional[int] = None
     user: Optional[str] = None
 
     # The request id.

@@ -152,6 +152,7 @@ class ServerArgs:
     ep_size: int = 1
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
+    enable_flashinfer_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -236,6 +237,7 @@ class ServerArgs:
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
+    weight_loader_disable_mmap: bool = False
 
     def __post_init__(self):
         # Expert parallelism
@@ -244,7 +246,15 @@ class ServerArgs:
             logger.warning(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
-
+        if self.enable_flashinfer_moe:
+            assert (
+                self.quantization == "modelopt_fp4"
+            ), "modelopt_fp4 quantization is required for Flashinfer MOE"
+            os.environ["TRTLLM_ENABLE_PDL"] = "1"
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                f"Flashinfer MoE is enabled. Shared expert fusion is disabled."
+            )
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -1163,6 +1173,11 @@ class ServerArgs:
             help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
         )
         parser.add_argument(
+            "--enable-flashinfer-moe",
+            action="store_true",
+            help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP with --enable-ep-moe",
+        )
+        parser.add_argument(
             "--enable-deepep-moe",
             action="store_true",
             help="Enabling DeepEP MoE implementation for EP MoE.",
@@ -1585,6 +1600,11 @@ class ServerArgs:
             default=None,
             help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
         )
+        parser.add_argument(
+            "--weight-loader-disable-mmap",
+            action="store_true",
+            help="Disable mmap while loading weight using safetensors.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -1709,9 +1729,8 @@ class PortArgs:
             dist_init_host, dist_init_port = dist_init_addr
             port_base = int(dist_init_port) + 1
             if dp_rank is None:
-                scheduler_input_port = (
-                    port_base + 3
-                )  # TokenizerManager to DataParallelController
+                # TokenizerManager to DataParallelController
+                scheduler_input_port = port_base + 3
             else:
                 scheduler_input_port = port_base + 3 + 1 + dp_rank
 
