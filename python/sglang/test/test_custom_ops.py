@@ -1,7 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/8ca7a71df787ad711ad3ac70a5bd2eb2bb398938/tests/quantization/test_fp8.py
 
-import os
-
 import pytest
 import torch
 
@@ -14,13 +12,8 @@ _is_fp8_fnuz = is_fp8_fnuz()
 fp8_dtype = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
 
 
-@pytest.mark.parametrize("use_rocm_aiter", [True, False] if _is_hip else [False])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_scaled_fp8_quant_per_tensor(dtype, use_rocm_aiter) -> None:
-    if use_rocm_aiter:
-        os.environ["SGLANG_USE_AITER"] = "1"
-    else:
-        os.environ["SGLANG_USE_AITER"] = "0"
+def test_scaled_fp8_quant_per_tensor(dtype) -> None:
 
     def quantize_ref_per_tensor(tensor, inv_scale):
         # The reference implementation that fully aligns to
@@ -62,14 +55,8 @@ def test_scaled_fp8_quant_per_tensor(dtype, use_rocm_aiter) -> None:
 
 if _is_cuda or _is_hip:
 
-    @pytest.mark.parametrize("use_rocm_aiter", [True, False] if _is_hip else [False])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_scaled_fp8_quant_per_token_dynamic(dtype, use_rocm_aiter) -> None:
-        if use_rocm_aiter:
-            os.environ["SGLANG_USE_AITER"] = "1"
-        else:
-            os.environ["SGLANG_USE_AITER"] = "0"
-
+    def test_scaled_fp8_quant_per_token_dynamic(dtype) -> None:
         def quantize_ref_per_token(tensor, inv_scale):
             # The reference implementation that fully aligns to
             # the kernel being tested.
@@ -100,13 +87,8 @@ if _is_cuda or _is_hip:
             dequantize_per_token(ref_y, scale, dtype),
         )
 
-    @pytest.mark.parametrize("use_rocm_aiter", [True, False] if _is_hip else [False])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-    def test_scaled_fp8_quant_with_padding(dtype, use_rocm_aiter) -> None:
-        if use_rocm_aiter:
-            os.environ["SGLANG_USE_AITER"] = "1"
-        else:
-            os.environ["SGLANG_USE_AITER"] = "0"
+    def test_scaled_fp8_quant_with_padding(dtype) -> None:
         original_rows = 5
         x = (torch.randn(size=(original_rows, 16), device="cuda") * 13).to(dtype)
 
