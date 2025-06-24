@@ -253,6 +253,7 @@ set(SOURCES
     "csrc/common_extension.cc"
     "csrc/moe/marlin_moe_wna16/ops.cu"
     "csrc/moe/marlin_moe_wna16/gptq_marlin_repack.cu"
+    "csrc/moe/marlin_moe_wna16/awq_marlin_repack.cu"
     "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4.cu"
     "csrc/moe/marlin_moe_wna16/kernel_bf16_ku4b8.cu"
     "csrc/moe/marlin_moe_wna16/kernel_bf16_ku8b128.cu"

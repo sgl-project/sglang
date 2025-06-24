@@ -19,38 +19,32 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.marlin_utils import (
+    apply_awq_marlin_linear,
+    awq_to_marlin_zero_points,
+    check_marlin_supported,
+    check_marlin_supports_layer,
+    check_moe_marlin_supports_layer,
+    marlin_make_empty_g_idx,
+    marlin_make_workspace,
+    marlin_moe_permute_scales,
+    marlin_permute_scales,
+    moe_awq_to_marlin_zero_points,
+    verify_marlin_supported,
+    verify_marlin_supports_shape,
+)
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import is_cuda
 
-_is_cuda = is_cuda()
-
-try:
-    from vllm import _custom_ops as ops
-    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-        apply_awq_marlin_linear,
-        awq_to_marlin_zero_points,
-        check_marlin_supported,
-        check_marlin_supports_layer,
-        check_moe_marlin_supports_layer,
-        marlin_make_empty_g_idx,
-        marlin_make_workspace,
-        marlin_moe_permute_scales,
-        marlin_permute_scales,
-        moe_awq_to_marlin_zero_points,
-        verify_marlin_supported,
-        verify_marlin_supports_shape,
-    )
-    from vllm.scalar_type import scalar_types
-
-except ImportError:
-    FusedMoEMethodBase = QuantizeMethodBase
-
-    class scalar_types:
-        uint4b8 = "uint4b8"
-        uint8b128 = "uint8b128"
-
+from sgl_kernel import (
+    awq_marlin_repack,
+    awq_marlin_moe_repack,
+)
+from sgl_kernel.scalar_type import scalar_types
 
 logger = logging.getLogger(__name__)
+
+_is_cuda = is_cuda()
 
 
 class AWQMarlinConfig(QuantizationConfig):
@@ -182,7 +176,7 @@ class AWQMarlinConfig(QuantizationConfig):
                 )
             return AWQMarlinLinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
+            from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
             if not check_moe_marlin_supports_layer(layer, self.group_size):
                 logger.warning_one(
@@ -320,7 +314,7 @@ class AWQMarlinLinearMethod(LinearMethodBase):
         layer.workspace = marlin_make_workspace(layer.output_size_per_partition, device)
 
         # Repack weights from AWQ format to marlin format.
-        marlin_qweight = ops.awq_marlin_repack(
+        marlin_qweight = awq_marlin_repack(
             layer.qweight,
             size_k=layer.input_size_per_partition,
             size_n=layer.output_size_per_partition,
@@ -371,7 +365,27 @@ class AWQMarlinLinearMethod(LinearMethodBase):
         )
 
 
-class AWQMoEMethod(FusedMoEMethodBase):
+class AWQMoEMethod:
+
+    def __new__(cls, *args, **kwargs):
+        # avoid circular import
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
+
+        if not hasattr(cls, "_initialized"):
+            original_init = cls.__init__
+            new_cls = type(
+                cls.__name__,
+                (FusedMoEMethodBase,),
+                {
+                    "__init__": original_init,
+                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
+                },
+            )
+            obj = super(new_cls, new_cls).__new__(new_cls)
+            obj.__init__(*args, **kwargs)
+            cls._initialized = True
+            return obj
+        return super().__new__(cls)
 
     def __init__(self, quant_config: AWQMarlinConfig):
         self.quant_config = quant_config
@@ -488,7 +502,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
 
-        marlin_w13_qweight = ops.awq_marlin_moe_repack(
+        marlin_w13_qweight = awq_marlin_moe_repack(
             layer.w13_qweight,
             layer.w13_g_idx_sort_indices,
             size_k=layer.w13_qweight.shape[1],
@@ -497,7 +511,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
         )
         replace_parameter(layer, "w13_qweight", marlin_w13_qweight)
 
-        marlin_w2_qweight = ops.awq_marlin_moe_repack(
+        marlin_w2_qweight = awq_marlin_moe_repack(
             layer.w2_qweight,
             layer.w2_g_idx_sort_indices,
             size_k=layer.w2_qweight.shape[1],
