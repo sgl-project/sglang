@@ -28,7 +28,7 @@ class Llama32Detector(BaseFormatDetector):
         # They need specific prompt engineering to support parallel tool calls
         # Here we use ';' as the separator, which might have compatibility issues
         # if users define to use a different separator in their prompt
-        self.tool_call_separator = ";"
+        self.tool_call_separator = "; "
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Llama 3.2 format tool call."""
