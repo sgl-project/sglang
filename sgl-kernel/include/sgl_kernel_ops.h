@@ -320,6 +320,15 @@ void scaled_fp4_experts_quant(
     torch::Tensor const& input_offset_by_experts,
     torch::Tensor const& output_scale_offset_by_experts);
 
+void balance_topk_ids(
+    const torch::Tensor& topk_ids,
+    const int64_t num_gpus,
+    const int64_t num_logical_experts,
+    const int64_t num_physical_experts,
+    torch::Tensor& max_workload_after_balance,
+    torch::Tensor& gpu_workloads_balance_mapping,
+    torch::Tensor& new_topk_ids);
+
 /*
  * From csrc/speculative
  */

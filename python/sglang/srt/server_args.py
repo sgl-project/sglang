@@ -156,7 +156,7 @@ class ServerArgs:
     enable_flashinfer_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
-    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
+    ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake", "balance"]] = None
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
     eplb_algorithm: str = "auto"
@@ -431,6 +431,14 @@ class ServerArgs:
             logger.info(
                 "EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
             )
+            
+        if self.ep_dispatch_algorithm == "balance":
+            assert (
+                not self.enable_eplb
+            ), "'--ep-dispatch-algorithm balance' cannot be used with experts rebalance"
+            assert (
+                self.init_expert_location == "trivial"
+            ), "'--ep-dispatch-algorithm balance' cannot be used with non-trivial '--init-expert-location'"
 
         if self.enable_expert_distribution_metrics and (
             self.expert_distribution_recorder_mode is None

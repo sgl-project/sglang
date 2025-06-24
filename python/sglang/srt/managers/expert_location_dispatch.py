@@ -23,7 +23,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 @dataclass
 class ExpertLocationDispatchInfo:
-    ep_dispatch_algorithm: Literal["static", "random", "workload_based"]
+    ep_dispatch_algorithm: Literal["static", "random", "workload_based", "balance"]
     # (num_logical_experts,)
     partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # (num_logical_experts, X)
@@ -31,6 +31,7 @@ class ExpertLocationDispatchInfo:
     # (num_logical_experts,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
+    ep_size: int
 
     @classmethod
     def init_new(cls, layer_id: int):
@@ -57,6 +58,7 @@ class ExpertLocationDispatchInfo:
                 layer_id, :
             ],
             num_physical_experts=expert_location_metadata.num_physical_experts,
+            ep_size=expert_location_metadata.ep_size,
         )
 
 
@@ -84,6 +86,8 @@ def topk_ids_logical_to_physical(
         return _topk_ids_logical_to_physical_workload_heuristic(topk_ids, info)
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
         return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+    if info.ep_dispatch_algorithm == "balance":
+        return _topk_ids_logical_to_physical_balance(topk_ids, info)
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
 
 
@@ -213,3 +217,39 @@ def _topk_ids_logical_to_physical_workload_heuristic(
         flat_physical[all_tokens] = all_phys
 
     return flat_physical.view_as(topk_ids)
+    
+def _topk_ids_logical_to_physical_balance(
+    topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
+) -> torch.Tensor:
+    from sgl_kernel import balance_topk_ids
+
+    num_topk_ids = topk_ids.numel()
+    num_gpus = info.ep_size
+
+    if num_topk_ids / num_gpus < 2:
+        # When num_topk_ids is small, the additional overhead of workload balance will be higher than the benefits.
+        return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+
+    num_logical_experts = info.partial_logical_to_all_physical_map.shape[0]
+    num_physical_experts = info.num_physical_experts
+
+    max_workload_after_balance = torch.empty(
+        [1], dtype=torch.int32, device=topk_ids.device
+    )
+    gpu_workloads_balance_mapping = torch.empty(
+        [num_physical_experts // num_logical_experts, num_gpus],
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    new_topk_ids = torch.empty_like(topk_ids)
+    balance_topk_ids(
+        topk_ids,
+        num_gpus,
+        num_logical_experts,
+        num_physical_experts,
+        max_workload_after_balance,
+        gpu_workloads_balance_mapping,
+        new_topk_ids,
+    )
+
+    return new_topk_ids

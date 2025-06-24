@@ -203,6 +203,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
   m.impl("apply_shuffle_mul_sum", torch::kCUDA, &apply_shuffle_mul_sum);
 
+  m.def(
+      "balance_topk_ids(Tensor topk_ids, int num_gpus, int num_logical_experts, int num_physical_experts, Tensor "
+      "max_workload_after_balance, Tensor gpu_workloads_balance_mapping, Tensor new_topk_ids) -> ()");
+  m.impl("balance_topk_ids", torch::kCUDA, &balance_topk_ids);
+
   /*
    * From csrc/speculative
    */

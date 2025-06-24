@@ -254,3 +254,22 @@ def cutlass_fp4_group_mm(
         params["blockscale_offsets"],
     )
     return c.to(dtype=out_dtype)
+
+def balance_topk_ids(
+    topk_ids,
+    num_gpus,
+    num_logical_experts,
+    num_physical_experts,
+    max_workload_after_balance,
+    gpu_workloads_balance_mapping,
+    new_topk_ids,
+):
+    torch.ops.sgl_kernel.balance_topk_ids.default(
+        topk_ids,
+        num_gpus,
+        num_logical_experts,
+        num_physical_experts,
+        max_workload_after_balance,
+        gpu_workloads_balance_mapping,
+        new_topk_ids,
+    )
