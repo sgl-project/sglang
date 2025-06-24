@@ -23,7 +23,6 @@ import time
 from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass
-from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
@@ -141,6 +140,7 @@ from sglang.srt.utils import (
     DeepEPMode,
     DynamicGradMode,
     broadcast_pyobj,
+    configure_gc_logger,
     configure_logger,
     disable_request_logging,
     get_available_gpu_memory,
@@ -508,6 +508,9 @@ class Scheduler(
             self.server_args.disaggregation_mode
         )
         self.init_disaggregation()
+
+        if get_bool_env_var("SGLANG_GC_LOG"):
+            configure_gc_logger()
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
@@ -1371,7 +1374,14 @@ class Scheduler(
             )
             raise ValueError(msg)
 
-        if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            req_total_size = (
+                self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
+            )
+        else:
+            req_total_size = self.req_to_token_pool.size
+
+        if len(self.req_to_token_pool.free_slots) != req_total_size:
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
@@ -1810,11 +1820,6 @@ class Scheduler(
             can_cuda_graph = 1
         else:
             can_cuda_graph = 0
-
-        if not spec_algorithm.is_none():
-            # TODO(sang): Support cuda graph when idle batch is there.
-            if local_batch is None or local_batch.forward_mode.is_idle():
-                can_cuda_graph = 0
 
         is_extend_in_batch = (
             local_batch.forward_mode.is_extend() if local_batch else False

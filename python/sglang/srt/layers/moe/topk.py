@@ -30,6 +30,7 @@ from sglang.srt.managers.expert_location_dispatch import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     cpu_has_amx_support,
+    get_bool_env_var,
     get_compiler_backend,
     is_cpu,
     is_cuda,
@@ -38,6 +39,7 @@ from sglang.srt.utils import (
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
@@ -46,6 +48,11 @@ if _is_cuda:
 
 if _is_cuda or _is_hip:
     from sgl_kernel import topk_softmax
+if _use_aiter:
+    try:
+        from aiter import biased_grouped_topk as aiter_biased_grouped_topk
+    except ImportError:
+        raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 
 
 def fused_topk_torch_native(
@@ -346,6 +353,25 @@ def biased_grouped_topk_gpu(
             topk_ids = _biased_grouped_topk_postprocess(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
+        return topk_weights, topk_ids
+    elif _use_aiter:
+        token = gating_output.shape[0]
+        device = gating_output.device
+        assert (
+            hidden_states.shape[0] == gating_output.shape[0]
+        ), f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
+        topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
+        topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
+        aiter_biased_grouped_topk(
+            gating_output,
+            correction_bias,
+            topk_weights,
+            topk_ids,
+            num_expert_group,
+            topk_group,
+            renormalize,
+            routed_scaling_factor,
+        )
         return topk_weights, topk_ids
     else:
         biased_grouped_topk_fn = (
