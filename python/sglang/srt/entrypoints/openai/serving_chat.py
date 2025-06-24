@@ -63,33 +63,33 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
-        result = self._process_messages(request, is_multimodal)
+        processed_messages = self._process_messages(request, is_multimodal)
 
         # Build sampling parameters
         sampling_params = self._build_sampling_params(
-            request, result.stop, result.tool_call_constraint
+            request, processed_messages.stop, processed_messages.tool_call_constraint
         )
 
         # Handle single vs multiple requests
         if is_multimodal:
-            prompt_kwargs = {"text": result.prompt}
+            prompt_kwargs = {"text": processed_messages.prompt}
         else:
-            if isinstance(result.prompt_ids, str):
-                prompt_kwargs = {"text": result.prompt_ids}
+            if isinstance(processed_messages.prompt_ids, str):
+                prompt_kwargs = {"text": processed_messages.prompt_ids}
             else:
-                prompt_kwargs = {"input_ids": result.prompt_ids}
+                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
-            image_data=result.image_data,
-            audio_data=result.audio_data,
+            image_data=processed_messages.image_data,
+            audio_data=processed_messages.audio_data,
             sampling_params=sampling_params,
             return_logprob=request.logprobs,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
             stream=request.stream,
             return_text_in_logprobs=True,
-            modalities=result.modalities,
+            modalities=processed_messages.modalities,
             lora_path=request.lora_path,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
@@ -104,8 +104,6 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
         tool_call_constraint = None
-        prompt = ""
-        prompt_ids = []
 
         # Apply chat template and its stop strings
         tools = None
