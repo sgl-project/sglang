@@ -1,5 +1,5 @@
 ARG BASE_IMAGE
-FROM ${BASE_IMAGE}}
+FROM ${BASE_IMAGE}
 
 ARG sglang_version=0.4.6.post2+byted.0.0.2.202505261551
 ARG sgl_kernel_version=0.1.1+byted.0.0.2.202505261548
