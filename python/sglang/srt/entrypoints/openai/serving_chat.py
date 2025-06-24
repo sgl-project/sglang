@@ -107,52 +107,31 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt = ""
         prompt_ids = []
 
-        if not isinstance(request.messages, str):
-            # Apply chat template and its stop strings
-            tools = None
-            if request.tools and request.tool_choice != "none":
-                request.skip_special_tokens = False
-                if not isinstance(request.tool_choice, str):
-                    tools = [
-                        item.function.model_dump()
-                        for item in request.tools
-                        if item.function.name == request.tool_choice.function.name
-                    ]
-                else:
-                    tools = [item.function.model_dump() for item in request.tools]
-
-                tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
-                parser = FunctionCallParser(request.tools, tool_call_parser)
-                tool_call_constraint = parser.get_structure_constraint(
-                    request.tool_choice
-                )
-
-            # Use chat template
-            if self.template_manager.chat_template_name is None:
-                result = self._apply_jinja_template(request, tools, is_multimodal)
+        # Apply chat template and its stop strings
+        tools = None
+        if request.tools and request.tool_choice != "none":
+            request.skip_special_tokens = False
+            if not isinstance(request.tool_choice, str):
+                tools = [
+                    item.function.model_dump()
+                    for item in request.tools
+                    if item.function.name == request.tool_choice.function.name
+                ]
             else:
-                result = self._apply_conversation_template(request, is_multimodal)
+                tools = [item.function.model_dump() for item in request.tools]
 
-            result.tool_call_constraint = tool_call_constraint
-            return result
+            tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
+            parser = FunctionCallParser(request.tools, tool_call_parser)
+            tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
+
+        # Use chat template
+        if self.template_manager.chat_template_name is None:
+            result = self._apply_jinja_template(request, tools, is_multimodal)
         else:
-            # Use raw prompt
-            prompt_ids = request.messages
-            stop = request.stop or []
-            image_data = None
-            audio_data = None
-            modalities = []
-            prompt = request.messages
+            result = self._apply_conversation_template(request, is_multimodal)
 
-            return MessageProcessingResult(
-                prompt=prompt,
-                prompt_ids=prompt_ids,
-                image_data=image_data,
-                audio_data=audio_data,
-                modalities=modalities,
-                stop=stop,
-                tool_call_constraint=tool_call_constraint,
-            )
+        result.tool_call_constraint = tool_call_constraint
+        return result
 
     def _apply_jinja_template(
         self,
