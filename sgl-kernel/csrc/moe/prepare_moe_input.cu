@@ -271,7 +271,8 @@ __global__ void apply_shuffle_mul_sum_kernel(
   }
 
   constexpr uint32_t vec_size = 16 / sizeof(scalar_t);
-  using vec_t = flashinfer::vec_t<scalar_t, vec_size>;
+  using t = float;
+  using vec_t = flashinfer::vec_t<t, vec_size>;
   int thread_idx = threadIdx.x;
   int stride = blockDim.x;
 
@@ -285,9 +286,9 @@ __global__ void apply_shuffle_mul_sum_kernel(
       int src_row = permutation[token_major_idx];
 
       vec_t val_vec;
-      val_vec.load(input_tensor + src_row * row_stride + d);
+      val_vec.cast_load(input_tensor + src_row * row_stride + d);
 
-      scalar_t factor = 1.0;
+      t factor = 1.0;
       if (factors != nullptr) {
         factor = factors[token_major_idx];
       }
@@ -297,7 +298,25 @@ __global__ void apply_shuffle_mul_sum_kernel(
         sum_vec[k] += factor * val_vec[k];
       }
     }
-    sum_vec.store(output_tensor + i * row_stride + d);
+    sum_vec.cast_store(output_tensor + i * row_stride + d);
+  }
+
+  //  remainder part
+  int remainder_start = (row_stride / vec_size) * vec_size;
+  for (int d = remainder_start + thread_idx; d < row_stride; d += stride) {
+    t sum_val = 0.0;
+    for (int j = 0; j < topk; ++j) {
+      int token_major_idx = i * topk + j;
+      int src_row = permutation[token_major_idx];
+      t val = input_tensor[src_row * row_stride + d];
+
+      t factor = 1.0;
+      if (factors != nullptr) {
+        factor = factors[token_major_idx];
+      }
+      sum_val += factor * val;
+    }
+    output_tensor[i * row_stride + d] = sum_val;
   }
 }
 
