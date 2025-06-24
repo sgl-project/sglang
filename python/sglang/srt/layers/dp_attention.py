@@ -165,7 +165,8 @@ def disable_dp_size():
 
 
 def get_dp_local_info(forward_batch: ForwardBatch):
-    dp_rank = get_local_attention_dp_rank()
+    # `get_dp_local_info` is only called in global DP gather and scatter. We use global DP rank here.
+    dp_rank = get_attention_dp_rank()
 
     if forward_batch.dp_local_start_pos is None:
         cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
@@ -238,6 +239,10 @@ def _dp_gather(
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
+        if forward_batch.forward_mode.is_draft_extend():
+            shape_tensor = local_num_tokens.new_full((), local_tokens.shape[0])
+            local_num_tokens = torch.minimum(local_num_tokens, shape_tensor)
+
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
         )
@@ -288,6 +293,10 @@ def dp_scatter(
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
+        if forward_batch.forward_mode.is_draft_extend():
+            shape_tensor = local_num_tokens.new_full((), local_tokens.shape[0])
+            local_num_tokens = torch.minimum(local_num_tokens, shape_tensor)
+
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
@@ -301,4 +310,4 @@ def attn_tp_reduce_scatter(
 
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input_: torch.Tensor):
-    return get_attention_tp_group().all_gather(input_, tensor_list=output_list)
+    return get_attention_tp_group().all_gather(input_, output_tensor_list=output_list)

@@ -34,6 +34,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.utils import print_warning_once
 
 logger = logging.getLogger(__name__)
@@ -206,7 +207,10 @@ def get_quant_config(
             config["adapter_name_or_path"] = model_name_or_path
         elif model_config.quantization == "modelopt":
             if config["producer"]["name"] == "modelopt":
-                return quant_cls.from_config(config)
+                if "FP4" in config["quantization"]["quant_algo"]:
+                    return ModelOptFp4Config.from_config(config)
+                else:
+                    return quant_cls.from_config(config)
             else:
                 raise ValueError(
                     f"Unsupported quantization config"
@@ -418,6 +422,7 @@ def safetensors_weights_iterator(
     hf_weights_files: List[str],
     is_all_weights_sharded: bool = False,
     decryption_key: Optional[str] = None,
+    disable_mmap: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
@@ -439,7 +444,11 @@ def safetensors_weights_iterator(
         disable=not enable_tqdm,
         bar_format=_BAR_FORMAT,
     ):
-        result = safetensors.torch.load_file(st_file, device="cpu")
+        if disable_mmap:
+            with open(st_file, "rb") as f:
+                result = safetensors.torch.load(f.read())
+        else:
+            result = safetensors.torch.load_file(st_file, device="cpu")
         for name, param in result.items():
             yield name, param
 

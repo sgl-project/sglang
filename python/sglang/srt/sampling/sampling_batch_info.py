@@ -10,6 +10,7 @@ import torch
 import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.utils import merge_bias_tensor
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -63,6 +64,9 @@ class SamplingBatchInfo:
     # Device
     device: str = "cuda"
 
+    # Handle logit bias
+    logit_bias: Optional[torch.Tensor] = None
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         reqs = batch.reqs
@@ -84,6 +88,14 @@ class SamplingBatchInfo:
         min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs], dtype=torch.float
         ).to(device, non_blocking=True)
+
+        logit_bias = None
+        if any(r.sampling_params.logit_bias is not None for r in reqs):
+            logit_bias = torch.zeros(len(reqs), vocab_size, device=device)
+            for i, r in enumerate(reqs):
+                if r.sampling_params.logit_bias is not None:
+                    for key, value in r.sampling_params.logit_bias.items():
+                        logit_bias[i, int(key)] = value
 
         # Check if any request has custom logit processor
         has_custom_logit_processor = (
@@ -150,6 +162,7 @@ class SamplingBatchInfo:
             custom_params=custom_params,
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
+            logit_bias=logit_bias,
         )
         return ret
 
@@ -206,6 +219,9 @@ class SamplingBatchInfo:
         if self.vocab_mask is not None:
             self.apply_mask_func(logits=logits, vocab_mask=self.vocab_mask)
 
+        if self.logit_bias is not None:
+            logits.add_(self.logit_bias)
+
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         self.penalizer_orchestrator.filter(keep_indices_device)
 
@@ -220,6 +236,9 @@ class SamplingBatchInfo:
         ]:
             value = getattr(self, item, None)
             setattr(self, item, value[keep_indices_device])
+
+        if self.logit_bias is not None:
+            self.logit_bias = self.logit_bias[keep_indices_device]
 
     def _filter_batch_custom_logit_processor(
         self, keep_indices: List[int], keep_indices_device: torch.Tensor
@@ -321,3 +340,8 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+
+        # Merge logit bias
+        self.logit_bias = merge_bias_tensor(
+            self.logit_bias, other.logit_bias, len(self), len(other), self.device, 0.0
+        )

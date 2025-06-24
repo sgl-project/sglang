@@ -8,10 +8,12 @@ from utils import precision
 from sglang.srt.layers.moe.topk import (
     biased_grouped_topk_impl as native_biased_grouped_topk,
 )
-from sglang.srt.layers.moe.topk import fused_topk_native as native_fused_topk
-from sglang.srt.layers.moe.topk import grouped_topk as native_grouped_topk
+from sglang.srt.layers.moe.topk import fused_topk_torch_native as native_fused_topk
+from sglang.srt.layers.moe.topk import grouped_topk_gpu as native_grouped_topk
 from sglang.srt.models.llama4 import Llama4MoE
 from sglang.test.test_utils import CustomTestCase
+
+torch.manual_seed(0)
 
 
 # This is used by the Deepseek-V2 model
@@ -34,7 +36,15 @@ class TestGroupedTopK(CustomTestCase):
 
         # fused version
         topk_weights, topk_ids = torch.ops.sgl_kernel.grouped_topk_cpu(
-            hidden_states, gating_output, topk, renormalize, G, topk_group
+            hidden_states,
+            gating_output,
+            topk,
+            renormalize,
+            G,
+            topk_group,
+            0,
+            None,
+            None,
         )
 
         res = torch.zeros(M, E, dtype=torch.float)
@@ -83,6 +93,9 @@ class TestBiasedGroupedTopK(CustomTestCase):
             renormalize,
             G,
             topk_group,
+            0,
+            None,
+            None,
         )
 
         res = torch.zeros(M, E, dtype=torch.float)
