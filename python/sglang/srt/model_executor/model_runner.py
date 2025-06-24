@@ -650,6 +650,7 @@ class ModelRunner:
             if hasattr(self.model, "get_attention_sliding_window_size")
             else None
         )
+        # TODO: set self.full_tokens_per_layer and self.swa_tokens_per_layer in swa memory pool init
         self.dtype = self.model_config.dtype
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
