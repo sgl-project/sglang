@@ -1,10 +1,16 @@
-# python3 benchmark/kernels/fbgemm/benchmark_fbgemm_grouped_gemm.py --model Qwen/Qwen2-57B-A14B-Instruct --tp-size 4 --use-fp8-w8a8
+# python3 benchmark/fbgemm/benchmark_fbgemm_grouped_gemm.py --model Qwen/Qwen2-57B-A14B-Instruct --tp-size 4 --use-fp8-w8a8
 import argparse
 
 import torch
 import triton
-from fbgemm_grouped_gemm import grouped_gemm as fbgemm_grouped_gemm
-from fbgemm_grouped_gemm import (
+from fbgemm_gpu.experimental.gemm.triton_gemm.fp8_gemm import (
+    quantize_fp8_row,
+    triton_quantize_fp8_row,
+)
+from fbgemm_gpu.experimental.gemm.triton_gemm.grouped_gemm import (
+    grouped_gemm as fbgemm_grouped_gemm,
+)
+from fbgemm_gpu.experimental.gemm.triton_gemm.grouped_gemm import (
     grouped_gemm_fp8_rowwise as fbgemm_grouped_gemm_fp8_rowwise,
 )
 from transformers import AutoConfig
@@ -29,12 +35,11 @@ def get_model_config(model_name: str, tp_size: int):
     elif config.architectures[0] == "Qwen3MoeForCausalLM":
         num_groups = config.num_experts
         intermediate_size = config.moe_intermediate_size
-    elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
-        num_groups = (
-            config.n_routed_experts + 1
-            if config.architectures[0] in ["DeepseekV3ForCausalLM"]
-            else config.n_routed_experts
-        )
+    elif config.architectures[0] in [
+        "DeepseekV2ForCausalLM",
+        "DeepseekV3ForCausalLM",
+    ]:
+        num_groups = config.n_routed_experts
         intermediate_size = config.moe_intermediate_size
     elif config.architectures[0] == "Llama4ForConditionalGeneration":
         num_groups = config.text_config.num_local_experts
@@ -65,7 +70,7 @@ def create_test_data(batch_size, num_groups, hidden_size, intermediate_size):
 
     tokens_per_group = batch_size // num_groups
     m_sizes = torch.full(
-        (num_groups,), tokens_per_group, dtype=torch.int64, device="cuda"
+        (num_groups,), tokens_per_group, dtype=torch.int32, device="cuda"
     )
 
     x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device="cuda")
@@ -84,11 +89,11 @@ def create_test_data(batch_size, num_groups, hidden_size, intermediate_size):
         batch_size, intermediate_size, dtype=torch.bfloat16, device="cuda"
     )
 
-    seg_indptr = torch.zeros(num_groups + 1, dtype=torch.int64, device="cuda")
+    seg_indptr = torch.zeros(num_groups + 1, dtype=torch.int32, device="cuda")
     for i in range(1, num_groups + 1):
         seg_indptr[i] = seg_indptr[i - 1] + tokens_per_group
 
-    weight_indices = torch.arange(num_groups, dtype=torch.int64, device="cuda")
+    weight_indices = torch.arange(num_groups, dtype=torch.int32, device="cuda")
 
     return (
         x,
@@ -102,39 +107,144 @@ def create_test_data(batch_size, num_groups, hidden_size, intermediate_size):
     )
 
 
-def create_fp8_test_data(batch_size, num_groups, hidden_size, intermediate_size):
+def create_fp8_test_data(
+    batch_size, num_groups, hidden_size, intermediate_size, backend="triton"
+):
+    """
+    Create test data for FP8 grouped GEMM operations.
+
+    Args:
+        batch_size: Total batch size
+        num_groups: Number of groups
+        hidden_size: Hidden dimension size
+        intermediate_size: Intermediate dimension size
+        backend: "triton" for Triton GEMM, "cutlass" for CUTLASS GEMM
+
+    Returns:
+        For triton: (x_fp8, w_fp8, m_sizes, x_scale, w_scale)
+        For cutlass: (x, wq, w_scale, m_sizes)
+    """
     torch.manual_seed(42)
 
     tokens_per_group = batch_size // num_groups
-    m_sizes = torch.full(
-        (num_groups,), tokens_per_group, dtype=torch.int64, device="cuda"
-    )
 
-    x_fp16 = torch.randn(batch_size, hidden_size, dtype=torch.float16, device="cuda")
-    w_fp16 = torch.randn(
-        num_groups * intermediate_size, hidden_size, dtype=torch.float16, device="cuda"
-    )
+    # Create weight matrices for each group
+    w_list = []
+    for _ in range(num_groups):
+        w = torch.randn(
+            intermediate_size, hidden_size, dtype=torch.float16, device="cuda"
+        )
+        w_list.append(w)
 
-    x_fp8 = x_fp16.to(torch.float8_e4m3fn)
-    w_fp8 = w_fp16.to(torch.float8_e4m3fn)
+    # Quantize weights using quantize_fp8_row for each group
+    wq_list, w_scale_list = zip(*[quantize_fp8_row(w) for w in w_list])
 
-    x_scale = torch.randn(batch_size, dtype=torch.float32, device="cuda").abs() + 1e-4
-    w_scale = torch.randn(num_groups, dtype=torch.float32, device="cuda").abs() + 1e-4
+    if backend == "triton":
+        # Triton format: concatenated weights
+        w_fp8 = torch.concat(wq_list, dim=0).contiguous()
+        w_scale = torch.concat(w_scale_list, dim=0).contiguous()
 
-    return x_fp8, w_fp8, m_sizes, x_scale, w_scale
+        # Create m_sizes as int32 for triton
+        m_sizes = torch.full(
+            (num_groups,), tokens_per_group, dtype=torch.int32, device="cuda"
+        )
+
+        # Create and quantize input
+        x_fp16 = torch.randn(
+            batch_size, hidden_size, dtype=torch.float16, device="cuda"
+        )
+        x_fp8, x_scale = triton_quantize_fp8_row(x_fp16)
+        x_scale = x_scale.view(batch_size, -1)
+
+        return x_fp8, w_fp8, m_sizes, x_scale, w_scale
+
+    elif backend == "cutlass":
+        # CUTLASS format: stacked weights
+        wq = torch.stack(wq_list, dim=0).contiguous()
+        w_scale = torch.stack(w_scale_list, dim=0).contiguous()
+
+        # Create m_sizes as int64 for cutlass
+        m_values = [tokens_per_group] * num_groups
+        m_sizes = torch.tensor(m_values).to(dtype=torch.int64, device="cuda")
+
+        # Create input data - separate for each group then concat
+        x_list = []
+        for _ in range(num_groups):
+            x = torch.randn(
+                tokens_per_group, hidden_size, dtype=torch.float16, device="cuda"
+            )
+            x_list.append(x)
+
+        # Concatenate inputs into single tensor
+        x = torch.concat(x_list, dim=0).contiguous()
+
+        return x, wq, w_scale, m_sizes
+
+    else:
+        raise ValueError(f"Unsupported backend: {backend}")
+
+
+def calculate_memory_bandwidth(m_sizes, hidden_size, intermediate_size, dtype):
+    """
+    Calculate memory bandwidth based on accessed expert weights.
+
+    Args:
+        m_sizes: Tensor containing batch sizes for each group
+        hidden_size: Hidden dimension size
+        intermediate_size: Intermediate dimension size
+        dtype: Data type of weights
+
+    Returns:
+        Memory size in bytes for accessed expert weights
+    """
+    # Count non-zero groups (active experts)
+    if hasattr(m_sizes, "cpu"):
+        active_experts = torch.count_nonzero(m_sizes).item()
+    else:
+        active_experts = sum(1 for m in m_sizes if m > 0)
+
+    # Calculate bytes per element based on dtype
+    if dtype in [torch.float16, torch.bfloat16]:
+        bytes_per_element = 2
+    elif dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        bytes_per_element = 1
+    elif dtype == torch.float32:
+        bytes_per_element = 4
+    else:
+        # Default to 2 bytes for unknown dtypes
+        bytes_per_element = 2
+
+    # Memory per expert weight matrix
+    memory_per_expert = hidden_size * intermediate_size * bytes_per_element
+
+    # Total memory for active experts
+    total_memory_bytes = active_experts * memory_per_expert
+
+    return total_memory_bytes
 
 
 def get_benchmark_config(use_fp8_w8a8=False):
     if use_fp8_w8a8:
         return {
-            "line_vals": ["fbgemm_grouped_gemm_fp8", "sglang_grouped_gemm"],
-            "line_names": ["FBGEMM Grouped GEMM FP8", "SGLang Grouped GEMM FP8"],
-            "styles": [("blue", "-"), ("red", "-")],
+            "line_vals": [
+                "fbgemm_triton_grouped_gemm_fp8",
+                "fbgemm_cutlass_f8f8bf16_rowwise",
+                "sglang_grouped_gemm",
+            ],
+            "line_names": [
+                "FBGEMM Triton Grouped GEMM FP8",
+                "FBGEMM CUTLASS F8F8BF16 Rowwise",
+                "SGLang Grouped GEMM FP8",
+            ],
+            "styles": [("blue", "-"), ("orange", "-"), ("red", "-")],
         }
     else:
         return {
-            "line_vals": ["fbgemm_grouped_gemm", "sglang_grouped_gemm"],
-            "line_names": ["FBGEMM Grouped GEMM BF16", "SGLang Grouped GEMM BF16"],
+            "line_vals": ["fbgemm_triton_grouped_gemm", "sglang_grouped_gemm"],
+            "line_names": [
+                "FBGEMM Triton Grouped GEMM BF16",
+                "SGLang Grouped GEMM BF16",
+            ],
             "styles": [("blue", "-"), ("green", "-")],
         }
 
@@ -146,12 +256,12 @@ def run_benchmark(
 
     benchmark_config = triton.testing.Benchmark(
         x_names=["batch_size"],
-        x_vals=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+        x_vals=[256, 512, 1024, 2048, 4096],
         line_arg="provider",
         line_vals=config["line_vals"],
         line_names=config["line_names"],
         styles=config["styles"],
-        ylabel="Time (ms)",
+        ylabel="Bandwidth (GB/s)",
         plot_name="grouped-gemm-performance",
         args={},
     )
@@ -165,12 +275,21 @@ def run_benchmark(
         hidden_size = model_config["hidden_size"]
         intermediate_size = model_config["intermediate_size"]
 
-        if provider == "fbgemm_grouped_gemm_fp8":
+        if provider == "fbgemm_triton_grouped_gemm_fp8":
             try:
                 test_data = create_fp8_test_data(
-                    batch_size, num_groups, hidden_size, intermediate_size
+                    batch_size,
+                    num_groups,
+                    hidden_size,
+                    intermediate_size,
+                    backend="triton",
                 )
                 x_fp8, w_fp8, m_sizes, x_scale, w_scale = test_data
+
+                # Calculate memory bandwidth
+                memory_bytes = calculate_memory_bandwidth(
+                    m_sizes, hidden_size, intermediate_size, torch.float8_e4m3fn
+                )
 
                 def run_func():
                     return fbgemm_grouped_gemm_fp8_rowwise(
@@ -179,6 +298,38 @@ def run_benchmark(
 
             except Exception as e:
                 print(f"FP8 not supported, skipping: {e}")
+                return float("inf"), float("inf"), float("inf")
+
+        elif provider == "fbgemm_cutlass_f8f8bf16_rowwise":
+            try:
+                test_data = create_fp8_test_data(
+                    batch_size,
+                    num_groups,
+                    hidden_size,
+                    intermediate_size,
+                    backend="cutlass",
+                )
+                x, wq, w_scale, m_sizes = test_data
+
+                # Calculate memory bandwidth
+                memory_bytes = calculate_memory_bandwidth(
+                    m_sizes, hidden_size, intermediate_size, torch.float8_e4m3fn
+                )
+
+                # Quantize input using triton_quantize_fp8_row
+                xq, x_scale = triton_quantize_fp8_row(x)
+                x_scale = x_scale.view(batch_size, -1)
+
+                def run_func():
+                    return torch.ops.fbgemm.f8f8bf16_rowwise_grouped_stacked(
+                        xq, wq, x_scale, w_scale, m_sizes
+                    )
+
+            except Exception as e:
+                print(
+                    f"CUTLASS f8f8bf16_rowwise_grouped_stacked not supported, "
+                    f"skipping: {e}"
+                )
                 return float("inf"), float("inf"), float("inf")
         else:
             test_data = create_test_data(
@@ -195,7 +346,12 @@ def run_benchmark(
                 weight_indices,
             ) = test_data
 
-            if provider == "fbgemm_grouped_gemm":
+            # Calculate memory bandwidth for BF16 operations
+            memory_bytes = calculate_memory_bandwidth(
+                m_sizes, hidden_size, intermediate_size, torch.bfloat16
+            )
+
+            if provider == "fbgemm_triton_grouped_gemm":
 
                 def run_func():
                     return fbgemm_grouped_gemm(
@@ -228,10 +384,19 @@ def run_benchmark(
         try:
             quantiles = [0.5, 0.2, 0.8]
             ms, min_ms, max_ms = triton.testing.do_bench(run_func, quantiles=quantiles)
-            return ms, min_ms, max_ms
+
+            # Convert time (ms) to bandwidth (GB/s)
+            # Bandwidth = Memory (bytes) / Time (seconds)
+            # Convert ms to seconds and bytes to GB (1e9)
+            gb_per_s = (memory_bytes / 1e9) / (ms / 1000)
+            # min bandwidth = max time, max bandwidth = min time
+            min_gb_per_s = (memory_bytes / 1e9) / (max_ms / 1000)
+            max_gb_per_s = (memory_bytes / 1e9) / (min_ms / 1000)
+
+            return gb_per_s, min_gb_per_s, max_gb_per_s
         except Exception as e:
             print(f"Error during benchmarking for {provider}: {e}")
-            return float("inf"), float("inf"), float("inf")
+            return 0.0, 0.0, 0.0
 
     dynamic_benchmark.run(
         show_plots=True,
@@ -242,7 +407,7 @@ def run_benchmark(
     )
 
 
-def verify_correctness(model_config, use_fp8_w8a8):
+def verify_correctness(model_config):
     print("Verifying correctness...")
     batch_size = 128
     num_groups = model_config["num_groups"]
@@ -250,53 +415,38 @@ def verify_correctness(model_config, use_fp8_w8a8):
     intermediate_size = model_config["intermediate_size"]
 
     test_data = create_test_data(batch_size, num_groups, hidden_size, intermediate_size)
-    (x, w_fbgemm, w_sglang, c_fbgemm, c_sglang, m_sizes, seg_indptr, weight_indices) = (
-        test_data
+    (
+        x,
+        w_fbgemm,
+        w_sglang,
+        c_fbgemm,
+        c_sglang,
+        m_sizes,
+        seg_indptr,
+        weight_indices,
+    ) = test_data
+
+    result_fbgemm = fbgemm_grouped_gemm(x, w_fbgemm, m_sizes, use_fast_accum=True)
+
+    result_sglang = sglang_grouped_gemm(
+        x,
+        w_sglang,
+        c_sglang,
+        num_groups,
+        weight_column_major=True,
+        seg_indptr=seg_indptr,
+        weight_indices=weight_indices,
+        c_dtype=c_sglang.dtype,
     )
 
-    try:
-        result_fbgemm = fbgemm_grouped_gemm(x, w_fbgemm, m_sizes, use_fast_accum=True)
-
-        result_sglang = sglang_grouped_gemm(
-            x,
-            w_sglang,
-            c_sglang,
-            num_groups,
-            weight_column_major=True,
-            seg_indptr=seg_indptr,
-            weight_indices=weight_indices,
-            c_dtype=c_sglang.dtype,
-        )
-
-        if torch.allclose(result_fbgemm, result_sglang, rtol=1e-3, atol=1e-3):
-            print("✓ BF16 Correctness verification passed!")
-        else:
-            max_diff = torch.max(torch.abs(result_fbgemm - result_sglang))
-            print(f"✗ BF16 Correctness verification failed! Max diff: {max_diff}")
-            return False
-
-        if use_fp8_w8a8:
-            try:
-                fp8_data = create_fp8_test_data(
-                    batch_size, num_groups, hidden_size, intermediate_size
-                )
-                x_fp8, w_fp8, m_sizes_fp8, x_scale, w_scale = fp8_data
-
-                result_fp8 = fbgemm_grouped_gemm_fp8_rowwise(
-                    x_fp8, w_fp8, m_sizes_fp8, x_scale, w_scale, use_fast_accum=True
-                )
-
-                assert result_fp8.shape == (batch_size, intermediate_size)
-                print("✓ FP8 functionality test passed!")
-            except Exception as e:
-                print(f"FP8 test failed (possibly unsupported): {e}")
-                return False
-
-        return True
-
-    except Exception as e:
-        print(f"✗ Error during correctness verification: {e}")
+    if torch.allclose(result_fbgemm, result_sglang, rtol=1e-3, atol=1e-3):
+        print("✓ BF16 Correctness verification passed!")
+    else:
+        max_diff = torch.max(torch.abs(result_fbgemm - result_sglang))
+        print(f"✗ BF16 Correctness verification failed! Max diff: {max_diff}")
         return False
+
+    return True
 
 
 def main():
@@ -348,7 +498,7 @@ def main():
     print(f"  use_fp8_w8a8: {args.use_fp8_w8a8}")
 
     if args.verify_correctness:
-        if not verify_correctness(model_config, args.use_fp8_w8a8):
+        if not verify_correctness(model_config):
             print("Correctness verification failed. Exiting...")
             return
 
