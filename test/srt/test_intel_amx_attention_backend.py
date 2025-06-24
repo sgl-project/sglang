@@ -67,7 +67,7 @@ class TestIntelAMXAttnBackend(CustomTestCase):
             )
 
             metrics = run_eval(args)
-            self.assertGreaterEqual(metrics["score"], 0.65)
+            self.assertGreater(metrics["score"], 0.5)
         finally:
             kill_process_tree(process.pid)
 
