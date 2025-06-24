@@ -52,6 +52,7 @@ from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
+    get_bool_env_var,
     get_device_memory_capacity,
     rank0_log,
     require_attn_tp_gather,
@@ -135,7 +136,9 @@ def patch_model(
                 mode=os.environ.get(
                     "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
                 ),
-                dynamic=False,
+                dynamic=get_bool_env_var(
+                    "SGLANG_ENABLE_DYNAMIC_TORCH_COMPILE", "false"
+                ),
             )
         else:
             yield model.forward
