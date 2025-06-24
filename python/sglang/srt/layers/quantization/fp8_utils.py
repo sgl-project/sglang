@@ -45,7 +45,6 @@ if _use_aiter:
     import aiter
     from aiter import gemm_a8w8_blockscale_CK, get_hip_quant
     from aiter import gemm_a8w8_bpreshuffle_CK
-    from aiter.ops.shuffle import shuffle_weight
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
@@ -615,19 +614,15 @@ def apply_fp8_linear(
                 and USE_HIP_SCALED_MM
             ):
                 if _use_aiter:
-                    # with shuffle weight the CK kernel do not need to cache weight on LDS
-                    # and get better performance
-                    weight_shuffled = shuffle_weight(weight.t(), layout=(16,16))
-                    
                     output = gemm_a8w8_bpreshuffle_CK(
                         XQ=qinput,
-                        WQ=weight_shuffled,
+                        WQ=weight,
                         x_scale=x_scale,
                         w_scale=weight_scale,
                         dtype=input.dtype)
                     if bias is not None:
                         output += bias
-                    return _process_scaled_mm_output(output, input_2d.shape, output_shape)
+                    return _process_scaled_mm_output(output, input_2d.shape, [*input.shape[:-1], weight.shape[0]])
                 else:
                     # For now validated on ROCm platform
                     # fp8 rowwise scaling in torch._scaled_mm is introduced in
