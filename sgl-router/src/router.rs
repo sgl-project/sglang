@@ -455,14 +455,13 @@ impl Router {
         let mut dp_aware_workers: Vec<String> = Vec::new();
 
         for url in worker_urls {
-            match Self::get_worker_dp_size(&url[..], api_key) {
+            match Self::get_worker_dp_size(url, api_key) {
                 Ok(dp_size) => {
                     for i in 0..dp_size {
-                        let worker_url_dp = String::from(format!("{}@{}", &url, i));
-                        dp_aware_workers.push(worker_url_dp);
+                        dp_aware_workers.push(format!("{}@{}", url, i));
                     }
                 },
-                Err(e) => return Err(format!("get_worker_dp_size failed: {}", e)),
+                Err(e) => return Err(format!("Failed to get DP size for {}: {}", url, e)),
             }
         }
 
@@ -952,8 +951,8 @@ impl Router {
                 debug!("Modified request body: {}",
                     serde_json::to_string(&json_val).unwrap_or(String::from("ERR")));
             } else {
-                warn!("Failed to insert the data_parallel_rank field into the request body");
-                // still try to send the request
+                return HttpResponse::BadRequest()
+                    .body("Failed to insert the data_parallel_rank field into the request body")
             }
 
             let body = match serde_json::to_vec(&json_val) {
