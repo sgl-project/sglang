@@ -449,7 +449,6 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
-    meta_info: Optional[Dict] = None
 
 
 class DeltaMessage(BaseModel):
