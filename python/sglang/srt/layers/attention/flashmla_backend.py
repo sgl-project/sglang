@@ -161,22 +161,20 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         else:
             cuda_graph_kv_indices = block_kv_indices
 
-        if self.num_draft_tokens:
-            self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
-                torch.ones(
-                    max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
-                ),
-                self.num_draft_tokens * self.num_q_heads,
-                1,
-            )
-        else:
-            self.cuda_graph_mla_metadata, self.cuda_graph_num_splits = get_mla_metadata(
-                torch.ones(
-                    max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
-                ),
-                self.num_q_heads,
-                1,
-            )
+        self.cuda_graph_mla_metadata_verify, self.cuda_graph_num_splits_verify = get_mla_metadata(
+            torch.ones(
+                max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
+            ),
+            self.num_draft_tokens * self.num_q_heads,
+            1,
+        )
+        self.cuda_graph_mla_metadata_decoder, self.cuda_graph_num_splits_decoder = get_mla_metadata(
+            torch.ones(
+                max_bs, dtype=torch.int32, device=cuda_graph_kv_indices.device
+            ),
+            self.num_q_heads,
+            1,
+        )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
 
     def init_forward_metadata_capture_cuda_graph(
@@ -206,11 +204,11 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.num_q_heads,
                 1,
             )
-            self.cuda_graph_mla_metadata.copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+            self.cuda_graph_mla_metadata_decoder.copy_(mla_metadata)
+            self.cuda_graph_num_splits_decoder[: bs + 1].copy_(num_splits)
             self.forward_metadata = FlashMLADecodeMetadata(
-                self.cuda_graph_mla_metadata,
-                self.cuda_graph_num_splits[: bs + 1],
+                self.cuda_graph_mla_metadata_decoder,
+                self.cuda_graph_num_splits_decoder[: bs + 1],
                 self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
             )
         elif forward_mode.is_target_verify():
@@ -231,11 +229,11 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.num_draft_tokens * self.num_q_heads,
                 1,
             )
-            self.cuda_graph_mla_metadata.copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
+            self.cuda_graph_mla_metadata_verify.copy_(mla_metadata)
+            self.cuda_graph_num_splits_verify[: bs + 1].copy_(num_splits)
             self.forward_metadata = FlashMLADecodeMetadata(
-                self.cuda_graph_mla_metadata,
-                self.cuda_graph_num_splits[: bs + 1],
+                self.cuda_graph_mla_metadata_verify,
+                self.cuda_graph_num_splits_verify[: bs + 1],
                 self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
             )
         else:
@@ -280,10 +278,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.num_q_heads,
                 1,
             )
-            self.cuda_graph_mla_metadata.copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-            self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata
-            self.forward_metadata.num_splits = self.cuda_graph_num_splits[: bs + 1]
+            self.cuda_graph_mla_metadata_decoder.copy_(mla_metadata)
+            self.cuda_graph_num_splits_decoder[: bs + 1].copy_(num_splits)
+            self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata_decoder
+            self.forward_metadata.num_splits = self.cuda_graph_num_splits_decoder[: bs + 1]
             self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
                 :bs, :max_seqlen_pad
             ]
@@ -305,10 +303,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.num_draft_tokens * self.num_q_heads,
                 1,
             )
-            self.cuda_graph_mla_metadata.copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-            self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata
-            self.forward_metadata.num_splits = self.cuda_graph_num_splits[: bs + 1]
+            self.cuda_graph_mla_metadata_verify.copy_(mla_metadata)
+            self.cuda_graph_num_splits_verify[: bs + 1].copy_(num_splits)
+            self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata_verify
+            self.forward_metadata.num_splits = self.cuda_graph_num_splits_verify[: bs + 1]
             self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
                 :bs, :max_seqlen_pad
             ]
