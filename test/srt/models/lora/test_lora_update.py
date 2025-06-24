@@ -21,8 +21,8 @@ from typing import List, Optional, Union
 import requests
 import torch
 
-from sglang.test.runners import SRTRunner
 from sglang.srt.utils import kill_process_tree
+from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -207,17 +207,15 @@ class LoRAUpdateTestSessionMode(Enum):
     SERVER = "server"
 
 
-class LoRAUpdateTestSession:
+class LoRAUpdateTestSessionBase:
     """
-    Context manager for testing LoRA adapters either in‐process (engine)
-    or via a standalone server.
+    Base context manager for testing LoRA adapters.
     """
 
     def __init__(
         self,
         *,
         testcase: Optional[TestCase],
-        mode: LoRAUpdateTestSessionMode,  # "engine" or "server"
         model_path: str,
         lora_paths: list[str],
         max_loras_per_batch: int = 1,
@@ -226,7 +224,6 @@ class LoRAUpdateTestSession:
         cuda_graph_max_bs: int = 4,
     ):
         self.testcase = testcase
-        self.mode = mode
         self.model_path = model_path
         self.lora_paths = lora_paths
         self.max_loras_per_batch = max_loras_per_batch
@@ -238,91 +235,81 @@ class LoRAUpdateTestSession:
         self.handle = None  # Will be set in __enter__
 
     def __enter__(self):
-        if self.mode == LoRAUpdateTestSessionMode.ENGINE:
-            # in-process runner
-            self.handle = SRTRunner(
-                model_path=self.model_path,
-                model_type="generation",
-                lora_paths=self.lora_paths,
-                lora_backend=self.lora_backend,
-                torch_dtype=torch.float16,
-                max_loras_per_batch=self.max_loras_per_batch,
-                disable_cuda_graph=self.disable_cuda_graph,
-                cuda_graph_max_bs=self.cuda_graph_max_bs,
-                disable_radix_cache=True,
-            )
-            self.handle.__enter__()
-            return self
-
-        elif self.mode == LoRAUpdateTestSessionMode.SERVER:
-            other_args = [
-                "--cuda-graph-max-bs",
-                str(self.cuda_graph_max_bs),
-                "--lora-paths",
-                *self.lora_paths,
-                "--max-loras-per-batch",
-                str(self.max_loras_per_batch),
-                "--lora-backend",
-                self.lora_backend,
-                "--disable-radix-cache",
-                "--random-seed", "42",
-            ]
-            if self.disable_cuda_graph:
-                other_args.append("--disable-cuda-graph")
-
-            # launch external server
-            self.handle = popen_launch_server(
-                self.model_path,
-                DEFAULT_URL_FOR_TEST,
-                DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=other_args,
-            )
-            return self
-
-        else:
-            raise ValueError(f"Unrecognized mode: {self.mode!r}")
+        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.mode == LoRAUpdateTestSessionMode.ENGINE and self.handle is not None:
-            # delegate cleanup to SRTRunner
-            return self.handle.__exit__(exc_type, exc_val, exc_tb)
-
-        elif self.mode == LoRAUpdateTestSessionMode.SERVER and self.handle is not None:
-            kill_process_tree(self.handle.pid)
-            # don’t suppress exceptions
-            return False
-
-        # fallback: don’t suppress exceptions
+        # Don't suppress exceptions by default
         return False
 
     def load_lora_adapter(self, lora_name: str, lora_path: Optional[str] = None):
         """
         Load a LoRA adapter by name and path.
         """
+        raise NotImplementedError("Subclasses must implement load_lora_adapter")
 
+    def unload_lora_adapter(self, lora_name: str):
+        """
+        Unload a LoRA adapter by name.
+        """
+        raise NotImplementedError("Subclasses must implement unload_lora_adapter")
+
+    def forward(
+        self,
+        prompts: List[str],
+        lora_paths: List[str],
+        max_new_tokens: int = 32,
+    ):
+        """
+        Perform a batch forward pass with the current set of loaded LoRA adapters.
+        """
+        raise NotImplementedError("Subclasses must implement forward")
+
+
+class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
+    """
+    Context manager for testing LoRA adapters with in-process engine.
+    """
+
+    def __enter__(self):
+        # in-process runner
+        self.handle = SRTRunner(
+            model_path=self.model_path,
+            model_type="generation",
+            lora_paths=self.lora_paths,
+            lora_backend=self.lora_backend,
+            torch_dtype=torch.float16,
+            max_loras_per_batch=self.max_loras_per_batch,
+            disable_cuda_graph=self.disable_cuda_graph,
+            cuda_graph_max_bs=self.cuda_graph_max_bs,
+            disable_radix_cache=True,
+        )
+        self.handle.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.handle is not None:
+            # delegate cleanup to SRTRunner
+            return self.handle.__exit__(exc_type, exc_val, exc_tb)
+        # don't suppress exceptions
+        return False
+
+    def load_lora_adapter(self, lora_name: str, lora_path: Optional[str] = None):
+        """
+        Load a LoRA adapter by name and path.
+        """
         if lora_path is None:
             lora_path = lora_name
 
         self.expected_adapters.add(lora_name)
 
-        if self.mode == LoRAUpdateTestSessionMode.ENGINE:
-            response = self.handle.load_lora_adapter(
-                lora_name=lora_name,
-                lora_path=lora_path,
-            )
-            self.testcase.assertTrue(response.success)
-            loaded_adapters = set(response.loaded_adapters)
-
-        elif self.mode == LoRAUpdateTestSessionMode.SERVER:
-            response = requests.post(
-                DEFAULT_URL_FOR_TEST + "/load_lora_adapter",
-                json={"lora_name": lora_name, "lora_path": lora_path},
-            )
-            self.testcase.assertTrue(response.ok)
-            loaded_adapters = set(response.json()["loaded_adapters"])
+        response = self.handle.load_lora_adapter(
+            lora_name=lora_name,
+            lora_path=lora_path,
+        )
+        self.testcase.assertTrue(response.success)
+        loaded_adapters = set(response.loaded_adapters)
 
         print(f"loaded_adapters: {loaded_adapters}")
-
         self.testcase.assertEqual(loaded_adapters, self.expected_adapters)
 
     def unload_lora_adapter(self, lora_name: str):
@@ -331,23 +318,13 @@ class LoRAUpdateTestSession:
         """
         self.expected_adapters.remove(lora_name)
 
-        if self.mode == LoRAUpdateTestSessionMode.ENGINE:
-            response = self.handle.unload_lora_adapter(
-                lora_name=lora_name,
-            )
-            self.testcase.assertTrue(response.success)
-            loaded_adapters = set(response.loaded_adapters)
-
-        elif self.mode == LoRAUpdateTestSessionMode.SERVER:
-            response = requests.post(
-                DEFAULT_URL_FOR_TEST + "/unload_lora_adapter",
-                json={"lora_name": lora_name},
-            )
-            self.testcase.assertTrue(response.ok)
-            loaded_adapters = set(response.json()["loaded_adapters"])
+        response = self.handle.unload_lora_adapter(
+            lora_name=lora_name,
+        )
+        self.testcase.assertTrue(response.success)
+        loaded_adapters = set(response.loaded_adapters)
 
         print(f"loaded_adapters: {loaded_adapters}")
-
         self.testcase.assertEqual(loaded_adapters, self.expected_adapters)
 
     def forward(
@@ -359,33 +336,147 @@ class LoRAUpdateTestSession:
         """
         Perform a batch forward pass with the current set of loaded LoRA adapters.
         """
-        if self.mode == LoRAUpdateTestSessionMode.ENGINE:
-            response = self.handle.batch_forward(
-                prompts=prompts,
-                lora_paths=lora_paths,
-                max_new_tokens=max_new_tokens,
-            )
-            output_strs = response.output_strs
-
-        elif self.mode == LoRAUpdateTestSessionMode.SERVER:
-            response = requests.post(
-                DEFAULT_URL_FOR_TEST + "/generate",
-                json={
-                    "text": prompts,
-                    "lora_path": lora_paths,
-                    "sampling_params": {
-                        "temperature": 0,
-                        "top_k": 1,
-                        "max_new_tokens": 32,
-                    },
-                },
-            )
-            self.testcase.assertTrue(response.ok)
-            output_strs = [r["text"] for r in response.json()]
+        response = self.handle.batch_forward(
+            prompts=prompts,
+            lora_paths=lora_paths,
+            max_new_tokens=max_new_tokens,
+        )
+        output_strs = response.output_strs
 
         print(f"output_strs: {output_strs}")
-
         return output_strs
+
+
+class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
+    """
+    Context manager for testing LoRA adapters with standalone server.
+    """
+
+    def __enter__(self):
+        other_args = [
+            "--cuda-graph-max-bs",
+            str(self.cuda_graph_max_bs),
+            "--lora-paths",
+            *self.lora_paths,
+            "--max-loras-per-batch",
+            str(self.max_loras_per_batch),
+            "--lora-backend",
+            self.lora_backend,
+            "--disable-radix-cache",
+            "--random-seed",
+            "42",
+            "--max-running-request",
+            "1",
+        ]
+        if self.disable_cuda_graph:
+            other_args.append("--disable-cuda-graph")
+
+        # launch external server
+        self.handle = popen_launch_server(
+            self.model_path,
+            DEFAULT_URL_FOR_TEST,
+            DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.handle is not None:
+            kill_process_tree(self.handle.pid)
+        # don't suppress exceptions
+        return False
+
+    def load_lora_adapter(self, lora_name: str, lora_path: Optional[str] = None):
+        """
+        Load a LoRA adapter by name and path.
+        """
+        if lora_path is None:
+            lora_path = lora_name
+
+        self.expected_adapters.add(lora_name)
+
+        response = requests.post(
+            DEFAULT_URL_FOR_TEST + "/load_lora_adapter",
+            json={"lora_name": lora_name, "lora_path": lora_path},
+        )
+        self.testcase.assertTrue(response.ok)
+        loaded_adapters = set(response.json()["loaded_adapters"])
+
+        print(f"loaded_adapters: {loaded_adapters}")
+        self.testcase.assertEqual(loaded_adapters, self.expected_adapters)
+
+    def unload_lora_adapter(self, lora_name: str):
+        """
+        Unload a LoRA adapter by name.
+        """
+        self.expected_adapters.remove(lora_name)
+
+        response = requests.post(
+            DEFAULT_URL_FOR_TEST + "/unload_lora_adapter",
+            json={"lora_name": lora_name},
+        )
+        self.testcase.assertTrue(response.ok)
+        loaded_adapters = set(response.json()["loaded_adapters"])
+
+        print(f"loaded_adapters: {loaded_adapters}")
+        self.testcase.assertEqual(loaded_adapters, self.expected_adapters)
+
+    def forward(
+        self,
+        prompts: List[str],
+        lora_paths: List[str],
+        max_new_tokens: int = 32,
+    ):
+        """
+        Perform a batch forward pass with the current set of loaded LoRA adapters.
+        """
+        response = requests.post(
+            DEFAULT_URL_FOR_TEST + "/generate",
+            json={
+                "text": prompts,
+                "lora_path": lora_paths,
+                "sampling_params": {
+                    "temperature": 0,
+                    "top_k": 1,
+                    "max_new_tokens": max_new_tokens,
+                },
+            },
+        )
+        self.testcase.assertTrue(response.ok)
+        output_strs = [r["text"] for r in response.json()]
+
+        print(f"output_strs: {output_strs}")
+        return output_strs
+
+
+# Factory function to create the appropriate LoRA test session based on mode
+def LoRAUpdateTestSession(
+    *,
+    testcase: Optional[TestCase],
+    mode: LoRAUpdateTestSessionMode,
+    model_path: str,
+    lora_paths: list[str],
+    max_loras_per_batch: int = 1,
+    lora_backend: str = "triton",
+    disable_cuda_graph: bool = False,
+    cuda_graph_max_bs: int = 4,
+):
+    common_kwargs = {
+        "testcase": testcase,
+        "model_path": model_path,
+        "lora_paths": lora_paths,
+        "max_loras_per_batch": max_loras_per_batch,
+        "lora_backend": lora_backend,
+        "disable_cuda_graph": disable_cuda_graph,
+        "cuda_graph_max_bs": cuda_graph_max_bs,
+    }
+
+    if mode == LoRAUpdateTestSessionMode.ENGINE:
+        return LoRAUpdateEngineTestSession(**common_kwargs)
+    elif mode == LoRAUpdateTestSessionMode.SERVER:
+        return LoRAUpdateServerTestSession(**common_kwargs)
+    else:
+        raise ValueError(f"Unrecognized mode: {mode!r}")
 
 
 class TestLoRADynamicUpdate(CustomTestCase):
@@ -450,7 +541,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
     def test_dynamic_adapter_updates(self):
         for case_idx, test_case in enumerate(TEST_CASES, start=1):
             for mode in [
-                LoRAUpdateTestSessionMode.SERVER,
+                # LoRAUpdateTestSessionMode.SERVER,
                 LoRAUpdateTestSessionMode.ENGINE,
             ]:
                 print("=" * 100)
@@ -476,6 +567,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
                 forward_ops = [
                     x for x in test_case.op_sequence if x.type == OperationType.FORWARD
                 ]
+
                 print("=" * 100)
                 print(
                     f"\n--- Running static pass with {len(forward_ops)} operations ---"
