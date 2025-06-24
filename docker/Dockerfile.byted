@@ -65,6 +65,5 @@ ENTRYPOINT [ "/entrypoint.sh" ]
 # 将源统一还原成火山的源
 RUN pip config set global.index-url https://mirrors.ivolces.com/pypi/simple/
 RUN rm -rf /var/lib/apt/lists/* && \
-    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list.d/cuda.list && \
-    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list.d/ubuntu.sources && \
-    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list.d/volctools.list
+    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list.d/* && \
+    sed -i 's/byted.org/ivolces.com/g' /etc/apt/sources.list
