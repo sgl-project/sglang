@@ -1374,7 +1374,14 @@ class Scheduler(
             )
             raise ValueError(msg)
 
-        if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            req_total_size = (
+                self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
+            )
+        else:
+            req_total_size = self.req_to_token_pool.size
+
+        if len(self.req_to_token_pool.free_slots) != req_total_size:
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
@@ -1813,11 +1820,6 @@ class Scheduler(
             can_cuda_graph = 1
         else:
             can_cuda_graph = 0
-
-        if not spec_algorithm.is_none():
-            # TODO(sang): Support cuda graph when idle batch is there.
-            if local_batch is None or local_batch.forward_mode.is_idle():
-                can_cuda_graph = 0
 
         is_extend_in_batch = (
             local_batch.forward_mode.is_extend() if local_batch else False
