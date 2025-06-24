@@ -1481,7 +1481,11 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         if not enable_rope_fusion:
             k_pe = k_input[..., self.kv_lora_rank :]
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            if not (
+                forward_batch.hip_metadata_cache_pool is not None
+                and forward_batch.hip_metadata_cache_pool.hip_config.using_extend
+            ):
+                q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
             q_input[..., self.kv_lora_rank :] = q_pe
             k_input[..., self.kv_lora_rank :] = k_pe
             k_pe_output = None
@@ -1891,7 +1895,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         v = kv[..., self.qk_nope_head_dim :]
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
 
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        if not (
+            forward_batch.hip_metadata_cache_pool is not None
+            and forward_batch.hip_metadata_cache_pool.hip_config.using_extend
+        ):
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
         k[..., : self.qk_nope_head_dim] = k_nope
