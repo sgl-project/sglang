@@ -310,22 +310,44 @@ class PrefillAdder:
                     for r in running_batch.reqs
                 ]
             )
+        
+        self.is_hybrid = isinstance(
+            self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+        )
 
     @property
     def rem_total_tokens(self):
-        return (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
-            - self.rem_total_token_offset
-        )
+        if self.is_hybrid:
+            available_and_evictable = min(
+                self.token_to_kv_pool_allocator.full_available_size()
+                + self.tree_cache.full_evictable_size(),
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size(),
+            )
+        else:
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.available_size()
+                + self.tree_cache.evictable_size()
+            )
+
+        return available_and_evictable - self.rem_total_token_offset
 
     @property
     def cur_rem_tokens(self):
-        return (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
-            - self.cur_rem_token_offset
-        )
+        if self.is_hybrid:
+            available_and_evictable = min(
+                self.token_to_kv_pool_allocator.full_available_size()
+                + self.tree_cache.full_evictable_size(),
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size(),
+            )
+        else:
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.available_size()
+                + self.tree_cache.evictable_size()
+            )
+
+        return available_and_evictable - self.cur_rem_token_offset
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
