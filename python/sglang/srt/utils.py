@@ -891,9 +891,10 @@ def add_payload_size_limit_middleware(app, max_payload_size: int):
         # check body size
         try:
             max_body_size = get_int_env_var("SGLANG_MAX_PAYLOAD_SIZE", max_payload_size)
-        except ValueError:
+        except ValueError as e:
             logger.warning(
-                "SGLANG_MAX_PAYLOAD_SIZE is not a valid integer, using default value."
+                "SGLANG_MAX_PAYLOAD_SIZE is not a valid integer, using default value. Exception: %s",
+                str(e),
             )
 
         # check content-length header if available
