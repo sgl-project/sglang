@@ -20,28 +20,23 @@ test: ## Run all tests
 
 bench: ## Run full benchmark suite
 	@echo "Running full benchmarks..."
-	@./scripts/run_benchmarks.sh
+	@python3 scripts/run_benchmarks.py
 
 bench-quick: ## Run quick benchmarks only
 	@echo "Running quick benchmarks..."
-	@./scripts/run_benchmarks.sh --quick
+	@python3 scripts/run_benchmarks.py --quick
 
 bench-baseline: ## Save current performance as baseline
 	@echo "Saving performance baseline..."
-	@./scripts/run_benchmarks.sh --save-baseline $(shell date +%Y%m%d)-baseline
+	@python3 scripts/run_benchmarks.py --save-baseline main
 
-bench-compare: ## Compare with saved baseline (requires BASELINE variable)
-	@if [ -z "$(BASELINE)" ]; then \
-		echo "Error: Please specify BASELINE variable"; \
-		echo "   Example: make bench-compare BASELINE=20241224-baseline"; \
-		exit 1; \
-	fi
-	@echo "Comparing with baseline: $(BASELINE)"
-	@./scripts/run_benchmarks.sh --compare-baseline $(BASELINE)
+bench-compare: ## Compare with saved baseline
+	@echo "Comparing with baseline..."
+	@python3 scripts/run_benchmarks.py --compare-baseline main
 
 bench-ci: ## Run benchmarks suitable for CI (quick mode)
 	@echo "Running CI benchmarks..."
-	@./scripts/run_benchmarks.sh --quick
+	@python3 scripts/run_benchmarks.py --quick
 
 clean: ## Clean build artifacts
 	@echo "Cleaning build artifacts..."

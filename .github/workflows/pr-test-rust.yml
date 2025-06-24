@@ -51,8 +51,8 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
-          # Run quick benchmarks to ensure they work
-          ./scripts/run_benchmarks.sh --quick
+          # Run quick benchmarks to ensure they work using Python script
+          python3 scripts/run_benchmarks.py --quick
 
   e2e-python:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'

@@ -57,83 +57,8 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
-          # Run quick benchmarks for PR validation
-          ./scripts/run_benchmarks.sh --quick
-
-      - name: Check for performance regressions
-        run: |
-          source "$HOME/.cargo/env"
-          cd sgl-router/
-
-          # Define performance thresholds (in nanoseconds)
-          MAX_SERIALIZATION_TIME=2000      # 2μs max for serialization
-          MAX_DESERIALIZATION_TIME=2000    # 2μs max for deserialization
-          MAX_ADAPTATION_TIME=5000         # 5μs max for PD adaptation
-          MAX_TOTAL_PIPELINE_TIME=10000    # 10μs max for total pipeline
-
-          echo "Validating performance thresholds..."
-          echo "Max serialization: ${MAX_SERIALIZATION_TIME}ns"
-          echo "Max deserialization: ${MAX_DESERIALIZATION_TIME}ns"
-          echo "Max adaptation: ${MAX_ADAPTATION_TIME}ns"
-          echo "Max total pipeline: ${MAX_TOTAL_PIPELINE_TIME}ns"
-
-          # Run a quick benchmark and capture output
-          benchmark_output=$(./scripts/run_benchmarks.sh --quick 2>&1)
-          echo "$benchmark_output"
-
-          # Extract performance metrics using simple grep/awk
-          serialization_time=$(echo "$benchmark_output" | grep "Serialization (avg):" | awk '{print $4}' | tr -d 'ns/req')
-          deserialization_time=$(echo "$benchmark_output" | grep "Deserialization (avg):" | awk '{print $4}' | tr -d 'ns/req')
-          adaptation_time=$(echo "$benchmark_output" | grep "PD Adaptation (avg):" | awk '{print $5}' | tr -d 'ns/req')
-          total_time=$(echo "$benchmark_output" | grep "Total Pipeline (avg):" | awk '{print $5}' | tr -d 'ns/req')
-
-          echo "Measured performance:"
-          echo "Serialization: ${serialization_time}ns"
-          echo "Deserialization: ${deserialization_time}ns"
-          echo "Adaptation: ${adaptation_time}ns"
-          echo "Total: ${total_time}ns"
-
-          # Validate thresholds
-          failed=false
-
-          if [ "$serialization_time" -gt "$MAX_SERIALIZATION_TIME" ]; then
-            echo "ERROR: Serialization time ${serialization_time}ns exceeds threshold ${MAX_SERIALIZATION_TIME}ns"
-            failed=true
-          fi
-
-          if [ "$deserialization_time" -gt "$MAX_DESERIALIZATION_TIME" ]; then
-            echo "ERROR: Deserialization time ${deserialization_time}ns exceeds threshold ${MAX_DESERIALIZATION_TIME}ns"
-            failed=true
-          fi
-
-          if [ "$adaptation_time" -gt "$MAX_ADAPTATION_TIME" ]; then
-            echo "ERROR: Adaptation time ${adaptation_time}ns exceeds threshold ${MAX_ADAPTATION_TIME}ns"
-            failed=true
-          fi
-
-          if [ "$total_time" -gt "$MAX_TOTAL_PIPELINE_TIME" ]; then
-            echo "ERROR: Total pipeline time ${total_time}ns exceeds threshold ${MAX_TOTAL_PIPELINE_TIME}ns"
-            failed=true
-          fi
-
-          if [ "$failed" = true ]; then
-            echo "Performance regression detected!"
-            exit 1
-          else
-            echo "All performance thresholds passed!"
-          fi
-
-          # Save benchmark results as environment variables and to a file
-          echo "SERIALIZATION_TIME=${serialization_time:-N/A}" >> $GITHUB_ENV
-          echo "DESERIALIZATION_TIME=${deserialization_time:-N/A}" >> $GITHUB_ENV
-          echo "ADAPTATION_TIME=${adaptation_time:-N/A}" >> $GITHUB_ENV
-          echo "TOTAL_TIME=${total_time:-N/A}" >> $GITHUB_ENV
-
-          # Also save to a file for reliable access
-          echo "serialization_time=${serialization_time:-N/A}" > benchmark_results.env
-          echo "deserialization_time=${deserialization_time:-N/A}" >> benchmark_results.env
-          echo "adaptation_time=${adaptation_time:-N/A}" >> benchmark_results.env
-          echo "total_time=${total_time:-N/A}" >> benchmark_results.env
+          # Run quick benchmarks for PR validation using Python script
+          python3 scripts/run_benchmarks.py --quick --validate-thresholds --save-results
 
       - name: Upload benchmark results
         if: always()
@@ -144,93 +69,17 @@ jobs:
             sgl-router/target/criterion/
           retention-days: 30
 
-      - name: Comment PR with benchmark results
+      - name: Post benchmark results as PR comment
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-
-            // Try to read benchmark results from file
-            let serialization_time = 'N/A';
-            let deserialization_time = 'N/A';
-            let adaptation_time = 'N/A';
-            let total_time = 'N/A';
-
-            try {
-              const resultsFile = 'sgl-router/benchmark_results.env';
-              if (fs.existsSync(resultsFile)) {
-                const content = fs.readFileSync(resultsFile, 'utf8');
-                const lines = content.split('\n');
-                for (const line of lines) {
-                  const [key, value] = line.split('=');
-                  if (key === 'serialization_time') serialization_time = value;
-                  if (key === 'deserialization_time') deserialization_time = value;
-                  if (key === 'adaptation_time') adaptation_time = value;
-                  if (key === 'total_time') total_time = value;
-                }
-              }
-            } catch (error) {
-              console.log('Could not read benchmark results file:', error);
-            }
-
-            const benchmarkResults = `
-            ### SGLang Router Benchmark Results
-
-            **Performance Summary for PR #${{ github.event.number }}**
-
-            The router benchmarks have completed successfully!
-
-            **Performance Thresholds:** All passed
-            - Serialization: < 2μs
-            - Deserialization: < 2μs
-            - PD Adaptation: < 5μs
-            - Total Pipeline: < 10μs
-
-            **Measured Results:**
-            - Serialization: \`${serialization_time}\`ns
-            - Deserialization: \`${deserialization_time}\`ns
-            - PD Adaptation: \`${adaptation_time}\`ns
-            - Total Pipeline: \`${total_time}\`ns
-
-            **Detailed Reports:**
-            - Download the \`benchmark-results-${{ github.sha }}\` artifact for HTML reports
-            - Run \`make bench\` locally for detailed analysis
-
-            **Commit:** ${{ github.sha }}
-            `;
-
-            // Find existing benchmark comment
-            const comments = await github.rest.issues.listComments({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-            });
-
-            const existingComment = comments.data.find(comment =>
-              comment.user.login === 'github-actions[bot]' &&
-              comment.body.includes('SGLang Router Benchmark Results')
-            );
-
-            if (existingComment) {
-              // Update existing comment
-              await github.rest.issues.updateComment({
-                comment_id: existingComment.id,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: benchmarkResults
-              });
-              console.log('Updated existing benchmark comment');
-            } else {
-              // Create new comment
-              await github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: benchmarkResults
-              });
-              console.log('Created new benchmark comment');
-            }
+        run: |
+          cd sgl-router/
+          # Use Python script to post benchmark comment
+          python3 scripts/post_benchmark_comment.py \
+            --pr-number ${{ github.event.number }} \
+            --commit-sha ${{ github.sha }} \
+            --results-file benchmark_results.env
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   benchmark-integration-test:
     if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
