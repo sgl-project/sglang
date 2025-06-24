@@ -1504,7 +1504,6 @@ def v1_chat_generate_response(
                         + ret[i]["meta_info"]["completion_tokens"],
                     },
                     "system_fingerprint": None,
-                    "meta_info": meta_info,
                 },
             }
             responses.append(response)
@@ -1528,7 +1527,6 @@ def v1_chat_generate_response(
                     {"cached_tokens": cached_tokens} if cache_report else None
                 ),
             ),
-            meta_info=meta_info,
         )
         return response
 
