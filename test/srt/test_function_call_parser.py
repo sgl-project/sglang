@@ -1092,7 +1092,7 @@ class TestLlama32Detector(unittest.TestCase):
 
     def test_multiple_json_with_separator(self):
         text = (
-            '<|python_tag|>{"name": "get_weather", "parameters": {"city": "Paris"}};'
+            '<|python_tag|>{"name": "get_weather", "parameters": {"city": "Paris"}}; '
             '{"name": "get_tourist_attractions", "parameters": {"city": "Paris"}}'
         )
         result = self.detector.detect_and_parse(text, self.tools)
