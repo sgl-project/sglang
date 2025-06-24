@@ -1481,12 +1481,6 @@ def v1_chat_generate_response(
 
         choices.append(choice_data)
 
-    meta_info = {
-        "spec_verify_ct": [
-            ret_item["meta_info"].get("spec_verify_ct", 0) for ret_item in ret
-        ]
-    }
-
     if to_file:
         responses = []
 
