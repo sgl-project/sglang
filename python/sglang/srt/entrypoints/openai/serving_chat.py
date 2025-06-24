@@ -22,6 +22,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
     FunctionResponse,
     LogProbs,
+    MessageProcessingResult,
     ToolCall,
     TopLogprob,
 )
@@ -62,41 +63,33 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
-        (
-            prompt,
-            prompt_ids,
-            image_data,
-            audio_data,
-            modalities,
-            stop,
-            tool_call_constraint,
-        ) = self._process_messages(request, is_multimodal)
+        result = self._process_messages(request, is_multimodal)
 
         # Build sampling parameters
         sampling_params = self._build_sampling_params(
-            request, stop, tool_call_constraint
+            request, result.stop, result.tool_call_constraint
         )
 
         # Handle single vs multiple requests
         if is_multimodal:
-            prompt_kwargs = {"text": prompt}
+            prompt_kwargs = {"text": result.prompt}
         else:
-            if isinstance(prompt_ids, str):
-                prompt_kwargs = {"text": prompt_ids}
+            if isinstance(result.prompt_ids, str):
+                prompt_kwargs = {"text": result.prompt_ids}
             else:
-                prompt_kwargs = {"input_ids": prompt_ids}
+                prompt_kwargs = {"input_ids": result.prompt_ids}
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
-            image_data=image_data,
-            audio_data=audio_data,
+            image_data=result.image_data,
+            audio_data=result.audio_data,
             sampling_params=sampling_params,
             return_logprob=request.logprobs,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
             stream=request.stream,
             return_text_in_logprobs=True,
-            modalities=modalities,
+            modalities=result.modalities,
             lora_path=request.lora_path,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
@@ -108,15 +101,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
-    ) -> tuple[
-        str,
-        Union[str, List[int]],
-        Optional[Any],
-        Optional[Any],
-        List[str],
-        List[str],
-        Optional[Any],
-    ]:
+    ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
         tool_call_constraint = None
         prompt = ""
@@ -144,13 +129,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Use chat template
             if self.template_manager.chat_template_name is None:
-                prompt, prompt_ids, image_data, audio_data, modalities, stop = (
-                    self._apply_jinja_template(request, tools, is_multimodal)
-                )
+                result = self._apply_jinja_template(request, tools, is_multimodal)
             else:
-                prompt, prompt_ids, image_data, audio_data, modalities, stop = (
-                    self._apply_conversation_template(request, is_multimodal)
-                )
+                result = self._apply_conversation_template(request, is_multimodal)
         else:
             # Use raw prompt
             prompt_ids = request.messages
@@ -159,23 +140,24 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data = None
             modalities = []
             prompt = request.messages
+            result = MessageProcessingResult(
+                prompt=prompt,
+                prompt_ids=prompt_ids,
+                image_data=image_data,
+                audio_data=audio_data,
+                modalities=modalities,
+                stop=stop,
+                tool_call_constraint=tool_call_constraint,
+            )
 
-        return (
-            prompt,
-            prompt_ids,
-            image_data,
-            audio_data,
-            modalities,
-            stop,
-            tool_call_constraint,
-        )
+        return result
 
     def _apply_jinja_template(
         self,
         request: ChatCompletionRequest,
         tools: Optional[List[Dict]],
         is_multimodal: bool,
-    ) -> tuple[str, List[int], Optional[Any], Optional[Any], List[str], List[str]]:
+    ) -> MessageProcessingResult:
         """Apply Jinja chat template"""
         prompt = ""
         prompt_ids = []
@@ -253,13 +235,20 @@ class OpenAIServingChat(OpenAIServingBase):
         image_data = image_data if image_data else None
         audio_data = audio_data if audio_data else None
         modalities = modalities if modalities else []
-        return prompt, prompt_ids, image_data, audio_data, modalities, stop
+        return MessageProcessingResult(
+            prompt=prompt,
+            prompt_ids=prompt_ids,
+            image_data=image_data,
+            audio_data=audio_data,
+            modalities=modalities,
+            stop=stop,
+        )
 
     def _apply_conversation_template(
         self,
         request: ChatCompletionRequest,
         is_multimodal: bool,
-    ) -> tuple[str, Optional[Any], Optional[Any], List[str], List[str], List[str]]:
+    ) -> MessageProcessingResult:
         """Apply conversation template"""
         prompt = ""
         prompt_ids = []
@@ -304,7 +293,14 @@ class OpenAIServingChat(OpenAIServingBase):
         if not is_multimodal:
             prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
 
-        return prompt, prompt_ids, image_data, audio_data, modalities, stop
+        return MessageProcessingResult(
+            prompt=prompt,
+            prompt_ids=prompt_ids,
+            image_data=image_data,
+            audio_data=audio_data,
+            modalities=modalities,
+            stop=stop,
+        )
 
     def _build_sampling_params(
         self,

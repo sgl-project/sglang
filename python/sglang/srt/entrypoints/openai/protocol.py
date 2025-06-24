@@ -14,7 +14,8 @@
 """Pydantic models for OpenAI API protocol"""
 
 import time
-from typing import Dict, List, Optional, Union
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import (
     BaseModel,
@@ -587,3 +588,30 @@ OpenAIServingRequest = Union[
     ScoringRequest,
     V1RerankReqInput,
 ]
+
+
+@dataclass
+class MessageProcessingResult:
+    """Result of processing chat messages and applying templates.
+
+    This dataclass encapsulates all the outputs from message processing including
+    prompt generation, multimodal data extraction, and constraint preparation.
+    Used internally by OpenAIServingChat to pass processed data between methods.
+
+    Args:
+        prompt: The final text prompt after applying chat template
+        prompt_ids: Either the text prompt (str) or tokenized IDs (List[int])
+        image_data: Extracted image data from messages, if any
+        audio_data: Extracted audio data from messages, if any
+        modalities: List of modality types present in the messages
+        stop: Combined stop strings from template and request
+        tool_call_constraint: Optional constraint for structured tool calls
+    """
+
+    prompt: str
+    prompt_ids: Union[str, List[int]]
+    image_data: Optional[Any]
+    audio_data: Optional[Any]
+    modalities: List[str]
+    stop: List[str]
+    tool_call_constraint: Optional[Any] = None
