@@ -136,6 +136,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-cache-report` | Return number of cached tokens in usage.prompt_tokens_details for each openai request. | False |
 | `--reasoning-parser` | Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}. | None |
 | `--tool-call-parser` | Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', and 'pythonic'. | None |
+| `--max-payload-size` | The maximum payload size in bytes for each request body. | 50MB |
 
 ##  Data parallelism
 
