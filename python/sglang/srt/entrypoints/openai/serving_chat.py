@@ -132,6 +132,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 result = self._apply_jinja_template(request, tools, is_multimodal)
             else:
                 result = self._apply_conversation_template(request, is_multimodal)
+
+            result.tool_call_constraint = tool_call_constraint
+            return result
         else:
             # Use raw prompt
             prompt_ids = request.messages
@@ -140,7 +143,8 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data = None
             modalities = []
             prompt = request.messages
-            result = MessageProcessingResult(
+
+            return MessageProcessingResult(
                 prompt=prompt,
                 prompt_ids=prompt_ids,
                 image_data=image_data,
@@ -149,8 +153,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 stop=stop,
                 tool_call_constraint=tool_call_constraint,
             )
-
-        return result
 
     def _apply_jinja_template(
         self,
