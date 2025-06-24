@@ -33,39 +33,55 @@ from sglang.srt.utils import add_prefix, make_layers
 
 
 class Gemma3nCumulativeGroupNorm(nn.Module):
-    """Applies Group Normalization cumulatively over the time dimension."""
+    """Applies Group Normalization cumulatively over the time dimension.
+
+    This layer normalizes the input by calculating the mean and variance
+    cumulatively over the time dimension (dim 1). The statistics are computed
+    over all feature dimensions (specified by `feature_dims` and `num_channels`)
+    for elements marked as valid by the optional `mask`.
+
+    If a `mask` is provided (True for valid, False for invalid/padded),
+    invalid time steps do not contribute to the statistics calculation, and
+    their corresponding output values are zeroed out.
+
+    Scale and bias, if enabled, are applied per-channel (last dimension).
+    This behavior is similar to JAX's `GroupNormalization` with `num_groups=1`
+    and `cumulative=True`.
+    """
 
     def __init__(
         self,
-        num_channels: int,
-        feature_dims: Sequence[int],
+        num_channels: int,  # Number of channels (size of the last dimension)
+        feature_dims: Sequence[
+            int
+        ],  # Sizes of non-channel feature dimensions, e.g., (H, W) for input [B,T,H,W,C]
         eps: float = 1e-3,
-        use_scale: bool = True,
-        use_bias: bool = False,
     ):
         super().__init__()
         self.num_channels = num_channels
         self.feature_dims = tuple(feature_dims)
         self.eps = eps
-        self.use_scale = use_scale
-        self.use_bias = use_bias
 
-        if self.use_scale:
-            self.weight = nn.Parameter(torch.ones(num_channels))
-        else:
-            self.register_parameter("weight", None)
+        # Scale parameter depends only on the channel dimension
+        self.weight = nn.Parameter(torch.ones(num_channels))
 
-        if self.use_bias:
-            self.bias = nn.Parameter(torch.zeros(num_channels))
-        else:
-            self.register_parameter("bias", None)
-
+        # Axes for normalization: all dimensions except Batch (0) and Time (1).
+        # For input [B, T, *feature_dims, C], these are dims from 2 onwards.
         self.reduction_axes = tuple(range(2, 2 + len(self.feature_dims) + 1))
 
     def forward(
         self, x: torch.Tensor, mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Applies cumulative group norm, optionally using a mask."""
+        """Applies cumulative group norm, optionally using a mask.
+
+        Args:
+          x: Input tensor, shape [B, T, *feature_dims, C].
+          mask: Optional boolean mask, shape [B, T]. True indicates a valid
+            (non-padded) time step. If None, all time steps are considered valid.
+
+        Returns:
+          Normalized tensor with the same shape as x.
+        """
         expected_input_suffix = self.feature_dims + (self.num_channels,)
         if x.shape[2:] != expected_input_suffix:
             raise ValueError(
@@ -73,62 +89,63 @@ class Gemma3nCumulativeGroupNorm(nn.Module):
                 f" suffix (feature_dims + num_channels) {expected_input_suffix}"
             )
 
-        if mask is not None:
-            if mask.shape != x.shape[:2]:
-                raise ValueError(
-                    f"Mask shape {mask.shape} must match input Batch/Time dimensions {x.shape[:2]}"
-                )
-            if mask.dtype != torch.bool:
-                raise TypeError("Mask must be a boolean tensor.")
-
         input_dtype = x.dtype
+        # Calculations are performed in float32 for numerical stability.
         calc_dtype = torch.float32
         x_calc = x.to(calc_dtype)
 
-        if mask is not None:
-            mask_suffix_shape = (1,) * len(expected_input_suffix)
-            mask_calc = mask.view(mask.shape + mask_suffix_shape).to(calc_dtype)
-        else:
-            mask_calc = torch.ones_like(x_calc, dtype=calc_dtype)
-
-        x_masked_for_sum = x_calc * mask_calc
+        # Prepare a broadcastable mask (`mask_calc`).
+        # If no mask is provided, treat all elements as valid
+        # (mask_calc is all ones).
+        # Otherwise, expand the [B, T] mask to [B, T, 1, ..., 1] for broadcasting.
+        mask_calc = torch.ones_like(x_calc, dtype=calc_dtype)
 
         # Cumulative Statistics Calculation
-        sum_values_at_t = torch.sum(
-            x_masked_for_sum, dim=self.reduction_axes, keepdim=True
-        )
+        # 1. Sum of values over reduction axes at each time step.
+        sum_values_at_t = torch.sum(x_calc, dim=self.reduction_axes, keepdim=True)
+        # 2. Cumulative sum of values over time.
         cum_sum_values = torch.cumsum(sum_values_at_t, dim=1)
 
+        # 3. Count of valid elements in the normalization group at each time step.
+        #    (A "group" here consists of all features at a given Batch, Time).
         elements_in_group_at_t = torch.sum(
             mask_calc, dim=self.reduction_axes, keepdim=True
         )
+        # 4. Cumulative count of valid elements over time.
         cum_count_elements = torch.cumsum(elements_in_group_at_t, dim=1)
+        # Avoid division by zero if all preceding elements were masked.
         safe_cum_count_elements = torch.clamp(cum_count_elements, min=1.0)
 
+        # 5. Cumulative mean.
         cum_mean = cum_sum_values / safe_cum_count_elements
 
+        # 6. Sum of squared differences from the cumulative mean.
+        #    Only sum for valid elements: (x_calc - cum_mean)^2 * mask_calc.
+        #    Using x_calc here for the difference, as cum_mean already accounts for masking.
         squared_diff_from_mean = (x_calc - cum_mean).pow(2)
         sum_sq_diff_at_t = torch.sum(
-            squared_diff_from_mean * mask_calc,
-            dim=self.reduction_axes,
-            keepdim=True,
+            squared_diff_from_mean, dim=self.reduction_axes, keepdim=True
         )
+
+        # 7. Cumulative sum of squared differences over time.
         cum_sum_sq_diff = torch.cumsum(sum_sq_diff_at_t, dim=1)
 
+        # 8. Cumulative variance.
         cum_variance = cum_sum_sq_diff / safe_cum_count_elements
 
+        # Normalize the input using the calculated cumulative statistics:
+        # (x - E[x]) / sqrt(Var[x] + eps)
         normalized_x = (x_calc - cum_mean) * torch.rsqrt(cum_variance + self.eps)
 
-        if self.use_scale and self.weight is not None:
-            scale = self.weight.to(calc_dtype)
-            scale_view_shape = [1] * (x.dim() - 1) + [self.num_channels]
-            normalized_x = normalized_x * scale.view(scale_view_shape)
+        # Apply affine transformation (scale and bias) if enabled.
+        # Scale and bias are applied per-channel (last dimension).
+        scale = self.weight.to(calc_dtype)
+        # Reshape for broadcasting: [C] -> [1, ..., 1, C]
+        scale_view_shape = [1] * (x.dim() - 1) + [self.num_channels]
+        normalized_x = normalized_x * scale.view(scale_view_shape)
 
-        if self.use_bias and self.bias is not None:
-            bias = self.bias.to(calc_dtype)
-            bias_view_shape = [1] * (x.dim() - 1) + [self.num_channels]
-            normalized_x = normalized_x + bias.view(bias_view_shape)
-
+        # Zero out outputs for time steps that were originally masked (where mask_calc is 0).
+        # This ensures padded/invalid positions in the input result in zero output.
         final_output = normalized_x * mask_calc
 
         return final_output.to(input_dtype)
@@ -292,9 +309,6 @@ class Gemma3nAudioAttention(nn.Module):
         self.chunk_size = self.config.conf_attention_chunk_size
         self.max_future_horizon = self.config.conf_attention_context_right
         self.max_past_horizon = max(0, self.config.conf_attention_context_left - 1)
-        self.attention_invalid_logits_value = (
-            self.config.conf_attention_invalid_logits_value
-        )
         self.attention_logits_soft_cap = self.config.conf_attention_logit_cap
         self.context_size = (
             self.chunk_size + self.max_past_horizon + self.max_future_horizon
@@ -454,15 +468,17 @@ class Gemma3nAudioAttention(nn.Module):
         logits = torch.tanh(logits)
         logits = logits * softcap_val
 
-        # Apply mask
+        # Apply the combined mask.
+        # final_condition_for_where will broadcast with logits [B,N,U,W,C]
         logits = torch.where(
-            final_condition_for_where, logits, self.attention_invalid_logits_value
+            final_condition_for_where, logits, torch.finfo(logits.dtype).min
         )
+
         probabilities = F.softmax(logits, dim=-1, dtype=torch.float32).to(
             dtype=value_blocks.dtype
         )
 
-        # Compute context vectors
+        # context_vectors is adapted from jax.numpy.einsum("BNuwc,BucNH->BuwNH", ...)
         b_dim, n_dim, u_dim, w_dim, c_dim = probabilities.shape
         h_dim = value_blocks.shape[-1]
         prob_bun = probabilities.permute(0, 2, 1, 3, 4).reshape(-1, w_dim, c_dim)
@@ -521,8 +537,6 @@ class Gemma3nAudioSSCPConvBlock(nn.Module):
             num_channels=out_channels,
             feature_dims=(f_out_conv,),
             eps=self.config.sscp_conv_eps,
-            use_scale=True,
-            use_bias=False,
         )
 
         self.activation = nn.ReLU()
@@ -626,7 +640,11 @@ class Gemma3nAudioConformerAttention(nn.Module):
         self.post_in_shape = (self.config.conf_num_attention_heads, head_dim)
         self.post_in_features = self.config.hidden_size
 
-        self.gradient_clipping = torch.tensor(self.config.gradient_clipping)
+        self.register_buffer(
+            "gradient_clipping",
+            torch.tensor(self.config.gradient_clipping),
+            persistent=False,
+        )
 
         self.pre_attn_norm = Gemma3nRMSNorm(self.config.hidden_size)
         self.attn = Gemma3nAudioAttention(
@@ -673,7 +691,11 @@ class Gemma3nAudioConformerFeedForward(nn.Module):
         super().__init__()
         self.config = config
 
-        self.gradient_clipping = torch.tensor(self.config.gradient_clipping)
+        self.register_buffer(
+            "gradient_clipping",
+            torch.tensor(self.config.gradient_clipping),
+            persistent=False,
+        )
 
         self.pre_layer_norm = Gemma3nRMSNorm(self.config.hidden_size)
         self.ffw_layer_1 = ColumnParallelLinear(
@@ -739,7 +761,11 @@ class Gemma3nAudioConformerLightConv1d(nn.Module):
             groups=self.config.hidden_size,  # Depthwise
             bias=False,
         )
-        self.gradient_clipping = torch.tensor(self.config.gradient_clipping)
+        self.register_buffer(
+            "gradient_clipping",
+            torch.tensor(self.config.gradient_clipping),
+            persistent=False,
+        )
         self.conv_norm = Gemma3nRMSNorm(
             self.config.hidden_size, eps=self.config.rms_norm_eps
         )
@@ -801,7 +827,11 @@ class Gemma3nAudioConformerBlock(nn.Module):
         self.ffw_layer_end = Gemma3nAudioConformerFeedForward(
             config, quant_config, prefix=add_prefix("ffw_layer_end", prefix)
         )
-        self.gradient_clipping = torch.tensor(self.config.gradient_clipping)
+        self.register_buffer(
+            "gradient_clipping",
+            torch.tensor(self.config.gradient_clipping),
+            persistent=False,
+        )
         self.norm = Gemma3nRMSNorm(self.config.hidden_size)
 
     def forward(

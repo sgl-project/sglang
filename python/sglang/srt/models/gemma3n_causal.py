@@ -28,6 +28,7 @@ from transformers import (
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -47,6 +48,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.models.gemma3_causal import Gemma3TextScaledWordEmbedding
 from sglang.srt.utils import add_prefix, make_layers
 
 
@@ -56,17 +58,15 @@ def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
 
-class Gemma3nRMSNorm(nn.Module):
+class Gemma3nRMSNorm(Gemma3RMSNorm):
     def __init__(
         self,
         dim: int,
         eps: float = 1e-6,
-        scale_shift: float = 0.0,
         with_scale: bool = True,
     ):
-        super().__init__()
-        self.eps = eps
-        self.scale_shift = scale_shift
+        super().__init__(dim, eps=eps)
+        del self.weight
         self.with_scale = with_scale
 
         if self.with_scale:
@@ -80,36 +80,40 @@ class Gemma3nRMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Llama does x.to(float16) * w whilst Gemma3n is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
-        output = self._norm(x) * (self.weight + self.scale_shift).type_as(x)
+        output = self._norm(x) * self.weight.type_as(x)
         return output.type_as(x)
 
 
-class Gemma3nTextScaledWordEmbedding(VocabParallelEmbedding):
-    """
-    This module overrides VocabParallelEmbedding's forward by multiplying with embeddings scale.
-    """
+# class Gemma3nTextScaledWordEmbedding(VocabParallelEmbedding):
+#     """
+#     This module overrides VocabParallelEmbedding's forward by multiplying with embeddings scale.
+#     """
 
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        org_num_embeddings: Optional[int] = None,
-        embed_scale: float = 1.0,
-    ):
-        super().__init__(
-            num_embeddings=num_embeddings,
-            embedding_dim=embedding_dim,
-            quant_config=quant_config,
-            prefix=prefix,
-            org_num_embeddings=org_num_embeddings,
-        )
-        self.embed_scale = embed_scale
+#     def __init__(
+#         self,
+#         num_embeddings: int,
+#         embedding_dim: int,
+#         quant_config: Optional[QuantizationConfig] = None,
+#         prefix: str = "",
+#         org_num_embeddings: Optional[int] = None,
+#         embed_scale: float = 1.0,
+#     ):
+#         super().__init__(
+#             num_embeddings=num_embeddings,
+#             embedding_dim=embedding_dim,
+#             quant_config=quant_config,
+#             prefix=prefix,
+#             org_num_embeddings=org_num_embeddings,
+#         )
+#         self.embed_scale = embed_scale
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        embeddings = super().forward(input_ids)
-        return embeddings * self.embed_scale
+#     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+#         embeddings = super().forward(input_ids)
+#         return embeddings * self.embed_scale
+
+
+class Gemma3nTextScaledWordEmbedding(Gemma3TextScaledWordEmbedding):
+    pass
 
 
 class Gemma3nMLP(nn.Module):
@@ -206,8 +210,6 @@ class Gemma3nLaurelBlock(nn.Module):
         self.post_laurel_norm = Gemma3nRMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
-            scale_shift=0.0,
-            with_scale=True,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -258,8 +260,6 @@ class Gemma3nAltUp(nn.Module):
         self.router_norm = Gemma3nRMSNorm(
             dim=config.hidden_size,
             eps=config.rms_norm_eps,
-            scale_shift=0.0,
-            with_scale=True,
         )
 
         self.register_buffer(
@@ -277,9 +277,7 @@ class Gemma3nAltUp(nn.Module):
         routed, _ = self.modality_router(router_inputs)
 
         # routed : [num_tokens, altup_num_inputs]
-        return torch.tanh(
-            routed
-        )  # TODO: MAYBE NEED TO CHANGE TO torch.tanh(routed.float())
+        return torch.tanh(routed.float()).type_as(routed)
 
     def predict(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Predicts the output of a layer using a trainable map.
@@ -487,7 +485,6 @@ class Gemma3nAttention(nn.Module):
                 rope_scaling=config.rope_scaling,
             )
 
-        self.attn_logit_softcapping = self.config.attn_logit_softcapping
         self.sliding_window = config.sliding_window if self.is_sliding else None
 
         self.attn = RadixAttention(
@@ -498,7 +495,7 @@ class Gemma3nAttention(nn.Module):
             layer_id=(
                 layer_id if not self.is_kv_shared_layer else self.kv_shared_layer_index
             ),
-            logit_cap=getattr(config, "attn_logit_softcapping", 0.0) or 0.0,
+            logit_cap=0.0,
             sliding_window_size=self.sliding_window,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -508,17 +505,14 @@ class Gemma3nAttention(nn.Module):
         self.q_norm = Gemma3nRMSNorm(
             dim=config.head_dim,
             eps=config.rms_norm_eps,
-            scale_shift=0.0,
         )
         self.k_norm = Gemma3nRMSNorm(
             dim=config.head_dim,
             eps=config.rms_norm_eps,
-            scale_shift=0.0,
         )
         self.v_norm = Gemma3nRMSNorm(
             dim=config.head_dim,
             eps=config.rms_norm_eps,
-            scale_shift=0.0,
             with_scale=False,
         )
 
@@ -681,17 +675,15 @@ class Gemma3nDecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        self.input_layernorm = Gemma3nRMSNorm(
-            self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
-        )
+        self.input_layernorm = Gemma3nRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Gemma3nRMSNorm(
-            self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
+            self.hidden_size, eps=config.rms_norm_eps
         )
         self.pre_feedforward_layernorm = Gemma3nRMSNorm(
-            self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
+            self.hidden_size, eps=config.rms_norm_eps
         )
         self.post_feedforward_layernorm = Gemma3nRMSNorm(
-            self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
+            self.hidden_size, eps=config.rms_norm_eps
         )
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
@@ -718,7 +710,7 @@ class Gemma3nDecoderLayer(nn.Module):
             prefix=add_prefix("per_layer_projection", prefix),
         )
         self.post_per_layer_input_norm = Gemma3nRMSNorm(
-            self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
+            self.hidden_size, eps=config.rms_norm_eps
         )
         self.is_sliding = self.self_attn.is_sliding
 
@@ -794,21 +786,19 @@ class Gemma3nTextModel(PreTrainedModel):
         self.config = config
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
+        self.padding_idx = config.pad_token_id
 
         # Gemma3n downcasts the below to float16, causing sqrt(3072)=55.4256 to become 55.5
         self.embed_tokens = Gemma3nTextScaledWordEmbedding(
             config.vocab_size,
             config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("embed_tokens", prefix),
+            self.padding_idx,
             embed_scale=self.config.hidden_size**0.5,
         )
 
         self.norm = Gemma3nRMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            scale_shift=0.0,
-            with_scale=True,
         )
 
         self.layers = make_layers(
@@ -827,11 +817,10 @@ class Gemma3nTextModel(PreTrainedModel):
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
 
         self.embed_tokens_per_layer = Gemma3nTextScaledWordEmbedding(
-            config.vocab_size,
+            config.vocab_size_per_layer_input,
             config.num_hidden_layers * config.hidden_size_per_layer_input,
-            quant_config=quant_config,
-            prefix=add_prefix("embed_tokens_per_layer", prefix),
-            embed_scale=config.hidden_size_per_layer_input**0.5,
+            self.padding_idx,
+            embed_scale=self.config.hidden_size_per_layer_input**0.5,
         )
 
         self.per_layer_model_projection = ColumnParallelLinear(
@@ -845,8 +834,6 @@ class Gemma3nTextModel(PreTrainedModel):
         self.per_layer_projection_norm = Gemma3nRMSNorm(
             dim=config.hidden_size_per_layer_input,
             eps=config.rms_norm_eps,
-            scale_shift=0.0,
-            with_scale=True,
         )
 
         self.altup_projections = make_layers(
@@ -891,13 +878,7 @@ class Gemma3nTextModel(PreTrainedModel):
         return next(self.parameters()).dtype
 
     def get_per_layer_inputs(self, input_ids: torch.LongTensor) -> torch.Tensor:
-        per_layer_inputs_mask = torch.logical_and(
-            input_ids >= 0, input_ids < self.vocab_size
-        )
-        tokens = torch.where(
-            per_layer_inputs_mask, input_ids, torch.zeros_like(input_ids)
-        )
-        embeddings = self.embed_tokens_per_layer(tokens)
+        embeddings = self.embed_tokens_per_layer(input_ids)
         return embeddings.reshape(
             *input_ids.shape,
             self.config.num_hidden_layers,

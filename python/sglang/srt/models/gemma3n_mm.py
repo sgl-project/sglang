@@ -18,7 +18,7 @@
 import logging
 import re
 from functools import lru_cache
-from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict
+from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict, Union
 
 import torch
 from torch import nn
@@ -66,60 +66,54 @@ class Gemma3nAudioInputs(TypedDict):
     """Shape: `(batch_size * num_audio, seq_length)`"""
 
 
-class Gemma3nVisionEmbedder(nn.Module):
-    """Vision embedder for Gemma3n multimodal."""
+class Gemma3nMultimodalEmbedder(nn.Module):
+    """Embeds token ids or soft tokens for multimodal content into language model space."""
 
     def __init__(
         self,
-        config: Gemma3nConfig,
+        multimodal_config: Union[
+            object, object
+        ],  # Gemma3nAudioConfig or Gemma3nVisionConfig
+        text_config: object,  # Gemma3nTextConfig
         quant_config: Optional[QuantizationConfig] = None,
-        vocab_offset: int = 0,
         prefix: str = "",
     ):
         super().__init__()
 
-        if config.vision_config is None:
-            raise ValueError(
-                "`Gemma3nConfig` passed as `config` cannot have `vision_config=None`"
-            )
-
-        self.vision_config = config.vision_config
-        self.text_config = config.text_config
-        self.vocab_offset = vocab_offset
+        self.multimodal_hidden_size = multimodal_config.hidden_size
+        self.eps = multimodal_config.rms_norm_eps
+        self.vocab_offset = multimodal_config.vocab_offset
+        self.vocab_size = multimodal_config.vocab_size
+        self.text_hidden_size = text_config.hidden_size
 
         self.embedding = VocabParallelEmbedding(
-            self.vision_config.vocab_size,
-            self.vision_config.hidden_size,
+            self.vocab_size,
+            self.multimodal_hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("embedding", prefix),
         )
 
         self.hard_embedding_norm = Gemma3nRMSNorm(
-            self.vision_config.hidden_size,
-            eps=self.text_config.rms_norm_eps,
-            scale_shift=0.0,
-            with_scale=True,
+            self.multimodal_hidden_size,
+            eps=self.eps,
         )
 
         self.soft_embedding_norm = Gemma3nRMSNorm(
-            self.vision_config.hidden_size,
-            eps=self.text_config.rms_norm_eps,
-            scale_shift=0.0,
-            with_scale=True,
+            self.multimodal_hidden_size,
+            eps=self.eps,
         )
 
         self.embedding_projection = RowParallelLinear(
-            self.vision_config.hidden_size,
-            self.text_config.hidden_size,
+            self.multimodal_hidden_size,
+            self.text_hidden_size,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("embedding_projection", prefix),
         )
 
         self.embedding_post_projection_norm = Gemma3nRMSNorm(
-            dim=self.text_config.hidden_size,
-            eps=self.text_config.rms_norm_eps,
-            scale_shift=0.0,
+            self.text_hidden_size,
+            eps=self.eps,
             with_scale=False,
         )
 
@@ -128,7 +122,16 @@ class Gemma3nVisionEmbedder(nn.Module):
         input_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Embeds hard or soft tokens and projects them into the language model space."""
+        """Embeds token ids or soft tokens for multimodal content into language model space.
+
+        Args:
+            input_ids: A torch.LongTensor containing the token ids to embed. Values should be in the range
+                `[vocab_offset, vocab_offset + vocab_size)`.
+            inputs_embeds: A torch.Tensor containing the soft tokens to embed.
+
+        Returns:
+            A torch.Tensor of embeddings with  shape `[batch_size, seq_len, self.config.text_config.hidden_size]`.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You must specify exactly one of input_ids or inputs_embeds"
@@ -137,97 +140,14 @@ class Gemma3nVisionEmbedder(nn.Module):
         if inputs_embeds is not None:
             emb_norm = self.soft_embedding_norm(inputs_embeds)
         else:
-            out_of_vocab_id = self.vision_config.vocab_size - 1
-            input_ids = input_ids - self.vocab_offset
-            input_ids = torch.where(input_ids < 0, out_of_vocab_id, input_ids)
-            input_ids = torch.where(
-                input_ids >= self.vision_config.vocab_size, out_of_vocab_id, input_ids
+            # Handle out of vocab ids to prevent CUDA assertion failures
+            out_of_vocab_id = self.vocab_size - 1
+            adjusted_ids = input_ids - self.vocab_offset
+            adjusted_ids = torch.where(adjusted_ids < 0, out_of_vocab_id, adjusted_ids)
+            adjusted_ids = torch.where(
+                adjusted_ids >= self.vocab_size, out_of_vocab_id, adjusted_ids
             )
-            hard_emb = self.embedding(input_ids)
-            emb_norm = self.hard_embedding_norm(hard_emb)
-
-        emb_norm_proj, _ = self.embedding_projection(emb_norm)
-        return self.embedding_post_projection_norm(emb_norm_proj)
-
-
-class Gemma3nAudioEmbedder(nn.Module):
-    """Audio embedder for Gemma3n multimodal."""
-
-    def __init__(
-        self,
-        config: Gemma3nConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        vocab_offset: int = 0,
-        prefix: str = "",
-    ):
-        super().__init__()
-
-        if config.audio_config is None:
-            raise ValueError(
-                "`Gemma3nConfig` passed as `config` cannot have `audio_config=None`"
-            )
-
-        self.audio_config = config.audio_config
-        self.text_config = config.text_config
-        self.vocab_offset = vocab_offset
-
-        self.embedding = VocabParallelEmbedding(
-            self.audio_config.vocab_size,
-            self.audio_config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("embedding", prefix),
-        )
-
-        self.hard_embedding_norm = Gemma3nRMSNorm(
-            dim=self.audio_config.hidden_size,
-            eps=self.audio_config.rms_norm_eps,
-            scale_shift=0.0,
-            with_scale=True,
-        )
-
-        self.soft_embedding_norm = Gemma3nRMSNorm(
-            dim=self.audio_config.hidden_size,
-            eps=self.audio_config.rms_norm_eps,
-            scale_shift=0.0,
-            with_scale=True,
-        )
-
-        self.embedding_projection = RowParallelLinear(
-            self.audio_config.hidden_size,
-            self.text_config.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("embedding_projection", prefix),
-        )
-
-        self.embedding_post_projection_norm = Gemma3nRMSNorm(
-            dim=self.text_config.hidden_size,
-            eps=self.audio_config.rms_norm_eps,
-            scale_shift=0.0,
-            with_scale=False,
-        )
-
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Embeds hard or soft tokens and projects them into the language model space."""
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError(
-                "You must specify exactly one of input_ids or inputs_embeds"
-            )
-
-        if inputs_embeds is not None:
-            emb_norm = self.soft_embedding_norm(inputs_embeds)
-        else:
-            out_of_vocab_id = self.audio_config.vocab_size - 1
-            input_ids = input_ids - self.vocab_offset
-            input_ids = torch.where(input_ids < 0, out_of_vocab_id, input_ids)
-            input_ids = torch.where(
-                input_ids >= self.audio_config.vocab_size, out_of_vocab_id, input_ids
-            )
-            hard_emb = self.embedding(input_ids)
+            hard_emb = self.embedding(adjusted_ids)
             emb_norm = self.hard_embedding_norm(hard_emb)
 
         emb_norm_proj, _ = self.embedding_projection(emb_norm)
@@ -298,24 +218,21 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         # TODO: Use sglang's vision model
         self.vision_tower = AutoModel.from_config(config=config.vision_config)
 
-        vision_vocab_offset = config.text_config.vocab_size
-        self.embed_vision = Gemma3nVisionEmbedder(
-            config,
+        self.embed_vision = Gemma3nMultimodalEmbedder(
+            config.vision_config,
+            config.text_config,
             quant_config=quant_config,
-            vocab_offset=vision_vocab_offset,
             prefix=add_prefix("embed_vision", prefix),
         )
 
         # Audio components
-        audio_vocab_offset = (
-            config.text_config.vocab_size + config.vision_config.vocab_size
-        )
-        self.embed_audio = Gemma3nAudioEmbedder(
-            config,
+        self.embed_audio = Gemma3nMultimodalEmbedder(
+            config.audio_config,
+            config.text_config,
             quant_config=quant_config,
-            vocab_offset=audio_vocab_offset,
             prefix=add_prefix("embed_audio", prefix),
         )
+
         self.audio_tower = Gemma3nAudioEncoder(
             config.audio_config,
             quant_config=quant_config,
@@ -508,6 +425,10 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         **kwargs: object,
     ) -> LogitsProcessor:
         """Forward pass for multimodal Gemma3n."""
+
+        # Important: position_ids in Gemma3 are 1-indexed
+        # This really does cost me sometime
+        # positions += 1
 
         # Get per-layer inputs if needed
         if per_layer_inputs is None and input_ids is not None:
