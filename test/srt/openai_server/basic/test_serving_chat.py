@@ -13,7 +13,10 @@ from unittest.mock import Mock, patch
 
 from fastapi import Request
 
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    MessageProcessingResult,
+)
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.managers.io_struct import GenerateReqInput
 
@@ -104,7 +107,7 @@ class ServingChatTestCase(unittest.TestCase):
             conv_ins.stop_str = ["</s>"]
             conv_mock.return_value = conv_ins
 
-            proc_mock.return_value = (
+            proc_mock.return_value = MessageProcessingResult(
                 "Test prompt",
                 [1, 2, 3],
                 None,
