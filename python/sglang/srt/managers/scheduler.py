@@ -1821,11 +1821,6 @@ class Scheduler(
         else:
             can_cuda_graph = 0
 
-        if not spec_algorithm.is_none():
-            # TODO(sang): Support cuda graph when idle batch is there.
-            if local_batch is None or local_batch.forward_mode.is_idle():
-                can_cuda_graph = 0
-
         is_extend_in_batch = (
             local_batch.forward_mode.is_extend() if local_batch else False
         )
