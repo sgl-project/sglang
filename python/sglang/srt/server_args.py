@@ -237,6 +237,7 @@ class ServerArgs:
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
+    weight_loader_disable_mmap: bool = False
 
     def __post_init__(self):
         # Expert parallelism
@@ -1598,6 +1599,11 @@ class ServerArgs:
             nargs="*",
             default=None,
             help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
+        )
+        parser.add_argument(
+            "--weight-loader-disable-mmap",
+            action="store_true",
+            help="Disable mmap while loading weight using safetensors.",
         )
 
     @classmethod

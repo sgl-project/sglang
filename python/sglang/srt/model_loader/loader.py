@@ -337,7 +337,14 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            weights_iterator = safetensors_weights_iterator(hf_weights_files)
+            from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+            weight_loader_disable_mmap = global_server_args_dict.get(
+                "weight_loader_disable_mmap"
+            )
+            weights_iterator = safetensors_weights_iterator(
+                hf_weights_files, disable_mmap=weight_loader_disable_mmap
+            )
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files)
 

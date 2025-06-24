@@ -101,6 +101,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "torchao_config",
     "triton_attention_reduce_in_fp32",
     "num_reserved_decode_tokens",
+    "weight_loader_disable_mmap",
 ]
 
 # Put some global args for easy access
