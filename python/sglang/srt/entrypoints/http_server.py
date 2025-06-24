@@ -176,13 +176,15 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     exc_str = str(exc)
     errors_str = str(exc.errors())
 
-    if exc.errors() and errors_str and errors_str != exc_str:
+    if errors_str and errors_str != exc_str:
         message = f"{exc_str} {errors_str}"
     else:
         message = exc_str
 
     err = ErrorResponse(
-        message=message, type=HTTPStatus.BAD_REQUEST.phrase, code=HTTPStatus.BAD_REQUEST
+        message=message,
+        type=HTTPStatus.BAD_REQUEST.phrase,
+        code=HTTPStatus.BAD_REQUEST.value,
     )
 
     return ORJSONResponse(
