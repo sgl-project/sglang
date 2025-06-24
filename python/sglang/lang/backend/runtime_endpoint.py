@@ -82,7 +82,7 @@ class RuntimeEndpoint(BaseBackend):
         return self.chat_template
 
     def cache_prefix(self, prefix_str: str):
-        from sglang.srt.openai_api.protocol import (
+        from sglang.srt.entrypoints.openai.protocol import (
             ChatCompletionMessageGenericParam,
             ChatCompletionRequest,
         )
