@@ -53,14 +53,15 @@ class Llama32Detector(BaseFormatDetector):
         action_text_len = len(action_text)
         while idx < action_text_len:
             try:
-                obj, end = decoder.raw_decode(action_text[idx:])
+                text = action_text[idx:].lstrip()
+                obj, end = decoder.raw_decode(text)
                 all_actions.append(obj)
                 idx += end + len(self.tool_call_separator)
                 safe_idx = idx
             except json.JSONDecodeError as e:
                 # Find where next `{"name"` appears and try again
                 logger.warning(
-                    f"Failed to parse JSON part: {action_text[idx:]}, JSON parse error: {str(e)}"
+                    f"Failed to parse JSON part: {text}, JSON parse error: {str(e)}"
                 )
                 next_obj_start = action_text.find('{"name":', idx + 1)
                 if next_obj_start == -1:
