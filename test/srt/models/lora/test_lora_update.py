@@ -18,12 +18,20 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional, Union
 
+import requests
 import torch
 
 from sglang.test.runners import SRTRunner
-from sglang.test.test_utils import CustomTestCase
+from sglang.srt.utils import kill_process_tree
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
 
 PROMPTS = [
+    "SGL is a",
     "AI is a field of computer science focused on",
     "Computer science is the study of",
     "Write a short story.",
@@ -194,6 +202,192 @@ TEST_CASES = [
 ]
 
 
+class LoRAUpdateTestSessionMode(Enum):
+    ENGINE = "engine"
+    SERVER = "server"
+
+
+class LoRAUpdateTestSession:
+    """
+    Context manager for testing LoRA adapters either in‐process (engine)
+    or via a standalone server.
+    """
+
+    def __init__(
+        self,
+        *,
+        testcase: Optional[TestCase],
+        mode: LoRAUpdateTestSessionMode,  # "engine" or "server"
+        model_path: str,
+        lora_paths: list[str],
+        max_loras_per_batch: int = 1,
+        lora_backend: str = "triton",
+        disable_cuda_graph: bool = False,
+        cuda_graph_max_bs: int = 4,
+    ):
+        self.testcase = testcase
+        self.mode = mode
+        self.model_path = model_path
+        self.lora_paths = lora_paths
+        self.max_loras_per_batch = max_loras_per_batch
+        self.lora_backend = lora_backend
+        self.disable_cuda_graph = disable_cuda_graph
+        self.cuda_graph_max_bs = cuda_graph_max_bs
+
+        self.expected_adapters = set(lora_paths)
+        self.handle = None  # Will be set in __enter__
+
+    def __enter__(self):
+        if self.mode == LoRAUpdateTestSessionMode.ENGINE:
+            # in-process runner
+            self.handle = SRTRunner(
+                model_path=self.model_path,
+                model_type="generation",
+                lora_paths=self.lora_paths,
+                lora_backend=self.lora_backend,
+                torch_dtype=torch.float16,
+                max_loras_per_batch=self.max_loras_per_batch,
+                disable_cuda_graph=self.disable_cuda_graph,
+                cuda_graph_max_bs=self.cuda_graph_max_bs,
+                disable_radix_cache=True,
+            )
+            self.handle.__enter__()
+            return self
+
+        elif self.mode == LoRAUpdateTestSessionMode.SERVER:
+            other_args = [
+                "--cuda-graph-max-bs",
+                str(self.cuda_graph_max_bs),
+                "--lora-paths",
+                *self.lora_paths,
+                "--max-loras-per-batch",
+                str(self.max_loras_per_batch),
+                "--lora-backend",
+                self.lora_backend,
+                "--disable-radix-cache",
+                "--random-seed", "42",
+            ]
+            if self.disable_cuda_graph:
+                other_args.append("--disable-cuda-graph")
+
+            # launch external server
+            self.handle = popen_launch_server(
+                self.model_path,
+                DEFAULT_URL_FOR_TEST,
+                DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=other_args,
+            )
+            return self
+
+        else:
+            raise ValueError(f"Unrecognized mode: {self.mode!r}")
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.mode == LoRAUpdateTestSessionMode.ENGINE and self.handle is not None:
+            # delegate cleanup to SRTRunner
+            return self.handle.__exit__(exc_type, exc_val, exc_tb)
+
+        elif self.mode == LoRAUpdateTestSessionMode.SERVER and self.handle is not None:
+            kill_process_tree(self.handle.pid)
+            # don’t suppress exceptions
+            return False
+
+        # fallback: don’t suppress exceptions
+        return False
+
+    def load_lora_adapter(self, lora_name: str, lora_path: Optional[str] = None):
+        """
+        Load a LoRA adapter by name and path.
+        """
+
+        if lora_path is None:
+            lora_path = lora_name
+
+        self.expected_adapters.add(lora_name)
+
+        if self.mode == LoRAUpdateTestSessionMode.ENGINE:
+            response = self.handle.load_lora_adapter(
+                lora_name=lora_name,
+                lora_path=lora_path,
+            )
+            self.testcase.assertTrue(response.success)
+            loaded_adapters = set(response.loaded_adapters)
+
+        elif self.mode == LoRAUpdateTestSessionMode.SERVER:
+            response = requests.post(
+                DEFAULT_URL_FOR_TEST + "/load_lora_adapter",
+                json={"lora_name": lora_name, "lora_path": lora_path},
+            )
+            self.testcase.assertTrue(response.ok)
+            loaded_adapters = set(response.json()["loaded_adapters"])
+
+        print(f"loaded_adapters: {loaded_adapters}")
+
+        self.testcase.assertEqual(loaded_adapters, self.expected_adapters)
+
+    def unload_lora_adapter(self, lora_name: str):
+        """
+        Unload a LoRA adapter by name.
+        """
+        self.expected_adapters.remove(lora_name)
+
+        if self.mode == LoRAUpdateTestSessionMode.ENGINE:
+            response = self.handle.unload_lora_adapter(
+                lora_name=lora_name,
+            )
+            self.testcase.assertTrue(response.success)
+            loaded_adapters = set(response.loaded_adapters)
+
+        elif self.mode == LoRAUpdateTestSessionMode.SERVER:
+            response = requests.post(
+                DEFAULT_URL_FOR_TEST + "/unload_lora_adapter",
+                json={"lora_name": lora_name},
+            )
+            self.testcase.assertTrue(response.ok)
+            loaded_adapters = set(response.json()["loaded_adapters"])
+
+        print(f"loaded_adapters: {loaded_adapters}")
+
+        self.testcase.assertEqual(loaded_adapters, self.expected_adapters)
+
+    def forward(
+        self,
+        prompts: List[str],
+        lora_paths: List[str],
+        max_new_tokens: int = 32,
+    ):
+        """
+        Perform a batch forward pass with the current set of loaded LoRA adapters.
+        """
+        if self.mode == LoRAUpdateTestSessionMode.ENGINE:
+            response = self.handle.batch_forward(
+                prompts=prompts,
+                lora_paths=lora_paths,
+                max_new_tokens=max_new_tokens,
+            )
+            output_strs = response.output_strs
+
+        elif self.mode == LoRAUpdateTestSessionMode.SERVER:
+            response = requests.post(
+                DEFAULT_URL_FOR_TEST + "/generate",
+                json={
+                    "text": prompts,
+                    "lora_path": lora_paths,
+                    "sampling_params": {
+                        "temperature": 0,
+                        "top_k": 1,
+                        "max_new_tokens": 32,
+                    },
+                },
+            )
+            self.testcase.assertTrue(response.ok)
+            output_strs = [r["text"] for r in response.json()]
+
+        print(f"output_strs: {output_strs}")
+
+        return output_strs
+
+
 class TestLoRADynamicUpdate(CustomTestCase):
     """
     This test case verifies that the SRT runner can dynamically load and unload LoRA adapters
@@ -206,9 +400,10 @@ class TestLoRADynamicUpdate(CustomTestCase):
 
     def _run_operation_sequence(
         self,
+        mode: LoRAUpdateTestSessionMode,
         base: str,
-        max_loras_per_batch: int,
         initial_adapters: List[str],
+        max_loras_per_batch: int,
         op_sequence: List[Operation],
         max_new_tokens: int = 32,
     ) -> List[tuple]:
@@ -218,95 +413,106 @@ class TestLoRADynamicUpdate(CustomTestCase):
         """
 
         forward_outputs = []
-        with SRTRunner(
+        with LoRAUpdateTestSession(
+            testcase=self,
+            mode=mode,
             model_path=base,
-            torch_dtype=torch.float16,
-            model_type="generation",
             lora_paths=initial_adapters,
             max_loras_per_batch=max_loras_per_batch,
-            lora_backend="triton",
-            disable_cuda_graph=False,
-            disable_radix_cache=True,
-        ) as srt_runner:
-            expected_adapters = set(initial_adapters)
-            actual_adapters = set(initial_adapters)
+        ) as session:
             for op in op_sequence:
                 op_type = op.type
                 data = op.data
+                print("-" * 100)
                 print(
-                    f"\n---  Running operation: {op_type} --- data: {data} --- current adapters: {actual_adapters}"
+                    f"Running operation: {op_type} --- data: {data} --- mode: {mode} ---"
                 )
                 if op_type == OperationType.LOAD:
-                    expected_adapters.add(data)
-                    result = srt_runner.load_lora_adapter(
+                    result = session.load_lora_adapter(
                         lora_name=data,
                         lora_path=data,
                     )
-                    actual_adapters = set(result.loaded_adapters)
-                    assert result.success
-                    assert actual_adapters == expected_adapters
                 elif op_type == OperationType.UNLOAD:
-                    expected_adapters.remove(data)
-                    result = srt_runner.unload_lora_adapter(
+                    result = session.unload_lora_adapter(
                         lora_name=data,
                     )
-                    actual_adapters = set(result.loaded_adapters)
-                    assert result.success
-                    assert actual_adapters == expected_adapters
                 elif op_type == OperationType.FORWARD:
                     prompts, adapters = zip(*data)
-                    result = srt_runner.batch_forward(
+                    result = session.forward(
                         prompts=list(prompts),
                         lora_paths=list(adapters),
                         max_new_tokens=max_new_tokens,
                     )
                     forward_outputs.append(result)
-                print(f"\n--- Operation {op_type} result: {result}")
 
             return forward_outputs
 
     def test_dynamic_adapter_updates(self):
-        for test_case in TEST_CASES:
-            # Test dynamic loading of adapters
-            # TODO (lifuhuang): currently at least one LoRA path is required during initialization to enable lora,
-            # we should fix this in the future https://github.com/sgl-project/sglang/issues/7463.
-            dynamic_output = self._run_operation_sequence(
-                initial_adapters=test_case.initial_adapters,
-                base=test_case.base,
-                max_loras_per_batch=test_case.max_loras_per_batch,
-                op_sequence=test_case.op_sequence,
-                max_new_tokens=test_case.max_new_tokens,
-            )
+        for case_idx, test_case in enumerate(TEST_CASES, start=1):
+            for mode in [
+                LoRAUpdateTestSessionMode.SERVER,
+                LoRAUpdateTestSessionMode.ENGINE,
+            ]:
+                print("=" * 100)
+                print(f"Starting test case {case_idx} in {mode.value} mode.")
+                print("=" * 100)
 
-            # static loading
-            forward_ops = [
-                x for x in test_case.op_sequence if x.type == OperationType.FORWARD
-            ]
-            static_output = self._run_operation_sequence(
-                initial_adapters=test_case.all_adapters,
-                base=test_case.base,
-                max_loras_per_batch=test_case.max_loras_per_batch,
-                op_sequence=forward_ops,
-                max_new_tokens=test_case.max_new_tokens,
-            )
-
-            assert len(dynamic_output) == len(
-                static_output
-            ), f"Dynamic output length {len(dynamic_output)} does not match static output length {len(static_output)}"
-            for i, (dynamic, static) in enumerate(zip(dynamic_output, static_output)):
-                assert len(dynamic.output_strs) == len(static.output_strs), (
-                    f"Output length mismatch at batch {i}: "
-                    f"Dynamic: {len(dynamic.output_strs)}, Static: {len(static.output_strs)}"
+                print(
+                    f"--- Running dynamic update pass with {len(test_case.op_sequence)} operations ---"
                 )
-                for j, (d_out, s_out) in enumerate(
-                    zip(dynamic.output_strs, static.output_strs)
+                # Test dynamic loading of adapters
+                # TODO (lifuhuang): currently at least one LoRA path is required during initialization to enable lora,
+                # we should fix this in the future https://github.com/sgl-project/sglang/issues/7463.
+                dynamic_output = self._run_operation_sequence(
+                    mode=mode,
+                    initial_adapters=test_case.initial_adapters,
+                    base=test_case.base,
+                    max_loras_per_batch=test_case.max_loras_per_batch,
+                    op_sequence=test_case.op_sequence,
+                    max_new_tokens=test_case.max_new_tokens,
+                )
+
+                # static loading
+                forward_ops = [
+                    x for x in test_case.op_sequence if x.type == OperationType.FORWARD
+                ]
+                print("=" * 100)
+                print(
+                    f"\n--- Running static pass with {len(forward_ops)} operations ---"
+                )
+                static_output = self._run_operation_sequence(
+                    mode=mode,
+                    initial_adapters=test_case.all_adapters,
+                    base=test_case.base,
+                    max_loras_per_batch=test_case.max_loras_per_batch,
+                    op_sequence=forward_ops,
+                    max_new_tokens=test_case.max_new_tokens,
+                )
+
+                print(f"Dynamic output: {dynamic_output}")
+                print(f"Static output: {static_output}")
+                print("=" * 100)
+                self.assertEqual(
+                    len(dynamic_output),
+                    len(static_output),
+                    f"Dynamic output length {len(dynamic_output)} does not match static output length {len(static_output)}",
+                )
+                for i, (dynamic, static) in enumerate(
+                    zip(dynamic_output, static_output), start=1
                 ):
-                    d_out = d_out.strip()
-                    s_out = s_out.strip()
-                    assert d_out == s_out, (
-                        f"Output mismatch at batch {i}, prompt {j}: "
-                        f"Dynamic: '{d_out}', Static: '{s_out}'"
+                    self.assertEqual(
+                        len(dynamic),
+                        len(static),
+                        f"Output length mismatch at batch {i}:\n- Dynamic={len(dynamic)}\n- Static={len(static)}",
                     )
+                    for j, (d_out, s_out) in enumerate(zip(dynamic, static), start=1):
+                        d_out = d_out.strip()
+                        s_out = s_out.strip()
+                        self.assertEqual(
+                            d_out,
+                            s_out,
+                            f"Output mismatch at batch {i}, prompt {j}:\n- Dynamic: '{d_out}'\n- Static: '{s_out}'",
+                        )
 
 
 if __name__ == "__main__":
