@@ -441,8 +441,10 @@ void tinygemm_kernel(
     int64_t ldb,
     int64_t ldc,
     bool brg,
-    int64_t block_size_K) {
-  tinygemm_kernel<scalar_t, false>(A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K);
+    int64_t block_size_K,
+    bool do_unpack) {
+  tinygemm_kernel<scalar_t, false>(
+      A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
 }
 
 #define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE)    \
@@ -460,7 +462,8 @@ void tinygemm_kernel(
       int64_t ldb,                             \
       int64_t ldc,                             \
       bool brg,                                \
-      int64_t block_size_K)
+      int64_t block_size_K,                    \
+      bool do_unpack)
 
 INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16);
 INSTANTIATE_TINYGEMM_TEMPLATE(at::Half);
