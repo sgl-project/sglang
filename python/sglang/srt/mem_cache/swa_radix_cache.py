@@ -118,14 +118,7 @@ class LRUList:
 
     def _add_node(self, node):
         """Helper to add node right after head (most recently used)"""
-        setattr(node, self.prv, self.head)  # node.prev = self.head
-        setattr(
-            node, self.nxt, getattr(self.head, self.nxt)
-        )  # node.next = self.head.next
-        setattr(
-            getattr(self.head, self.nxt), self.prv, node
-        )  # self.head.next.prev = node
-        setattr(self.head, self.nxt, node)  # self.head.next = node
+        self._add_node_after(self.head, node)
 
     def _add_node_after(self, old_node, new_node):
         """Helper to add node right after old_node"""
@@ -211,33 +204,22 @@ class LRUList:
         """
         Get the least recently used node that is not locked
         """
-        x = getattr(self.tail, self.prv)  # x = self.tail.prev
-        while x.lock_ref > 0:
-            x = getattr(x, self.prv)  # x = x.prev
-        # if x is the head, it means there is no node in the lru list without lock
-        if x == self.head:
-            return None
-        return x
+        return self.get_prev_no_lock(self.tail, check_id=False)
 
     def get_leaf_lru_no_lock(self) -> Optional[TreeNode]:
         """
         Get the least recently used leaf node that is not locked
         """
-        x = getattr(self.tail, self.prv)  # x = self.tail.prev
-        while x.lock_ref > 0 or len(x.children) > 0:
-            x = getattr(x, self.prv)  # x = x.prev
-        # if x is the head, it means there is no leaf node in the lru list without lock
-        if x == self.head:
-            return None
-        return x
+        return self.get_prev_no_lock(self.tail, check_id=False)
 
-    def get_prev_no_lock(self, node: TreeNode) -> Optional[TreeNode]:
+    def get_prev_no_lock(self, node: TreeNode, check_id: bool = True) -> Optional[TreeNode]:
         """
         Get the previous (i.e. more recently used) node that is not locked
         """
-        assert (
-            node.id in self.cache
-        ), f"Getting prev of node {node.key[:10]=} not in lru list"
+        if check_id:
+            assert (
+                node.id in self.cache
+            ), f"Getting prev of node {node.key[:10]=} not in lru list"
         x = getattr(node, self.prv)  # x = node.prev
         while x.lock_ref > 0:
             x = getattr(x, self.prv)  # x = x.prev
@@ -246,13 +228,14 @@ class LRUList:
             return None
         return x
 
-    def get_prev_leaf_no_lock(self, node: TreeNode):
+    def get_prev_leaf_no_lock(self, node: TreeNode, check_id: bool = True):
         """
         Get the previous (i.e. more recently used) leaf node that is not locked
         """
-        assert (
-            node.id in self.cache
-        ), f"Getting prev of node {node.key[:10]=} not in lru list"
+        if check_id:
+            assert (
+                node.id in self.cache
+            ), f"Getting prev of node {node.key[:10]=} not in lru list"
         x = getattr(node, self.prv)  # x = node.prev
         while x.lock_ref > 0 or len(x.children) > 0:
             x = getattr(x, self.prv)  # x = x.prev
