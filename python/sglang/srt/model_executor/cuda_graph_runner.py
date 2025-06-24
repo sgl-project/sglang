@@ -421,7 +421,7 @@ class CudaGraphRunner:
                             empty_cache=False,
                         )
                         capture_range.set_description(
-                            f"Capturing batches ({avail_mem=:.2f} GB)"
+                            f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                         )
 
                     with patch_model(
