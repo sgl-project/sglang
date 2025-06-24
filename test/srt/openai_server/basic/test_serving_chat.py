@@ -119,6 +119,59 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertFalse(adapted.stream)
             self.assertEqual(processed, self.basic_req)
 
+    def test_stop_str_isolation_between_requests(self):
+        """Test that stop strings from one request don't affect subsequent requests.
+
+        This tests the fix for the bug where conv.stop_str was being mutated globally,
+        causing stop strings from one request to persist in subsequent requests.
+        """
+        # Mock conversation template with initial stop_str
+        initial_stop_str = ["\n"]
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            # Create a mock conversation object that will be returned by generate_chat_conv
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_ins.image_data = None
+            conv_ins.audio_data = None
+            conv_ins.modalities = []
+            conv_ins.stop_str = (
+                initial_stop_str.copy()
+            )  # Template's default stop strings
+            conv_mock.return_value = conv_ins
+
+            # First request with additional stop string
+            req1 = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "First request"}],
+                stop=["CUSTOM_STOP"],
+            )
+
+            # Call the actual _apply_conversation_template method (not mocked)
+            result1 = self.chat._apply_conversation_template(req1, is_multimodal=False)
+
+            # Verify first request has both stop strings
+            expected_stop1 = initial_stop_str + ["CUSTOM_STOP"]
+            self.assertEqual(result1.stop, expected_stop1)
+
+            # Verify the original template's stop_str wasn't mutated after first request
+            self.assertEqual(conv_ins.stop_str, initial_stop_str)
+
+            # Second request without additional stop string
+            req2 = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Second request"}],
+                # No custom stop strings
+            )
+            result2 = self.chat._apply_conversation_template(req2, is_multimodal=False)
+
+            # Verify second request only has original stop strings (no CUSTOM_STOP from req1)
+            self.assertEqual(result2.stop, initial_stop_str)
+            self.assertNotIn("CUSTOM_STOP", result2.stop)
+            self.assertEqual(conv_ins.stop_str, initial_stop_str)
+
     # ------------- sampling-params -------------
     def test_sampling_param_build(self):
         req = ChatCompletionRequest(
