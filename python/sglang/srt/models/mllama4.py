@@ -8,7 +8,6 @@ from torch import nn
 from transformers import Llama4Config, Llama4VisionModel
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization import QuantizationConfig
