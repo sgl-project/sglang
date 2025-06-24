@@ -237,6 +237,7 @@ class ServerArgs:
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
+    weight_loader_disable_mmap: bool = False
 
     def __post_init__(self):
         # Expert parallelism
@@ -1599,6 +1600,11 @@ class ServerArgs:
             default=None,
             help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
         )
+        parser.add_argument(
+            "--weight-loader-disable-mmap",
+            action="store_true",
+            help="Disable mmap while loading weight using safetensors.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -1723,9 +1729,8 @@ class PortArgs:
             dist_init_host, dist_init_port = dist_init_addr
             port_base = int(dist_init_port) + 1
             if dp_rank is None:
-                scheduler_input_port = (
-                    port_base + 3
-                )  # TokenizerManager to DataParallelController
+                # TokenizerManager to DataParallelController
+                scheduler_input_port = port_base + 3
             else:
                 scheduler_input_port = port_base + 3 + 1 + dp_rank
 
