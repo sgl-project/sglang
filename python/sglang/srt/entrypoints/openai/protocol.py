@@ -316,7 +316,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
             v_lower = v.lower()
             if v_lower not in {"system", "assistant", "tool"}:
                 raise ValueError(
-                    "'role' must be system/assistant/tool (case insensitive).）"
+                    "'role' must be one of 'system', 'assistant', or 'tool' (case-insensitive)."
                 )
             return v_lower
         raise ValueError("'role' must be a string")
