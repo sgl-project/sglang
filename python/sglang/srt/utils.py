@@ -2425,6 +2425,13 @@ def prepack_weight_if_needed(weight):
     return torch.ops.sgl_kernel.convert_weight_packed(weight)
 
 
+# TODO: currently gemm kernel has the below requirements:
+# OC % TILE_N == 0, where TILE_N = 16
+# IC % TILE_K == 0, where TILE_K = 32
+def dim_is_supported(weight):
+    return weight.size(0) % 16 == 0 and weight.size(1) % 32 == 0
+
+
 def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
     # Pack weight for get better performance on CPU
     devices = {getattr(module, weight_name).device for weight_name in weight_names}
@@ -2438,6 +2445,17 @@ def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> 
 
     for i, weight_name in enumerate(weight_names):
         weight_tensor = getattr(module, weight_name)
+
+        # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
+        if not dim_is_supported(weight_tensor):
+            logger.warning(
+                f"Expects weight.size(0) % 16 == 0 and weight.size(1) % 32 == 0 "
+                f"but {weight_tensor.size(0)=} and {weight_tensor.size(1)=} in {module}. "
+                f"{module} won't use intel amx backend."
+            )
+            module.use_intel_amx_backend = False
+            return
+
         if transpose_dims and transpose_dims[i]:
             weight_tensor = weight_tensor.transpose(*transpose_dims[i])
 
