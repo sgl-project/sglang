@@ -1917,18 +1917,14 @@ def configure_ipv6(dist_init_addr):
     return port, host
 
 
-def rank0_log(msg: str):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-    if get_tensor_model_parallel_rank() == 0:
-        logger.info(msg)
-
-
 def rank0_print(msg: str):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     if get_tensor_model_parallel_rank() == 0:
         print(msg, flush=True)
+
+
+rank0_log = rank0_print
 
 
 def get_cuda_version():
