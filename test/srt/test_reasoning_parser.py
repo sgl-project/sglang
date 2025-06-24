@@ -106,7 +106,7 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         """Test streaming parse of reasoning content."""
         # First add start token
         self.detector.parse_streaming_increment("<think>")
-        
+
         # Then add reasoning content
         result = self.detector.parse_streaming_increment("reasoning content")
         self.assertEqual(result.reasoning_text, "reasoning content")
@@ -117,7 +117,7 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         # Start reasoning mode
         self.detector.parse_streaming_increment("<think>")
         self.detector.parse_streaming_increment("reasoning")
-        
+
         # End reasoning - the reasoning content accumulated in previous calls is cleared when end token is found
         result = self.detector.parse_streaming_increment("</think>normal text")
         self.assertEqual(result.reasoning_text, "")  # Buffer cleared, returns empty
@@ -129,10 +129,10 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         detector = BaseReasoningFormatDetector(
             "<think>", "</think>", stream_reasoning=False
         )
-        
+
         # Start reasoning mode
         detector.parse_streaming_increment("<think>")
-        
+
         # Add reasoning content - should not return content
         result = detector.parse_streaming_increment("reasoning content")
         self.assertEqual(result.reasoning_text, "")
@@ -140,7 +140,9 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
 
     def test_parse_streaming_increment_mixed_content(self):
         """Test streaming parse with mixed content in one chunk."""
-        result = self.detector.parse_streaming_increment("<think>reasoning</think>normal")
+        result = self.detector.parse_streaming_increment(
+            "<think>reasoning</think>normal"
+        )
         self.assertEqual(result.reasoning_text, "reasoning")
         self.assertEqual(result.normal_text, "normal")
 
@@ -166,7 +168,9 @@ class TestDeepSeekR1Detector(CustomTestCase):
         text = "I need to think about this. The answer is 42."
         result = self.detector.detect_and_parse(text)
         # Should be treated as reasoning because force_reasoning=True
-        self.assertEqual(result.reasoning_text, "I need to think about this. The answer is 42.")
+        self.assertEqual(
+            result.reasoning_text, "I need to think about this. The answer is 42."
+        )
         self.assertEqual(result.normal_text, "")
 
     def test_detect_and_parse_with_end_token(self):
@@ -288,7 +292,7 @@ class TestReasoningParser(CustomTestCase):
     def test_parse_stream_chunk(self):
         """Test streaming chunk parsing."""
         parser = ReasoningParser("qwen3")
-        
+
         # First chunk with start token
         reasoning, normal = parser.parse_stream_chunk("<think>")
         self.assertEqual(reasoning, "")
@@ -309,7 +313,7 @@ class TestReasoningParser(CustomTestCase):
         parser1 = ReasoningParser("DeepSeek-R1")
         parser2 = ReasoningParser("QWEN3")
         parser3 = ReasoningParser("Kimi")
-        
+
         self.assertIsInstance(parser1.detector, DeepSeekR1Detector)
         self.assertIsInstance(parser2.detector, Qwen3Detector)
         self.assertIsInstance(parser3.detector, KimiDetector)
@@ -322,6 +326,7 @@ class TestReasoningParser(CustomTestCase):
         parser = ReasoningParser("qwen3", stream_reasoning=True)
         self.assertTrue(parser.detector.stream_reasoning)
 
+
 class TestIntegrationScenarios(CustomTestCase):
     """Integration tests for realistic usage scenarios."""
 
@@ -329,36 +334,38 @@ class TestIntegrationScenarios(CustomTestCase):
         """Test complete DeepSeek-R1 response parsing."""
         parser = ReasoningParser("deepseek-r1")
         text = "I need to solve this step by step. First, I'll analyze the problem. The given equation is x + 2 = 5. To solve for x, I subtract 2 from both sides: x = 5 - 2 = 3.</think>The answer is x = 3."
-        
+
         reasoning, normal = parser.parse_non_stream(text)
         self.assertIn("step by step", reasoning)
-        self.assertIn("= 3", reasoning)  # The reasoning contains "x = 5 - 2 = 3" which has "= 3"
+        self.assertIn(
+            "= 3", reasoning
+        )  # The reasoning contains "x = 5 - 2 = 3" which has "= 3"
         self.assertEqual(normal, "The answer is x = 3.")
 
     def test_qwen3_streaming_scenario(self):
         """Test Qwen3 streaming scenario."""
         parser = ReasoningParser("qwen3")
-        
+
         chunks = [
             "<think>",
             "Let me analyze this problem.",
             " I need to consider multiple factors.",
             "</think>",
-            "Based on my analysis, the solution is to use a different approach."
+            "Based on my analysis, the solution is to use a different approach.",
         ]
-        
+
         all_reasoning = ""
         all_normal = ""
-        
+
         for chunk in chunks:
             reasoning, normal = parser.parse_stream_chunk(chunk)
             all_reasoning += reasoning
             all_normal += normal
-        
+
         self.assertIn("analyze", all_reasoning)
         self.assertIn("multiple factors", all_reasoning)
         self.assertIn("different approach", all_normal)
-        
+
     def test_kimi_streaming_scenario(self):
         """Test Kimi streaming scenario."""
         parser = ReasoningParser("kimi")
@@ -386,10 +393,11 @@ class TestIntegrationScenarios(CustomTestCase):
         """Test handling of empty reasoning blocks."""
         parser = ReasoningParser("qwen3")
         text = "<think></think>Just the answer."
-        
+
         reasoning, normal = parser.parse_non_stream(text)
         self.assertEqual(reasoning, "")
         self.assertEqual(normal, "Just the answer.")
+
 
 if __name__ == "__main__":
     unittest.main()
