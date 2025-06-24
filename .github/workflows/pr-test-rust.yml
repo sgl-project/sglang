@@ -47,7 +47,7 @@ jobs:
           cargo check --benches
 
       - name: Quick benchmark sanity check
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           source "$HOME/.cargo/env"
           cd sgl-router/
