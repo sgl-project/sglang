@@ -541,7 +541,7 @@ class SRTRunner:
             disable_overlap_schedule=disable_overlap_schedule,
             cuda_graph_max_bs=4,
             disable_custom_all_reduce=disable_custom_all_reduce,
-            disable_chunked_prefix_cache=max_running_requests,
+            max_running_requests=max_running_requests,
             **spec_kwargs,
         )
 
