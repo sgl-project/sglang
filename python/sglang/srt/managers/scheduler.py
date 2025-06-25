@@ -2392,9 +2392,10 @@ class Scheduler(
 
     def profile(self, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
-            if recv_req.profile_by_stage:
+            if recv_req.profile_by_stage or recv_req.start_step:
                 return self.init_profile(
                     recv_req.output_dir,
+                    recv_req.start_step,
                     recv_req.num_steps,
                     recv_req.activities,
                     recv_req.with_stack,
@@ -2449,8 +2450,6 @@ class Scheduler(
 
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.forward_ct + 1)
-        else:
-            self.profiler_start_forward_ct = self.forward_ct + 1
 
         if num_steps:
             self.profile_steps = num_steps
@@ -2459,11 +2458,12 @@ class Scheduler(
                 self.profiler_target_decode_ct = num_steps
                 self.profiler_prefill_ct = 0
                 self.profiler_decode_ct = 0
-            else:
+            elif start_step:
                 self.profiler_target_forward_ct = self.profiler_start_forward_ct + num_steps
+            else:
+                self.profiler_target_forward_ct = self.forward_ct + num_steps
             # The caller will be notified when reaching profiler_target_forward_ct
         else:
-
             self.profiler_target_forward_ct = None
 
         return ProfileReqOutput(success=True, message="Succeeded")
@@ -2532,6 +2532,7 @@ class Scheduler(
 
         if "CUDA_PROFILER" in activities:
             torch.cuda.cudart().cudaProfilerStart()
+            self.profile_in_progress = True
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
