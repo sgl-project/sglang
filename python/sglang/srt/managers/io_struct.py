@@ -324,9 +324,12 @@ class GenerateReqInput:
             self.rid = new_rids
         elif isinstance(self.rid, list):
             if len(self.rid) != num:
-                raise ValueError("The specified rids length mismatch with the batch_size for batch processing.")
+                raise ValueError(
+                    "The specified rids length mismatch with the batch_size for batch processing."
+                )
         else:
             raise ValueError("The rid should be a string or a list of strings.")
+
     def _normalize_logprob_params(self, num):
         """Normalize logprob-related parameters for batch processing."""
 
