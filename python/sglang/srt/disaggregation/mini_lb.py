@@ -210,6 +210,38 @@ async def flush_cache():
     return Response(status_code=200)
 
 
+@app.post("/start_profile")
+async def start_profile():
+    prefill_servers, decode_servers = (
+        load_balancer.prefill_servers,
+        load_balancer.decode_servers,
+    )
+    async with aiohttp.ClientSession() as session:
+        # Create the tasks
+        tasks = []
+        for server in chain(prefill_servers, decode_servers):
+            tasks.append(session.post(f"{server}/start_profile"))
+        for i, response in enumerate(asyncio.as_completed(tasks)):
+            await response
+    return Response(status_code=200)
+
+
+@app.post("/stop_profile")
+async def stop_profile():
+    prefill_servers, decode_servers = (
+        load_balancer.prefill_servers,
+        load_balancer.decode_servers,
+    )
+    async with aiohttp.ClientSession() as session:
+        # Create the tasks
+        tasks = []
+        for server in chain(prefill_servers, decode_servers):
+            tasks.append(session.post(f"{server}/stop_profile"))
+        for i, response in enumerate(asyncio.as_completed(tasks)):
+            await response
+    return Response(status_code=200)
+
+
 @app.get("/get_server_info")
 async def get_server_info():
     prefill_servers, decode_servers = (
