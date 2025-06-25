@@ -128,7 +128,7 @@ class TestLoRA(CustomTestCase):
                     max_loras_per_batch=len(lora_adapter_paths) + 1,
                     lora_backend=backend,
                     disable_radix_cache=True,
-                    disable_chunked_prefix_cache=True,
+                    max_running_requests=1,
                 )
                 hf_runner = HFRunner(
                     base_path, torch_dtype=torch_dtype, model_type="generation"
