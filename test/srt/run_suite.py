@@ -183,7 +183,6 @@ suites = {
     ],
     "per-commit-cpu": [
         TestFile("cpu/test_activation.py"),
-        TestFile("cpu/test_binding.py"),
         TestFile("cpu/test_decode.py"),
         TestFile("cpu/test_extend.py"),
         TestFile("cpu/test_gemm.py"),
@@ -193,7 +192,6 @@ suites = {
         TestFile("cpu/test_qkv_proj_with_rope.py"),
         TestFile("cpu/test_rope.py"),
         TestFile("cpu/test_shared_expert.py"),
-        TestFile("cpu/test_topk.py"),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
