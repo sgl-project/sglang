@@ -247,7 +247,7 @@ class ModelConfig:
         self.vocab_size = self.hf_text_config.vocab_size
 
         if self.is_hybrid is not None:
-            # TODO(tarinkk): swa layer position shoud not be hard coded.
+            # TODO(tarinkk): swa layer position should not be hard coded.
             self.swa_attention_layer_ids = [
                 i for i in range(self.num_hidden_layers) if (i + 1) % 4 != 0
             ]
