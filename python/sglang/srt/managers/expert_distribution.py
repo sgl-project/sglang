@@ -479,16 +479,13 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
         topk_ids = topk_ids.flatten()
         mask = topk_ids != -1
-        try:
-            self._data[layer_idx, :].scatter_add_(
-                dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
-            )
-        except RuntimeError as e:
-            if "Index tensor must have the same number of dimensions as self tensor" in str(e):
-                logger.warning(
-                    f"Expert selection is not supported for draft models for MTP at this moment."
-                )
-            raise e
+        assert self._data[layer_idx, :].shape == topk_ids.shape, (
+            "Shape mismatch between data and topk_ids."
+            "Selecting expert is not supported for multiple token prediction at the moment."
+        )
+        self._data[layer_idx, :].scatter_add_(
+            dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
+        )
 
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
