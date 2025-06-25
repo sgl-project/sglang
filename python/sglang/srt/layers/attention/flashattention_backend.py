@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
-import os
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
@@ -21,25 +21,28 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
-
 try:
     from sglang.srt.distributed import (
-        get_tensor_model_parallel_world_size,
         get_tensor_model_parallel_rank,
-        tensor_model_parallel_all_gather,
+        get_tensor_model_parallel_world_size,
         model_parallel_is_initialized,
+        tensor_model_parallel_all_gather,
     )
 
     SGLANG_DIST_AVAILABLE = True
-    
+
 except:
     SGLANG_DIST_AVAILABLE = False
 
+
 def get_local_rank():
     if SGLANG_DIST_AVAILABLE:
-        return get_tensor_model_parallel_rank() if model_parallel_is_initialized() else 0
+        return (
+            get_tensor_model_parallel_rank() if model_parallel_is_initialized() else 0
+        )
     else:
         return 0
+
 
 @dataclass
 class FlashAttentionMetadata:
@@ -722,11 +725,11 @@ class FlashAttentionBackend(AttentionBackend):
             max_seqlen_q = metadata.max_seq_len_q
             max_seqlen_k = metadata.max_seq_len_k
             cu_seqlens_k = metadata.cu_seqlens_k
-        
+
         run_benchmark = (
-            (not torch.cuda.is_current_stream_capturing()) and 
-            os.getenv('HIP_DEBUG_BENCH', '0') == '1' and
-            (get_local_rank() == 0)
+            (not torch.cuda.is_current_stream_capturing())
+            and os.getenv("HIP_DEBUG_BENCH", "0") == "1"
+            and (get_local_rank() == 0)
         )
 
         if run_benchmark:
@@ -841,16 +844,17 @@ class FlashAttentionBackend(AttentionBackend):
                         causal=True,
                         return_softmax_lse=True,
                     )
-                
+
                 if run_benchmark:
                     from hip_attn.v1_2.utils import capture
+
                     end_event.record()
                     end_event.synchronize()
 
                     elapsed = start_event.elapsed_time(end_event)
                     capture.report()
-                    print(f'[fa3] layer {layer.layer_id} took {elapsed:.2f} ms')
-                
+                    print(f"[fa3] layer {layer.layer_id} took {elapsed:.2f} ms")
+
                 return output, lse
             else:
                 # Do absorbed multi-latent attention
@@ -925,16 +929,17 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 else:
                     o = result
-        
+
         if run_benchmark:
             from hip_attn.v1_2.utils import capture
+
             end_event.record()
             end_event.synchronize()
 
             elapsed = start_event.elapsed_time(end_event)
             capture.report()
-            print(f'[fa3] layer {layer.layer_id} took {elapsed:.2f} ms')
-        
+            print(f"[fa3] layer {layer.layer_id} took {elapsed:.2f} ms")
+
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(

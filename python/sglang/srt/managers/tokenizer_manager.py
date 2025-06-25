@@ -565,7 +565,7 @@ class TokenizerManager:
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
-        
+
         input_token_num = len(input_ids) if input_ids is not None else 0
         # Check if input alone exceeds context length
         if input_token_num >= self.context_len:
@@ -597,7 +597,11 @@ class TokenizerManager:
                 trunc_first = num_trunc // 2
                 for _ in range(num_trunc):
                     input_ids.pop(input_token_num // 2 + 1 - trunc_first)
-                assert (max_new_tokens + len(input_ids)) < self.context_len, f'({max_new_tokens} + {len(input_ids)}) < {self.context_len}'
+                assert (
+                    max_new_tokens + len(input_ids)
+                ) < self.context_len, (
+                    f"({max_new_tokens} + {len(input_ids)}) < {self.context_len}"
+                )
             else:
                 error_msg = (
                     f"Requested token count exceeds the model's maximum context length "

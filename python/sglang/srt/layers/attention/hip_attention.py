@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import os
 
 """
@@ -7,14 +8,14 @@ https://arxiv.org/pdf/2406.09827
 """
 
 import logging
+import time
 from typing import TYPE_CHECKING, Optional, Union
 
-import time
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVPool
 
 if TYPE_CHECKING:
     from hip_attn.v1_2 import HiPAttentionConfig
@@ -29,25 +30,34 @@ logger = logging.getLogger(__name__)
 
 try:
     from sglang.srt.distributed import (
-        get_tensor_model_parallel_world_size,
         get_tensor_model_parallel_rank,
-        tensor_model_parallel_all_gather,
+        get_tensor_model_parallel_world_size,
         model_parallel_is_initialized,
+        tensor_model_parallel_all_gather,
     )
 
     SGLANG_DIST_AVAILABLE = True
 except:
     SGLANG_DIST_AVAILABLE = False
 
+
 def get_local_rank():
     if SGLANG_DIST_AVAILABLE:
-        return get_tensor_model_parallel_rank() if model_parallel_is_initialized() else 0
+        return (
+            get_tensor_model_parallel_rank() if model_parallel_is_initialized() else 0
+        )
     else:
         return 0
 
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend, FlashAttentionMetadata
-from sglang.srt.configs.model_config import AttentionArch
+
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.layers.attention.flashattention_backend import (
+    FlashAttentionBackend,
+    FlashAttentionMetadata,
+)
+
 
 class HiPAttentionBackend(AttentionBackend):
 
@@ -59,9 +69,9 @@ class HiPAttentionBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.page_size = model_runner.page_size
         assert self.page_size == 1
-        
+
         self.forward_paged_hip = PagedHiPStateful()
-        
+
         self.hip_config: HiPAttentionConfig = (
             model_runner.server_args.hip_attention_config
         )
@@ -74,22 +84,19 @@ class HiPAttentionBackend(AttentionBackend):
         self.tp_rank = model_runner.tp_rank
 
         self.attention_chunk_size = model_runner.attention_chunk_size
-        
-        self.flashattention_backend = FlashAttentionBackend(
-            model_runner=model_runner
-        )
-        
+
+        self.flashattention_backend = FlashAttentionBackend(model_runner=model_runner)
+
         self._last_tick = 0
-        
+
         self._block_table: torch.Tensor = None
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        self._block_table = forward_batch.req_to_token_pool.req_to_token\
-            .index_select(dim=0, index=forward_batch.req_pool_indices)
-        
-        self.flashattention_backend.init_forward_metadata(
-            forward_batch=forward_batch
+        self._block_table = forward_batch.req_to_token_pool.req_to_token.index_select(
+            dim=0, index=forward_batch.req_pool_indices
         )
+
+        self.flashattention_backend.init_forward_metadata(forward_batch=forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int):
         self.flashattention_backend.init_cuda_graph_state(
@@ -165,30 +172,34 @@ class HiPAttentionBackend(AttentionBackend):
         if layer.use_irope:
             using_chunked_sw = True
             sw_size = self.attention_chunk_size
-        
+
         using_dense_prefill = os.getenv("HIP_DEBUG_USING_DENSE_PREFILL", "0") == "1"
-        using_dense_prefill = (using_dense_prefill and (layer.layer_id in self.hip_config.dense_layers))
-        
+        using_dense_prefill = using_dense_prefill and (
+            layer.layer_id in self.hip_config.dense_layers
+        )
+
         force_dense_decode = os.getenv("HIP_DEBUG_FORCE_DENSE_DECODE", "0") == "1"
-        
-        delta_attention_args = os.getenv('HIP_DELTA_ATTENTION_ARGS', "")
-        delta_dense_decode = any(['dense_decode' == key for key in delta_attention_args.split('-')])
-        
+
+        delta_attention_args = os.getenv("HIP_DELTA_ATTENTION_ARGS", "")
+        delta_dense_decode = any(
+            ["dense_decode" == key for key in delta_attention_args.split("-")]
+        )
+
         is_decode = False
         need_dense_prefill = using_chunked_sw or using_dense_prefill
         need_dense_decode = using_chunked_sw or delta_dense_decode
-        
+
         run_benchmark = (
-            (not torch.cuda.is_current_stream_capturing()) and 
-            os.getenv('HIP_DEBUG_BENCH', '0') == '1' and
-            (get_local_rank() == 0)
+            (not torch.cuda.is_current_stream_capturing())
+            and os.getenv("HIP_DEBUG_BENCH", "0") == "1"
+            and (get_local_rank() == 0)
         )
 
         if run_benchmark:
             start_event = torch.cuda.Event(True)
             end_event = torch.cuda.Event(True)
             start_event.record()
-            
+
         if (need_dense_prefill and (not is_decode)) or False:
             return self.flashattention_backend.forward_extend(
                 q=q,
@@ -198,8 +209,8 @@ class HiPAttentionBackend(AttentionBackend):
                 forward_batch=forward_batch,
                 save_kv_cache=save_kv_cache,
                 # For multi-head latent attention
-                q_rope = q_rope,
-                k_rope = k_rope,
+                q_rope=q_rope,
+                k_rope=k_rope,
             )
         else:
             if not self.is_kv_cache_offload_enabled:
@@ -207,7 +218,9 @@ class HiPAttentionBackend(AttentionBackend):
                     assert v is not None
                     if save_kv_cache:
                         if not self.use_mla:
-                            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                            forward_batch.token_to_kv_pool.set_kv_buffer(
+                                layer, cache_loc, k, v
+                            )
                         else:
                             forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                                 layer,
@@ -223,8 +236,10 @@ class HiPAttentionBackend(AttentionBackend):
                     k_chunk = k.reshape(-1, layer.tp_k_head_num, layer.head_dim)
                     v_chunk = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
                 else:
-                    kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                
+                    kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
+                        layer.layer_id
+                    )
+
                 offload_cache = None
                 offloading_metadata = None
 
@@ -238,7 +253,12 @@ class HiPAttentionBackend(AttentionBackend):
                     if save_kv_cache:
                         if not self.use_mla:
                             forward_batch.token_to_kv_pool.set_kv_buffer(
-                                layer, cache_loc, k, v, async_copy=True, push_to_gpu_cache=False
+                                layer,
+                                cache_loc,
+                                k,
+                                v,
+                                async_copy=True,
+                                push_to_gpu_cache=False,
                             )
                         else:
                             raise Exception()
@@ -253,14 +273,14 @@ class HiPAttentionBackend(AttentionBackend):
                         cache_v=v,
                     )
                 )
-            
+
             use_cascade_attn = (
                 forward_batch.forward_mode.is_target_verify() and self.topk > 1
             )
-            
+
             if not self.use_mla:
                 q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-                
+
                 o, _ = self.forward_paged_hip(
                     query=q_reshaped,
                     sm_scale=layer.scaling,
@@ -298,12 +318,12 @@ class HiPAttentionBackend(AttentionBackend):
                     using_chunked_sliding_window=using_chunked_sw,
                 )
             else:
-                assert q.shape[0] == 1, f'{q.shape=}'
+                assert q.shape[0] == 1, f"{q.shape=}"
                 k_reshaped = k.reshape(1, -1, layer.tp_k_head_num, layer.head_dim)
                 v_reshaped = v.reshape(1, -1, layer.tp_v_head_num, layer.v_head_dim)
-                
+
                 assert not use_cascade_attn
-                
+
                 o, metadata = self.forward_paged_hip(
                     query=q,
                     sm_scale=layer.scaling,
@@ -344,6 +364,7 @@ class HiPAttentionBackend(AttentionBackend):
 
         if run_benchmark:
             from hip_attn.v1_2.utils import capture
+
             end_event.record()
             end_event.synchronize()
 
@@ -351,7 +372,9 @@ class HiPAttentionBackend(AttentionBackend):
             elapsed_layer = (time.time() - self._last_tick) * 1000
             self._last_tick = time.time()
             capture.report()
-            print(f'[hip] layer {layer.layer_id} took {elapsed:.2f} ms (from last tick: {elapsed_layer:.2f} ms)')
+            print(
+                f"[hip] layer {layer.layer_id} took {elapsed:.2f} ms (from last tick: {elapsed_layer:.2f} ms)"
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -367,7 +390,7 @@ class HiPAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        
+
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -379,19 +402,23 @@ class HiPAttentionBackend(AttentionBackend):
         if layer.use_irope:
             using_chunked_sw = True
             sw_size = self.attention_chunk_size
-        
+
         using_dense_prefill = os.getenv("HIP_DEBUG_USING_DENSE_PREFILL", "0") == "1"
-        using_dense_prefill = (using_dense_prefill and (layer.layer_id in self.hip_config.dense_layers))
-        
+        using_dense_prefill = using_dense_prefill and (
+            layer.layer_id in self.hip_config.dense_layers
+        )
+
         force_dense_decode = os.getenv("HIP_DEBUG_FORCE_DENSE_DECODE", "0") == "1"
-        
-        delta_attention_args = os.getenv('HIP_DELTA_ATTENTION_ARGS', "")
-        delta_dense_decode = any(['dense_decode' == key for key in delta_attention_args.split('-')])
-        
+
+        delta_attention_args = os.getenv("HIP_DELTA_ATTENTION_ARGS", "")
+        delta_dense_decode = any(
+            ["dense_decode" == key for key in delta_attention_args.split("-")]
+        )
+
         is_decode = False
         need_dense_prefill = using_chunked_sw or using_dense_prefill
         need_dense_decode = using_chunked_sw or delta_dense_decode or force_dense_decode
-        
+
         if need_dense_decode or False:
             o = self.flashattention_backend.forward_decode(
                 q=q,
@@ -401,8 +428,8 @@ class HiPAttentionBackend(AttentionBackend):
                 forward_batch=forward_batch,
                 save_kv_cache=save_kv_cache,
                 # For multi-head latent attention
-                q_rope = q_rope,
-                k_rope = k_rope,
+                q_rope=q_rope,
+                k_rope=k_rope,
             )
         else:
             metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache(
@@ -432,8 +459,10 @@ class HiPAttentionBackend(AttentionBackend):
                         layer.layer_id
                     )
                 else:
-                    kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                
+                    kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
+                        layer.layer_id
+                    )
+
                 offload_cache = offloading_metadata = None
             else:  # Offloading enabled
                 assert isinstance(
@@ -444,7 +473,12 @@ class HiPAttentionBackend(AttentionBackend):
                     if save_kv_cache:
                         if not self.use_mla:
                             forward_batch.token_to_kv_pool.set_kv_buffer(
-                                layer, cache_loc, k, v, async_copy=False, push_to_gpu_cache=True
+                                layer,
+                                cache_loc,
+                                k,
+                                v,
+                                async_copy=False,
+                                push_to_gpu_cache=True,
                             )
                         else:
                             raise Exception()
@@ -456,13 +490,17 @@ class HiPAttentionBackend(AttentionBackend):
 
             if not self.use_mla:
                 if k_cache is not None:
-                    if k_cache.dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+                    if k_cache.dtype not in [
+                        torch.float32,
+                        torch.float16,
+                        torch.bfloat16,
+                    ]:
                         assert layer.k_scale is not None, "fp8 scale should be handled"
-                
+
                 q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
                 k_reshaped = k.reshape(-1, layer.tp_k_head_num, layer.head_dim)
                 v_reshaped = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
-                
+
                 o, metadata = self.forward_paged_hip(
                     query=q_reshaped,
                     sm_scale=layer.scaling,
@@ -501,7 +539,7 @@ class HiPAttentionBackend(AttentionBackend):
             else:
                 # print(q.shape, k.shape, q_rope.shape, k_rope.shape)
                 # torch.Size([1, 16, 512]) torch.Size([1, 1, 512]) torch.Size([1, 16, 64]) torch.Size([1, 1, 64])
-                
+
                 k_rope = kv_cache[:, :, layer.v_head_dim :]
                 c_kv = kv_cache[:, :, : layer.v_head_dim]
                 k_rope_cache = k_rope.view(
@@ -523,11 +561,13 @@ class HiPAttentionBackend(AttentionBackend):
                     q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                     q_nope = q_all[:, :, : layer.v_head_dim]
                     q_rope = q_all[:, :, layer.v_head_dim :]
-                max_seqlen_q = self.flashattention_backend.forward_metadata.max_seq_len_q
-                
+                max_seqlen_q = (
+                    self.flashattention_backend.forward_metadata.max_seq_len_q
+                )
+
                 # print(q_rope.shape, k_rope_cache.shape, c_kv_cache.shape, q_nope.shape)
                 # torch.Size([1, 16, 64]) torch.Size([320001, 1, 1, 64]) torch.Size([320001, 1, 1, 512]) torch.Size([1, 16, 512])
-                
+
                 assert q_nope.shape[-1] == layer.rope_range[0]
                 assert (q_rope.shape[-1] + q_nope.shape[-1]) == layer.rope_range[1]
                 q_merged = torch.cat([q_nope, q_rope], dim=-1)
@@ -535,7 +575,7 @@ class HiPAttentionBackend(AttentionBackend):
                 # k_cache = torch.cat([c_kv_cache, k_rope_cache], dim=-1)
                 k_cache = kv_cache
                 v_cache = c_kv_cache
-                
+
                 o, metadata = self.forward_paged_hip(
                     query=q_merged,
                     sm_scale=layer.scaling,

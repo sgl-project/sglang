@@ -2033,8 +2033,8 @@ class ServerArgs:
         args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
-        
-        if args.attention_backend == 'hip_attention':
+
+        if args.attention_backend == "hip_attention":
             args.enable_hip_attention = True
 
         if args.enable_hip_attention:
@@ -2043,7 +2043,9 @@ class ServerArgs:
             args.hip_attention_config = HiPAttentionConfig(
                 json_or_path=args.hip_attention_config
             )
-            logger.info(f'attention_backend changed {args.attention_backend} -> hip_attention')
+            logger.info(
+                f"attention_backend changed {args.attention_backend} -> hip_attention"
+            )
             args.attention_backend = "hip_attention"
         else:
             args.hip_attention_config = None
