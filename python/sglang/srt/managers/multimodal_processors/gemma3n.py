@@ -65,6 +65,7 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
     ):
         """Process multimodal data including images and audio."""
 
+        audio_data = request_obj.audio_data
         if not image_data and not audio_data:
             return None
 

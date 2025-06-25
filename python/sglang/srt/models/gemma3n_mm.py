@@ -468,7 +468,6 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         #     input_embeds[audio_indices] = audio_embeds_flat
 
         if input_ids is not None:
-            print(f"DEBUG: input_ids: {input_ids}")
             # Prepare per-layer inputs from inputs_ids
             per_layer_inputs_mask = torch.logical_and(
                 input_ids >= 0, input_ids < self.vocab_size_per_layer_input
