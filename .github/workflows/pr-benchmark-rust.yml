@@ -1,0 +1,121 @@
+name: PR Benchmark (Rust Router)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "sgl-router/**"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "sgl-router/**"
+  workflow_dispatch:
+
+concurrency:
+  group: pr-benchmark-rust-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+jobs:
+  benchmark-router:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Fetch enough history for baseline comparison
+          fetch-depth: 100
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_rust.sh
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            sgl-router/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build router in release mode
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-router/
+          cargo build --release
+
+      - name: Run quick benchmarks
+        timeout-minutes: 15
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-router/
+          # Run quick benchmarks for PR validation using Python script
+          python3 scripts/run_benchmarks.py --quick --validate-thresholds --save-results
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: |
+            sgl-router/target/criterion/
+          retention-days: 30
+
+      - name: Post benchmark results as PR comment
+        if: github.event_name == 'pull_request'
+        run: |
+          cd sgl-router/
+          # Use Python script to post benchmark comment
+          python3 scripts/post_benchmark_comment.py \
+            --pr-number ${{ github.event.number }} \
+            --commit-sha ${{ github.sha }} \
+            --results-file benchmark_results.env
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  benchmark-integration-test:
+    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci_install_rust.sh
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            sgl-router/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Run benchmark integration tests
+        timeout-minutes: 10
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-router/
+          # Run integration tests to ensure benchmark code compiles and works
+          cargo test --test benchmark_integration
+
+      - name: Verify benchmark compilation
+        run: |
+          source "$HOME/.cargo/env"
+          cd sgl-router/
+          # Ensure all benchmarks compile without running them
+          cargo check --benches
