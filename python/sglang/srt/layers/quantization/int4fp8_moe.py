@@ -571,6 +571,7 @@ class QuarkInt4Fp8MoEMethod:
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
+        num_fused_shared_experts: int = 0,
     ) -> torch.Tensor:
         # TODO: fix circular imports issues in sglang forcing us to import here instead of at
         # the top of file.
@@ -588,6 +589,7 @@ class QuarkInt4Fp8MoEMethod:
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
+            num_fused_shared_experts=num_fused_shared_experts,
         )
 
         # TODO: add triton kernel and add check get_bool_env_var("CK_MOE")

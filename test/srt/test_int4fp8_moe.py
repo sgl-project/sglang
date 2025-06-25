@@ -42,7 +42,7 @@ class TestMixtralAccuracy(CustomTestCase):
         args = SimpleNamespace(
             num_shots=8,
             data_path=None,
-            num_questions=200,
+            num_questions=1400,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",
@@ -50,5 +50,4 @@ class TestMixtralAccuracy(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.549)
-        self.assertLess(metrics["accuracy"], 0.56)
+        self.assertGreater(metrics["accuracy"], 0.60)
