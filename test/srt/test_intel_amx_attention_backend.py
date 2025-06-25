@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 
 class TestIntelAMXAttnBackend(CustomTestCase):
     def test_latency(self):
-        output_throughput = run_bench_one_batch(
+        prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
             DEFAULT_MLA_MODEL_NAME_FOR_TEST,
             [
                 "--attention-backend",
@@ -30,14 +30,17 @@ class TestIntelAMXAttnBackend(CustomTestCase):
                 "0.05",
                 "--disable-radix",
                 "--trust-remote-code",
+                "--batch-size",
+                "4",
             ],
         )
 
-        print(f"{output_throughput=}")
+        print(f"{prefill_latency=}")
+        print(f"{decode_throughput=}")
+        print(f"{decode_latency=}")
 
-        # TODO: The expected throughput for Intel AMX backend is not defined yet.
-        # if is_in_ci():
-        #     self.assertGreater(output_throughput, 153)
+        if is_in_ci():
+            self.assertGreater(decode_throughput, 10)
 
     def test_mmlu(self):
         model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
