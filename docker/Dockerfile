@@ -85,7 +85,7 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/sour
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
     datamodel_code_generator \
-    mooncake_transfer_engine==0.3.4.post1 \
+    mooncake_transfer_engine==0.3.4.post2 \
     pre-commit \
     pytest \
     black \
