@@ -196,6 +196,9 @@ class CompletionRequest(BaseModel):
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
 
+    # For request id
+    rid: Optional[Union[List[str], str]] = None
+
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
@@ -309,6 +312,18 @@ class ChatCompletionMessageGenericParam(BaseModel):
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def _normalize_role(cls, v):
+        if isinstance(v, str):
+            v_lower = v.lower()
+            if v_lower not in {"system", "assistant", "tool"}:
+                raise ValueError(
+                    "'role' must be one of 'system', 'assistant', or 'tool' (case-insensitive)."
+                )
+            return v_lower
+        raise ValueError("'role' must be a string")
 
 
 class ChatCompletionMessageUserParam(BaseModel):
@@ -430,8 +445,8 @@ class ChatCompletionRequest(BaseModel):
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
 
-    # The request id.
-    rid: Optional[str] = None
+    # For request id
+    rid: Optional[Union[List[str], str]] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[str] = None
@@ -529,7 +544,7 @@ class EmbeddingRequest(BaseModel):
     user: Optional[str] = None
 
     # The request id.
-    rid: Optional[str] = None
+    rid: Optional[Union[List[str], str]] = None
 
 
 class EmbeddingObject(BaseModel):

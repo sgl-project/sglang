@@ -8,16 +8,29 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.custom_op import CustomOp
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_bool_env_var,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
 if _is_cuda:
     from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
+if _use_aiter:
+    from aiter.rotary_embedding import get_rope as aiter_get_rope
+
+if is_npu():
+    import torch_npu
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -151,6 +164,36 @@ class RotaryEmbedding(CustomOp):
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
+
+    def forward_npu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """A PyTorch-npu implementation of forward()."""
+        import os
+
+        if get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
+            return self.forward_native(positions, query, key, offsets)
+        else:
+            rotary_mode = "half"
+            if self.is_neox_style:
+                rotary_mode = "half"
+            else:
+                rotary_mode = "interleave"
+            mrope_section = [0, 0, 0]
+            query_out, key_out = torch_npu.npu_mrope(
+                positions,
+                query,
+                key,
+                self.cos_sin_cache,
+                self.head_size,
+                mrope_section=mrope_section,
+                rotary_mode=rotary_mode,
+            )
+            return query_out, key_out
 
     def forward_cpu(
         self,
@@ -1388,7 +1431,8 @@ def get_rope_wrapper(
     device: Optional[str] = None,
 ):
     if device != "cpu":
-        return get_rope(
+        wrapper = aiter_get_rope if _use_aiter else get_rope
+        return wrapper(
             head_size,
             rotary_dim,
             max_position,
