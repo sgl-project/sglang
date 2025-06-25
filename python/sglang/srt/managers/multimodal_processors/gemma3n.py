@@ -13,9 +13,7 @@
 # ==============================================================================
 
 import re
-from typing import Dict, List, Optional, Tuple, Union
-
-import numpy as np
+from typing import Dict, List, Optional, Union
 
 from sglang.srt.managers.multimodal_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -23,7 +21,6 @@ from sglang.srt.managers.multimodal_processor import (
 from sglang.srt.managers.multimodal_processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.gemma3n_mm import Gemma3nForConditionalGeneration
 
 

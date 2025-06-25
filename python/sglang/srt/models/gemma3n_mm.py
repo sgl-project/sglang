@@ -36,7 +36,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.gemma3n_audio import Gemma3nAudioEncoder
 from sglang.srt.models.gemma3n_causal import Gemma3nRMSNorm, Gemma3nTextModel
-from sglang.srt.utils import add_prefix, debug_print
+from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -381,7 +381,6 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             audio_features = torch.where(
                 audio_mask.unsqueeze(-1), audio_padding_embs, audio_features
             )
-            debug_print("gemma3n_mm: audio_embeds(after where)", audio_features)
 
             audio_batch_size, audio_seq_len, audio_embed_dim = audio_features.shape
             extra_padding_tokens = (
@@ -392,7 +391,6 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             )
 
             audio_features = torch.cat((audio_features, extra_padding_features), dim=1)
-            debug_print("gemma3n_mm: audio_embeds(after cat)", audio_features)
             return audio_features
         else:
             return torch.empty(
