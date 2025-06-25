@@ -196,6 +196,9 @@ class CompletionRequest(BaseModel):
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
 
+    # For request id
+    rid: Optional[Union[List[str], str]] = None
+
     @field_validator("max_tokens")
     @classmethod
     def validate_max_tokens_positive(cls, v):
@@ -430,8 +433,8 @@ class ChatCompletionRequest(BaseModel):
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
 
-    # The request id.
-    rid: Optional[str] = None
+    # For request id
+    rid: Optional[Union[List[str], str]] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[str] = None
@@ -529,7 +532,7 @@ class EmbeddingRequest(BaseModel):
     user: Optional[str] = None
 
     # The request id.
-    rid: Optional[str] = None
+    rid: Optional[Union[List[str], str]] = None
 
 
 class EmbeddingObject(BaseModel):
