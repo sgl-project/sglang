@@ -18,15 +18,10 @@ import random
 import unittest
 from typing import List
 
-from utils import (
-    TORCH_DTYPES,
-    LoRAAdaptor,
-    LoRAModelCase,
-)
+from utils import TORCH_DTYPES, LoRAAdaptor, LoRAModelCase
 
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, calculate_rouge_l, is_in_ci
-
 
 LORA_MODELS_QWEN3 = [
     LoRAModelCase(
@@ -148,7 +143,9 @@ class TestLoRA(CustomTestCase):
                     disable_radix_cache=True,
                 )
                 hf_runner = HFRunner(
-                    base_path, torch_dtype=torch_dtype, model_type="generation",
+                    base_path,
+                    torch_dtype=torch_dtype,
+                    model_type="generation",
                     patch_model_do_sample_false=True,
                 )
 
