@@ -191,6 +191,7 @@ class ModelRunner:
         self.attention_chunk_size = model_config.attention_chunk_size
 
         self.forward_pass_id = 0
+        self.device_graph_runner = None
 
         # Model-specific adjustment
         self.model_specific_adjustment()
@@ -303,7 +304,7 @@ class ModelRunner:
         elif self.device == "npu":
             self.init_npu_graphs()
         else:
-            self.cuda_graph_runner = None
+            self.device_graph_runner = None
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
@@ -1143,7 +1144,7 @@ class ModelRunner:
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
-        self.cuda_graph_runner = None
+        self.device_graph_runner = None
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
@@ -1157,7 +1158,7 @@ class ModelRunner:
         logger.info(
             f"Capture cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        self.cuda_graph_runner = CudaGraphRunner(self)
+        self.device_graph_runner = CudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Capture cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
@@ -1166,7 +1167,7 @@ class ModelRunner:
 
     def init_npu_graphs(self):
         """Enable torch.compile and graph engine with Npu."""
-        self.cuda_graph_runner = None
+        self.device_graph_runner = None
 
         if not self.is_generation:
             # TODO: Currently, npu graph only captures decode steps, which only exists for generation models
@@ -1180,7 +1181,7 @@ class ModelRunner:
         logger.info(
             f"Compile graph with npu begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        self.npu_graph_runner = NpuGraphRunner(self)
+        self.device_graph_runner = NpuGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Compile graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
@@ -1269,23 +1270,15 @@ class ModelRunner:
         skip_attn_backend_init: bool,
         pp_proxy_tensors: Optional[PPProxyTensors],
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
-        can_run_cuda_graph = bool(
-            forward_batch.forward_mode.is_cuda_graph()
-            and self.cuda_graph_runner
-            and self.cuda_graph_runner.can_run(forward_batch)
-        )
-        if can_run_cuda_graph:
-            ret = self.cuda_graph_runner.replay(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+        can_run_graph = bool(self.device_graph_runner and self.device_graph_runner.can_run(forward_batch))
+        if can_run_graph:
+            with self.device_graph_runner.get_runner_context(forward_batch) as runner_fn:
+                ret = runner_fn(
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
         elif forward_batch.forward_mode.is_decode():
-            if is_npu():
-                with self.npu_graph_runner.compile_context(forward_batch) as forward_decode:
-                    ret = forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
-            else:
-                ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+            ret = self.forward_decode(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         elif forward_batch.forward_mode.is_extend():
             ret = self.forward_extend(
                 forward_batch,
@@ -1297,7 +1290,7 @@ class ModelRunner:
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
-        return ret, can_run_cuda_graph
+        return ret, can_run_graph
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo

@@ -425,9 +425,9 @@ class MHATokenToKVPool(KVCache):
                 self.v_buffer[layer_id - self.start_layer][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
         else:
-            if _is_npu and loc.size() > 0 and loc.ndim == 1:
-                torch_npu.scatter_update_(self.k_buffer[layer_id - self.start_layer].unsqueeze(0), loc[0], cache_k.unsqueeze(0))
-                torch_npu.scatter_update_(self.v_buffer[layer_id - self.start_layer].unsqueeze(0), loc[0], cache_v.unsqueeze(0))
+            if _is_npu and len(loc.size()) > 0 and loc.ndim == 1:
+                torch_npu.scatter_update_(self.k_buffer[layer_id - self.start_layer].unsqueeze(0), loc[0], cache_k.unsqueeze(0), axis=1)
+                torch_npu.scatter_update_(self.v_buffer[layer_id - self.start_layer].unsqueeze(0), loc[0], cache_v.unsqueeze(0), axis=1)
             else:
                 self.k_buffer[layer_id - self.start_layer][loc] = cache_k
                 self.v_buffer[layer_id - self.start_layer][loc] = cache_v

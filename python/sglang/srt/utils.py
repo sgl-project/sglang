@@ -1525,33 +1525,18 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 
     return major, minor
 
-npu_compile_config = {}
-def set_npu_compiler_config(compile_config: Dict[str, Any] = None):
-    global npu_compile_config
-    for key, value in compile_config.items():
-        if key in npu_compile_config:
-            old_val = npu_compile_config[key]
-            new_val = value
-            if type(old_val) != type(new_val):
-                raise TypeError(f"Type mismatch for {key}: {type(old_val)} vs {type(new_val)}")
-
-            if isinstance(old_val, dict):
-                for k, v in new_val.items():
-                    if k in old_val and old_val[k] != v:
-                        raise ValueError(f"Conflict in {key}.{k}: {old_val[k]} vs {v}")
-
-            else:
-                if old_val != new_val:
-                    if isinstance(old_val, set):
-                        err_msg = f"Set conflict for {key}: Existing {old_val} vs New {new_val}"
-                    else:
-                        err_msg = f"Value conflict for {key}: {old_val} vs {new_val}"
-                    raise ValueError(err_msg)
-
-        npu_compile_config[key] = value
-
-
-
+npu_compile_config = {
+    "experimental_config": {
+        "frozen_parameter": True,
+        "tiling_schedule_optimize": True,
+        "topology_sorting_strategy": "StableRDFS",
+    },
+    "inference_config": {
+        "dynamic_gears_merge_policy": "zip"
+    },
+    "mode": os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune")
+}
+npu_backend = None
 def get_compiler_backend() -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
@@ -1566,6 +1551,10 @@ def get_compiler_backend() -> str:
                 "NPU detected, but torchair package is not installed. "
                 "Please install torchair for torch.compile support on NPU."
             )
+        global npu_backend
+        if npu_backend is not None:
+            logger.info("npu_backend is already registered, return it.")
+            return npu_backend
         compiler_config = CompilerConfig()
         for config_group, config_value in npu_compile_config.items():
             config_obj = getattr(compiler_config, config_group, None)

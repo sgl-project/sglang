@@ -19,8 +19,7 @@ import bisect
 import inspect
 import os
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Callable, Optional, Union
-
+from typing import TYPE_CHECKING, Callable, Optional, Union, ContextManager, Tuple, Any, Generator
 import torch
 import tqdm
 
@@ -30,6 +29,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+    enable_num_token_non_padded
 )
 from sglang.srt.utils import (
     get_available_gpu_memory,
@@ -37,7 +37,6 @@ from sglang.srt.utils import (
     rank0_log,
     get_compiler_backend,
     get_device,
-    set_npu_compiler_config
 )
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.model_executor.cuda_graph_runner import _to_torch, patch_model, get_batch_sizes_to_capture, \
@@ -69,31 +68,12 @@ class NpuGraphRunner(DeviceRunnerBase):
                       "please set --enable-torch-compile")
             return
 
-        compile_mode = os.environ.get(
-            "SGLANG_TORCH_COMPILE_MODE", "max-autotune"
-        )
-        # support max-autotune currently, will support reduce-overhead(similar to cuda graph) in the future
-        assert compile_mode in ["max-autotune"], "Only max-autotune is supported for now while use npu"
-        npu_compile_config = {
-            "experimental_config": {
-                "frozen_parameter": True,
-                "tiling_schedule_optimize": True,
-                "topology_sorting_strategy": "StableRDFS",
-            },
-            "inference_config": {
-                "dynamic_gears_merge_policy": "zip"
-            },
-            "mode": compile_mode
-            # add compile_config here
-        }
-        set_npu_compiler_config(npu_compile_config)
         rank0_log("Warming up npu graph")
-
+        use_dim_gears = os.getenv("SGLANG_USE_DIM_GEARS", "0")
         self.model_runner.model.compile_forward = torch.compile(
             torch.no_grad()(self.model_runner.model.forward),
-            fullgraph=True,
+            fullgraph=True if use_dim_gears is "1" else False,
             backend=get_compiler_backend(),
-            mode = compile_mode
         )
         compile_range = (
             tqdm.tqdm(list(reversed(self.compile_bs)))
@@ -113,7 +93,7 @@ class NpuGraphRunner(DeviceRunnerBase):
             num_tokens = bs * self.num_tokens_per_bs
             forward_batch = self.prepare_forward_batch(bs, num_tokens)
 
-            if get_device().startswith("npu"):
+            if get_device().startswith("npu") and use_dim_gears is "1":
                 import torchair
                 torchair.inference.set_dim_gears(forward_batch.input_ids, dim_gears={0: self.compile_bs})
 
@@ -159,19 +139,26 @@ class NpuGraphRunner(DeviceRunnerBase):
         return
 
     @contextmanager
-    def compile_context(self, forward_batch: ForwardBatch):
-        if self.enable_torch_compile and forward_batch.batch_size in self.compile_bs:
-            yield self.model_runner.model.compile_forward
-        else:
-            yield self.model_runner.model.forward
-
-    def can_run(self, forward_batch: ForwardBatch):
-        raise NotImplementedError("Did not support for npu currently.")
-
-    def replay(
+    def get_runner_context(
             self,
-            forward_batch: ForwardBatch,
-            skip_attn_backend_init: bool = False,
-            pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        raise NotImplementedError("Did not support for npu currently.")
+            forward_batch: "ForwardBatch"
+    ) -> Generator[Callable[[bool, PPProxyTensors | None], Any], Any, None]:
+        def runner_fn(
+                skip_attn_backend_init: bool,
+                pp_proxy_tensors: Optional["PPProxyTensors"]
+        ):
+            return self.model_runner.model.compile_forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors
+            )
+        forward_batch.attn_backend.init_forward_metadata(forward_batch)
+        yield runner_fn
+
+    def can_run(self, forward_batch: "ForwardBatch") -> bool:
+        return bool(
+            forward_batch.forward_mode.is_decode()
+            and self.model_runner.device_graph_runner
+            and self.model_runner.device_graph_runner.enable_torch_compile
+            and forward_batch.batch_size in self.model_runner.device_graph_runner.compile_bs)
