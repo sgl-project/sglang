@@ -44,6 +44,12 @@ class DeepseekModelNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+            logger.warning(
+                "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
+            )
+            quant_config = None
+
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -107,7 +113,11 @@ class DeepseekModelNextN(nn.Module):
         )
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+            if residual is not None:
+                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+            else:
+                hidden_states = self.shared_head.norm(hidden_states)
+
         return hidden_states
 
 
