@@ -2185,11 +2185,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     if _is_hip:
                         self_attn.w_scale *= 2.0
                 # TODO: remove this after adding FP8 support in bmm cpu kernel
-                if (
-                    w_kc.device == torch.device("cpu")
-                    and cpu_has_amx_support()
-                    and w.dtype == torch.float8_e4m3fn
-                ):
+                if _is_cpu and _is_cpu_amx_available and w.dtype == torch.float8_e4m3fn:
                     self_attn.w_kc = (
                         self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
                     )
