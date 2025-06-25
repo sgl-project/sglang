@@ -182,7 +182,7 @@ def cutlass_moe_fp8(
     #                             problem_sizes2, a_map, c_map, num_experts, n,
     #                             k)
 
-    sgl_per_tensor_quant_fp8(a, a_q, a1_scale, False)
+    sgl_per_tensor_quant_fp8(a, a_q, a1_scale, True)
     get_cutlass_moe_mm_data(
         local_topk_ids,
         expert_offsets,
@@ -213,7 +213,7 @@ def cutlass_moe_fp8(
 
     silu_and_mul(c1, intermediate)
 
-    sgl_per_tensor_quant_fp8(intermediate, intemediate_q, a2_scale, False)
+    sgl_per_tensor_quant_fp8(intermediate, intemediate_q, a2_scale, True)
 
     cutlass_moe_mm(
         c2,
