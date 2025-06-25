@@ -29,6 +29,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.utils import BumpAllocator, add_prefix
@@ -82,43 +83,43 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-
-        zero_allocator = BumpAllocator(
-            buffer_size=2,
-            dtype=torch.float32,
-            device=(
-                input_embeds.device if input_embeds is not None else input_ids.device
-            ),
-        )
-
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
-
-        if hidden_states.shape[0] > 0:
-            hidden_states = self.eh_proj(
-                torch.cat(
-                    (
-                        self.enorm(hidden_states),
-                        self.hnorm(forward_batch.spec_info.hidden_states),
-                    ),
-                    dim=-1,
-                )
+        with get_global_expert_distribution_recorder().with_disable_all():
+            zero_allocator = BumpAllocator(
+                buffer_size=2,
+                dtype=torch.float32,
+                device=(
+                    input_embeds.device if input_embeds is not None else input_ids.device
+                ),
             )
 
-        residual = None
-        hidden_states, residual = self.decoder(
-            positions, hidden_states, forward_batch, residual, zero_allocator
-        )
-
-        if not forward_batch.forward_mode.is_idle():
-            if residual is not None:
-                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
             else:
-                hidden_states = self.shared_head.norm(hidden_states)
+                hidden_states = input_embeds
 
-        return hidden_states
+            if hidden_states.shape[0] > 0:
+                hidden_states = self.eh_proj(
+                    torch.cat(
+                        (
+                            self.enorm(hidden_states),
+                            self.hnorm(forward_batch.spec_info.hidden_states),
+                        ),
+                        dim=-1,
+                    )
+                )
+
+            residual = None
+            hidden_states, residual = self.decoder(
+                positions, hidden_states, forward_batch, residual, zero_allocator
+            )
+
+            if not forward_batch.forward_mode.is_idle():
+                if residual is not None:
+                    hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+                else:
+                    hidden_states = self.shared_head.norm(hidden_states)
+
+            return hidden_states
 
 
 class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
