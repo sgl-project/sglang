@@ -21,7 +21,16 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ContextManager,
+    Generator,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import torch
 import tqdm
@@ -217,14 +226,9 @@ class DeviceRunnerBase(ABC):
     - initialize(): Configure hardware-specific environment and allocate resources
     - prepare_forward_batch(batch: Any) -> Any: Preprocess input data for device execution
     - warm_up(): Pre-execution calibration for performance stabilization
-    - can_run() -> bool: Verify device readiness and operational constraints
-    - replay(): Execute precompiled graph or replay captured execution sequence
-
-    Implementation Guidelines for Subclasses:
-    1. Handle device-specific memory management in prepare_forward_batch()
-    2. Implement hardware warm-up routines with actual kernel executions
-    3. In replay(), ensure thread safety for concurrent execution environments
-    4. Manage graph capture/replay states for stateful devices (e.g. NPU/CUDA)
+    - can_run_graph() -> bool: can use graph to accelerate the forward pass(eg: cuda: CudaGraph, npu: GraphEngine)
+    - get_runner_context(): Get runner context func for device-specific execution
+    - get_spec_info() -> Any: Get some info for speculative decoding
 
     Example subclassing:
     class CustomDeviceRunner(DeviceRunnerBase):
@@ -236,6 +240,7 @@ class DeviceRunnerBase(ABC):
 
     Note: Concrete subclasses must be instantiated with valid hardware context.
     """
+
     def __init__(self, model_runner: ModelRunner):
         # Parse args
         self.model_runner = model_runner
@@ -261,7 +266,9 @@ class DeviceRunnerBase(ABC):
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-        rank0_log(f"Device: {model_runner.device}, capture bs {self.capture_bs}, compile bs {self.compile_bs}")
+        rank0_log(
+            f"Device: {model_runner.device}, capture bs {self.capture_bs}, compile bs {self.compile_bs}"
+        )
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
@@ -352,12 +359,13 @@ class DeviceRunnerBase(ABC):
                     self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
             self.custom_mask = torch.ones(
                 (
-                        (self.seq_lens.sum().item() + self.max_num_token)
-                        * self.num_tokens_per_bs
+                    (self.seq_lens.sum().item() + self.max_num_token)
+                    * self.num_tokens_per_bs
                 ),
                 dtype=torch.bool,
                 device=self.model_runner.device,
             )
+
     def prepare_forward_batch(self, bs: int, num_tokens: int) -> ForwardBatch:
         # Graph inputs
         input_ids = self.input_ids[:num_tokens]
@@ -449,20 +457,17 @@ class DeviceRunnerBase(ABC):
     def warm_up(self):
         raise NotImplementedError
 
-
     @abstractmethod
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         raise NotImplementedError
 
-    @abstractmethod
-    def replay(
-            self,
-            forward_batch: ForwardBatch,
-            skip_attn_backend_init: bool = False,
-            pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        raise NotImplementedError
-
+    @contextmanager
+    def get_runner_context(
+        self, forward_batch: "ForwardBatch"
+    ) -> ContextManager[
+        Callable[..., Union["LogitsProcessorOutput", "PPProxyTensors"]]
+    ]:
+        raise NotImplementedError()
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
@@ -510,7 +515,7 @@ class CudaGraphRunner(DeviceRunnerBase):
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 sum(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -556,7 +561,8 @@ class CudaGraphRunner(DeviceRunnerBase):
         )
 
         return (
-            is_bs_supported
+            forward_batch.forward_mode.is_cuda_graph()
+            and is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
@@ -656,7 +662,10 @@ class CudaGraphRunner(DeviceRunnerBase):
                 and "pp_proxy_tensors" in inspect.signature(forward).parameters
             ):
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                    {k: v.clone() for k, v in forward_batch.pp_proxy_tensors.tensors.items()}
+                    {
+                        k: v.clone()
+                        for k, v in forward_batch.pp_proxy_tensors.tensors.items()
+                    }
                 )
 
             logits_output_or_pp_proxy_tensors = forward(
@@ -816,6 +825,19 @@ class CudaGraphRunner(DeviceRunnerBase):
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+
+    @contextmanager
+    def get_runner_context(self, forward_batch: "ForwardBatch") -> Generator[
+        Callable[[bool, PPProxyTensors | None], LogitsProcessorOutput | PPProxyTensors],
+        Any,
+        None,
+    ]:
+        def runner_fn(
+            skip_attn_backend_init: bool, pp_proxy_tensors: Optional["PPProxyTensors"]
+        ):
+            return self.replay(forward_batch, skip_attn_backend_init, pp_proxy_tensors)
+
+        yield runner_fn
 
 
 CUDA_GRAPH_CAPTURE_FAILED_MSG = (

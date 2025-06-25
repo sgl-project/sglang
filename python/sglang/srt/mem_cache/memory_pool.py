@@ -37,7 +37,13 @@ import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import debug_timing, get_bool_env_var, is_cuda, next_power_of_2, is_npu
+from sglang.srt.utils import (
+    debug_timing,
+    get_bool_env_var,
+    is_cuda,
+    is_npu,
+    next_power_of_2,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +52,7 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 if is_npu():
-    try:
-        import torch_npu
-    except ImportError:
-        logger.warning("torch_npu is not installed. NPU support will be disabled.")
-        _is_npu = False
+    import torch_npu
 
 
 class ReqToTokenPool:
@@ -432,9 +434,17 @@ class MHATokenToKVPool(KVCache):
                 self.v_buffer[layer_id - self.start_layer][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
         else:
-            if _is_npu and loc.size() > 0 and loc.ndim == 1:
-                torch_npu.scatter_update_(self.k_buffer[layer_id - self.start_layer].unsqueeze(0), loc[0], cache_k.unsqueeze(0))
-                torch_npu.scatter_update_(self.v_buffer[layer_id - self.start_layer].unsqueeze(0), loc[0], cache_v.unsqueeze(0))
+            if _is_npu and loc.ndim == 1:
+                torch_npu.npu_scatter_nd_update_(
+                    self.k_buffer[layer_id - self.start_layer],
+                    loc.view(-1, 1),
+                    cache_k,
+                )
+                torch_npu.npu_scatter_nd_update_(
+                    self.v_buffer[layer_id - self.start_layer],
+                    loc.view(-1, 1),
+                    cache_v,
+                )
             else:
                 self.k_buffer[layer_id - self.start_layer][loc] = cache_k
                 self.v_buffer[layer_id - self.start_layer][loc] = cache_v
