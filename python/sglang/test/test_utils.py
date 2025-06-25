@@ -5,6 +5,7 @@ import copy
 import logging
 import os
 import random
+import re
 import subprocess
 import threading
 import time
@@ -840,12 +841,23 @@ def run_bench_one_batch(model, other_args):
         print(f"Output: {output}", flush=True)
         print(f"Error: {error}", flush=True)
 
-        lastline = output.split("\n")[-3]
-        output_throughput = float(lastline.split(" ")[-2])
+        # Return prefill_latency, decode_throughput, decode_latency
+        prefill_line = output.split("\n")[-9]
+        decode_line = output.split("\n")[-3]
+        pattern = (
+            r"latency: (?P<latency>\d+\.\d+).*?throughput:\s*(?P<throughput>\d+\.\d+)"
+        )
+        match = re.search(pattern, prefill_line)
+        if match:
+            prefill_latency = float(match.group("latency"))
+        match = re.search(pattern, decode_line)
+        if match:
+            decode_latency = float(match.group("latency"))
+            decode_throughput = float(match.group("throughput"))
     finally:
         kill_process_tree(process.pid)
 
-    return output_throughput
+    return prefill_latency, decode_throughput, decode_latency
 
 
 def run_bench_offline_throughput(model, other_args):
