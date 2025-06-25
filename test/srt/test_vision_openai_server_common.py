@@ -1,5 +1,4 @@
 import base64
-import copy
 import io
 import json
 import os
@@ -78,57 +77,8 @@ class TestOpenAIVisionServer(CustomTestCase):
         assert response.usage.completion_tokens > 0
         assert response.usage.total_tokens > 0
 
-
     def get_request_kwargs(self):
         return {}
-
-    def test_single_image_chat_completion(self):
-        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-
-        response = client.chat.completions.create(
-            model="default",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
-                        },
-                        {
-                            "type": "text",
-                            "text": "Describe this image in a very short sentence.",
-                        },
-                    ],
-                },
-            ],
-            temperature=0,
-            **(self.get_request_kwargs()),
-        )
-
-        assert response.choices[0].message.role == "assistant"
-        text = response.choices[0].message.content
-        assert isinstance(text, str)
-        # `driver` is for gemma-3-it
-        assert (
-            "man" in text or "person" or "driver" in text
-        ), f"text: {text}, should contain man, person or driver"
-        assert (
-            "cab" in text
-            or "taxi" in text
-            or "SUV" in text
-            or "vehicle" in text
-            or "car" in text
-        ), f"text: {text}, should contain cab, taxi, SUV, vehicle or car"
-        # MiniCPMO fails to recognize `iron`, but `hanging`
-        assert (
-            "iron" in text or "hang" in text or "cloth" in text or "holding" in text
-        ), f"text: {text}, should contain iron, hang, cloth or holding"
-        assert response.id
-        assert response.created
-        assert response.usage.prompt_tokens > 0
-        assert response.usage.completion_tokens > 0
-        assert response.usage.total_tokens > 0
 
     def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
