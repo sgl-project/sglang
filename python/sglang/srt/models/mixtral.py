@@ -357,57 +357,59 @@ class MixtralModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         
         # ----------------
-        if get_tensor_model_parallel_rank() == 0:
-            for i in range(len(self.layers)):
-                # 保留3位小数
-                info = {
-                    "layer_id": i,
-                    "self_attn_time(ms, avg)": round(1000 * self.layers[i].timing["self_attn_time"], 3),
-                    "block_sparse_moe_time": round(1000 * self.layers[i].timing["block_sparse_moe_time"], 3),
-                    "moe_timing": {
-                        "gate_time": round(1000 * self.layers[i].timing["moe_timing"]["gate_time"], 3),
-                        "pre_order_time": round(1000 * self.layers[i].timing["moe_timing"]["pre_order_time"], 3),
-                        "group_gemm_0_time": round(1000 * self.layers[i].timing["moe_timing"]["group_gemm_0_time"], 3),
-                        "act_time": round(1000 * self.layers[i].timing["moe_timing"]["act_time"], 3),
-                        "group_gemm_1_time": round(1000 * self.layers[i].timing["moe_timing"]["group_gemm_1_time"], 3),
-                        "post_order_time": round(1000 * self.layers[i].timing["moe_timing"]["post_order_time"], 3),
-                        "all_reduce_time": round(1000 * self.layers[i].timing["moe_timing"]["all_reduce_time"], 3),
-                    },
-                }
-                self.model_timings.append(info)
-            
-            import json
-            import os   
-            tp_size = get_tensor_model_parallel_world_size()
-            batch_size = forward_batch.batch_size
-            run_id = os.environ["RUN_ID"] + "_tp" + str(tp_size) + "_bs" + str(batch_size)
-            
-            # check if the file exists
-            if not os.path.exists(f"MixtralModel_Timing_{run_id}.json"):
-                with open(f"MixtralModel_Timing_{run_id}.json", "w") as f:
-                    json.dump({}, f)
-            
-            
-            with open(f"MixtralModel_Timing_{run_id}.json", "r") as f:
-                content = json.load(f)
-            
-            with open(f"MixtralModel_Timing_{run_id}.json", "w") as f:
-                # if self.forward_times == 0:
-                #     # clear the file
-                #     f.truncate(0)
-                info = {
-                    "forward_id": self.forward_times,
-                    "moe_group_gemm_0_shape": self.layers[0].timing["moe_timing"]["group_gemm_0_shape"],
-                    "moe_group_gemm_1_shape": self.layers[0].timing["moe_timing"]["group_gemm_1_shape"],
-                    "layers_info": self.model_timings,
-                }
-                print("write forward_id: ", self.forward_times, "to file")
+        ## [moe-scaling] must set OP_TIMING_RUN_ID in env for timing EPMoE layer
+        if os.environ.get("OP_TIMING_RUN_ID", None) is not None:
+            if get_tensor_model_parallel_rank() == 0:
+                for i in range(len(self.layers)):
+                    # 保留3位小数
+                    info = {
+                        "layer_id": i,
+                        "self_attn_time(ms, avg)": round(1000 * self.layers[i].timing["self_attn_time"], 3),
+                        "block_sparse_moe_time": round(1000 * self.layers[i].timing["block_sparse_moe_time"], 3),
+                        "moe_timing": {
+                            "gate_time": round(1000 * self.layers[i].timing["moe_timing"]["gate_time"], 3),
+                            "pre_order_time": round(1000 * self.layers[i].timing["moe_timing"]["pre_order_time"], 3),
+                            "group_gemm_0_time": round(1000 * self.layers[i].timing["moe_timing"]["group_gemm_0_time"], 3),
+                            "act_time": round(1000 * self.layers[i].timing["moe_timing"]["act_time"], 3),
+                            "group_gemm_1_time": round(1000 * self.layers[i].timing["moe_timing"]["group_gemm_1_time"], 3),
+                            "post_order_time": round(1000 * self.layers[i].timing["moe_timing"]["post_order_time"], 3),
+                            "all_reduce_time": round(1000 * self.layers[i].timing["moe_timing"]["all_reduce_time"], 3),
+                        },
+                    }
+                    self.model_timings.append(info)
                 
-                content.update(info)
-                json.dump(content, f, indent=4)
-            
-            self.forward_times += 1
-            self.model_timings = []
+                import json
+                import os   
+                tp_size = get_tensor_model_parallel_world_size()
+                batch_size = forward_batch.batch_size
+                run_id = os.environ.get("OP_TIMING_RUN_ID", "default") + "_tp" + str(tp_size) + "_bs" + str(batch_size)
+                
+                # check if the file exists
+                if not os.path.exists(f"MixtralModel_Timing_{run_id}.json"):
+                    with open(f"MixtralModel_Timing_{run_id}.json", "w") as f:
+                        json.dump({}, f)
+                
+                
+                with open(f"MixtralModel_Timing_{run_id}.json", "r") as f:
+                    content = json.load(f)
+                
+                with open(f"MixtralModel_Timing_{run_id}.json", "w") as f:
+                    # if self.forward_times == 0:
+                    #     # clear the file
+                    #     f.truncate(0)
+                    info = {
+                        "forward_id": self.forward_times,
+                        "moe_group_gemm_0_shape": self.layers[0].timing["moe_timing"]["group_gemm_0_shape"],
+                        "moe_group_gemm_1_shape": self.layers[0].timing["moe_timing"]["group_gemm_1_shape"],
+                        "layers_info": self.model_timings,
+                    }
+                    print("write forward_id: ", self.forward_times, "to file")
+                    
+                    content.update(info)
+                    json.dump(content, f, indent=4)
+                
+                self.forward_times += 1
+                self.model_timings = []
         # torch.distributed.barrier()
         # ----------------
         
