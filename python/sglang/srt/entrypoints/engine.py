@@ -115,13 +115,13 @@ class Engine(EngineBase):
         atexit.register(self.shutdown)
 
         # Allocate ports for inter-process communications
-        port_args = PortArgs.init_new(server_args)
+        self.port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
         # Launch subprocesses
         tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args,
-            port_args=port_args,
+            port_args=self.port_args,
         )
         self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
@@ -130,7 +130,7 @@ class Engine(EngineBase):
 
         context = zmq.Context(2)
         self.send_to_rpc = get_zmq_socket(
-            context, zmq.DEALER, port_args.rpc_ipc_name, True
+            context, zmq.DEALER, self.port_args.rpc_ipc_name, True
         )
 
     def generate(
