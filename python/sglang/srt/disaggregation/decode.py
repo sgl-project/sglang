@@ -21,13 +21,11 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
-import os
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
@@ -47,12 +45,9 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import (
-    KVCache,
-    ReqToTokenPool,
-    TokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import require_mlp_sync
@@ -141,7 +136,7 @@ class DecodePreallocQueue:
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         draft_token_to_kv_pool: Optional[KVCache],
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
@@ -584,11 +579,11 @@ class DecodeTransferQueue:
                 idx = decode_req.metadata_buffer_index
                 (
                     output_id,
-                    output_hidden_states,
                     output_token_logprobs_val,
                     output_token_logprobs_idx,
                     output_top_logprobs_val,
                     output_top_logprobs_idx,
+                    output_hidden_states,
                 ) = self.metadata_buffers.get_buf(idx)
 
                 decode_req.req.output_ids.append(output_id[0].item())
@@ -766,7 +761,7 @@ class SchedulerDisaggregationDecodeMixin:
         if batch:
             result = self.run_batch(batch)
             if not delay_process:
-                self.prepare_mlp_sync_batch(batch, result)
+                self.process_batch_result(batch, result)
         return batch, result
 
     def get_next_disagg_decode_batch_to_run(

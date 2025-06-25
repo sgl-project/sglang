@@ -3,12 +3,9 @@ import time
 from typing import Any, AsyncGenerator, Dict, List, Union
 
 from fastapi import Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 
-from sglang.srt.code_completion_parser import (
-    generate_completion_prompt_from_request,
-    is_completion_template_defined,
-)
+from sglang.srt.code_completion_parser import generate_completion_prompt_from_request
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -19,14 +16,27 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
-from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
+from sglang.srt.entrypoints.openai.utils import (
+    process_hidden_states_from_ret,
+    to_openai_style_logprobs,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.template_manager import TemplateManager
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
 
 
 class OpenAIServingCompletion(OpenAIServingBase):
-    """Handler for completion requests"""
+    """Handler for /v1/completion requests"""
+
+    def __init__(
+        self,
+        tokenizer_manager: TokenizerManager,
+        template_manager: TemplateManager,
+    ):
+        super().__init__(tokenizer_manager)
+        self.template_manager = template_manager
 
     def _request_id_prefix(self) -> str:
         return "cmpl-"
@@ -44,7 +54,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             )
         # Process prompt
         prompt = request.prompt
-        if is_completion_template_defined():
+        if self.template_manager.completion_template_name is not None:
             prompt = generate_completion_prompt_from_request(request)
 
         # Set logprob start length based on echo and logprobs
@@ -76,6 +86,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
+            return_hidden_states=request.return_hidden_states,
+            rid=request.rid,
         )
 
         return adapted_request, request
@@ -137,6 +149,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         prompt_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
+        hidden_states = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -148,6 +161,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                hidden_states[index] = content["meta_info"].get("hidden_states", None)
 
                 stream_buffer = stream_buffers.get(index, "")
                 # Handle echo for first chunk
@@ -210,6 +224,30 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
 
+            if request.return_hidden_states and hidden_states:
+                for index, choice_hidden_states in hidden_states.items():
+                    if choice_hidden_states:
+                        last_token_hidden_states = (
+                            choice_hidden_states[-1]
+                            if len(choice_hidden_states) > 1
+                            else []
+                        )
+                        hidden_states_chunk = CompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=created,
+                            object="text_completion",
+                            choices=[
+                                CompletionResponseStreamChoice(
+                                    index=index,
+                                    text="",
+                                    hidden_states=last_token_hidden_states,
+                                    finish_reason=None,
+                                )
+                            ],
+                            model=request.model,
+                        )
+                        yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
+
             # Handle final usage chunk
             if request.stream_options and request.stream_options.include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
@@ -240,7 +278,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
-    ) -> Union[CompletionResponse, ErrorResponse]:
+    ) -> Union[CompletionResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming completion request"""
         try:
             generator = self.tokenizer_manager.generate_request(
@@ -304,6 +342,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     output_top_logprobs=ret_item["meta_info"]["output_top_logprobs"],
                 )
 
+            # Handle hidden states
+            hidden_states = process_hidden_states_from_ret(ret_item, request)
+
             finish_reason = ret_item["meta_info"]["finish_reason"]
 
             choice_data = CompletionResponseChoice(
@@ -316,6 +357,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     if finish_reason and "matched" in finish_reason
                     else None
                 ),
+                hidden_states=hidden_states,
             )
             choices.append(choice_data)
 
