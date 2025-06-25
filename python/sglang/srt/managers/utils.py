@@ -40,8 +40,8 @@ def validate_input_length(
             trunc_first = num_to_truncate // 2
             trunc_last = num_to_truncate - trunc_first
             req.origin_input_ids = (
-                req.origin_input_ids[:input_len // 2 - trunc_first] 
-                + req.origin_input_ids[input_len // 2 + trunc_last:]
+                req.origin_input_ids[: input_len // 2 - trunc_first]
+                + req.origin_input_ids[input_len // 2 + trunc_last :]
             )
             return None
         else:

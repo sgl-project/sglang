@@ -63,6 +63,7 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -531,7 +532,7 @@ class CudaGraphRunner:
                 )
             )
             logger.info(log_message)
-    
+
     def capture_configs(self):
         if self.enable_hip_attention:
             from hip_attn.v1_2.paged_hip import cuda_graph_capture_configs
@@ -620,7 +621,7 @@ class CudaGraphRunner:
             lora_ids = [None] * bs
         else:
             lora_ids = None
-        
+
         hip_num_cached_stages = None
         if self.enable_hip_attention:
             (hip_num_cached_stages,) = capture_config
@@ -850,7 +851,7 @@ class CudaGraphRunner:
         self.graphs[graph_handle].replay()
 
         output = self.output_buffers[graph_handle]
-        
+
         if isinstance(output, LogitsProcessorOutput):
             return LogitsProcessorOutput(
                 next_token_logits=output.next_token_logits[: self.raw_num_token],

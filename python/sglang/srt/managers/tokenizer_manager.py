@@ -626,7 +626,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
-        
+
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.reserve_input_token_num
         if input_token_num >= self.context_len:
@@ -671,7 +671,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 trunc_first = num_trunc // 2
                 for _ in range(num_trunc):
                     input_ids.pop(input_token_num // 2 + 1 - trunc_first)
-                assert (max_new_tokens + len(input_ids)) < self.context_len, f'({max_new_tokens} + {len(input_ids)}) < {self.context_len}'
+                assert (
+                    max_new_tokens + len(input_ids)
+                ) < self.context_len, (
+                    f"({max_new_tokens} + {len(input_ids)}) < {self.context_len}"
+                )
             else:
                 error_msg = (
                     f"Requested token count exceeds the model's maximum context length "

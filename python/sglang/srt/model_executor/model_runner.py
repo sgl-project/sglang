@@ -63,6 +63,7 @@ from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.hf_transformers_utils import get_context_length, update_context_length
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_size,
@@ -759,8 +760,10 @@ class ModelRunner:
             monkey_patch_vllm_gguf_config()
 
         if self.server_args.enable_hip_attention:
-            if hasattr(self.model_config.hf_config, 'text_config'):
-                orig_context_length = get_context_length(self.model_config.hf_config.text_config)
+            if hasattr(self.model_config.hf_config, "text_config"):
+                orig_context_length = get_context_length(
+                    self.model_config.hf_config.text_config
+                )
                 new_context_length = (
                     max(orig_context_length, self.server_args.context_length)
                     if self.server_args.context_length is not None
@@ -769,9 +772,13 @@ class ModelRunner:
                 if self.server_args.context_length is None:
                     new_context_length = orig_context_length
                 update_context_length(self.model_config.hf_config, new_context_length)
-                update_context_length(self.model_config.hf_config.text_config, new_context_length)
+                update_context_length(
+                    self.model_config.hf_config.text_config, new_context_length
+                )
                 self.model_config.hf_config.orig_context_len = orig_context_length
-                self.model_config.hf_config.text_config.orig_context_len = orig_context_length
+                self.model_config.hf_config.text_config.orig_context_len = (
+                    orig_context_length
+                )
             else:
                 orig_context_length = get_context_length(self.model_config.hf_config)
                 new_context_length = (

@@ -348,7 +348,7 @@ class Qwen2Model(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         forward_batch.on_model_start()
-        
+
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             forward_batch.on_layer_start(i)
