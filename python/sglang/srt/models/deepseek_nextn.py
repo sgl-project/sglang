@@ -83,43 +83,43 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        with get_global_expert_distribution_recorder().with_disable_all():
-            zero_allocator = BumpAllocator(
-                buffer_size=2,
-                dtype=torch.float32,
-                device=(
-                    input_embeds.device if input_embeds is not None else input_ids.device
-                ),
+        zero_allocator = BumpAllocator(
+            buffer_size=2,
+            dtype=torch.float32,
+            device=(
+                input_embeds.device if input_embeds is not None else input_ids.device
+            ),
+        )
+
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
+
+        if hidden_states.shape[0] > 0:
+            hidden_states = self.eh_proj(
+                torch.cat(
+                    (
+                        self.enorm(hidden_states),
+                        self.hnorm(forward_batch.spec_info.hidden_states),
+                    ),
+                    dim=-1,
+                )
             )
 
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
-
-            if hidden_states.shape[0] > 0:
-                hidden_states = self.eh_proj(
-                    torch.cat(
-                        (
-                            self.enorm(hidden_states),
-                            self.hnorm(forward_batch.spec_info.hidden_states),
-                        ),
-                        dim=-1,
-                    )
-                )
-
-            residual = None
+        residual = None
+        with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual = self.decoder(
                 positions, hidden_states, forward_batch, residual, zero_allocator
             )
 
-            if not forward_batch.forward_mode.is_idle():
-                if residual is not None:
-                    hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-                else:
-                    hidden_states = self.shared_head.norm(hidden_states)
+        if not forward_batch.forward_mode.is_idle():
+            if residual is not None:
+                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+            else:
+                hidden_states = self.shared_head.norm(hidden_states)
 
-            return hidden_states
+        return hidden_states
 
 
 class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):

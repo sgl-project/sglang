@@ -62,7 +62,7 @@ class ExpertDistributionRecorder(ABC):
         yield
 
     @contextmanager
-    def with_disable_all(self):
+    def disable_this_region(self):
         yield
 
     @contextmanager
@@ -154,7 +154,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 self._on_forward_pass_end(forward_pass_id)
 
     @contextmanager
-    def with_disable_all(self):
+    def disable_this_region(self):
         """Context manager to temporarily disable recording."""
         previous_disable_all = self._disable_all
         self._disable_all = True

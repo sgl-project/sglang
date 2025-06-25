@@ -44,9 +44,6 @@ from sglang.srt.speculative.eagle_utils import (
     select_top_k_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.managers.expert_distribution import (
-    get_global_expert_distribution_recorder,
-)
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -259,39 +256,38 @@ class EAGLEWorker(TpModelWorker):
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
-        with get_global_expert_distribution_recorder().with_disable_all():
-            self.cuda_graph_runner = None
-            self.cuda_graph_runner_for_draft_extend = None
+        self.cuda_graph_runner = None
+        self.cuda_graph_runner_for_draft_extend = None
 
-            if self.server_args.disable_cuda_graph:
-                return
+        if self.server_args.disable_cuda_graph:
+            return
 
-            # Capture draft
+        # Capture draft
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+        )
+        self.cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+        )
+
+        # Capture extend
+        if self.draft_extend_attn_backend:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
-                f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+                f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
             )
-            self.cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
+            self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
+                self
+            )
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
-                f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+                f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
-
-            # Capture extend
-            if self.draft_extend_attn_backend:
-                tic = time.perf_counter()
-                before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-                logger.info(
-                    f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
-                )
-                self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
-                    self
-                )
-                after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-                logger.info(
-                    f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
-                )
 
     @property
     def draft_model_runner(self):
@@ -578,63 +574,62 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
-        with get_global_expert_distribution_recorder().with_disable_all():
         # Parse args
-            spec_info = forward_batch.spec_info
-            out_cache_loc = forward_batch.out_cache_loc
-            topk_p, topk_index, hidden_states = (
-                spec_info.topk_p,
-                spec_info.topk_index,
-                spec_info.hidden_states,
+        spec_info = forward_batch.spec_info
+        out_cache_loc = forward_batch.out_cache_loc
+        topk_p, topk_index, hidden_states = (
+            spec_info.topk_p,
+            spec_info.topk_index,
+            spec_info.hidden_states,
+        )
+        if self.hot_token_id is not None:
+            topk_index = self.hot_token_id[topk_index]
+
+        out_cache_loc = out_cache_loc.reshape(
+            forward_batch.batch_size, self.topk, self.speculative_num_steps
+        )
+        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
+            self.speculative_num_steps, -1
+        )
+
+        # Return values
+        score_list: List[torch.Tensor] = []
+        token_list: List[torch.Tensor] = []
+        parents_list: List[torch.Tensor] = []
+
+        # Forward multiple steps
+        scores = None
+        for i in range(self.speculative_num_steps):
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, topk_p, topk_index, hidden_states, scores, self.topk
             )
+            score_list.append(tree_info[0])
+            token_list.append(tree_info[1])
+            parents_list.append(tree_info[2])
+
+            # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
+            if i == self.speculative_num_steps - 1:
+                break
+
+            # Set inputs
+            forward_batch.input_ids = input_ids
+            forward_batch.out_cache_loc = out_cache_loc[i]
+            forward_batch.positions.add_(1)
+            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+            spec_info.hidden_states = hidden_states
+
+            # Run forward
+            logits_output = self.draft_model_runner.model.forward(
+                forward_batch.input_ids, forward_batch.positions, forward_batch
+            )
+            self._detect_nan_if_needed(logits_output)
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
+            hidden_states = logits_output.hidden_states
 
-            out_cache_loc = out_cache_loc.reshape(
-                forward_batch.batch_size, self.topk, self.speculative_num_steps
-            )
-            out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
-                self.speculative_num_steps, -1
-            )
-
-            # Return values
-            score_list: List[torch.Tensor] = []
-            token_list: List[torch.Tensor] = []
-            parents_list: List[torch.Tensor] = []
-
-            # Forward multiple steps
-            scores = None
-            for i in range(self.speculative_num_steps):
-                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                    i, topk_p, topk_index, hidden_states, scores, self.topk
-                )
-                score_list.append(tree_info[0])
-                token_list.append(tree_info[1])
-                parents_list.append(tree_info[2])
-
-                # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
-                if i == self.speculative_num_steps - 1:
-                    break
-
-                # Set inputs
-                forward_batch.input_ids = input_ids
-                forward_batch.out_cache_loc = out_cache_loc[i]
-                forward_batch.positions.add_(1)
-                forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
-                spec_info.hidden_states = hidden_states
-
-                # Run forward
-                logits_output = self.draft_model_runner.model.forward(
-                    forward_batch.input_ids, forward_batch.positions, forward_batch
-                )
-                self._detect_nan_if_needed(logits_output)
-                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-                if self.hot_token_id is not None:
-                    topk_index = self.hot_token_id[topk_index]
-                hidden_states = logits_output.hidden_states
-
-            return score_list, token_list, parents_list
+        return score_list, token_list, parents_list
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         spec_info.prepare_for_verify(batch, self.page_size)
