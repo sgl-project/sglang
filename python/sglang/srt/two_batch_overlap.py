@@ -98,30 +98,38 @@ def split_spec_info(
     else:
         draft_token = None
     if spec_info.custom_mask is not None and spec_info.draft_token is not None:
-        if spec_info.draft_token.shape[0] == 0:
+        if start_seq_index == 0:
             custom_mask_start = 0
-            custom_mask_end = 0
         else:
-            custom_mask_start = (
-                start_token_index
-                * spec_info.custom_mask.shape[0]
-                // spec_info.draft_token.shape[0]
-            )
-            custom_mask_end = min(
-                end_token_index
-                * spec_info.custom_mask.shape[0]
-                // spec_info.draft_token.shape[0],
-                spec_info.custom_mask.shape[0],
-            )
-        custom_mask = torch.full(
-            (spec_info.custom_mask.shape[0],),
-            True,
-            device=spec_info.custom_mask.device,
+            custom_mask_start = 0
+            for i in range(min(start_seq_index, spec_info.seq_lens_cpu.shape[0])):
+                custom_mask_start += (
+                    spec_info.seq_lens_cpu[i] + spec_info.draft_token_num
+                ) * spec_info.draft_token_num
+        if end_seq_index == 0:
+            custom_mask_end = 0
+        elif end_seq_index == spec_info.seq_lens_cpu.shape[0]:
+            custom_mask_end = spec_info.custom_mask.shape[0]
+        else:
+            custom_mask_end = 0
+            for i in range(min(end_seq_index, spec_info.seq_lens_cpu.shape[0])):
+                custom_mask_end += (
+                    spec_info.seq_lens_cpu[i] + spec_info.draft_token_num
+                ) * spec_info.draft_token_num
+
+        logger.info(
+            f"seq_lens_cpu={spec_info.seq_lens_cpu}, start_seq_index={start_seq_index}, end_seq_index={end_seq_index}, custom_mask_start={custom_mask_start}, custom_mask_end={custom_mask_end}, spec_info.custom_mask_shape={spec_info.custom_mask.shape}"
         )
-        if custom_mask_end > custom_mask_start:
-            custom_mask[: (custom_mask_end - custom_mask_start)].copy_(
-                spec_info.custom_mask[custom_mask_start:custom_mask_end]
-            )
+        custom_mask = spec_info.custom_mask[custom_mask_start:custom_mask_end]
+        # custom_mask = torch.full(
+        #     (spec_info.custom_mask.shape[0],),
+        #     True,
+        #     device=spec_info.custom_mask.device,
+        # )
+        # if custom_mask_end > custom_mask_start:
+        #     custom_mask[: (custom_mask_end - custom_mask_start)].copy_(
+        #         spec_info.custom_mask[custom_mask_start:custom_mask_end]
+        #     )
     else:
         custom_mask = spec_info.custom_mask
     if spec_info.positions is not None:
