@@ -557,7 +557,6 @@ class DummyModelLoader(BaseModelLoader):
             if hasattr(model, "post_load_weights"):
                 model.post_load_weights()
 
-
         return model.eval()
 
 
