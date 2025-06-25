@@ -124,8 +124,6 @@ if _is_hip:
         decode_attention_fwd_grouped_rope,
     )
 
-if _use_aiter:
-    from aiter.rotary_embedding import get_rope
 
 logger = logging.getLogger(__name__)
 
