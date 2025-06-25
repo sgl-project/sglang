@@ -42,6 +42,7 @@ class BenchArgs:
     dataset_name: str = "sharegpt"
     dataset_path: str = ""
     num_prompts: int = 1000
+    skip_num_prompts: int = 0
     sharegpt_output_len: Optional[int] = None
     sharegpt_context_len: Optional[int] = None
     random_input_len: int = 1024
@@ -82,6 +83,12 @@ class BenchArgs:
             type=int,
             default=BenchArgs.num_prompts,
             help="Number of prompts to process. Default is 1000.",
+        )
+        parser.add_argument(
+            "--skip-num-prompts",
+            type=int,
+            default=0,
+            help="Number of prompts to skip. Default is 0.",
         )
         parser.add_argument(
             "--sharegpt-output-len",

@@ -82,7 +82,9 @@ from sgl_kernel.speculative import (
 from sgl_kernel.top_k import fast_topk
 from sgl_kernel.cutlass_moe_mm import (
     get_cutlass_moe_mm_data,
+    get_cutlass_w4a8_moe_mm_data,
     cutlass_moe_mm,
+    cutlass_w4a8_moe_mm,
 )
 from sgl_kernel.version import __version__
 

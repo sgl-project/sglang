@@ -1,7 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
 
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -290,7 +290,7 @@ class Fp8LinearMethod(LinearMethodBase):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: Fp8Config):
+    def __init__(self, quant_config: Union["Fp8Config", "W4AFp8Config"]):
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
 
@@ -376,7 +376,10 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.quant_config.is_checkpoint_fp8_serialized:
             # WEIGHT SCALE
             if self.block_quant:
-                assert self.quant_config.activation_scheme == "dynamic"
+                if hasattr(self.quant_config, "activation_scheme"):
+                    assert self.quant_config.activation_scheme == "dynamic"
+                elif hasattr(self.quant_config, "linear_activation_scheme"):
+                    assert self.quant_config.linear_activation_scheme == "dynamic"
                 scale = BlockQuantScaleParameter(
                     data=torch.empty(
                         (output_size_per_partition + block_n - 1) // block_n,
@@ -398,7 +401,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("weight_scale", scale)
 
             # INPUT ACTIVATION SCALE
-            if self.quant_config.activation_scheme == "static":
+            if (
+                hasattr(self.quant_config, "activation_scheme")
+                and self.quant_config.activation_scheme == "static"
+            ) or (
+                hasattr(self.quant_config, "linear_activation_scheme")
+                and self.quant_config.linear_activation_scheme == "static"
+            ):
                 scale = PerTensorScaleParameter(
                     data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
                     weight_loader=weight_loader,
@@ -455,7 +464,13 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale = torch.nn.Parameter(
                 layer.weight_scale.data, requires_grad=False
             )
-            if self.quant_config.activation_scheme == "static":
+            if (
+                hasattr(self.quant_config, "activation_scheme")
+                and self.quant_config.activation_scheme == "static"
+            ) or (
+                hasattr(self.quant_config, "linear_activation_scheme")
+                and self.quant_config.linear_activation_scheme == "static"
+            ):
                 layer.input_scale = torch.nn.Parameter(
                     layer.input_scale.data, requires_grad=False
                 )
@@ -489,7 +504,13 @@ class Fp8LinearMethod(LinearMethodBase):
             # Update layer with new values.
             layer.weight = Parameter(weight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-            if self.quant_config.activation_scheme == "static":
+            if (
+                hasattr(self.quant_config, "activation_scheme")
+                and self.quant_config.activation_scheme == "static"
+            ) or (
+                hasattr(self.quant_config, "linear_activation_scheme")
+                and self.quant_config.linear_activation_scheme == "static"
+            ):
                 layer.input_scale = Parameter(
                     layer.input_scale.max(), requires_grad=False
                 )
