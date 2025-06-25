@@ -679,6 +679,7 @@ class CudaGraphRunner:
                 forward_mode=self.capture_forward_mode,
                 bs=bs,
                 num_token_non_padded=len(forward_batch.input_ids),
+                spec_info=forward_batch.spec_info,
             )
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = self.custom_mask
