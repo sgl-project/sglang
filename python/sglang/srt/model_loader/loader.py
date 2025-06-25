@@ -2,6 +2,7 @@
 
 # ruff: noqa: SIM117
 import collections
+import concurrent
 import dataclasses
 import fnmatch
 import glob
@@ -11,14 +12,17 @@ import math
 import os
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, cast
 
 import huggingface_hub
 import numpy as np
+import safetensors.torch
 import torch
 from huggingface_hub import HfApi, hf_hub_download
 from torch import nn
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
@@ -41,6 +45,7 @@ from sglang.srt.model_loader.utils import (
     set_default_torch_dtype,
 )
 from sglang.srt.model_loader.weight_utils import (
+    _BAR_FORMAT,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     filter_duplicate_safetensors_files,
@@ -49,6 +54,8 @@ from sglang.srt.model_loader.weight_utils import (
     get_quant_config,
     gguf_quant_weights_iterator,
     initialize_dummy_weights,
+    multi_thread_pt_weights_iterator,
+    multi_thread_safetensors_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
     safetensors_weights_iterator,
@@ -181,6 +188,9 @@ class BaseModelLoader(ABC):
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
+    # default number of thread when enable multithread weight loading
+    DEFAULT_NUM_THREADS = 8
+
     @dataclasses.dataclass
     class Source:
         """A source for weights."""
@@ -208,10 +218,15 @@ class DefaultModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        if load_config.model_loader_extra_config:
+        extra_config = load_config.model_loader_extra_config
+        allowed_keys = {"enable_multithread_load", "num_threads"}
+        unexpected_keys = set(extra_config.keys()) - allowed_keys
+
+        if unexpected_keys:
             raise ValueError(
-                f"Model loader extra config is not supported for "
-                f"load format {load_config.load_format}"
+                f"Unexpected extra config keys for load format "
+                f"{load_config.load_format}: "
+                f"{unexpected_keys}"
             )
 
     def _maybe_download_from_modelscope(
@@ -324,6 +339,7 @@ class DefaultModelLoader(BaseModelLoader):
         self, source: "Source"
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
+        extra_config = self.load_config.model_loader_extra_config
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
@@ -337,9 +353,35 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            weights_iterator = safetensors_weights_iterator(hf_weights_files)
+            from sglang.srt.managers.schedule_batch import global_server_args_dict
+
+            weight_loader_disable_mmap = global_server_args_dict.get(
+                "weight_loader_disable_mmap"
+            )
+
+            if extra_config.get("enable_multithread_load"):
+                weights_iterator = multi_thread_safetensors_weights_iterator(
+                    hf_weights_files,
+                    max_workers=extra_config.get(
+                        "num_threads", self.DEFAULT_NUM_THREADS
+                    ),
+                    disable_mmap=weight_loader_disable_mmap,
+                )
+            else:
+                weights_iterator = safetensors_weights_iterator(
+                    hf_weights_files, disable_mmap=weight_loader_disable_mmap
+                )
+
         else:
-            weights_iterator = pt_weights_iterator(hf_weights_files)
+            if extra_config.get("enable_multithread_load"):
+                weights_iterator = multi_thread_pt_weights_iterator(
+                    hf_weights_files,
+                    max_workers=extra_config.get(
+                        "num_threads", self.DEFAULT_NUM_THREADS
+                    ),
+                )
+            else:
+                weights_iterator = pt_weights_iterator(hf_weights_files)
 
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
@@ -378,9 +420,9 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config,
                 )
 
-            self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
-            )
+        self.load_weights_and_postprocess(
+            model, self._get_all_weights(model_config, model), target_device
+        )
 
         return model.eval()
 

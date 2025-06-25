@@ -52,6 +52,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     CompletionRequest,
     EmbeddingRequest,
+    ErrorResponse,
     ModelCard,
     ModelList,
     ScoringRequest,
@@ -172,12 +173,23 @@ app.add_middleware(
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Override FastAPI's default 422 validation error with 400"""
+    exc_str = str(exc)
+    errors_str = str(exc.errors())
+
+    if errors_str and errors_str != exc_str:
+        message = f"{exc_str} {errors_str}"
+    else:
+        message = exc_str
+
+    err = ErrorResponse(
+        message=message,
+        type=HTTPStatus.BAD_REQUEST.phrase,
+        code=HTTPStatus.BAD_REQUEST.value,
+    )
+
     return ORJSONResponse(
         status_code=400,
-        content={
-            "detail": exc.errors(),
-            "body": exc.body,
-        },
+        content=err.model_dump(),
     )
 
 
