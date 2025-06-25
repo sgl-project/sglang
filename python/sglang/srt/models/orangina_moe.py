@@ -29,7 +29,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.activation import SwiGLU
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
@@ -78,6 +78,45 @@ from sglang.srt.utils import DeepEPMode, add_prefix, is_non_idle_and_non_empty
 OranginaMoeConfig = None
 
 logger = logging.getLogger(__name__)
+
+
+class OranginaMoeMLP(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: bool = True,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("gate_up_proj", prefix),
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=reduce_results,
+            prefix=add_prefix("down_proj", prefix),
+        )
+        if hidden_act != "swiglu":
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. Only swiglu is supported for now."
+            )
+        self.act_fn = SwiGLU()
+
+    def forward(self, x):
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
 
 
 class OranginaMoeSparseMoeBlock(nn.Module):
