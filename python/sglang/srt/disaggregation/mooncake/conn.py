@@ -422,7 +422,7 @@ class MooncakeKVManager(BaseKVManager):
                     src_addr_list.append(src_slice_addr)
                     dst_addr_list.append(dst_slice_addr)
                     length_list.append(slice_lens_per_page)
-                
+
                     logger.debug(
                         f"SYNC: sid={mooncake_session_id}, "
                         f"src={src_slice_addr}, dst={dst_slice_addr}, len={slice_lens_per_page}"
