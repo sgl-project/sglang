@@ -1,19 +1,19 @@
 import math
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
-
-from sglang.srt.layers.quantization.quant_utils import (
-    get_pack_factor, 
-    pack_cols, 
-    quantize_weights
-)
-
 from sgl_kernel import awq_marlin_repack
 from sgl_kernel.scalar_type import scalar_types
 
-GPTQ_MARLIN_TILE=16
+from sglang.srt.layers.quantization.quant_utils import (
+    get_pack_factor,
+    pack_cols,
+    quantize_weights,
+)
+
+GPTQ_MARLIN_TILE = 16
+
 
 def awq_pack(
     q_w: torch.Tensor,
@@ -36,6 +36,7 @@ def awq_pack(
 
     return pack_cols(q_w, num_bits, size_k, size_n)
 
+
 def marlin_permute_weights(q_w, size_k, size_n, perm, tile=GPTQ_MARLIN_TILE):
     assert q_w.shape == (size_k, size_n)
     assert size_k % tile == 0, f"size_k = {size_k}, tile = {tile}"
@@ -50,6 +51,7 @@ def marlin_permute_weights(q_w, size_k, size_n, perm, tile=GPTQ_MARLIN_TILE):
 
     return q_w
 
+
 def marlin_weights(q_w, size_k, size_n, num_bits, perm):
     # Permute
     q_w = marlin_permute_weights(q_w, size_k, size_n, perm)
@@ -60,14 +62,14 @@ def marlin_weights(q_w, size_k, size_n, num_bits, perm):
 
     q_w = q_w.cpu().numpy().astype(np.uint32)
 
-    q_packed = np.zeros((q_w.shape[0], q_w.shape[1] // pack_factor),
-                        dtype=np.uint32)
+    q_packed = np.zeros((q_w.shape[0], q_w.shape[1] // pack_factor), dtype=np.uint32)
     for i in range(pack_factor):
         q_packed |= q_w[:, i::pack_factor] << num_bits * i
 
     q_packed = torch.from_numpy(q_packed.astype(np.int32)).to(orig_device)
 
     return q_packed
+
 
 def get_weight_perm(num_bits: int):
     perm_list: list[int] = []
@@ -76,10 +78,10 @@ def get_weight_perm(num_bits: int):
         col = i // 4
         for block in [0, 1]:
             for row in [
-                    2 * (i % 4),
-                    2 * (i % 4) + 1,
-                    2 * (i % 4 + 4),
-                    2 * (i % 4 + 4) + 1,
+                2 * (i % 4),
+                2 * (i % 4) + 1,
+                2 * (i % 4 + 4),
+                2 * (i % 4 + 4) + 1,
             ]:
                 perm1.append(16 * row + col + 8 * block)
         for j in range(4):
@@ -98,6 +100,7 @@ def get_weight_perm(num_bits: int):
     perm = torch.from_numpy(perm)
     return perm
 
+
 @pytest.mark.parametrize("num_bits", [4, 8])
 @pytest.mark.parametrize("k_tiles,n_tiles", [(1, 1), (2, 2)])
 @pytest.mark.parametrize("group_size", [16, 32])
@@ -107,19 +110,16 @@ def test_awq_marlin_repack_correct(num_bits, k_tiles, n_tiles, group_size):
     size_n = n_tiles * tile_n
     pack_factor = 32 // num_bits
 
-    
     b_weight = torch.randn((size_k, size_n), dtype=torch.float16, device="cuda")
 
-    w_ref, q_w, s, zp = quantize_weights(b_weight,
-                                         scalar_types.uint4,
-                                         group_size,
-                                         zero_points=True)
+    w_ref, q_w, s, zp = quantize_weights(
+        b_weight, scalar_types.uint4, group_size, zero_points=True
+    )
 
     q_w_awq = awq_pack(q_w, num_bits, size_k, size_n)
 
     weight_perm = get_weight_perm(num_bits)
-    q_w_marlin = marlin_weights(q_w, size_k, size_n, num_bits,
-                                  weight_perm)
+    q_w_marlin = marlin_weights(q_w, size_k, size_n, num_bits, weight_perm)
 
     out_gpu = awq_marlin_repack(q_w_awq, size_k, size_n, num_bits)
     assert out_gpu.is_cuda and out_gpu.dtype == torch.int32
@@ -131,6 +131,8 @@ def test_awq_marlin_repack_correct(num_bits, k_tiles, n_tiles, group_size):
 
     torch.testing.assert_close(out_gpu, q_w_marlin)
 
+
 if __name__ == "__main__":
     import subprocess
-    subprocess.call(['pytest', '--tb=short', str(__file__)])
+
+    subprocess.call(["pytest", "--tb=short", str(__file__)])

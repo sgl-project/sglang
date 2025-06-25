@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/quant_utils.py
 
-import torch
-import numpy
 from typing import Optional
 
+import numpy
+import torch
 from sgl_kernel.scalar_type import ScalarType
+
 
 def get_pack_factor(num_bits):
     assert 32 % num_bits == 0, f"Unsupported num_bits = {num_bits}"
     return 32 // num_bits
+
 
 def pack_cols(
     q_w: torch.Tensor,
@@ -46,9 +48,11 @@ def unpack_cols(
     pack_factor = get_pack_factor(num_bits)
     assert size_n % pack_factor == 0
     assert packed_q_w.shape == (
-        size_k, size_n // pack_factor
+        size_k,
+        size_n // pack_factor,
     ), "packed_q_w.shape = {} size_k = {}, size_n = {} pack_Factor = {}".format(
-        packed_q_w.shape, size_k, size_n, pack_factor)
+        packed_q_w.shape, size_k, size_n, pack_factor
+    )
 
     orig_device = packed_q_w.device
 
@@ -66,16 +70,21 @@ def unpack_cols(
 
     return q_res
 
-def quantize_weights(w: torch.Tensor,
-                     quant_type: ScalarType,
-                     group_size: Optional[int],
-                     zero_points: bool = False,
-                     ref_zero_points_after_scales: bool = False):
-    assert quant_type.is_integer(), \
-        "Floating point quantization may work but has not been tested"
-    assert not zero_points or group_size is not None, \
-        "to have group zero points, group_size must be provided "\
+
+def quantize_weights(
+    w: torch.Tensor,
+    quant_type: ScalarType,
+    group_size: Optional[int],
+    zero_points: bool = False,
+    ref_zero_points_after_scales: bool = False,
+):
+    assert (
+        quant_type.is_integer()
+    ), "Floating point quantization may work but has not been tested"
+    assert not zero_points or group_size is not None, (
+        "to have group zero points, group_size must be provided "
         "(-1 group_size is channelwise)"
+    )
 
     orig_device = w.device
     orig_type = w.dtype
@@ -105,14 +114,16 @@ def quantize_weights(w: torch.Tensor,
         if zero_points:
             assert not quant_type.is_signed() and quant_type.max() > 0
             w_s = (max_val - min_val).clamp(min=1e-5) / quant_type.max()
-            maybe_w_zp = torch.round(torch.abs(min_val / w_s)) \
-                .clamp(min_q_val, max_q_val).int()
+            maybe_w_zp = (
+                torch.round(torch.abs(min_val / w_s)).clamp(min_q_val, max_q_val).int()
+            )
         else:
             # If the bias is such that there are no possible negative/positive
             #  values, set the max value to inf to avoid divide by 0
             w_s = torch.max(
                 abs(max_val / (max_q_val if max_q_val != 0 else torch.inf)),
-                abs(min_val / (min_q_val if min_q_val != 0 else torch.inf)))
+                abs(min_val / (min_q_val if min_q_val != 0 else torch.inf)),
+            )
 
     # Quantize
     w_q = torch.round(w / w_s).int() + (maybe_w_zp if zero_points else 0)

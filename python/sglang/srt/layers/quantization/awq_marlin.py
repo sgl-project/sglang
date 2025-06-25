@@ -4,7 +4,9 @@ import logging
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
+from sgl_kernel import awq_marlin_moe_repack, awq_marlin_repack
 from sgl_kernel.fused_moe import fused_marlin_moe
+from sgl_kernel.scalar_type import scalar_types
 from torch.nn import Parameter
 
 from sglang.srt.layers.linear import (
@@ -35,12 +37,6 @@ from sglang.srt.layers.quantization.marlin_utils import (
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import is_cuda
-
-from sgl_kernel import (
-    awq_marlin_repack,
-    awq_marlin_moe_repack,
-)
-from sgl_kernel.scalar_type import scalar_types
 
 logger = logging.getLogger(__name__)
 

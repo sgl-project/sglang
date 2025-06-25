@@ -2,9 +2,9 @@
 #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif
 
-#include "kernel.h"
-#include "gptq_marlin/marlin.cuh"
 #include "core/registration.h"
+#include "gptq_marlin/marlin.cuh"
+#include "kernel.h"
 
 namespace MARLIN_NAMESPACE_NAME {
 
@@ -14,8 +14,7 @@ namespace MARLIN_NAMESPACE_NAME {
 
 template <int const num_threads, int const num_bits>
 __global__ void awq_marlin_repack_kernel(
-    uint32_t const* __restrict__ b_q_weight_ptr, uint32_t* __restrict__ out_ptr,
-    int size_k, int size_n) {
+    uint32_t const* __restrict__ b_q_weight_ptr, uint32_t* __restrict__ out_ptr, int size_k, int size_n) {
   constexpr int pack_factor = 32 / num_bits;
 
   int k_tiles = size_k / tile_k_size;
@@ -64,10 +63,10 @@ __global__ void awq_marlin_repack_kernel(
 
       int first_k = k_tile_id * tile_k_size;
 
-      cp_async4(&sh_ptr[k_id * stage_n_threads + n_id],
-                reinterpret_cast<int4 const*>(
-                    &(b_q_weight_ptr[(first_k + k_id) * (size_n / pack_factor) +
-                                     first_n_packed + (n_id * 4)])));
+      cp_async4(
+          &sh_ptr[k_id * stage_n_threads + n_id],
+          reinterpret_cast<int4 const*>(
+              &(b_q_weight_ptr[(first_k + k_id) * (size_n / pack_factor) + first_n_packed + (n_id * 4)])));
     }
 
     cp_async_fence();
@@ -116,8 +115,7 @@ __global__ void awq_marlin_repack_kernel(
       int cur_elem = tc_row + tc_offsets[i];
 
       int packed_src_0 = sh_stage_int_ptr[cur_n_packed + sh_stride * cur_elem];
-      int packed_src_1 = sh_stage_int_ptr[cur_n_packed + (8 / pack_factor) +
-                                          sh_stride * cur_elem];
+      int packed_src_1 = sh_stage_int_ptr[cur_n_packed + (8 / pack_factor) + sh_stride * cur_elem];
 
       vals[i] = (packed_src_0 >> (cur_n_pos_unpacked * num_bits)) & mask;
       vals[4 + i] = (packed_src_1 >> (cur_n_pos_unpacked * num_bits)) & mask;
@@ -172,8 +170,7 @@ __global__ void awq_marlin_repack_kernel(
     while (n_tile_id < n_tiles) {
 #pragma unroll
       for (int pipe = 0; pipe < repack_stages; pipe++) {
-        fetch_to_shared((pipe + repack_stages - 1) % repack_stages, k_tile_id,
-                        n_tile_id + pipe + repack_stages - 1);
+        fetch_to_shared((pipe + repack_stages - 1) % repack_stages, k_tile_id, n_tile_id + pipe + repack_stages - 1);
         repack_tile(pipe, k_tile_id, n_tile_id + pipe);
         wait_for_stage();
       }
@@ -182,37 +179,34 @@ __global__ void awq_marlin_repack_kernel(
   }
 }
 
-
-
-#define CALL_IF(NUM_BITS)                                                   \
-  else if (num_bits == NUM_BITS) {                                          \
-    cudaFuncSetAttribute(                                                   \
-        awq_marlin_repack_kernel<repack_threads, NUM_BITS>, \
-        cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);       \
-        awq_marlin_repack_kernel<repack_threads, NUM_BITS>      \
-        <<<blocks, repack_threads, max_shared_mem, stream>>>(       \
-            b_q_weight_ptr, out_ptr, size_k, size_n);                       \
+#define CALL_IF(NUM_BITS)                                                                              \
+  else if (num_bits == NUM_BITS) {                                                                     \
+    cudaFuncSetAttribute(                                                                              \
+        awq_marlin_repack_kernel<repack_threads, NUM_BITS>,                                            \
+        cudaFuncAttributeMaxDynamicSharedMemorySize,                                                   \
+        max_shared_mem);                                                                               \
+    awq_marlin_repack_kernel<repack_threads, NUM_BITS>                                                 \
+        <<<blocks, repack_threads, max_shared_mem, stream>>>(b_q_weight_ptr, out_ptr, size_k, size_n); \
   }
 
-torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k,
-                                int64_t size_n, int64_t num_bits) {
+torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64_t size_n, int64_t num_bits) {
   // Verify compatibility with marlin tile of 16x64
-  TORCH_CHECK(size_k % tile_k_size == 0, "size_k = ", size_k,
-              " is not divisible by tile_k_size = ", tile_k_size);
-  TORCH_CHECK(size_n % tile_n_size == 0, "size_n = ", size_n,
-              " is not divisible by tile_n_size = ", tile_n_size);
+  TORCH_CHECK(size_k % tile_k_size == 0, "size_k = ", size_k, " is not divisible by tile_k_size = ", tile_k_size);
+  TORCH_CHECK(size_n % tile_n_size == 0, "size_n = ", size_n, " is not divisible by tile_n_size = ", tile_n_size);
 
-  TORCH_CHECK(num_bits == 4 || num_bits == 8,
-              "num_bits must be 4 or 8. Got = ", num_bits);
+  TORCH_CHECK(num_bits == 4 || num_bits == 8, "num_bits must be 4 or 8. Got = ", num_bits);
   int const pack_factor = 32 / num_bits;
 
   // Verify B
-  TORCH_CHECK(b_q_weight.size(0) == size_k,
-              "b_q_weight.size(0) = ", b_q_weight.size(0),
-              " is not size_k = ", size_k);
-  TORCH_CHECK((size_n / pack_factor) == b_q_weight.size(1),
-              "Shape mismatch: b_q_weight.size(1) = ", b_q_weight.size(1),
-              ", size_n = ", size_n, ", pack_factor = ", pack_factor);
+  TORCH_CHECK(b_q_weight.size(0) == size_k, "b_q_weight.size(0) = ", b_q_weight.size(0), " is not size_k = ", size_k);
+  TORCH_CHECK(
+      (size_n / pack_factor) == b_q_weight.size(1),
+      "Shape mismatch: b_q_weight.size(1) = ",
+      b_q_weight.size(1),
+      ", size_n = ",
+      size_n,
+      ", pack_factor = ",
+      pack_factor);
 
   // Verify device and strides
   TORCH_CHECK(b_q_weight.device().is_cuda(), "b_q_weight is not on GPU");
@@ -221,16 +215,11 @@ torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k,
 
   // Alloc buffers
   const at::cuda::OptionalCUDAGuard device_guard(device_of(b_q_weight));
-  auto options = torch::TensorOptions()
-                     .dtype(b_q_weight.dtype())
-                     .device(b_q_weight.device());
-  torch::Tensor out = torch::empty(
-      {size_k / tile_size, size_n * tile_size / pack_factor},
-      options);
+  auto options = torch::TensorOptions().dtype(b_q_weight.dtype()).device(b_q_weight.device());
+  torch::Tensor out = torch::empty({size_k / tile_size, size_n * tile_size / pack_factor}, options);
 
   // Get ptrs
-  uint32_t const* b_q_weight_ptr =
-      reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr());
+  uint32_t const* b_q_weight_ptr = reinterpret_cast<uint32_t const*>(b_q_weight.data_ptr());
   uint32_t* out_ptr = reinterpret_cast<uint32_t*>(out.data_ptr());
 
   // Get dev info
@@ -240,8 +229,7 @@ torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k,
   cudaDeviceGetAttribute(&blocks, cudaDevAttrMultiProcessorCount, dev);
 
   int max_shared_mem = 0;
-  cudaDeviceGetAttribute(&max_shared_mem,
-                         cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
   TORCH_CHECK(max_shared_mem > 0);
 
   if (false) {
@@ -255,16 +243,11 @@ torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k,
   return out;
 }
 
-torch::Tensor awq_marlin_repack_meta(torch::Tensor& b_q_weight,
-                                     c10::SymInt size_k, c10::SymInt size_n,
-                                     int64_t num_bits) {
+torch::Tensor
+awq_marlin_repack_meta(torch::Tensor& b_q_weight, c10::SymInt size_k, c10::SymInt size_n, int64_t num_bits) {
   int const pack_factor = 32 / num_bits;
-  auto options = torch::TensorOptions()
-                     .dtype(b_q_weight.dtype())
-                     .device(b_q_weight.device());
-  return torch::empty_symint(
-      {size_k / tile_size, size_n * tile_size / pack_factor},
-      options);
+  auto options = torch::TensorOptions().dtype(b_q_weight.dtype()).device(b_q_weight.device());
+  return torch::empty_symint({size_k / tile_size, size_n * tile_size / pack_factor}, options);
 }
 
 #endif
