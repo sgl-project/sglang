@@ -25,6 +25,7 @@ import torch
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    get_world_group
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
@@ -589,7 +590,7 @@ class HiCacheController:
                 logger.error(e)
 
     def _fragment_cache_all_gather(self, fragment_tensor, unpadded_len):
-        fragment_tensor = fragment_tensor.to(f"cuda:{self.tp_rank}", non_blocking=True)
+        fragment_tensor = fragment_tensor.to(f"cuda:{get_world_group().local_rank}", non_blocking=True)
         if not self.l3_fragment_load:
             return fragment_tensor
         gathered_tensor = tensor_model_parallel_all_gather(fragment_tensor, dim=1)

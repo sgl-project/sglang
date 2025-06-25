@@ -344,7 +344,7 @@ class HiRadixCache(RadixCache):
             for k, v in x.parent.children.items():
                 if v == x:
                     break
-            if len(x.parent.children[k].l3_keys()) == 0:
+            if len(x.parent.children[k].l3_keys) == 0:
                 del x.parent.children[k]
 
             if len(x.parent.children) == 0 and x.parent.evicted:
