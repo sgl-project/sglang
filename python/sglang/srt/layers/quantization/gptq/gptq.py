@@ -16,32 +16,48 @@ _is_cuda = is_cuda()
 
 try:
     from vllm import _custom_ops as ops
-    from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
-    from vllm.model_executor.layers.quantization.gptq_marlin import (
-        FusedMoE,
-        FusedMoEMethodBase,
-        FusedMoeWeightScaleSupported,
-        GPTQMarlinLinearMethod,
-        marlin_moe_permute_scales,
-    )
-    from vllm.model_executor.layers.quantization.marlin import MarlinLinearMethod
-    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-        check_marlin_supported,
-    )
-    from vllm.scalar_type import scalar_types
 
-    VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
 
-    GPTQLinearMethod = MarlinLinearMethod = Any
 
-    FusedMoEMethodBase = QuantizeMethodBase
+class scalar_types:
+    uint4b8 = "uint4b8"
+    uint8b128 = "uint8b128"
 
-    class scalar_types:
-        uint4b8 = "uint4b8"
-        uint8b128 = "uint8b128"
 
+import enum
+from enum import Enum
+
+from torch.nn.parameter import Parameter
+
+from python.sglang.srt.layers.quantization.gptq.gptq_marlin import (
+    FusedMoE,
+    FusedMoEMethodBase,
+    FusedMoeWeightScaleSupported,
+    GPTQMarlinLinearMethod,
+    marlin_moe_permute_scales,
+)
+from python.sglang.srt.layers.quantization.marlin.marlin import MarlinLinearMethod
+from python.sglang.srt.layers.quantization.marlin.marlin_utils import (
+    check_marlin_supported,
+)
+from sglang.srt.layers.linear import (
+    LinearBase,
+    LinearMethodBase,
+    UnquantizedLinearMethod,
+)
+from sglang.srt.layers.parameter import (
+    BasevLLMParameter,
+    BlockQuantScaleParameter,
+    ChannelQuantScaleParameter,
+    GroupQuantScaleParameter,
+    PackedColumnParameter,
+    PackedvLLMParameter,
+    PerTensorScaleParameter,
+    RowvLLMParameter,
+    _ColumnvLLMParameter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +167,7 @@ class GPTQConfig(QuantizationConfig):
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[GPTQLinearMethod]:
+    ) -> Optional["GPTQLinearMethod"]:
         # Delay the import to avoid circular dependency
         from sglang.srt.layers.quantization import get_linear_quant_method
 
@@ -446,6 +462,178 @@ class MarlinConfig(QuantizationConfig):
         ):
             return MarlinLinearMethod(self)
         return None
+
+
+class ExllamaState(Enum):
+
+    UNUSED = enum.auto()
+    UNINITIALIZED = enum.auto()
+    READY = enum.auto()
+
+
+class GPTQLinearMethod(LinearMethodBase):
+    """Linear method for GPTQ.
+
+    Args:
+        quant_config: The GPTQ quantization config.
+    """
+
+    def __init__(self, quant_config: GPTQConfig):
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        del output_size  # Unused.
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        if input_size_per_partition % self.quant_config.group_size != 0:
+            raise ValueError(
+                "The input size is not aligned with the quantized "
+                "weight shape. This can be caused by too large "
+                "tensor parallel size."
+            )
+        output_size_per_partition = sum(output_partition_sizes)
+        if output_size_per_partition % self.quant_config.pack_factor.numerator != 0:
+            raise ValueError(
+                "The output size is not aligned with the quantized "
+                "weight shape. This can be caused by too large "
+                "tensor parallel size."
+            )
+
+        if self.quant_config.group_size != -1:
+            group_size = self.quant_config.group_size
+        else:
+            group_size = input_size
+        exllama_state = ExllamaState.UNINITIALIZED
+        scale_and_zero_size = input_size // group_size
+        scale_and_zero_input_dim = None
+        if (
+            input_size != input_size_per_partition
+            and self.quant_config.group_size != -1
+        ):
+            # For act-order models, we cannot use Exllama for row parallel layer
+            if self.quant_config.desc_act:
+                exllama_state = ExllamaState.UNUSED
+            else:
+                # we need to partition qzeros and scales for exllama kernel
+                scale_and_zero_size = input_size_per_partition // group_size
+                scale_and_zero_input_dim = 0
+
+        qweight = PackedvLLMParameter(
+            data=torch.empty(
+                input_size_per_partition // self.quant_config.pack_factor,
+                output_size_per_partition,
+                dtype=torch.int32,
+            ),
+            input_dim=0,
+            output_dim=1,
+            packed_dim=0,
+            packed_factor=self.quant_config.pack_factor,
+            weight_loader=weight_loader,
+        )
+
+        g_idx = RowvLLMParameter(
+            data=torch.tensor(
+                [
+                    i // self.quant_config.group_size
+                    for i in range(input_size_per_partition)
+                ],
+                dtype=torch.int32,
+            ),
+            input_dim=0,
+            weight_loader=weight_loader,
+        )
+        qzeros_args = {
+            "data": torch.empty(
+                scale_and_zero_size,
+                output_size_per_partition // self.quant_config.pack_factor,
+                dtype=torch.int32,
+            ),
+            "weight_loader": weight_loader,
+        }
+        weight_scale_args = {
+            "data": torch.empty(
+                scale_and_zero_size,
+                output_size_per_partition,
+                dtype=params_dtype,
+            ),
+            "weight_loader": weight_loader,
+        }
+        if scale_and_zero_input_dim is None:
+            scales = ChannelQuantScaleParameter(output_dim=1, **weight_scale_args)
+            qzeros = PackedColumnParameter(
+                output_dim=1,
+                packed_dim=1,
+                packed_factor=self.quant_config.pack_factor,
+                **qzeros_args,
+            )
+
+        else:
+            scales = GroupQuantScaleParameter(
+                output_dim=1, input_dim=0, **weight_scale_args
+            )
+            qzeros = PackedvLLMParameter(
+                input_dim=0,
+                output_dim=1,
+                packed_dim=1,
+                packed_factor=self.quant_config.pack_factor,
+                **qzeros_args,
+            )
+
+        layer.register_parameter("qweight", qweight)
+        layer.register_parameter("g_idx", g_idx)
+        layer.register_parameter("qzeros", qzeros)
+        layer.register_parameter("scales", scales)
+
+        layer.exllama_state = exllama_state
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # for torch.compile
+        layer.qzeros = Parameter(layer.qzeros.data, requires_grad=False)
+        layer.qweight = Parameter(layer.qweight.data, requires_grad=False)
+        layer.g_idx = Parameter(layer.g_idx.data, requires_grad=False)
+        layer.scales = Parameter(layer.scales.data, requires_grad=False)
+
+        # exllama needs to shuffle the weight after the weight is loaded
+        # here we do the shuffle on first forward pass
+        if layer.exllama_state == ExllamaState.UNINITIALIZED:
+            if self.quant_config.desc_act:
+                layer.g_idx.data = torch.argsort(layer.g_idx).to(torch.int)
+            else:
+                layer.g_idx.data = torch.empty(
+                    (0,), dtype=torch.int, device=layer.g_idx.device
+                )
+            layer.exllama_state = ExllamaState.READY
+            ops.gptq_shuffle(layer.qweight, layer.g_idx, self.quant_config.weight_bits)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
+        reshaped_x = x.reshape(-1, x.shape[-1])
+
+        output = ops.gptq_gemm(
+            reshaped_x,
+            layer.qweight,
+            layer.qzeros,
+            layer.scales,
+            layer.g_idx,
+            layer.exllama_state == ExllamaState.READY,
+            self.quant_config.weight_bits,
+        )
+        if bias is not None:
+            output.add_(bias)
+        return output.reshape(out_shape)
 
 
 class GPTQMarlinMoEMethod(FusedMoEMethodBase):
