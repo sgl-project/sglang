@@ -93,6 +93,12 @@ class ModelConfig:
             context_length=context_length,
             attention_chunk_size=self.attention_chunk_size,
         )
+        if self.is_hybrid is not None:
+            self.swa_attention_layer_ids, self.full_attention_layer_ids = (
+                get_hybrid_layer_ids(
+                    self.hf_config.architectures, self.hf_text_config.num_hidden_layers
+                )
+            )
 
         if enable_multimodal is None:
             mm_disabled_models = [
@@ -245,15 +251,6 @@ class ModelConfig:
         self.hidden_size = self.hf_text_config.hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.vocab_size = self.hf_text_config.vocab_size
-
-        if self.is_hybrid is not None:
-            # TODO(tarinkk): swa layer position should not be hard coded.
-            self.swa_attention_layer_ids = [
-                i for i in range(self.num_hidden_layers) if (i + 1) % 4 != 0
-            ]
-            self.full_attention_layer_ids = [
-                i for i in range(self.num_hidden_layers) if (i + 1) % 4 == 0
-            ]
 
         # Verify quantization
         self._verify_quantization()
@@ -667,3 +664,18 @@ def is_hybrid_model(
         return hybrid_kvcache_ratio
     else:
         return None
+
+
+def get_hybrid_layer_ids(model_architectures: List[str], num_hidden_layers: int):
+    if "Llama4ForConditionalGeneration" in model_architectures:
+        swa_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if (i + 1) % 4 != 0
+        ]
+        full_attention_layer_ids = [
+            i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
+        ]
+    else:
+        raise ValueError(
+            "get_hybrid_layer_ids is only implemented for Llama4ForConditionalGeneration"
+        )
+    return swa_attention_layer_ids, full_attention_layer_ids

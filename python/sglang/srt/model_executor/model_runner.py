@@ -860,27 +860,37 @@ class ModelRunner:
         return max_num_token
 
     def get_num_token_hybrid(self):
-        temp_ratio = (
-            (1 - self.is_hybrid)
-            + self.is_hybrid * self.attention_chunk_size / self.model_config.context_len
-        )
-        self.local_max_total_num_tokens = (
-            4 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
-        )
-        self.max_total_num_tokens = (
-            4 * self.max_total_num_tokens
-            - 12 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
-        )
-        self.local_max_total_num_tokens = int(
-            self.local_max_total_num_tokens
-            // self.server_args.page_size
-            * self.server_args.page_size
-        )
-        self.max_total_num_tokens = int(
-            self.max_total_num_tokens
-            // self.server_args.page_size
-            * self.server_args.page_size
-        )
+        if (
+            "Llama4ForConditionalGeneration"
+            in self.model_config.hf_config.architectures
+        ):
+            temp_ratio = (
+                (1 - self.is_hybrid)
+                + self.is_hybrid
+                * self.attention_chunk_size
+                / self.model_config.context_len
+            )
+            self.local_max_total_num_tokens = (
+                4 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
+            )
+            self.max_total_num_tokens = (
+                4 * self.max_total_num_tokens
+                - 12 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
+            )
+            self.local_max_total_num_tokens = int(
+                self.local_max_total_num_tokens
+                // self.server_args.page_size
+                * self.server_args.page_size
+            )
+            self.max_total_num_tokens = int(
+                self.max_total_num_tokens
+                // self.server_args.page_size
+                * self.server_args.page_size
+            )
+        else:
+            raise ValueError(
+                f"Unsupported model for hybrid cache: {self.model_config.hf_config.architectures}."
+            )
 
     def init_memory_pool(
         self,
