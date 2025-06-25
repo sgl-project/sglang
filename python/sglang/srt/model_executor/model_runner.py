@@ -547,6 +547,7 @@ class ModelRunner:
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
+            model_loader_extra_config=self.server_args.model_loader_extra_config,
         )
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
