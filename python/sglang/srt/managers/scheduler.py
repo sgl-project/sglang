@@ -2237,6 +2237,7 @@ class Scheduler(
                 assert flash_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
+        barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromTensorReqOutput(success, message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
