@@ -56,13 +56,28 @@ def multi_process_parallel(
 
 
 class TestCustomAllReduce(CustomTestCase):
+    # @classmethod
+    # def setUpClass(cls):
+    #     random.seed(42)
+    #     # 512B to 32MB
+    #     cls.test_sizes = [512, 4096, 32768, 262144, 2097152, 16777216, 33554432]
+    #     cls.world_sizes = [2, 4, 6, 8]
+    #     cls.test_loop = 10
+    test_sizes = [
+        512,
+        4096,
+        32768,
+        262144,
+        2097152,
+        16777216,
+        33554432,
+    ]  # 512 B … 32 MB
+    world_sizes = [2, 4, 6, 8]
+    test_loop = 10
+
     @classmethod
     def setUpClass(cls):
-        random.seed(42)
-        # 512B to 32MB
-        cls.test_sizes = [512, 4096, 32768, 262144, 2097152, 16777216, 33554432]
-        cls.world_sizes = [2, 4, 6, 8]
-        cls.test_loop = 10
+        random.seed(42)  # keep the deterministic seed
 
     def test_graph_allreduce(self):
         for world_size in self.world_sizes:
