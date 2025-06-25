@@ -382,6 +382,7 @@ def np_cache_weights_iterator(
                 desc="Loading np_cache checkpoint shards",
                 disable=not enable_tqdm,
                 bar_format=_BAR_FORMAT,
+                position=tqdm._get_free_pos()
             ):
                 state = torch.load(bin_file, map_location="cpu", weights_only=True)
                 for name, param in state.items():
@@ -438,6 +439,7 @@ def safetensors_weights_iterator(
         desc="Loading safetensors checkpoint shards",
         disable=not enable_tqdm,
         bar_format=_BAR_FORMAT,
+        position=tqdm._get_free_pos()
     ):
         result = safetensors.torch.load_file(st_file, device="cpu")
         for name, param in result.items():
@@ -456,6 +458,7 @@ def pt_weights_iterator(
         desc="Loading pt checkpoint shards",
         disable=not enable_tqdm,
         bar_format=_BAR_FORMAT,
+        position=tqdm._get_free_pos()
     ):
         state = torch.load(bin_file, map_location="cpu", weights_only=True)
         yield from state.items()
@@ -606,6 +609,7 @@ def runai_safetensors_weights_iterator(
             desc="Loading safetensors using Runai Model Streamer",
             disable=not enable_tqdm,
             bar_format=_BAR_FORMAT,
+            position=tqdm._get_free_pos()
         ):
             streamer.stream_file(st_file)
             yield from streamer.get_tensors()

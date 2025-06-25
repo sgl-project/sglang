@@ -5,6 +5,7 @@ from tqdm import tqdm
 from tqdm.std import EMA
 import torch
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+
 from torch.nn.parameter import Parameter
 
 try:
@@ -61,6 +62,12 @@ if _is_hip:
 
 logger = logging.getLogger(__name__)
 
+# explicitly use pure text format, with a newline at the end
+# this makes it impossible to see the animation in the progress bar
+# but will avoid messing up with ray or multiprocessing, which wraps
+# each line of output with some prefix.
+_BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"  # noqa: E501
+
 def tqdm_reset_no_print(tqdm_bar: tqdm, total=None):
     tqdm_bar.n = 0
     if total is not None:
@@ -85,7 +92,12 @@ class QuarkInt4Fp8Config(QuantizationConfig):
         self.weight_block_size = None
 
         self.num_quant_layers = 0
-        self.online_quant_progress_bar = tqdm(total=0, desc="Online int4fp8_moe quantization")
+
+        tp_rank = get_tensor_model_parallel_rank()
+
+        # The weight iterator already has a progress bar on rank=0, account for that.
+        position = 1 + tqdm._get_free_pos()
+        self.online_quant_progress_bar = tqdm(total=0, desc=f"Online int4fp8_moe quantization on rank={tp_rank}", position=position, bar_format=_BAR_FORMAT, mininterval=2.)
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -327,20 +339,30 @@ class QuarkInt4Fp8MoEMethod:
             shard_id: str,
             expert_id: int,
         ):
+            layer.use_presharded_weights = True
+    
+            if shard_id in ["w1", "w3"]:
+                shard_dim = 0
+                shard_size = self.w13_shard_size
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, shard_size * self.tp_rank, shard_size
+                )
+            else:
+                shard_dim = 1
+                shard_size = self.w2_shard_size
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, shard_size * self.tp_rank, shard_size
+                )
+            
+            # We want to run online quantization on-device for speed purposes.
+            loaded_weight = loaded_weight.to(param.device)
+
             _, fp8_scale = quantize_fp8_scale_tensorwise(loaded_weight)
 
             # The original weight loader handles the sharding of int4_w, so we can't shard it
             # ahead here.
             int4_w, int4_scale = quantize_int4_scale_columnwise(loaded_weight)
-
-            if shard_id in ["w1", "w3"]:
-                shard_size = self.w13_shard_size
-                shard_dim = 0
-
-                int4_scale = int4_scale.narrow(
-                    shard_dim, shard_size * self.tp_rank, shard_size
-                )
-
+            
             int4_w = pack_int4_to_int32(int4_w)
             int4_scale /= fp8_scale
 
@@ -365,6 +387,7 @@ class QuarkInt4Fp8MoEMethod:
                 layer.w13_fp8_scale[expert_id][idx].copy_(fp8_scale)
             else:
                 assert param[expert_id].dtype == int4_w.dtype
+                assert param[expert_id].shape == int4_w.shape
 
                 assert layer.w2_int4_scale[expert_id].shape == int4_scale.shape
                 assert layer.w2_int4_scale[expert_id].dtype == int4_scale.dtype
@@ -398,6 +421,7 @@ class QuarkInt4Fp8MoEMethod:
 
         # fused moe logic already hands TP logic.
         self.w13_shard_size = intermediate_size
+        self.w2_shard_size = intermediate_size
 
         assert "weight_loader" in extra_weight_attrs
         original_weight_loader = extra_weight_attrs.get("weight_loader")

@@ -50,4 +50,5 @@ class TestMixtralAccuracy(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.53)
+        self.assertGreater(metrics["accuracy"], 0.549)
+        self.assertLess(metrics["accuracy"], 0.56)
