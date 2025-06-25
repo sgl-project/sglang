@@ -196,15 +196,37 @@ def _init_forward_metadata_cuda_graph_split(
     seq_lens: torch.Tensor,
     encoder_lens: Optional[torch.Tensor],
     forward_mode: "ForwardMode",
-    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    spec_info: Optional[EagleVerifyInput],
     # capture args
     capture_num_tokens: int = None,
     # replay args
     replay_seq_lens_sum: int = None,
     replay_seq_lens_cpu: Optional[torch.Tensor] = None,
 ):
+    token_num_per_seq = two_batch_overlap.get_token_num_per_seq(
+        forward_mode=forward_mode, spec_info=spec_info
+    )
     assert encoder_lens is None, "encoder_lens is not supported yet"
+    if spec_info is not None:
+        output_spec_info = two_batch_overlap.split_spec_info(
+            spec_info=spec_info,
+            bs=bs,
+            start_seq_index=seq_slice.start if seq_slice.start is not None else 0,
+            end_seq_index=seq_slice.stop if seq_slice.stop is not None else bs,
+            start_token_index=(
+                seq_slice.start * token_num_per_seq
+                if seq_slice.start is not None
+                else 0
+            ),
+            end_token_index=(
+                seq_slice.stop * token_num_per_seq
+                if seq_slice.stop is not None
+                else bs * token_num_per_seq
+            ),
+        )
 
+    else:
+        output_spec_info = None
     ans = dict(
         bs=output_bs,
         req_pool_indices=req_pool_indices[seq_slice],
@@ -213,13 +235,10 @@ def _init_forward_metadata_cuda_graph_split(
         forward_mode=forward_mode,
         # ignore
         encoder_lens=None,
-        spec_info=spec_info,
+        spec_info=output_spec_info,
     )
 
     if fn_name == "init_forward_metadata_capture_cuda_graph":
-        token_num_per_seq = two_batch_overlap.get_token_num_per_seq(
-            forward_mode=forward_mode, spec_info=spec_info
-        )
         assert (
             capture_num_tokens == bs * token_num_per_seq
         ), "Only support num_tokens==bs * token_num_per_seq for target-verify or decode mode"

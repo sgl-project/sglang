@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+from dataclasses import replace
 from typing import Dict, List, Optional, Sequence, Union
 
 import torch
@@ -80,6 +81,93 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
             break
 
     return best_index
+
+
+def split_spec_info(
+    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    bs: int,
+    start_seq_index: int,
+    end_seq_index: int,
+    start_token_index: int,
+    end_token_index: int,
+):
+    if spec_info is None:
+        return None
+    if spec_info.draft_token is not None:
+        draft_token = spec_info.draft_token[start_token_index:end_token_index]
+    else:
+        draft_token = None
+    if spec_info.custom_mask is not None and spec_info.draft_token is not None:
+        if spec_info.draft_token.shape[0] == 0:
+            custom_mask_start = 0
+            custom_mask_end = 0
+        else:
+            custom_mask_start = (
+                start_token_index
+                * spec_info.custom_mask.shape[0]
+                // spec_info.draft_token.shape[0]
+            )
+            custom_mask_end = min(
+                end_token_index
+                * spec_info.custom_mask.shape[0]
+                // spec_info.draft_token.shape[0],
+                spec_info.custom_mask.shape[0],
+            )
+        custom_mask = torch.full(
+            (spec_info.custom_mask.shape[0],),
+            True,
+            device=spec_info.custom_mask.device,
+        )
+        if custom_mask_end > custom_mask_start:
+            custom_mask[: (custom_mask_end - custom_mask_start)].copy_(
+                spec_info.custom_mask[custom_mask_start:custom_mask_end]
+            )
+    else:
+        custom_mask = spec_info.custom_mask
+    if spec_info.positions is not None:
+        positions = spec_info.positions[start_token_index:end_token_index]
+    else:
+        positions = None
+    if spec_info.retrive_index is not None:
+        retrive_index = spec_info.retrive_index[start_seq_index:end_seq_index]
+    else:
+        retrive_index = None
+    if spec_info.retrive_next_token is not None:
+        retrive_next_token = spec_info.retrive_next_token[start_seq_index:end_seq_index]
+    else:
+        retrive_next_token = None
+    if spec_info.retrive_next_sibling is not None:
+        retrive_next_sibling = spec_info.retrive_next_sibling[
+            start_seq_index:end_seq_index
+        ]
+    else:
+        retrive_next_sibling = None
+    if spec_info.retrive_cum_len is not None:
+        retrive_cum_len = spec_info.retrive_cum_len[start_seq_index:end_seq_index]
+    else:
+        retrive_cum_len = None
+
+    if spec_info.seq_lens_cpu is not None:
+        seq_lens_cpu = spec_info.seq_lens_cpu[start_seq_index:end_seq_index]
+    else:
+        seq_lens_cpu = None
+    if seq_lens_cpu is not None:
+        seq_lens_sum = sum(seq_lens_cpu)
+    else:
+        seq_lens_sum = 0
+    output_spec_info = replace(
+        spec_info,
+        custom_mask=custom_mask,
+        draft_token=draft_token,
+        positions=positions,
+        retrive_index=retrive_index,
+        retrive_next_token=retrive_next_token,
+        retrive_next_sibling=retrive_next_sibling,
+        retrive_cum_len=retrive_cum_len,
+        seq_lens_cpu=seq_lens_cpu,
+        seq_lens_sum=seq_lens_sum,
+    )
+    return output_spec_info
 
 
 def compute_split_token_index(
@@ -392,6 +480,16 @@ class TboForwardBatchPreparer:
             ), f"{key=} {old_value=} {num_seqs=} {batch=}"
             output_dict[key] = old_value[start_seq_index:end_seq_index]
 
+        spec_info = getattr(batch, "spec_info")
+        output_spec_info = split_spec_info(
+            spec_info=spec_info,
+            bs=batch.batch_size,
+            start_token_index=start_token_index,
+            end_token_index=end_token_index,
+            start_seq_index=start_seq_index,
+            end_seq_index=end_seq_index,
+        )
+        output_dict["spec_info"] = output_spec_info
         for key in [
             "forward_mode",
             "return_logprob",
@@ -399,7 +497,6 @@ class TboForwardBatchPreparer:
             "token_to_kv_pool",
             "can_run_dp_cuda_graph",
             "global_forward_mode",
-            "spec_info",
             "spec_algorithm",
             "capture_hidden_mode",
             "padded_static_len",
