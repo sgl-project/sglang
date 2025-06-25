@@ -6,6 +6,7 @@ import random
 import threading
 import warnings
 from collections import deque
+from contextlib import nullcontext
 from enum import Enum
 from typing import TYPE_CHECKING, List, Optional
 
@@ -84,24 +85,43 @@ class ReqToMetadataIdxAllocator:
 
 
 class MetadataBuffers:
-    def __init__(self, size: int, max_top_logprobs_num: int = 128):
-        # TODO: abort top_logprobs_num > 128 in PD
+    def __init__(
+        self,
+        size: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        max_top_logprobs_num: int = 128,
+        custom_mem_pool: torch.cuda.MemPool = None,
+    ):
+        self.custom_mem_pool = custom_mem_pool
+        device = "cuda" if self.custom_mem_pool else "cpu"
 
-        # We transfer the metadata of first output token to decode
-        # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
-        self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device="cpu")
-        self.output_token_logprobs_val = torch.zeros(
-            (size, 16), dtype=torch.float32, device="cpu"
-        )
-        self.output_token_logprobs_idx = torch.zeros(
-            (size, 16), dtype=torch.int32, device="cpu"
-        )
-        self.output_top_logprobs_val = torch.zeros(
-            (size, max_top_logprobs_num), dtype=torch.float32, device="cpu"
-        )
-        self.output_top_logprobs_idx = torch.zeros(
-            (size, max_top_logprobs_num), dtype=torch.int32, device="cpu"
-        )
+        with (
+            torch.cuda.use_mem_pool(self.custom_mem_pool)
+            if self.custom_mem_pool
+            else nullcontext()
+        ):
+            # TODO: abort top_logprobs_num > 128 in PD
+
+            # We transfer the metadata of first output token to decode
+            # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
+            self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
+
+            self.output_token_logprobs_val = torch.zeros(
+                (size, 16), dtype=torch.float32, device=device
+            )
+            self.output_token_logprobs_idx = torch.zeros(
+                (size, 16), dtype=torch.int32, device=device
+            )
+            self.output_top_logprobs_val = torch.zeros(
+                (size, max_top_logprobs_num), dtype=torch.float32, device=device
+            )
+            self.output_top_logprobs_idx = torch.zeros(
+                (size, max_top_logprobs_num), dtype=torch.int32, device=device
+            )
+            self.output_hidden_states = torch.zeros(
+                (size, hidden_size), dtype=dtype, device=device
+            )
 
     def get_buf_infos(self):
         ptrs = [
@@ -110,6 +130,7 @@ class MetadataBuffers:
             self.output_token_logprobs_idx.data_ptr(),
             self.output_top_logprobs_val.data_ptr(),
             self.output_top_logprobs_idx.data_ptr(),
+            self.output_hidden_states.data_ptr(),
         ]
         data_lens = [
             self.output_ids.nbytes,
@@ -117,6 +138,7 @@ class MetadataBuffers:
             self.output_token_logprobs_idx.nbytes,
             self.output_top_logprobs_val.nbytes,
             self.output_top_logprobs_idx.nbytes,
+            self.output_hidden_states.nbytes,
         ]
         item_lens = [
             self.output_ids[0].nbytes,
@@ -124,6 +146,7 @@ class MetadataBuffers:
             self.output_token_logprobs_idx[0].nbytes,
             self.output_top_logprobs_val[0].nbytes,
             self.output_top_logprobs_idx[0].nbytes,
+            self.output_hidden_states[0].nbytes,
         ]
         return ptrs, data_lens, item_lens
 
@@ -134,6 +157,7 @@ class MetadataBuffers:
             self.output_token_logprobs_idx[idx],
             self.output_top_logprobs_val[idx],
             self.output_top_logprobs_idx[idx],
+            self.output_hidden_states[idx],
         )
 
     def set_buf(self, req: Req):
@@ -161,6 +185,11 @@ class MetadataBuffers:
                 ] = torch.tensor(
                     req.output_top_logprobs_idx[0], dtype=torch.int32, device="cpu"
                 )
+        # for PD + spec decode
+        if req.hidden_states_tensor is not None:
+            self.output_hidden_states[req.metadata_buffer_index].copy_(
+                req.hidden_states_tensor
+            )
 
 
 #########################

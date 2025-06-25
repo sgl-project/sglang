@@ -35,12 +35,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    get_free_port,
-    get_int_env_var,
-    get_ip,
-    get_local_ip_by_remote,
-)
+from sglang.srt.utils import get_free_port, get_int_env_var, get_ip, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 
@@ -130,8 +125,9 @@ class MooncakeKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
+        self.local_ip = get_local_ip_auto()
         self.engine = MooncakeTransferEngine(
-            hostname=get_local_ip_by_remote(),
+            hostname=self.local_ip,
             gpu_id=self.kv_args.gpu_id,
             ib_device=self.kv_args.ib_device,
         )
@@ -255,17 +251,19 @@ class MooncakeKVManager(BaseKVManager):
 
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+            src_addr_list = []
+            dst_addr_list = []
+            length_list = []
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
-
-                status = self.engine.transfer_sync(
-                    mooncake_session_id, src_addr, dst_addr, length
-                )
-                if status != 0:
-                    return status
-            return 0
+                src_addr_list.append(src_addr)
+                dst_addr_list.append(dst_addr)
+                length_list.append(length)
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id, src_addr_list, dst_addr_list, length_list
+            )
 
         futures = [
             executor.submit(
@@ -293,15 +291,21 @@ class MooncakeKVManager(BaseKVManager):
         dst_aux_ptrs: list[int],
         dst_aux_index: int,
     ):
-        aux_item_len = self.kv_args.aux_item_lens[0]
-        prefill_aux_addr = (
-            self.kv_args.aux_data_ptrs[0] + prefill_aux_index * aux_item_len
+        src_addr_list = []
+        dst_addr_list = []
+        length_list = []
+        prefill_aux_ptrs = self.kv_args.aux_data_ptrs
+        prefill_aux_item_lens = self.kv_args.aux_item_lens
+        for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
+            length = prefill_aux_item_lens[i]
+            src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
+            dst_addr = dst_aux_ptrs[i] + length * dst_aux_index
+            src_addr_list.append(src_addr)
+            dst_addr_list.append(dst_addr)
+            length_list.append(length)
+        return self.engine.batch_transfer_sync(
+            mooncake_session_id, src_addr_list, dst_addr_list, length_list
         )
-        decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index * aux_item_len
-        status = self.engine.transfer_sync(
-            mooncake_session_id, prefill_aux_addr, decode_aux_addr, aux_item_len
-        )
-        return status
 
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int
@@ -432,7 +436,7 @@ class MooncakeKVManager(BaseKVManager):
 
     def start_prefill_thread(self):
         self.rank_port = get_free_port()
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
+        self.server_socket.bind(f"tcp://{self.local_ip}:{self.rank_port}")
 
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
@@ -471,7 +475,7 @@ class MooncakeKVManager(BaseKVManager):
 
     def start_decode_thread(self):
         self.rank_port = get_free_port()
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
+        self.server_socket.bind(f"tcp://{self.local_ip}:{self.rank_port}")
 
         def decode_thread():
             while True:
@@ -620,7 +624,7 @@ class MooncakeKVManager(BaseKVManager):
             "role": "Prefill",
             "tp_size": self.tp_size,
             "dp_size": self.dp_size,
-            "rank_ip": get_local_ip_by_remote(),
+            "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
             "engine_rank": self.kv_args.engine_rank,
         }
@@ -746,11 +750,11 @@ class MooncakeKVSender(BaseKVSender):
             self.kv_mgr.request_status.pop(self.bootstrap_room)
 
     def failure_exception(self):
-        self.clear()
-
         # Explicitly set the status to failure since this request has failed in another rank
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
+
+        self.clear()
 
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(
@@ -953,7 +957,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 sock.send_multipart(
                     [
                         "None".encode("ascii"),
-                        get_local_ip_by_remote().encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
                         str(self.kv_mgr.rank_port).encode("ascii"),
                         self.session_id.encode("ascii"),
                         packed_kv_data_ptrs,
@@ -983,7 +987,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 sock.send_multipart(
                     [
                         str(self.bootstrap_room).encode("ascii"),
-                        get_local_ip_by_remote().encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
                         str(self.kv_mgr.rank_port).encode("ascii"),
                         self.session_id.encode("ascii"),
                         kv_indices.tobytes() if not is_dummy else b"",
@@ -1007,11 +1011,11 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.kv_mgr.request_status.pop(self.bootstrap_room)
 
     def failure_exception(self):
-        self.clear()
-
         # Explicitly set the status to failure since this request has failed in another rank
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
+
+        self.clear()
 
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(
