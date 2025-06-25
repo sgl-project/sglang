@@ -53,7 +53,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.gemma3n_audio import Gemma3nAudioEncoder
 from sglang.srt.models.gemma3n_causal import Gemma3nRMSNorm, Gemma3nTextModel
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, debug_print
 
 logger = logging.getLogger(__name__)
 
@@ -265,32 +265,26 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
     def pad_input_ids(
         self,
         input_ids: List[int],
-        image_inputs: MultimodalInputs,
-        audio_inputs: Optional[MultimodalInputs] = None,
+        mm_inputs: Optional[MultimodalInputs] = None,
     ) -> List[int]:
         """Pad input IDs with image and audio tokens."""
-        # Get special token IDs
+        if mm_inputs is None:
+            return input_ids
+
+        # Collect available media token pairs
         media_token_pairs = []
+        for attr_name in ["im_start_id", "audio_start_id"]:
+            if hasattr(mm_inputs, attr_name):
+                start_id = getattr(mm_inputs, attr_name)
+                end_id = getattr(mm_inputs, attr_name.replace("start", "end"))
+                media_token_pairs.append((start_id, end_id))
 
-        if image_inputs is not None and hasattr(image_inputs, "im_start_id"):
-            im_start_id: int = image_inputs.im_start_id
-            im_end_id: int = image_inputs.im_end_id
-            media_token_pairs.append((im_start_id, im_end_id))
-
-        if audio_inputs is not None and hasattr(audio_inputs, "audio_start_id"):
-            audio_start_id: int = audio_inputs.audio_start_id
-            audio_end_id: int = audio_inputs.audio_end_id
-            media_token_pairs.append((audio_start_id, audio_end_id))
-
+        # Apply padding pattern if we have media tokens
         if media_token_pairs:
             pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
-            # Combine both image and audio inputs for padding
-            all_inputs = image_inputs
-            if audio_inputs is not None:
-                # Merge audio inputs into all_inputs if needed
-                pass
-            ids = pattern.pad_input_tokens(input_ids, all_inputs)
-            return ids
+            return pattern.pad_input_tokens(input_ids, mm_inputs)
+
+        return input_ids
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
@@ -361,8 +355,8 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             [item.input_features for item in items]
         )
         all_input_features_mask = flatten_nested_list(
-            [item.input_features_mask for item in items]
-        )
+            [~item.input_features_mask for item in items]
+        )  # Note(Xinyuan): reverse the mask according to the HF implementation
 
         # Process audio features one by one
         audio_features_list = []
@@ -394,9 +388,34 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
 
         # Concatenate all audio features
         if audio_features_list:
-            return torch.cat(audio_features_list, dim=0)
+            audio_features = torch.cat(audio_features_list, dim=0)
+
+            # The Gemma3nProcessor expects all audio will be 30s in length and inserts 188 audio soft tokens into the
+            # text to account for this. However, the audio preprocessing and encoder do not gurarantee they will
+            # produce 188 soft tokens; they will produce at most that many tokens, but they may produce fewer tokens
+            # depending on the length of the longest audio input in the batch. When we encounter this situation, we pad
+            # the audio feature out to 188 soft tokens with the emebedding of the last token in the embed_audio vocab.
+            audio_padding_toks = torch.tensor(
+                [[self.vocab_size - 1]], dtype=torch.long, device=audio_features.device
+            )
+            audio_padding_embs = self.embed_audio(input_ids=audio_padding_toks)
+            audio_features = torch.where(
+                audio_mask.unsqueeze(-1), audio_padding_embs, audio_features
+            )
+            debug_print("gemma3n_mm: audio_embeds(after where)", audio_features)
+
+            audio_batch_size, audio_seq_len, audio_embed_dim = audio_features.shape
+            extra_padding_tokens = (
+                self.config.audio_soft_tokens_per_image - audio_seq_len
+            )
+            extra_padding_features = audio_padding_embs.expand(
+                audio_batch_size, extra_padding_tokens, audio_embed_dim
+            )
+
+            audio_features = torch.cat((audio_features, extra_padding_features), dim=1)
+            debug_print("gemma3n_mm: audio_embeds(after cat)", audio_features)
+            return audio_features
         else:
-            # Return empty tensor with correct dimensions if no audio
             return torch.empty(
                 0,
                 0,
@@ -433,6 +452,8 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             raise ValueError(
                 "You must specify exactly one of input_ids or inputs_embeds"
             )
+
+        positions += 1
 
         # if input_ids is not None:
         #     # replace the ids that are not in the vocab with the image token id
@@ -479,7 +500,6 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
                 per_layer_inputs_tokens
             )
 
-        print(f"{forward_batch.mm_inputs=}, {forward_batch.contains_mm_inputs()=}")
         # Use general_mm_embed_routine for handling multimodal data
         # This will automatically handle text, image, and audio embeddings
         hidden_states = general_mm_embed_routine(
