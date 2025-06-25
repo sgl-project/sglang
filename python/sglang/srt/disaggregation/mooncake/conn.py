@@ -251,17 +251,19 @@ class MooncakeKVManager(BaseKVManager):
 
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+            src_addr_list = []
+            dst_addr_list = []
+            length_list = []
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
-
-                status = self.engine.transfer_sync(
-                    mooncake_session_id, src_addr, dst_addr, length
-                )
-                if status != 0:
-                    return status
-            return 0
+                src_addr_list.append(src_addr)
+                dst_addr_list.append(dst_addr)
+                length_list.append(length)
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id, src_addr_list, dst_addr_list, length_list
+            )
 
         futures = [
             executor.submit(
@@ -289,15 +291,21 @@ class MooncakeKVManager(BaseKVManager):
         dst_aux_ptrs: list[int],
         dst_aux_index: int,
     ):
-        aux_item_len = self.kv_args.aux_item_lens[0]
-        prefill_aux_addr = (
-            self.kv_args.aux_data_ptrs[0] + prefill_aux_index * aux_item_len
+        src_addr_list = []
+        dst_addr_list = []
+        length_list = []
+        prefill_aux_ptrs = self.kv_args.aux_data_ptrs
+        prefill_aux_item_lens = self.kv_args.aux_item_lens
+        for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
+            length = prefill_aux_item_lens[i]
+            src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
+            dst_addr = dst_aux_ptrs[i] + length * dst_aux_index
+            src_addr_list.append(src_addr)
+            dst_addr_list.append(dst_addr)
+            length_list.append(length)
+        return self.engine.batch_transfer_sync(
+            mooncake_session_id, src_addr_list, dst_addr_list, length_list
         )
-        decode_aux_addr = dst_aux_ptrs[0] + dst_aux_index * aux_item_len
-        status = self.engine.transfer_sync(
-            mooncake_session_id, prefill_aux_addr, decode_aux_addr, aux_item_len
-        )
-        return status
 
     def sync_status_to_decode_endpoint(
         self, remote: str, dst_port: int, room: int, status: int
