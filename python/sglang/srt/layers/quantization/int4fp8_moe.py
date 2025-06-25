@@ -131,24 +131,12 @@ class QuarkInt4Fp8Config(QuantizationConfig):
 class QuarkInt4Fp8LinearMethod(LinearMethodBase):
 
     def __init__(self, quantization_config: QuarkInt4Fp8Config):
-        self.cutlass_fp8_supported = cutlass_fp8_supported()
         self.quant_config = quantization_config
-
         self.online_quant_progress_bar = quantization_config.online_quant_progress_bar
 
-        # For GPUs that lack FP8 hardware support, we can leverage the Marlin
-        # kernel for fast weight-only FP8 quantization
-        self.use_marlin = (
-            get_bool_env_var("SGLANG_FORCE_FP8_MARLIN") and MARLIN_FP8_AVAILABLE
-        )
-        # Disable marlin for ROCm
-        if _is_hip:
-            self.use_marlin = False
+        if not _is_hip:
+            raise NotImplementedError("The int4fp8_moe online quantization scheme is only supported on AMD GPUs.")
 
-        self.block_quant = self.quant_config.weight_block_size is not None
-        if self.block_quant:
-            # Marlin doesn't support block-wise fp8
-            self.use_marlin = False
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
@@ -162,32 +150,25 @@ class QuarkInt4Fp8LinearMethod(LinearMethodBase):
                 layer.input_scale.data, requires_grad=False
             )
 
-        # cutlass sgl-kernel and marlin only support per-channel scale
-        if self.cutlass_fp8_supported or self.use_marlin:
-            weight = layer.weight
-            weight_scale = convert_to_channelwise(
-                layer.weight_scale, layer.logical_widths
-            )
-        else:
-            # Dequant -> Quant with max scale so we can run per tensor.
-            weight = layer.weight
-            weight_scale = layer.weight_scale
-            
-            # Normalize the weights and scales to e4m3fnuz.
-            if _is_hip and not ON_GFX950:
-                weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=weight,
-                    weight_scale=weight_scale,
-                    input_scale=layer.input_scale,
-                )
-                if input_scale is not None:
-                    layer.input_scale = Parameter(input_scale, requires_grad=False)
-
-            weight_scale, weight = requantize_with_max_scale(
+        # Dequant -> Quant with max scale so we can run per tensor.
+        weight = layer.weight
+        weight_scale = layer.weight_scale
+        
+        # Normalize the weights and scales to e4m3fnuz.
+        if _is_hip and not ON_GFX950:
+            weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
                 weight=weight,
                 weight_scale=weight_scale,
-                logical_widths=layer.logical_widths,
+                input_scale=layer.input_scale,
             )
+            if input_scale is not None:
+                layer.input_scale = Parameter(input_scale, requires_grad=False)
+
+        weight_scale, weight = requantize_with_max_scale(
+            weight=weight,
+            weight_scale=weight_scale,
+            logical_widths=layer.logical_widths,
+        )
 
         # Update layer with new values.
         layer.weight = Parameter(weight.t(), requires_grad=False)
@@ -292,7 +273,7 @@ class QuarkInt4Fp8LinearMethod(LinearMethodBase):
             weight_scale=layer.weight_scale,
             input_scale=layer.input_scale,
             bias=bias,
-            cutlass_fp8_supported=self.cutlass_fp8_supported,
+            cutlass_fp8_supported=False,
             use_per_token_if_dynamic=False
         )
 
@@ -585,44 +566,18 @@ class QuarkInt4Fp8MoEMethod:
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        if _is_hip:
-            # TODO: add triton kernel and add check get_bool_env_var("CK_MOE")
-            assert not no_combine, f"{no_combine=} is not supported."
-            return ck_moe_2stages(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                QuantType.per_Token,
-                layer.w13_int4_scale,
-                layer.w2_int4_scale,
-                activation=(
-                    ActivationType.Silu if activation == "silu" else ActivationType.Gelu
-                ),
-            )
-
-        # Expert fusion with FP8 quantization
-        return fused_experts(
+        # TODO: add triton kernel and add check get_bool_env_var("CK_MOE")
+        assert not no_combine, f"{no_combine=} is not supported."
+        return ck_moe_2stages(
             x,
             layer.w13_weight,
             layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=inplace and not no_combine,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            use_fp8_w8a8=True,
-            w1_scale=(
-                layer.w13_fp8_scale_inv
-                if self.block_quant
-                else layer.w13_fp8_scale
+            topk_weights,
+            topk_ids,
+            QuantType.per_Token,
+            layer.w13_int4_scale,
+            layer.w2_int4_scale,
+            activation=(
+                ActivationType.Silu if activation == "silu" else ActivationType.Gelu
             ),
-            w2_scale=(
-                layer.w2_fp8_scale_inv if self.block_quant else layer.w2_fp8_scale
-            ),
-            a1_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-            block_shape=self.quant_config.weight_block_size,
-            no_combine=no_combine,
         )
