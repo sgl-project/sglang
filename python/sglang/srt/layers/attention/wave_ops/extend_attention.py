@@ -160,6 +160,7 @@ def extend_attention_wave(
         qo_indptr,
         kv_indptr,
         kv_indices,
+        max_seq_len,
         output,
     )
 
