@@ -98,8 +98,10 @@ class Gemma3nMLP(nn.Module):
         # Use proper GELU with tanh approximation as specified
         self.act_fn = GeluAndMul()
         self.activation_sparsity = activation_sparsity
-        self.target_sparsity_tensor = torch.tensor(
-            self.activation_sparsity, dtype=torch.float32
+        self.register_buffer(
+            "target_sparsity_tensor",
+            torch.tensor(self.activation_sparsity, dtype=torch.float32),
+            persistent=False,
         )  # moved from _gaussian_topk for cuda graph
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
