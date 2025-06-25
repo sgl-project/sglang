@@ -1,20 +1,3 @@
-# Copyright 2025 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-
-# Adapted from:
-# https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/gemma3n_mm.py
-
 import logging
 import re
 from functools import lru_cache
@@ -256,10 +239,6 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         # Create logits processor for the multimodal model
         self.logits_processor = LogitsProcessor(config.text_config)
 
-        # if self.language_model.logits_processor.logit_scale:
-        #     logit_scale = getattr(config, "logit_scale", 1.0)
-        #     self.language_model.logits_processor.logit_scale *= logit_scale
-
         self.post_init()
 
     def pad_input_ids(
@@ -455,39 +434,6 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
 
         positions += 1
 
-        # if input_ids is not None:
-        #     # replace the ids that are not in the vocab with the image token id
-        #     input_ids = torch.where(input_ids >= self.vocab_size, self.config.image_token_id, input_ids)
-        #     # print(f"DEBUG: input_ids: {input_ids}")
-        #     input_embeds = self.get_input_embeddings()(input_ids)
-
-        #     # Prepare per-layer inputs from inputs_ids
-        #     per_layer_inputs_mask = torch.logical_and(input_ids >= 0, input_ids < self.vocab_size_per_layer_input)
-        #     per_layer_inputs_tokens = torch.where(per_layer_inputs_mask, input_ids, torch.zeros_like(input_ids))
-        #     per_layer_inputs = self.language_model.get_per_layer_inputs(per_layer_inputs_tokens)
-        #     # Ensure no gaps between text, vision, and audio embeddings, in that order
-        #     assert self.embed_audio.vocab_offset == self.vocab_size - self.embed_audio.vocab_size
-        #     assert self.embed_vision.vocab_offset == (
-        #         self.vocab_size - self.embed_audio.vocab_size - self.embed_vision.vocab_size
-        #     )
-
-        #     # Handle vision tokens (>= embed_vision.vocab_offset and < embed_audio.vocab_offset)
-        #     vision_mask = torch.logical_and(
-        #         input_ids >= self.embed_vision.vocab_offset,
-        #         input_ids < self.embed_audio.vocab_offset
-        #     )
-        #     vision_indices = torch.where(vision_mask)
-        #     vision_tokens = input_ids[vision_indices]
-        #     vision_embeds_flat = self.embed_vision(input_ids=vision_tokens)
-        #     input_embeds[vision_indices] = vision_embeds_flat
-
-        #     # Handle audio tokens (>= embed_audio.vocab_offset)
-        #     audio_mask = input_ids >= self.embed_audio.vocab_offset
-        #     audio_indices = torch.where(audio_mask)
-        #     audio_tokens = input_ids[audio_indices]
-        #     audio_embeds_flat = self.embed_audio(input_ids=audio_tokens)
-        #     input_embeds[audio_indices] = audio_embeds_flat
-
         if input_ids is not None:
             # Prepare per-layer inputs from inputs_ids
             per_layer_inputs_mask = torch.logical_and(
@@ -535,13 +481,6 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
 
         for name, loaded_weight in weights:
             name = re.sub(r"^model\.", "", name)
-            # if "language_model" in name:
-            #     causal_loaded_params = Gemma3nForCausalLM.load_weights(
-            #         self, [(name, loaded_weight)]
-            #     )
-            #     loaded_params.update(causal_loaded_params)
-            #     continue
-            # else:
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue

@@ -1,30 +1,9 @@
-# Copyright 2025 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-
-import copy
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import (
-    ROPE_INIT_FUNCTIONS,
-    AutoModel,
-    Gemma3nTextConfig,
-    PretrainedConfig,
-    PreTrainedModel,
-)
+from transformers import AutoModel, Gemma3nTextConfig, PretrainedConfig, PreTrainedModel
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
@@ -38,11 +17,8 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb, get_rope
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
+from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -82,34 +58,6 @@ class Gemma3nRMSNorm(Gemma3RMSNorm):
         # See https://github.com/huggingface/transformers/pull/29402
         output = self._norm(x) * self.weight.type_as(x)
         return output.type_as(x)
-
-
-# class Gemma3nTextScaledWordEmbedding(VocabParallelEmbedding):
-#     """
-#     This module overrides VocabParallelEmbedding's forward by multiplying with embeddings scale.
-#     """
-
-#     def __init__(
-#         self,
-#         num_embeddings: int,
-#         embedding_dim: int,
-#         quant_config: Optional[QuantizationConfig] = None,
-#         prefix: str = "",
-#         org_num_embeddings: Optional[int] = None,
-#         embed_scale: float = 1.0,
-#     ):
-#         super().__init__(
-#             num_embeddings=num_embeddings,
-#             embedding_dim=embedding_dim,
-#             quant_config=quant_config,
-#             prefix=prefix,
-#             org_num_embeddings=org_num_embeddings,
-#         )
-#         self.embed_scale = embed_scale
-
-#     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-#         embeddings = super().forward(input_ids)
-#         return embeddings * self.embed_scale
 
 
 class Gemma3nTextScaledWordEmbedding(Gemma3TextScaledWordEmbedding):
@@ -418,9 +366,6 @@ class Gemma3nAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # self.is_causal = True
-        # self.attention_dropout = self.config.attention_dropout
-
         # Determine if layer uses sliding window based on pattern
         self.is_sliding = config.layer_types[layer_id] == "sliding_attention"
 
@@ -438,36 +383,6 @@ class Gemma3nAttention(nn.Module):
         else:
             self.kv_shared_layer_index = first_kv_shared_layer_idx - 1
 
-        # Initialize the rotary embedding
-        # if self.is_sliding:
-        #     self.rope_theta = config.rope_local_base_freq
-        #     self.rope_scaling = {"rope_type": "default"}
-        #     self.sliding_window = get_attention_sliding_window_size(config)
-        # else:
-        #     self.rope_theta = config.rope_theta
-        #     self.rope_scaling = config.rope_scaling
-        #     self.sliding_window = None
-
-        # self.rotary_emb = Gemma3nRotaryEmbedding(config=config)
-        # self.rotary_emb = get_rope(
-        #     self.head_dim,
-        #     rotary_dim=self.head_dim,
-        #     max_position=config.max_position_embeddings,
-        #     base=config.rope_theta,
-        #     rope_scaling=config.rope_scaling
-        # )
-        # Local RoPE layer with different theta
-        # config_local = copy.deepcopy(config)
-        # config_local.rope_theta = config.rope_local_base_freq
-        # config_local.rope_scaling = {"rope_type": "default"}
-        # self.rotary_emb_local = Gemma3nRotaryEmbedding(config=config_local)
-        # self.rotary_emb_local = get_rope(
-        #     self.head_dim,
-        #     rotary_dim=self.head_dim,
-        #     max_position=config.max_position_embeddings,
-        #     base=config.rope_local_base_freq,
-        #     rope_scaling={"rope_type": "default"}
-        # )
         if self.is_sliding:
             self.rotary_emb = get_rope(
                 self.head_dim,
@@ -575,72 +490,6 @@ class Gemma3nAttention(nn.Module):
 
         output, _ = self.o_proj(attn_output)
         return output
-
-
-# class Gemma3nRotaryEmbedding(nn.Module):
-#     def __init__(self, config: Gemma3nTextConfig, device=None):
-#         super().__init__()
-#         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-#             self.rope_type = config.rope_scaling.get(
-#                 "rope_type", config.rope_scaling.get("type")
-#             )
-#         else:
-#             self.rope_type = "default"
-#         self.max_seq_len_cached = config.max_position_embeddings
-#         self.original_max_seq_len = config.max_position_embeddings
-
-#         self.config = config
-#         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-
-#         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
-#         self.register_buffer("inv_freq", inv_freq, persistent=False)
-#         self.original_inv_freq = self.inv_freq
-
-#     def _dynamic_frequency_update(self, position_ids, device):
-#         """Dynamic RoPE frequency update."""
-#         seq_len = torch.max(position_ids) + 1
-#         if seq_len > self.max_seq_len_cached:
-#             inv_freq, self.attention_scaling = self.rope_init_fn(
-#                 self.config, device, seq_len=seq_len
-#             )
-#             self.register_buffer("inv_freq", inv_freq, persistent=False)
-#             self.max_seq_len_cached = seq_len
-
-#         if (
-#             seq_len < self.original_max_seq_len
-#             and self.max_seq_len_cached > self.original_max_seq_len
-#         ):
-#             self.original_inv_freq = self.original_inv_freq.to(device)
-#             self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
-#             self.max_seq_len_cached = self.original_max_seq_len
-
-#     @torch.no_grad()
-#     def forward(self, x, position_ids):
-#         if "dynamic" in self.rope_type:
-#             self._dynamic_frequency_update(position_ids, device=x.device)
-
-#         inv_freq_expanded = (
-#             self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-#         )
-#         position_ids_expanded = position_ids[:, None, :].float()
-#         device_type = x.device.type
-#         device_type = (
-#             device_type
-#             if isinstance(device_type, str) and device_type != "mps"
-#             else "cpu"
-#         )
-#         with torch.autocast(device_type=device_type, enabled=False):
-#             freqs = (
-#                 inv_freq_expanded.float().to(x.device) @ position_ids_expanded.float()
-#             ).transpose(1, 2)
-#             emb = torch.cat((freqs, freqs), dim=-1)
-#             cos = emb.cos()
-#             sin = emb.sin()
-
-#         cos = cos * self.attention_scaling
-#         sin = sin * self.attention_scaling
-
-#         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 class Gemma3nDecoderLayer(nn.Module):
