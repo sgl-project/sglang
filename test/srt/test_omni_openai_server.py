@@ -12,7 +12,7 @@ from test_vision_openai_server_common import *
 class TestOpenAIOmniServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen2.5-Omni-7B"
+        cls.model = "openbmb/MiniCPM-o-2_6"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
@@ -22,7 +22,7 @@ class TestOpenAIOmniServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.4",
+                "0.7",
             ],
         )
         cls.base_url += "/v1"
@@ -141,25 +141,6 @@ class TestOpenAIOmniServer(TestOpenAIVisionServer):
 
         self.verify_single_image_response(response=response)
         self.verify_speech_recognition_response(text=text)
-
-
-class TestMinicpmoServer(TestOpenAIOmniServer):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "openbmb/MiniCPM-o-2_6"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.7",
-            ],
-        )
-        cls.base_url += "/v1"
 
 
 if __name__ == "__main__":
