@@ -126,15 +126,16 @@ class ScheduleBatchDisaggregationDecodeMixin:
             )
             topk_index = topk_index.reshape(b, server_args.speculative_eagle_topk)
 
+            hidden_states_list = [req.hidden_states_tensor for req in self.reqs]
+            hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)
+
             # local import to avoid circular import
             from sglang.srt.speculative.eagle_utils import EagleDraftInput
 
             spec_info = EagleDraftInput(
                 topk_p=topk_p,
                 topk_index=topk_index,
-                hidden_states=torch.ones(
-                    (b, model_config.hidden_size), device=self.device
-                ),
+                hidden_states=hidden_states,
                 verified_id=self.output_ids,
             )
             spec_info.prepare_for_extend(self)

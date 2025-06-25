@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,14 +20,16 @@ import random
 from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
 
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
 # This can prevent the server from being too conservative.
@@ -49,6 +53,9 @@ IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD = int(
 IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
     os.environ.get("IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD", "32")
 )
+
+
+IGNORE_EOS_RESERVE_TOKENS = 1
 
 
 class CacheAwarePolicy(Enum):
@@ -90,7 +97,7 @@ class SchedulePolicy:
     def calc_priority(self, waiting_queue: List[Req]) -> bool:
         if self.policy == CacheAgnosticPolicy.FCFS:
             # A shortcut for FCFS
-            return
+            return False
 
         policy = self._determine_active_policy(waiting_queue)
 
@@ -134,7 +141,7 @@ class SchedulePolicy:
         """
         try:
             policy_enum = CacheAwarePolicy(policy)
-            if tree_cache.disable:
+            if getattr(tree_cache, "disable", True):
                 # If tree_cache is disabled, using CacheAgnosticPolicy policy
                 return CacheAgnosticPolicy.FCFS
             return policy_enum
@@ -158,14 +165,9 @@ class SchedulePolicy:
             prefix_ids = r.adjust_max_prefix_ids()
 
             # NOTE: the prefix_indices must always be aligned with last_node
-            if self.enable_hierarchical_cache:
-                r.prefix_indices, r.last_node, r.last_node_global = (
-                    self.tree_cache.match_prefix(key=prefix_ids, include_evicted=True)
-                )
-            else:
-                r.prefix_indices, r.last_node = self.tree_cache.match_prefix(
-                    rid=r.rid, key=prefix_ids
-                )
+            r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length = (
+                self.tree_cache.match_prefix(rid=r.rid, key=prefix_ids)
+            )
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -175,7 +177,7 @@ class SchedulePolicy:
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
-                in_batch_matching_prefixes, _ = (
+                in_batch_matching_prefixes, _, _, _ = (
                     self.waiting_queue_radix_tree.match_prefix(
                         rid=r.rid, key=prefix_ids
                     )
@@ -268,14 +270,16 @@ class AddReqResult(Enum):
 class PrefillAdder:
     def __init__(
         self,
+        page_size: int,
         tree_cache: BasePrefixCache,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         running_batch: ScheduleBatch,
         new_token_ratio: float,
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
     ):
+        self.page_size = page_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
@@ -292,6 +296,7 @@ class PrefillAdder:
         self.can_run_list = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
+        # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
 
         if running_batch is not None:
@@ -322,6 +327,9 @@ class PrefillAdder:
             - self.cur_rem_token_offset
         )
 
+    def ceil_paged_tokens(self, tokens: int) -> int:
+        return -(-tokens // self.page_size) * self.page_size
+
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
@@ -333,9 +341,12 @@ class PrefillAdder:
 
         return AddReqResult.CONTINUE
 
-    def _prefill_one_req(
+    def _update_prefill_budget(
         self, prefix_len: int, extend_input_len: int, max_new_tokens: int
     ):
+        # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
+        extend_input_len = self.ceil_paged_tokens(extend_input_len)
+
         self.rem_total_token_offset += extend_input_len + max_new_tokens
         self.cur_rem_token_offset += extend_input_len
         self.rem_input_tokens -= extend_input_len
@@ -350,7 +361,7 @@ class PrefillAdder:
         req.extend_input_len = min(req.extend_input_len, self.rem_chunk_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
-        self._prefill_one_req(
+        self._update_prefill_budget(
             0,
             req.extend_input_len,
             (
@@ -372,6 +383,12 @@ class PrefillAdder:
             self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool):
+        # Early exit if no enough tokens for the input tokens
+        if self.ceil_paged_tokens(req.extend_input_len) > min(
+            self.cur_rem_tokens, self.rem_total_tokens
+        ):
+            return AddReqResult.NO_TOKEN
+
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
                 1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
@@ -381,15 +398,17 @@ class PrefillAdder:
             )
             tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
 
-            if tokens_left > 0:
-                if not insert_sort:
-                    self.req_states.append((tokens_left, tokens_occupied))
-                else:
-                    i = 0
-                    for i in range(len(self.req_states)):
-                        if tokens_left <= self.req_states[i][0]:
-                            break
-                    self.req_states.insert(i, (tokens_left, tokens_occupied))
+            if tokens_left <= 0:
+                return
+
+            if not insert_sort:
+                self.req_states.append((tokens_left, tokens_occupied))
+            else:
+                i = 0
+                for i in range(len(self.req_states)):
+                    if tokens_left <= self.req_states[i][0]:
+                        break
+                self.req_states.insert(i, (tokens_left, tokens_occupied))
 
         if self.req_states is None:
             self.req_states = []
@@ -406,13 +425,11 @@ class PrefillAdder:
         cur_rem_tokens = self.cur_rem_tokens - len(req.origin_input_ids)
         tokens_freed = 0
         for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
-            decode_steps = (
-                self.req_states[i + 1][0]
-                if i + 1 < len(self.req_states)
-                else tokens_left
-            )
+            # tokens_left gives a reservative calculation as the last token is not stored
             bs = len(self.req_states) - i
-            if cur_rem_tokens + tokens_freed - decode_steps * bs <= 0:
+            min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
+            # reserve tokens for corner cases
+            if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
                 return AddReqResult.NO_TOKEN
             tokens_freed += tokens_occupied
 
@@ -422,7 +439,7 @@ class PrefillAdder:
         ):
             # Non-chunked prefill
             self.can_run_list.append(req)
-            self._prefill_one_req(
+            self._update_prefill_budget(
                 0,
                 req.extend_input_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION),
@@ -438,55 +455,52 @@ class PrefillAdder:
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
             self.new_chunked_req = req
-            self._prefill_one_req(0, trunc_len, 0)
+            self._update_prefill_budget(0, trunc_len, 0)
 
         return self.budget_state()
 
-    def add_one_req(
-        self, req: Req, has_chunked_req: bool, enable_hierarchical_cache: bool = False
-    ):
+    def add_one_req(self, req: Req, has_chunked_req: bool):
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
         total_tokens = req.extend_input_len + min(
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
         )
-        input_tokens = (
-            -(-req.extend_input_len // self.tree_cache.page_size)
-            * self.tree_cache.page_size
-        )
+
+        # adjusting the input_tokens based on host_hit_length and page_size
+        real_input_tokens = req.extend_input_len - req.host_hit_length
+        real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
-        if input_tokens > self.rem_input_tokens and len(self.can_run_list) != 0:
+        if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
-            if total_tokens > self.rem_total_tokens:
+            # self.rem_total_tokens may decrease after the lock acquisition
+            if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
-            if (
-                enable_hierarchical_cache
-                and req.last_node_global is not None
-                and req.last_node_global.evicted
-            ):
-                req.last_node, req.prefix_indices = self.tree_cache.init_load_back(
-                    req.last_node_global, req.prefix_indices
+            if req.host_hit_length > 0:
+                new_indices, req.last_node = self.tree_cache.init_load_back(
+                    req.last_host_node, req.host_hit_length
                 )
+                req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                input_tokens = (
-                    -(-req.extend_input_len // self.tree_cache.page_size)
-                    * self.tree_cache.page_size
-                )
                 prefix_len = len(req.prefix_indices)
+
+            input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+
+            if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+                return AddReqResult.OTHER
 
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
                 self.tree_cache.inc_lock_ref(req.last_node)
-                self._prefill_one_req(
+                self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
                     min(
@@ -496,7 +510,7 @@ class PrefillAdder:
                 )
             else:
                 # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens - self.tree_cache.page_size + 1
+                trunc_len = self.rem_chunk_tokens - self.page_size + 1
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
@@ -507,6 +521,6 @@ class PrefillAdder:
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
                 self.tree_cache.inc_lock_ref(req.last_node)
-                self._prefill_one_req(prefix_len, trunc_len, 0)
+                self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()

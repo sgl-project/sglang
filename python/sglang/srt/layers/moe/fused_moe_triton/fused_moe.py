@@ -25,9 +25,11 @@ from sglang.srt.layers.quantization.int8_kernel import (
     sglang_per_token_group_quant_int8,
 )
 from sglang.srt.utils import (
+    cpu_has_amx_support,
     direct_register_custom_op,
     get_bool_env_var,
     get_device_name,
+    is_cpu,
     is_cuda,
     is_hip,
     log_info_on_rank0,
@@ -36,9 +38,13 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
+elif _is_cpu and _is_cpu_amx_available:
+    pass
 else:
     from vllm import _custom_ops as vllm_ops
     from vllm._custom_ops import scaled_fp8_quant
@@ -744,9 +750,11 @@ def moe_align_block_size(
         by block_size for proper block matrix operations.
     """
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
-    sorted_ids, cumsum_buffer = init_sorted_ids_and_cumsum_buffer(
-        max_num_tokens_padded, topk_ids.numel(), num_experts, topk_ids.device
+    sorted_ids = torch.empty(
+        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
+    sorted_ids.fill_(topk_ids.numel())
+
     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
     expert_ids = torch.empty(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
@@ -762,6 +770,9 @@ def moe_align_block_size(
             num_tokens_post_pad,
         )
     else:
+        cumsum_buffer = torch.empty(
+            (num_experts + 1,), dtype=torch.int32, device=topk_ids.device
+        )
         token_cnts_buffer = torch.empty(
             (num_experts + 1) * num_experts,
             dtype=torch.int32,

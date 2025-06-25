@@ -20,7 +20,7 @@ from sglang.bench_serving import (
     get_gen_prefix_cache_path,
 )
 from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
-from sglang.srt.openai_api.protocol import ChatCompletionMessageContentPart
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageContentPart
 from sglang.utils import encode_video_base64
 
 # type of content fields, can be only prompts or with images/videos
@@ -83,8 +83,9 @@ def common_filter_chat(
                 input_tokens += prompt_len
                 output_tokens += output_len
                 processed.append((prompt, prompt_len, output_len))
-            filtered_dataset.append(processed)
-            l += 1
+            if len(processed) != 0:
+                filtered_dataset.append(processed)
+                l += 1
 
     print(f"#Input tokens: {input_tokens}")
     print(f"#Output tokens: {output_tokens}")
