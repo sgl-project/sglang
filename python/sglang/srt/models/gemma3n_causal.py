@@ -921,39 +921,41 @@ class Gemma3nTextModel(PreTrainedModel):
         per_layer_inputs: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
+        if (input_ids is None) ^ (input_embeds is not None):
+            raise ValueError(
+                "You must specify exactly one of input_ids or inputs_embeds"
+            )
 
-        if per_layer_inputs is None and input_ids is not None:
+        if input_ids is not None:
+            input_embeds = self.embed_tokens(input_ids)
             per_layer_inputs = self.get_per_layer_inputs(input_ids)
 
-        per_layer_inputs = self.project_per_layer_inputs(
-            hidden_states, per_layer_inputs
-        )
+        per_layer_inputs = self.project_per_layer_inputs(input_embeds, per_layer_inputs)
 
         if positions.dim() == 1:
             positions = positions.unsqueeze(0)
 
         # Expand hidden_states to support per-layer inputs
-        target_magnitude = torch.mean(hidden_states**2, dim=-1, keepdim=True) ** 0.5
-        epsilon_tensor = torch.tensor(torch.finfo(hidden_states.dtype).min)
+        target_magnitude = torch.mean(input_embeds**2, dim=-1, keepdim=True) ** 0.5
+        epsilon_tensor = torch.tensor(torch.finfo(input_embeds.dtype).min)
 
-        hidden_states_list = [hidden_states] * self.config.altup_num_inputs
+        # embed positions
+        hidden_states_0 = input_embeds
+        temp_hidden_states = [hidden_states_0]
 
         for i in range(1, self.config.altup_num_inputs):
-            altup_proj, _ = self.altup_projections[i - 1](hidden_states_list[i])
-            hidden_states_list[i] = altup_proj.type(hidden_states.dtype)
+            altup_proj, _ = self.altup_projections[i - 1](hidden_states_0)
+            current_hidden_state = altup_proj.type(hidden_states_0.dtype)
             new_magnitude = (
-                torch.mean(hidden_states_list[i] ** 2, dim=-1, keepdim=True) ** 0.5
+                torch.mean(current_hidden_state**2, dim=-1, keepdim=True) ** 0.5
             )
-            hidden_states_list[i] *= target_magnitude / torch.maximum(
-                new_magnitude, epsilon_tensor
+            current_hidden_state = current_hidden_state * (
+                target_magnitude / torch.maximum(new_magnitude, epsilon_tensor)
             )
+            temp_hidden_states.append(current_hidden_state)
 
         hidden_states = torch.stack(
-            hidden_states_list, dim=0
+            temp_hidden_states, dim=0
         )  # [num_altup_inputs, n_tokens, hidden_size]
 
         for layer_idx, layer in enumerate(self.layers):
@@ -970,18 +972,24 @@ class Gemma3nTextModel(PreTrainedModel):
         target_magnitude = (
             torch.mean(hidden_states[0] ** 2, dim=-1, keepdim=True) ** 0.5
         )
+
+        temp_hidden_states = [hidden_states[0]]
+
         for i in range(1, self.config.altup_num_inputs):
+            # altup_unembed_projections adapted from jax.numpy.einsum("btp,pd->btd", ...)
             altup_unemb_proj, _ = self.altup_unembed_projections[i - 1](
                 hidden_states[i]
             )
-            hidden_states[i] = altup_unemb_proj.type(hidden_states[0].dtype)
+            current_hidden_state = altup_unemb_proj.type(hidden_states_0.dtype)
             new_magnitude = (
-                torch.mean(hidden_states[i] ** 2, dim=-1, keepdim=True) ** 0.5
+                torch.mean(current_hidden_state**2, dim=-1, keepdim=True) ** 0.5
             )
-            hidden_states[i] *= target_magnitude / torch.maximum(
-                new_magnitude, epsilon_tensor
+            current_hidden_state = current_hidden_state * (
+                target_magnitude / torch.maximum(new_magnitude, epsilon_tensor)
             )
+            temp_hidden_states.append(current_hidden_state)
 
+        hidden_states = torch.stack(temp_hidden_states)
         hidden_states = torch.mean(hidden_states, dim=0)
         hidden_states = self.norm(hidden_states)
 

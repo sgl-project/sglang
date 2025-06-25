@@ -22,7 +22,13 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict, Union
 
 import torch
 from torch import nn
-from transformers import Gemma3nConfig, PreTrainedModel
+from transformers import (
+    Gemma3nAudioConfig,
+    Gemma3nConfig,
+    Gemma3nTextConfig,
+    Gemma3nVisionConfig,
+    PreTrainedModel,
+)
 from transformers.models.auto.modeling_auto import AutoModel
 
 from sglang.srt.hf_transformers_utils import get_processor
@@ -71,10 +77,8 @@ class Gemma3nMultimodalEmbedder(nn.Module):
 
     def __init__(
         self,
-        multimodal_config: Union[
-            object, object
-        ],  # Gemma3nAudioConfig or Gemma3nVisionConfig
-        text_config: object,  # Gemma3nTextConfig
+        multimodal_config: Union[Gemma3nAudioConfig, Gemma3nVisionConfig],
+        text_config: Gemma3nTextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -211,7 +215,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         super().__init__(config=config)
         self.config = config
         self.quant_config = quant_config
-        print(f"DEBUG: prefix: {prefix}")
+
         prefix = add_prefix("model", prefix)
 
         # Vision components
@@ -240,6 +244,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         )
 
         self.vocab_size = config.text_config.vocab_size
+        self.vocab_size_per_layer_input = config.text_config.vocab_size_per_layer_input
 
         # Text model
         self.language_model = Gemma3nTextModel(
@@ -421,19 +426,61 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-        per_layer_inputs: Optional[torch.Tensor] = None,
         **kwargs: object,
     ) -> LogitsProcessor:
         """Forward pass for multimodal Gemma3n."""
+        if (input_ids is None) ^ (input_embeds is not None):
+            raise ValueError(
+                "You must specify exactly one of input_ids or inputs_embeds"
+            )
 
-        # Important: position_ids in Gemma3 are 1-indexed
-        # This really does cost me sometime
-        # positions += 1
+        # if input_ids is not None:
+        #     # replace the ids that are not in the vocab with the image token id
+        #     input_ids = torch.where(input_ids >= self.vocab_size, self.config.image_token_id, input_ids)
+        #     # print(f"DEBUG: input_ids: {input_ids}")
+        #     input_embeds = self.get_input_embeddings()(input_ids)
 
-        # Get per-layer inputs if needed
-        if per_layer_inputs is None and input_ids is not None:
-            per_layer_inputs = self.get_per_layer_inputs(input_ids)
+        #     # Prepare per-layer inputs from inputs_ids
+        #     per_layer_inputs_mask = torch.logical_and(input_ids >= 0, input_ids < self.vocab_size_per_layer_input)
+        #     per_layer_inputs_tokens = torch.where(per_layer_inputs_mask, input_ids, torch.zeros_like(input_ids))
+        #     per_layer_inputs = self.language_model.get_per_layer_inputs(per_layer_inputs_tokens)
+        #     # Ensure no gaps between text, vision, and audio embeddings, in that order
+        #     assert self.embed_audio.vocab_offset == self.vocab_size - self.embed_audio.vocab_size
+        #     assert self.embed_vision.vocab_offset == (
+        #         self.vocab_size - self.embed_audio.vocab_size - self.embed_vision.vocab_size
+        #     )
 
+        #     # Handle vision tokens (>= embed_vision.vocab_offset and < embed_audio.vocab_offset)
+        #     vision_mask = torch.logical_and(
+        #         input_ids >= self.embed_vision.vocab_offset,
+        #         input_ids < self.embed_audio.vocab_offset
+        #     )
+        #     vision_indices = torch.where(vision_mask)
+        #     vision_tokens = input_ids[vision_indices]
+        #     vision_embeds_flat = self.embed_vision(input_ids=vision_tokens)
+        #     input_embeds[vision_indices] = vision_embeds_flat
+
+        #     # Handle audio tokens (>= embed_audio.vocab_offset)
+        #     audio_mask = input_ids >= self.embed_audio.vocab_offset
+        #     audio_indices = torch.where(audio_mask)
+        #     audio_tokens = input_ids[audio_indices]
+        #     audio_embeds_flat = self.embed_audio(input_ids=audio_tokens)
+        #     input_embeds[audio_indices] = audio_embeds_flat
+
+        if input_ids is not None:
+            print(f"DEBUG: input_ids: {input_ids}")
+            # Prepare per-layer inputs from inputs_ids
+            per_layer_inputs_mask = torch.logical_and(
+                input_ids >= 0, input_ids < self.vocab_size_per_layer_input
+            )
+            per_layer_inputs_tokens = torch.where(
+                per_layer_inputs_mask, input_ids, torch.zeros_like(input_ids)
+            )
+            per_layer_inputs = self.language_model.get_per_layer_inputs(
+                per_layer_inputs_tokens
+            )
+
+        print(f"{forward_batch.mm_inputs=}, {forward_batch.contains_mm_inputs()=}")
         # Use general_mm_embed_routine for handling multimodal data
         # This will automatically handle text, image, and audio embeddings
         hidden_states = general_mm_embed_routine(
@@ -465,7 +512,6 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         ]
         """Load weights for the model."""
         params_dict = dict(self.named_parameters())
-        print(f"DEBUG: params_dict: {params_dict.keys()}")
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
