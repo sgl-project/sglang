@@ -47,6 +47,7 @@ class ServerArgs:
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
+    model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
@@ -563,6 +564,7 @@ class ServerArgs:
         # Model and port args
         parser.add_argument(
             "--model-path",
+            "--model",
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
             required=True,
@@ -631,6 +633,13 @@ class ServerArgs:
             '"layered" loads weights layer by layer so that one can quantize a '
             "layer before loading another to make the peak memory envelope "
             "smaller.",
+        )
+        parser.add_argument(
+            "--model-loader-extra-config",
+            type=str,
+            help="Extra config for model loader. "
+            "This will be passed to the model loader corresponding to the chosen load_format.",
+            default=ServerArgs.model_loader_extra_config,
         )
         parser.add_argument(
             "--trust-remote-code",
