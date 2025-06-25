@@ -77,8 +77,8 @@ def create_flashmla_kv_indices_triton(
         ) * PAGED_SIZE
         paged_offset_out = tl.arange(0, NUM_PAGE_PER_BLOCK) + i * NUM_PAGE_PER_BLOCK
 
-        mask = paged_offset <= num_paged * PAGED_SIZE
-        mask_out = paged_offset_out <= num_paged
+        mask = paged_offset < num_paged * PAGED_SIZE
+        mask_out = paged_offset_out < num_paged
 
         data = tl.load(
             req_to_token_ptr

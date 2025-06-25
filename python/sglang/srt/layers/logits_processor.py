@@ -33,6 +33,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_size,
+    get_local_attention_dp_size,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -324,7 +325,8 @@ class LogitsProcessor(nn.Module):
 
         if self.debug_tensor_dump_output_folder:
             assert (
-                not self.do_tensor_parallel_all_gather or get_attention_dp_size() == 1
+                not self.do_tensor_parallel_all_gather
+                or get_local_attention_dp_size() == 1
             ), "dp attention + sharded lm_head doesn't support full logits"
             full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
             dump_to_file(self.debug_tensor_dump_output_folder, "logits", full_logits)
@@ -440,11 +442,20 @@ class LogitsProcessor(nn.Module):
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
         if hasattr(lm_head, "weight"):
-            logits = torch.matmul(
-                hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-            )
+            if getattr(lm_head, "use_intel_amx_backend", False):
+                logits = torch.ops.sgl_kernel.weight_packed_linear(
+                    hidden_states.to(lm_head.weight.dtype),
+                    lm_head.weight,
+                    None,  # bias
+                    True,  # is_vnni
+                )
+            else:
+                logits = torch.matmul(
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                )
         else:
             # GGUF models
+            # TODO: use weight_packed_linear for GGUF models
             logits = lm_head.quant_method.apply(lm_head, hidden_states, embedding_bias)
 
         if self.logit_scale is not None:

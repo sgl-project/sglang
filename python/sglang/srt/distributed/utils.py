@@ -127,14 +127,14 @@ class StatelessProcessGroup:
         key = f"send_to/{dst}/{self.send_dst_counter[dst]}"
         self.store.set(key, pickle.dumps(obj))
         self.send_dst_counter[dst] += 1
-        self.entries.append((key, time.time()))
+        self.entries.append((key, time.perf_counter()))
 
     def expire_data(self):
         """Expire data that is older than `data_expiration_seconds` seconds."""
         while self.entries:
             # check the oldest entry
             key, timestamp = self.entries[0]
-            if time.time() - timestamp > self.data_expiration_seconds:
+            if time.perf_counter() - timestamp > self.data_expiration_seconds:
                 self.store.delete_key(key)
                 self.entries.popleft()
             else:
@@ -158,7 +158,7 @@ class StatelessProcessGroup:
             key = f"broadcast_from/{src}/" f"{self.broadcast_send_counter}"
             self.store.set(key, pickle.dumps(obj))
             self.broadcast_send_counter += 1
-            self.entries.append((key, time.time()))
+            self.entries.append((key, time.perf_counter()))
             return obj
         else:
             key = f"broadcast_from/{src}/" f"{self.broadcast_recv_src_counter[src]}"

@@ -28,6 +28,8 @@ def popen_launch_router(
     selector: list = None,
     service_discovery_port: int = 80,
     service_discovery_namespace: str = None,
+    prometheus_port: int = None,
+    prometheus_host: str = None,
 ):
     """
     Launch the router server process.
@@ -45,6 +47,8 @@ def popen_launch_router(
         selector: List of label selectors in format ["key1=value1", "key2=value2"]
         service_discovery_port: Port to use for service discovery
         service_discovery_namespace: Kubernetes namespace to watch for pods. If None, watches all namespaces.
+        prometheus_port: Port to expose Prometheus metrics. If None, Prometheus metrics are disabled.
+        prometheus_host: Host address to bind the Prometheus metrics server.
     """
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -86,6 +90,12 @@ def popen_launch_router(
         command.extend(
             ["--router-service-discovery-namespace", service_discovery_namespace]
         )
+
+    if prometheus_port is not None:
+        command.extend(["--router-prometheus-port", str(prometheus_port)])
+
+    if prometheus_host is not None:
+        command.extend(["--router-prometheus-host", prometheus_host])
 
     if log_dir is not None:
         command.extend(["--log-dir", log_dir])

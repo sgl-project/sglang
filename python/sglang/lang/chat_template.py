@@ -194,6 +194,21 @@ register_chat_template(
     )
 )
 
+# Reference: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/blob/main/chat_template.json
+register_chat_template(
+    ChatTemplate(
+        name="mistral",
+        default_system_prompt=None,
+        role_prefix_and_suffix={
+            "system": ("[SYSTEM_PROMPT] ", " [/SYSTEM_PROMPT]"),
+            "user": ("[INST] ", " [/INST]"),
+            "assistant": ("", " </s><s>"),
+        },
+        stop_str=("</s>",),
+        image_token="[IMG]",
+    )
+)
+
 register_chat_template(
     ChatTemplate(
         name="llama-3-instruct",
@@ -509,11 +524,17 @@ def match_vicuna(model_path: str):
 @register_chat_template_matching_function
 def match_llama2_chat(model_path: str):
     if re.search(
-        r"llama-2.*chat|(mistral|mixtral).*instruct|codellama.*instruct",
+        r"llama-2.*chat|codellama.*instruct",
         model_path,
         re.IGNORECASE,
     ):
         return "llama-2-chat"
+
+
+@register_chat_template_matching_function
+def match_mistral(model_path: str):
+    if re.search(r"pixtral|(mistral|mixtral).*instruct", model_path, re.IGNORECASE):
+        return "mistral"
 
 
 @register_chat_template_matching_function
