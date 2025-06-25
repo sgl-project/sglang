@@ -316,12 +316,13 @@ jobs:
       - name: Install dependencies
         run: bash scripts/amd_ci_install_dependency.sh
 
-      - name: Run test #### TODO: sgl-kernel/test
+      - name: Run test
         timeout-minutes: 10
         run: |
-          bash scripts/amd_ci_exec.sh pytest test_moe_align.py
-          bash scripts/amd_ci_exec.sh pytest test_moe_topk_softmax.py
-          bash scripts/amd_ci_exec.sh pytest test_eagle_utils.py
+          cd sgl-kernel/tests
+          pytest test_moe_align.py
+          pytest test_moe_topk_softmax.py
+          pytest test_eagle_utils.py
 
   finish:
     if: always()
