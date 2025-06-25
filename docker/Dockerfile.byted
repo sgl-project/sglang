@@ -15,16 +15,14 @@ RUN sed -i 's/archive.ubuntu.com/mirrors.byted.org/g' /etc/apt/sources.list && \
 
 # ep statistics
 WORKDIR /sgl-workspace
-RUN wget https://github.com/user-attachments/files/20036217/attachment_ep_statistics.zip \
-    && unzip attachment_ep_statistics.zip \
-    && rm attachment_ep_statistics.zip \
-    && mv attachment_ep_statistics /sgl-workspace/eps
+RUN wget -O DeepSeek-R1_prefill_ep16_3500_1500.json https://github.com/user-attachments/files/20903459/DeepSeek-R1_prefill_ep16_3500_1500.json
+RUN wget -O DeepSeek-R1_decode_ep32_3500_1500.json https://github.com/user-attachments/files/20903460/DeepSeek-R1_decode_ep32_3500_1500.json
 
-# FlashMLA 安装
+# flash MLA
 WORKDIR /sgl-workspace
-RUN git clone https://github.com/deepseek-ai/FlashMLA.git
+RUN git clone --branch support_fp8  https://github.com/bytedance-iaas/FlashMLA.git
 WORKDIR /sgl-workspace/FlashMLA
-RUN python3 setup.py install
+RUN pip install . --break-system-packages
 
 # sglang 安装
 RUN http_proxy='' pip index versions sglang -i https://scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com/simple/
