@@ -1324,12 +1324,29 @@ class ModelRunner:
             forward_batch,
             **kwargs,
         )
+    
+    def forward_split_prefill(
+        self,
+        forward_batch: ForwardBatch,
+        reinit_attn_backend: bool = False,
+    ) -> LogitsProcessorOutput:
+        if forward_batch.split_index == 0 or reinit_attn_backend:
+            self.attn_backend.init_forward_metadata(forward_batch)
+        ret = self.model.forward_split_prefill(
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            (forward_batch.split_index, forward_batch.split_index + 1),
+        )
+        forward_batch.split_index = forward_batch.split_index + 1
+        return ret
 
     def forward(
         self,
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        reinit_attn_backend: bool = False
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         self.forward_pass_id += 1
 
@@ -1338,7 +1355,7 @@ class ModelRunner:
             forward_batch,
         ):
             output = self._forward_raw(
-                forward_batch, skip_attn_backend_init, pp_proxy_tensors
+                forward_batch, skip_attn_backend_init, pp_proxy_tensors, reinit_attn_backend
             )
 
         if self.eplb_manager is not None:
@@ -1351,6 +1368,7 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool,
         pp_proxy_tensors: Optional[PPProxyTensors],
+        reinit_attn_backend: bool = False
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         can_run_cuda_graph = bool(
             forward_batch.forward_mode.is_cuda_graph()
@@ -1370,6 +1388,11 @@ class ModelRunner:
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
+            )
+        elif forward_batch.forward_mode.is_split_prefill():
+            ret = self.forward_split_prefill(
+                forward_batch,
+                reinit_attn_backend=reinit_attn_backend,
             )
         elif forward_batch.forward_mode.is_idle():
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
