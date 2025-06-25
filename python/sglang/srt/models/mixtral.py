@@ -49,6 +49,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 
 import time
+import os
 
 
 class MixtralMoE(EPMoETimer, nn.Module):
@@ -358,6 +359,7 @@ class MixtralModel(nn.Module):
         
         # ----------------
         ## [moe-scaling] must set OP_TIMING_RUN_ID in env for timing EPMoE layer
+        import os  
         if os.environ.get("OP_TIMING_RUN_ID", None) is not None:
             if get_tensor_model_parallel_rank() == 0:
                 for i in range(len(self.layers)):
@@ -379,7 +381,7 @@ class MixtralModel(nn.Module):
                     self.model_timings.append(info)
                 
                 import json
-                import os   
+ 
                 tp_size = get_tensor_model_parallel_world_size()
                 batch_size = forward_batch.batch_size
                 run_id = os.environ.get("OP_TIMING_RUN_ID", "default") + "_tp" + str(tp_size) + "_bs" + str(batch_size)

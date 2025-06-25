@@ -75,6 +75,12 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 
+from sglang.srt.distributed import (
+    get_tp_group,
+    update_tp_group,
+    get_world_group,
+)
+
 
 @dataclasses.dataclass
 class BenchArgs:
@@ -408,6 +414,22 @@ def latency_test_run_once(
             rank_print(
                 f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
+            
+            
+        # Update the group coordinator _tp in the middle of the loop
+        if i % 10 == 5:
+            new_tp_group_ranks=[[0,1,2,3]]
+            
+            print(f"Updating tp group ranks to {new_tp_group_ranks} at step {i}")
+            
+            update_tp_group(
+                new_tp_group_ranks,
+                get_tp_group().local_rank,
+                torch.distributed.get_backend(get_world_group().device_group),          
+            )
+
+            
+            
 
     if profile:
         profiler.stop()

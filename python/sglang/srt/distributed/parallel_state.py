@@ -955,6 +955,7 @@ def init_model_parallel_group(
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
+
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -963,6 +964,27 @@ def init_model_parallel_group(
         use_custom_allreduce=use_custom_allreduce,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
+        use_message_queue_broadcaster=use_message_queue_broadcaster,
+        group_name=group_name,
+    )
+    
+def update_tp_group(
+    group_ranks: List[List[int]],
+    local_rank: int,
+    backend: str,
+    use_custom_allreduce: Optional[bool] = None,
+    use_message_queue_broadcaster: bool = False,
+    group_name: Optional[str] = None,
+):
+
+    global _TP
+    if _TP is not None:
+        _TP.destroy()
+    _TP = init_model_parallel_group(
+        group_ranks=group_ranks,
+        local_rank=local_rank,
+        backend=backend,
+        use_custom_allreduce=use_custom_allreduce,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
     )
@@ -1128,6 +1150,9 @@ def initialize_model_parallel(
         group_ranks.append(ranks)
 
     # message queue broadcaster is only used in tensor model parallel group
+    print(
+        f"Initializing TP parallel group with ranks: {group_ranks}, "
+    )
     _TP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
@@ -1145,6 +1170,9 @@ def initialize_model_parallel(
         ranks = list(range(i, world_size, num_pipeline_model_parallel_groups))
         group_ranks.append(ranks)
     # pipeline parallel does not need custom allreduce
+    print(
+        f"Initializing PP group with ranks: {group_ranks}, "
+    )
     _PP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
