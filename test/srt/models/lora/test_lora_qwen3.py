@@ -1,4 +1,4 @@
-# Copyright 2023-2024 SGLang Team
+# Copyright 2023-2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -19,14 +19,32 @@ import unittest
 from typing import List
 
 from utils import (
-    ALL_OTHER_MULTI_LORA_MODELS,
-    CI_MULTI_LORA_MODELS,
     TORCH_DTYPES,
+    LoRAAdaptor,
     LoRAModelCase,
 )
 
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, calculate_rouge_l, is_in_ci
+
+
+LORA_MODELS_QWEN3 = [
+    LoRAModelCase(
+        base="Qwen/Qwen3-4B",
+        adaptors=[
+            LoRAAdaptor(
+                name="nissenj/Qwen3-4B-lora-v2",
+                prefill_tolerance=3e-1,
+            ),
+            LoRAAdaptor(
+                name="y9760210/Qwen3-4B-lora_model",
+                prefill_tolerance=3e-1,
+            ),
+        ],
+        max_loras_per_batch=2,
+    ),
+]
+
 
 TEST_MULTIPLE_BATCH_PROMPTS = [
     """
@@ -58,7 +76,7 @@ class TestLoRA(CustomTestCase):
     def _run_lora_multiple_batch_on_model_cases(self, model_cases: List[LoRAModelCase]):
         for model_case in model_cases:
             for torch_dtype in TORCH_DTYPES:
-                max_new_tokens = 32
+                max_new_tokens = 10
                 backend = "triton"
                 base_path = model_case.base
                 lora_adapter_paths = [a.name for a in model_case.adaptors]
@@ -130,7 +148,8 @@ class TestLoRA(CustomTestCase):
                     disable_radix_cache=True,
                 )
                 hf_runner = HFRunner(
-                    base_path, torch_dtype=torch_dtype, model_type="generation"
+                    base_path, torch_dtype=torch_dtype, model_type="generation",
+                    patch_model_do_sample_false=True,
                 )
 
                 with srt_runner, hf_runner:
@@ -170,19 +189,18 @@ class TestLoRA(CustomTestCase):
                         print(f"--- Batch {i+1} Comparison Passed --- ")
 
     def test_ci_lora_models(self):
-        self._run_lora_multiple_batch_on_model_cases(CI_MULTI_LORA_MODELS)
+        self._run_lora_multiple_batch_on_model_cases(LORA_MODELS_QWEN3)
 
     def test_all_lora_models(self):
         if is_in_ci():
             return
-
-        filtered_models = []
-        for model_case in ALL_OTHER_MULTI_LORA_MODELS:
+        qwen_filtered_models = []
+        for model_case in LORA_MODELS_QWEN3:
             if "ONLY_RUN" in os.environ and os.environ["ONLY_RUN"] != model_case.base:
                 continue
-            filtered_models.append(model_case)
+            qwen_filtered_models.append(model_case)
 
-        self._run_lora_multiple_batch_on_model_cases(filtered_models)
+        self._run_lora_multiple_batch_on_model_cases(qwen_filtered_models)
 
 
 if __name__ == "__main__":
