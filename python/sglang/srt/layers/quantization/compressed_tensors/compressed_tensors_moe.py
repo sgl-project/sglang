@@ -17,12 +17,16 @@ from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnu
 from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
+    cpu_has_amx_support,
     per_tensor_dequantize,
     replace_parameter,
 )
-from sglang.srt.utils import is_cuda, set_weight_attrs
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 

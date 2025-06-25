@@ -324,18 +324,11 @@ void scaled_fp4_experts_quant(
 
 namespace marlin_moe_wna16 {
 
-torch::Tensor gptq_marlin_repack(
-    torch::Tensor& b_q_weight, 
-    torch::Tensor& perm, 
-    int64_t size_k, 
-    int64_t size_n, 
-    int64_t num_bits);
+torch::Tensor
+gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm, int64_t size_k, int64_t size_n, int64_t num_bits);
 
-torch::Tensor awq_marlin_repack(
-    torch::Tensor& b_q_weight, 
-    int64_t size_k,
-    int64_t size_n, int64_t num_bits);
-    
+torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64_t size_n, int64_t num_bits);
+
 }  // namespace marlin_moe_wna16
 
 /*
@@ -389,6 +382,89 @@ void segment_packbits(
     at::Tensor y,
     int64_t batch_size,
     int64_t cuda_stream = 0);
+
+/*
+ * From csrc/kvcacheio
+ */
+void transfer_kv_per_layer(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_per_layer_direct(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t page_size);
+
+void transfer_kv_all_layer(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t src_layer_offset,
+    int64_t dst_layer_offset,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_all_layer_direct(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t page_size,
+    int64_t num_layers);
+
+void transfer_kv_per_layer_mla(
+    const at::Tensor src,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_per_layer_mla_direct(
+    const at::Tensor src,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t page_size);
+
+void transfer_kv_all_layer_mla(
+    const at::Tensor src,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t src_layer_offset,
+    int64_t dst_layer_offset,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_all_layer_mla_direct(
+    const at::Tensor src,
+    at::Tensor dst,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t page_size,
+    int64_t num_layers);
 
 /*
  * From FlashInfer
