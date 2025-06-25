@@ -97,7 +97,7 @@ class QuarkInt4Fp8Config(QuantizationConfig):
 
     @classmethod
     def get_name(self) -> str:
-        return "w4a8_int4fp8"
+        return "int4fp8_moe"
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
