@@ -330,6 +330,12 @@ class FusedMoE(torch.nn.Module):
         self.tp_rank = get_tensor_model_parallel_rank()
         self.num_experts = num_experts
         self.expert_map = None
+
+        if enable_flashinfer_moe and quant_config is None:
+            logger.warning("Disable flashinfer MoE when quantization config is None.")
+            enable_flashinfer_moe = False
+            enable_ep_moe = False
+
         self.enable_flashinfer_moe = enable_flashinfer_moe
         if enable_ep_moe:
             assert (
