@@ -541,7 +541,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
     def test_dynamic_adapter_updates(self):
         for case_idx, test_case in enumerate(TEST_CASES, start=1):
             for mode in [
-                # LoRAUpdateTestSessionMode.SERVER,
+                LoRAUpdateTestSessionMode.SERVER,
                 LoRAUpdateTestSessionMode.ENGINE,
             ]:
                 print("=" * 100)
