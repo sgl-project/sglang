@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
+import time
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -488,7 +489,13 @@ class LlamaForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         split_interval: Tuple[int, int], # [start, end) 0-based
         input_embeds: torch.Tensor = None,
+        measure_speed: bool = True,
     ) -> Optional[LogitsProcessorOutput]:
+        
+        if measure_speed:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
         # embed
         start, end = split_interval
         if start == 0:
@@ -506,16 +513,24 @@ class LlamaForCausalLM(nn.Module):
                 forward_batch.residual,
             )
         
-        if end == self.model.end_layer:
+        if end == self.model.config.num_hidden_layers:
             # norm
             hidden_states, _ = self.model.norm(forward_batch.hidden_states, forward_batch.residual)
             forward_batch.hidden_states = hidden_states
             # logits process
-            return self.logits_processor(
+            result = self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
+            )                
         else:
-            return None
+            result = None
+        
+        if measure_speed:
+            end_event.record()
+            torch.cuda.synchronize()
+            layer_time = start_event.elapsed_time(end_event)  # Returns time in milliseconds
+            print(f"split_prefill layer [{start}, {end}) time: {layer_time:.2f} ms")
+
+        return result
 
     @property
     def start_layer(self):
