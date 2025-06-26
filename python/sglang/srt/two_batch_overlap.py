@@ -83,8 +83,21 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
     return best_index
 
 
+def _compute_mask_offset(seq_index: int, spec_info: Optional[EagleVerifyInput]) -> int:
+    if seq_index == 0:
+        return 0
+
+    offset = 0
+    max_seq_len = min(seq_index, spec_info.seq_lens_cpu.shape[0])
+    for i in range(max_seq_len):
+        offset += (
+            spec_info.seq_lens_cpu[i] + spec_info.draft_token_num
+        ) * spec_info.draft_token_num
+    return offset
+
+
 def split_spec_info(
-    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    spec_info: Optional[EagleVerifyInput],
     start_seq_index: int,
     end_seq_index: int,
     start_token_index: int,
@@ -97,42 +110,16 @@ def split_spec_info(
     else:
         draft_token = None
     if spec_info.custom_mask is not None and spec_info.draft_token is not None:
-        if start_seq_index == 0:
-            custom_mask_start = 0
-        else:
-            custom_mask_start = 0
-            for i in range(min(start_seq_index, spec_info.seq_lens_cpu.shape[0])):
-                custom_mask_start += (
-                    spec_info.seq_lens_cpu[i] + spec_info.draft_token_num
-                ) * spec_info.draft_token_num
-        if end_seq_index == 0:
-            custom_mask_end = 0
-        elif end_seq_index == spec_info.seq_lens_cpu.shape[0]:
+        custom_mask_start = _compute_mask_offset(start_seq_index, spec_info)
+        if end_seq_index == spec_info.seq_lens_cpu.shape[0]:
             custom_mask_end = spec_info.custom_mask.shape[0]
         else:
-            custom_mask_end = 0
-            for i in range(min(end_seq_index, spec_info.seq_lens_cpu.shape[0])):
-                custom_mask_end += (
-                    spec_info.seq_lens_cpu[i] + spec_info.draft_token_num
-                ) * spec_info.draft_token_num
+            custom_mask_end = _compute_mask_offset(end_seq_index, spec_info)
 
-        logger.info(
-            f"seq_lens_cpu={spec_info.seq_lens_cpu}, start_seq_index={start_seq_index}, end_seq_index={end_seq_index}, custom_mask_start={custom_mask_start}, custom_mask_end={custom_mask_end}, spec_info.custom_mask_shape={spec_info.custom_mask.shape}"
-        )
         if custom_mask_end > custom_mask_start:
             custom_mask = spec_info.custom_mask[custom_mask_start:custom_mask_end]
         else:
             custom_mask = spec_info.custom_mask
-
-        # custom_mask = torch.full(
-        #     (spec_info.custom_mask.shape[0],),
-        #     True,
-        #     device=spec_info.custom_mask.device,
-        # )
-        # if custom_mask_end > custom_mask_start:
-        #     custom_mask[: (custom_mask_end - custom_mask_start)].copy_(
-        #         spec_info.custom_mask[custom_mask_start:custom_mask_end]
-        #     )
     else:
         custom_mask = spec_info.custom_mask
     if spec_info.positions is not None:
@@ -163,9 +150,9 @@ def split_spec_info(
     else:
         seq_lens_cpu = None
     if seq_lens_cpu is not None:
-        seq_lens_sum = sum(seq_lens_cpu)
+        seq_lens_sum = seq_lens_cpu.sum()
     else:
-        seq_lens_sum = 0
+        seq_lens_sum = None
     output_spec_info = replace(
         spec_info,
         custom_mask=custom_mask,
@@ -192,8 +179,6 @@ def compute_split_token_index(
         return sum(extend_seq_lens[:split_seq_index])
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
-        if token_num_per_seq == 0:
-            return 0
         return split_seq_index * token_num_per_seq
     elif forward_mode.is_idle():
         assert split_seq_index == 0
