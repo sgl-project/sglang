@@ -7,7 +7,7 @@ from transformers import AutoModel, Gemma3nTextConfig, PretrainedConfig, PreTrai
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
-from sglang.srt.layers.layernorm import Gemma3RMSNorm
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -34,30 +34,28 @@ def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
 
-class Gemma3nRMSNorm(Gemma3RMSNorm):
+class Gemma3nRMSNorm(RMSNorm):
     def __init__(
         self,
         dim: int,
         eps: float = 1e-6,
         with_scale: bool = True,
-    ):
+    ) -> None:
         super().__init__(dim, eps=eps)
-        del self.weight
-        self.with_scale = with_scale
-
-        if self.with_scale:
-            self.weight = nn.Parameter(torch.ones(dim))
-        else:
-            self.register_buffer("weight", torch.tensor(1.0), persistent=False)
-
-    def _norm(self, x):
-        return x / torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        if not with_scale:
+            del self.weight
+            self.register_buffer(
+                "weight",
+                torch.ones(dim, dtype=torch.get_default_dtype()),
+                persistent=False,
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Llama does x.to(float16) * w whilst Gemma3n is (x * w).to(float16)
-        # See https://github.com/huggingface/transformers/pull/29402
-        output = self._norm(x.float()) * self.weight.float()
-        return output.type_as(x)
+        original_shape = x.shape
+        x_2d = x.contiguous().reshape(-1, original_shape[-1])
+        x_2d = super().forward(x_2d)
+        x = x_2d.reshape(original_shape)
+        return x
 
 
 class Gemma3nTextScaledWordEmbedding(Gemma3TextScaledWordEmbedding):
