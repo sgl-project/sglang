@@ -162,9 +162,12 @@ def cutlass_moe_fp8(
     device = a.device
     a_q = moe_ws.a_q_fp8[0:m, :]
 
-    a1_scale = moe_ws.a1_scale
-    a2_scale = moe_ws.a2_scale
-
+    # a1_scale = moe_ws.a1_scale
+    # a2_scale = moe_ws.a2_scale
+    # can not reuse scale for maxReduce will load a1_scale
+    a1_scale = torch.empty(1, dtype = torch.float32, device = "cuda")
+    a2_scale =  torch.empty(1, dtype = torch.float32, device = "cuda")
+    
     expert_offsets = moe_ws.expert_offsets
     problem_sizes1 = moe_ws.problem_sizes[0]
     problem_sizes2 = moe_ws.problem_sizes[1]
@@ -182,7 +185,7 @@ def cutlass_moe_fp8(
     #                             problem_sizes2, a_map, c_map, num_experts, n,
     #                             k)
 
-    sgl_per_tensor_quant_fp8(a, a_q, a1_scale, True)
+    sgl_per_tensor_quant_fp8(a, a_q, a1_scale, False)
     get_cutlass_moe_mm_data(
         local_topk_ids,
         expert_offsets,
@@ -213,7 +216,7 @@ def cutlass_moe_fp8(
 
     silu_and_mul(c1, intermediate)
 
-    sgl_per_tensor_quant_fp8(intermediate, intemediate_q, a2_scale, True)
+    sgl_per_tensor_quant_fp8(intermediate, intemediate_q, a2_scale, False)
 
     cutlass_moe_mm(
         c2,
