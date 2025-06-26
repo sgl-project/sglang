@@ -331,9 +331,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
                 layer.input_scale = None
-            elif layer.weight.device.type == "cpu":
+            elif _is_cpu:
                 assert (
-                    cpu_has_amx_support()
+                    _is_cpu_amx_available
                 ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
                 _process_weight_after_loading(layer, ["weight"])
                 return
@@ -765,9 +765,9 @@ class Fp8MoEMethod:
                     layer.w2_weight.contiguous(), (16, 16)
                 )
 
-            if all(w.device.type == "cpu" for w in [layer.w13_weight, layer.w2_weight]):
+            if _is_cpu:
                 assert (
-                    cpu_has_amx_support()
+                    _is_cpu_amx_available
                 ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
                 _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 

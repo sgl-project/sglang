@@ -14,11 +14,14 @@ from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.utils import (
     _process_weight_after_loading,
     cpu_has_amx_support,
+    is_cpu,
     is_cuda,
     set_weight_attrs,
 )
 
 _is_cuda = is_cuda()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 
@@ -77,9 +80,9 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if layer.weight.device == torch.device("cpu"):
+        if _is_cpu:
             assert (
-                cpu_has_amx_support()
+                _is_cpu_amx_available
             ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
             _process_weight_after_loading(layer, ["weight"])
             return
@@ -228,9 +231,9 @@ class W8A8Int8MoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if all(w.device.type == "cpu" for w in [layer.w13_weight, layer.w2_weight]):
+        if _is_cpu:
             assert (
-                cpu_has_amx_support()
+                _is_cpu_amx_available
             ), "W8A8Int8MoEMethod on CPU requires that CPU has AMX support"
             _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             return
