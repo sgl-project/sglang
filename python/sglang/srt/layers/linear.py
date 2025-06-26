@@ -227,7 +227,7 @@ class LinearBase(torch.nn.Module):
         self.skip_bias_add = skip_bias_add
         # Fix to PR#5619, to create fused weight/input scalars with correct size
         self.fused_parameters = fused_parameters
-        # Fix to PR#5619, to apply fused scalars to each shards
+        # Fix to PR#5619, to apply fused scalars to each shard
         self.fused_rank = fused_rank
         self.fused_shapes = fused_shapes
         if params_dtype is None:
