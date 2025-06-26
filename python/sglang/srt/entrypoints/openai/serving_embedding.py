@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, Union
 
 from fastapi import Request
+from fastapi.responses import ORJSONResponse
 
 from sglang.srt.conversation import generate_embedding_convs
 from sglang.srt.entrypoints.openai.protocol import (
@@ -13,10 +14,20 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.managers.io_struct import EmbeddingReqInput
+from sglang.srt.managers.template_manager import TemplateManager
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 
 class OpenAIServingEmbedding(OpenAIServingBase):
-    """Handler for embedding requests"""
+    """Handler for v1/embeddings requests"""
+
+    def __init__(
+        self,
+        tokenizer_manager: TokenizerManager,
+        template_manager: TemplateManager,
+    ):
+        super().__init__(tokenizer_manager)
+        self.template_manager = template_manager
 
     def _request_id_prefix(self) -> str:
         return "embd-"
@@ -54,34 +65,20 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                         return f"All items in input list must be integers"
                     if item < 0:
                         return f"Token ID at index {i} must be non-negative"
-            elif isinstance(first_item, list):
-                # List of lists (multiple token sequences)
-                for i, item in enumerate(input):
-                    if not isinstance(item, list):
-                        return f"Input at index {i} must be a list"
-                    if not item:
-                        return f"Input at index {i} cannot be empty"
-                    if not all(isinstance(token, int) for token in item):
-                        return f"Input at index {i} must contain only integers"
-                    if any(token < 0 for token in item):
-                        return f"Input at index {i} contains negative token IDs"
-            # Note: MultimodalEmbeddingInput validation would be handled by Pydantic
-
         return None
 
     def _convert_to_internal_request(
         self,
         request: EmbeddingRequest,
-        request_id: str,
-    ) -> tuple[EmbeddingReqInput, Union[EmbeddingRequest, List[EmbeddingRequest]]]:
+    ) -> tuple[EmbeddingReqInput, EmbeddingRequest]:
         """Convert OpenAI embedding request to internal format"""
         prompt = request.input
+
         if isinstance(prompt, str):
             # Single string input
             prompt_kwargs = {"text": prompt}
         elif isinstance(prompt, list):
             if len(prompt) > 0 and isinstance(prompt[0], str):
-                # List of strings
                 prompt_kwargs = {"text": prompt}
             elif len(prompt) > 0 and isinstance(prompt[0], MultimodalEmbeddingInput):
                 # Handle multimodal embedding inputs
@@ -94,12 +91,10 @@ class OpenAIServingEmbedding(OpenAIServingBase):
 
                 generate_prompts = []
                 # Check if we have a chat template for multimodal embeddings
-                # This would need to be passed in from the server configuration
-                chat_template_name = getattr(
-                    self.tokenizer_manager, "chat_template_name", None
-                )
-                if chat_template_name is not None:
-                    convs = generate_embedding_convs(texts, images, chat_template_name)
+                if self.template_manager.chat_template_name is not None:
+                    convs = generate_embedding_convs(
+                        texts, images, self.template_manager.chat_template_name
+                    )
                     for conv in convs:
                         generate_prompts.append(conv.get_prompt())
                 else:
@@ -121,8 +116,10 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         else:
             # Other types (should not happen but handle gracefully)
             prompt_kwargs = {"input_ids": prompt}
+
         adapted_request = EmbeddingReqInput(
             **prompt_kwargs,
+            rid=request.rid,
         )
 
         return adapted_request, request
@@ -132,7 +129,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         adapted_request: EmbeddingReqInput,
         request: EmbeddingRequest,
         raw_request: Request,
-    ) -> Union[EmbeddingResponse, ErrorResponse]:
+    ) -> Union[EmbeddingResponse, ErrorResponse, ORJSONResponse]:
         """Handle the embedding request"""
         try:
             ret = await self.tokenizer_manager.generate_request(

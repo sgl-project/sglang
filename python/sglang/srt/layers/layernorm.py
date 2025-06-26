@@ -52,6 +52,9 @@ elif _is_hip:
 
 logger = logging.getLogger(__name__)
 
+if is_npu():
+    import torch_npu
+
 
 class RMSNorm(CustomOp):
     def __init__(
@@ -75,6 +78,18 @@ class RMSNorm(CustomOp):
             return x, residual
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         return out
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None:
+            out, _, residual_out = torch_npu.npu_add_rms_norm(
+                residual, x, self.weight.data, self.variance_epsilon
+            )
+            return out, residual_out
+        return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
 
     def forward_aiter(
         self,

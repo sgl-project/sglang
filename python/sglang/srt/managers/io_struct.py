@@ -319,8 +319,16 @@ class GenerateReqInput:
         """Normalize request IDs for batch processing."""
         if self.rid is None:
             self.rid = [uuid.uuid4().hex for _ in range(num)]
-        elif not isinstance(self.rid, list):
-            raise ValueError("The rid should be a list for batch processing.")
+        elif isinstance(self.rid, str):
+            new_rids = [f"{self.rid}_{i}" for i in range(num)]
+            self.rid = new_rids
+        elif isinstance(self.rid, list):
+            if len(self.rid) != num:
+                raise ValueError(
+                    "The specified rids length mismatch with the batch_size for batch processing."
+                )
+        else:
+            raise ValueError("The rid should be a string or a list of strings.")
 
     def _normalize_logprob_params(self, num):
         """Normalize logprob-related parameters for batch processing."""
@@ -530,6 +538,7 @@ class EmbeddingReqInput:
         if self.text is not None:
             if isinstance(self.text, list):
                 self.batch_size += len(self.text)
+                self.is_single = False
             else:
                 self.batch_size += 1
 
@@ -537,11 +546,9 @@ class EmbeddingReqInput:
         if self.input_ids is not None:
             if isinstance(self.input_ids[0], list):
                 self.batch_size += len(self.input_ids)
+                self.is_single = False
             else:
                 self.batch_size += 1
-
-        if self.batch_size > 1:
-            self.is_single = False
 
         # Fill in default arguments
         if self.is_single:
@@ -863,12 +870,6 @@ class GetInternalStateReqOutput:
 @dataclass
 class SetInternalStateReq:
     server_args: Dict[str, Any]
-
-
-@dataclass
-class V1RerankReqInput:
-    query: str
-    documents: List[str]
 
 
 @dataclass

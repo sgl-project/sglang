@@ -54,9 +54,10 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.multimodal import gpu_tensor_hash
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.metrics.collector import TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -85,6 +86,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_deepep_moe",
     "deepep_mode",
     "enable_ep_moe",
+    "enable_flashinfer_moe",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
     "deepep_config",
@@ -99,6 +101,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "torchao_config",
     "triton_attention_reduce_in_fp32",
     "num_reserved_decode_tokens",
+    "weight_loader_disable_mmap",
 ]
 
 # Put some global args for easy access
@@ -211,6 +214,10 @@ class MultimodalDataItem:
     audio_feature_lens: Optional[List[torch.Tensor]] = None
     audio_offsets: Optional[List[Tuple[int, int]]] = None
 
+    # gemma3n related
+    input_features: Optional[torch.Tensor] = None
+    input_features_mask: Optional[torch.Tensor] = None
+
     precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     @staticmethod
@@ -274,7 +281,10 @@ class MultimodalDataItem:
         if self.precomputed_features is not None:
             self.hash = hash_feature(self.precomputed_features)
         elif self.is_audio():
-            self.hash = hash_feature(self.audio_features)
+            if self.audio_features is not None:
+                self.hash = hash_feature(self.audio_features)
+            elif self.input_features is not None:
+                self.hash = hash_feature(self.input_features)
         else:
             self.hash = hash_feature(self.pixel_values)
 
@@ -285,6 +295,7 @@ class MultimodalDataItem:
         return (self.modality == Modality.AUDIO) and (
             self.precomputed_features is not None
             or not MultimodalDataItem.is_empty_list(self.audio_features)
+            or not MultimodalDataItem.is_empty_list(self.input_features)
         )
 
     def is_image(self):
@@ -786,6 +797,7 @@ class Req:
         self.multimodal_inputs = None
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
+        self.return_logprob = False
         self.finished_reason = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
@@ -810,7 +822,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Request, memory pool, and cache
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool = None
-    token_to_kv_pool_allocator: TokenToKVPoolAllocator = None
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
 
     # Batch configs
@@ -907,7 +919,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         cls,
         reqs: List[Req],
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
@@ -1359,7 +1371,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return len(self.reqs)
         # In the decoding phase, the length of a request's KV cache should be
         # the total length of the request minus 1
-        return sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
+        return (
+            sum(1 for req in self.reqs if req.seqlen % page_size == 0)
+            if self.enable_overlap
+            else sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
+        )
 
     def check_decode_mem(self, buf_multiplier=1):
         tokens_required = (

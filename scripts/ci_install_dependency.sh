@@ -23,7 +23,7 @@ pip install -e "python[dev]"
 pip list
 
 # Install additional dependencies
-pip install mooncake-transfer-engine==0.3.4 nvidia-cuda-nvrtc-cu12
+pip install mooncake-transfer-engine==0.3.4.post2 nvidia-cuda-nvrtc-cu12
 
 # For lmms_evals evaluating MMMU
 git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
@@ -37,6 +37,9 @@ pip install huggingface_hub[hf_xet]
 
 # Install xformers
 pip install -U xformers --index-url https://download.pytorch.org/whl/cu126 --no-deps --force-reinstall
+
+# To help dumping traces when timeout occurred
+pip install py-spy
 
 # Show current packages
 pip list

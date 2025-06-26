@@ -42,12 +42,16 @@ struct Router {
     selector: HashMap<String, String>,
     service_discovery_port: u16,
     service_discovery_namespace: Option<String>,
+    // PD service discovery fields
+    prefill_selector: HashMap<String, String>,
+    decode_selector: HashMap<String, String>,
+    bootstrap_port_annotation: String,
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
     request_timeout_secs: u64,
     // PD mode flag
-    pd_disaggregated: bool,
-    // PD-specific fields (only used when pd_disaggregated is true)
+    pd_disaggregation: bool,
+    // PD-specific fields (only used when pd_disaggregation is true)
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
 }
@@ -74,10 +78,13 @@ impl Router {
         selector = HashMap::new(),
         service_discovery_port = 80,
         service_discovery_namespace = None,
+        prefill_selector = HashMap::new(),
+        decode_selector = HashMap::new(),
+        bootstrap_port_annotation = String::from("sglang.ai/bootstrap-port"),
         prometheus_port = None,
         prometheus_host = None,
         request_timeout_secs = 600,  // Add configurable request timeout
-        pd_disaggregated = false,  // New flag for PD mode
+        pd_disaggregation = false,  // New flag for PD mode
         prefill_urls = None,
         decode_urls = None
     ))]
@@ -100,10 +107,13 @@ impl Router {
         selector: HashMap<String, String>,
         service_discovery_port: u16,
         service_discovery_namespace: Option<String>,
+        prefill_selector: HashMap<String, String>,
+        decode_selector: HashMap<String, String>,
+        bootstrap_port_annotation: String,
         prometheus_port: Option<u16>,
         prometheus_host: Option<String>,
         request_timeout_secs: u64,
-        pd_disaggregated: bool,
+        pd_disaggregation: bool,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
     ) -> PyResult<Self> {
@@ -126,17 +136,20 @@ impl Router {
             selector,
             service_discovery_port,
             service_discovery_namespace,
+            prefill_selector,
+            decode_selector,
+            bootstrap_port_annotation,
             prometheus_port,
             prometheus_host,
             request_timeout_secs,
-            pd_disaggregated,
+            pd_disaggregation,
             prefill_urls,
             decode_urls,
         })
     }
 
     fn start(&self) -> PyResult<()> {
-        let policy_config = if self.pd_disaggregated {
+        let policy_config = if self.pd_disaggregation {
             // PD mode - map PolicyType to PDSelectionPolicy
             let pd_selection_policy = match &self.policy {
                 PolicyType::Random => pd_types::PDSelectionPolicy::Random,
@@ -207,6 +220,11 @@ impl Router {
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
+                // PD mode configuration
+                pd_mode: self.pd_disaggregation,
+                prefill_selector: self.prefill_selector.clone(),
+                decode_selector: self.decode_selector.clone(),
+                bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
             })
         } else {
             None

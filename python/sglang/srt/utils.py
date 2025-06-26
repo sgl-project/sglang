@@ -1917,18 +1917,14 @@ def configure_ipv6(dist_init_addr):
     return port, host
 
 
-def rank0_log(msg: str):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-    if get_tensor_model_parallel_rank() == 0:
-        logger.info(msg)
-
-
 def rank0_print(msg: str):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     if get_tensor_model_parallel_rank() == 0:
         print(msg, flush=True)
+
+
+rank0_log = rank0_print
 
 
 def get_cuda_version():
@@ -2303,6 +2299,51 @@ class Withable(Generic[T]):
             self._value = None
 
 
+def require_mlp_tp_gather(server_args):
+    """
+    Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
+    """
+    if server_args.enable_dp_attention:
+        assert server_args.dp_size > 1, "dp_size must be greater than 1"
+        if (
+            server_args.moe_dense_tp_size is None
+        ):  # TODO(ch-wan): some MoE models do not have dense layers
+            return True
+        elif not server_args.enable_dp_lm_head:
+            return True
+        elif not server_args.enable_deepep_moe:
+            return True
+        else:
+            return (
+                server_args.moe_dense_tp_size
+                > server_args.tp_size // server_args.dp_size
+            )
+    else:
+        return False
+
+
+def require_attn_tp_gather(server_args):
+    """
+    Check if the input of attention is scattered.
+    """
+    assert server_args.moe_dense_tp_size in [1, None]
+    if server_args.enable_deepep_moe or server_args.moe_dense_tp_size == 1:
+        if server_args.enable_dp_attention:
+            return server_args.dp_size < server_args.tp_size
+        else:
+            return True
+    else:
+        return False
+
+
+def require_gathered_buffer(server_args):
+    return require_mlp_tp_gather(server_args) or require_attn_tp_gather(server_args)
+
+
+def require_mlp_sync(server_args):
+    return server_args.enable_dp_attention or require_gathered_buffer(server_args)
+
+
 def merge_bias_tensor(
     lhs: Optional[torch.Tensor],
     rhs: Optional[torch.Tensor],
@@ -2416,6 +2457,77 @@ def cpu_has_amx_support():
     return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
 
 
+def prepack_weight_if_needed(weight):
+    if weight.device != torch.device("cpu"):
+        return weight
+    if not cpu_has_amx_support():
+        return weight
+
+    return torch.ops.sgl_kernel.convert_weight_packed(weight)
+
+
+# TODO: currently gemm kernel has the below requirements:
+# OC % TILE_N == 0, where TILE_N = 16
+# IC % TILE_K == 0, where TILE_K = 32
+def dim_is_supported(weight):
+    return weight.size(0) % 16 == 0 and weight.size(1) % 32 == 0
+
+
+def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
+    # Pack weight for get better performance on CPU
+    devices = {getattr(module, weight_name).device for weight_name in weight_names}
+    assert len(devices) == 1, f"Expects all weights to be on the same device"
+    device = devices.pop()
+
+    if transpose_dims:
+        assert len(weight_names) == len(
+            transpose_dims
+        ), "len(weight_names) should be equal to len(transpose_dims)"
+
+    for i, weight_name in enumerate(weight_names):
+        weight_tensor = getattr(module, weight_name)
+
+        # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
+        if not dim_is_supported(weight_tensor):
+            logger.warning(
+                f"Expects weight.size(0) % 16 == 0 and weight.size(1) % 32 == 0 "
+                f"but {weight_tensor.size(0)=} and {weight_tensor.size(1)=} in {module}. "
+                f"{module} won't use intel amx backend."
+            )
+            module.use_intel_amx_backend = False
+            return
+
+        if transpose_dims and transpose_dims[i]:
+            weight_tensor = weight_tensor.transpose(*transpose_dims[i])
+
+        packed_weight = torch.nn.Parameter(
+            prepack_weight_if_needed(weight_tensor),
+            requires_grad=False,
+        )
+        packed_weight.__dict__ = weight_tensor.__dict__
+        setattr(module, weight_name, packed_weight)
+
+    module.use_intel_amx_backend = (
+        device == torch.device("cpu") and cpu_has_amx_support()
+    )
+
+    if (
+        module.use_intel_amx_backend
+        and hasattr(module, "bias")
+        and module.bias is not None
+    ):
+        module.bias = torch.nn.Parameter(module.bias.data.float(), requires_grad=False)
+
+
+class PackWeightMethod:
+    def __init__(self, weight_names, transpose_dims=None):
+        self.weight_names = weight_names
+        self.transpose_dims = transpose_dims
+
+    def process_weights_after_loading(self, module) -> None:
+        _process_weight_after_loading(module, self.weight_names, self.transpose_dims)
+
+
 class LazyValue:
     def __init__(self, creator: Callable):
         self._creator = creator
@@ -2440,3 +2552,28 @@ def dynamic_import(func_path: str):
     module = importlib.import_module(module_path)
     func = getattr(module, func_name)
     return func
+
+
+def configure_gc_logger():
+    logger.info("Enable GC Logger")
+
+    import gc
+
+    gc_start_time = {}
+
+    def gc_callback(phase, info):
+        gen = info.get("generation", "?")
+        if phase == "start":
+            gc_start_time[gen] = time.time()
+            logger.info(f"GC start: Time {time.time()} | Generation {gen}")
+        elif phase == "stop":
+            duration = time.time() - gc_start_time.get(gen, time.time())
+            collected = info.get("collected", "?")
+            uncollectable = info.get("uncollectable", "?")
+            logger.info(
+                f"GC end: Time {time.time()} | Generation {gen} | "
+                f"Duration: {duration:.4f}s | Collected: {collected} | Uncollectable: {uncollectable} "
+                f'{"(LONG GC)" if duration > 0.1 else ""}'
+            )
+
+    gc.callbacks.append(gc_callback)

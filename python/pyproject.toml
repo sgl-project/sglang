@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.4.7.post1"
+version = "0.4.8.post1"
 description = "SGLang is yet another fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -29,6 +29,7 @@ runtime_common = [
     "msgspec",
     "ninja",
     "orjson",
+    "outlines==0.1.11",
     "packaging",
     "partial_json_parser",
     "pillow",
@@ -50,13 +51,12 @@ runtime_common = [
 srt = [
     "sglang[runtime_common]",
     "sgl-kernel==0.1.9",
-    "flashinfer_python==0.2.6.post1",
     "torch==2.7.1",
     "torchaudio==2.7.1",
     "torchvision==0.22.1",
     "cuda-python",
-    "outlines>=0.0.44,<=0.1.11",
     "einops",
+    "flashinfer_python==0.2.6.post1",
 ]
 
 blackwell = [
@@ -66,7 +66,6 @@ blackwell = [
     "torchaudio==2.7.1",
     "torchvision==0.22.1",
     "cuda-python",
-    "outlines>=0.0.44,<=0.1.11",
     "einops",
     "flashinfer_python==0.2.6.post1",
 ]
@@ -77,23 +76,22 @@ srt_hip = [
     "sglang[runtime_common]",
     "torch",
     "vllm==0.6.7.dev2",
-    "outlines==0.1.11"
 ]
 
 # xpu is not enabled in public vllm and torch whl,
 # need to follow https://docs.vllm.ai/en/latest/getting_started/xpu-installation.htmlinstall vllm
-srt_xpu = ["sglang[runtime_common]", "outlines>=0.0.44,<=0.1.11"]
+srt_xpu = ["sglang[runtime_common]"]
 
 # For Intel Gaudi(device : hpu) follow the installation guide
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
-srt_hpu = ["sglang[runtime_common]", "outlines>=0.0.44,<=0.1.11"]
+srt_hpu = ["sglang[runtime_common]"]
 
 # CPU: currently, there are no pre-built vllm wheels for CPU.
 # To install vllm for CPU, please follow the instruction here:
 # https://docs.vllm.ai/en/latest/getting_started/installation/cpu/index.html
-srt_cpu = ["sglang[runtime_common]", "outlines>=0.0.44,<=0.1.11", "einops"]
+srt_cpu = ["sglang[runtime_common]", "einops"]
 # https://vllm-ascend.readthedocs.io/en/latest/installation.html
-srt_npu = ["sglang[runtime_common]", "outlines>=0.0.44,<=0.1.11"]
+srt_npu = ["sglang[runtime_common]"]
 
 openai = ["openai>=1.0", "tiktoken"]
 anthropic = ["anthropic>=0.20.0"]
