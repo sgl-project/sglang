@@ -56,7 +56,7 @@ class Gemma3nRMSNorm(Gemma3RMSNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Llama does x.to(float16) * w whilst Gemma3n is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
-        output = self._norm(x) * self.weight.type_as(x)
+        output = self._norm(x.float()) * self.weight.float()
         return output.type_as(x)
 
 
