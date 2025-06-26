@@ -247,6 +247,8 @@ class EAGLEWorker(TpModelWorker):
                 FlashAttentionBackend,
                 FlashAttentionMultiStepBackend,
             )
+            
+            assert not self.server_args.hip_attention_config.using_extend
 
             self.draft_attn_backend = FlashAttentionMultiStepBackend(
                 self.draft_model_runner,
