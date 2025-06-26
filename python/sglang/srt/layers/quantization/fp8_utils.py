@@ -506,26 +506,18 @@ def _apply_fallback_scaled_mm(
     if TORCH_DEVICE_IDENTITY is None:
         TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32, device=weight.device)
 
-    try:
+    if not _is_column_major(weight):
+        cloned_weight = _clone_in_column_major(weight)
+    else:
+        cloned_weight = weight
 
-        if not _is_column_major(weight):
-            cloned_weight = _clone_in_column_major(weight)
-        else:
-            cloned_weight = weight
-
-        output = torch._scaled_mm(
-            qinput,
-            cloned_weight,
-            scale_a=TORCH_DEVICE_IDENTITY,
-            scale_b=TORCH_DEVICE_IDENTITY,
-            out_dtype=torch.float32,
-        )
-
-    except Exception as e:
-        from remote_pdb import set_trace
-
-        set_trace()
-        pass
+    output = torch._scaled_mm(
+        qinput,
+        cloned_weight,
+        scale_a=TORCH_DEVICE_IDENTITY,
+        scale_b=TORCH_DEVICE_IDENTITY,
+        out_dtype=torch.float32,
+    )
 
     output = _process_scaled_mm_output(output, input_2d_shape, output_shape)
     x_scale = torch.narrow(x_scale, 0, 0, input_2d_shape[0])

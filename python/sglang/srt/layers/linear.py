@@ -281,12 +281,6 @@ class ReplicatedLinear(LinearBase):
             fused_shapes=fused_shapes,
         )
 
-        # if "model.layers.52.self_attn.fused_qkv_a_proj_with_mqa" in prefix:
-        #     from remote_pdb import set_trace
-
-        #     set_trace()
-        #     pass
-
         # All the linear layer supports quant method.
         assert self.quant_method is not None
         self.quant_method.create_weights(

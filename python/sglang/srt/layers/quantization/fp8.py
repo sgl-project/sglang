@@ -420,12 +420,6 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
-        # if "model.layers.52.self_attn.fused_qkv_a_proj_with_mqa" in layer.prefix:
-        #     from remote_pdb import set_trace
-        #     set_trace()
-        #     pass
-
         if self.use_marlin:
             return apply_fp8_marlin_linear(
                 input=x,
