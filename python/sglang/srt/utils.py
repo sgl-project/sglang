@@ -1971,7 +1971,8 @@ def launch_dummy_health_check_server(host, port):
 
     except RuntimeError:
         logger.info(f"Starting dummy health check server at {host}:{port}")
-        server.run()
+        t = threading.Thread(target=server.run, daemon=True)
+        t.start()
 
 
 def create_checksum(directory: str):
