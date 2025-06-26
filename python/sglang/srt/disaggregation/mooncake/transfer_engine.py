@@ -97,13 +97,19 @@ class MooncakeTransferEngine:
         peer_buffer_addresses: List[int],
         lengths: List[int],
     ) -> int:
-        """Synchronously transfer data to the specified address."""
+        """Synchronously transfer data to the specified addresses in batches."""
         try:
             ret = self.engine.batch_transfer_sync_write(
                 session_id, buffers, peer_buffer_addresses, lengths
             )
         except Exception:
             ret = -1
+            # Inform user to upgrade mooncake-transfer-engine >= 0.3.4.post2
+            if not hasattr(self.engine, "batch_transfer_sync_write"):
+                raise RuntimeError(
+                    "Mooncake's batch transfer requires mooncake-transfer-engine >= 0.3.4.post2. "
+                    "Please upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'"
+                )
 
         if ret < 0:
             logger.debug(
