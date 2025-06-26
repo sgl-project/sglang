@@ -11,7 +11,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Conversation chat templates."""
+"""Conversation chat templates.
+
+This module provides conversation template definitions, data structures, and utilities
+for managing chat templates across different model types in SGLang.
+
+Key components:
+- Conversation class: Defines the structure and behavior of chat templates
+- SeparatorStyle enum: Different conversation formatting styles
+- Template registry: Functions to register and retrieve templates by name or model path
+- Built-in templates: Pre-defined templates for popular models
+"""
 
 # Adapted from
 # https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
@@ -20,7 +30,7 @@ import re
 from enum import IntEnum, auto
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
-from sglang.srt.openai_api.protocol import ChatCompletionRequest
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.utils import read_system_prompt_from_file
 
 
@@ -618,7 +628,7 @@ def generate_chat_conv(
 
 
 # llama2 template
-# reference: https://huggingface.co/blog/codellama#conversational-instructions
+# reference: https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
 # reference: https://github.com/facebookresearch/llama/blob/1a240688810f8036049e8da36b073f63d2ac552c/llama/generation.py#L212
 register_conv_template(
     Conversation(
@@ -983,3 +993,9 @@ def match_devstral(model_path: str):
 def match_phi_4_mm(model_path: str):
     if "phi-4-multimodal" in model_path.lower():
         return "phi-4-mm"
+
+
+@register_conv_template_matching_function
+def match_vila(model_path: str):
+    if re.search(r"vila", model_path, re.IGNORECASE):
+        return "chatml"

@@ -1,27 +1,22 @@
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.communicator import (
     CommunicateContext,
-    CommunicateSimpleFn,
     CommunicateSummableTensorPairFn,
     ScatterMode,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.quantization.deep_gemm import configure_deep_gemm_num_sms
+from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.utils import BumpAllocator, DeepEPMode, get_bool_env_var
-
-if TYPE_CHECKING:
-    from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 
 _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 
@@ -46,7 +41,7 @@ def compute_split_seq_index(
         assert num_tokens == 0
         return 0
     else:
-        raise NotImplementedError
+        raise NotImplementedError()
 
 
 def _split_array_by_half_sum(arr: Sequence[int]) -> int:
@@ -136,9 +131,6 @@ class TboCudaGraphRunnerPlugin:
     def replay_prepare(
         self, forward_mode: ForwardMode, bs: int, num_token_non_padded: int
     ):
-        if not global_server_args_dict["enable_two_batch_overlap"]:
-            return
-
         tbo_split_seq_index, tbo_split_token_index = (
             compute_split_indices_for_cuda_graph_replay(
                 forward_mode=forward_mode,
@@ -354,7 +346,10 @@ class TboForwardBatchPreparer:
         )
 
         # TODO improve, e.g. unify w/ `init_raw`
-        if global_server_args_dict["moe_dense_tp_size"] == 1:
+        if (
+            global_server_args_dict["moe_dense_tp_size"] == 1
+            and batch.gathered_buffer is not None
+        ):
             sum_len = end_token_index - start_token_index
             gathered_buffer = torch.zeros(
                 (sum_len, batch.gathered_buffer.shape[1]),
@@ -487,7 +482,9 @@ def _model_forward_tbo(
     )
     del inputs
 
-    with configure_deep_gemm_num_sms(operations_strategy.deep_gemm_num_sms):
+    with deep_gemm_wrapper.configure_deep_gemm_num_sms(
+        operations_strategy.deep_gemm_num_sms
+    ):
         outputs_arr = execute_overlapped_operations(
             inputs_arr=inputs_arr,
             operations_arr=[operations_strategy.operations] * 2,

@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -12,6 +12,7 @@ def moe_align_block_size(
     num_tokens_post_pad,
     token_cnts_buffer,
     cumsum_buffer,
+    pad_sorted_token_ids=False,
 ):
     torch.ops.sgl_kernel.moe_align_block_size.default(
         topk_ids,
@@ -22,6 +23,7 @@ def moe_align_block_size(
         num_tokens_post_pad,
         token_cnts_buffer,
         cumsum_buffer,
+        pad_sorted_token_ids,
     )
 
 
@@ -85,6 +87,24 @@ def ep_moe_pre_reorder(
         end_expert_id,
         topk,
         use_per_token_if_dynamic,
+    )
+
+
+def ep_moe_silu_and_mul(
+    gateup_output,
+    down_input,
+    reorder_topk_ids,
+    scales,
+    start_expert_id,
+    end_expert_id,
+):
+    return torch.ops.sgl_kernel.ep_moe_silu_and_mul.default(
+        gateup_output,
+        down_input,
+        reorder_topk_ids,
+        scales,
+        start_expert_id,
+        end_expert_id,
     )
 
 
@@ -178,19 +198,26 @@ def prepare_moe_input(
     )
 
 
+def apply_shuffle_mul_sum(
+    input,
+    output,
+    permutation,
+    factors,
+):
+    torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(
+        input, output, permutation, factors
+    )
+
+
 def cutlass_fp4_group_mm(
     a_fp4,
     b_fp4,
     a_blockscale,
     b_blockscale,
     alphas,
-    ab_strides,
-    c_strides,
-    problem_sizes,
-    expert_offsets,
-    blockscale_offsets,
     out_dtype,
     device,
+    params: Dict[str, Any],
 ):
     """
     An FP4 Blockscaled Group Gemm that takes in  a_tensors, b_tensors and runs
@@ -220,10 +247,10 @@ def cutlass_fp4_group_mm(
         a_blockscale,
         b_blockscale,
         alphas,
-        ab_strides,
-        c_strides,
-        problem_sizes,
-        expert_offsets,
-        blockscale_offsets,
+        params["ab_strides"],
+        params["c_strides"],
+        params["problem_sizes"],
+        params["expert_offsets"],
+        params["blockscale_offsets"],
     )
     return c.to(dtype=out_dtype)
