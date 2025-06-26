@@ -13,7 +13,7 @@ class TestFile:
 
 suites = {
     "per-commit": [
-        TestFile("models/lora/test_lora.py", 76),
+        TestFile("models/lora/test_lora.py", 200),
         TestFile("models/lora/test_lora_backend.py", 99),
         TestFile("models/lora/test_multi_lora_backend.py", 60),
         TestFile("models/lora/test_lora_cuda_graph.py", 250),
