@@ -116,7 +116,7 @@ class DeepEPBuffer:
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
             # TODO can be false when unneeded
-            allow_mnnvl=True,
+            allow_mnnvl=False,
         )
         return cls._buffer
 
