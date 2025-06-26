@@ -212,7 +212,8 @@ void moe_align_block_size(
     torch::Tensor experts_ids,
     torch::Tensor num_tokens_post_pad,
     torch::Tensor token_cnts_buffer,
-    torch::Tensor cumsum_buffer);
+    torch::Tensor cumsum_buffer,
+    bool pad_sorted_token_ids);
 
 void topk_softmax(
     torch::Tensor& topk_weights,

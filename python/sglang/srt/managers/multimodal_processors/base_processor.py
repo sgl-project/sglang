@@ -23,6 +23,7 @@ class MultimodalInputFormat(Enum):
     RAW_IMAGES = "raw_images"
     PRECOMPUTED_FEATURES = "precomputed_features"
     PIXEL_VALUES = "pixel_values"
+    AUDIO = "audio"
 
 
 @dataclasses.dataclass
@@ -441,10 +442,13 @@ class BaseMultimodalProcessor(ABC):
                 has_image = False
                 has_pixel_values = False
                 has_precomputed_features = False
+                has_audio = False
 
                 for mm_input in mm_inputs:
                     if isinstance(mm_input, Image.Image):
                         has_image = True
+                    elif isinstance(mm_input, np.ndarray):
+                        has_audio = True
                     elif isinstance(mm_input, dict):
                         if mm_input.get("precomputed_features", None) is not None:
                             has_precomputed_features = True
@@ -461,13 +465,13 @@ class BaseMultimodalProcessor(ABC):
 
                 # Validate format consistency
                 format_count = sum(
-                    [has_image, has_pixel_values, has_precomputed_features]
+                    [has_image, has_pixel_values, has_precomputed_features, has_audio]
                 )
                 if format_count > 1:
                     raise ValueError(
                         "Unsupported: mixture of multimodal input formats. "
                         f"Found formats: image={has_image}, pixel_values={has_pixel_values}, "
-                        f"precomputed_features={has_precomputed_features}"
+                        f"precomputed_features={has_precomputed_features}, audio={has_audio}"
                     )
 
                 if has_image:
@@ -476,6 +480,8 @@ class BaseMultimodalProcessor(ABC):
                     return MultimodalInputFormat.PRECOMPUTED_FEATURES
                 elif has_pixel_values:
                     return MultimodalInputFormat.PIXEL_VALUES
+                elif has_audio:
+                    return MultimodalInputFormat.AUDIO
                 else:
                     raise ValueError("No valid multimodal input format found")
             except Exception as e:
@@ -521,20 +527,47 @@ class BaseMultimodalProcessor(ABC):
             input_ids = tokenize_text(base_output.input_text)
             return combined_mm_item, input_ids
 
+        def process_audio(
+            base_output: BaseMultiModalProcessorOutput,
+        ) -> Tuple[MultimodalDataItem, torch.Tensor]:
+            """Process inputs with audio."""
+            ret = self.process_mm_data(
+                input_text=base_output.input_text,
+                audio=base_output.audios,  # Note: "audio" is for gemma3n only
+            )
+            combined_mm_item = MultimodalDataItem(modality=Modality.AUDIO)
+            for key, value in ret.items():
+                if key != "input_ids" and hasattr(combined_mm_item, key):
+                    setattr(combined_mm_item, key, value)
+            input_ids = ret["input_ids"].flatten()
+            return combined_mm_item, input_ids
+
         def finalize_mm_item(
             combined_mm_item: MultimodalDataItem, input_ids: torch.Tensor
         ) -> MultimodalDataItem:
             """Apply common post-processing to the multimodal item."""
-            combined_mm_item.image_offsets = self.get_mm_items_offset(
-                input_ids=input_ids,
-                mm_token_id=self.IM_TOKEN_ID,
-            )
+            if combined_mm_item.modality in [Modality.IMAGE, Modality.MULTI_IMAGES]:
+                combined_mm_item.image_offsets = self.get_mm_items_offset(
+                    input_ids=input_ids,
+                    mm_token_id=self.IM_TOKEN_ID,
+                )
+            elif combined_mm_item.modality == Modality.AUDIO:
+                combined_mm_item.audio_offsets = self.get_mm_items_offset(
+                    input_ids=input_ids,
+                    mm_token_id=self.AUDIO_TOKEN_ID,
+                )
+            elif combined_mm_item.modality == Modality.VIDEO:
+                combined_mm_item.video_offsets = self.get_mm_items_offset(
+                    input_ids=input_ids,
+                    mm_token_id=self.VIDEO_TOKEN_ID,
+                )
+            else:
+                raise ValueError(f"Unknown modality: {combined_mm_item.modality}")
             return combined_mm_item
 
-        # Main logic
-        mm_inputs = base_output.images
+        # Main logic - determine input type and handle text-only case
+        mm_inputs = base_output.images or base_output.audios
         if not mm_inputs:
-            # Return text-only case
             input_ids = tokenize_text(base_output.input_text)
             return None, input_ids
 
@@ -548,6 +581,8 @@ class BaseMultimodalProcessor(ABC):
             combined_mm_item, input_ids = process_precomputed_features(base_output)
         elif input_format == MultimodalInputFormat.PIXEL_VALUES:
             combined_mm_item, input_ids = process_pixel_values(base_output)
+        elif input_format == MultimodalInputFormat.AUDIO:
+            combined_mm_item, input_ids = process_audio(base_output)
         else:
             raise ValueError(f"Unknown input format: {input_format}")
 

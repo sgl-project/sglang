@@ -99,6 +99,8 @@ class EagleDraftInput:
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
+            accept_length=torch.empty((0,), device=device, dtype=torch.int32),
+            accept_length_cpu=[],
         )
 
     def prepare_extend_after_decode(
