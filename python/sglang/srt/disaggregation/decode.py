@@ -579,11 +579,11 @@ class DecodeTransferQueue:
                 idx = decode_req.metadata_buffer_index
                 (
                     output_id,
-                    output_hidden_states,
                     output_token_logprobs_val,
                     output_token_logprobs_idx,
                     output_top_logprobs_val,
                     output_top_logprobs_idx,
+                    output_hidden_states,
                 ) = self.metadata_buffers.get_buf(idx)
 
                 decode_req.req.output_ids.append(output_id[0].item())

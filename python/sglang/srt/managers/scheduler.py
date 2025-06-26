@@ -186,6 +186,18 @@ class EmbeddingBatchResult:
     bid: int
 
 
+class KvMetrics:
+    def __init__(self):
+        self.request_active_slots = None
+        self.request_total_slots = None
+        self.kv_active_blocks = None
+        self.kv_total_blocks = None
+        self.num_requests_waiting = None
+        self.gpu_cache_usage_perc = None
+        self.gpu_prefix_cache_hit_rate = None
+        self.data_parallel_rank = None
+
+
 class IdleSleeper:
     """
     In setups which have long inactivity periods it is desirable to reduce
@@ -227,6 +239,7 @@ class Scheduler(
         self.server_args = server_args
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
+        self.dp_rank = dp_rank
         self.tp_size = server_args.tp_size
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
@@ -265,6 +278,9 @@ class Scheduler(
             self.send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
+            self.send_metrics_from_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.metrics_ipc_name, False
+            )
 
             if server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
@@ -290,6 +306,7 @@ class Scheduler(
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
+            self.send_metrics_from_scheduler = None
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
@@ -1245,6 +1262,22 @@ class Scheduler(
         req.logprob_start_len = len(req.origin_input_ids) - 1
         self._add_request_to_queue(req)
 
+    def _emit_kv_metrics(self):
+        kv_metrics = KvMetrics()
+        kv_metrics.request_active_slots = self.stats.num_running_reqs
+        kv_metrics.request_total_slots = self.max_running_requests
+        kv_metrics.kv_active_blocks = int(
+            self.stats.token_usage * self.max_total_num_tokens
+        )
+        kv_metrics.kv_total_blocks = self.max_total_num_tokens
+        kv_metrics.num_requests_waiting = self.stats.num_queue_reqs
+        kv_metrics.gpu_cache_usage_perc = self.stats.token_usage
+        kv_metrics.gpu_prefix_cache_hit_rate = self.stats.cache_hit_rate
+        kv_metrics.data_parallel_rank = self.dp_rank if self.dp_rank is not None else 0
+
+        if not self.send_metrics_from_scheduler.closed:
+            self.send_metrics_from_scheduler.send_pyobj(kv_metrics)
+
     def log_prefill_stats(
         self,
         adder: PrefillAdder,
@@ -1297,6 +1330,7 @@ class Scheduler(
             self.stats.avg_request_queue_latency = total_queue_latency / num_new_seq
 
             self.metrics_collector.log_stats(self.stats)
+            self._emit_kv_metrics()
         self._publish_kv_events()
 
     def log_decode_stats(
@@ -1358,6 +1392,7 @@ class Scheduler(
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.spec_accept_length = spec_accept_length
             self.metrics_collector.log_stats(self.stats)
+            self._emit_kv_metrics()
         self._publish_kv_events()
 
     def check_memory(self):
@@ -2271,6 +2306,7 @@ class Scheduler(
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
+        barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromTensorReqOutput(success, message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
