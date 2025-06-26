@@ -160,13 +160,17 @@ def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
-def is_cpu() -> bool:
+def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (
         machine in ("x86_64", "amd64", "i386", "i686")
         and hasattr(torch, "cpu")
         and torch.cpu.is_available()
     )
+
+
+def is_cpu() -> bool:
+    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
 
 
 def is_flashinfer_available():
@@ -1291,6 +1295,15 @@ def get_hpu_memory_capacity():
         )
 
 
+def get_npu_memory_capacity():
+    try:
+        import torch_npu
+
+        return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+    except ImportError as e:
+        raise ImportError("torch_npu is required when run on npu device.")
+
+
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
@@ -1298,6 +1311,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_amdgpu_memory_capacity()
     elif device == "hpu":
         gpu_mem = get_hpu_memory_capacity()
+    elif device == "npu":
+        gpu_mem = get_npu_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -1423,6 +1438,11 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "xpu"
         return "xpu:{}".format(device_id)
 
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        if device_id == None:
+            return "npu"
+        return "npu:{}".format(device_id)
+
     if is_habana_available():
         try:
             import habana_frameworks.torch.hpu
@@ -1435,6 +1455,15 @@ def get_device(device_id: Optional[int] = None) -> str:
             raise ImportError(
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
+
+    if is_cpu():
+        if cpu_has_amx_support():
+            logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
+        else:
+            logger.warning(
+                "CPU device enabled, using torch native backend, low performance expected."
+            )
+        return "cpu"
 
     raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
 
@@ -1497,15 +1526,35 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     return major, minor
 
 
+def get_npu_compiler_config():
+    config = {
+        "frozen_parameter": True,
+        "tiling_schedule_optimize": True,
+        "topology_sorting_strategy": "StableRDFS",
+    }
+    return config
+
+
 def get_compiler_backend() -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
 
     if hasattr(torch, "npu") and torch.npu.is_available():
-        import torchair
+        try:
+            import torchair
+            import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
+            from torchair.configs.compiler_config import CompilerConfig
+        except ImportError as e:
+            raise ImportError(
+                "NPU detected, but torchair package is not installed. "
+                "Please install torchair for torch.compile support on NPU."
+            )
+        compiler_config = CompilerConfig()
+        predefined_config = get_npu_compiler_config()
+        for k, v in predefined_config.items():
+            setattr(compiler_config.experimental_config, k, v)
 
-        config = torchair.CompilerConfig()
-        npu_backend = torchair.get_npu_backend(compiler_config=config)
+        npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
         return npu_backend
 
     return "inductor"
@@ -1868,18 +1917,14 @@ def configure_ipv6(dist_init_addr):
     return port, host
 
 
-def rank0_log(msg: str):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-    if get_tensor_model_parallel_rank() == 0:
-        logger.info(msg)
-
-
 def rank0_print(msg: str):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     if get_tensor_model_parallel_rank() == 0:
         print(msg, flush=True)
+
+
+rank0_log = rank0_print
 
 
 def get_cuda_version():
@@ -2105,6 +2150,44 @@ def get_free_port():
             return s.getsockname()[1]
 
 
+def get_local_ip_auto() -> str:
+    interface = os.environ.get("SGLANG_LOCAL_IP_NIC", None)
+    return (
+        get_local_ip_by_nic(interface)
+        if interface is not None
+        else get_local_ip_by_remote()
+    )
+
+
+def get_local_ip_by_nic(interface: str) -> str:
+    try:
+        import netifaces
+    except ImportError as e:
+        raise ImportError(
+            "Environment variable SGLANG_LOCAL_IP_NIC requires package netifaces, please install it through 'pip install netifaces'"
+        ) from e
+
+    try:
+        addresses = netifaces.ifaddresses(interface)
+        if netifaces.AF_INET in addresses:
+            for addr_info in addresses[netifaces.AF_INET]:
+                ip = addr_info.get("addr")
+                if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+                    return ip
+        if netifaces.AF_INET6 in addresses:
+            for addr_info in addresses[netifaces.AF_INET6]:
+                ip = addr_info.get("addr")
+                if ip and not ip.startswith("fe80::") and ip != "::1":
+                    return ip.split("%")[0]
+    except (ValueError, OSError) as e:
+        raise ValueError(
+            "Can not get local ip from NIC. Please verify whether SGLANG_LOCAL_IP_NIC is set correctly."
+        )
+
+    # Fallback
+    return get_local_ip_by_remote()
+
+
 def get_local_ip_by_remote() -> str:
     # try ipv4
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -2214,6 +2297,51 @@ class Withable(Generic[T]):
         finally:
             assert self._value is new_value
             self._value = None
+
+
+def require_mlp_tp_gather(server_args):
+    """
+    Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
+    """
+    if server_args.enable_dp_attention:
+        assert server_args.dp_size > 1, "dp_size must be greater than 1"
+        if (
+            server_args.moe_dense_tp_size is None
+        ):  # TODO(ch-wan): some MoE models do not have dense layers
+            return True
+        elif not server_args.enable_dp_lm_head:
+            return True
+        elif not server_args.enable_deepep_moe:
+            return True
+        else:
+            return (
+                server_args.moe_dense_tp_size
+                > server_args.tp_size // server_args.dp_size
+            )
+    else:
+        return False
+
+
+def require_attn_tp_gather(server_args):
+    """
+    Check if the input of attention is scattered.
+    """
+    assert server_args.moe_dense_tp_size in [1, None]
+    if server_args.enable_deepep_moe or server_args.moe_dense_tp_size == 1:
+        if server_args.enable_dp_attention:
+            return server_args.dp_size < server_args.tp_size
+        else:
+            return True
+    else:
+        return False
+
+
+def require_gathered_buffer(server_args):
+    return require_mlp_tp_gather(server_args) or require_attn_tp_gather(server_args)
+
+
+def require_mlp_sync(server_args):
+    return server_args.enable_dp_attention or require_gathered_buffer(server_args)
 
 
 def merge_bias_tensor(
@@ -2329,6 +2457,77 @@ def cpu_has_amx_support():
     return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
 
 
+def prepack_weight_if_needed(weight):
+    if weight.device != torch.device("cpu"):
+        return weight
+    if not cpu_has_amx_support():
+        return weight
+
+    return torch.ops.sgl_kernel.convert_weight_packed(weight)
+
+
+# TODO: currently gemm kernel has the below requirements:
+# OC % TILE_N == 0, where TILE_N = 16
+# IC % TILE_K == 0, where TILE_K = 32
+def dim_is_supported(weight):
+    return weight.size(0) % 16 == 0 and weight.size(1) % 32 == 0
+
+
+def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
+    # Pack weight for get better performance on CPU
+    devices = {getattr(module, weight_name).device for weight_name in weight_names}
+    assert len(devices) == 1, f"Expects all weights to be on the same device"
+    device = devices.pop()
+
+    if transpose_dims:
+        assert len(weight_names) == len(
+            transpose_dims
+        ), "len(weight_names) should be equal to len(transpose_dims)"
+
+    for i, weight_name in enumerate(weight_names):
+        weight_tensor = getattr(module, weight_name)
+
+        # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
+        if not dim_is_supported(weight_tensor):
+            logger.warning(
+                f"Expects weight.size(0) % 16 == 0 and weight.size(1) % 32 == 0 "
+                f"but {weight_tensor.size(0)=} and {weight_tensor.size(1)=} in {module}. "
+                f"{module} won't use intel amx backend."
+            )
+            module.use_intel_amx_backend = False
+            return
+
+        if transpose_dims and transpose_dims[i]:
+            weight_tensor = weight_tensor.transpose(*transpose_dims[i])
+
+        packed_weight = torch.nn.Parameter(
+            prepack_weight_if_needed(weight_tensor),
+            requires_grad=False,
+        )
+        packed_weight.__dict__ = weight_tensor.__dict__
+        setattr(module, weight_name, packed_weight)
+
+    module.use_intel_amx_backend = (
+        device == torch.device("cpu") and cpu_has_amx_support()
+    )
+
+    if (
+        module.use_intel_amx_backend
+        and hasattr(module, "bias")
+        and module.bias is not None
+    ):
+        module.bias = torch.nn.Parameter(module.bias.data.float(), requires_grad=False)
+
+
+class PackWeightMethod:
+    def __init__(self, weight_names, transpose_dims=None):
+        self.weight_names = weight_names
+        self.transpose_dims = transpose_dims
+
+    def process_weights_after_loading(self, module) -> None:
+        _process_weight_after_loading(module, self.weight_names, self.transpose_dims)
+
+
 class LazyValue:
     def __init__(self, creator: Callable):
         self._creator = creator
@@ -2340,3 +2539,41 @@ class LazyValue:
             self._value = self._creator()
             self._creator = None
         return self._value
+
+
+def dynamic_import(func_path: str):
+    parts = func_path.split(".")
+    if len(parts) < 2:
+        raise ValueError(
+            "func_path should contain both module name and func name (such as 'module.func')"
+        )
+    module_path = ".".join(parts[:-1])
+    func_name = parts[-1]
+    module = importlib.import_module(module_path)
+    func = getattr(module, func_name)
+    return func
+
+
+def configure_gc_logger():
+    logger.info("Enable GC Logger")
+
+    import gc
+
+    gc_start_time = {}
+
+    def gc_callback(phase, info):
+        gen = info.get("generation", "?")
+        if phase == "start":
+            gc_start_time[gen] = time.time()
+            logger.info(f"GC start: Time {time.time()} | Generation {gen}")
+        elif phase == "stop":
+            duration = time.time() - gc_start_time.get(gen, time.time())
+            collected = info.get("collected", "?")
+            uncollectable = info.get("uncollectable", "?")
+            logger.info(
+                f"GC end: Time {time.time()} | Generation {gen} | "
+                f"Duration: {duration:.4f}s | Collected: {collected} | Uncollectable: {uncollectable} "
+                f'{"(LONG GC)" if duration > 0.1 else ""}'
+            )
+
+    gc.callbacks.append(gc_callback)
