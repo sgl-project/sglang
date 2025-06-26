@@ -196,6 +196,10 @@ class QuarkInt4Fp8LinearMethod(LinearMethodBase):
             loaded_weight: torch.Tensor,
             shard_id: Optional[Union[str, int]] = None,
         ):
+            # For linear layers, we did not implement pre-sharding here, so
+            # online quantization happens before sharding is done.
+            # Online quantization also happens on CPU here.
+            # TODO: Ideally, we could pre-shard here.
             fp8_w, fp8_scale = quantize_fp8_scale_tensorwise(loaded_weight)
 
             if shard_id is not None:                
@@ -339,28 +343,34 @@ class QuarkInt4Fp8MoEMethod:
             shard_id: str,
             expert_id: int,
         ):
-            layer.use_presharded_weights = True
-    
             if shard_id in ["w1", "w3"]:
-                shard_dim = 0
                 shard_size = self.w13_shard_size
-                loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * self.tp_rank, shard_size
-                )
             else:
-                shard_dim = 1
                 shard_size = self.w2_shard_size
-                loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * self.tp_rank, shard_size
-                )
+
+            if not layer.use_presharded_weights:
+                # In case the model is not pre-sharded (most checkpoints on HF Hub),
+                # we shard the model here in order to run online quantization on
+                # already sharded weights.
+                # Some models as `lmzheng/grok-1` are already be sharded.
+                layer.use_presharded_weights = True
+        
+                if shard_id in ["w1", "w3"]:
+                    shard_dim = 0
+                    loaded_weight = loaded_weight.narrow(
+                        shard_dim, shard_size * self.tp_rank, shard_size
+                    )
+                else:
+                    shard_dim = 1
+                    loaded_weight = loaded_weight.narrow(
+                        shard_dim, shard_size * self.tp_rank, shard_size
+                    )
             
             # We want to run online quantization on-device for speed purposes.
             loaded_weight = loaded_weight.to(param.device)
 
             _, fp8_scale = quantize_fp8_scale_tensorwise(loaded_weight)
 
-            # The original weight loader handles the sharding of int4_w, so we can't shard it
-            # ahead here.
             int4_w, int4_scale = quantize_int4_scale_columnwise(loaded_weight)
             
             int4_w = pack_int4_to_int32(int4_w)
@@ -399,7 +409,6 @@ class QuarkInt4Fp8MoEMethod:
 
                 layer.w2_fp8_scale[expert_id].copy_(fp8_scale)
 
-            # TODO: shard loaded_weight before quantization, and use use_presharded_weights=True.
             original_weight_loader(param, int4_w, shard_id=shard_id, weight_name=weight_name, expert_id=expert_id)
 
             self.online_quant_progress_bar.update(1)
