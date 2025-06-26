@@ -514,7 +514,7 @@ class HunYuanModel(nn.Module):
         return hidden_states
 
 
-class HunYuanForCausalLM(nn.Module):
+class HunYuanMoEV1ForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -768,4 +768,4 @@ class HunYuanForCausalLM(nn.Module):
                 )
 
 
-EntryClass = HunYuanForCausalLM
+EntryClass = HunYuanMoEV1ForCausalLM
