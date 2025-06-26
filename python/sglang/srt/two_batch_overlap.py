@@ -85,7 +85,6 @@ def _split_array_by_half_sum(arr: Sequence[int]) -> int:
 
 def split_spec_info(
     spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-    bs: int,
     start_seq_index: int,
     end_seq_index: int,
     start_token_index: int,
@@ -491,7 +490,6 @@ class TboForwardBatchPreparer:
         spec_info = getattr(batch, "spec_info")
         output_spec_info = split_spec_info(
             spec_info=spec_info,
-            bs=batch.batch_size,
             start_token_index=start_token_index,
             end_token_index=end_token_index,
             start_seq_index=start_seq_index,

@@ -29,8 +29,8 @@ class TboAttnBackend(AttentionBackend):
             for child, forward_batch_child in zip(
                 self.children, forward_batch.tbo_children, strict=True
             ):
-                if forward_batch_child.batch_size > 0:
-                    child.init_forward_metadata(forward_batch=forward_batch_child)
+                # if forward_batch_child.batch_size > 0:
+                child.init_forward_metadata(forward_batch=forward_batch_child)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.primary.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
@@ -80,6 +80,10 @@ class TboAttnBackend(AttentionBackend):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
+        print(
+            f"TboAttnBackend.init_forward_metadata_replay_cuda_graph: bs={bs}, req_pool_indices={req_pool_indices}, seq_lens={seq_lens}, seq_lens_sum={seq_lens_sum}, encoder_lens={encoder_lens}, forward_mode={forward_mode}, spec_info={spec_info}, seq_lens_cpu={seq_lens_cpu}",
+            flush=True,
+        )
         self.primary.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=req_pool_indices,
@@ -210,7 +214,6 @@ def _init_forward_metadata_cuda_graph_split(
     if spec_info is not None:
         output_spec_info = two_batch_overlap.split_spec_info(
             spec_info=spec_info,
-            bs=bs,
             start_seq_index=seq_slice.start if seq_slice.start is not None else 0,
             end_seq_index=seq_slice.stop if seq_slice.stop is not None else bs,
             start_token_index=(
@@ -236,6 +239,9 @@ def _init_forward_metadata_cuda_graph_split(
         # ignore
         encoder_lens=None,
         spec_info=output_spec_info,
+    )
+    print(
+        f"TboAttnBackend._init_forward_metadata_cuda_graph_split: ans={ans}", flush=True
     )
 
     if fn_name == "init_forward_metadata_capture_cuda_graph":
