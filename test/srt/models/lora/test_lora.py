@@ -18,6 +18,8 @@ import random
 import unittest
 from typing import List
 
+import torch
+
 from utils import (
     ALL_OTHER_MULTI_LORA_MODELS,
     CI_MULTI_LORA_MODELS,
@@ -54,7 +56,33 @@ TEST_MULTIPLE_BATCH_PROMPTS = [
 
 
 class TestLoRA(CustomTestCase):
+    def _create_test_samples(self, lora_adapter_paths: List[str], repeated_trials: int = 3):
+        state = random.getstate()
+        random.seed(42)  # Ensure reproducibility
+
+        patterns = [
+                [None, lora_adapter_paths[0], lora_adapter_paths[1]],
+                [lora_adapter_paths[0], None, lora_adapter_paths[1]],
+                [lora_adapter_paths[0], lora_adapter_paths[1], None],
+                [None, lora_adapter_paths[1], None],
+                [None, None, None],
+            ]
+        
+        batches = [
+            [random.choice(pattern) for _ in range(3)] for pattern in patterns for _ in range(repeated_trials)
+        ]
+
+        random.setstate(state)
+        return batches
+
     def _run_lora_multiple_batch_on_model_cases(self, model_cases: List[LoRAModelCase]):
+        # Ensure reproducibility
+        seed = 42
+        random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.use_deterministic_algorithms(True)
+
         for model_case in model_cases:
             for torch_dtype in TORCH_DTYPES:
                 max_new_tokens = 32
@@ -62,14 +90,6 @@ class TestLoRA(CustomTestCase):
                 base_path = model_case.base
                 lora_adapter_paths = [a.name for a in model_case.adaptors]
                 assert len(lora_adapter_paths) >= 2
-
-                batches = [
-                    [None, lora_adapter_paths[0], lora_adapter_paths[1]],
-                    [lora_adapter_paths[0], None, lora_adapter_paths[1]],
-                    [lora_adapter_paths[0], lora_adapter_paths[1], None],
-                    [None, lora_adapter_paths[1], None],
-                    [None, None, None],
-                ]
 
                 print(
                     f"\n========== Testing multiple batches on base '{base_path}' with backend={backend}, dtype={torch_dtype} ---"
@@ -91,48 +111,46 @@ class TestLoRA(CustomTestCase):
                     base_path, torch_dtype=torch_dtype, model_type="generation"
                 )
 
-                random.seed(42)  # Ensure reproducibility of repeated trials per batch
-                repeated_trial_per_batch = 3
+                batches = self._create_test_samples(lora_adapter_paths)
                 with srt_runner, hf_runner:
-                    for i, lora_paths in enumerate(batches):
-                        for j in range(repeated_trial_per_batch):
-                            prompts = [
-                                random.choice(TEST_MULTIPLE_BATCH_PROMPTS)
-                                for _ in range(3)
-                            ]
-                            print(
-                                f"\n--- Running Batch {i + 1}, trial {j + 1} --- prompts: {prompts}, lora_paths: {lora_paths}"
-                            )
+                    for i, lora_paths in enumerate(batches, start=1):
+                        prompts = [
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS)
+                            for _ in range(3)
+                        ]
+                        print(
+                            f"\n--- Running Batch {i} --- prompts: {prompts}, lora_paths: {lora_paths}"
+                        )
 
-                            srt_outputs = srt_runner.batch_forward(
-                                prompts,
-                                max_new_tokens=max_new_tokens,
-                                lora_paths=lora_paths,
-                            )
+                        srt_outputs = srt_runner.batch_forward(
+                            prompts,
+                            max_new_tokens=max_new_tokens,
+                            lora_paths=lora_paths,
+                        )
 
-                            hf_outputs = hf_runner.forward(
-                                prompts,
-                                max_new_tokens=max_new_tokens,
-                                lora_paths=lora_paths,
-                            )
+                        hf_outputs = hf_runner.forward(
+                            prompts,
+                            max_new_tokens=max_new_tokens,
+                            lora_paths=lora_paths,
+                        )
 
-                            print("SRT outputs:", [s for s in srt_outputs.output_strs])
-                            print("HF outputs:", [s for s in hf_outputs.output_strs])
+                        print("SRT outputs:", [s for s in srt_outputs.output_strs])
+                        print("HF outputs:", [s for s in hf_outputs.output_strs])
 
-                            for srt_out, hf_out in zip(
-                                srt_outputs.output_strs, hf_outputs.output_strs
-                            ):
-                                srt_str = srt_out.strip()
-                                hf_str = hf_out.strip()
-                                rouge_tol = model_case.rouge_l_tolerance
-                                rouge_score = calculate_rouge_l([srt_str], [hf_str])[0]
-                                if rouge_score < rouge_tol:
-                                    raise AssertionError(
-                                        f"ROUGE-L score {rouge_score} below tolerance {rouge_tol} "
-                                        f"for base '{base_path}', adaptor '{lora_paths}', backend '{backend}', prompt: '{prompts}...'"
-                                    )
+                        for srt_out, hf_out in zip(
+                            srt_outputs.output_strs, hf_outputs.output_strs
+                        ):
+                            srt_str = srt_out.strip()
+                            hf_str = hf_out.strip()
+                            rouge_tol = model_case.rouge_l_tolerance
+                            rouge_score = calculate_rouge_l([srt_str], [hf_str])[0]
+                            if rouge_score < rouge_tol:
+                                raise AssertionError(
+                                    f"ROUGE-L score {rouge_score} below tolerance {rouge_tol} "
+                                    f"for base '{base_path}', adaptor '{lora_paths}', backend '{backend}', prompt: '{prompts}...'"
+                                )
 
-                            print(f"--- Batch {i + 1} Comparison Passed --- ")
+                        print(f"--- Batch {i} Comparison Passed --- ")
 
     def test_ci_lora_models(self):
         self._run_lora_multiple_batch_on_model_cases(CI_MULTI_LORA_MODELS)
