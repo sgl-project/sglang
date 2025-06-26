@@ -4,6 +4,7 @@ from typing import Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import PreTrainedModel
 
 from sglang.srt.configs.gemma3n5 import Gemma3nAudioConfig
 from sglang.srt.layers.linear import (
@@ -14,7 +15,6 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.models.gemma3n_causal import Gemma3nRMSNorm
 from sglang.srt.utils import add_prefix, make_layers
-from transformers import PreTrainedModel
 
 
 class Gemma3nCumulativeGroupNorm(nn.Module):
@@ -212,8 +212,8 @@ class Gemma3nAudioRelativePositionEmbedding(nn.Module):
             )
         )
         term_bd_sliced = term_bd_reshaped[
-                         :, :, :, : query_block_size * key_context_size
-                         ]
+            :, :, :, : query_block_size * key_context_size
+        ]
         term_bd_shifted = term_bd_sliced.reshape(
             (
                 batch_size,
@@ -316,7 +316,7 @@ class Gemma3nAudioAttention(nn.Module):
             prefix=add_prefix("qkv_proj", prefix),
         )
 
-        q_scale = self.head_dim ** -0.5
+        q_scale = self.head_dim**-0.5
         r_softplus_0 = 1.0 / F.softplus(torch.tensor(0.0))
         self.register_buffer(
             "q_scale", (q_scale * r_softplus_0).clone().detach(), persistent=False

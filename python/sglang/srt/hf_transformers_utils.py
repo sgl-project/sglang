@@ -37,8 +37,9 @@ from sglang.srt.configs import (
     DbrxConfig,
     DeepseekVL2Config,
     ExaoneConfig,
+    Gemma3nConfig,
     KimiVLConfig,
-    MultiModalityConfig, Gemma3nConfig,
+    MultiModalityConfig,
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector

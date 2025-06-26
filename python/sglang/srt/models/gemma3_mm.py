@@ -21,7 +21,8 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict
 
 import torch
 from torch import nn
-from transformers import Gemma3Config, PreTrainedModel
+from transformers import PreTrainedModel
+from transformers.models.gemma3.modular_gemma3 import Gemma3Config
 
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.layernorm import Gemma3RMSNorm

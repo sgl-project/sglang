@@ -1,5 +1,5 @@
 # Adapted from transformers
-from typing import Optional, Sequence, Any, Union
+from typing import Any, Optional, Sequence, Union
 
 from transformers import is_timm_available
 
@@ -69,7 +69,7 @@ class Gemma3nTextConfig(PretrainedConfig):
         rope_theta (`float`, *optional*, defaults to 1000000.0):
             The base period of the RoPE embeddings.
         rope_scaling (`Dict`, *optional*):
-            Dictionary containing the scaling configuration for the RoPE embeddings used in gloabl attention.
+            Dictionary containing the scaling configuration for the RoPE embeddings used in global attention.
             NOTE: if you apply new rope type and you expect the model to work on longer `max_position_embeddings`, we
             recommend you to update this value accordingly.
             Expected contents:
@@ -129,11 +129,11 @@ class Gemma3nTextConfig(PretrainedConfig):
         altup_active_idx (`int`, *optional*, defaults to 0):
             The index of the prediction from which AltUp will compute additional predictions or correct
         altup_coef_clip (`float`, *optional*, defaults to 120.0):
-            The maximum amplitude of an AltUp prediction or correction coeficient weight.
+            The maximum amplitude of an AltUp prediction or correction coefficient weight.
         altup_correct_scale (`bool`, *optional*, defaults to `True`):
             If True, apply the `AltUp.correct_output_scale` to the corrected prediction at `altup_active_idx`.
         altup_lr_multiplier (`float`, *optional*, defaults to 1.0):
-            The learning ratre mutliplier used by AltUp during trianing.
+            The learning ratre multiplier used by AltUp during training.
         altup_num_inputs (`int`, *optional*, defaults to 4):
             The number of predictions that AltUp should be make given the input sequence.
         num_kv_shared_layers (`int`, *optional*, defaults to 15):
@@ -215,7 +215,8 @@ class Gemma3nTextConfig(PretrainedConfig):
         altup_num_inputs: int = 4,
         num_kv_shared_layers: int = 15,
         laurel_rank: int = 64,
-        activation_sparsity_pattern: Optional[Sequence[float]] = (0.95,) * 10 + (0.0,) * 25,
+        activation_sparsity_pattern: Optional[Sequence[float]] = (0.95,) * 10
+        + (0.0,) * 25,
         **kwargs,
     ):
         super().__init__(
@@ -258,7 +259,9 @@ class Gemma3nTextConfig(PretrainedConfig):
                 "sliding_attention",
                 "full_attention",
             )
-            self.layer_types = default_layer_types * (self.num_hidden_layers // len(default_layer_types))
+            self.layer_types = default_layer_types * (
+                self.num_hidden_layers // len(default_layer_types)
+            )
         else:
             self.layer_types = layer_types
 
@@ -309,7 +312,7 @@ class Gemma3nAudioConfig(PretrainedConfig):
         rms_norm_eps (`float`, *optional*, defaults to 1e-06):
             The epsilon used by the rms normalization layers.
         gradient_clipping (`float`, *optional*, defaults to 10000000000.0):
-            Clipping value used to stablize extremely large gradient values.
+            Clipping value used to stabelize extremely large gradient values.
         conf_attention_chunk_size (`int`, *optional*, defaults to 12):
             The sub-sequence size for local attention processing.
         conf_attention_context_left (`int`, *optional*, defaults to 13):
@@ -384,12 +387,12 @@ class Gemma3nAudioConfig(PretrainedConfig):
         sscp_conv_channel_size: tuple[int, int] = (128, 32),
         sscp_conv_group_norm_eps: float = 1e-3,
         sscp_conv_kernel_size: tuple[tuple[int, int], tuple[int, int]] = (
-                (3, 3),
-                (3, 3),
+            (3, 3),
+            (3, 3),
         ),
         sscp_conv_stride_size: tuple[tuple[int, int], tuple[int, int]] = (
-                (2, 2),
-                (2, 2),
+            (2, 2),
+            (2, 2),
         ),
         **kwargs,
     ):
@@ -508,7 +511,10 @@ class Gemma3nVisionConfig(PretrainedConfig):
 
         # pop num_classes from "pretrained_cfg",
         # it is not necessary to have it, only root one is used in timm
-        if "pretrained_cfg" in config_dict and "num_classes" in config_dict["pretrained_cfg"]:
+        if (
+            "pretrained_cfg" in config_dict
+            and "num_classes" in config_dict["pretrained_cfg"]
+        ):
             config_dict["pretrained_cfg"].pop("num_classes", None)
 
         return super().from_dict(config_dict, **kwargs)
