@@ -682,13 +682,35 @@ def grouped_gemm_triton(
 
         assert len(block_shape) == 2
         block_n, block_k = block_shape[0], block_shape[1]
-        a, scale_a = per_token_group_quant_fp8(a, block_k)
 
-        assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
-        assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
-        assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
+        print(
+            f"[grouped_gemm_triton] a : shape={a.shape}, dtype={a.dtype}, scale_a={scale_a}, use_per_token_if_dynamic={use_per_token_if_dynamic}"
+        )
 
-        dispose_tensor(a_original)
+        if torch.finfo(a.dtype).bits > 8:
+            try:
+                a, scale_a = per_token_group_quant_fp8(a, block_k)
+            except Exception as e:
+                from remote_pdb import set_trace
+
+                set_trace()
+                pass
+
+            print(
+                f"[grouped_gemm_triton] scale_a : shape={scale_a.shape}, dtype={scale_a.dtype}"
+            )
+
+            assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
+            assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
+            assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
+
+            dispose_tensor(a_original)
+        else:
+            assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
+            assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
+            assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
+
+    print("[grouped_gemm_triton] here!")
 
     # TODO: adjust config or tune kernel
     # Reduce block size to prevent L40 shared memory overflow.
@@ -713,6 +735,13 @@ def grouped_gemm_triton(
     )
 
     if use_fp8_w8a8 and block_shape is None and use_per_token_if_dynamic:
+
+        if scale_a.shape[0] != a.shape[0]:
+            from remote_pdb import set_trace
+
+            set_trace()
+            pass
+
         assert (
             scale_a.shape[0] == a.shape[0]
         ), f"scale_a.shape: {scale_a.shape}, a.shape: {a.shape}"

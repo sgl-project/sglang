@@ -207,9 +207,14 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             fused_parameters = 1
 
         if self.strategy == QuantizationStrategy.CHANNEL:
+            if fused_parameters > 1:
+                raise NotImplemented(
+                    "Support for channel-wise weight scaling for fused parameters is not supported yet. Stay tuned!"
+                )
+
             weight_scale = ChannelQuantScaleParameter(
                 data=torch.empty(
-                    (sum(output_partition_sizes) * fused_parameters, 1),
+                    (sum(output_partition_sizes), 1),
                     dtype=torch.float32,
                 ),
                 output_dim=0,
@@ -219,7 +224,9 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             assert self.strategy == QuantizationStrategy.TENSOR
             weight_scale = PerTensorScaleParameter(
                 data=torch.empty(
-                    len(output_partition_sizes) * fused_parameters, dtype=torch.float32
+                    # TODO (yiakwy) : impl logics inside PerTensorScaleParameter, i.e. each of fused prameteres has (fused_parameters,) tensor-wise weight scale parameters
+                    len(output_partition_sizes) * fused_parameters,
+                    dtype=torch.float32,
                 ),
                 weight_loader=weight_loader,
             )
@@ -246,23 +253,16 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
-        if hasattr(layer, "fused_parameters") and layer.fused_parameters > 0:
-            if "model.layers.52.self_attn.fused_qkv_a_proj_with_mqa" in layer.prefix:
-                from remote_pdb import set_trace
+        # if "model.layers.52.self_attn.fused_qkv_a_proj_with_mqa" in layer.prefix:
+        #     from remote_pdb import set_trace
 
-                set_trace()
-                pass
-
-            if "model.layers.52.self_attn.q_a_proj" in layer.prefix:
-                from remote_pdb import set_trace
-
-                set_trace()
-                pass
+        #     set_trace()
+        #     pass
 
         # NOTE (fallback to non-fused solution) : concat([input * w[:shard1] * w_shard1_scale, input * w[shart1:shart1+shart2] * w_shard2_scale], dim=1)
         # Will write kernel to improve it later
 
-        if False and hasattr(layer, "fused_parameters") and layer.fused_parameters > 0:
+        if hasattr(layer, "fused_parameters") and layer.fused_parameters > 0:
             if "fused_qkv_a_proj_with_mqa" in layer.prefix:
                 assert layer.fused_parameters == 2
 
