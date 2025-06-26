@@ -28,7 +28,7 @@ class Mod(nn.Module):
 
 class TestGemm(CustomTestCase):
     M = [1, 101]
-    N = [32 * 13]
+    N = [16, 32 * 13]
     K = [32 * 16]
     has_bias = [False, True]
 
