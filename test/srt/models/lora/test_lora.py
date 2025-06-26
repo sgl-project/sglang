@@ -19,7 +19,6 @@ import unittest
 from typing import List
 
 import torch
-
 from utils import (
     ALL_OTHER_MULTI_LORA_MODELS,
     CI_MULTI_LORA_MODELS,
@@ -56,20 +55,24 @@ TEST_MULTIPLE_BATCH_PROMPTS = [
 
 
 class TestLoRA(CustomTestCase):
-    def _create_test_samples(self, lora_adapter_paths: List[str], repeated_trials: int = 3):
+    def _create_test_samples(
+        self, lora_adapter_paths: List[str], repeated_trials: int = 3
+    ):
         state = random.getstate()
         random.seed(42)  # Ensure reproducibility
 
         patterns = [
-                [None, lora_adapter_paths[0], lora_adapter_paths[1]],
-                [lora_adapter_paths[0], None, lora_adapter_paths[1]],
-                [lora_adapter_paths[0], lora_adapter_paths[1], None],
-                [None, lora_adapter_paths[1], None],
-                [None, None, None],
-            ]
-        
+            [None, lora_adapter_paths[0], lora_adapter_paths[1]],
+            [lora_adapter_paths[0], None, lora_adapter_paths[1]],
+            [lora_adapter_paths[0], lora_adapter_paths[1], None],
+            [None, lora_adapter_paths[1], None],
+            [None, None, None],
+        ]
+
         batches = [
-            [random.choice(pattern) for _ in range(3)] for pattern in patterns for _ in range(repeated_trials)
+            [random.choice(pattern) for _ in range(3)]
+            for pattern in patterns
+            for _ in range(repeated_trials)
         ]
 
         random.setstate(state)
@@ -115,8 +118,7 @@ class TestLoRA(CustomTestCase):
                 with srt_runner, hf_runner:
                     for i, lora_paths in enumerate(batches, start=1):
                         prompts = [
-                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS)
-                            for _ in range(3)
+                            random.choice(TEST_MULTIPLE_BATCH_PROMPTS) for _ in range(3)
                         ]
                         print(
                             f"\n--- Running Batch {i} --- prompts: {prompts}, lora_paths: {lora_paths}"
