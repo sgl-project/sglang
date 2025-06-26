@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
@@ -363,7 +363,7 @@ class FlashAttentionBackend(AttentionBackend):
             if hasattr(model_runner, "attention_chunk_size")
             else None
         )
-        
+
         self._last_tick = time.time()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -866,7 +866,9 @@ class FlashAttentionBackend(AttentionBackend):
                     elapsed_layer = (time.time() - self._last_tick) * 1000
                     self._last_tick = time.time()
                     capture.report()
-                    print(f"[fa3] layer {layer.layer_id} took {elapsed:.2f} ms (from last tick: {elapsed_layer:.2f} ms)")
+                    print(
+                        f"[fa3] layer {layer.layer_id} took {elapsed:.2f} ms (from last tick: {elapsed_layer:.2f} ms)"
+                    )
 
                 return output, lse
             else:

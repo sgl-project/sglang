@@ -247,7 +247,10 @@ class EAGLEWorker(TpModelWorker):
                 FlashAttentionBackend,
                 FlashAttentionMultiStepBackend,
             )
-            
+            from sglang.srt.layers.attention.hip_attention import (
+                HiPAttentionMultiStepBackend,
+            )
+
             assert not self.server_args.hip_attention_config.using_extend
 
             self.draft_attn_backend = FlashAttentionMultiStepBackend(
