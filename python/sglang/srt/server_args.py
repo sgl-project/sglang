@@ -156,6 +156,7 @@ class ServerArgs:
     # HiP Attention
     enable_hip_attention: bool = False
     hip_attention_config: Optional[HiPAttentionConfig] = None
+    hip_attention_config_path: Optional[str] = None
 
     # HiP Attention Offload
     enable_hip_kv_cache_offload: bool = False
@@ -2107,9 +2108,15 @@ class ServerArgs:
 
         if args.enable_hip_attention:
             from hip_attn.v1_2 import HiPAttentionConfig
+            
+            if args.hip_attention_config_path is not None:
+                json_or_path = args.hip_attention_config_path
+            else:
+                assert hasattr(args, 'hip_attention_config')
+                json_or_path = args.hip_attention_config
 
             args.hip_attention_config = HiPAttentionConfig(
-                json_or_path=args.hip_attention_config_path
+                json_or_path=json_or_path
             )
             logger.info(
                 f"attention_backend changed {args.attention_backend} -> hip_attention"
