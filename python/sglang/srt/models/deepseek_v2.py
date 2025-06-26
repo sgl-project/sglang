@@ -251,6 +251,9 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
 
+        # for debug purpose
+        self.prefix = prefix
+
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -375,6 +378,10 @@ class DeepseekV2MoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
     ) -> torch.Tensor:
+
+        # from remote_pdb import set_trace
+        # set_trace()
+
         if not self._enable_deepep_moe:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
             if (
@@ -531,6 +538,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights=topk_weights,
                 forward_mode=forward_mode,
             )
+
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
