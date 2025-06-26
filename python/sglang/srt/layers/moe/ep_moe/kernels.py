@@ -178,7 +178,7 @@ def pre_reorder_triton_kernel(
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
 
-    src_idx = tl.program_id(0)
+    src_idx = tl.program_id(0).to(tl.int64)
     src2dst_ptr = src2dst_ptr + src_idx * topk
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
     src_ptr = input_ptr + src_idx * hidden_size
@@ -197,7 +197,7 @@ def pre_reorder_triton_kernel(
             else:
                 scale = 1.0
 
-            dst_idx = tl.load(src2dst_ptr + idx)
+            dst_idx = tl.load(src2dst_ptr + idx).to(tl.int64)
             dst_ptr = gateup_input_ptr + dst_idx * hidden_size
             for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
                 offset = start_offset + vec
