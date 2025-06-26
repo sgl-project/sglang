@@ -123,30 +123,23 @@ class GroupedGemmRunner(torch.nn.Module):
             )
         else:
             assert weight_column_major == True
-
-            try:
-                c = grouped_gemm_triton(
-                    a,
-                    b,
-                    c,
-                    batch_size,
-                    weight_column_major,
-                    seg_indptr,
-                    weight_indices,
-                    use_fp8_w8a8,
-                    scale_a,
-                    scale_b,
-                    block_shape=block_shape,
-                    c_dtype=c_dtype,
-                    # support broadcasting if self.use_per_token_if_dynamic is True
-                    use_per_token_if_dynamic=self.use_per_token_if_dynamic
-                    or block_shape is not None,
-                )
-            except Exception as e:
-                from remote_pdb import set_trace
-
-                set_trace()
-                pass
+            c = grouped_gemm_triton(
+                a,
+                b,
+                c,
+                batch_size,
+                weight_column_major,
+                seg_indptr,
+                weight_indices,
+                use_fp8_w8a8,
+                scale_a,
+                scale_b,
+                block_shape=block_shape,
+                c_dtype=c_dtype,
+                # support broadcasting if self.use_per_token_if_dynamic is True
+                use_per_token_if_dynamic=self.use_per_token_if_dynamic
+                or block_shape is not None,
+            )
         return c
 
 
@@ -525,12 +518,6 @@ class EPMoE(torch.nn.Module):
             device=hidden_states_device,
             dtype=torch.int64,
         )
-
-        if "model.layers.3.mlp.experts" in self.prefix:
-            from remote_pdb import set_trace
-
-            set_trace()
-            pass
 
         # GroupGemm-0
         gateup_output = self.grouped_gemm_runner(
@@ -952,11 +939,6 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                 requires_grad=False,
             )
 
-            print("************************************")
-            print(
-                f"[Fp8EPMoEMethod] [block-wise] creating w_13_scale: {w13_weight_scale.shape}"
-            )
-
             w2_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts_per_partition,
@@ -978,11 +960,6 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                 requires_grad=False,
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
-
-            print("************************************")
-            print(
-                f"[Fp8EPMoEMethod] [tensor-wise] creating w_13_scale: {w13_weight_scale.shape}"
-            )
 
             w2_weight_scale = torch.nn.Parameter(
                 torch.ones(num_experts_per_partition, dtype=torch.float32),
@@ -1254,28 +1231,21 @@ class DeepEPMoE(EPMoE):
                 hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
             )
 
-        # from remote_pdb import set_trace
-        # set_trace()
-
+        # NOTE (yiakwy) : currently we force mock block-wise scaling from tensor-wise scalars
         if False and self.activation_scheme == "dynamic" and not self.use_block_quant:
-            try:
-                # NOTE (yiakwy) : wrong input_scale shape
-                # max_value = (
-                #     torch.max(hidden_states)
-                #     .repeat(self.num_experts_per_partition)
-                #     .to(torch.float32)
-                # )
-                max_value = (
-                    torch.max(hidden_states)
-                    .repeat(hidden_states.shape[0])
-                    .to(torch.float32)
-                )
-                self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
-            except Exception as e:
-                from remote_pdb import set_trace
+            # NOTE (yiakwy) : wrong input_scale shape
+            # max_value = (
+            #     torch.max(hidden_states)
+            #     .repeat(self.num_experts_per_partition)
+            #     .to(torch.float32)
+            # )
+            max_value = (
+                torch.max(hidden_states)
+                .repeat(hidden_states.shape[0])
+                .to(torch.float32)
+            )
+            self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
 
-                set_trace()
-                pass
         weight_indices_cur_rank = torch.arange(
             0,
             self.num_experts_per_partition,
@@ -1298,9 +1268,6 @@ class DeepEPMoE(EPMoE):
             self.block_shape if self.block_shape is not None else [128, 128]
         )  # self.quant_method.quant_config.weight_block_size
         if isinstance(self.quant_method.quant_config, CompressedTensorsConfig):
-            # from remote_pdb import set_trace
-            # set_trace()
-
             hidden_size = hidden_states.shape[1]  # 7168
             intermediate_size = 2048
 
