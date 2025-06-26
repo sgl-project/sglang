@@ -58,7 +58,6 @@ class TestLoRA(CustomTestCase):
     def _create_test_samples(
         self, lora_adapter_paths: List[str], repeated_trials: int = 3
     ):
-        state = random.getstate()
         random.seed(42)  # Ensure reproducibility
 
         patterns = [
@@ -75,16 +74,16 @@ class TestLoRA(CustomTestCase):
             for _ in range(repeated_trials)
         ]
 
-        random.setstate(state)
         return batches
 
-    def _run_lora_multiple_batch_on_model_cases(self, model_cases: List[LoRAModelCase]):
-        # Ensure reproducibility
+    def ensure_reproducibility(self):
         seed = 42
         random.seed(seed)
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
         torch.use_deterministic_algorithms(True)
+
+    def _run_lora_multiple_batch_on_model_cases(self, model_cases: List[LoRAModelCase]):
 
         for model_case in model_cases:
             for torch_dtype in TORCH_DTYPES:
@@ -124,12 +123,14 @@ class TestLoRA(CustomTestCase):
                             f"\n--- Running Batch {i} --- prompts: {prompts}, lora_paths: {lora_paths}"
                         )
 
+                        self.ensure_reproducibility()
                         srt_outputs = srt_runner.batch_forward(
                             prompts,
                             max_new_tokens=max_new_tokens,
                             lora_paths=lora_paths,
                         )
 
+                        self.ensure_reproducibility()
                         hf_outputs = hf_runner.forward(
                             prompts,
                             max_new_tokens=max_new_tokens,
