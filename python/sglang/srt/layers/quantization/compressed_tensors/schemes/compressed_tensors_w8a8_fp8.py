@@ -117,9 +117,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
 
             return rectified_weight, rectified_weight_scale
 
-        # if "model.layers.52.self_attn.fused_qkv_a_proj_with_mqa" in layer.prefix:
         if "fused_qkv_a_proj_with_mqa" in layer.prefix:
-            # from remote_pdb import set_trace
 
             # See DeepSeek V2
             assert layer.fused_parameters == 2
@@ -143,8 +141,6 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                     [layer.fused_shapes[1]],
                 )
             )
-
-            # set_trace()
 
             # assigned merged weights back
             merged_weight = torch.cat(
@@ -252,12 +248,6 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
-        # if "model.layers.52.self_attn.fused_qkv_a_proj_with_mqa" in layer.prefix:
-        #     from remote_pdb import set_trace
-
-        #     set_trace()
-        #     pass
 
         # NOTE (fallback to non-fused solution) : concat([input * w[:shard1] * w_shard1_scale, input * w[shart1:shart1+shart2] * w_shard2_scale], dim=1)
         # Will write kernel to improve it later
