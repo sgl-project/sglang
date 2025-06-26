@@ -143,6 +143,10 @@ class BaseFormatDetector(ABC):
                 if current_text.startswith(self.bot_token):
                     start_idx = len(self.bot_token)
                 elif self.current_tool_id > 0 and current_text.startswith(
+                    self.tool_call_separator + self.bot_token
+                ):
+                    start_idx = len(self.tool_call_separator + self.bot_token)
+                elif self.current_tool_id > 0 and current_text.startswith(
                     self.tool_call_separator
                 ):
                     start_idx = len(self.tool_call_separator)

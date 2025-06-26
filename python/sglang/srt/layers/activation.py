@@ -48,6 +48,9 @@ if _is_cuda:
 
 logger = logging.getLogger(__name__)
 
+if is_npu():
+    import torch_npu
+
 
 class SiluAndMul(CustomOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
@@ -69,6 +72,10 @@ class SiluAndMul(CustomOp):
             return out
         else:
             return self.forward_native(x)
+
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch_npu.npu_swiglu(x)
+        return out
 
 
 class GeluAndMul(CustomOp):

@@ -306,27 +306,29 @@ class CudaGraphRunner:
                 self.encoder_lens = None
 
             if self.require_gathered_buffer:
+                self.gathered_buffer = torch.zeros(
+                    (
+                        self.max_num_token,
+                        self.model_runner.model_config.hidden_size,
+                    ),
+                    dtype=self.model_runner.dtype,
+                )
                 if self.require_mlp_tp_gather:
-                    self.gathered_buffer = torch.zeros(
-                        (
-                            self.max_bs * self.dp_size * self.num_tokens_per_bs,
-                            self.model_runner.model_config.hidden_size,
-                        ),
-                        dtype=self.model_runner.dtype,
-                    )
                     self.global_num_tokens_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32
                     )
                 else:
                     assert self.require_attn_tp_gather
-                    self.gathered_buffer = torch.zeros(
-                        (
-                            self.max_bs * self.num_tokens_per_bs,
-                            self.model_runner.model_config.hidden_size,
-                        ),
-                        dtype=self.model_runner.dtype,
-                    )
                     self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
+
+            self.custom_mask = torch.ones(
+                (
+                    (self.seq_lens.sum().item() + self.max_num_token)
+                    * self.num_tokens_per_bs
+                ),
+                dtype=torch.bool,
+                device="cuda",
+            )
 
         # Capture
         try:
@@ -419,7 +421,7 @@ class CudaGraphRunner:
                             empty_cache=False,
                         )
                         capture_range.set_description(
-                            f"Capturing batches ({avail_mem=:.2f} GB)"
+                            f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                         )
 
                     with patch_model(
@@ -674,11 +676,12 @@ class CudaGraphRunner:
             self.num_token_non_padded.copy_(forward_batch.num_token_non_padded)
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
-                forward_mode=forward_batch.forward_mode,
+                forward_mode=self.capture_forward_mode,
                 bs=bs,
                 num_token_non_padded=len(forward_batch.input_ids),
             )
-
+        if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
+            forward_batch.spec_info.custom_mask = self.custom_mask
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
@@ -686,7 +689,7 @@ class CudaGraphRunner:
             self.seq_lens[:bs],
             forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
             self.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            forward_batch.forward_mode,
+            self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=self.seq_lens_cpu[:bs],
         )
@@ -736,11 +739,7 @@ class CudaGraphRunner:
             else:
                 spec_info = EagleVerifyInput(
                     draft_token=None,
-                    custom_mask=torch.ones(
-                        (num_tokens * self.model_runner.model_config.context_len),
-                        dtype=torch.bool,
-                        device="cuda",
-                    ),
+                    custom_mask=self.custom_mask,
                     positions=None,
                     retrive_index=None,
                     retrive_next_token=None,

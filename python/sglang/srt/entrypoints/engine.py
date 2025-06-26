@@ -115,13 +115,13 @@ class Engine(EngineBase):
         atexit.register(self.shutdown)
 
         # Allocate ports for inter-process communications
-        port_args = PortArgs.init_new(server_args)
+        self.port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
         # Launch subprocesses
         tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args,
-            port_args=port_args,
+            port_args=self.port_args,
         )
         self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
@@ -130,7 +130,7 @@ class Engine(EngineBase):
 
         context = zmq.Context(2)
         self.send_to_rpc = get_zmq_socket(
-            context, zmq.DEALER, port_args.rpc_ipc_name, True
+            context, zmq.DEALER, self.port_args.rpc_ipc_name, True
         )
 
     def generate(
@@ -242,6 +242,7 @@ class Engine(EngineBase):
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        return_hidden_states: bool = False,
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
@@ -274,6 +275,7 @@ class Engine(EngineBase):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
+            return_hidden_states=return_hidden_states,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
             bootstrap_host=bootstrap_host,
