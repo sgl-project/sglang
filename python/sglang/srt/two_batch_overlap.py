@@ -119,7 +119,11 @@ def split_spec_info(
         logger.info(
             f"seq_lens_cpu={spec_info.seq_lens_cpu}, start_seq_index={start_seq_index}, end_seq_index={end_seq_index}, custom_mask_start={custom_mask_start}, custom_mask_end={custom_mask_end}, spec_info.custom_mask_shape={spec_info.custom_mask.shape}"
         )
-        custom_mask = spec_info.custom_mask[custom_mask_start:custom_mask_end]
+        if custom_mask_end > custom_mask_start:
+            custom_mask = spec_info.custom_mask[custom_mask_start:custom_mask_end]
+        else:
+            custom_mask = spec_info.custom_mask
+
         # custom_mask = torch.full(
         #     (spec_info.custom_mask.shape[0],),
         #     True,
