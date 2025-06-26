@@ -122,7 +122,7 @@ class L3LoadCacheOperation:
         self.node_ids.extend(other.node_ids)
         self.data = torch.cat([self.data, other.data], dim=cat_dim)
 
-    def __lt__(self, other: "MooncakeStoreCacheOperation"):
+    def __lt__(self, other: "L3LoadCacheOperation"):
         return self.priority < other.priority
 
 

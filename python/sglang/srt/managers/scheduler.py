@@ -1545,8 +1545,6 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             # check for completion of hierarchical cache activities to release memory
             self.tree_cache.check_hicache_events()
-            if self.enable_mooncake_store_l3_cache:
-                self.tree_cache.l3_loading_check()
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)

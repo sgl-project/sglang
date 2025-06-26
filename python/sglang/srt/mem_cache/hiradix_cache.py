@@ -494,6 +494,8 @@ class HiRadixCache(RadixCache):
     def check_hicache_events(self):
         self.writing_check()
         self.loading_check()
+        if self.enable_mooncake_store_l3_cache:
+            self.l3_loading_check()
 
     def match_prefix(self, key: List[int], **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
