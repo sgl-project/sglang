@@ -1058,12 +1058,7 @@ class TokenizerManager:
                         "lora_path",
                     ]
                 )
-                out_skip_names = set(
-                    [
-                        "text",
-                        "output_ids",
-                    ]
-                )
+                out_skip_names = set(["text", "output_ids", "embedding"])
             elif self.log_requests_level == 1:
                 max_length = 2048
             elif self.log_requests_level == 2:
@@ -1231,7 +1226,7 @@ class TokenizerManager:
                     state.last_output_offset = len(state.output_ids)
                 else:
                     state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids
+                    output_token_ids = state.output_ids.copy()
 
                 out_dict = {
                     "output_ids": output_token_ids,
