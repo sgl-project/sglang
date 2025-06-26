@@ -288,7 +288,7 @@ class EagleVerifyInput:
             batch.req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
         )
-        
+
         if batch.hip_mask_refresh_state is not None:
             batch.hip_metadata_cached_stages = batch.hip_mask_refresh_state.update()
 

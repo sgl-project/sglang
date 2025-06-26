@@ -853,7 +853,9 @@ class CudaGraphRunner:
             end.record()
             end.synchronize()
             elapsed = start.elapsed_time(end)
-            print(f"[CudaGraphRunner.replay] graph {graph_handle} took {elapsed:.2f} ms")
+            print(
+                f"[CudaGraphRunner.replay] graph {graph_handle} took {elapsed:.2f} ms"
+            )
         output = self.output_buffers[graph_handle]
 
         if isinstance(output, LogitsProcessorOutput):
