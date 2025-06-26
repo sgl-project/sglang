@@ -4,8 +4,7 @@ MODEL_PATH="/raid/models/meta-llama/Llama-3.1-8B-Instruct"
 
 # Function to find the first available active IB device
 find_active_ib_device() {
-    ibv_devices=$(ibv_devices)
-    for device in $ibv_devices; do
+    for device in mlx5_{0..11}; do
         if ibv_devinfo $device >/dev/null 2>&1; then
             state=$(ibv_devinfo $device | grep "state:" | head -1 | awk '{print $2}')
             if [[ "$state" == "PORT_ACTIVE" ]]; then
@@ -14,6 +13,8 @@ find_active_ib_device() {
             fi
         fi
     done
+    echo "No active IB device found" >&2
+    return 1
 }
 
 # Get the first available active IB device
@@ -34,7 +35,6 @@ for i in {0..3}; do
     --port "$PORT" \
     --disaggregation-ib-device "$DEVICE" \
     --disaggregation-bootstrap-port "$BOOTSTRAP_PORT" &
-
 done
 
 # Launch decode servers on GPU 4–7
@@ -53,19 +53,39 @@ for i in {4..7}; do
 done
 
 # Wait for disaggregation servers to initialize
-for i in {0..7}; do
-  HOST="127.0.0.$((i + 1))"
-  PORT=$((30001 + i))
-  until curl --fail --silent $HOST:$PORT/health; do
-    if ((SECONDS > 120)); then
-      echo "Timeout waiting for $HOST:$PORT to become healthy"
-      exit 1
-    fi
-    echo "Waiting for $HOST:$PORT to become healthy..."
-    sleep 5
-  done
-done
+echo "Waiting for disaggregation servers to initialize..."
 
+# Health check with 5-minute timeout
+TIMEOUT=300
+START_TIME=$(date +%s)
+
+echo "Checking health of all 8 servers..."
+while true; do
+    CURRENT_TIME=$(date +%s)
+    ELAPSED=$((CURRENT_TIME - START_TIME))
+
+    if [ $ELAPSED -ge $TIMEOUT ]; then
+        echo "❌ Timeout: Servers did not become healthy within 5 minutes"
+        exit 1
+    fi
+
+    HEALTHY_COUNT=0
+    # Check all 8 servers (127.0.0.1-8:30001-30008)
+    for i in {1..8}; do
+        if curl -s -f "http://127.0.0.$i:$((30000 + i))/health" >/dev/null 2>&1; then
+            HEALTHY_COUNT=$((HEALTHY_COUNT + 1))
+        fi
+    done
+
+    echo "Healthy servers: $HEALTHY_COUNT/8 (elapsed: ${ELAPSED}s)"
+
+    if [ $HEALTHY_COUNT -eq 8 ]; then
+        echo "✅ All 8 servers are healthy!"
+        break
+    else
+        sleep 5  # Wait 5 seconds before next check
+    fi
+done
 
 # Launch the router
 echo "Launching router at 127.0.0.9:8000..."
@@ -83,4 +103,4 @@ python3 -m sglang_router.launch_router \
   --host 127.0.0.9 \
   --port 8000 &
 
-wait
+wait  # Wait for all background jobs to finish
