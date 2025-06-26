@@ -314,7 +314,9 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/amd_ci_install_dependency.sh
+        run: |
+          bash scripts/amd_ci_install_dependency.sh
+          pip install pytest
 
       - name: Run test
         timeout-minutes: 10
