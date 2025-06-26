@@ -130,12 +130,30 @@ jobs:
         bash scripts/ci_start_disaggregation_servers.sh &
         SERVER_PID=$!
         echo "server_pid=$SERVER_PID" >> $GITHUB_OUTPUT
-        sleep 70
-        if ! ps -p $SERVER_PID > /dev/null; then
-          echo "Error: Server processes failed to start"
+
+        echo "Waiting for router to become healthy..."
+        TIMEOUT=300
+        ELAPSED=0
+        while [ $ELAPSED -lt $TIMEOUT ]; do
+          if curl --fail --silent http://127.0.0.9:8000/health > /dev/null 2>&1; then
+            echo "✓ Router is healthy"
+            break
+          fi
+          if ! ps -p $SERVER_PID > /dev/null; then
+            echo "Error: Server processes failed to start"
+            exit 1
+          fi
+          echo "Waiting for router... (${ELAPSED}s/${TIMEOUT}s)"
+          sleep 10
+          ELAPSED=$((ELAPSED + 10))
+        done
+
+        if [ $ELAPSED -ge $TIMEOUT ]; then
+          echo "Error: Router health check timeout after ${TIMEOUT}s"
           exit 1
         fi
-        echo "✓ Servers started (PID: $SERVER_PID)"
+
+        echo "✓ Servers started and healthy (PID: $SERVER_PID)"
 
     - name: Test API functionality
       timeout-minutes: 5

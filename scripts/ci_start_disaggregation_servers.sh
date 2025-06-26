@@ -83,7 +83,7 @@ while true; do
         echo "✅ All 8 servers are healthy!"
         break
     else
-        sleep 5  # Wait 5 seconds before next check
+        sleep 10  # Wait 10 seconds before next check
     fi
 done
 
