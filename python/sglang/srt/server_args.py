@@ -1289,7 +1289,7 @@ class ServerArgs:
         parser.add_argument(
             "--hip-attention-config-path",
             type=str,
-            default=ServerArgs.hip_attention_config,
+            default=ServerArgs.hip_attention_config_path,
             help="Path to the HiP attention config file, or the json in string format.",
         )
 
