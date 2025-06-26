@@ -520,7 +520,7 @@ class Gemma3nAudioSSCPConvBlock(nn.Module):
         self.norm = Gemma3nCumulativeGroupNorm(
             num_channels=out_channels,
             feature_dims=(f_out_conv,),
-            eps=self.config.sscp_conv_eps,
+            eps=self.config.sscp_conv_group_norm_eps,
         )
 
         self.activation = nn.ReLU()
