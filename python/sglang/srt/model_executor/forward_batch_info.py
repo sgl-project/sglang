@@ -193,8 +193,11 @@ class ForwardBatch:
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
     # For split prefill
+    # intermediate values for split prefill
     hidden_states: torch.Tensor = None
     residual: torch.Tensor = None
+    model_specific_states: Dict[str, any] = None
+    # current split index of layer
     split_index: int = 0
 
     # For MLA chunked prefix cache used in chunked prefill
