@@ -97,7 +97,6 @@ class Sampler(nn.Module):
                                 sampling_info.top_ps,
                                 sampling_info.temperatures,
                             )
-                        )
                 elif global_server_args_dict["sampling_backend"] == "pytorch":
                     # A slower fallback implementation with torch native operations.
                     logits.div_(sampling_info.temperatures)
