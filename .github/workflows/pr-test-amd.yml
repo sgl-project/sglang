@@ -302,7 +302,6 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi300-gpu-1, linux-mi325-gpu-1]
-        part: [0, 1, 2, 3, 4, 5]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
