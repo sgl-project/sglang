@@ -12,6 +12,7 @@ import time
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
+import triton
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -19,12 +20,13 @@ from sglang.srt.mem_cache.hip_offload_kv_pool_mha import MHATokenToHiPOffloadKVP
 
 if TYPE_CHECKING:
     from hip_attn.v1_2 import HiPAttentionConfig
+    from sglang.srt.speculative.spec_info import SpecInfo
 
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-    from sglang.srt.speculative.spec_info import SpecInfo
+
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +63,14 @@ from sglang.srt.layers.attention.flashattention_backend import (
 
 class HiPAttentionBackend(AttentionBackend):
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(
+        self, 
+        model_runner: ModelRunner,
+        skip_prefill: bool = False,
+        speculative_step_id=0,
+        topk=0,
+        speculative_num_steps=0,
+    ):
         super().__init__()
 
         from hip_attn.v1_2.paged_hip import PagedHiPStateful
@@ -85,9 +94,15 @@ class HiPAttentionBackend(AttentionBackend):
 
         self.attention_chunk_size = model_runner.attention_chunk_size
 
-        self.flashattention_backend = FlashAttentionBackend(model_runner=model_runner)
+        self.flashattention_backend = FlashAttentionBackend(
+            model_runner=model_runner,
+            skip_prefill=skip_prefill,
+            speculative_step_id=speculative_step_id,
+            topk=topk,
+            speculative_num_steps=speculative_num_steps,
+        )
 
-        self._last_tick = 0
+        self._last_tick = time.time()
 
         self._block_table: torch.Tensor = None
 
@@ -133,6 +148,7 @@ class HiPAttentionBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
+        out_cache_loc: torch.Tensor = None,
     ):
         self.flashattention_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
@@ -143,6 +159,7 @@ class HiPAttentionBackend(AttentionBackend):
             forward_mode=forward_mode,
             spec_info=spec_info,
             seq_lens_cpu=seq_lens_cpu,
+            out_cache_loc=out_cache_loc,
         )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -274,9 +291,10 @@ class HiPAttentionBackend(AttentionBackend):
                     )
                 )
 
-            use_cascade_attn = (
-                forward_batch.forward_mode.is_target_verify() and self.topk > 1
-            )
+            # use_cascade_attn = (
+            #     forward_batch.forward_mode.is_target_verify() and self.topk > 1
+            # )
+            use_cascade_attn = False
 
             if not self.use_mla:
                 q_reshaped = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
@@ -318,49 +336,172 @@ class HiPAttentionBackend(AttentionBackend):
                     using_chunked_sliding_window=using_chunked_sw,
                 )
             else:
-                assert q.shape[0] == 1, f"{q.shape=}"
-                k_reshaped = k.reshape(1, -1, layer.tp_k_head_num, layer.head_dim)
-                v_reshaped = v.reshape(1, -1, layer.tp_v_head_num, layer.v_head_dim)
+                if (
+                    # not global_server_args_dict["disable_chunked_prefix_cache"]
+                    # and forward_batch.attn_attend_prefix_cache is not None
+                    # and not forward_batch.forward_mode.is_target_verify()
+                    # and not forward_batch.forward_mode.is_draft_extend()
+                    not global_server_args_dict["disable_chunked_prefix_cache"]
+                    # and forward_batch.attn_attend_prefix_cache is not None
+                    and forward_batch.forward_mode.is_extend()
+                    and not forward_batch.forward_mode.is_target_verify()
+                    and not forward_batch.forward_mode.is_draft_extend()
+                ):
+                    # Do multi-head attention with chunked prefix cache
 
-                assert not use_cascade_attn
+                    assert q.shape[0] == 1, f"{q.shape=}"
+                    k_reshaped = k.reshape(1, -1, layer.tp_k_head_num, layer.head_dim)
+                    v_reshaped = v.reshape(1, -1, layer.tp_v_head_num, layer.v_head_dim)
 
-                o, metadata = self.forward_paged_hip(
-                    query=q,
-                    sm_scale=layer.scaling,
-                    batch_size=forward_batch.batch_size,
-                    k=k_reshaped,
-                    v=v_reshaped,
-                    k_cache=None,
-                    v_cache=None,
-                    offload_cache=offload_cache,
-                    positions=forward_batch.positions,
-                    seq_lens=forward_batch.seq_lens,
-                    req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
-                    req_pool_indices=forward_batch.req_pool_indices,
-                    block_table=self._block_table,
-                    rope_cos=layer.rope_cos,
-                    rope_sin=layer.rope_sin,
-                    rope_range=layer.rope_range,
-                    rope_is_neox_style=layer.rope_is_neox_style,
-                    layer_id=layer.layer_id,
-                    logit_cap=layer.logit_cap,
-                    orig_context_len=layer.orig_context_len,
-                    max_context_len=self.max_context_len,
-                    extend_seq_lens=forward_batch.extend_seq_lens,
-                    extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-                    hip_config=self.hip_config,
-                    is_kv_cache_offload_enabled=self.is_kv_cache_offload_enabled,
-                    cached_metadata=None,
-                    online_update_cache=(
-                        forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
-                        if self.is_kv_cache_offload_enabled
-                        else None
-                    ),
-                    is_decode=False,
-                    offloading_metadata=offloading_metadata,
-                    sliding_window_size=sw_size,
-                    using_chunked_sliding_window=using_chunked_sw,
-                )
+                    assert not use_cascade_attn
+
+                    o, metadata = self.forward_paged_hip(
+                        query=q,
+                        sm_scale=layer.scaling,
+                        batch_size=forward_batch.batch_size,
+                        k=k_reshaped,
+                        v=v_reshaped,
+                        k_cache=None,
+                        v_cache=None,
+                        offload_cache=offload_cache,
+                        positions=forward_batch.positions,
+                        seq_lens=forward_batch.seq_lens,
+                        req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        block_table=self._block_table,
+                        rope_cos=layer.rope_cos,
+                        rope_sin=layer.rope_sin,
+                        rope_range=layer.rope_range,
+                        rope_is_neox_style=layer.rope_is_neox_style,
+                        layer_id=layer.layer_id,
+                        logit_cap=layer.logit_cap,
+                        orig_context_len=layer.orig_context_len,
+                        max_context_len=self.max_context_len,
+                        extend_seq_lens=forward_batch.extend_seq_lens,
+                        extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                        hip_config=self.hip_config,
+                        is_kv_cache_offload_enabled=self.is_kv_cache_offload_enabled,
+                        cached_metadata=None,
+                        online_update_cache=(
+                            forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
+                            if self.is_kv_cache_offload_enabled
+                            else None
+                        ),
+                        is_decode=False,
+                        offloading_metadata=offloading_metadata,
+                        sliding_window_size=sw_size,
+                        using_chunked_sliding_window=using_chunked_sw,
+                    )
+                else:
+                    # Do absorbed multi-latent attention
+                    
+                    require_metadata_checkout = False
+                    if forward_batch.forward_mode.is_target_verify():
+                        # NOTE: this condition will be graph captured.
+                        metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache(
+                            layer.layer_id,
+                            q.shape[0],
+                            forward_batch.batch_size,
+                            forward_batch.hip_metadata_cached_stages,
+                            block_size_q=self.hip_config.block_sparse_block_size_q,
+                        )
+                        require_metadata_checkout = True
+                    else:
+                        metadata = None
+                    
+                    kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                    nope_dim = triton.next_power_of_2(kv_cache.shape[-1]) // 2
+                    rope_dim = kv_cache.shape[-1] - nope_dim
+                    # print(q.shape, kv_cache.shape, nope_dim, rope_dim)
+                    
+                    kv_head = kv_cache.shape[-2]
+                    q_head = q.shape[-2]
+                    
+                    k_rope = kv_cache[..., nope_dim:]
+                    c_kv = kv_cache[..., :nope_dim]
+                    # k_rope_cache = k_rope.view(
+                    #     -1,
+                    #     self.page_size,
+                    #     layer.tp_k_head_num,
+                    #     layer.head_dim - layer.v_head_dim,
+                    # )
+                    c_kv_cache = c_kv.view(
+                        -1, self.page_size, kv_head, nope_dim
+                    )
+                    if q_rope is not None:
+                        q_nope = q.view(-1, q_head, nope_dim)
+                        q_rope = q_rope.view(
+                            -1, q_head, rope_dim
+                        )
+                    else:
+                        q_all = q.contiguous().view(-1, q_head, nope_dim + rope_dim)
+                        q_nope = q_all[:, :, :nope_dim]
+                        q_rope = q_all[:, :, nope_dim:]
+
+                    assert q_nope.shape[-1] == layer.rope_range[0]
+                    assert (q_rope.shape[-1] + q_nope.shape[-1]) == layer.rope_range[1]
+                    q_merged = torch.cat([q_nope, q_rope], dim=-1)
+                    # TODO FIXME
+                    # k_cache = torch.cat([c_kv_cache, k_rope_cache], dim=-1)
+                    k_cache = kv_cache
+                    v_cache = c_kv_cache
+                    
+                    if forward_batch.forward_mode.is_draft_extend():
+                        sw_size = 512
+                        sw_sink = 128
+                    else:
+                        sw_sink = -1
+                    
+                    # print(q_merged.shape, k_cache.shape, v_cache.shape, sw_sink, sw_size)
+                    
+                    o, metadata = self.forward_paged_hip(
+                        query=q_merged,
+                        sm_scale=layer.scaling,
+                        batch_size=forward_batch.batch_size,
+                        k=None,
+                        v=None,
+                        k_cache=k_cache,
+                        v_cache=v_cache,
+                        offload_cache=offload_cache,
+                        positions=forward_batch.positions,
+                        seq_lens=forward_batch.seq_lens,
+                        req_to_tokens=forward_batch.req_to_token_pool.req_to_token,
+                        req_pool_indices=forward_batch.req_pool_indices,
+                        block_table=self._block_table,
+                        rope_cos=layer.rope_cos,
+                        rope_sin=layer.rope_sin,
+                        rope_range=layer.rope_range,
+                        rope_is_neox_style=layer.rope_is_neox_style,
+                        layer_id=layer.layer_id,
+                        logit_cap=layer.logit_cap,
+                        orig_context_len=layer.orig_context_len,
+                        max_context_len=self.max_context_len,
+                        hip_config=self.hip_config,
+                        is_kv_cache_offload_enabled=self.is_kv_cache_offload_enabled,
+                        cached_metadata=metadata,
+                        online_update_cache=(
+                            forward_batch.token_to_kv_pool.is_online_cache_update_enabled()
+                            if self.is_kv_cache_offload_enabled
+                            else None
+                        ),
+                        is_decode=True,
+                        offloading_metadata=offloading_metadata,
+                        sliding_window_size=sw_size,
+                        sliding_window_sink=sw_sink,
+                        using_chunked_sliding_window=using_chunked_sw,
+                    )
+                    
+                    if require_metadata_checkout and (metadata is not None):
+                        forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
+                            layer_id=layer.layer_id,
+                            tdst=q.shape[0],
+                            batch_size=forward_batch.batch_size,
+                            metadata=metadata,
+                            block_size_q=self.hip_config.block_sparse_block_size_q,
+                        )
+
+                        if self.is_kv_cache_offload_enabled:
+                            offload_cache.handle_cache_miss(metadata)
 
         if run_benchmark:
             from hip_attn.v1_2.utils import capture
@@ -432,12 +573,16 @@ class HiPAttentionBackend(AttentionBackend):
                 k_rope=k_rope,
             )
         else:
-            metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache(
-                layer.layer_id,
-                q.shape[0],
-                forward_batch.batch_size,
-                forward_batch.hip_metadata_cached_stages,
-            )
+            if forward_batch.hip_metadata_cache_pool is not None:
+                metadata = forward_batch.hip_metadata_cache_pool.get_hip_metadata_cache(
+                    layer.layer_id,
+                    q.shape[0],
+                    forward_batch.batch_size,
+                    forward_batch.hip_metadata_cached_stages,
+                    block_size_q=self.hip_config.block_sparse_block_size_q,
+                )
+            else:
+                metadata = None
 
             if not self.is_kv_cache_offload_enabled:
                 if k is not None:
@@ -612,15 +757,80 @@ class HiPAttentionBackend(AttentionBackend):
                     using_chunked_sliding_window=using_chunked_sw,
                 )
 
-            if metadata is not None:
+            if (metadata is not None) and (forward_batch.hip_metadata_cache_pool is not None):
                 forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
                     layer_id=layer.layer_id,
-                    size=q.shape[0],
+                    tdst=q.shape[0],
                     batch_size=forward_batch.batch_size,
                     metadata=metadata,
+                    block_size_q=self.hip_config.block_sparse_block_size_q,
                 )
 
                 if self.is_kv_cache_offload_enabled:
                     offload_cache.handle_cache_miss(metadata)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+class HiPAttentionMultiStepBackend:
+
+    def __init__(
+        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
+    ):
+        self.model_runner = model_runner
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.attn_backends = []
+        for i in range(self.speculative_num_steps):
+            self.attn_backends.append(
+                HiPAttentionBackend(
+                    model_runner,
+                    speculative_step_id=i,
+                    topk=self.topk,
+                    speculative_num_steps=self.speculative_num_steps,
+                )
+            )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata(forward_batch)
+
+    def init_cuda_graph_state(self, max_bs: int):
+        for i in range(self.speculative_num_steps):
+            self.attn_backends[i].init_cuda_graph_state(max_bs)
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        forward_batch: ForwardBatch,
+    ):
+        assert forward_batch.spec_info is not None
+        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
+                forward_batch.batch_size,
+                forward_batch.batch_size * self.topk,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                encoder_lens=forward_batch.encoder_lens,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=forward_batch.spec_info,
+            )
+
+    def init_forward_metadata_replay_cuda_graph(
+        self, forward_batch: ForwardBatch, bs: int
+    ):
+        assert forward_batch.spec_info is not None
+        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
+                bs,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_sum,
+                encoder_lens=forward_batch.encoder_lens,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+                out_cache_loc=forward_batch.out_cache_loc,
+            )
