@@ -101,38 +101,6 @@ class ModelConfig:
             else:
                 enable_multimodal = True
 
-        # Override architecture to use causal LM when multimodal is disabled
-        if not enable_multimodal:
-            mm_to_causal_mapping = {
-                "Gemma3ForConditionalGeneration": "Gemma3ForCausalLM",
-                "Gemma3nForConditionalGeneration": "Gemma3nForCausalLM",
-                "Llama4ForConditionalGeneration": "Llama4ForCausalLM",
-            }
-            if self.hf_config.architectures[0] in mm_to_causal_mapping:
-                old_arch = self.hf_config.architectures[0]
-                new_arch = mm_to_causal_mapping[old_arch]
-
-                # Extract text config if this is a multimodal config
-                if (
-                    hasattr(self.hf_config, "text_config")
-                    and self.hf_config.text_config is not None
-                ):
-                    # Replace the full multimodal config with just the text config
-                    text_config = self.hf_config.text_config
-                    # Preserve the model_type and architectures on the text config
-                    text_config.architectures = [new_arch]
-                    # Update the main config reference
-                    self.hf_config = text_config
-                    logger.info(
-                        f"Overriding architecture from {old_arch} to {new_arch} and using text_config only since multimodal is disabled."
-                    )
-                else:
-                    # Fallback: just change the architecture
-                    self.hf_config.architectures[0] = new_arch
-                    logger.info(
-                        f"Overriding architecture from {old_arch} to {new_arch} since multimodal is disabled."
-                    )
-
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
