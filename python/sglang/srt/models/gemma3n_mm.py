@@ -5,24 +5,10 @@ from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
 
 import torch
 from torch import nn
-
-try:
-    from transformers import (
-        Gemma3nAudioConfig,
-        Gemma3nConfig,
-        Gemma3nTextConfig,
-        Gemma3nVisionConfig,
-        PreTrainedModel,
-    )
-except Exception as e:
-    Gemma3nTextConfig = None
-    Gemma3nVisionConfig = None
-    Gemma3nConfig = None
-    Gemma3nAudioConfig = None
-
-from transformers import PreTrainedModel
 from transformers.models.auto.modeling_auto import AutoModel
 
+from sglang.srt.configs import Gemma3nConfig
+from sglang.srt.configs.gemma3n5 import Gemma3nAudioConfig, Gemma3nVisionConfig, Gemma3nTextConfig
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -45,6 +31,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.gemma3n_audio import Gemma3nAudioEncoder
 from sglang.srt.models.gemma3n_causal import Gemma3nRMSNorm, Gemma3nTextModel
 from sglang.srt.utils import add_prefix
+from transformers import PreTrainedModel
 
 logger = logging.getLogger(__name__)
 
@@ -304,7 +291,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             # Process each image in the batch
             batch_size = pixel_values_batch.shape[0]
             for i in range(batch_size):
-                pixel_value = pixel_values_batch[i : i + 1]  # Keep batch dimension as 1
+                pixel_value = pixel_values_batch[i: i + 1]  # Keep batch dimension as 1
                 pixel_value = pixel_value.to(
                     device=self.vision_tower.device, dtype=self.language_model.dtype()
                 )
@@ -324,7 +311,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         ).permute(0, 2, 1)
 
         # Normalize and embed the soft tokens into language model space
-        vision_outputs *= self.config.vision_config.hidden_size**0.5
+        vision_outputs *= self.config.vision_config.hidden_size ** 0.5
         return self.embed_vision(inputs_embeds=vision_outputs)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:

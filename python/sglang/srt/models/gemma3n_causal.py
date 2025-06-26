@@ -4,12 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-try:
-    from transformers import Gemma3nTextConfig
-except Exception as e:
-    Gemma3nTextConfig = None
-    pass
-
+from sglang.srt.configs.gemma3n5 import Gemma3nTextConfig
 from transformers import AutoModel, PretrainedConfig, PreTrainedModel
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size

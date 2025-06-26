@@ -38,7 +38,7 @@ from sglang.srt.configs import (
     DeepseekVL2Config,
     ExaoneConfig,
     KimiVLConfig,
-    MultiModalityConfig,
+    MultiModalityConfig, Gemma3nConfig,
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
@@ -52,6 +52,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     MultiModalityConfig.model_type: MultiModalityConfig,
     KimiVLConfig.model_type: KimiVLConfig,
     InternVLChatConfig.model_type: InternVLChatConfig,
+    Gemma3nConfig.model_type: Gemma3nConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
