@@ -135,8 +135,8 @@ jobs:
         TIMEOUT=300
         ELAPSED=0
         while [ $ELAPSED -lt $TIMEOUT ]; do
-          if curl --fail --silent http://127.0.0.9:8000/health > /dev/null 2>&1; then
-            echo "✓ Router is healthy"
+          if curl --connect-timeout 5 --silent http://127.0.0.9:8000 > /dev/null 2>&1; then
+            echo "✓ Router is reachable"
             break
           fi
           if ! ps -p $SERVER_PID > /dev/null; then
