@@ -546,14 +546,23 @@ class BaseMultimodalProcessor(ABC):
             combined_mm_item: MultimodalDataItem, input_ids: torch.Tensor
         ) -> MultimodalDataItem:
             """Apply common post-processing to the multimodal item."""
-            combined_mm_item.image_offsets = self.get_mm_items_offset(
-                input_ids=input_ids,
-                mm_token_id=self.IM_TOKEN_ID,
-            )
-            combined_mm_item.audio_offsets = self.get_mm_items_offset(
-                input_ids=input_ids,
-                mm_token_id=self.AUDIO_TOKEN_ID,
-            )
+            if combined_mm_item.modality in [Modality.IMAGE, Modality.MULTI_IMAGES]:
+                combined_mm_item.image_offsets = self.get_mm_items_offset(
+                    input_ids=input_ids,
+                    mm_token_id=self.IM_TOKEN_ID,
+                )
+            elif combined_mm_item.modality == Modality.AUDIO:
+                combined_mm_item.audio_offsets = self.get_mm_items_offset(
+                    input_ids=input_ids,
+                    mm_token_id=self.AUDIO_TOKEN_ID,
+                )
+            elif combined_mm_item.modality == Modality.VIDEO:
+                combined_mm_item.video_offsets = self.get_mm_items_offset(
+                    input_ids=input_ids,
+                    mm_token_id=self.VIDEO_TOKEN_ID,
+                )
+            else:
+                raise ValueError(f"Unknown modality: {combined_mm_item.modality}")
             return combined_mm_item
 
         # Main logic - determine input type and handle text-only case
