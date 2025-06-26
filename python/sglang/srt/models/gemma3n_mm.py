@@ -1,22 +1,30 @@
 import logging
 import re
 from functools import lru_cache
-from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict, Union
+from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
 
 import torch
 from torch import nn
-from transformers import (
-    Gemma3nAudioConfig,
-    Gemma3nConfig,
-    Gemma3nTextConfig,
-    Gemma3nVisionConfig,
-    PreTrainedModel,
-)
+
+try:
+    from transformers import (
+        Gemma3nAudioConfig,
+        Gemma3nConfig,
+        Gemma3nTextConfig,
+        Gemma3nVisionConfig,
+        PreTrainedModel,
+    )
+except Exception as e:
+    Gemma3nTextConfig = None
+    Gemma3nVisionConfig = None
+    Gemma3nConfig = None
+    Gemma3nAudioConfig = None
+
+from transformers import PreTrainedModel
 from transformers.models.auto.modeling_auto import AutoModel
 
 from sglang.srt.hf_transformers_utils import get_processor
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding

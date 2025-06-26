@@ -4,7 +4,13 @@ from typing import Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import Gemma3nAudioConfig, PreTrainedModel
+
+try:
+    from transformers import Gemma3nAudioConfig
+except Exception as e:
+    Gemma3nAudioConfig = None
+    pass
+from transformers import PreTrainedModel
 
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,

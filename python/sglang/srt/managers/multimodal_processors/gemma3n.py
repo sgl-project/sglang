@@ -21,7 +21,12 @@ from sglang.srt.managers.multimodal_processor import (
 from sglang.srt.managers.multimodal_processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.models.gemma3n_mm import Gemma3nForConditionalGeneration
+
+try:
+    from sglang.srt.models.gemma3n_mm import Gemma3nForConditionalGeneration
+except Exception as e:
+    Gemma3nForConditionalGeneration = None
+    pass
 
 
 class Gemma3nSGLangProcessor(SGLangBaseProcessor):

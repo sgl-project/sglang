@@ -56,7 +56,7 @@ def get_mm_processor(
     hf_config, server_args: ServerArgs, processor
 ) -> BaseMultimodalProcessor:
     for model_cls, processor_cls in PROCESSOR_MAPPING.items():
-        if model_cls.__name__ in hf_config.architectures:
+        if model_cls and model_cls.__name__ in hf_config.architectures:
             return processor_cls(hf_config, server_args, processor)
     raise ValueError(
         f"No processor registered for architecture: {hf_config.architectures}.\n"
