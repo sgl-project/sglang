@@ -93,6 +93,7 @@ from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
     LazyValue,
+    PackWeightMethod,
     add_prefix,
     bind_or_assign,
     cpu_has_amx_support,
@@ -124,8 +125,6 @@ if _is_hip:
         decode_attention_fwd_grouped_rope,
     )
 
-if _use_aiter:
-    from aiter.rotary_embedding import get_rope
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +142,9 @@ class AttnForwardMethod(IntEnum):
 
     # Use MLA but with fused RoPE
     MLA_FUSED_ROPE = auto()
+
+    # Use MLA with fused RoPE kernel for CPU
+    MLA_FUSED_ROPE_CPU = auto()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -212,8 +214,18 @@ class MoEGate(nn.Module):
             )
         else:
             self.e_score_correction_bias = None
+        if _is_cpu and _is_cpu_amx_available:
+            self.quant_method = PackWeightMethod(weight_names=["weight"])
 
     def forward(self, hidden_states):
+        if getattr(self, "use_intel_amx_backend", False):
+            return torch.ops.sgl_kernel.weight_packed_linear(
+                hidden_states,
+                self.weight,
+                None,  # bias
+                True,  # is_vnni
+            )
+
         logits = F.linear(hidden_states, self.weight, None)
         return logits
 
@@ -778,6 +790,37 @@ class DeepseekV2AttentionMLA(nn.Module):
             "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
         )
 
+        # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
+        # which requires self.w_kc and self.w_vc to be packed.
+        # If not, we will use torch.bmm and weight shouldn't be packed in this case
+        if (
+            hasattr(self, "fused_qkv_a_proj_with_mqa")
+            and _is_cpu
+            and _is_cpu_amx_available
+        ):
+            self.quant_method = PackWeightMethod(
+                weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
+            )
+
+        self.qkv_proj_with_rope_is_int8 = (
+            hasattr(self, "fused_qkv_a_proj_with_mqa")
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.int8
+        )
+        self.qkv_proj_with_rope_is_fp8 = (
+            hasattr(self, "fused_qkv_a_proj_with_mqa")
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.float8_e4m3fn
+        )
+
+        self.weight_block_size = None
+        if self.qkv_proj_with_rope_is_fp8:
+            assert (
+                self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
+                == self.q_b_proj.quant_method.quant_config.weight_block_size
+            )
+            self.weight_block_size = (
+                self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
+            )
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
@@ -791,7 +834,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                 else:
                     return AttnForwardMethod.MLA
             else:
-                return AttnForwardMethod.MLA
+                if hasattr(self, "fused_qkv_a_proj_with_mqa") and getattr(
+                    self, "use_intel_amx_backend", False
+                ):
+                    return AttnForwardMethod.MLA_FUSED_ROPE_CPU
+                else:
+                    return AttnForwardMethod.MLA
 
         if self.attention_backend == "flashinfer":
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
@@ -905,6 +953,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             inner_state = self.forward_absorb_fused_mla_rope_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
             )
+        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_CPU:
+            inner_state = self.forward_absorb_fused_mla_rope_cpu_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
         else:
             raise NotImplementedError
         return None, attn_forward_method, forward_batch, inner_state
@@ -924,6 +976,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             return self.forward_absorb_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
             return self.forward_absorb_fused_mla_rope_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_CPU:
+            return self.forward_absorb_fused_mla_rope_cpu_core(*inner_state)
         else:
             raise NotImplementedError
 
@@ -1241,6 +1295,57 @@ class DeepseekV2AttentionMLA(nn.Module):
             zero_allocator,
         )
 
+    def forward_absorb_fused_mla_rope_cpu_prepare(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ):
+        assert self.q_lora_rank is not None and getattr(
+            self, "use_intel_amx_backend", False
+        ), "forward_absorb_fused_mla_rope_cpu_prepare requires q_lora_rank is not None and use_intel_amx_backend"
+
+        q_input, k_input, v_input = (
+            torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight(
+                hidden_states,
+                self.fused_qkv_a_proj_with_mqa.weight,
+                self.q_b_proj.weight,
+                self.w_kc,
+                self.q_a_layernorm.weight,
+                self.kv_a_layernorm.weight,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.kv_a_layernorm.variance_epsilon,
+                self.qkv_proj_with_rope_is_int8,
+                self.qkv_proj_with_rope_is_fp8,
+                (
+                    self.fused_qkv_a_proj_with_mqa.weight_scale
+                    if self.qkv_proj_with_rope_is_int8
+                    else (
+                        self.fused_qkv_a_proj_with_mqa.weight_scale_inv
+                        if self.qkv_proj_with_rope_is_fp8
+                        else None
+                    )
+                ),
+                (
+                    self.q_b_proj.weight_scale
+                    if self.qkv_proj_with_rope_is_int8
+                    else (
+                        self.q_b_proj.weight_scale_inv
+                        if self.qkv_proj_with_rope_is_fp8
+                        else None
+                    )
+                ),
+                True,  # is_vnni
+                self.weight_block_size,
+                self.q_lora_rank,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+            )
+        )
+        return (q_input, k_input, v_input, forward_batch, zero_allocator)
+
     def forward_absorb_fused_mla_rope_core(
         self,
         q_input,
@@ -1310,6 +1415,43 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        output, _ = self.o_proj(attn_output)
+
+        return output
+
+    def forward_absorb_fused_mla_rope_cpu_core(
+        self, q_input, k_input, v_input, forward_batch, zero_allocator
+    ):
+        assert self.q_lora_rank is not None and getattr(
+            self, "use_intel_amx_backend", False
+        ), "forward_absorb_fused_mla_rope_cpu_core requires q_lora_rank is not None and use_intel_amx_backend"
+
+        attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
+        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+
+        # [Note] Align shapes of bmm inputs.
+        # Shapes of inputs:
+        #   q_nope: [M, B, K]
+        #   original self.w_kc: [B, K, N]
+        #   current self.w_kc (which has been converted in PackWeightMethod): [B, N, K]
+
+        # Shapes of inputs to sgl_kernel.cpu.bmm:
+        #   out: [B, M, N]
+        #   mat1: [B, M, K]
+        #   mat2: [B, N, K]
+        B = self.w_vc.size(0)
+        N = self.w_vc.size(1)
+        M = attn_output.size(0)
+        output = torch.empty([M, int(B * N)], dtype=attn_output.dtype)
+        attn_bmm_output = output.view([M, B, N]).transpose_(0, 1)
+        torch.ops.sgl_kernel.bmm_cpu(
+            attn_bmm_output,
+            attn_output.transpose(0, 1),
+            self.w_vc,
+            True,  # is_vnni
+            None,  # scale
+        )
+        attn_output = output
         output, _ = self.o_proj(attn_output)
 
         return output
