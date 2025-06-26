@@ -865,6 +865,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            self.server_args.hip_attention_config,
         )
 
         # construct fake completed prefill

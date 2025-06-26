@@ -1034,21 +1034,36 @@ class DeepseekV2AttentionMLA(nn.Module):
             # Flash Attention: Use MHA with chunked KV cache when prefilling on long sequences.
             if forward_batch.extend_prefix_lens_cpu is not None:
                 sum_extend_prefix_lens = sum(forward_batch.extend_prefix_lens_cpu)
+            # if (
+            #     forward_batch.forward_mode.is_extend()
+            #     and not self.disable_chunked_prefix_cache
+            #     and not forward_batch.forward_mode.is_target_verify()
+            #     and not forward_batch.forward_mode.is_draft_extend()
+            #     and (
+            #         sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
+            #         or sum_extend_prefix_lens == 0
+            #     )
+            # ):
+            # print(
+            #     global_server_args_dict["disable_chunked_prefix_cache"],
+            #     forward_batch.attn_attend_prefix_cache is not None,
+            #     forward_batch.forward_mode.is_target_verify(),
+            #     forward_batch.forward_mode.is_draft_extend(),
+            #     forward_batch.forward_mode,
+            # )
             if (
-                forward_batch.forward_mode.is_extend()
-                and not self.disable_chunked_prefix_cache
+                not global_server_args_dict["disable_chunked_prefix_cache"]
+                # and forward_batch.attn_attend_prefix_cache is not None
+                and forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
-                and (
-                    sum_extend_prefix_lens >= self.chunked_prefix_cache_threshold
-                    or sum_extend_prefix_lens == 0
-                )
+                # and not forward_batch.forward_mode.is_draft_extend()
             ):
                 return AttnForwardMethod.MHA_FROM_CACHE
             else:
-                if forward_batch.forward_mode.is_extend():
-                    # FIXME: this should be MLA, but bug.
-                    return AttnForwardMethod.MHA_FROM_CACHE
+                # if forward_batch.forward_mode == ForwardMode.EXTEND:
+                #     # FIXME: this should be MLA, but bug.
+                #     return AttnForwardMethod.MHA_FROM_CACHE
                 return AttnForwardMethod.MLA
         elif self.attention_backend == "fa3":
             # Flash Attention: Use MHA with chunked KV cache when prefilling on long sequences.
@@ -1867,6 +1882,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
+        assert not torch.cuda.is_current_stream_capturing()
         # In normal mha, the k and v tensors will become overly large when the prefix length is long.
         # To avoid this, we split the kv cache into chunks and process them one after another.
         # Since mha is compute friendly, the for loop induced here will not introduce significant overhead.

@@ -1286,7 +1286,7 @@ class ServerArgs:
             help="Enable HiP attention. This flag is not compatible with other sparse attention flags (e.g., double sparsity).",
         )
         parser.add_argument(
-            "--hip-attention-config",
+            "--hip-attention-config-path",
             type=str,
             default=ServerArgs.hip_attention_config,
             help="Path to the HiP attention config file, or the json in string format.",
@@ -2041,7 +2041,7 @@ class ServerArgs:
             from hip_attn.v1_2 import HiPAttentionConfig
 
             args.hip_attention_config = HiPAttentionConfig(
-                json_or_path=args.hip_attention_config
+                json_or_path=args.hip_attention_config_path
             )
             logger.info(
                 f"attention_backend changed {args.attention_backend} -> hip_attention"
