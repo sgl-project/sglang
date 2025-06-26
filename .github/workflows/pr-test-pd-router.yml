@@ -5,13 +5,13 @@ on:
     branches: [ main ]
     paths:
       - 'python/sglang/srt/disaggregation/**'
-      - 'scripts/ci_p4d4.sh'
+      - 'scripts/ci_start_disaggregation_servers.sh'
       - 'sgl-router/**'
   pull_request:
     branches: [ main ]
     paths:
       - 'python/sglang/srt/disaggregation/**'
-      - 'scripts/ci_p4d4.sh'
+      - 'scripts/ci_start_disaggregation_servers.sh'
       - 'sgl-router/**'
   workflow_dispatch:
 
