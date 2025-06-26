@@ -64,7 +64,7 @@ from sglang.srt.layers.attention.flashattention_backend import (
 class HiPAttentionBackend(AttentionBackend):
 
     def __init__(
-        self, 
+        self,
         model_runner: ModelRunner,
         skip_prefill: bool = False,
         speculative_step_id=0,
@@ -394,7 +394,7 @@ class HiPAttentionBackend(AttentionBackend):
                     )
                 else:
                     # Do absorbed multi-latent attention
-                    
+
                     require_metadata_checkout = False
                     if forward_batch.forward_mode.is_target_verify():
                         # NOTE: this condition will be graph captured.
@@ -408,15 +408,17 @@ class HiPAttentionBackend(AttentionBackend):
                         require_metadata_checkout = True
                     else:
                         metadata = None
-                    
-                    kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+
+                    kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
+                        layer.layer_id
+                    )
                     nope_dim = triton.next_power_of_2(kv_cache.shape[-1]) // 2
                     rope_dim = kv_cache.shape[-1] - nope_dim
                     # print(q.shape, kv_cache.shape, nope_dim, rope_dim)
-                    
+
                     kv_head = kv_cache.shape[-2]
                     q_head = q.shape[-2]
-                    
+
                     k_rope = kv_cache[..., nope_dim:]
                     c_kv = kv_cache[..., :nope_dim]
                     # k_rope_cache = k_rope.view(
@@ -425,14 +427,10 @@ class HiPAttentionBackend(AttentionBackend):
                     #     layer.tp_k_head_num,
                     #     layer.head_dim - layer.v_head_dim,
                     # )
-                    c_kv_cache = c_kv.view(
-                        -1, self.page_size, kv_head, nope_dim
-                    )
+                    c_kv_cache = c_kv.view(-1, self.page_size, kv_head, nope_dim)
                     if q_rope is not None:
                         q_nope = q.view(-1, q_head, nope_dim)
-                        q_rope = q_rope.view(
-                            -1, q_head, rope_dim
-                        )
+                        q_rope = q_rope.view(-1, q_head, rope_dim)
                     else:
                         q_all = q.contiguous().view(-1, q_head, nope_dim + rope_dim)
                         q_nope = q_all[:, :, :nope_dim]
@@ -445,15 +443,15 @@ class HiPAttentionBackend(AttentionBackend):
                     # k_cache = torch.cat([c_kv_cache, k_rope_cache], dim=-1)
                     k_cache = kv_cache
                     v_cache = c_kv_cache
-                    
+
                     if forward_batch.forward_mode.is_draft_extend():
                         sw_size = 512
                         sw_sink = 128
                     else:
                         sw_sink = -1
-                    
+
                     # print(q_merged.shape, k_cache.shape, v_cache.shape, sw_sink, sw_size)
-                    
+
                     o, metadata = self.forward_paged_hip(
                         query=q_merged,
                         sm_scale=layer.scaling,
@@ -490,7 +488,7 @@ class HiPAttentionBackend(AttentionBackend):
                         sliding_window_sink=sw_sink,
                         using_chunked_sliding_window=using_chunked_sw,
                     )
-                    
+
                     if require_metadata_checkout and (metadata is not None):
                         forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
                             layer_id=layer.layer_id,
@@ -757,7 +755,9 @@ class HiPAttentionBackend(AttentionBackend):
                     using_chunked_sliding_window=using_chunked_sw,
                 )
 
-            if (metadata is not None) and (forward_batch.hip_metadata_cache_pool is not None):
+            if (metadata is not None) and (
+                forward_batch.hip_metadata_cache_pool is not None
+            ):
                 forward_batch.hip_metadata_cache_pool.set_hip_metadata_cache(
                     layer_id=layer.layer_id,
                     tdst=q.shape[0],
@@ -770,6 +770,7 @@ class HiPAttentionBackend(AttentionBackend):
                     offload_cache.handle_cache_miss(metadata)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
 
 class HiPAttentionMultiStepBackend:
 
