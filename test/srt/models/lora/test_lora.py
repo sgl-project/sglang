@@ -91,7 +91,7 @@ class TestLoRA(CustomTestCase):
                     base_path, torch_dtype=torch_dtype, model_type="generation"
                 )
 
-                random.seed(42)  # Ensure reproducibility of repeated trials per batch 
+                random.seed(42)  # Ensure reproducibility of repeated trials per batch
                 repeated_trial_per_batch = 3
                 with srt_runner, hf_runner:
                     for i, lora_paths in enumerate(batches):
