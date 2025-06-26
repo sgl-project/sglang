@@ -22,7 +22,6 @@ DEVICE=$(find_active_ib_device)
 echo "Using IB device: $DEVICE"
 
 # Launch prefill servers on GPU 0–3
-echo "=== STEP 1: Launching prefill servers ==="
 for i in {0..3}; do
   PORT=$((30001 + i))
   BOOTSTRAP_PORT=$((9001 + i))
@@ -38,40 +37,7 @@ for i in {0..3}; do
     --disaggregation-bootstrap-port "$BOOTSTRAP_PORT" &
 done
 
-# Wait for prefill servers to be ready
-echo "=== STEP 2: Waiting for prefill servers to be ready ==="
-TIMEOUT=300
-START_TIME=$(date +%s)
-
-while true; do
-    CURRENT_TIME=$(date +%s)
-    ELAPSED=$((CURRENT_TIME - START_TIME))
-
-    if [ $ELAPSED -ge $TIMEOUT ]; then
-        echo "❌ Timeout: Prefill servers did not become ready within 5 minutes"
-        exit 1
-    fi
-
-    READY_COUNT=0
-    # Check prefill servers (127.0.0.1-4:30001-30004)
-    for i in {1..4}; do
-        if curl --connect-timeout 5 --silent "http://127.0.0.$i:$((30000 + i))" >/dev/null 2>&1; then
-            READY_COUNT=$((READY_COUNT + 1))
-        fi
-    done
-
-    echo "Ready prefill servers: $READY_COUNT/4 (elapsed: ${ELAPSED}s)"
-
-    if [ $READY_COUNT -eq 4 ]; then
-        echo "✅ All 4 prefill servers are ready!"
-        break
-    else
-        sleep 10
-    fi
-done
-
 # Launch decode servers on GPU 4–7
-echo "=== STEP 3: Launching decode servers ==="
 for i in {4..7}; do
   PORT=$((30001 + i))
   HOST="127.0.0.$((i + 1))"
@@ -86,34 +52,38 @@ for i in {4..7}; do
     --base-gpu-id 0 &
 done
 
-# Wait for decode servers to be ready
-echo "=== STEP 4: Waiting for decode servers to be ready ==="
+# Wait for disaggregation servers to initialize
+echo "Waiting for disaggregation servers to initialize..."
+
+# Health check with 5-minute timeout
+TIMEOUT=300
 START_TIME=$(date +%s)
 
+echo "Checking health of all 8 servers..."
 while true; do
     CURRENT_TIME=$(date +%s)
     ELAPSED=$((CURRENT_TIME - START_TIME))
 
     if [ $ELAPSED -ge $TIMEOUT ]; then
-        echo "❌ Timeout: Decode servers did not become ready within 5 minutes"
+        echo "❌ Timeout: Servers did not become healthy within 5 minutes"
         exit 1
     fi
 
-    READY_COUNT=0
-    # Check decode servers (127.0.0.5-8:30005-30008)
-    for i in {5..8}; do
-        if curl --connect-timeout 5 --silent "http://127.0.0.$i:$((30000 + i))" >/dev/null 2>&1; then
-            READY_COUNT=$((READY_COUNT + 1))
+    HEALTHY_COUNT=0
+    # Check all 8 servers (127.0.0.1-8:30001-30008)
+    for i in {1..8}; do
+        if curl -s -f "http://127.0.0.$i:$((30000 + i))/health" >/dev/null 2>&1; then
+            HEALTHY_COUNT=$((HEALTHY_COUNT + 1))
         fi
     done
 
-    echo "Ready decode servers: $READY_COUNT/4 (elapsed: ${ELAPSED}s)"
+    echo "Healthy servers: $HEALTHY_COUNT/8 (elapsed: ${ELAPSED}s)"
 
-    if [ $READY_COUNT -eq 4 ]; then
-        echo "✅ All 4 decode servers are ready!"
+    if [ $HEALTHY_COUNT -eq 8 ]; then
+        echo "✅ All 8 servers are healthy!"
         break
     else
-        sleep 10
+        sleep 10  # Wait 10 seconds before next check
     fi
 done
 
