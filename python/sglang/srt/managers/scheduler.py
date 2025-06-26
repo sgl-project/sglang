@@ -23,6 +23,7 @@ import time
 from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass
+from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
@@ -358,6 +359,7 @@ class Scheduler(
             self.max_total_num_tokens,
             self.max_prefill_tokens,
             self.max_running_requests,
+            self.max_queued_requests,
             self.max_req_len,
             self.max_req_input_len,
             self.random_seed,
@@ -1020,6 +1022,15 @@ class Scheduler(
                 self.chunked_req is not None or not self.running_batch.is_empty()
             ):
                 self.return_health_check_ct += 1
+                continue
+
+            if len(self.waiting_queue) >= self.max_queued_requests:
+                setattr(recv_req, "finished_reason", FINISH_ABORT(
+                    "Request queue is full.", HTTPStatus.TOO_MANY_REQUESTS, "TOO_MANY_REQUESTS")
+                )
+                rid = getattr(recv_req, "rid", "")
+                self.send_to_tokenizer.send_pyobj(AbortReq(rid))
+                logger.error(f"The request queue is full. Abort request {rid}.")
                 continue
 
             output = self._request_dispatcher(recv_req)
