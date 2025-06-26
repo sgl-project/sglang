@@ -214,6 +214,10 @@ class MultimodalDataItem:
     audio_feature_lens: Optional[List[torch.Tensor]] = None
     audio_offsets: Optional[List[Tuple[int, int]]] = None
 
+    # gemma3n related
+    input_features: Optional[torch.Tensor] = None
+    input_features_mask: Optional[torch.Tensor] = None
+
     precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     @staticmethod
@@ -277,7 +281,10 @@ class MultimodalDataItem:
         if self.precomputed_features is not None:
             self.hash = hash_feature(self.precomputed_features)
         elif self.is_audio():
-            self.hash = hash_feature(self.audio_features)
+            if self.audio_features is not None:
+                self.hash = hash_feature(self.audio_features)
+            elif self.input_features is not None:
+                self.hash = hash_feature(self.input_features)
         else:
             self.hash = hash_feature(self.pixel_values)
 
@@ -288,6 +295,7 @@ class MultimodalDataItem:
         return (self.modality == Modality.AUDIO) and (
             self.precomputed_features is not None
             or not MultimodalDataItem.is_empty_list(self.audio_features)
+            or not MultimodalDataItem.is_empty_list(self.input_features)
         )
 
     def is_image(self):
