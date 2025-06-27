@@ -1,6 +1,7 @@
 import itertools
 
 import torch
+import triton
 
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
