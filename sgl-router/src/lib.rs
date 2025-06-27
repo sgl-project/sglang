@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+pub mod connection_pool;
 pub mod logging;
 use std::collections::HashMap;
 pub mod openai_api_types;
@@ -49,6 +50,7 @@ struct Router {
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
     request_timeout_secs: u64,
+    max_connections: Option<u64>,
     // PD mode flag
     pd_disaggregation: bool,
     // PD-specific fields (only used when pd_disaggregation is true)
@@ -84,6 +86,7 @@ impl Router {
         prometheus_port = None,
         prometheus_host = None,
         request_timeout_secs = 600,  // Add configurable request timeout
+        max_connections = None,
         pd_disaggregation = false,  // New flag for PD mode
         prefill_urls = None,
         decode_urls = None
@@ -113,6 +116,7 @@ impl Router {
         prometheus_port: Option<u16>,
         prometheus_host: Option<String>,
         request_timeout_secs: u64,
+        max_connections: Option<u64>,
         pd_disaggregation: bool,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
@@ -142,6 +146,7 @@ impl Router {
             prometheus_port,
             prometheus_host,
             request_timeout_secs,
+            max_connections,
             pd_disaggregation,
             prefill_urls,
             decode_urls,
@@ -251,6 +256,7 @@ impl Router {
                 service_discovery_config,
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
+                max_connections: self.max_connections,
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;

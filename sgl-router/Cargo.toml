@@ -12,7 +12,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 actix-web = "4.0"
 serde = { version = "1.0", features = ["derive"] }
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.4", features = ["derive", "cargo"] }
 bytes = "1.8.0"
 rand = "0.8.5"
 reqwest = { version = "0.12.8", features = ["stream", "blocking", "json"] }
@@ -36,6 +36,8 @@ metrics-exporter-prometheus = "0.17.0"
 # Added for request tracing
 uuid = { version = "1.10", features = ["v4", "serde"] }
 thiserror = "2.0.12"
+libc = "0.2"
+chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

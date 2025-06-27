@@ -13,7 +13,6 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::spawn;
 use tracing::{error, info, warn, Level};
 
@@ -29,12 +28,14 @@ impl AppState {
         worker_urls: Vec<String>,
         client: Client,
         policy_config: PolicyConfig,
+        _max_connections: Option<u64>, // Kept for API compatibility
     ) -> Result<Self, String> {
         // Check if this is PD mode from policy config
         let is_pd_mode = matches!(policy_config, PolicyConfig::PrefillDecodeConfig { .. });
 
         // Create router based on policy
         let router = Arc::new(Router::new(worker_urls, policy_config)?);
+
         Ok(Self {
             router,
             client,
@@ -284,6 +285,7 @@ pub struct ServerConfig {
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
+    pub max_connections: Option<u64>,
 }
 
 pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
@@ -334,16 +336,26 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         info!("🚧 Service discovery disabled");
     }
 
-    let client = Client::builder()
-        .pool_idle_timeout(Some(Duration::from_secs(50)))
-        .timeout(Duration::from_secs(config.request_timeout_secs)) // Use configurable timeout
-        .build()
-        .expect("Failed to create HTTP client");
+    // Create connection pool with optimized settings
+    let pool_config = crate::connection_pool::ConnectionPoolConfig {
+        idle_timeout_secs: 90,
+        request_timeout_secs: config.request_timeout_secs,
+        max_concurrent_connections: config.max_connections,
+        ..Default::default()
+    };
+
+    let connection_pool = Arc::new(
+        crate::connection_pool::ConnectionPool::new(pool_config)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+    );
+
+    let client = connection_pool.client().clone();
 
     let app_state_init = AppState::new(
         config.worker_urls.clone(),
         client.clone(),
         config.policy_config.clone(),
+        config.max_connections,
     )
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let router_arc = Arc::clone(&app_state_init.router);
@@ -387,6 +399,9 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
                     .error_handler(json_error_handler),
             )
             .app_data(web::PayloadConfig::default().limit(config.max_payload_size))
+            .wrap(crate::connection_pool::ConnectionLimitMiddleware::new(
+                connection_pool.clone(),
+            ))
             .service(generate)
             .service(v1_chat_completions)
             .service(v1_completions)
