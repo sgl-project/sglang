@@ -277,30 +277,6 @@ def per_token_group_quant_fp8(
     return x_q, x_s
 
 
-PER_TOKEN_GROUP_QUANT_8BIT_VALID_FLAGS = [
-    dict(
-        column_major_scales=False,
-        scale_tma_aligned=False,
-        scale_ue8m0=False,
-    ),
-    dict(
-        column_major_scales=True,
-        scale_tma_aligned=False,
-        scale_ue8m0=False,
-    ),
-    dict(
-        column_major_scales=True,
-        scale_tma_aligned=True,
-        scale_ue8m0=False,
-    ),
-    dict(
-        column_major_scales=True,
-        scale_tma_aligned=True,
-        scale_ue8m0=True,
-    ),
-]
-
-
 # TODO maybe unify int8 and fp8 code later
 def per_token_group_quant_8bit(
     x: torch.Tensor,

@@ -4,9 +4,6 @@ import pytest
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import (
-    PER_TOKEN_GROUP_QUANT_8BIT_VALID_FLAGS,
-)
-from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
@@ -28,7 +25,28 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
             [256],  # hidden_dim
             [8],  # group_size
             [torch.int8, fp8_type_],  # dtype
-            PER_TOKEN_GROUP_QUANT_8BIT_VALID_FLAGS,
+            [
+                dict(
+                    column_major_scales=False,
+                    scale_tma_aligned=False,
+                    scale_ue8m0=False,
+                ),
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=False,
+                    scale_ue8m0=False,
+                ),
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=False,
+                ),
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=True,
+                ),
+            ]
         )
     ),
 )
