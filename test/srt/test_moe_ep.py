@@ -82,8 +82,6 @@ class TestEpMoEFP8(CustomTestCase):
                 "0.4",
             ],
         )
-        import os
-        os.system("python3 -m sglang.compile_deep_gemm--model-path lmsys/sglang-ci-dsv3-test --trust-remote-code --tp 2 --enable-torch-compile --cuda-graph-max-bs 2 --device cuda --host 127.0.0.1 --port 6400")
 
     @classmethod
     def tearDownClass(cls):
@@ -115,4 +113,6 @@ class TestEpMoEFP8(CustomTestCase):
 
 
 if __name__ == "__main__":
+    import os
+    os.system("python3 -m sglang.compile_deep_gemm --model-path deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct --trust-remote-code --tp 2 --ep-size 2 --enable-ep-moe --quantization fp8 --mem-fraction-static 0.4 --device cuda --host 127.0.0.1 --port 6400")
     unittest.main()
