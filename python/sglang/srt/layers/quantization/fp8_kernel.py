@@ -213,7 +213,7 @@ def per_token_group_quant_fp8(
     assert x.is_contiguous(), "`x` is not contiguous"
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
-    x_s = _create_per_token_group_quant_fp8_output_scale(
+    x_s = create_per_token_group_quant_fp8_output_scale(
         x_shape=x.shape,
         device=x.device,
         group_size=group_size,
@@ -310,7 +310,7 @@ def per_token_group_quant_8bit(
     )
 
 
-def _create_per_token_group_quant_fp8_output_scale(
+def create_per_token_group_quant_fp8_output_scale(
     x_shape,
     device,
     group_size,
@@ -372,7 +372,7 @@ def sglang_per_token_group_quant_fp8(
         assert x.shape[-1] % (group_size * 4) == 0
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
-    x_s = _create_per_token_group_quant_fp8_output_scale(
+    x_s = create_per_token_group_quant_fp8_output_scale(
         x_shape=x.shape,
         device=x.device,
         group_size=group_size,
