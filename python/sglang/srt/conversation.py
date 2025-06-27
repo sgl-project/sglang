@@ -916,6 +916,7 @@ register_conv_template(
     )
 )
 
+
 @register_conv_template_matching_function
 def match_internvl(model_path: str):
     if re.search(r"internvl2_5", model_path, re.IGNORECASE):
@@ -1012,6 +1013,7 @@ def match_phi_4_mm(model_path: str):
 def match_vila(model_path: str):
     if re.search(r"vila", model_path, re.IGNORECASE):
         return "chatml"
+
 
 @register_conv_template_matching_function
 def match_mimo_vl(model_path: str):
