@@ -84,15 +84,15 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
 
     x = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.bfloat16)
 
-    fn = {
-        "triton": triton_per_token_group_quant_8bit,
-        "sglang": sglang_per_token_group_quant_8bit,
+    fn, kernel_names = {
+        "triton": (triton_per_token_group_quant_8bit, "_per_token_group_quant_fp8"),
+        "sglang": (sglang_per_token_group_quant_8bit, "per_token_group_quant_8bit_kernel"),
     }[provider]
     bench_fn = lambda: fn(
         x=x.clone(), group_size=group_size, dst_dtype=dst_dtype, **flags
     )
 
-    time_s = bench_kineto(bench_fn)
+    time_s = bench_kineto(bench_fn, kernel_names=kernel_names)
     return time_s * 1e6
 
 
