@@ -626,9 +626,6 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        use_hybrid_loc = self.is_hybrid is not None and (
-            hasattr(layer, "use_irope") and layer.use_irope
-        )
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -892,9 +889,6 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        use_hybrid_loc = self.is_hybrid is not None and (
-            hasattr(layer, "use_irope") and layer.use_irope
-        )
         if k is not None:
             assert v is not None
             if save_kv_cache:

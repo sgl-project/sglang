@@ -526,8 +526,6 @@ class Req:
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = []
-        # The indices to local kv cache for the shared prefix.
-        self.prefix_indices_local: torch.Tensor = []
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
