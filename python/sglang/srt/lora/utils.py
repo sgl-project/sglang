@@ -108,7 +108,7 @@ def get_hidden_dim(
 
 def get_normalized_lora_weight_names(name: str) -> Tuple[List[str], List[str]]:
     """
-    Mapping a target module name to names of the normized LoRA weights.
+    Mapping a target module name to names of the normalized LoRA weights.
     Returned tuple contains (name for Lora A, name for Lora B)
     """
     params_mapping = {

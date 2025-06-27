@@ -25,7 +25,6 @@ from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
-import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
@@ -45,6 +44,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import require_mlp_sync
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -93,8 +93,6 @@ class PrefillBootstrapQueue:
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
         self.queue: List[Req] = []
-        self.pp_rank = pp_rank
-        self.pp_size = pp_size
         self.gloo_group = gloo_group
         self.max_total_num_tokens = max_total_num_tokens
         self.scheduler = scheduler
@@ -124,6 +122,9 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        if not self.is_mla_backend:
+            kv_args.kv_head_num = self.token_to_kv_pool.head_num
+        kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -274,12 +275,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
 
-            # Handle DP attention
-            if (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            ):
-                batch, _ = self.prepare_dp_attn_batch(batch)
+            if require_mlp_sync(self.server_args):
+                batch, _ = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
 
             if batch:
@@ -312,12 +309,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
 
-            # Handle DP attention
-            if (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            ):
-                batch, _ = self.prepare_dp_attn_batch(batch)
+            if require_mlp_sync(self.server_args):
+                batch, _ = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
             if batch:
                 result = self.run_batch(batch)

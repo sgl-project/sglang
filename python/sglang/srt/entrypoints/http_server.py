@@ -38,7 +38,8 @@ import orjson
 import requests
 import uvicorn
 import uvloop
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import Depends, FastAPI, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
@@ -47,6 +48,21 @@ from sglang.srt.disaggregation.utils import (
     register_disaggregation_server,
 )
 from sglang.srt.entrypoints.engine import _launch_subprocesses
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    EmbeddingRequest,
+    ErrorResponse,
+    ModelCard,
+    ModelList,
+    ScoringRequest,
+    V1RerankReqInput,
+)
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
+from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
+from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
+from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -67,26 +83,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
-    V1RerankReqInput,
     VertexGenerateReqInput,
 )
+from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
-from sglang.srt.openai_api.adapter import (
-    v1_batches,
-    v1_cancel_batch,
-    v1_chat_completions,
-    v1_completions,
-    v1_delete_file,
-    v1_embeddings,
-    v1_files_create,
-    v1_rerank,
-    v1_retrieve_batch,
-    v1_retrieve_file,
-    v1_retrieve_file_content,
-    v1_score,
-)
-from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -109,6 +110,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 @dataclasses.dataclass
 class _GlobalState:
     tokenizer_manager: TokenizerManager
+    template_manager: TemplateManager
     scheduler_info: Dict
 
 
@@ -123,6 +125,24 @@ def set_global_state(global_state: _GlobalState):
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
     server_args: ServerArgs = fast_api_app.server_args
+
+    # Initialize OpenAI serving handlers
+    fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
+    fast_api_app.state.openai_serving_chat = OpenAIServingChat(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
+    fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
+        _global_state.tokenizer_manager, _global_state.template_manager
+    )
+    fast_api_app.state.openai_serving_score = OpenAIServingScore(
+        _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
+        _global_state.tokenizer_manager
+    )
+
     if server_args.warmups is not None:
         await execute_warmups(
             server_args.warmups.split(","), _global_state.tokenizer_manager
@@ -147,6 +167,47 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Custom exception handlers to change validation error status codes
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Override FastAPI's default 422 validation error with 400"""
+    exc_str = str(exc)
+    errors_str = str(exc.errors())
+
+    if errors_str and errors_str != exc_str:
+        message = f"{exc_str} {errors_str}"
+    else:
+        message = exc_str
+
+    err = ErrorResponse(
+        message=message,
+        type=HTTPStatus.BAD_REQUEST.phrase,
+        code=HTTPStatus.BAD_REQUEST.value,
+    )
+
+    return ORJSONResponse(
+        status_code=400,
+        content=err.model_dump(),
+    )
+
+
+async def validate_json_request(raw_request: Request):
+    """Validate that the request content-type is application/json."""
+    content_type = raw_request.headers.get("content-type", "").lower()
+    media_type = content_type.split(";", maxsplit=1)[0]
+    if media_type != "application/json":
+        raise RequestValidationError(
+            errors=[
+                {
+                    "loc": ["header", "content-type"],
+                    "msg": "Unsupported Media Type: Only 'application/json' is allowed",
+                    "type": "value_error",
+                }
+            ]
+        )
+
 
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 
@@ -330,13 +391,14 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         return _create_error_response(e)
 
 
-@app.api_route("/v1/rerank", methods=["POST", "PUT"])
-async def v1_rerank_request(obj: V1RerankReqInput, raw_request: Request):
-    try:
-        ret = await v1_rerank(_global_state.tokenizer_manager, obj, raw_request)
-        return ret
-    except ValueError as e:
-        return _create_error_response(e)
+@app.api_route(
+    "/v1/rerank", methods=["POST", "PUT"], dependencies=[Depends(validate_json_request)]
+)
+async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
+    """Endpoint for reranking documents based on query relevance."""
+    return await raw_request.app.state.openai_serving_rerank.handle_request(
+        request, raw_request
+    )
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
@@ -619,25 +681,39 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
 ##### OpenAI-compatible API endpoints #####
 
 
-@app.post("/v1/completions")
-async def openai_v1_completions(raw_request: Request):
-    return await v1_completions(_global_state.tokenizer_manager, raw_request)
+@app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
+async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
+    """OpenAI-compatible text completion endpoint."""
+    return await raw_request.app.state.openai_serving_completion.handle_request(
+        request, raw_request
+    )
 
 
-@app.post("/v1/chat/completions")
-async def openai_v1_chat_completions(raw_request: Request):
-    return await v1_chat_completions(_global_state.tokenizer_manager, raw_request)
+@app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])
+async def openai_v1_chat_completions(
+    request: ChatCompletionRequest, raw_request: Request
+):
+    """OpenAI-compatible chat completion endpoint."""
+    return await raw_request.app.state.openai_serving_chat.handle_request(
+        request, raw_request
+    )
 
 
-@app.post("/v1/embeddings", response_class=ORJSONResponse)
-async def openai_v1_embeddings(raw_request: Request):
-    response = await v1_embeddings(_global_state.tokenizer_manager, raw_request)
-    return response
+@app.post(
+    "/v1/embeddings",
+    response_class=ORJSONResponse,
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
+    """OpenAI-compatible embeddings endpoint."""
+    return await raw_request.app.state.openai_serving_embedding.handle_request(
+        request, raw_request
+    )
 
 
 @app.get("/v1/models", response_class=ORJSONResponse)
-def available_models():
-    """Show available models."""
+async def available_models():
+    """Show available models. OpenAI-compatible endpoint."""
     served_model_names = [_global_state.tokenizer_manager.served_model_name]
     model_cards = []
     for served_model_name in served_model_names:
@@ -651,45 +727,29 @@ def available_models():
     return ModelList(data=model_cards)
 
 
-@app.post("/v1/files")
-async def openai_v1_files(file: UploadFile = File(...), purpose: str = Form("batch")):
-    return await v1_files_create(
-        file, purpose, _global_state.tokenizer_manager.server_args.file_storage_path
+@app.get("/v1/models/{model:path}", response_class=ORJSONResponse)
+async def retrieve_model(model: str):
+    """Retrieves a model instance, providing basic information about the model."""
+    served_model_names = [_global_state.tokenizer_manager.served_model_name]
+
+    if model not in served_model_names:
+        return ORJSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "message": f"The model '{model}' does not exist",
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": "model_not_found",
+                }
+            },
+        )
+
+    return ModelCard(
+        id=model,
+        root=model,
+        max_model_len=_global_state.tokenizer_manager.model_config.context_len,
     )
-
-
-@app.delete("/v1/files/{file_id}")
-async def delete_file(file_id: str):
-    # https://platform.openai.com/docs/api-reference/files/delete
-    return await v1_delete_file(file_id)
-
-
-@app.post("/v1/batches")
-async def openai_v1_batches(raw_request: Request):
-    return await v1_batches(_global_state.tokenizer_manager, raw_request)
-
-
-@app.post("/v1/batches/{batch_id}/cancel")
-async def cancel_batches(batch_id: str):
-    # https://platform.openai.com/docs/api-reference/batch/cancel
-    return await v1_cancel_batch(_global_state.tokenizer_manager, batch_id)
-
-
-@app.get("/v1/batches/{batch_id}")
-async def retrieve_batch(batch_id: str):
-    return await v1_retrieve_batch(batch_id)
-
-
-@app.get("/v1/files/{file_id}")
-async def retrieve_file(file_id: str):
-    # https://platform.openai.com/docs/api-reference/files/retrieve
-    return await v1_retrieve_file(file_id)
-
-
-@app.get("/v1/files/{file_id}/content")
-async def retrieve_file_content(file_id: str):
-    # https://platform.openai.com/docs/api-reference/files/retrieve-contents
-    return await v1_retrieve_file_content(file_id)
 
 
 ## SageMaker API
@@ -700,8 +760,13 @@ async def sagemaker_health() -> Response:
 
 
 @app.post("/invocations")
-async def sagemaker_chat_completions(raw_request: Request):
-    return await v1_chat_completions(_global_state.tokenizer_manager, raw_request)
+async def sagemaker_chat_completions(
+    request: ChatCompletionRequest, raw_request: Request
+):
+    """OpenAI-compatible chat completion endpoint."""
+    return await raw_request.app.state.openai_serving_chat.handle_request(
+        request, raw_request
+    )
 
 
 ## Vertex AI API
@@ -732,10 +797,12 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     return ORJSONResponse({"predictions": ret})
 
 
-@app.post("/v1/score")
-async def v1_score_request(raw_request: Request):
+@app.post("/v1/score", dependencies=[Depends(validate_json_request)])
+async def v1_score_request(request: ScoringRequest, raw_request: Request):
     """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
-    return await v1_score(_global_state.tokenizer_manager, raw_request)
+    return await raw_request.app.state.openai_serving_score.handle_request(
+        request, raw_request
+    )
 
 
 def _create_error_response(e):
@@ -764,10 +831,13 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    tokenizer_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
+    tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
+        server_args=server_args
+    )
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
+            template_manager=template_manager,
             scheduler_info=scheduler_info,
         )
     )
