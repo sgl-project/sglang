@@ -300,6 +300,50 @@ def per_token_group_quant_8bit(
     )
 
 
+def _create_per_token_group_quant_fp8_output_scale(
+    x_shape,
+    device,
+    group_size,
+    column_major_scales: bool,
+    scale_tma_aligned: bool,
+    scale_ue8m0: bool,
+):
+    if scale_ue8m0:
+        assert column_major_scales and scale_tma_aligned
+        x_q_mn, x_q_k = x_shape
+        x_s_mn, x_s_k = x_q_mn, x_q_k // 128
+        aligned_mn = align(x_s_mn, 4)
+        aligned_k = align(x_s_k, 4)
+        # TODO(FIXME): Fix cuda kernel and recover here to empty.
+        return torch.zeros(
+            (aligned_k // 4, aligned_mn),
+            device=device,
+            dtype=torch.int,
+        ).transpose(0, 1)[:x_s_mn, :]
+    elif column_major_scales:
+        if scale_tma_aligned:
+            # TODO extract "align" function
+            # aligned to 4 * sizeof(float)
+            aligned_size = (x_shape[-2] + 3) // 4 * 4
+            return torch.empty(
+                x_shape[:-2] + (x_shape[-1] // group_size, aligned_size),
+                device=device,
+                dtype=torch.float32,
+            ).permute(-1, -2)[: x_shape[-2], :]
+        else:
+            return torch.empty(
+                (x_shape[-1] // group_size,) + x_shape[:-1],
+                device=device,
+                dtype=torch.float32,
+            ).permute(-1, -2)
+    else:
+        return torch.empty(
+            x_shape[:-1] + (x_shape[-1] // group_size,),
+            device=device,
+            dtype=torch.float32,
+        )
+
+
 def sglang_per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
@@ -314,40 +358,15 @@ def sglang_per_token_group_quant_fp8(
     assert x.is_contiguous(), "`x` is not contiguous"
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
-    if scale_ue8m0:
-        assert column_major_scales and scale_tma_aligned
-        x_q_mn, x_q_k = x.shape
-        x_s_mn, x_s_k = x_q_mn, x_q_k // 128
-        aligned_mn = align(x_s_mn, 4)
-        aligned_k = align(x_s_k, 4)
-        # TODO(FIXME): Fix cuda kernel and recover here to empty.
-        x_s = torch.zeros(
-            (aligned_k // 4, aligned_mn),
-            device=x.device,
-            dtype=torch.int,
-        ).transpose(0, 1)[:x_s_mn, :]
-    elif column_major_scales:
-        if scale_tma_aligned:
-            # TODO extract "align" function
-            # aligned to 4 * sizeof(float)
-            aligned_size = (x.shape[-2] + 3) // 4 * 4
-            x_s = torch.empty(
-                x.shape[:-2] + (x.shape[-1] // group_size, aligned_size),
-                device=x.device,
-                dtype=torch.float32,
-            ).permute(-1, -2)[: x.shape[-2], :]
-        else:
-            x_s = torch.empty(
-                (x.shape[-1] // group_size,) + x.shape[:-1],
-                device=x.device,
-                dtype=torch.float32,
-            ).permute(-1, -2)
-    else:
-        x_s = torch.empty(
-            x.shape[:-1] + (x.shape[-1] // group_size,),
-            device=x.device,
-            dtype=torch.float32,
-        )
+    x_s = _create_per_token_group_quant_fp8_output_scale(
+        x_shape=x.shape,
+        device=x.device,
+        group_size=group_size,
+        column_major_scales=column_major_scales,
+        scale_tma_aligned=scale_tma_aligned,
+        scale_ue8m0=scale_ue8m0,
+    )
+
     if x.shape[0] > 0:
         sgl_per_token_group_quant_fp8(
             x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
