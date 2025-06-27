@@ -166,8 +166,7 @@ class Gemma3Attention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        # Determine if layer uses sliding window based on pattern
-        self.is_sliding = bool((layer_id + 1) % config.sliding_window_pattern)
+        self.is_sliding = config.layer_types[layer_id] == "sliding_attention"
 
         # Initialize the rotary embedding.
         if self.is_sliding:
