@@ -437,7 +437,7 @@ class MHATokenToKVPool(KVCache):
 
 
 class SWAKVPool(KVCache):
-    """KV cache with separate pools for global and SWA attention layers."""
+    """KV cache with separate pools for full and SWA attention layers."""
 
     def __init__(
         self,
