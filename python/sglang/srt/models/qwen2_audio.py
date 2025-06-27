@@ -61,26 +61,6 @@ from sglang.srt.utils import add_prefix
 logger = logging.getLogger(__name__)
 
 
-# === Audio Inputs === #
-
-
-class Qwen2AudioInputs(TypedDict):
-    input_features: torch.Tensor
-    """Shape: `(batch_size, num_mel_bins, seq_len)`
-
-    Audio features extracted from raw audio waveforms.
-    """
-
-    feature_attention_mask: Optional[torch.Tensor]
-    """Shape: `(batch_size, seq_len)`
-
-    Attention mask for audio features.
-    """
-
-
-cached_get_processor = lru_cache(get_processor)
-
-
 class Qwen2AudioForConditionalGeneration(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
@@ -151,12 +131,6 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
             new_embeds.append(d[: items.audio_feature_lens[i].item()])
 
         return torch.cat(new_embeds, dim=0)
-
-    def _process_audio_input(self, audio_input: Qwen2AudioInputs) -> torch.Tensor:
-        input_features = audio_input["input_features"].type(self.audio_tower.dtype)
-        feature_attention_mask = audio_input.get("feature_attention_mask")
-        audio_embeds = self.audio_tower(input_features, feature_attention_mask)
-        return audio_embeds
 
     def forward(
         self,
