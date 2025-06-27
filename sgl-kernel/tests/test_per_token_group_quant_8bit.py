@@ -80,7 +80,8 @@ def test_per_token_group_quant_with_column_major(
 
     assert_fp8_all_close(x_q_triton, x_q_sglang)
     torch.testing.assert_close(
-        x_s_triton.contiguous(), x_s_sglang.contiguous(), rtol=1e-3, atol=1e-5
+        x_s_triton.contiguous(), x_s_sglang.contiguous(), rtol=1e-3, atol=1e-5,
+        msg=lambda message: message + f" {x_s_triton=} {x_s_sglang=}"
     )
 
 
