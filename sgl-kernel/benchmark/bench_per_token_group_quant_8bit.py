@@ -17,7 +17,7 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 
 batch_size_range = [1, 2, 4, 8, 16, 32, 64]
-seq_len_range = [64, 128, 256, 512, 1024, 2048]
+seq_len_range = [64, 128, 256, 512, 768, 1024, 2048]
 group_size_range = [128]  # For DeepSeek V3/R1
 dst_dtype_range = [torch.int8, fp8_type_]
 flags_range = PER_TOKEN_GROUP_QUANT_8BIT_VALID_FLAGS
