@@ -146,5 +146,13 @@ def replace_parameter(
 
 
 def assert_fp8_all_close(a: torch.Tensor, b: torch.Tensor):
-    assert (a.dtype == torch.float8_e4m3) and (b.dtype == torch.float8_e4m3)
+    assert a.shape == b.shape
+    assert a.dtype == b.dtype == torch.float8_e4m3
 
+    a_u8 = a.view(torch.uint8)
+    b_u8 = b.view(torch.uint8)
+    diff_u8 = (a_u8.to(torch.int16) - b_u8.to(torch.int16)).abs()
+
+    count_diff_sign = ((a_u8 >= 0) & (b_u8 < 0)).sum.item()
+    count_large_diff = (diff_u8 >= 2).sum().item()
+    assert (count_diff_sign == 0) and (count_large_diff == 0), f"{count_diff_sign=} {count_large_diff=}"
