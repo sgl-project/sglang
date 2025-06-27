@@ -7,9 +7,12 @@ import torch
 import triton
 
 from sglang.srt.layers.quantization.fp8_kernel import (
+    create_per_token_group_quant_fp8_output_scale,
+)
+from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit, create_per_token_group_quant_fp8_output_scale
+from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -18,7 +21,7 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 # TODO temp
 num_tokens_range = [768]
-hidden_dim_range = [1536, 7168, 18432] # For DeepSeek V3/R1
+hidden_dim_range = [1536, 7168, 18432]  # For DeepSeek V3/R1
 # num_tokens_range = [1, 4, 16, 64, 256, 768, 2048, 8192, 16384]
 # hidden_dim_range = [1536, 7168, 18432] # For DeepSeek V3/R1
 group_size_range = [128]  # For DeepSeek V3/R1
@@ -49,7 +52,13 @@ flags_range = [
 
 
 configs = list(
-    itertools.product(num_tokens_range, hidden_dim_range, group_size_range, dst_dtype_range, flags_range)
+    itertools.product(
+        num_tokens_range,
+        hidden_dim_range,
+        group_size_range,
+        dst_dtype_range,
+        flags_range,
+    )
 )
 
 
@@ -80,7 +89,9 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
         "triton": triton_per_token_group_quant_8bit,
         "sglang": sglang_per_token_group_quant_8bit,
     }[provider]
-    bench_fn = lambda: fn(x=x.clone(), group_size=group_size, dst_dtype=dst_dtype, **flags)
+    bench_fn = lambda: fn(
+        x=x.clone(), group_size=group_size, dst_dtype=dst_dtype, **flags
+    )
 
     # TODO no need?
     num_repeat = 10
@@ -93,8 +104,16 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
 
 
 if __name__ == "__main__":
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU]) as prof:
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CUDA,
+            torch.profiler.ProfilerActivity.CPU,
+        ]
+    ) as prof:
         benchmark.run(print_data=True)
 
-    trace_path = str(Path("/data/numa0/tom/temp_sglang_server2local/") / f"{time.time()}.trace.json.gz")
+    trace_path = str(
+        Path("/data/numa0/tom/temp_sglang_server2local/")
+        / f"{time.time()}.trace.json.gz"
+    )
     prof.export_chrome_trace(trace_path)
