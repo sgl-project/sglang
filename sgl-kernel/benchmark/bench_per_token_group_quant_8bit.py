@@ -85,9 +85,13 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
     }[provider]
     bench_fn = lambda: fn(x=x.clone(), group_size=group_size, dst_dtype=dst_dtype, **flags)
 
-    ms, min_ms, max_ms = triton.testing.do_bench(bench_fn, quantiles=quantiles)
+    num_repeat = 10
+    repeated_bench_fn = lambda: [bench_fn() for _ in range(num_repeat)]
 
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    ms, min_ms, max_ms = triton.testing.do_bench(repeatd_bench_fn, quantiles=quantiles)
+
+    postprocess_time = lambda t_ms: t_ms * 1000 / num_repeat
+    return postprocess_time(ms), postprocess_time(max_ms), postprocess_time(min_ms)
 
 
 if __name__ == "__main__":
