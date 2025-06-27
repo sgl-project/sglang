@@ -3,6 +3,31 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+// Custom error type for PD router operations
+#[derive(Debug, thiserror::Error)]
+pub enum PDRouterError {
+    #[error("Worker already exists: {url}")]
+    WorkerAlreadyExists { url: String },
+
+    #[error("Worker not found: {url}")]
+    WorkerNotFound { url: String },
+
+    #[error("Lock acquisition failed: {operation}")]
+    LockError { operation: String },
+
+    #[error("Health check failed for worker: {url}")]
+    HealthCheckFailed { url: String },
+
+    #[error("Invalid worker configuration: {reason}")]
+    InvalidConfiguration { reason: String },
+
+    #[error("Network error: {message}")]
+    NetworkError { message: String },
+
+    #[error("Timeout waiting for worker: {url}")]
+    Timeout { url: String },
+}
+
 #[derive(Debug, Clone)]
 pub enum EngineType {
     Prefill,
