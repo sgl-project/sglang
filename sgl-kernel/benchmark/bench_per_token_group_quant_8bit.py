@@ -66,7 +66,7 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
 
     device = torch.device("cuda")
 
-    x = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.float16)
+    x = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.bfloat16)
 
     quantiles = [0.5, 0.2, 0.8]
 

@@ -59,7 +59,7 @@ def test_per_token_group_quant_with_column_major(
         pytest.skip()
         return
 
-    x = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
+    x = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)
 
     execute_kwargs = dict(
         x=x,
