@@ -50,13 +50,10 @@ def benchmark(num_tokens, group_size, dst_dtype, flags, provider):
 
     quantiles = [0.5, 0.2, 0.8]
 
-    if provider == "triton":
-        fn = triton_per_token_group_quant_8bit
-    elif provider == "sglang":
-        fn = sglang_per_token_group_quant_8bit
-    else:
-        raise NotImplementedError
-
+    fn = {
+        "triton": triton_per_token_group_quant_8bit,
+        "sglang": sglang_per_token_group_quant_8bit,
+    }[provider]
     fn = lambda: fn(x.clone(), group_size, dst_dtype, **flags)
 
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
