@@ -903,6 +903,20 @@ register_conv_template(
 )
 
 
+register_conv_template(
+    Conversation(
+        name="qwen2-audio",
+        system_template="<|im_start|>system\n{system_message}",
+        system_message="You are a helpful assistant.",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<|im_end|>"],
+        audio_token="<|audio_bos|><|AUDIO|><|audio_eos|>",
+    )
+)
+
+
 @register_conv_template_matching_function
 def match_internvl(model_path: str):
     if re.search(r"internvl2_5", model_path, re.IGNORECASE):
@@ -955,6 +969,8 @@ def match_qwen_chat_ml(model_path: str):
         return "gme-qwen2-vl"
     if re.search(r"qwen.*vl", model_path, re.IGNORECASE):
         return "qwen2-vl"
+    if re.search(r"qwen2.*audio", model_path, re.IGNORECASE):
+        return "qwen2-audio"
     if re.search(
         r"llava-v1\.6-34b|llava-v1\.6-yi-34b|llava-next-video-34b|llava-onevision-qwen2",
         model_path,
