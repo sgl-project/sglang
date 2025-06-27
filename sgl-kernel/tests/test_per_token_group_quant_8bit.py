@@ -21,12 +21,10 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
             # [127, 128, 512, 1024, 4096, 8192],  # num_tokens
             # [256, 512, 1024, 2048, 4096],  # hidden_dim
             # [8, 16, 32, 64, 128],  # group_size
-
             # TODO temp
             [1],  # num_tokens
             [4096],  # hidden_dim
             [128],  # group_size
-
             # TODO test int8
             [fp8_type_],  # dtype
             [
@@ -44,7 +42,7 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
                 #     scale_tma_aligned=True,
                 #     scale_ue8m0=True,
                 # ),
-            ]
+            ],
         )
     ),
 )

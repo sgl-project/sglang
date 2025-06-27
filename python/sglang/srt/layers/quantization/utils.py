@@ -154,5 +154,8 @@ def assert_fp8_all_close(a: torch.Tensor, b: torch.Tensor):
     diff_u8 = (a_u8.to(torch.int16) - b_u8.to(torch.int16)).abs()
 
     count_diff_sign = ((a_u8 >= 0) & (b_u8 < 0)).sum.item()
+    count_tiny_diff = (diff_u8 >= 1).sum().item()
     count_large_diff = (diff_u8 >= 2).sum().item()
-    assert (count_diff_sign == 0) and (count_large_diff == 0), f"{count_diff_sign=} {count_large_diff=}"
+    assert (count_diff_sign == 0) and (
+        count_large_diff == 0
+    ), f"{count_diff_sign=} {count_tiny_diff=} {count_large_diff=} numel={a.numel()}"
