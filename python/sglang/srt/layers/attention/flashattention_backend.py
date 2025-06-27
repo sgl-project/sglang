@@ -1967,12 +1967,11 @@ class FlashAttentionBackend(AttentionBackend):
         # Without this slicing, the pre-allocated page_table may contain zeros or invalid indices
         # beyond the actual sequence length, leading to incorrect attention calculations
         max_seq_len = int(seqlens.max().item())
-        page_table_slice = metadata.page_table[:bs, :max_seq_len]
         if self.is_hybrid:
             assert full_to_swa_index_mapping is not None
-            sliced_page_table = full_to_swa_index_mapping[page_table_slice]
+            sliced_page_table = full_to_swa_index_mapping[metadata.page_table[:bs, :max_seq_len]]
         else:
-            sliced_page_table = page_table_slice
+            sliced_page_table = metadata.page_table[:bs, :max_seq_len]
 
         cu_seqlens_q_np = cu_seqlens_q.cpu().numpy()
         seqlens_np = seqlens.cpu().numpy()
