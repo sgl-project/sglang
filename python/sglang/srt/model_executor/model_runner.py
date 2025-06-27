@@ -55,13 +55,13 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.managers.eplb_manager import EPLBManager
-from sglang.srt.managers.expert_distribution import (
+from sglang.srt.eplb.eplb_manager import EPLBManager
+from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
     set_global_expert_distribution_recorder,
 )
-from sglang.srt.managers.expert_location import (
+from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     compute_initial_expert_location_metadata,
     get_global_expert_location_metadata,
