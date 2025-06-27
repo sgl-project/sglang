@@ -657,12 +657,16 @@ class FlashAttentionBackend(AttentionBackend):
         )
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # has corresponding quantization method so that layer.k_scale is not None
-        if self.kv_cache_dtype_str != "auto" and layer.k_scale is not None:
-            descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-            k_descale = layer.k_scale.expand(descale_shape)
-            v_descale = layer.v_scale.expand(descale_shape)
+        # has corresponding quantization method so that layer.k_scale is not None,
+        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
+        if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
+            if layer.k_scale is not None:
+                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+                k_descale = layer.k_scale.expand(descale_shape)
+                v_descale = layer.v_scale.expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
+            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         causal = not layer.is_cross_attention
 
         # Check if we should use local attention
@@ -776,8 +780,8 @@ class FlashAttentionBackend(AttentionBackend):
 
                     output, lse, *rest = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
+                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
                         cu_seqlens_q=metadata.cu_seqlens_q,
                         cu_seqlens_k=forward_batch.prefix_chunk_cu_seq_lens[chunk_idx],
                         max_seqlen_q=metadata.max_seq_len_q,
@@ -790,8 +794,8 @@ class FlashAttentionBackend(AttentionBackend):
                     # MHA for extend part of sequence without attending prefix kv cache
                     output, lse, *rest = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
+                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
                         cu_seqlens_q=metadata.cu_seqlens_q,
                         cu_seqlens_k=metadata.cu_seqlens_q,
                         max_seqlen_q=metadata.max_seq_len_q,
@@ -803,7 +807,9 @@ class FlashAttentionBackend(AttentionBackend):
                 return output, lse
             else:
                 # Do absorbed multi-latent attention
-                kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
+                    layer.layer_id
+                ).to(q.dtype)
                 k_rope = kv_cache[:, :, layer.v_head_dim :]
                 c_kv = kv_cache[:, :, : layer.v_head_dim]
                 k_rope_cache = k_rope.view(
@@ -933,14 +939,16 @@ class FlashAttentionBackend(AttentionBackend):
 
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # has corresponding quantization method so that layer.k_scale is not None
-        if self.kv_cache_dtype_str != "auto":
+        # has corresponding quantization method so that layer.k_scale is not None,
+        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
+        if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
-
+            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if not self.use_mla:
             # Do multi-head attention
 
@@ -1048,7 +1056,9 @@ class FlashAttentionBackend(AttentionBackend):
                     o = result
         else:
             # Do absorbed multi-latent attention
-            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
+                q.dtype
+            )
             k_rope = kv_cache[:, :, layer.v_head_dim :]
             c_kv = kv_cache[:, :, : layer.v_head_dim]
             k_rope_cache = k_rope.view(
