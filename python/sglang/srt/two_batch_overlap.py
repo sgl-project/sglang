@@ -32,17 +32,15 @@ def get_token_num_per_seq(
     forward_mode: ForwardMode,
     spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
 ):
-    assert (
-        forward_mode.is_target_verify()
-        or forward_mode.is_decode()
-        or forward_mode.is_idle()
-    ), f"forward_mode: {forward_mode} is not supported for `get_token_num_per_seq`"
     if forward_mode.is_target_verify():
         return spec_info.draft_token_num
     elif forward_mode.is_decode():
         return 1
     elif forward_mode.is_idle():
         return 0
+    else:
+        # For extend, we should not use `token_num_per_seq`.
+        return None
 
 
 # TODO: may smartly disable TBO when batch size is too small b/c it will slow down
@@ -582,6 +580,7 @@ class TboForwardBatchPreparer:
 
     @classmethod
     def _compute_split_token_index(cls, batch: ForwardBatch):
+        torch.distributed.breakpoint()
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=batch.forward_mode, spec_info=batch.spec_info
         )
