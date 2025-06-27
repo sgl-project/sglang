@@ -1291,7 +1291,7 @@ class Scheduler(
 
         num_new_seq = len(can_run_list)
         f = (
-            f"Prefill batch. Prefill step: {self.forward_ct}, "
+            f"Prefill batch. "
             f"#new-seq: {num_new_seq}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
@@ -1349,7 +1349,7 @@ class Scheduler(
             )
 
         msg = (
-            f"Decode batch. step: {self.forward_ct}, "
+            f"Decode batch. "
             f"#running-req: {num_running_reqs}, "
             f"#token: {num_used}, "
             f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
@@ -2471,10 +2471,7 @@ class Scheduler(
     def stop_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
-        logger.info("Stop profiling()")
-
         if not self.profile_in_progress:
-            logger.info("Stop profiling() - Profile not in progress")
             return ProfileReqOutput(
                 success=False,
                 message="Profiling is not in progress. Call /start_profile first.",
@@ -2559,10 +2556,6 @@ class Scheduler(
             else:
                 raise RuntimeError(f"unsupported profile stage: {batch.forward_mode}")
         else:
-            if self.profiler_target_forward_ct:
-                logger.info(
-                    f"[check profiler] profiler_target_forward_ct: {self.profiler_target_forward_ct}, forward_ct: {self.forward_ct}, stop_profile: {self.profiler_target_forward_ct <= self.forward_ct}",
-                )
             # Check profiler
             if (
                 self.profiler_target_forward_ct
