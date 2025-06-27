@@ -160,8 +160,8 @@ def _per_token_group_quant_fp8_colmajor(
     """
     # Map the program id to the row of X and Y it should compute.
     g_id = tl.program_id(0)
-    y_ptr += g_id * group_size
-    y_q_ptr += g_id * group_size
+    y_ptr += g_id.to(tl.int64) * group_size
+    y_q_ptr += g_id.to(tl.int64) * group_size
 
     # Convert g_id the flattened block coordinate to 2D so we can index
     # into the output y_scales matrix
