@@ -23,7 +23,7 @@ limitations under the License.
 // Adapted from
 // [flashinfer::activation::act_and_mul_kernel](https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/include/flashinfer/activation.cuh#L29)
 
-namespace flashinfer {
+namespace sgl_hip {
 namespace activation {
 
 template <typename T, T (*Activation)(const T&)>
@@ -36,7 +36,7 @@ __global__ void act_and_mul_kernel(T* __restrict__ out, const T* __restrict__ in
 
 #pragma unroll 1
   for (uint32_t idx = thread_idx; idx < d / vec_size; idx += stride) {
-    flashinfer::vec_t<T, vec_size> x_vec, y_vec, out_vec;
+    sgl_hip::vec_t<T, vec_size> x_vec, y_vec, out_vec;
     x_vec.cast_load(input + offset + idx * vec_size);
     y_vec.cast_load(input + offset + d + idx * vec_size);
 #pragma unroll
@@ -65,7 +65,7 @@ __global__ void act_only_kernel(T* __restrict__ out, const T* __restrict__ input
 
 #pragma unroll 1
   for (uint32_t idx = thread_idx; idx < d / vec_size; idx += stride) {
-    flashinfer::vec_t<T, vec_size> x_vec, y_vec, out_vec;
+    sgl_hip::vec_t<T, vec_size> x_vec, y_vec, out_vec;
     x_vec.cast_load(input + offset + idx * vec_size);
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
@@ -84,4 +84,4 @@ __global__ void act_only_kernel(T* __restrict__ out, const T* __restrict__ input
 }
 
 }  // namespace activation
-}  // namespace flashinfer
+}  // namespace sgl_hip

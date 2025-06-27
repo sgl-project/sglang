@@ -24,44 +24,44 @@ limitations under the License.
 
 // Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)d
 
-#define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
+#define SGL_HIP_INLINE inline __attribute__((always_inline)) __device__
 
-namespace flashinfer {
+namespace sgl_hip {
 
 template <typename float_t, size_t vec_size>
 struct vec_t;
 
 template <typename srcDtype, typename dstDtype, size_t vec_size>
-FLASHINFER_INLINE void cast_load_impl(vec_t<dstDtype, vec_size>& dst, const srcDtype* src);
+SGL_HIP_INLINE void cast_load_impl(vec_t<dstDtype, vec_size>& dst, const srcDtype* src);
 
 template <typename srcDtype, typename dstDtype, size_t vec_size>
-FLASHINFER_INLINE void cast_store_impl(dstDtype* dst_ptr, const vec_t<srcDtype, vec_size>& src);
+SGL_HIP_INLINE void cast_store_impl(dstDtype* dst_ptr, const vec_t<srcDtype, vec_size>& src);
 
 template <typename float_t, size_t vec_size>
 struct vec_t {
-  FLASHINFER_INLINE float_t& operator[](size_t i);
-  FLASHINFER_INLINE const float_t& operator[](size_t i) const;
-  FLASHINFER_INLINE float_t* ptr();
+  SGL_HIP_INLINE float_t& operator[](size_t i);
+  SGL_HIP_INLINE const float_t& operator[](size_t i) const;
+  SGL_HIP_INLINE float_t* ptr();
 
-  FLASHINFER_INLINE void load(const float_t* ptr);
-  FLASHINFER_INLINE void store(float_t* ptr) const;
+  SGL_HIP_INLINE void load(const float_t* ptr);
+  SGL_HIP_INLINE void store(float_t* ptr) const;
 
   template <typename T>
-  FLASHINFER_INLINE void cast_from(const vec_t<T, vec_size>& src);
+  SGL_HIP_INLINE void cast_from(const vec_t<T, vec_size>& src);
   template <typename T>
-  FLASHINFER_INLINE void cast_load(const T* ptr);
+  SGL_HIP_INLINE void cast_load(const T* ptr);
   template <typename T>
-  FLASHINFER_INLINE void cast_store(T* ptr) const;
+  SGL_HIP_INLINE void cast_store(T* ptr) const;
 };
 
-}  // namespace flashinfer
+}  // namespace sgl_hip
 
 // **** impl *****
 
-namespace flashinfer {
+namespace sgl_hip {
 
 template <typename srcDtype, typename dstDtype, size_t vec_size>
-FLASHINFER_INLINE void cast_load_impl(vec_t<dstDtype, vec_size>& dst, const srcDtype* src_ptr) {
+SGL_HIP_INLINE void cast_load_impl(vec_t<dstDtype, vec_size>& dst, const srcDtype* src_ptr) {
   if constexpr (std::is_same<srcDtype, dstDtype>::value) {
     dst.load(src_ptr);
   } else {
@@ -72,7 +72,7 @@ FLASHINFER_INLINE void cast_load_impl(vec_t<dstDtype, vec_size>& dst, const srcD
 }
 
 template <typename srcDtype, typename dstDtype, size_t vec_size>
-FLASHINFER_INLINE void cast_store_impl(dstDtype* dst_ptr, const vec_t<srcDtype, vec_size>& src) {
+SGL_HIP_INLINE void cast_store_impl(dstDtype* dst_ptr, const vec_t<srcDtype, vec_size>& src) {
   if constexpr (std::is_same<srcDtype, dstDtype>::value) {
     src.store(dst_ptr);
   } else {
@@ -84,17 +84,17 @@ FLASHINFER_INLINE void cast_store_impl(dstDtype* dst_ptr, const vec_t<srcDtype, 
 
 template <typename float_t, size_t vec_size>
 template <typename T>
-FLASHINFER_INLINE void vec_t<float_t, vec_size>::cast_load(const T* ptr) {
+SGL_HIP_INLINE void vec_t<float_t, vec_size>::cast_load(const T* ptr) {
   cast_load_impl(*this, ptr);
 }
 
 template <typename float_t, size_t vec_size>
 template <typename T>
-FLASHINFER_INLINE void vec_t<float_t, vec_size>::cast_store(T* ptr) const {
+SGL_HIP_INLINE void vec_t<float_t, vec_size>::cast_store(T* ptr) const {
   cast_store_impl(ptr, *this);
 }
 
-}  // namespace flashinfer
+}  // namespace sgl_hip
 
 #include "impl/hip_vec_bf16_impl.h"
 #include "impl/hip_vec_fp32_impl.h"

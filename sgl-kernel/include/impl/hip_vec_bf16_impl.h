@@ -17,42 +17,42 @@ __BF16_HOST_DEVICE_STATIC__ __hip_bfloat162 make_bfloat162(const __hip_bfloat16 
   return t;
 }
 
-namespace flashinfer {
+namespace sgl_hip {
 
 // nv_bfloat16 x 1
 template <>
 struct vec_t<nv_bfloat16, 1> {
   nv_bfloat16 data;
-  FLASHINFER_INLINE nv_bfloat16& operator[](size_t i) {
+  SGL_HIP_INLINE nv_bfloat16& operator[](size_t i) {
     return ((nv_bfloat16*)(&data))[i];
   }
-  FLASHINFER_INLINE const nv_bfloat16& operator[](size_t i) const {
+  SGL_HIP_INLINE const nv_bfloat16& operator[](size_t i) const {
     return ((const nv_bfloat16*)(&data))[i];
   }
-  FLASHINFER_INLINE nv_bfloat16* ptr() {
+  SGL_HIP_INLINE nv_bfloat16* ptr() {
     return reinterpret_cast<nv_bfloat16*>(&data);
   }
-  FLASHINFER_INLINE void load(const nv_bfloat16* ptr);
-  FLASHINFER_INLINE void store(nv_bfloat16* ptr) const;
+  SGL_HIP_INLINE void load(const nv_bfloat16* ptr);
+  SGL_HIP_INLINE void store(nv_bfloat16* ptr) const;
   template <typename T>
-  FLASHINFER_INLINE void cast_from(const vec_t<T, 1>& src) {
+  SGL_HIP_INLINE void cast_from(const vec_t<T, 1>& src) {
     cast_from_impl(*this, src);
   }
   template <typename T>
-  FLASHINFER_INLINE void cast_load(const T* ptr) {
+  SGL_HIP_INLINE void cast_load(const T* ptr) {
     cast_load_impl(*this, ptr);
   }
   template <typename T>
-  FLASHINFER_INLINE void cast_store(T* ptr) const {
+  SGL_HIP_INLINE void cast_store(T* ptr) const {
     cast_store_impl(ptr, *this);
   }
 };
 
-FLASHINFER_INLINE void vec_t<nv_bfloat16, 1>::load(const nv_bfloat16* ptr) {
+SGL_HIP_INLINE void vec_t<nv_bfloat16, 1>::load(const nv_bfloat16* ptr) {
   data = *ptr;
 }
 
-FLASHINFER_INLINE void vec_t<nv_bfloat16, 1>::store(nv_bfloat16* ptr) const {
+SGL_HIP_INLINE void vec_t<nv_bfloat16, 1>::store(nv_bfloat16* ptr) const {
   *ptr = data;
 }
 
@@ -61,36 +61,36 @@ template <>
 struct vec_t<nv_bfloat16, 2> {
   nv_bfloat162 data;
 
-  FLASHINFER_INLINE nv_bfloat16& operator[](size_t i) {
+  SGL_HIP_INLINE nv_bfloat16& operator[](size_t i) {
     return ((nv_bfloat16*)(&data))[i];
   }
-  FLASHINFER_INLINE const nv_bfloat16& operator[](size_t i) const {
+  SGL_HIP_INLINE const nv_bfloat16& operator[](size_t i) const {
     return ((const nv_bfloat16*)(&data))[i];
   }
-  FLASHINFER_INLINE nv_bfloat16* ptr() {
+  SGL_HIP_INLINE nv_bfloat16* ptr() {
     return reinterpret_cast<nv_bfloat16*>(&data);
   }
-  FLASHINFER_INLINE void load(const nv_bfloat16* ptr);
-  FLASHINFER_INLINE void store(nv_bfloat16* ptr) const;
+  SGL_HIP_INLINE void load(const nv_bfloat16* ptr);
+  SGL_HIP_INLINE void store(nv_bfloat16* ptr) const;
   template <typename T>
-  FLASHINFER_INLINE void cast_from(const vec_t<T, 2>& src) {
+  SGL_HIP_INLINE void cast_from(const vec_t<T, 2>& src) {
     cast_from_impl(*this, src);
   }
   template <typename T>
-  FLASHINFER_INLINE void cast_load(const T* ptr) {
+  SGL_HIP_INLINE void cast_load(const T* ptr) {
     cast_load_impl(*this, ptr);
   }
   template <typename T>
-  FLASHINFER_INLINE void cast_store(T* ptr) const {
+  SGL_HIP_INLINE void cast_store(T* ptr) const {
     cast_store_impl(ptr, *this);
   }
 };
 
-FLASHINFER_INLINE void vec_t<nv_bfloat16, 2>::load(const nv_bfloat16* ptr) {
+SGL_HIP_INLINE void vec_t<nv_bfloat16, 2>::load(const nv_bfloat16* ptr) {
   data = *((nv_bfloat162*)ptr);
 }
 
-FLASHINFER_INLINE void vec_t<nv_bfloat16, 2>::store(nv_bfloat16* ptr) const {
+SGL_HIP_INLINE void vec_t<nv_bfloat16, 2>::store(nv_bfloat16* ptr) const {
   *((nv_bfloat162*)ptr) = data;
 }
 
@@ -98,36 +98,36 @@ template <>
 struct vec_t<nv_bfloat16, 4> {
   uint2 data;
 
-  FLASHINFER_INLINE nv_bfloat16& operator[](size_t i) {
+  SGL_HIP_INLINE nv_bfloat16& operator[](size_t i) {
     return ((nv_bfloat16*)(&data))[i];
   }
-  FLASHINFER_INLINE const nv_bfloat16& operator[](size_t i) const {
+  SGL_HIP_INLINE const nv_bfloat16& operator[](size_t i) const {
     return ((const nv_bfloat16*)(&data))[i];
   }
-  FLASHINFER_INLINE nv_bfloat16* ptr() {
+  SGL_HIP_INLINE nv_bfloat16* ptr() {
     return reinterpret_cast<nv_bfloat16*>(&data);
   }
-  FLASHINFER_INLINE void load(const nv_bfloat16* ptr);
-  FLASHINFER_INLINE void store(nv_bfloat16* ptr) const;
+  SGL_HIP_INLINE void load(const nv_bfloat16* ptr);
+  SGL_HIP_INLINE void store(nv_bfloat16* ptr) const;
   template <typename T>
-  FLASHINFER_INLINE void cast_from(const vec_t<T, 4>& src) {
+  SGL_HIP_INLINE void cast_from(const vec_t<T, 4>& src) {
     cast_from_impl(*this, src);
   }
   template <typename T>
-  FLASHINFER_INLINE void cast_load(const T* ptr) {
+  SGL_HIP_INLINE void cast_load(const T* ptr) {
     cast_load_impl(*this, ptr);
   }
   template <typename T>
-  FLASHINFER_INLINE void cast_store(T* ptr) const {
+  SGL_HIP_INLINE void cast_store(T* ptr) const {
     cast_store_impl(ptr, *this);
   }
 };
 
-FLASHINFER_INLINE void vec_t<nv_bfloat16, 4>::load(const nv_bfloat16* ptr) {
+SGL_HIP_INLINE void vec_t<nv_bfloat16, 4>::load(const nv_bfloat16* ptr) {
   data = *((uint2*)ptr);
 }
 
-FLASHINFER_INLINE void vec_t<nv_bfloat16, 4>::store(nv_bfloat16* ptr) const {
+SGL_HIP_INLINE void vec_t<nv_bfloat16, 4>::store(nv_bfloat16* ptr) const {
   *((uint2*)ptr) = data;
 }
 
@@ -137,41 +137,41 @@ template <size_t vec_size>
 struct vec_t<nv_bfloat16, vec_size> {
   uint4 data[vec_size / 8];
 
-  FLASHINFER_INLINE nv_bfloat16& operator[](size_t i) {
+  SGL_HIP_INLINE nv_bfloat16& operator[](size_t i) {
     return ((nv_bfloat16*)data)[i];
   }
-  FLASHINFER_INLINE const nv_bfloat16& operator[](size_t i) const {
+  SGL_HIP_INLINE const nv_bfloat16& operator[](size_t i) const {
     return ((const nv_bfloat16*)data)[i];
   }
-  FLASHINFER_INLINE nv_bfloat16* ptr() {
+  SGL_HIP_INLINE nv_bfloat16* ptr() {
     return reinterpret_cast<nv_bfloat16*>(&data);
   }
-  FLASHINFER_INLINE void load(const nv_bfloat16* ptr) {
-#pragma unroll
+  SGL_HIP_INLINE void load(const nv_bfloat16* ptr) {
+#pragma unoll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       data[i] = ((uint4*)ptr)[i];
     }
   }
-  FLASHINFER_INLINE void store(nv_bfloat16* ptr) const {
-#pragma unroll
+  SGL_HIP_INLINE void store(nv_bfloat16* ptr) const {
+#pragma unoll
     for (size_t i = 0; i < vec_size / 8; ++i) {
       ((uint4*)ptr)[i] = data[i];
     }
   }
   template <typename T>
-  FLASHINFER_INLINE void cast_from(const vec_t<T, vec_size>& src) {
+  SGL_HIP_INLINE void cast_from(const vec_t<T, vec_size>& src) {
     cast_from_impl(*this, src);
   }
   template <typename T>
-  FLASHINFER_INLINE void cast_load(const T* ptr) {
+  SGL_HIP_INLINE void cast_load(const T* ptr) {
     cast_load_impl(*this, ptr);
   }
   template <typename T>
-  FLASHINFER_INLINE void cast_store(T* ptr) const {
+  SGL_HIP_INLINE void cast_store(T* ptr) const {
     cast_store_impl(ptr, *this);
   }
 };
 
-}  // namespace flashinfer
+}  // namespace sgl_hip
 
 #endif
