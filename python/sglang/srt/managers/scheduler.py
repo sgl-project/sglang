@@ -495,7 +495,7 @@ class Scheduler(
         self.rpd_profiler = None
 
         # Init metrics stats
-        self.init_metrics()
+        self.init_metrics(tp_rank, dp_rank)
         self.init_kv_events(server_args.kv_events_config)
 
         # Init request dispatcher
@@ -626,7 +626,7 @@ class Scheduler(
             )
         )
 
-    def init_metrics(self):
+    def init_metrics(self, tp_rank: int, dp_rank: Optional[int]):
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -641,6 +641,8 @@ class Scheduler(
                 labels={
                     "model_name": self.server_args.served_model_name,
                     "engine_type": engine_type,
+                    "tp_rank": tp_rank,
+                    **({"dp_rank": dp_rank} if dp_rank is not None else {}),
                 },
             )
 
