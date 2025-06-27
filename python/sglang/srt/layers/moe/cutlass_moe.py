@@ -65,14 +65,12 @@ def cutlass_fused_experts_fp8(
             number of tokens and `k` is the hidden size. Expected dtype: `torch.half`
             or `torch.bfloat16`.
         w1_q (torch.Tensor): Pre-quantized FP8 weight tensor for the first GEMM
-            (up-projection part of SwiGLU). Expected shape: `(E, k, n*2)`, where
+            (up-projection part of SwiGLU). Expected shape: `(E, n*2, k)`, where
             `E` is the number of experts, `k` is the hidden size, and `n*2` is the
             intermediate size (`I`). Expected dtype: `torch.float8_e4m3fn`.
-            Note: This shape implies weights are stored as (num_experts, hidden_size, intermediate_size).
         w2_q (torch.Tensor): Pre-quantized FP8 weight tensor for the second GEMM
-            (down-projection). Expected shape: `(E, n, k)`, where `n` is half the
+            (down-projection). Expected shape: `(E, k, n)`, where `n` is half the
             intermediate size (`I // 2`). Expected dtype: `torch.float8_e4m3fn`.
-            Note: This shape implies weights are stored as (num_experts, intermediate_size // 2, hidden_size).
         w1_scale (torch.Tensor): Scales corresponding to `w1_q` (per-block scales).
             Shape: `(E, num_blocks_n, num_blocks_k)`. Dtype: `torch.float32`.
         w2_scale (torch.Tensor): Scales corresponding to `w2_q` (per-block scales).
@@ -113,10 +111,9 @@ def cutlass_fused_experts_fp8(
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert w1_q.dtype == torch.float8_e4m3fn
     assert w2_q.dtype == torch.float8_e4m3fn
-    assert a.shape[1] == w1_q.shape[1], "Hidden size mismatch w1"
-    assert w1_q.shape[2] == w2_q.shape[1] * 2, "Hidden size mismatch w2"
+    assert a.shape[1] == w1_q.shape[2], "Hidden size mismatch w1"
+    assert w1_q.shape[1] == w2_q.shape[2] * 2, "Hidden size mismatch w2"
     assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
-    assert w1_q.shape[0] == w2_q.shape[0], "Weights expert number mismatch"
     assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
     assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid output dtype"
@@ -128,9 +125,8 @@ def cutlass_fused_experts_fp8(
 
     out_dtype = a.dtype
     num_experts = w1_q.size(0)
-    m = a.size(0)
-    k = w1_q.size(1)
-    n = w2_q.size(1)
+    m, k = a.shape
+    n = w2_q.size(2)
 
     topk = topk_ids.size(1)
 
@@ -208,8 +204,11 @@ def cutlass_fused_experts_fp8(
         workspace,
     )
 
-    result = torch.empty((m, k), device=device, dtype=out_dtype)
-    return apply_shuffle_mul_sum(c2, result, c_map, topk_weights)
+    c2 = shuffle_rows(c2, c_map, (m * topk, k))
+    c2 = c2.view(m, topk, k)
+    c2 = c2 * topk_weights.view(m, topk, 1).to(out_dtype)
+    result = c2.sum(dim=1).to(out_dtype)
+    return result
 
 
 FLOAT4_E2M1_MAX = 6.0
