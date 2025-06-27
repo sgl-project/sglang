@@ -533,7 +533,7 @@ class _attention(torch.autograd.Function):
 lightning_attention_ = _attention.apply
 
 
-def lightning_attention(q, k, v, s, kv_history=None):
+def lightning_attention(q, k, v, ed, block_size=256, kv_history=None):
     """
     Apply lightning attention algorithm 
     to compute attention efficiently.
