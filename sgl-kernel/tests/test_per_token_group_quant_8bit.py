@@ -2,16 +2,15 @@ import itertools
 
 import pytest
 import torch
+
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
-
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
-
 
 
 @pytest.mark.parametrize(
