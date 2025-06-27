@@ -11,11 +11,17 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 if _is_cuda:
     from sgl_kernel import awq_dequantize
+elif _is_hip:
+    # TODO (Hubert): call awq_dequantize_triton
+    from sglang.srt.layers.quantization.awq_triton import awq_dequantize_triton
+else:
+    raise RuntimeError("Only CUDA and HIP support AWQ currently.")
 
 logger = logging.getLogger(__name__)
 
@@ -195,8 +201,12 @@ class AWQLinearMethod(LinearMethodBase):
         pack_factor = self.quant_config.pack_factor
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
-
-        out = awq_dequantize(qweight, scales, qzeros)
+        if _is_cuda:
+            out = awq_dequantize(qweight, scales, qzeros)
+        elif _is_hip:
+            out = awq_dequantize_triton(qweight, scales, qzeros)
+        else:
+            raise RuntimeError("Only CUDA and HIP support AWQ currently.")
         out = torch.matmul(reshaped_x, out)
 
         if bias is not None:
