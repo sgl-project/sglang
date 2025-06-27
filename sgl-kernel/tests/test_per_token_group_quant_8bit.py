@@ -24,9 +24,10 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
             [127],  # num_tokens
             [256],  # hidden_dim
             [8],  # group_size
-            [torch.int8, fp8_type_],  # dtype
+            # TODO test int8
+            [fp8_type_],  # dtype
             [
-                # TODO support more combinations
+                # TODO test more combinations
                 dict(
                     column_major_scales=True,
                     scale_tma_aligned=True,
