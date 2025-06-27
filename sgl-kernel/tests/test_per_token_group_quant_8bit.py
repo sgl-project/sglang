@@ -14,15 +14,19 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 
 @pytest.mark.parametrize(
-    "num_tokens, hidden_dim, group_size, dst_dtype, column_major_scales, scale_tma_aligned",
+    "num_tokens, hidden_dim, group_size, dst_dtype, flags",
     list(
         itertools.product(
             [127, 128, 512, 1024, 4096, 8192],  # num_tokens
             [256, 512, 1024, 2048, 4096],  # hidden_dim
             [8, 16, 32, 64, 128],  # group_size
             [torch.int8, fp8_type_],  # dtype
-            [False, True],  # column_major_scales
-            [False, True],  # scale_tma_aligned
+            [
+                dict(column_major_scales=False, scale_tma_aligned=False, scale_ue8m0=False),
+                dict(column_major_scales=True, scale_tma_aligned=False, scale_ue8m0=False),
+                dict(column_major_scales=True, scale_tma_aligned=True, scale_ue8m0=False),
+                dict(column_major_scales=True, scale_tma_aligned=True, scale_ue8m0=True),
+            ],
         )
     ),
 )
@@ -31,12 +35,8 @@ def test_per_token_group_quant_with_column_major(
     hidden_dim,
     group_size,
     dst_dtype,
-    column_major_scales,
-    scale_tma_aligned,
+    flags,
 ):
-    if not column_major_scales and scale_tma_aligned:
-        return
-
     x = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
 
     x_q_triton, x_s_triton = triton_per_token_group_quant_8bit(
@@ -44,8 +44,7 @@ def test_per_token_group_quant_with_column_major(
         group_size,
         eps=1e-10,
         dtype=dst_dtype,
-        column_major_scales=column_major_scales,
-        scale_tma_aligned=scale_tma_aligned,
+        **flags,
     )
 
     x_q_sglang, x_s_sglang = sglang_per_token_group_quant_8bit(
@@ -53,8 +52,7 @@ def test_per_token_group_quant_with_column_major(
         group_size,
         eps=1e-10,
         dtype=dst_dtype,
-        column_major_scales=column_major_scales,
-        scale_tma_aligned=scale_tma_aligned,
+        **flags,
     )
 
     torch.testing.assert_close(
