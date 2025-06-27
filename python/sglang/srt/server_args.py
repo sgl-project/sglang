@@ -240,6 +240,9 @@ class ServerArgs:
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
 
+    # KV manager
+    kv_manager: Literal["default", "kvbm"] = "default"
+
     def __post_init__(self):
         # Expert parallelism
         if self.enable_ep_moe:
@@ -550,6 +553,8 @@ class ServerArgs:
 
         if self.custom_weight_loader is None:
             self.custom_weight_loader = []
+
+        os.environ["SGLANG_KV_MANAGER"] = self.kv_manager
 
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
         larger_tp = max(decode_tp, prefill_tp)
@@ -1613,6 +1618,16 @@ class ServerArgs:
             "--weight-loader-disable-mmap",
             action="store_true",
             help="Disable mmap while loading weight using safetensors.",
+        )
+
+        # KV manager
+        parser.add_argument(
+            "--kv-manager",
+            type=str,
+            default=ServerArgs.kv_manager,
+            choices=["default", "kvbm"],
+            help="Select KV cache manager. 'kvbm' routes allocations to NVIDIA Dynamo KVBM; "
+                 "'default' keeps the built-in allocator.",
         )
 
     @classmethod
