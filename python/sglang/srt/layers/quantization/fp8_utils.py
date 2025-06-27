@@ -1,9 +1,10 @@
-import os
-from curses import flash
 from typing import Callable, List, Optional, Tuple
 
+import einops
 import torch
 
+from sglang.math_utils import align
+from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.utils import is_sm100_supported
 
@@ -14,7 +15,6 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
 
-from sglang.srt.layers.quantization.deep_gemm import _ENABLE_JIT_DEEPGEMM
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
@@ -42,7 +42,10 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
-    from aiter import gemm_a8w8_blockscale_CK
+    import aiter
+    from aiter import gemm_a8w8_blockscale_CK, get_hip_quant
+
+    aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
@@ -137,7 +140,7 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
-    elif _ENABLE_JIT_DEEPGEMM:
+    elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
     else:
         return triton_w8a8_block_fp8_linear
@@ -238,13 +241,25 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         block_size[1],
         column_major_scales=True,
         scale_tma_aligned=True,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
     )
+
+    # NOTE(alcanderian): Useless when scale is packed to int32
+    # if get_bool_env_var("SGLANG_W8A8_DEEPGEMM_SANITY_CHECK_UE8M0"):
+    #     _check_ue8m0("x_scale", x_scale)
+    #     _check_ue8m0("weight_scale", ws)
+
     output = w8a8_block_fp8_matmul_deepgemm(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
     )
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
+
+
+def _check_ue8m0(name, x):
+    x_ceil = ceil_to_ue8m0(x)
+    assert torch.all(x == x_ceil), f"{name=} {x=} {x_ceil=}"
 
 
 def aiter_w8a8_block_fp8_linear(
@@ -259,9 +274,7 @@ def aiter_w8a8_block_fp8_linear(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=False
-    )
+    q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
     output = gemm_a8w8_blockscale_CK(
         q_input, weight, x_scale, weight_scale, dtype=input.dtype
     )
@@ -369,27 +382,80 @@ def block_quant_dequant(
     The output is an unquantized tensor with dtype.
     """
     block_n, block_k = block_size[0], block_size[1]
-    n, k = x_q_block.shape
-    n_tiles = (n + block_n - 1) // block_n
-    k_tiles = (k + block_k - 1) // block_k
-    assert n_tiles == x_s.shape[0]
-    assert k_tiles == x_s.shape[1]
+    *_, n, k = x_q_block.shape
 
-    x_dq_block = torch.empty_like(x_q_block, dtype=dtype)
+    # ... n_scale k_scale -> ... (n_scale block_n) (k_scale block_k)
+    x_scale_repeat = x_s.repeat_interleave(block_n, dim=-2).repeat_interleave(
+        block_k, dim=-1
+    )
+    x_scale_repeat = x_scale_repeat[..., :n, :k]
 
-    for j in range(n_tiles):
-        for i in range(k_tiles):
-            x_q_block_tile = x_q_block[
-                j * block_n : min((j + 1) * block_n, n),
-                i * block_k : min((i + 1) * block_k, k),
-            ]
-            x_dq_block_tile = x_dq_block[
-                j * block_n : min((j + 1) * block_n, n),
-                i * block_k : min((i + 1) * block_k, k),
-            ]
-            x_dq_block_tile[:, :] = x_q_block_tile.to(torch.float32) * x_s[j][i]
+    return (x_q_block.to(torch.float32) * x_scale_repeat).to(dtype)
 
-    return x_dq_block
+
+def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
+    assert isinstance(weight, torch.nn.Parameter)
+    assert isinstance(weight_scale_inv, torch.nn.Parameter)
+    weight.data, weight_scale_inv.data = _requant_weight_ue8m0(
+        weight, weight_scale_inv, weight_block_size
+    )
+
+
+def _requant_weight_ue8m0(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    weight_block_size: List[int],
+):
+    assert weight_block_size == [128, 128]
+
+    *_, n, k = weight.shape
+
+    weight_dequant = block_quant_dequant(
+        weight,
+        weight_scale_inv,
+        weight_block_size,
+        torch.bfloat16,
+    )
+
+    weight_dequant_flat = weight_dequant.view((-1, k))
+    out_w_flat, out_s_flat = per_block_cast_to_fp8(weight_dequant_flat)
+
+    out_w = out_w_flat.view(weight.shape)
+    out_s = out_s_flat.view(weight_scale_inv.shape)
+
+    # NOTE copy and modified from DeepGEMM
+    def _transform_scale(sf, mn: int):
+        import deep_gemm.utils.layout
+
+        sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
+        sf = deep_gemm.utils.layout.get_col_major_tma_aligned_packed_tensor(sf)
+        return sf
+
+    out_s = _transform_scale(out_s, mn=out_w.shape[-2])
+
+    return out_w, out_s
+
+
+# COPIED FROM DeepGEMM
+def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2
+    m, n = x.shape
+    x_padded = torch.zeros(
+        (align(m, 128), align(n, 128)), dtype=x.dtype, device=x.device
+    )
+    x_padded[:m, :n] = x
+    x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
+    x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
+    sf = ceil_to_ue8m0(x_amax / 448.0)
+    x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
+    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(
+        x_view.size(0), x_view.size(2)
+    )
+
+
+# COPIED FROM DeepGEMM
+def ceil_to_ue8m0(x: torch.Tensor):
+    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 
 
 def channel_quant_to_tensor_quant(

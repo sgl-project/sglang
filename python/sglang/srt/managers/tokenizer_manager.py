@@ -459,6 +459,10 @@ class TokenizerManager:
         # Tokenize
         input_embeds = None
         input_text = obj.text
+        token_type_ids = None
+        is_cross_encoder_request = (
+            isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
+        )
         if obj.input_embeds is not None:
             if not self.server_args.disable_radix_cache:
                 raise ValueError(
@@ -477,7 +481,14 @@ class TokenizerManager:
                     "accept text prompts. Please provide input_ids or re-initialize "
                     "the engine with skip_tokenizer_init=False."
                 )
-            input_ids = self.tokenizer.encode(input_text)
+            encoded = self.tokenizer(
+                input_text, return_token_type_ids=is_cross_encoder_request
+            )
+
+            input_ids = encoded["input_ids"]
+            if is_cross_encoder_request:
+                input_ids = encoded["input_ids"][0]
+                token_type_ids = encoded.get("token_type_ids", [None])[0]
 
         if self.mm_processor and obj.contains_mm_input():
             image_inputs = await self.mm_processor.process_mm_data_async(
@@ -493,7 +504,7 @@ class TokenizerManager:
 
         self._validate_token_len(obj, input_ids)
         return self._create_tokenized_object(
-            obj, input_text, input_ids, input_embeds, image_inputs
+            obj, input_text, input_ids, input_embeds, image_inputs, token_type_ids
         )
 
     def _validate_token_len(
@@ -532,6 +543,7 @@ class TokenizerManager:
         input_ids: List[int],
         input_embeds: Optional[Union[List[float], None]] = None,
         image_inputs: Optional[Dict] = None,
+        token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
 
@@ -592,6 +604,7 @@ class TokenizerManager:
                 input_text,
                 input_ids,
                 image_inputs,
+                token_type_ids,
                 sampling_params,
             )
 
@@ -1045,12 +1058,7 @@ class TokenizerManager:
                         "lora_path",
                     ]
                 )
-                out_skip_names = set(
-                    [
-                        "text",
-                        "output_ids",
-                    ]
-                )
+                out_skip_names = set(["text", "output_ids", "embedding"])
             elif self.log_requests_level == 1:
                 max_length = 2048
             elif self.log_requests_level == 2:
@@ -1127,9 +1135,17 @@ class TokenizerManager:
             remain_num_req = len(self.rid_to_state)
 
             if self.health_check_failed:
-                # if health check failed, we should exit immediately
+                # if health check failed, exit immediately
                 logger.error(
                     "Signal SIGTERM received while health check failed. Exiting... remaining number of requests: %d",
+                    remain_num_req,
+                )
+                break
+
+            elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
+                # if force shutdown flag set, exit immediately
+                logger.error(
+                    "Signal SIGTERM received while force shutdown flag set. Force exiting... remaining number of requests: %d",
                     remain_num_req,
                 )
                 break
@@ -1210,7 +1226,7 @@ class TokenizerManager:
                     state.last_output_offset = len(state.output_ids)
                 else:
                     state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids
+                    output_token_ids = state.output_ids.copy()
 
                 out_dict = {
                     "output_ids": output_token_ids,

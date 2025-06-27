@@ -11,7 +11,6 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -407,9 +406,10 @@ class FlashAttentionBackend(AttentionBackend):
                         dtype=torch.int32,
                         device=device,
                     )
+                    # shape: [bs, num_steps, topk] -> [bs x topk, num_steps]
                     cache_loc = forward_batch.out_cache_loc.view(
-                        self.speculative_num_steps, -1
-                    ).T.contiguous()
+                        -1, self.speculative_num_steps
+                    )
                     metadata_expand.page_table = (
                         cache_loc[:, :decode_length].contiguous().to(torch.int32)
                     )
@@ -657,12 +657,16 @@ class FlashAttentionBackend(AttentionBackend):
         )
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # has corresponding quantization method so that layer.k_scale is not None
-        if self.kv_cache_dtype_str != "auto" and layer.k_scale is not None:
-            descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-            k_descale = layer.k_scale.expand(descale_shape)
-            v_descale = layer.v_scale.expand(descale_shape)
+        # has corresponding quantization method so that layer.k_scale is not None,
+        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
+        if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
+            if layer.k_scale is not None:
+                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+                k_descale = layer.k_scale.expand(descale_shape)
+                v_descale = layer.v_scale.expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
+            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         causal = not layer.is_cross_attention
 
         # Check if we should use local attention
@@ -776,8 +780,8 @@ class FlashAttentionBackend(AttentionBackend):
 
                     output, lse, *rest = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
+                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
                         cu_seqlens_q=metadata.cu_seqlens_q,
                         cu_seqlens_k=forward_batch.prefix_chunk_cu_seq_lens[chunk_idx],
                         max_seqlen_q=metadata.max_seq_len_q,
@@ -790,8 +794,8 @@ class FlashAttentionBackend(AttentionBackend):
                     # MHA for extend part of sequence without attending prefix kv cache
                     output, lse, *rest = flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim),
+                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
                         cu_seqlens_q=metadata.cu_seqlens_q,
                         cu_seqlens_k=metadata.cu_seqlens_q,
                         max_seqlen_q=metadata.max_seq_len_q,
@@ -803,7 +807,9 @@ class FlashAttentionBackend(AttentionBackend):
                 return output, lse
             else:
                 # Do absorbed multi-latent attention
-                kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
+                    layer.layer_id
+                ).to(q.dtype)
                 k_rope = kv_cache[:, :, layer.v_head_dim :]
                 c_kv = kv_cache[:, :, : layer.v_head_dim]
                 k_rope_cache = k_rope.view(
@@ -933,14 +939,16 @@ class FlashAttentionBackend(AttentionBackend):
 
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # has corresponding quantization method so that layer.k_scale is not None
-        if self.kv_cache_dtype_str != "auto":
+        # has corresponding quantization method so that layer.k_scale is not None,
+        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
+        if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
             q = q.to(self.kv_cache_dtype)
-
+            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if not self.use_mla:
             # Do multi-head attention
 
@@ -1048,7 +1056,9 @@ class FlashAttentionBackend(AttentionBackend):
                     o = result
         else:
             # Do absorbed multi-latent attention
-            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
+                q.dtype
+            )
             k_rope = kv_cache[:, :, layer.v_head_dim :]
             c_kv = kv_cache[:, :, : layer.v_head_dim]
             k_rope_cache = k_rope.view(
@@ -1120,7 +1130,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
 
         Args:
@@ -1637,9 +1647,8 @@ class FlashAttentionBackend(AttentionBackend):
                     # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                     metadata_expand = self.draft_decode_metadata_topk_expand[bs]
                     decode_length = self.speculative_step_id + 1
-                    cache_loc = out_cache_loc.view(
-                        self.speculative_num_steps, -1
-                    ).T.contiguous()
+                    # shape: [bs, num_steps, topk] -> [bs x topk, num_steps]
+                    cache_loc = out_cache_loc.view(-1, self.speculative_num_steps)
                     metadata_expand.page_table[: cache_loc.shape[0]].copy_(
                         cache_loc[:, :decode_length]
                     )
@@ -1705,14 +1714,15 @@ class FlashAttentionBackend(AttentionBackend):
 
                 # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                 metadata_expand = self.target_verify_metadata_topk_expand[bs]
+
                 # metadata_expand.max_seq_len_q = 1, already set in capture
                 # metadata_expand.cu_seqlens_q already set in capture
-
                 offsets = torch.arange(
                     self.speculative_num_draft_tokens, device=device
                 ).unsqueeze(
                     0
                 )  # shape: (1, self.speculative_num_draft_tokens)
+
                 cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
                 cum_len = torch.nn.functional.pad(
                     torch.cumsum(
@@ -1729,17 +1739,20 @@ class FlashAttentionBackend(AttentionBackend):
                 ).view(1, -1)
                 # avoid extracting padded seq indices which will be out of boundary
                 mask_extraction_indices[
-                    :, spec_info.positions.numel() * self.speculative_num_draft_tokens :
+                    :,
+                    spec_info.positions.numel() * self.speculative_num_draft_tokens :,
                 ].fill_(0)
-
                 mask = spec_info.custom_mask[mask_extraction_indices].view(
                     -1, self.speculative_num_draft_tokens
                 )  # (bsz * draft_num, draft_num)
+
                 col_indices = offsets.expand(
                     mask.shape[0], self.speculative_num_draft_tokens
                 )
                 keys = torch.where(
-                    mask, col_indices, col_indices + self.speculative_num_draft_tokens
+                    mask,
+                    col_indices,
+                    col_indices + self.speculative_num_draft_tokens,
                 )
                 _, sort_order = torch.sort(keys, dim=1)
 
@@ -1748,6 +1761,7 @@ class FlashAttentionBackend(AttentionBackend):
                     .gather(1, cols)
                     .repeat_interleave(self.speculative_num_draft_tokens, dim=0)
                 )  # (bsz, draft_num)
+
                 metadata_expand.page_table.copy_(
                     non_masked_page_table.gather(1, sort_order)
                 )
@@ -1759,6 +1773,7 @@ class FlashAttentionBackend(AttentionBackend):
                         dtype=torch.int32,
                     )
                 )
+
         elif forward_mode.is_draft_extend():
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
@@ -1768,7 +1783,11 @@ class FlashAttentionBackend(AttentionBackend):
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
             accept_length = spec_info.accept_length[:bs]
-            metadata.max_seq_len_q = max(spec_info.accept_length_cpu) + 1
+            if spec_info.accept_length_cpu:
+                metadata.max_seq_len_q = max(spec_info.accept_length_cpu) + 1
+            else:
+                metadata.max_seq_len_q = 1
+
             metadata.cu_seqlens_q[1:].copy_(
                 torch.cumsum(accept_length, dim=0, dtype=torch.int32)
             )
@@ -1808,7 +1827,7 @@ class FlashAttentionBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
-        return 0
+        return 1
 
     def _init_local_attn_metadata(self, metadata: FlashAttentionMetadata, device):
         """Centralized utility to initialize local_attn_metadata if chunked attention is enabled."""
@@ -2000,9 +2019,9 @@ class FlashAttentionMultiStepBackend:
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
-    def init_cuda_graph_state(self, max_bs: int):
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps):
-            self.attn_backends[i].init_cuda_graph_state(max_bs)
+            self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
     def init_forward_metadata_capture_cuda_graph(
         self,

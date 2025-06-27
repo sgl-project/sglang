@@ -26,9 +26,11 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt import debug_utils
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.distributed import (
     get_tp_group,
     get_world_group,
@@ -45,10 +47,9 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.quantization import monkey_patch_isinstance_for_vllm_base_layer
-from sglang.srt.layers.quantization.deep_gemm import (
-    _ENABLE_JIT_DEEPGEMM,
-    update_deep_gemm_config,
+from sglang.srt.layers.quantization import (
+    deep_gemm_wrapper,
+    monkey_patch_isinstance_for_vllm_base_layer,
 )
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
@@ -70,14 +71,17 @@ from sglang.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
 )
+from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    PagedTokenToKVPoolAllocator,
+    TokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
-    TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -93,6 +97,7 @@ from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     cpu_has_amx_support,
+    dynamic_import,
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -110,6 +115,7 @@ from sglang.srt.utils import (
 )
 
 _is_hip = is_hip()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 # Use a small KV cache pool size for tests in CI
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
@@ -149,7 +155,7 @@ class ModelRunner:
         server_args: ServerArgs,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
-        token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
+        token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
         # Parse args
         self.model_config = model_config
@@ -162,6 +168,7 @@ class ModelRunner:
             logger.addFilter(RankZeroFilter(tp_rank == 0))
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.dp_size = server_args.dp_size
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.dist_port = nccl_port
@@ -195,6 +202,7 @@ class ModelRunner:
             | {
                 # TODO it is indeed not a "server args"
                 "use_mla_backend": self.use_mla_backend,
+                "speculative_algorithm": self.spec_algorithm,
             }
         )
 
@@ -205,8 +213,8 @@ class ModelRunner:
         min_per_gpu_memory = self.init_torch_distributed()
 
         # Update deep gemm configure
-        if _ENABLE_JIT_DEEPGEMM:
-            update_deep_gemm_config(gpu_id, server_args)
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
 
         # If it is a draft model, tp_group can be different
         self.initialize(min_per_gpu_memory)
@@ -218,6 +226,7 @@ class ModelRunner:
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
+
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
@@ -230,7 +239,7 @@ class ModelRunner:
                 "SGLANG_LOG_EXPERT_LOCATION_METADATA"
             ):
                 logger.info(
-                    f"Initial expert_location_metadata: {get_global_expert_location_metadata().debug_str()}"
+                    f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
                 )
 
             set_global_expert_distribution_recorder(
@@ -272,6 +281,10 @@ class ModelRunner:
             self.apply_torch_tp()
 
         # Init lora
+        # TODO (lifuhuang): when we support dynamic LoRA loading / unloading, we should add
+        # a new server arg `enable_lora` to control whether to init LoRA manager to be more
+        # explicit, as it is perfectly valid to start a server with an empty lora_paths and
+        # load LoRA adapters dynamically later.
         if server_args.lora_paths is not None:
             self.init_lora_manager()
 
@@ -299,7 +312,7 @@ class ModelRunner:
         if (
             server_args.attention_backend == "intel_amx"
             and server_args.device == "cpu"
-            and not cpu_has_amx_support()
+            and not _is_cpu_amx_available
         ):
             logger.info(
                 "The current platform does not support Intel AMX, will fallback to torch_native backend."
@@ -534,6 +547,7 @@ class ModelRunner:
         self.load_config = LoadConfig(
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
+            model_loader_extra_config=self.server_args.model_loader_extra_config,
         )
         if self.server_args.load_format == "gguf":
             monkey_patch_vllm_gguf_config()
@@ -543,7 +557,7 @@ class ModelRunner:
         monkey_patch_vllm_parallel_state()
         monkey_patch_isinstance_for_vllm_base_layer()
 
-        with self.memory_saver_adapter.region():
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
@@ -761,6 +775,9 @@ class ModelRunner:
         ]
         if load_format == "direct":
             _model_load_weights_direct(self.model, named_tensors)
+        elif load_format in self.server_args.custom_weight_loader:
+            custom_loader = dynamic_import(load_format)
+            custom_loader(self.model, named_tensors)
         elif load_format is None:
             self.model.load_weights(named_tensors)
         else:
@@ -787,7 +804,6 @@ class ModelRunner:
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
             base_model=self.model,
-            lora_paths=self.server_args.lora_paths,
             base_hf_config=self.model_config.hf_config,
             max_loras_per_batch=self.server_args.max_loras_per_batch,
             load_config=self.load_config,
@@ -796,6 +812,7 @@ class ModelRunner:
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
         )
+        self.lora_manager.load_lora_adapters(self.server_args.lora_paths)
         logger.info("LoRA manager ready.")
 
     def profile_max_num_token(self, total_gpu_memory: int):
@@ -849,7 +866,9 @@ class ModelRunner:
             else:
                 self.kv_cache_dtype = torch.float8_e5m2
         elif self.server_args.kv_cache_dtype == "fp8_e4m3":
-            if is_cuda():
+            if _is_hip:  # Using natively supported format
+                self.kv_cache_dtype = torch.float8_e4m3fnuz
+            else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
         else:
             raise ValueError(
