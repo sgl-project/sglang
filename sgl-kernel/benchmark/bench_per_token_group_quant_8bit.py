@@ -1,5 +1,7 @@
 import itertools
+import time
 from functools import partial
+from pathlib import Path
 
 import torch
 import triton
@@ -96,4 +98,8 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        benchmark.run(print_data=True)
+
+    trace_path = str(Path("/data/numa0/tom/temp_sglang_server2local/") / f"{time.time()}.trace.json.gz")
+    prof.export_chrome_trace(trace_path)
