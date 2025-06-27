@@ -1,16 +1,8 @@
 import os
 import sys
+from contextlib import nullcontext
+
 import torch
-
-
-
-# NOTE copied and modified from DeepGEMM
-class empty_suppress:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        pass
 
 
 # NOTE copied and modified from DeepGEMM
@@ -64,10 +56,11 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
     fn()
 
     # Profile
-    suppress = suppress_stdout_stderr if suppress_kineto_output and not using_nsys else empty_suppress
+    suppress = suppress_stdout_stderr if suppress_kineto_output and not using_nsys else nullcontext
     with suppress():
         schedule = torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1) if not using_nsys else None
-        profiler = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA], schedule=schedule) if not using_nsys else empty_suppress()
+        profiler = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA],
+                                          schedule=schedule) if not using_nsys else empty_suppress()
         with profiler:
             for i in range(2):
                 for _ in range(num_tests):
@@ -86,11 +79,12 @@ def bench_kineto(fn, kernel_names, num_tests: int = 30,
     assert isinstance(kernel_names, str) or isinstance(kernel_names, tuple)
     is_tuple = isinstance(kernel_names, tuple)
     prof_lines = profiler.key_averages().table(sort_by='cuda_time_total', max_name_column_width=100).split('\n')
-    kernel_names = (kernel_names, ) if isinstance(kernel_names, str) else kernel_names
+    kernel_names = (kernel_names,) if isinstance(kernel_names, str) else kernel_names
     assert all([isinstance(name, str) for name in kernel_names])
     if not with_multiple_kernels:
         for name in kernel_names:
-            assert sum([name in line for line in prof_lines]) == 1, f'Errors of the kernel {name} in the profiling table'
+            assert sum(
+                [name in line for line in prof_lines]) == 1, f'Errors of the kernel {name} in the profiling table'
 
     # Save chrome traces
     if trace_path is not None:
