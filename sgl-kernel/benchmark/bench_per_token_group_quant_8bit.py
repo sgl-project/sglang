@@ -1,4 +1,5 @@
 import itertools
+from functools import partial
 
 import torch
 import triton
@@ -6,7 +7,7 @@ import triton
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
-from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
+from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit, create_per_token_group_quant_fp8_output_scale
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -68,13 +69,21 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
 
     x = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.bfloat16)
 
+    x_q = torch.empty_like(x, device=x.device, dtype=dst_dtype)
+    x_s = create_per_token_group_quant_fp8_output_scale(
+        x_shape=x.shape,
+        device=x.device,
+        group_size=group_size,
+        **flags,
+    )
+
     quantiles = [0.5, 0.2, 0.8]
 
     fn = {
         "triton": triton_per_token_group_quant_8bit,
-        "sglang": sglang_per_token_group_quant_8bit,
+        "sglang": partial(sglang_per_token_group_quant_8bit, x_q=x_q, x_s=x_s),
     }[provider]
-    bench_fn = lambda: fn(x.clone(), group_size, dst_dtype, **flags)
+    bench_fn = lambda: fn(x=x.clone(), group_size=group_size, dst_dtype=dst_dtype, **flags)
 
     ms, min_ms, max_ms = triton.testing.do_bench(bench_fn, quantiles=quantiles)
 
