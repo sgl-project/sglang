@@ -33,7 +33,7 @@ Add [performance optimization options](#performance-optimization-options) as nee
 
 ```bash
 # Installation
-pip install "sglang[all]>=0.4.7.post1"
+pip install "sglang[all]>=0.4.8.post1"
 
 # Launch
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code

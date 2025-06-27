@@ -25,7 +25,6 @@ from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
-import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
@@ -45,6 +44,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import require_mlp_sync
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -93,8 +93,6 @@ class PrefillBootstrapQueue:
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
         self.queue: List[Req] = []
-        self.pp_rank = pp_rank
-        self.pp_size = pp_size
         self.gloo_group = gloo_group
         self.max_total_num_tokens = max_total_num_tokens
         self.scheduler = scheduler
@@ -124,6 +122,9 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        if not self.is_mla_backend:
+            kv_args.kv_head_num = self.token_to_kv_pool.head_num
+        kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -274,12 +275,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
 
-            # Handle DP attention
-            if (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            ):
-                batch, _ = self.prepare_dp_attn_batch(batch)
+            if require_mlp_sync(self.server_args):
+                batch, _ = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
 
             if batch:
@@ -312,12 +309,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.process_prefill_chunk()
             batch = self.get_new_batch_prefill()
 
-            # Handle DP attention
-            if (
-                self.server_args.enable_dp_attention
-                or self.server_args.enable_sp_layernorm
-            ):
-                batch, _ = self.prepare_dp_attn_batch(batch)
+            if require_mlp_sync(self.server_args):
+                batch, _ = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
             if batch:
                 result = self.run_batch(batch)
@@ -393,6 +386,8 @@ class SchedulerDisaggregationPrefillMixin:
                     logits_output.input_token_logprobs = tuple(
                         logits_output.input_token_logprobs.tolist()
                     )
+
+        hidden_state_offset = 0
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
@@ -402,6 +397,16 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 self.disagg_prefill_inflight_queue.append(req)
+                if logits_output.hidden_states is not None:
+                    last_hidden_index = (
+                        hidden_state_offset + extend_input_len_per_req[i] - 1
+                    )
+                    req.hidden_states_tensor = (
+                        logits_output.hidden_states[last_hidden_index].cpu().clone()
+                    )
+                    hidden_state_offset += extend_input_len_per_req[i]
+                else:
+                    req.hidden_states_tensor = None
                 if req.return_logprob:
                     assert extend_logprob_start_len_per_req is not None
                     assert extend_input_len_per_req is not None
