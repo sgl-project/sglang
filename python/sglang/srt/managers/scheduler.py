@@ -1623,7 +1623,7 @@ class Scheduler(
             self.chunked_req.is_chunked += 1
 
         # Print stats
-        if self.attn_tp_rank == 0:
+        if True:  # self.attn_tp_rank == 0:
             self.log_prefill_stats(adder, can_run_list, running_bs)
 
         # Create a new batch
