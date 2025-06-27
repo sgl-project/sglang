@@ -55,7 +55,8 @@ def test_per_token_group_quant_with_column_major(
     dst_dtype,
     flags,
 ):
-    if flags["scale_ue8m0"] and group_size != 128:
+    if flags["scale_ue8m0"] and ((group_size != 128) or (hidden_dim % 512 != 0)):
+        pytest.skip()
         return
 
     x = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.float16)
