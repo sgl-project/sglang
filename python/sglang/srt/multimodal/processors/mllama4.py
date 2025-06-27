@@ -7,12 +7,12 @@ from transformers.models.llama4.image_processing_llama4_fast import (
     get_best_fit,
 )
 
-from sglang.srt.managers.multimodal_processors.base_processor import (
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.models.mllama4 import Llama4ForConditionalGeneration
+from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.models.mllama4 import Llama4ForConditionalGeneration
 
 
 class Mllama4ImageProcessor(BaseMultimodalProcessor):
