@@ -10,12 +10,12 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     ImageDataItem,
 )
-from sglang.srt.managers.multimodal_processors.base_processor import (
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.models.vila import VILAForConditionalGeneration
+from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.models.vila import VILAForConditionalGeneration
 from sglang.srt.server_args import ServerArgs
 
 
