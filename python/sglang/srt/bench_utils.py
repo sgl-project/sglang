@@ -109,7 +109,7 @@ def bench_kineto(
         for name in kernel_names:
             assert (
                 sum([name in line for line in prof_lines]) == 1
-            ), f"Errors of the kernel {name} in the profiling table"
+            ), f"Errors of the kernel {name} in the profiling table (table: {prof_lines})"
 
     # Save chrome traces
     if trace_path is not None:
