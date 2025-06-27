@@ -219,7 +219,7 @@ def per_token_group_quant_fp8(
         group_size=group_size,
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
-        scale_ue8m0=scale_ue8m0,
+        scale_ue8m0=False,
     )
 
     M = x.numel() // group_size
@@ -230,7 +230,6 @@ def per_token_group_quant_fp8(
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1
     if column_major_scales:
-        TODO_extra_intermediate_output
         _per_token_group_quant_fp8_colmajor[(M,)](
             x,
             x_q,
@@ -261,6 +260,9 @@ def per_token_group_quant_fp8(
             num_warps=num_warps,
             num_stages=num_stages,
         )
+
+    if scale_ue8m0:
+        x_s = TODO(x_s)
 
     return x_q, x_s
 
