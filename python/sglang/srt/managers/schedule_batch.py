@@ -101,6 +101,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "torchao_config",
     "triton_attention_reduce_in_fp32",
     "num_reserved_decode_tokens",
+    "weight_loader_disable_mmap",
 ]
 
 # Put some global args for easy access
@@ -213,6 +214,10 @@ class MultimodalDataItem:
     audio_feature_lens: Optional[List[torch.Tensor]] = None
     audio_offsets: Optional[List[Tuple[int, int]]] = None
 
+    # gemma3n related
+    input_features: Optional[torch.Tensor] = None
+    input_features_mask: Optional[torch.Tensor] = None
+
     precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     @staticmethod
@@ -276,7 +281,10 @@ class MultimodalDataItem:
         if self.precomputed_features is not None:
             self.hash = hash_feature(self.precomputed_features)
         elif self.is_audio():
-            self.hash = hash_feature(self.audio_features)
+            if self.audio_features is not None:
+                self.hash = hash_feature(self.audio_features)
+            elif self.input_features is not None:
+                self.hash = hash_feature(self.input_features)
         else:
             self.hash = hash_feature(self.pixel_values)
 
@@ -287,6 +295,7 @@ class MultimodalDataItem:
         return (self.modality == Modality.AUDIO) and (
             self.precomputed_features is not None
             or not MultimodalDataItem.is_empty_list(self.audio_features)
+            or not MultimodalDataItem.is_empty_list(self.input_features)
         )
 
     def is_image(self):
@@ -788,6 +797,7 @@ class Req:
         self.multimodal_inputs = None
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
+        self.return_logprob = False
         self.finished_reason = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )

@@ -18,7 +18,14 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    _process_weight_after_loading,
+    cpu_has_amx_support,
+    get_bool_env_var,
+    is_cpu,
+    is_hip,
+    set_weight_attrs,
+)
 
 if torch.cuda.is_available():
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
@@ -28,6 +35,8 @@ else:
 import logging
 
 _is_hip = is_hip()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
@@ -117,6 +126,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 requires_grad=False,
             )
             torch.cuda.empty_cache()
+
+        # Pack weight for get better performance on CPU
+        if _is_cpu and _is_cpu_amx_available:
+            _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+
         return
 
     def apply(
@@ -248,19 +262,64 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
     ) -> torch.Tensor:
-        return moe_forward_native(
-            layer,
-            x,
-            use_grouped_topk,
-            top_k,
-            router_logits,
-            renormalize,
-            topk_group,
-            num_expert_group,
-            num_fused_shared_experts,
-            custom_routing_function,
-            correction_bias,
-        )
+        assert activation == "silu", f"activation = {activation} is not supported."
+
+        if (
+            getattr(layer, "use_intel_amx_backend", False)
+            and not apply_router_weight_on_input
+        ):
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                num_fused_shared_experts=num_fused_shared_experts,
+                custom_routing_function=custom_routing_function,
+                correction_bias=correction_bias,
+                routed_scaling_factor=routed_scaling_factor,
+            )
+
+            # TODO: support apply_router_weight_on_input in the fused_experts_cpu kernel
+            return torch.ops.sgl_kernel.fused_experts_cpu(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights.to(
+                    torch.float
+                ),  # TODO: the topk_weights of llama4 is computed via Llama4MoE:custom_routing_function and is bfloat16 while the kernel requires it to be float32
+                topk_ids,
+                True,  # inplace
+                False,  # use_int8_w8a8
+                False,  # use_fp8_w8a16
+                None,  # w1_scale
+                None,  # w2_scale
+                None,  # block_size
+                None,  # a1_scale
+                None,  # a2_scale
+                True,  # is_vnni
+            )
+        else:
+            return moe_forward_native(
+                layer,
+                x,
+                use_grouped_topk,
+                top_k,
+                router_logits,
+                renormalize,
+                topk_group,
+                num_expert_group,
+                num_fused_shared_experts,
+                custom_routing_function,
+                correction_bias,
+                activation,
+                apply_router_weight_on_input,
+                inplace,
+                no_combine,
+                routed_scaling_factor,
+            )
 
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
@@ -330,6 +389,12 @@ class FusedMoE(torch.nn.Module):
         self.tp_rank = get_tensor_model_parallel_rank()
         self.num_experts = num_experts
         self.expert_map = None
+
+        if enable_flashinfer_moe and quant_config is None:
+            logger.warning("Disable flashinfer MoE when quantization config is None.")
+            enable_flashinfer_moe = False
+            enable_ep_moe = False
+
         self.enable_flashinfer_moe = enable_flashinfer_moe
         if enable_ep_moe:
             assert (

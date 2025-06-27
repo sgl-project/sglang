@@ -182,6 +182,18 @@ class EmbeddingBatchResult:
     bid: int
 
 
+class KvMetrics:
+    def __init__(self):
+        self.request_active_slots = None
+        self.request_total_slots = None
+        self.kv_active_blocks = None
+        self.kv_total_blocks = None
+        self.num_requests_waiting = None
+        self.gpu_cache_usage_perc = None
+        self.gpu_prefix_cache_hit_rate = None
+        self.data_parallel_rank = None
+
+
 class IdleSleeper:
     """
     In setups which have long inactivity periods it is desirable to reduce
@@ -223,6 +235,7 @@ class Scheduler(
         self.server_args = server_args
         self.tp_rank = tp_rank
         self.pp_rank = pp_rank
+        self.dp_rank = dp_rank
         self.tp_size = server_args.tp_size
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
@@ -261,6 +274,9 @@ class Scheduler(
             self.send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
+            self.send_metrics_from_scheduler = get_zmq_socket(
+                context, zmq.PUSH, port_args.metrics_ipc_name, False
+            )
 
             if server_args.skip_tokenizer_init:
                 # Directly send to the TokenizerManager
@@ -286,6 +302,7 @@ class Scheduler(
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
+            self.send_metrics_from_scheduler = None
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
@@ -1239,6 +1256,22 @@ class Scheduler(
         req.logprob_start_len = len(req.origin_input_ids) - 1
         self._add_request_to_queue(req)
 
+    def _emit_kv_metrics(self):
+        kv_metrics = KvMetrics()
+        kv_metrics.request_active_slots = self.stats.num_running_reqs
+        kv_metrics.request_total_slots = self.max_running_requests
+        kv_metrics.kv_active_blocks = int(
+            self.stats.token_usage * self.max_total_num_tokens
+        )
+        kv_metrics.kv_total_blocks = self.max_total_num_tokens
+        kv_metrics.num_requests_waiting = self.stats.num_queue_reqs
+        kv_metrics.gpu_cache_usage_perc = self.stats.token_usage
+        kv_metrics.gpu_prefix_cache_hit_rate = self.stats.cache_hit_rate
+        kv_metrics.data_parallel_rank = self.dp_rank if self.dp_rank is not None else 0
+
+        if not self.send_metrics_from_scheduler.closed:
+            self.send_metrics_from_scheduler.send_pyobj(kv_metrics)
+
     def log_prefill_stats(
         self,
         adder: PrefillAdder,
@@ -1291,6 +1324,7 @@ class Scheduler(
             self.stats.avg_request_queue_latency = total_queue_latency / num_new_seq
 
             self.metrics_collector.log_stats(self.stats)
+            self._emit_kv_metrics()
         self._publish_kv_events()
 
     def log_decode_stats(
@@ -1352,6 +1386,7 @@ class Scheduler(
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.spec_accept_length = spec_accept_length
             self.metrics_collector.log_stats(self.stats)
+            self._emit_kv_metrics()
         self._publish_kv_events()
 
     def check_memory(self):
@@ -1374,7 +1409,14 @@ class Scheduler(
             )
             raise ValueError(msg)
 
-        if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            req_total_size = (
+                self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
+            )
+        else:
+            req_total_size = self.req_to_token_pool.size
+
+        if len(self.req_to_token_pool.free_slots) != req_total_size:
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
@@ -1814,11 +1856,6 @@ class Scheduler(
         else:
             can_cuda_graph = 0
 
-        if not spec_algorithm.is_none():
-            # TODO(sang): Support cuda graph when idle batch is there.
-            if local_batch is None or local_batch.forward_mode.is_idle():
-                can_cuda_graph = 0
-
         is_extend_in_batch = (
             local_batch.forward_mode.is_extend() if local_batch else False
         )
@@ -2199,8 +2236,8 @@ class Scheduler(
         """In-place update of the weights from disk."""
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
         if success:
-            flash_cache_success = self.flush_cache()
-            assert flash_cache_success, "Cache flush failed after updating weights"
+            flush_cache_success = self.flush_cache()
+            assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
         return UpdateWeightFromDiskReqOutput(success, message, 0)
@@ -2217,8 +2254,8 @@ class Scheduler(
         """Update the online model parameter."""
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
-            flash_cache_success = self.flush_cache()
-            assert flash_cache_success, "Cache flush failed after updating weights"
+            flush_cache_success = self.flush_cache()
+            assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
         return UpdateWeightsFromDistributedReqOutput(success, message)
@@ -2229,10 +2266,11 @@ class Scheduler(
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
             if recv_req.flush_cache:
-                flash_cache_success = self.flush_cache()
-                assert flash_cache_success, "Cache flush failed after updating weights"
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
+        barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromTensorReqOutput(success, message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
