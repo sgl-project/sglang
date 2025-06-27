@@ -94,7 +94,6 @@ class WaveAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
         # Lazy import to avoid the initialization of cuda context
-        # TODO: Switch to wave decode.
         from sglang.srt.layers.attention.wave_ops.decode_attention import (
             decode_attention_fwd,
         )
@@ -218,13 +217,15 @@ class WaveAttnBackend(AttentionBackend):
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
 
+            from sglang.srt.layers.attention.wave_ops.decode_attention import decode_attention_intermediate_arrays_shapes
+            attn_logits_shape, attn_logits_max_shape = decode_attention_intermediate_arrays_shapes(bs, self.v_head_dim, self.num_head, self.max_kv_splits)
             attn_logits = torch.empty(
-                (self.max_kv_splits, bs, self.v_head_dim, self.num_head),
+                attn_logits_shape,
                 dtype=torch.float32,
                 device=self.device,
             )
             attn_lse = torch.empty(
-                (self.max_kv_splits, bs, self.num_head),
+                attn_logits_max_shape,
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -337,15 +338,15 @@ class WaveAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None
     ):
+        from sglang.srt.layers.attention.wave_ops.decode_attention import decode_attention_intermediate_arrays_shapes
+        attn_logits_shape, attn_logits_max_shape = decode_attention_intermediate_arrays_shapes(max_bs, self.v_head_dim, self.num_head, self.max_kv_splits)
         self.cuda_graph_attn_logits = torch.zeros(
-            (self.max_kv_splits, max_bs, self.v_head_dim, self.num_head),
-            # (max_bs, self.num_head, self.max_kv_splits, self.v_head_dim),
+            attn_logits_shape,
             dtype=torch.float32,
             device=self.device,
         )
         self.cuda_graph_attn_lse = torch.zeros(
-            (self.max_kv_splits, max_bs, self.num_head),
-            # (max_bs, self.num_head, self.max_kv_splits),
+            attn_logits_max_shape,
             dtype=torch.float32,
             device=self.device,
         )

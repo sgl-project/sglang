@@ -32,6 +32,7 @@ from iree.turbine.kernel.wave.utils.run_utils import (
 from iree.turbine.kernel.wave.constraints import MMAType, GenericDot, MMAOperand
 from iree.turbine.kernel.wave.templates.paged_decode_attention import (
     get_paged_decode_attention_kernels,
+    get_paged_decode_intermediate_arrays_shapes,
     paged_decode_attention_shape,
 )
 from iree.turbine.kernel.wave.compile import WaveCompileOptions, wave_compile
@@ -117,6 +118,19 @@ def get_wave_kernel(
 def view_trunc(tensor, shape):
     size = math.prod(shape)
     return tensor.view(-1)[:size].view(shape)
+
+def decode_attention_intermediate_arrays_shapes(num_seqs, head_size_kv, num_query_heads, max_kv_splits):
+    # Not all fields are used, but we need to pass them to the function
+    shape = paged_decode_attention_shape(
+        num_query_heads=num_query_heads,
+        num_kv_heads=0,
+        head_size=0,
+        head_size_kv=head_size_kv,
+        block_size=0,
+        num_seqs=num_seqs,
+        kv_lens=0,
+    )
+    return get_paged_decode_intermediate_arrays_shapes(shape, max_kv_splits)
 
 
 def decode_attention_wave(
