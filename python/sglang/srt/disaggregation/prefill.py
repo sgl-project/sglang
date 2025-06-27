@@ -395,7 +395,7 @@ class SchedulerDisaggregationPrefillMixin:
             zip(batch.reqs, next_token_ids, strict=True)
         ):
             req: Req
-            if req.time_stats.prefill_transfer_queue_entry_time < 0.1:
+            if req.time_stats.prefill_transfer_queue_entry_time == 0.0:
                 req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
             if req.is_chunked <= 0:
                 # There is no output_ids for prefill
