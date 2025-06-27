@@ -450,7 +450,7 @@ class OpenAIMoeAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
-            reduce_results=False,
+            reduce_results=True # False,
             prefix=add_prefix("o_proj", prefix),
         )
         print("self.o_proj.weight.shape", self.o_proj.weight.shape) # (2880, 4096)
