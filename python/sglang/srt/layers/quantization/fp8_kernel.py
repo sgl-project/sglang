@@ -262,7 +262,16 @@ def per_token_group_quant_fp8(
         )
 
     if scale_ue8m0:
-        x_s = TODO(x_s)
+        from deep_gemm.utils.layout import transform_sf_into_required_layout
+
+        assert group_size == 128
+        x_s = transform_sf_into_required_layout(
+            x_s,
+            mn=x_q.shape[1], k=x_q.shape[2],
+            recipe=(1, 128, 128),
+            num_groups=x_q.shape[0],
+            is_sfa=True,
+        )
 
     return x_q, x_s
 
