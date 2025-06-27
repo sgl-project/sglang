@@ -20,11 +20,8 @@ _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 
-# TODO temp
-num_tokens_range = [768]
-hidden_dim_range = [1536, 7168, 18432]  # For DeepSeek V3/R1
-# num_tokens_range = [1, 4, 16, 64, 256, 768, 2048, 8192, 16384]
-# hidden_dim_range = [1536, 7168, 18432] # For DeepSeek V3/R1
+num_tokens_range = [1, 4, 16, 64, 256, 768, 2048, 8192, 16384]
+hidden_dim_range = [1536, 7168, 18432] # For DeepSeek V3/R1
 group_size_range = [128]  # For DeepSeek V3/R1
 # TODO test int8
 dst_dtype_range = [fp8_type_]
