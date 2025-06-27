@@ -143,3 +143,8 @@ def replace_parameter(
         if not isinstance(new, torch.nn.Parameter):
             new = torch.nn.Parameter(new, requires_grad=False)
         mod.register_parameter(name, torch.nn.Parameter(new, requires_grad=False))
+
+
+def assert_fp8_all_close(a: torch.Tensor, b: torch.Tensor):
+    assert (a.dtype == torch.float8_e4m3) and (b.dtype == torch.float8_e4m3)
+
