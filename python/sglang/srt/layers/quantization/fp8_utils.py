@@ -1,9 +1,7 @@
 from typing import Callable, List, Optional, Tuple
 
-import einops
 import torch
 
-from sglang.math_utils import align
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.utils import is_sm100_supported
@@ -27,6 +25,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_triton,
 )
 from sglang.srt.utils import (
+    align,
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
