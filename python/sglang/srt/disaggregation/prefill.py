@@ -247,7 +247,7 @@ class PrefillBootstrapQueue:
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
-            if req.time_stats.wait_queue_entry_time < 0.1:
+            if req.time_stats.wait_queue_entry_time == 0.0:
                 req.time_stats.wait_queue_entry_time = time.perf_counter()
 
         self.queue = [
