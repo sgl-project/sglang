@@ -22,10 +22,26 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
             [8, 16, 32, 64, 128],  # group_size
             [torch.int8, fp8_type_],  # dtype
             [
-                dict(column_major_scales=False, scale_tma_aligned=False, scale_ue8m0=False),
-                dict(column_major_scales=True, scale_tma_aligned=False, scale_ue8m0=False),
-                dict(column_major_scales=True, scale_tma_aligned=True, scale_ue8m0=False),
-                dict(column_major_scales=True, scale_tma_aligned=True, scale_ue8m0=True),
+                dict(
+                    column_major_scales=False,
+                    scale_tma_aligned=False,
+                    scale_ue8m0=False,
+                ),
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=False,
+                    scale_ue8m0=False,
+                ),
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=False,
+                ),
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=True,
+                ),
             ],
         )
     ),
