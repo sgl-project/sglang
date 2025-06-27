@@ -8,6 +8,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
 from sglang.srt.utils import is_hip
+from sglang.srt.layers.quantization.fp8_kernel import PER_TOKEN_GROUP_QUANT_8BIT_VALID_FLAGS
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
@@ -21,28 +22,7 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
             [256, 512, 1024, 2048, 4096],  # hidden_dim
             [8, 16, 32, 64, 128],  # group_size
             [torch.int8, fp8_type_],  # dtype
-            [
-                dict(
-                    column_major_scales=False,
-                    scale_tma_aligned=False,
-                    scale_ue8m0=False,
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=False,
-                    scale_ue8m0=False,
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=False,
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                ),
-            ],
+            PER_TOKEN_GROUP_QUANT_8BIT_VALID_FLAGS,
         )
     ),
 )

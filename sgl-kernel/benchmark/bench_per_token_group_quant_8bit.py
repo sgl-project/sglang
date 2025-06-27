@@ -8,6 +8,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
 from sglang.srt.utils import is_hip
+from sglang.srt.layers.quantization.fp8_kernel import PER_TOKEN_GROUP_QUANT_8BIT_VALID_FLAGS
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
@@ -17,7 +18,7 @@ batch_size_range = [1, 2, 4, 8, 16, 32, 64]
 seq_len_range = [64, 128, 256, 512, 1024, 2048]
 group_size_range = [128]  # For DeepSeek V3/R1
 dst_dtype_range = [torch.int8, fp8_type_]
-flags_range = [TODO]
+flags_range = PER_TOKEN_GROUP_QUANT_8BIT_VALID_FLAGS
 
 configs = list(
     itertools.product(
