@@ -41,7 +41,7 @@ def test_per_token_group_quant_with_column_major(
         x=x,
         group_size=group_size,
         eps=1e-10,
-        dtype=dst_dtype,
+        dst_dtype=dst_dtype,
         **flags,
     )
 
