@@ -658,7 +658,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             if batch:
                 for req in batch.reqs:
-                    if req.time_stats.forward_entry_time < 0.1:
+                    if req.time_stats.forward_entry_time == 0.0:
                         req.time_stats.forward_entry_time = time.perf_counter()
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
