@@ -85,6 +85,7 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
     }[provider]
     bench_fn = lambda: fn(x=x.clone(), group_size=group_size, dst_dtype=dst_dtype, **flags)
 
+    # TODO no need?
     num_repeat = 10
     repeated_bench_fn = lambda: [bench_fn() for _ in range(num_repeat)]
 
