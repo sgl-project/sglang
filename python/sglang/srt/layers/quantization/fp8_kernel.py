@@ -366,7 +366,9 @@ def sglang_per_token_group_quant_8bit(
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
 ):
-    from sglang.srt.layers.quantization.int8_kernel import sglang_per_token_group_quant_int8
+    from sglang.srt.layers.quantization.int8_kernel import (
+        sglang_per_token_group_quant_int8,
+    )
 
     if dst_dtype == torch.int8:
         assert not column_major_scales
