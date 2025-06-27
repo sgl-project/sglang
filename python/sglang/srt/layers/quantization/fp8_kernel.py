@@ -267,7 +267,8 @@ def per_token_group_quant_fp8(
         assert group_size == 128
         x_s = transform_sf_into_required_layout(
             x_s,
-            mn=x_q.shape[1], k=x_q.shape[2],
+            mn=x_q.shape[1],
+            k=x_q.shape[2],
             recipe=(1, 128, 128),
             num_groups=x_q.shape[0],
             is_sfa=True,
