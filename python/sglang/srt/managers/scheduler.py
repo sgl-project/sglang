@@ -555,17 +555,14 @@ class Scheduler(
             and server_args.disable_radix_cache
         ):
             if self.model_config.is_hybrid:
-                self.tree_cache = SWAChunkCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    page_size=self.page_size,
-                )
+                ChunkCacheClass = SWAChunkCache
             else:
-                self.tree_cache = ChunkCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    page_size=self.page_size,
-                )
+                ChunkCacheClass = ChunkCache
+            self.tree_cache = ChunkCacheClass(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                page_size=self.page_size,
+            )
         else:
             if self.enable_hierarchical_cache:
                 self.tree_cache = HiRadixCache(
