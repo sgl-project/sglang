@@ -1072,6 +1072,7 @@ class Scheduler(
             req.tokenizer = self.tokenizer
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
+                req.time_stats.prefill_bootstrap_queue_entry_time = time.perf_counter()
                 # Invalid request for disaggregated mode
                 if recv_req.bootstrap_room is None:
                     error_msg = (
@@ -1602,6 +1603,7 @@ class Scheduler(
         if self.enable_metrics:
             # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:
+                req.time_stats.forward_entry_time = time.perf_counter()
                 req.queue_time_end = time.perf_counter()
 
         self.waiting_queue = [
