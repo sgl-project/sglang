@@ -82,6 +82,8 @@ class TestEpMoEFP8(CustomTestCase):
                 "0.4",
             ],
         )
+        import os
+        os.system("python3 -m sglang.compile_deep_gemm--model-path lmsys/sglang-ci-dsv3-test --trust-remote-code --tp 2 --enable-torch-compile --cuda-graph-max-bs 2 --device cuda --host 127.0.0.1 --port 6400")
 
     @classmethod
     def tearDownClass(cls):
