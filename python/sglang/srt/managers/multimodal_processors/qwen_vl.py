@@ -39,7 +39,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         self.NUM_TOKEN_PER_FRAME = 770
         self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = 4 * 28 * 28
-        self.MAX_PIXELS = 16384 * 28 * 28
+        self.MAX_PIXELS = 1280 * 28 * 28
         self.MAX_RATIO = 200
 
     async def process_mm_data_async(
