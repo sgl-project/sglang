@@ -565,6 +565,7 @@ multimodal_model_archs = [
     "CLIPModel",
     "DeepseekVL2ForCausalLM",
     "Gemma3ForConditionalGeneration",
+    "Gemma3nForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",
