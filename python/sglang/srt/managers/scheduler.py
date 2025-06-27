@@ -2459,7 +2459,9 @@ class Scheduler(
                 self.profiler_prefill_ct = 0
                 self.profiler_decode_ct = 0
             elif start_step:
-                self.profiler_target_forward_ct = self.profiler_start_forward_ct + num_steps
+                self.profiler_target_forward_ct = (
+                    self.profiler_start_forward_ct + num_steps
+                )
             else:
                 self.profiler_target_forward_ct = self.forward_ct + num_steps
             # The caller will be notified when reaching profiler_target_forward_ct
@@ -2635,7 +2637,6 @@ class Scheduler(
                 and self.profiler_start_forward_ct == self.forward_ct
             ):
                 self.start_profile()
-
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
         if recv_req == ExpertDistributionReq.START_RECORD:
