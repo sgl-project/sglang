@@ -18,7 +18,16 @@ group_size_range = [128]  # For DeepSeek V3/R1
 # TODO test int8
 dst_dtype_range = [fp8_type_]
 flags_range = [
-    # TODO test more combinations
+    dict(
+        column_major_scales=False,
+        scale_tma_aligned=False,
+        scale_ue8m0=False,
+    ),
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=False,
+        scale_ue8m0=False,
+    ),
     dict(
         column_major_scales=True,
         scale_tma_aligned=True,
