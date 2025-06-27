@@ -153,6 +153,7 @@ def _per_token_group_quant_fp8_colmajor(
     fp8_max,
     # Meta-parameters
     BLOCK: tl.constexpr,
+    SCALE_UE8M0: tl.constexpr,
 ):
     """A Triton-accelerated function to perform per-token-group
     quantization on a tensor.
@@ -177,6 +178,8 @@ def _per_token_group_quant_fp8_colmajor(
     # Quant
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
     y_s = _absmax / fp8_max
+    if SCALE_UE8M0:
+        y_s = tl.exp2(tl.ceil(tl.log2(tl.abs(y_s))))
     y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
@@ -189,6 +192,7 @@ def per_token_group_quant_fp8(
     eps: float = 1e-10,
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
+    scale_ue8m0: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Function to perform per-token-group quantization on an input tensor `x`.
 
@@ -226,6 +230,7 @@ def per_token_group_quant_fp8(
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1
     if column_major_scales:
+        TODO_extra_intermediate_output
         _per_token_group_quant_fp8_colmajor[(M,)](
             x,
             x_q,
@@ -239,8 +244,10 @@ def per_token_group_quant_fp8(
             BLOCK=BLOCK,
             num_warps=num_warps,
             num_stages=num_stages,
+            SCALE_UE8M0=scale_ue8m0,
         )
     else:
+        assert not scale_ue8m0
         _per_token_group_quant_fp8[(M,)](
             x,
             x_q,
