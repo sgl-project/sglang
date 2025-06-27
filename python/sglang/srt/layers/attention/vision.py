@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
+import threading
 from functools import lru_cache
 from typing import Any, Optional, Tuple, Union
 
@@ -64,8 +65,9 @@ class AttentionMaskCacheEntry:
         self.flatten_batch = flatten_batch
 
 
-# GPU-based cache for attention masks with cu_seqlens validation
+# GPU-based cache for attention masks with cu_seqlens validation and thread safety
 _attention_mask_cache_gpu = {}
+_attention_mask_cache_lock_gpu = threading.Lock()
 
 
 def _get_attention_mask_cache_key(
@@ -151,7 +153,7 @@ class VisionSdpaAttention(nn.Module):
     ) -> Optional[torch.Tensor]:
         r"""
         Creates a non-causal 4D mask of shape `(b, 1, s, s)` or `(1, 1, s, s)`.
-        Optimized version that avoids CPU transfers and validates cu_seqlens values.
+        Thread-safe optimized version that avoids CPU transfers and validates cu_seqlens values.
         """
         if cu_seqlens is None:
             return None
@@ -159,41 +161,64 @@ class VisionSdpaAttention(nn.Module):
         # Generate cache key
         cache_key = _get_attention_mask_cache_key(s, flatten_batch, cu_seqlens)
 
-        # Check if mask is already cached
-        if cache_key in _attention_mask_cache_gpu:
-            cache_entry = _attention_mask_cache_gpu[cache_key]
+        # Thread-safe cache operations
+        with _attention_mask_cache_lock_gpu:
+            # Check if mask is already cached
+            if cache_key in _attention_mask_cache_gpu:
+                cache_entry = _attention_mask_cache_gpu[cache_key]
 
-            # Validate that the cached entry matches current parameters
-            if (
-                cache_entry.s == s
-                and cache_entry.flatten_batch == flatten_batch
-                and cache_entry.mask.device == cu_seqlens.device
-                and torch.equal(cache_entry.cu_seqlens, cu_seqlens)
-            ):
-                return cache_entry.mask
-            else:
-                # Cache entry is stale, remove it
-                del _attention_mask_cache_gpu[cache_key]
+                # Validate that the cached entry matches current parameters
+                if (
+                    cache_entry.s == s
+                    and cache_entry.flatten_batch == flatten_batch
+                    and cache_entry.mask.device == cu_seqlens.device
+                    and torch.equal(cache_entry.cu_seqlens, cu_seqlens)
+                ):
+                    return cache_entry.mask
+                else:
+                    # Cache entry is stale, remove it atomically
+                    del _attention_mask_cache_gpu[cache_key]
 
-        # Generate mask on GPU
-        mask = self._generate_mask_gpu(s, flatten_batch, cu_seqlens, cu_seqlens.device)
+            # Generate mask on GPU (outside the critical section for performance)
+            # We'll re-check the cache after generation to handle race conditions
+            should_generate = True
 
-        # Cache the result with cu_seqlens validation data
-        cache_entry = AttentionMaskCacheEntry(
-            mask=mask,
-            cu_seqlens=cu_seqlens.clone(),  # Store a copy for validation
-            s=s,
-            flatten_batch=flatten_batch,
-        )
+        # Generate mask outside the lock to minimize lock contention
+        if should_generate:
+            mask = self._generate_mask_gpu(
+                s, flatten_batch, cu_seqlens, cu_seqlens.device
+            )
 
-        # Simple cache eviction to prevent memory issues
-        if len(_attention_mask_cache_gpu) > 128:
-            # Remove oldest entries (simple FIFO)
-            oldest_key = next(iter(_attention_mask_cache_gpu))
-            del _attention_mask_cache_gpu[oldest_key]
+            # Re-acquire lock to update cache
+            with _attention_mask_cache_lock_gpu:
+                # Double-check if another thread already added this entry
+                if cache_key in _attention_mask_cache_gpu:
+                    cache_entry = _attention_mask_cache_gpu[cache_key]
+                    if (
+                        cache_entry.s == s
+                        and cache_entry.flatten_batch == flatten_batch
+                        and cache_entry.mask.device == cu_seqlens.device
+                        and torch.equal(cache_entry.cu_seqlens, cu_seqlens)
+                    ):
+                        # Another thread already cached the same mask, use it
+                        return cache_entry.mask
 
-        _attention_mask_cache_gpu[cache_key] = cache_entry
-        return mask
+                # Cache the result with cu_seqlens validation data
+                cache_entry = AttentionMaskCacheEntry(
+                    mask=mask,
+                    cu_seqlens=cu_seqlens.clone(),  # Store a copy for validation
+                    s=s,
+                    flatten_batch=flatten_batch,
+                )
+
+                # Simple cache eviction to prevent memory issues
+                if len(_attention_mask_cache_gpu) > 100:
+                    # Remove oldest entries (simple FIFO) - atomic operation
+                    oldest_key = next(iter(_attention_mask_cache_gpu))
+                    del _attention_mask_cache_gpu[oldest_key]
+
+                _attention_mask_cache_gpu[cache_key] = cache_entry
+                return mask
 
     def forward(
         self,
