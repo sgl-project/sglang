@@ -78,6 +78,8 @@ class TestEpMoEFP8(CustomTestCase):
                 "--enable-ep-moe",
                 "--quantization",
                 "fp8",
+                "--mem-fraction-static",
+                "0.5",
             ],
         )
 
