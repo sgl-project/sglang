@@ -212,7 +212,7 @@ class VisionSdpaAttention(nn.Module):
                 )
 
                 # Simple cache eviction to prevent memory issues
-                if len(_attention_mask_cache_gpu) > 100:
+                if len(_attention_mask_cache_gpu) > 128:
                     # Remove oldest entries (simple FIFO) - atomic operation
                     oldest_key = next(iter(_attention_mask_cache_gpu))
                     del _attention_mask_cache_gpu[oldest_key]
