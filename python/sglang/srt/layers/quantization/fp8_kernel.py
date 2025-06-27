@@ -309,12 +309,14 @@ def per_token_group_quant_8bit(
     eps: float = 1e-10,
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
+    scale_ue8m0: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     from sglang.srt.layers.quantization.int8_kernel import per_token_group_quant_int8
 
     if dst_dtype == torch.int8:
         assert not column_major_scales
         assert not scale_tma_aligned
+        assert not scale_ue8m0
         return per_token_group_quant_int8(
             x=x,
             group_size=group_size,
@@ -328,6 +330,7 @@ def per_token_group_quant_8bit(
         eps=eps,
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
+        scale_ue8m0=scale_ue8m0,
     )
 
 
