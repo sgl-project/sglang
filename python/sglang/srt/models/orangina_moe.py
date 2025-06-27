@@ -12,10 +12,10 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only Orangina model."""
+"""Inference-only OpenAIMoE model."""
 
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -29,8 +29,8 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.activation import SwiGLU
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes, ScatterMode
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_reduce_scatter,
@@ -55,7 +55,7 @@ from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -72,15 +72,15 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
-from sglang.srt.utils import DeepEPMode, add_prefix, is_non_idle_and_non_empty
+from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher, model_forward_maybe_tbo
+from sglang.srt.utils import DeepEPMode, add_prefix, is_non_idle_and_non_empty, make_layers
 
-OranginaMoeConfig = None
+OpenAIMoeConfig = None
 
 logger = logging.getLogger(__name__)
 
 
-class OranginaMoeMLP(nn.Module):
+class OpenAIMoeMLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -106,11 +106,11 @@ class OranginaMoeMLP(nn.Module):
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
         )
-        if hidden_act != "swiglu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only swiglu is supported for now."
-            )
-        self.act_fn = SwiGLU()
+        # if hidden_act != "swiglu":
+        #     raise ValueError(
+        #         f"Unsupported activation: {hidden_act}. Only swiglu is supported for now."
+        #     )
+        self.act_fn = SiluAndMul()
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
@@ -119,11 +119,11 @@ class OranginaMoeMLP(nn.Module):
         return x
 
 
-class OranginaMoeSparseMoeBlock(nn.Module):
+class OpenAIMoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
         layer_id: int,
-        config: OranginaMoeConfig,
+        config: OpenAIMoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -373,7 +373,7 @@ class OranginaMoeSparseMoeBlock(nn.Module):
         state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
 
 
-class OranginaMoeAttention(nn.Module):
+class OpenAIMoeAttention(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -415,6 +415,20 @@ class OranginaMoeAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.tp_rank = get_tensor_model_parallel_rank()
+        '''
+        print("self.hidden_size", self.hidden_size) # 2880
+        print("self.total_num_heads", self.total_num_heads) # 64
+        print("self.num_heads", self.num_heads) # 64
+        print("self.total_num_kv_heads", self.total_num_kv_heads) # 8
+        print("self.num_kv_heads", self.num_kv_heads) # 8
+        print("self.head_dim", self.head_dim) # 64
+        print("self.q_size", self.q_size) # 4096
+        print("self.kv_size", self.kv_size) # 512
+        print("self.scaling", self.scaling) # 0.125
+        print("self.rope_theta", self.rope_theta) # 150000
+        print("self.max_position_embeddings", self.max_position_embeddings) # 131072
+        print("self.tp_rank", self.tp_rank) # 0
+        '''
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -427,6 +441,7 @@ class OranginaMoeAttention(nn.Module):
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
+        print("self.qkv_proj.weight.shape", self.qkv_proj.weight.shape) # (5120, 2880)
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -438,6 +453,7 @@ class OranginaMoeAttention(nn.Module):
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
+        print("self.o_proj.weight.shape", self.o_proj.weight.shape) # (2880, 4096)
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -518,10 +534,10 @@ class OranginaMoeAttention(nn.Module):
         return self.forward_core(s)
 
 
-class OranginaMoeDecoderLayer(nn.Module):
+class OpenAIMoeDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: OranginaMoeConfig,
+        config: OpenAIMoeConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -537,7 +553,7 @@ class OranginaMoeDecoderLayer(nn.Module):
         )
         rms_norm_eps = config.rms_norm_eps
         attention_bias = config.attention_bias
-        self.self_attn = OranginaMoeAttention(
+        self.self_attn = OpenAIMoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -558,7 +574,7 @@ class OranginaMoeDecoderLayer(nn.Module):
         self.attn_tp_rank = get_attention_tp_rank()
         self.local_dp_size = get_local_attention_dp_size()
 
-        # OranginaMoE all layers are sparse and have no nextn now
+        # OpenAIMoE all layers are sparse and have no nextn now
         self.is_layer_sparse = True
         is_previous_layer_sparse = True
 
@@ -570,14 +586,14 @@ class OranginaMoeDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = OranginaMoeSparseMoeBlock(
+            self.mlp = OpenAIMoeSparseMoeBlock(
                 layer_id=self.layer_id,
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            self.mlp = OranginaMoeMLP(
+            self.mlp = OpenAIMoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -686,27 +702,105 @@ class OranginaMoeDecoderLayer(nn.Module):
         return output
 
 
-class OranginaMoeModel(Qwen2MoeModel):
+class OpenAIMoeModel(nn.Module):
     def __init__(
         self,
-        config: OranginaMoeConfig,
+        config: OpenAIMoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        decoder_layer_type: type[nn.Module] = OpenAIMoeDecoderLayer,
     ) -> None:
-        super().__init__(
-            config=config,
-            quant_config=quant_config,
-            prefix=prefix,
-            decoder_layer_type=OranginaMoeDecoderLayer,
+        super().__init__()
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.pp_group = get_pp_group()
+
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                enable_tp=not global_server_args_dict["enable_dp_attention"],
+                prefix=add_prefix("embed_tokens", prefix),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+        decoder_layer_type = decoder_layer_type or OpenAIMoeDecoderLayer
+        self.layers, self.start_layer, self.end_layer = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: decoder_layer_type(
+                layer_id=idx,
+                config=config,
+                quant_config=quant_config,
+                prefix=prefix,
+            ),
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
+            prefix=add_prefix("layers", prefix),
         )
+        if self.pp_group.is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer(return_tuple=True)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
+
+        if forward_batch.can_run_tbo:
+            hidden_states, residual = model_forward_maybe_tbo(
+                layers=self.layers,
+                enable_tbo=True,
+                input_data_scatter_mode=ScatterMode.model_input_output(),
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        else:
+            for i in range(self.start_layer, self.end_layer):
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    layer = self.layers[i]
+                    hidden_states, residual = layer(
+                        positions, hidden_states, forward_batch, residual
+                    )
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
+        else:
+            if hidden_states.shape[0] != 0:
+                if residual is None:
+                    hidden_states = self.norm(hidden_states)
+                else:
+                    hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
 
 
-class OranginaMoeForCausalLM(nn.Module):
+class OpenAIMoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
 
     def __init__(
         self,
-        config: OranginaMoeConfig,
+        config: OpenAIMoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -714,7 +808,7 @@ class OranginaMoeForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.model = OranginaMoeModel(
+        self.model = OpenAIMoeModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = ParallelLMHead(
@@ -849,16 +943,16 @@ class OranginaMoeForCausalLM(nn.Module):
         self.routed_experts_weights_of_layer = {
             layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
             for layer_id in range(self.start_layer, self.end_layer)
-            if isinstance(self.model.layers[layer_id].mlp, OranginaMoeSparseMoeBlock)
+            if isinstance(self.model.layers[layer_id].mlp, OpenAIMoeSparseMoeBlock)
         }
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         return ModelConfigForExpertLocation(
             num_layers=config.num_hidden_layers,
-            num_logical_experts=config.num_experts,
+            num_logical_experts=config.num_local_experts,
             num_groups=None,
         )
 
 
-EntryClass = OranginaMoeForCausalLM
+EntryClass = OpenAIMoeForCausalLM
