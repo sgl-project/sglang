@@ -322,6 +322,10 @@ class FlashAttentionBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.is_hybrid = model_runner.is_hybrid
+        if self.is_hybrid:
+            self.full_to_swa_index_mapping = (
+                model_runner.token_to_kv_pool.full_to_swa_index_mapping
+            )
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = (
@@ -1590,8 +1594,7 @@ class FlashAttentionBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
-        out_cache_loc: torch.Tensor = None,
-        full_to_swa_index_mapping: Optional[torch.Tensor] = None,
+        out_cache_loc: Optional[torch.Tensor] = None,
     ):
         """Initialize forward metadata for replaying CUDA graph."""
         seq_lens = seq_lens[:bs]
@@ -1679,7 +1682,6 @@ class FlashAttentionBackend(AttentionBackend):
                 self._update_local_attn_metadata_for_replay(
                     metadata,
                     bs,
-                    full_to_swa_index_mapping,
                 )
         elif forward_mode.is_target_verify():
             if self.topk <= 1:
@@ -1847,8 +1849,8 @@ class FlashAttentionBackend(AttentionBackend):
         cu_seqlens_q = metadata.cu_seqlens_q
         cache_seqlens_int32 = metadata.cache_seqlens_int32
         if self.is_hybrid:
-            page_table = forwardbatch.token_to_kv_pool.translate_loc_from_full_to_swa(
-                metadata.page_table
+            page_table = self.full_to_swa_index_mapping[metadata.page_table].to(
+                torch.int32
             )
         else:
             page_table = metadata.page_table
@@ -1940,7 +1942,6 @@ class FlashAttentionBackend(AttentionBackend):
         self,
         metadata: FlashAttentionMetadata,
         bs: int,
-        full_to_swa_index_mapping: Optional[torch.Tensor] = None,
     ):
         """Update preallocated local attention metadata in-place before CUDA graph replay."""
         if self.attention_chunk_size is None:
@@ -1972,8 +1973,7 @@ class FlashAttentionBackend(AttentionBackend):
         # beyond the actual sequence length, leading to incorrect attention calculations
         max_seq_len = int(seqlens.max().item())
         if self.is_hybrid:
-            assert full_to_swa_index_mapping is not None
-            sliced_page_table = full_to_swa_index_mapping[
+            sliced_page_table = self.full_to_swa_index_mapping[
                 metadata.page_table[:bs, :max_seq_len]
             ].to(torch.int32)
         else:
