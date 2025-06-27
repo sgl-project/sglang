@@ -71,6 +71,10 @@ if amdgpu_target not in ["gfx942", "gfx950"]:
     )
     sys.exit(1)
 
+fp8_macro = (
+    "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
+)
+
 hipcc_flags = [
     "-DNDEBUG",
     f"-DOPERATOR_NAMESPACE={operator_namespace}",
@@ -82,6 +86,7 @@ hipcc_flags = [
     f"--amdgpu-target={amdgpu_target}",
     "-DENABLE_BF16",
     "-DENABLE_FP8",
+    fp8_macro,
 ]
 
 ext_modules = [

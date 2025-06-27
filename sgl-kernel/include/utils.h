@@ -19,9 +19,7 @@ limitations under the License.
 #include <cuda_runtime.h>
 #include <torch/all.h>
 
-#ifndef USE_ROCM
-#else
-
+#ifdef USE_ROCM
 // Adapted from flashinfer-rocm [PR#491](https://github.com/flashinfer-ai/flashinfer/pull/491)
 #define _DISPATCH_CASE_F16(c_type, ...) \
   case at::ScalarType::Half: {          \
@@ -34,7 +32,6 @@ limitations under the License.
     using c_type = __hip_bfloat16;       \
     return __VA_ARGS__();                \
   }
-
 #endif  // USE_ROCM
 
 #ifndef USE_ROCM
@@ -343,12 +340,23 @@ __device__ __forceinline__ dstDtype castFromFloat(float val) {
 #include <c10/util/Float8_e4m3fn.h>
 using FP8_TYPE = c10::Float8_e4m3fn;
 C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
-#else
-#include <c10/util/Float8_e4m3fnuz.h>
 
+#else  // USE_ROCM
+
+#if HIP_FP8_TYPE_FNUZ
+#include <c10/util/Float8_e4m3fnuz.h>
 using FP8_TYPE = c10::Float8_e4m3fnuz;
 constexpr auto FP8_E4M3_MAX = 224.0f;
-#endif
+#else
+#if HIP_FP8_TYPE_E4M3
+#include <c10/util/Float8_e4m3fn.h>
+using FP8_TYPE = c10::Float8_e4m3fn;
+C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
+#else
+#error "fp8 is not supported in this processor (arch < gfx942)."
+#endif  // HIP_FP8_TYPE_E4M3
+#endif  // HIP_FP8_TYPE_FNUZ
+#endif  // USE_ROCM
 
 #define FULL_MASK 0xffffffff
 

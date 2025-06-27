@@ -70,11 +70,15 @@ __forceinline__ __device__ __hip_bfloat16 cast(float fval) {
 
 template <>
 __forceinline__ __device__ uint8_t cast(float fval) {
-#ifdef HIP_FP8_TYPE_FNUZ
+#if HIP_FP8_TYPE_FNUZ
   return __hip_cvt_float_to_fp8(fval, __HIP_SATFINITE, __HIP_E4M3_FNUZ);
 #else
+#if HIP_FP8_TYPE_E4M3
+  return __hip_cvt_float_to_fp8(fval, __HIP_SATFINITE, __HIP_E4M3);
+#else
 #error "__hip_cvt_float_to_fp8 is not supported in this processor (arch < gfx942)."
-#endif
+#endif  // HIP_FP8_TYPE_E4M3
+#endif  // HIP_FP8_TYPE_FNUZ
 }
 
 }  // namespace amdgpu
