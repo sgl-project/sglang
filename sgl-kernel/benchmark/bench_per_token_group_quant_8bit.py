@@ -43,6 +43,9 @@ configs = list(
     )
 )
 def benchmark(batch_size, seq_len, group_size, dst_dtype, flags, provider):
+    if flags["scale_ue8m0"] and group_size != 128:
+        return
+
     device = torch.device("cuda")
     hidden_dim = 7168
 
