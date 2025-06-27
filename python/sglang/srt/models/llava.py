@@ -41,16 +41,16 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.mm_utils import (
-    get_anyres_image_grid_shape,
-    unpad_image,
-    unpad_image_shape,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+from sglang.srt.multimodal.mm_utils import (
+    get_anyres_image_grid_shape,
+    unpad_image,
+    unpad_image_shape,
+)
 from sglang.srt.utils import add_prefix, flatten_nested_list, logger
 
 

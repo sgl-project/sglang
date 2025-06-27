@@ -71,7 +71,9 @@ def _compute_moe_deepseek_layer_operations_strategy_tbo(
     assert layer.is_layer_sparse, "dense layer TBO not yet implemented"
     if forward_mode == ForwardMode.EXTEND:
         return _compute_moe_deepseek_blog_prefill(layer)
-    elif forward_mode == ForwardMode.DECODE:
+    elif (
+        forward_mode == ForwardMode.DECODE or forward_mode == ForwardMode.TARGET_VERIFY
+    ):
         return _compute_moe_deepseek_blog_decode(layer)
     else:
         raise NotImplementedError(f"Unsupported {forward_mode=}")
@@ -146,7 +148,9 @@ def _compute_moe_qwen3_layer_operations_strategy_tbo(
     assert layer.is_layer_sparse, "qwen3 moe only support sparse layers"
     if forward_mode == ForwardMode.EXTEND:
         return _compute_moe_qwen3_prefill(layer)
-    elif forward_mode == ForwardMode.DECODE:
+    elif (
+        forward_mode == ForwardMode.DECODE or forward_mode == ForwardMode.TARGET_VERIFY
+    ):
         return _compute_moe_qwen3_decode(layer)
     else:
         raise NotImplementedError(f"Unsupported {forward_mode=}")

@@ -1,7 +1,7 @@
 import json
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,36 @@ class MooncakeTransferEngine:
                 peer_buffer_address,
             )
 
+        return ret
+
+    def batch_transfer_sync(
+        self,
+        session_id: str,
+        buffers: List[int],
+        peer_buffer_addresses: List[int],
+        lengths: List[int],
+    ) -> int:
+        """Synchronously transfer data to the specified addresses in batches."""
+        try:
+            ret = self.engine.batch_transfer_sync_write(
+                session_id, buffers, peer_buffer_addresses, lengths
+            )
+        except Exception:
+            ret = -1
+            # Inform user to upgrade mooncake-transfer-engine >= 0.3.4.post2
+            if not hasattr(self.engine, "batch_transfer_sync_write"):
+                raise RuntimeError(
+                    "Mooncake's batch transfer requires mooncake-transfer-engine >= 0.3.4.post2. "
+                    "Please upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'"
+                )
+
+        if ret < 0:
+            logger.debug(
+                "Failed to batch transfer data. Buffers: %s, Session: %s, Peer addresses: %s",
+                buffers,
+                session_id,
+                peer_buffer_addresses,
+            )
         return ret
 
     def get_session_id(self):

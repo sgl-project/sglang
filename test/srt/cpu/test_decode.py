@@ -6,6 +6,8 @@ from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.test.test_utils import CustomTestCase
 
+torch.manual_seed(1234)
+
 
 class TestDecodeAttention(CustomTestCase):
     def _run_sdpa_forward_decode(

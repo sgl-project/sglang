@@ -3,6 +3,7 @@ import logging
 import re
 from typing import List
 
+from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -10,7 +11,6 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.ebnf_composer import EBNFComposer
-from sglang.srt.openai_api.protocol import Tool
 
 logger = logging.getLogger(__name__)
 
