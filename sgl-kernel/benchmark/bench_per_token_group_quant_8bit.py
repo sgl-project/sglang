@@ -84,8 +84,6 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
 
     x = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.bfloat16)
 
-    quantiles = [0.5, 0.2, 0.8]
-
     fn = {
         "triton": triton_per_token_group_quant_8bit,
         "sglang": sglang_per_token_group_quant_8bit,
@@ -94,10 +92,8 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
         x=x.clone(), group_size=group_size, dst_dtype=dst_dtype, **flags
     )
 
-    ms, min_ms, max_ms = bench_kineto(bench_fn, quantiles=quantiles)
-
-    postprocess_time = lambda t_ms: t_ms * 1000
-    return postprocess_time(ms), postprocess_time(max_ms), postprocess_time(min_ms)
+    time_s = bench_kineto(bench_fn)
+    return time_s * 1e6
 
 
 if __name__ == "__main__":
