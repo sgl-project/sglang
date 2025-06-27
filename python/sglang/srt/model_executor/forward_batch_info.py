@@ -352,7 +352,9 @@ class ForwardBatch:
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
-            TboForwardBatchPreparer.prepare(ret)
+            TboForwardBatchPreparer.prepare(
+                ret, is_draft_worker=model_runner.is_draft_worker
+            )
             return ret
 
         # Override the positions with spec_info
@@ -397,7 +399,9 @@ class ForwardBatch:
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        TboForwardBatchPreparer.prepare(ret)
+        TboForwardBatchPreparer.prepare(
+            ret, is_draft_worker=model_runner.is_draft_worker
+        )
 
         return ret
 

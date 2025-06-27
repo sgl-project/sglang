@@ -242,7 +242,7 @@ class ModelRunner:
                 "SGLANG_LOG_EXPERT_LOCATION_METADATA"
             ):
                 logger.info(
-                    f"Initial expert_location_metadata: {get_global_expert_location_metadata().debug_str()}"
+                    f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
                 )
 
             set_global_expert_distribution_recorder(
@@ -907,7 +907,9 @@ class ModelRunner:
             else:
                 self.kv_cache_dtype = torch.float8_e5m2
         elif self.server_args.kv_cache_dtype == "fp8_e4m3":
-            if is_cuda():
+            if _is_hip:  # Using natively supported format
+                self.kv_cache_dtype = torch.float8_e4m3fnuz
+            else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
         else:
             raise ValueError(
@@ -1108,7 +1110,7 @@ class ModelRunner:
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
-        if self.server_args.enable_two_batch_overlap:
+        if self.server_args.enable_two_batch_overlap and not self.is_draft_worker:
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
         else:
             self.attn_backend = self._get_attention_backend()
