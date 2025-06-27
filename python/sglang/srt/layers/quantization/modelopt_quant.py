@@ -30,7 +30,7 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import is_cuda, next_power_of_2, set_weight_attrs
+from sglang.srt.utils import is_cuda, next_power_of_2
 
 if is_cuda():
     from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
@@ -101,25 +101,22 @@ class ModelOptFp8Config(QuantizationConfig):
                 "Check the `hf_quant_config.json` file for your model's configuration."
             )
 
-        # Convert exclude_modules to handle the language_model prefix that gets added by mllama4.py
-        converted_exclude_modules = []
-        if exclude_modules:
-            for module in exclude_modules:
-                converted_exclude_modules.append(module)
-                if not module.startswith("language_model."):
-                    converted_exclude_modules.append(f"language_model.{module}")
-
         return cls(
             is_checkpoint_fp8_serialized=True,
             kv_cache_quant_method=kv_cache_quant_method,
-            exclude_modules=converted_exclude_modules,
+            exclude_modules=exclude_modules,
         )
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
         if self.exclude_modules and any(
-            module in prefix for module in self.exclude_modules
+            module in prefix
+            or (
+                prefix.startswith("language_model.")
+                and module in prefix.removeprefix("language_model.")
+            )
+            for module in self.exclude_modules
         ):
             return None
 

@@ -231,7 +231,11 @@ class Llama4ForConditionalGeneration(nn.Module):
 
     def _transform_weight_name(self, name: str) -> str:
         """Transform weight name by adding language_model prefix if needed."""
-        if not name.startswith("language_model.") and "vision" not in name:
+        if (
+            not name.startswith("language_model.")
+            and "vision" not in name
+            and "multi_modal_projector" not in name
+        ):
             return f"language_model.{name}"
         return name
 
