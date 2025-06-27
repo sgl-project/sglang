@@ -47,6 +47,7 @@ class ServerArgs:
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
+    model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
@@ -152,6 +153,7 @@ class ServerArgs:
     ep_size: int = 1
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
+    enable_flashinfer_moe: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -236,6 +238,7 @@ class ServerArgs:
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
+    weight_loader_disable_mmap: bool = False
 
     def __post_init__(self):
         # Expert parallelism
@@ -244,7 +247,15 @@ class ServerArgs:
             logger.warning(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
-
+        if self.enable_flashinfer_moe:
+            assert (
+                self.quantization == "modelopt_fp4"
+            ), "modelopt_fp4 quantization is required for Flashinfer MOE"
+            os.environ["TRTLLM_ENABLE_PDL"] = "1"
+            self.disable_shared_experts_fusion = True
+            logger.warning(
+                f"Flashinfer MoE is enabled. Shared expert fusion is disabled."
+            )
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -553,6 +564,7 @@ class ServerArgs:
         # Model and port args
         parser.add_argument(
             "--model-path",
+            "--model",
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
             required=True,
@@ -621,6 +633,13 @@ class ServerArgs:
             '"layered" loads weights layer by layer so that one can quantize a '
             "layer before loading another to make the peak memory envelope "
             "smaller.",
+        )
+        parser.add_argument(
+            "--model-loader-extra-config",
+            type=str,
+            help="Extra config for model loader. "
+            "This will be passed to the model loader corresponding to the chosen load_format.",
+            default=ServerArgs.model_loader_extra_config,
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -1163,6 +1182,11 @@ class ServerArgs:
             help="Enabling expert parallelism for moe. The ep size is equal to the tp size.",
         )
         parser.add_argument(
+            "--enable-flashinfer-moe",
+            action="store_true",
+            help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP with --enable-ep-moe",
+        )
+        parser.add_argument(
             "--enable-deepep-moe",
             action="store_true",
             help="Enabling DeepEP MoE implementation for EP MoE.",
@@ -1585,6 +1609,11 @@ class ServerArgs:
             default=None,
             help="The custom dataloader which used to update the model. Should be set with a valid import path, such as my_package.weight_load_func",
         )
+        parser.add_argument(
+            "--weight-loader-disable-mmap",
+            action="store_true",
+            help="Disable mmap while loading weight using safetensors.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -1672,6 +1701,9 @@ class PortArgs:
     # The ipc filename for rpc call between Engine and Scheduler
     rpc_ipc_name: str
 
+    # The ipc filename for Scheduler to send metrics
+    metrics_ipc_name: str
+
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
         port = server_args.port + random.randint(100, 1000)
@@ -1691,6 +1723,7 @@ class PortArgs:
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -1709,11 +1742,10 @@ class PortArgs:
             dist_init_host, dist_init_port = dist_init_addr
             port_base = int(dist_init_port) + 1
             if dp_rank is None:
-                scheduler_input_port = (
-                    port_base + 3
-                )  # TokenizerManager to DataParallelController
+                # TokenizerManager to DataParallelController
+                scheduler_input_port = port_base + 4
             else:
-                scheduler_input_port = port_base + 3 + 1 + dp_rank
+                scheduler_input_port = port_base + 4 + 1 + dp_rank
 
             return PortArgs(
                 tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
@@ -1721,6 +1753,7 @@ class PortArgs:
                 detokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base + 1}",
                 nccl_port=port,
                 rpc_ipc_name=f"tcp://{dist_init_host}:{port_base + 2}",
+                metrics_ipc_name=f"tcp://{dist_init_host}:{port_base + 3}",
             )
 
 
