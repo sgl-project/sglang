@@ -160,6 +160,7 @@ suites = {
     "per-commit-4-gpu": [
         TestFile("test_local_attn.py", 250),
         TestFile("test_pp_single_node.py", 150),
+        TestFile("test_multi_instance_release_memory_occupation.py", 64),
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
