@@ -16,22 +16,19 @@ _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 
-batch_size_range = [1, 2, 4, 8, 16, 32, 64]
-seq_len_range = [64, 128, 256, 512, 768, 1024, 2048]
+num_tokens_range = [1, 4, 16, 64, 256, 768, 2048, 8192, 16384]
 group_size_range = [128]  # For DeepSeek V3/R1
 dst_dtype_range = [torch.int8, fp8_type_]
 flags_range = PER_TOKEN_GROUP_QUANT_8BIT_VALID_FLAGS
 
 configs = list(
-    itertools.product(
-        batch_size_range, seq_len_range, group_size_range, dst_dtype_range, flags_range
-    )
+    itertools.product(num_tokens_range, group_size_range, dst_dtype_range, flags_range)
 )
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["batch_size", "seq_len", "group_size", "dst_dtype", "flags"],
+        x_names=["num_tokens", "group_size", "dst_dtype", "flags"],
         x_vals=configs,
         line_arg="provider",
         line_vals=["triton", "sglang"],
@@ -42,16 +39,14 @@ configs = list(
         args={},
     )
 )
-def benchmark(batch_size, seq_len, group_size, dst_dtype, flags, provider):
+def benchmark(num_tokens, group_size, dst_dtype, flags, provider):
     if flags["scale_ue8m0"] and group_size != 128:
         return
 
     device = torch.device("cuda")
     hidden_dim = 7168
 
-    x = torch.randn(
-        batch_size * seq_len, hidden_dim, device=device, dtype=torch.float16
-    )
+    x = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.float16)
 
     quantiles = [0.5, 0.2, 0.8]
 
