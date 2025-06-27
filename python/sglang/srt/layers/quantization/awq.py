@@ -18,7 +18,6 @@ _is_hip = is_hip()
 if _is_cuda:
     from sgl_kernel import awq_dequantize
 elif _is_hip:
-    # TODO (Hubert): call awq_dequantize_triton
     from sglang.srt.layers.quantization.awq_triton import awq_dequantize_triton
 else:
     raise RuntimeError("Only CUDA and HIP support AWQ currently.")
