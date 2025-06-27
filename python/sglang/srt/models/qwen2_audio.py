@@ -137,43 +137,20 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        print(f"get_audio_feature: {items}")
         # Extract audio features from input items
         input_features = torch.cat([item.audio_features for item in items], dim=0).type(
             self.audio_tower.dtype
         )
 
-        # Handle attention mask if available - create from audio_feature_lens if available
-        feature_attention_mask = None
-        if items[0].audio_feature_lens is not None:
-            # Create attention mask from feature lengths
-            max_len = max(
-                len_tensor.item()
-                for item in items
-                for len_tensor in item.audio_feature_lens
-            )
-            feature_attention_mask = torch.zeros(
-                (len(items), max_len), dtype=torch.bool
-            )
-            for i, item in enumerate(items):
-                if item.audio_feature_lens:
-                    feature_attention_mask[i, : item.audio_feature_lens[0].item()] = (
-                        True
-                    )
-
-        assert (
-            input_features.dim() == 3
-        ), f"Expected 3D tensor, got {input_features.dim()}D"
-
-        print(
-            f"input_features: {input_features.shape}, feature_attention_mask: {feature_attention_mask.shape}"
-        )
-        audio_embeds = self.audio_tower(
-            input_features
-        ).last_hidden_state  # , feature_attention_mask)
+        audio_embeds = self.audio_tower(input_features).last_hidden_state
         audio_embeds = self.multi_modal_projector(audio_embeds)
-        print(f"audio_embeds: {audio_embeds.shape}")
-        return audio_embeds
+
+        items = items[0]
+        new_embeds = []
+        for i, d in enumerate(audio_embeds):
+            new_embeds.append(d[: items.audio_feature_lens[i].item()])
+
+        return torch.cat(new_embeds, dim=0)
 
     def _process_audio_input(self, audio_input: Qwen2AudioInputs) -> torch.Tensor:
         input_features = audio_input["input_features"].type(self.audio_tower.dtype)
@@ -188,13 +165,6 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ) -> torch.Tensor:
-        if getattr(self, "tokenizer", None) is None:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                "Qwen/Qwen2-Audio-7B-Instruct"
-            )
-
-        print(self.tokenizer.decode(input_ids))
-
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,

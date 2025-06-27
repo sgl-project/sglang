@@ -59,14 +59,11 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
         items = []
         input_ids = res["input_ids"].flatten()
 
-        print(f"key: {res.keys()}")
-
         if (
             "input_features" in res
             and res["input_features"] is not None
             and len(res["input_features"]) != 0
         ):
-            print(f"res: {res}")
             if audio_start_id is not None and audio_end_id is not None:
                 audio_offsets = self.get_mm_items_offset_by_pair(
                     input_ids=input_ids,
@@ -76,15 +73,17 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
             else:
                 audio_offsets = None
 
+            input_lengths = res["feature_attention_mask"].sum(dim=-1)
+            input_lengths = (input_lengths - 1) // 2 + 1
+            output_lengths = (input_lengths - 2) // 2 + 1
+
             item = MultimodalDataItem(
                 audio_features=res["input_features"],
-                audio_feature_lens=res["attention_mask"].sum(dim=-1),
+                audio_feature_lens=output_lengths,
                 audio_offsets=audio_offsets,
                 modality=Modality.AUDIO,
             )
             items += [item]
-
-        print(f"items: {items}")
 
         return {
             "mm_items": items,
