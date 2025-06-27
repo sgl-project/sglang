@@ -39,14 +39,11 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
                     scale_tma_aligned=True,
                     scale_ue8m0=False,
                 ),
-                # TODO
-                # TODO temp
-                # TODO
-                # dict(
-                #     column_major_scales=True,
-                #     scale_tma_aligned=True,
-                #     scale_ue8m0=True,
-                # ),
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=True,
+                ),
             ],
         )
     ),
