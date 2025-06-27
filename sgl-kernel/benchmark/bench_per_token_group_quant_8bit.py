@@ -101,7 +101,7 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
 
 
 if __name__ == "__main__":
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU]) as prof:
         benchmark.run(print_data=True)
 
     trace_path = str(Path("/data/numa0/tom/temp_sglang_server2local/") / f"{time.time()}.trace.json.gz")
