@@ -26,6 +26,9 @@ class MatchResult(NamedTuple):
     last_device_node: Any
     last_host_node: Any
     host_hit_length: int = 0
+    last_l3_node: Any = None
+    l3_hit_length: int = 0
+
 
 
 class BasePrefixCache(ABC):

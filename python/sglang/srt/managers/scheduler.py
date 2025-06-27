@@ -2031,11 +2031,13 @@ class Scheduler(
                         continue
 
                     req.init_next_round_input(
-                        self.tree_cache,
-                        self.enable_hierarchical_cache,
+                        self.tree_cache
                     )
+                    if req.l3_hit_length == 0:
+                        req.waiting_status = WaitingStatus.READY
+                        continue
                     req.waiting_status = WaitingStatus.LOADING
-                    self.tree_cache.mooncake_load_back(req, req.last_node_global)
+                    self.tree_cache.mooncake_load_back(req, req.last_l3_node)
             time.sleep(0.001)
 
     def watchdog_thread(self):

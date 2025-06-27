@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils import debug_timing
 
 """
 Memory pool.
@@ -151,6 +152,9 @@ class KVCache(abc.ABC):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ) -> None:
+        raise NotImplementedError()
+
+    def transfer(self, indices, flat_data):
         raise NotImplementedError()
 
     @abc.abstractmethod
@@ -405,6 +409,15 @@ class MHATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    @debug_timing
+    def transfer(self, indices, flat_data):
+        # transfer prepared data from host to device
+        flat_data = flat_data.to(device=self.device, non_blocking=False)
+        k_data, v_data = flat_data[0], flat_data[1]
+        for i in range(self.layer_num):
+            self.k_buffer[i][indices] = k_data[i]
+            self.v_buffer[i][indices] = v_data[i]
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -653,6 +666,13 @@ class MLATokenToKVPool(KVCache):
         set_mla_kv_buffer_triton(
             self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
         )
+
+    @debug_timing
+    def transfer(self, indices, flat_data):
+        # transfer prepared data from host to device
+        flat_data = flat_data.to(device=self.device, non_blocking=False)
+        for i in range(self.layer_num):
+            self.kv_buffer[i][indices] = flat_data[i]
 
     def load_from_host_per_layer(
         self, host_pool, host_indices, device_indices, layer_id, io_backend

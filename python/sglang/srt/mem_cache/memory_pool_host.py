@@ -98,6 +98,10 @@ class HostKVCache(abc.ABC):
     def init_kv_buffer(self):
         raise NotImplementedError()
 
+    @abc.abstractmethod
+    def get_flat_data(self, indices):
+        raise NotImplementedError()
+
     @synchronized()
     def clear(self):
         # Initialize memory states and tracking structures.
@@ -226,6 +230,9 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
         )
 
+    def get_flat_data(self, indices):
+        return self.kv_buffer[:, :, indices]
+
     @property
     def k_buffer(self):
         return self.kv_buffer[0]
@@ -275,3 +282,6 @@ class MLATokenToKVPoolHost(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
         )
+
+    def get_flat_data(self, indices):
+        return self.kv_buffer[:, indices]

@@ -517,9 +517,18 @@ class HiRadixCache(RadixCache):
         else:
             value = empty_value
 
+        last_l3_node = None
+        l3_hit_length = 0
+        if self.enable_mooncake_store_l3_cache:
+            while last_node.evicted and last_node.l3_backuped and not last_node.l2_backuped:
+                if not last_l3_node:
+                    last_l3_node = last_node
+                l3_hit_length += len(last_node.l3_keys) * self.page_size
+                last_node = last_node.parent
+
         host_hit_length = 0
         last_host_node = last_node
-        while last_node.evicted:
+        while last_node.evicted and last_node.l2_backuped:
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
 
@@ -528,6 +537,8 @@ class HiRadixCache(RadixCache):
             last_device_node=last_node,
             last_host_node=last_host_node,
             host_hit_length=host_hit_length,
+            last_l3_node=last_l3_node,
+            l3_hit_length=l3_hit_length
         )
 
     def _match_prefix_helper(self, node: TreeNode, key: List):
