@@ -361,8 +361,6 @@ def sglang_per_token_group_quant_fp8(
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
-    x_q: Optional[torch.Tensor] = None,
-    x_s: Optional[torch.Tensor] = None,
 ):
     assert (
         x.shape[-1] % group_size == 0
@@ -373,17 +371,15 @@ def sglang_per_token_group_quant_fp8(
         # TODO: handle this case by fixing the (token=4, dim=256, group_size=128) UT case
         assert x.shape[-1] % (group_size * 4) == 0
 
-    if x_q is None:
-        x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
-    if x_s is None:
-        x_s = create_per_token_group_quant_fp8_output_scale(
-            x_shape=x.shape,
-            device=x.device,
-            group_size=group_size,
-            column_major_scales=column_major_scales,
-            scale_tma_aligned=scale_tma_aligned,
-            scale_ue8m0=scale_ue8m0,
-        )
+    x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
+    x_s = create_per_token_group_quant_fp8_output_scale(
+        x_shape=x.shape,
+        device=x.device,
+        group_size=group_size,
+        column_major_scales=column_major_scales,
+        scale_tma_aligned=scale_tma_aligned,
+        scale_ue8m0=scale_ue8m0,
+    )
 
     if x.shape[0] > 0:
         sgl_per_token_group_quant_fp8(
@@ -402,8 +398,6 @@ def sglang_per_token_group_quant_8bit(
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
-    x_q: Optional[torch.Tensor] = None,
-    x_s: Optional[torch.Tensor] = None,
 ):
     from sglang.srt.layers.quantization.int8_kernel import (
         sglang_per_token_group_quant_int8,
@@ -412,7 +406,6 @@ def sglang_per_token_group_quant_8bit(
     if dst_dtype == torch.int8:
         assert not column_major_scales
         assert not scale_tma_aligned
-        assert (x_q is None) and (x_s is None)
         return sglang_per_token_group_quant_int8(
             x=x,
             group_size=group_size,
@@ -427,8 +420,6 @@ def sglang_per_token_group_quant_8bit(
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=scale_ue8m0,
-        x_q=x_q,
-        x_s=x_s,
     )
 
 

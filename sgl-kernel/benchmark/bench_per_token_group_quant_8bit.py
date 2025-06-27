@@ -74,19 +74,11 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
 
     x = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.bfloat16)
 
-    x_q = torch.empty_like(x, device=x.device, dtype=dst_dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
-        x_shape=x.shape,
-        device=x.device,
-        group_size=group_size,
-        **flags,
-    )
-
     quantiles = [0.5, 0.2, 0.8]
 
     fn = {
         "triton": triton_per_token_group_quant_8bit,
-        "sglang": partial(sglang_per_token_group_quant_8bit, x_q=x_q, x_s=x_s),
+        "sglang": sglang_per_token_group_quant_8bit,
     }[provider]
     bench_fn = lambda: fn(x=x.clone(), group_size=group_size, dst_dtype=dst_dtype, **flags)
 
