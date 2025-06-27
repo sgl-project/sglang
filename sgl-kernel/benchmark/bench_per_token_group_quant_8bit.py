@@ -14,6 +14,7 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 
 num_tokens_range = [1, 4, 16, 64, 256, 768, 2048, 8192, 16384]
+hidden_dim_range = [1536, 7168, 18432] # For DeepSeek V3/R1
 group_size_range = [128]  # For DeepSeek V3/R1
 # TODO test int8
 dst_dtype_range = [fp8_type_]
@@ -42,13 +43,13 @@ flags_range = [
 
 
 configs = list(
-    itertools.product(num_tokens_range, group_size_range, dst_dtype_range, flags_range)
+    itertools.product(num_tokens_range, hidden_dim_range, group_size_range, dst_dtype_range, flags_range)
 )
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["num_tokens", "group_size", "dst_dtype", "flags"],
+        x_names=["num_tokens", "hidden_dim", "group_size", "dst_dtype", "flags"],
         x_vals=configs,
         line_arg="provider",
         line_vals=["triton", "sglang"],
@@ -59,12 +60,11 @@ configs = list(
         args={},
     )
 )
-def benchmark(num_tokens, group_size, dst_dtype, flags, provider):
+def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
     if flags["scale_ue8m0"] and group_size != 128:
         return
 
     device = torch.device("cuda")
-    hidden_dim = 7168
 
     x = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.float16)
 
