@@ -1646,11 +1646,7 @@ class ServerArgs:
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
         ), "multi-node data parallel is not supported unless dp attention!"
-        assert (
-            self.max_loras_per_batch > 0
-            # FIXME
-            and (self.lora_paths is None or self.disable_radix_cache)
-        ), "compatibility of lora and radix attention is in progress"
+
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
