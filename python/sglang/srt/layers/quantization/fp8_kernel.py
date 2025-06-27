@@ -209,29 +209,17 @@ def per_token_group_quant_fp8(
     assert x.is_contiguous(), "`x` is not contiguous"
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
+    x_s = _create_per_token_group_quant_fp8_output_scale(
+        x_shape=x.shape,
+        device=x.device,
+        group_size=group_size,
+        column_major_scales=column_major_scales,
+        scale_tma_aligned=scale_tma_aligned,
+        scale_ue8m0=scale_ue8m0,
+    )
+
     M = x.numel() // group_size
     N = group_size
-    if column_major_scales:
-        if scale_tma_aligned:
-            # aligned to 4 * sizeof(float)
-            aligned_size = (x.shape[-2] + 3) // 4 * 4
-            x_s = torch.empty(
-                x.shape[:-2] + (x.shape[-1] // group_size, aligned_size),
-                device=x.device,
-                dtype=torch.float32,
-            ).permute(-1, -2)[: x.shape[-2], :]
-        else:
-            x_s = torch.empty(
-                (x.shape[-1] // group_size,) + x.shape[:-1],
-                device=x.device,
-                dtype=torch.float32,
-            ).permute(-1, -2)
-    else:
-        x_s = torch.empty(
-            x.shape[:-1] + (x.shape[-1] // group_size,),
-            device=x.device,
-            dtype=torch.float32,
-        )
 
     BLOCK = triton.next_power_of_2(N)
     # heuristics for number of warps
