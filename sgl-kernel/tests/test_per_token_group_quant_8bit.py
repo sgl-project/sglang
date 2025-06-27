@@ -7,6 +7,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
+from sglang.srt.layers.quantization.utils import assert_fp8_all_close
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -77,9 +78,7 @@ def test_per_token_group_quant_with_column_major(
     print(f"{x_s_sglang=}")
     torch.set_printoptions(profile="default")
 
-    torch.testing.assert_close(
-        x_q_triton.to(torch.float32), x_q_sglang.to(torch.float32), rtol=1e-3, atol=1e-5
-    )
+    assert_fp8_all_close(x_q_triton, x_q_sglang)
     torch.testing.assert_close(
         x_s_triton.contiguous(), x_s_sglang.contiguous(), rtol=1e-3, atol=1e-5
     )
