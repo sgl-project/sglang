@@ -4,9 +4,7 @@ from typing import TYPE_CHECKING, List
 
 import torch.cuda
 
-from sglang.srt.eplb.expert_distribution import (
-    get_global_expert_distribution_recorder,
-)
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 
 if TYPE_CHECKING:
