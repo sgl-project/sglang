@@ -4,11 +4,13 @@ import torch
 import triton
 
 from sglang.srt.layers.quantization.fp8_kernel import (
+    PER_TOKEN_GROUP_QUANT_8BIT_VALID_FLAGS,
+)
+from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
 from sglang.srt.utils import is_hip
-from sglang.srt.layers.quantization.fp8_kernel import PER_TOKEN_GROUP_QUANT_8BIT_VALID_FLAGS
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
@@ -51,9 +53,13 @@ def benchmark(batch_size, seq_len, group_size, dst_dtype, flags, provider):
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "triton":
-        fn = lambda: triton_per_token_group_quant_8bit(x.clone(), group_size, dst_dtype, **flags)
+        fn = lambda: triton_per_token_group_quant_8bit(
+            x.clone(), group_size, dst_dtype, **flags
+        )
     elif provider == "sglang":
-        fn = lambda: sglang_per_token_group_quant_8bit(x.clone(), group_size, dst_dtype, **flags)
+        fn = lambda: sglang_per_token_group_quant_8bit(
+            x.clone(), group_size, dst_dtype, **flags
+        )
 
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
 
