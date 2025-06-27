@@ -826,8 +826,8 @@ class ServerArgs:
             default=ServerArgs.hybrid_kvcache_ratio,
             help=(
                 "Mix ratio in [0,1] between uniform and hybrid kv buffers "
-                "(0.0 = pure uniform: local_size / global_size = 1)"
-                "(1.0 = pure hybrid: local_size / global_size = local_attention_size / context_length)"
+                "(0.0 = pure uniform: swa_size / full_size = 1)"
+                "(1.0 = pure hybrid: swa_size / full_size = local_attention_size / context_length)"
             ),
         )
 

@@ -120,7 +120,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
-            1, self.size + 1, dtype=torch.int32, device=self.device
+            1, self.size + 1, dtype=torch.int64, device=self.device
         )
         self.is_not_in_free_group = True
         self.free_group = []
@@ -182,11 +182,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.full_to_swa_index_mapping = torch.empty(
             size + size_swa + 1,
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=device,
         )
         self.clear()
-        self._kvcache.register_mapping(weakref.proxy(self.full_to_swa_index_mapping))
+
+        self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
 
     def available_size(self):
         return min(self.full_available_size(), self.swa_available_size())
@@ -213,12 +214,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         return msg
 
-    def log_usage(self, evictable_size: int = 0):
-        used_full = self.size_full - (self.full_available_size() + evictable_size)
-        used_swa = self.size_swa - self.swa_available_size()
+    def log_usage(self, swa_evictable_size: int = 0, full_evictable_size: int = 0):
+        used_full = self.size_full - (self.full_available_size() + full_evictable_size)
+        used_swa = self.size_swa - (self.swa_available_size() + swa_evictable_size)
         msg = (
-            f"#token: global={used_full}, swa={used_swa}, "
-            f"token usage: global={used_full / self.size_full:.2f}, "
+            f"#token: full={used_full}, swa={used_swa}, "
+            f"token usage: full={used_full / self.size_full:.2f}, "
             f"swa={used_swa / self.size_swa:.2f}, "
         )
         return msg, used_full
@@ -261,17 +262,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[free_index] = 0
 
     def backup_state(self):
-        return (
-            self.full_attn_allocator.backup_state(),
-            self.swa_attn_allocator.backup_state(),
-            self.full_to_swa_index_mapping.clone(),
-        )
+        raise NotImplementedError
 
     def restore_state(self, state):
-        full_state, swa_state, mapping = state
-        self.full_attn_allocator.restore_state(full_state)
-        self.swa_attn_allocator.restore_state(swa_state)
-        self.full_to_swa_index_mapping.copy_(mapping)
+        raise NotImplementedError
 
     def clear(self):
         self.swa_attn_allocator.clear()

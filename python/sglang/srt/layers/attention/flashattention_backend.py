@@ -1837,9 +1837,9 @@ class FlashAttentionBackend(AttentionBackend):
         cu_seqlens_q = metadata.cu_seqlens_q
         cache_seqlens_int32 = metadata.cache_seqlens_int32
         if self.is_hybrid:
-            page_table = forwardbatch.token_to_kv_pool.full_to_swa_index_mapping[
+            page_table = forwardbatch.token_to_kv_pool.translate_loc_from_full_to_swa(
                 metadata.page_table
-            ]
+            )
         else:
             page_table = metadata.page_table
         if cu_seqlens_q is None or cache_seqlens_int32 is None or page_table is None:
@@ -1963,7 +1963,9 @@ class FlashAttentionBackend(AttentionBackend):
         max_seq_len = int(seqlens.max().item())
         if self.is_hybrid:
             assert full_to_swa_index_mapping is not None
-            sliced_page_table = full_to_swa_index_mapping[metadata.page_table[:bs, :max_seq_len]]
+            sliced_page_table = full_to_swa_index_mapping[
+                metadata.page_table[:bs, :max_seq_len]
+            ].to(torch.int32)
         else:
             sliced_page_table = metadata.page_table[:bs, :max_seq_len]
 

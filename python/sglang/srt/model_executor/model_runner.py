@@ -440,7 +440,7 @@ class ModelRunner:
             if self.model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
 
-        if self.is_hybrid is not None and not server_args.disable_radix_cache:
+        if self.is_hybrid and not server_args.disable_radix_cache:
             logger.info("Automatically disable radix cache for hybrid cache.")
             server_args.disable_radix_cache = True
 
@@ -859,7 +859,7 @@ class ModelRunner:
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
-    def get_num_token_hybrid(self):
+    def set_num_token_hybrid(self):
         if (
             "Llama4ForConditionalGeneration"
             in self.model_config.hf_config.architectures
@@ -870,23 +870,24 @@ class ModelRunner:
                 * self.attention_chunk_size
                 / self.model_config.context_len
             )
-            self.local_max_total_num_tokens = (
+            self.swa_max_total_num_tokens = (
                 4 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
             )
-            self.max_total_num_tokens = (
+            self.full_max_total_num_tokens = (
                 4 * self.max_total_num_tokens
                 - 12 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
             )
-            self.local_max_total_num_tokens = int(
-                self.local_max_total_num_tokens
+            self.swa_max_total_num_tokens = int(
+                self.swa_max_total_num_tokens
                 // self.server_args.page_size
                 * self.server_args.page_size
             )
-            self.max_total_num_tokens = int(
-                self.max_total_num_tokens
+            self.full_max_total_num_tokens = int(
+                self.full_max_total_num_tokens
                 // self.server_args.page_size
                 * self.server_args.page_size
             )
+            self.max_total_num_tokens = self.full_max_total_num_tokens
         else:
             raise ValueError(
                 f"Unsupported model for hybrid cache: {self.model_config.hf_config.architectures}."
@@ -968,8 +969,8 @@ class ModelRunner:
         )
 
         # create token size for hybrid cache
-        if self.is_hybrid is not None:
-            self.get_num_token_hybrid()
+        if self.is_hybrid:
+            self.set_num_token_hybrid()
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
@@ -1033,10 +1034,10 @@ class ModelRunner:
                 end_layer=self.end_layer,
             )
         else:
-            if self.is_hybrid is not None:
+            if self.is_hybrid:
                 self.token_to_kv_pool = SWAKVPool(
-                    size=self.max_total_num_tokens,
-                    size_swa=self.local_max_total_num_tokens,
+                    size=self.full_max_total_num_tokens,
+                    size_swa=self.swa_max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
                         get_attention_tp_size()
@@ -1065,17 +1066,17 @@ class ModelRunner:
 
         if self.token_to_kv_pool_allocator is None:
             if self.page_size == 1:
-                if self.is_hybrid is None:
-                    self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
+                if self.is_hybrid:
+                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                        self.full_max_total_num_tokens,
+                        self.swa_max_total_num_tokens,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
                     )
                 else:
-                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                    self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                         self.max_total_num_tokens,
-                        self.local_max_total_num_tokens,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=self.token_to_kv_pool,

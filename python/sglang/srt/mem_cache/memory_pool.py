@@ -437,6 +437,8 @@ class MHATokenToKVPool(KVCache):
 
 
 class SWAKVPool(KVCache):
+    """KV cache with separate pools for global and SWA attention layers."""
+
     def __init__(
         self,
         size: int,
@@ -457,6 +459,7 @@ class SWAKVPool(KVCache):
         self.full_layer_nums = len(full_attention_layer_ids)
         self.page_size = 1
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
+        assert not enable_kvcache_transpose
         TokenToKVPoolClass = MHATokenToKVPool
         self.swa_kv_pool = TokenToKVPoolClass(
             size=size_swa,
@@ -484,9 +487,6 @@ class SWAKVPool(KVCache):
         for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
             self.layers_mapping[global_layer_id] = (swa_layer_id, True)
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
-
-    def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
-        self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
     def get_kv_size_bytes(self):
         raise NotImplementedError
