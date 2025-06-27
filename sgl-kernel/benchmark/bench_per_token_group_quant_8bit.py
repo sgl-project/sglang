@@ -94,13 +94,9 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
         x=x.clone(), group_size=group_size, dst_dtype=dst_dtype, **flags
     )
 
-    # TODO no need?
-    num_repeat = 10
-    repeated_bench_fn = lambda: [bench_fn() for _ in range(num_repeat)]
+    ms, min_ms, max_ms = bench_kineto(bench_fn, quantiles=quantiles)
 
-    ms, min_ms, max_ms = bench_kineto(repeated_bench_fn, quantiles=quantiles)
-
-    postprocess_time = lambda t_ms: t_ms * 1000 / num_repeat
+    postprocess_time = lambda t_ms: t_ms * 1000
     return postprocess_time(ms), postprocess_time(max_ms), postprocess_time(min_ms)
 
 
