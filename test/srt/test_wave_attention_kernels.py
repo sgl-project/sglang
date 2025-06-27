@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.layers.attention.wave_ops.decode_attention import (
     decode_attention_wave,
+    decode_attention_intermediate_arrays_shapes,
 )
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
     decode_attention_fwd_grouped as triton_decode_attention_fwd_grouped,
@@ -223,14 +224,16 @@ class TestWaveAttention(unittest.TestCase):
             logit_cap,
         )
 
+        attn_logits_shape, attn_logits_max_shape = decode_attention_intermediate_arrays_shapes(B, D_V, H_Q, max_kv_splits)
+
         attn_logits = torch.empty(
-            (max_kv_splits, B, D_V, H_Q),
+            attn_logits_shape,
             dtype=torch.float32,
             device="cuda",
         )
 
         attn_logits_max = torch.empty(
-            (max_kv_splits, B, H_Q),
+            attn_logits_max_shape,
             dtype=torch.float32,
             device="cuda",
         )
