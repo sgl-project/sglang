@@ -6,13 +6,13 @@
 
 #include "utils.h"
 
-template <int THREADS_PER_GROUP>
+template <int THREADS_PER_HYPERGROUP>
 __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   unsigned mask = 0xffff;
 
-  static_assert((THREADS_PER_GROUP == 16) or (THREADS_PER_GROUP == 8));
+  static_assert((THREADS_PER_HYPERGROUP == 16) or (THREADS_PER_HYPERGROUP == 8));
 
-  if constexpr (THREADS_PER_GROUP == 16) {
+  if constexpr (THREADS_PER_HYPERGROUP == 16) {
     val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
   }
   val = fmaxf(val, __shfl_xor_sync(mask, val, 4));
@@ -73,7 +73,7 @@ __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
   return ret;
 }
 
-constexpr int THREADS_PER_GROUP = 8;
+constexpr int THREADS_PER_HYPERGROUP = 8;
 constexpr uint32_t VEC_NUM_BYTES = 32;
 constexpr int GROUP_SIZE_CONST = 128;
 
@@ -97,13 +97,13 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int scale_stride = 0) {
   constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);
   constexpr uint32_t VEC_INT4_SIZE = VEC_NUM_BYTES / sizeof(int4);
-  constexpr uint32_t BYTES_PER_ITERATION = GROUP_SIZE_CONST * sizeof(T) / THREADS_PER_GROUP;
+  constexpr uint32_t BYTES_PER_ITERATION = GROUP_SIZE_CONST * sizeof(T) / THREADS_PER_HYPERGROUP;
   constexpr uint32_t NUM_GROUPS_PER_HYPERGROUP = VEC_NUM_BYTES / BYTES_PER_ITERATION;
   static_assert(NUM_GROUPS_PER_HYPERGROUP == VEC_INT4_SIZE);
   static_assert(sizeof(int4) == BYTES_PER_ITERATION);
 
-  const int local_hypergroup_id = threadIdx.x / THREADS_PER_GROUP;
-  const int lane_id = threadIdx.x % THREADS_PER_GROUP;
+  const int local_hypergroup_id = threadIdx.x / THREADS_PER_HYPERGROUP;
+  const int lane_id = threadIdx.x % THREADS_PER_HYPERGROUP;
 
   const int block_hypergroup_id = blockIdx.x * hypergroups_per_block;
   const int global_hypergroup_id = block_hypergroup_id + local_hypergroup_id;
@@ -152,7 +152,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     local_absmax = fmaxf(local_absmax, abs_val);
   }
 
-  local_absmax = GroupReduceMax<THREADS_PER_GROUP>(local_absmax, lane_id);
+  local_absmax = GroupReduceMax<THREADS_PER_HYPERGROUP>(local_absmax, lane_id);
 
   float y_scale, y_scale_inv;
   calculate_fp8_scales<SCALE_UE8M0>(local_absmax, y_scale, y_scale_inv, max_8bit, max_8bit_inv);
@@ -225,7 +225,7 @@ void sgl_per_token_group_quant_8bit(
 
   auto dst_type = output_q.scalar_type();
   const int num_blocks = num_groups / hypergroups_per_block;
-  const int num_threads = hypergroups_per_block * THREADS_PER_GROUP;
+  const int num_threads = hypergroups_per_block * THREADS_PER_HYPERGROUP;
 
   const bool is_column_major = output_s.stride(0) < output_s.stride(1);
   const int scale_num_rows = output_s.size(1);
@@ -239,7 +239,7 @@ void sgl_per_token_group_quant_8bit(
   do {                                                                                            \
     /* TODO do not copy paste */                                                                  \
     constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);                                \
-    TORCH_CHECK(THREADS_PER_GROUP == GROUP_SIZE_CONST / VEC_TYPED_SIZE);                          \
+    TORCH_CHECK(THREADS_PER_HYPERGROUP == GROUP_SIZE_CONST / VEC_TYPED_SIZE);                          \
                                                                                                   \
     dim3 grid(num_blocks);                                                                        \
     dim3 block(num_threads);                                                                      \
