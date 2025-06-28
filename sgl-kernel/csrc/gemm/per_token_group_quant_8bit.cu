@@ -75,6 +75,7 @@ __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
 
 constexpr int THREADS_PER_GROUP = 8;
 constexpr int INPUT_INT4_SIZE = 2;
+constexpr uint32_t VEC_NUM_BYTES = 32;
 
 template <
     typename T,
@@ -125,8 +126,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     scale_output = output_s + global_group_id;
   }
 
-  constexpr uint32_t vec_num_bytes = 32;
-  constexpr uint32_t vec_size = vec_num_bytes / sizeof(T);
+  constexpr uint32_t vec_size = VEC_NUM_BYTES / sizeof(T);
 
   const int32_t num_vec_elems = group_size / vec_size;
 
@@ -230,8 +230,7 @@ void sgl_per_token_group_quant_8bit(
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
   do {                                                                                            \
     /* TODO do not copy paste */                                                                  \
-    constexpr uint32_t vec_num_bytes = 32;                                                        \
-    constexpr uint32_t vec_size = vec_num_bytes / sizeof(T);                                      \
+    constexpr uint32_t vec_size = VEC_NUM_BYTES / sizeof(T);                                      \
     const int32_t num_vec_elems = group_size / vec_size;                                          \
     TORCH_CHECK(THREADS_PER_GROUP == num_vec_elems);                                              \
                                                                                                   \
