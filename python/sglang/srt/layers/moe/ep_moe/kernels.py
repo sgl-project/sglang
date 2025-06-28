@@ -4,8 +4,6 @@ from typing import List, Optional
 import torch
 import triton
 
-from sglang.math_utils import ceil_div
-from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 from sglang.srt.utils import ceil_div, dispose_tensor, is_cuda
 
