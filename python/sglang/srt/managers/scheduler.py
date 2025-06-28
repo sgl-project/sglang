@@ -317,6 +317,9 @@ class Scheduler(
             self.tokenizer.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
+            self.tokenizer.think_start_id = self.tokenizer.encode(
+                reasoning_parser.detector.think_start_token, add_special_tokens=False
+            )[0]
 
         # Check whether overlap can be enabled
         if not self.is_generation:

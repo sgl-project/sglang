@@ -149,6 +149,9 @@ class ServerArgs:
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
 
+    speculative_thinking_start_token = None
+    speculative_thinking_end_token = None
+
     # Expert parallelism
     ep_size: int = 1
     enable_ep_moe: bool = False

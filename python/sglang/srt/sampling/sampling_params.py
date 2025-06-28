@@ -81,6 +81,14 @@ class SamplingParams:
         self.stream_interval = stream_interval
         self.logit_bias = logit_bias
 
+        self.thinking_start_token = None
+        self.thinking_end_token = None
+        # tokenizer.encode("<think>")
+        # 128798
+
+        # tokenizer.encode("</think>")
+        # 128799
+
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
             # top_k = 1 means greedy sampling

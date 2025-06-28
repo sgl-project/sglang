@@ -70,6 +70,8 @@ class EagleDraftInput:
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
 
+    is_thinking = None
+
     def prepare_for_extend(self, batch: ScheduleBatch):
         if batch.forward_mode.is_idle():
             return
@@ -197,6 +199,8 @@ class EagleVerifyOutput:
     accept_length_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
     accepted_indices: torch.Tensor
+
+    thinking_states: List[bool]
 
 
 @dataclass
@@ -476,6 +480,10 @@ class EagleVerifyInput:
         predict_cpu = predict.tolist()
         has_finished = False
 
+        thinking_states = None
+        if batch.relax_thinking:
+            thinking_states = batch.thinking_states()
+
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
@@ -484,6 +492,14 @@ class EagleVerifyInput:
                     break
                 id = predict_cpu[idx]
                 req.output_ids.append(id)
+
+                # think_start_token = 128798
+                # think_end_token = 128799
+                if id == 128798:
+                    thinking_states[i] = True
+                elif id == 128799:
+                    thinking_states[i] = False
+
                 req.check_finished()
                 if req.finished():
                     has_finished = True
@@ -607,6 +623,7 @@ class EagleVerifyInput:
                 verified_id=verified_id,
                 accept_length_per_req_cpu=draft_input.accept_length_cpu,
                 accepted_indices=accept_index,
+                thinking_states=thinking_states,
             )
         else:
             if page_size == 1 or self.topk == 1:
@@ -672,6 +689,7 @@ class EagleVerifyInput:
                 verified_id=verified_id,
                 accept_length_per_req_cpu=accept_length_cpu,
                 accepted_indices=accept_index,
+                thinking_states=thinking_states,
             )
 
 

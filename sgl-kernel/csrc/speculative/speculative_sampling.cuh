@@ -36,6 +36,7 @@ template <
     typename DType,
     typename IdType,
     typename IdType2>
+// Support list of threshold
 __global__ void TreeSpeculativeSamplingTargetOnly(
     IdType* predicts,          // mutable
     IdType* accept_index,      // mutable

@@ -67,6 +67,12 @@ class SamplingBatchInfo:
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
+    relax_thinking = False
+    in_thinking = None
+    # Deepseek tokenizer
+    think_start_token = 128798
+    think_end_token = 128799
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         reqs = batch.reqs

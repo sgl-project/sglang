@@ -682,6 +682,8 @@ class EAGLEWorker(TpModelWorker):
 
         self._detect_nan_if_needed(logits_output)
         spec_info.hidden_states = logits_output.hidden_states
+
+        # Thinking status is in batch.
         res: EagleVerifyOutput = spec_info.verify(
             batch,
             logits_output,
@@ -689,6 +691,9 @@ class EAGLEWorker(TpModelWorker):
             self.page_size,
             vocab_mask,
         )
+        # Get verify result and update thinking status
+        if batch.relax_thinking:
+            batch.update_thinking_states(res.thinking_states)
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)

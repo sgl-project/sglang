@@ -102,6 +102,9 @@ class BaseReasoningFormatDetector:
 
         return StreamingParseResult()
 
+    def in_reasoning(self):
+        return self._in_reasoning
+
 
 class DeepSeekR1Detector(BaseReasoningFormatDetector):
     """

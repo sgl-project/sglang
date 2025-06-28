@@ -632,6 +632,8 @@ class Req:
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
 
+        self.is_thinking = False
+
     @property
     def seqlen(self):
         return len(self.origin_input_ids) + len(self.output_ids)
@@ -834,6 +836,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
+    relax_thinking = None
     next_batch_sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
@@ -943,6 +946,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_empty(self):
         return len(self.reqs) == 0
+
+    def thinking_states(self):
+        return [req.is_thinking for req in self.reqs]
+
+    def update_thinking_states(self, thinking_states):
+        assert len(thinking_states) == len(self.zip)
+        for req, s in zip(self.reqs, thinking_states):
+            req.is_thinking = s
 
     def alloc_req_slots(self, num_reqs: int):
         req_pool_indices = self.req_to_token_pool.alloc(num_reqs)
