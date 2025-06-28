@@ -165,6 +165,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     }
 
     int4 output_buf;
+    static_assert(sizeof(output_buf) == VEC_TYPED_SIZE_PER_ITERATION * sizeof(DST_DTYPE));
 
     if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
       const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
@@ -180,7 +181,6 @@ __global__ void per_token_group_quant_8bit_kernel(
       }
     } else {
       const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
-      static_assert(sizeof(output_buf) == VEC_TYPED_SIZE_PER_ITERATION * sizeof(DST_DTYPE));
 
 #pragma unroll
       for (uint32_t j = 0; j < VEC_TYPED_SIZE_PER_ITERATION; ++j) {
