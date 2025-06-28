@@ -127,7 +127,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     int4 input_int4;
     T* input_vec = reinterpret_cast<T*>(&input_int4);
     static_assert(sizeof(input_vec) * vec_size == sizeof(input_int4));
-    input_int4 = ld_global_nc(reinterpret_cast<int4*>(group_input + i * vec_size));
+    input_int4 = ld_global_nc(reinterpret_cast<const int4*>(group_input + i * vec_size));
 
 #pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
@@ -153,7 +153,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     int4 input_int4;
     T* input_vec = reinterpret_cast<T*>(&input_int4);
     static_assert(sizeof(input_vec) * vec_size == sizeof(input_int4));
-    input_int4 = ld_global_nc(reinterpret_cast<int4*>(group_input + i * vec_size));
+    input_int4 = ld_global_nc(reinterpret_cast<const int4*>(group_input + i * vec_size));
 
     int2 output_buf;
 
