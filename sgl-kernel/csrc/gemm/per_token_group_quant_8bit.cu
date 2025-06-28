@@ -170,8 +170,8 @@ __global__ void per_token_group_quant_8bit_kernel(
         max_8bit_inv);
     y_scale_repeated[group_in_threadgroup_index] = {y_scale, y_scale};
 
-    // TODO do vec output for scale (not done yet)
-    scale_element_t y_scale_inv_quant = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv[0]);
+    // TODO do vec output for scale
+    scale_element_t y_scale_inv_quant = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
     if (lane_id == 0) {
       *scale_output = y_scale_inv_quant;
     }
