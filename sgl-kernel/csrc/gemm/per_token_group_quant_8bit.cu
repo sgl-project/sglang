@@ -142,14 +142,21 @@ __global__ void per_token_group_quant_8bit_kernel(
     input_vec.cast_load(group_input + i * vec_size);
 
     int2 output_buf;
-    const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
-    static_assert(sizeof(output_buf) == vec_size * sizeof(DST_DTYPE));
+
+    if constexpr (std::is_same_v<T, c10::Float8_e4m3fn>) {
+      const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
+      static_assert(sizeof(output_buf) == vec_size / 2 * sizeof(__nv_fp8x2_storage_t));
+
+    } else {
+      const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
+      static_assert(sizeof(output_buf) == vec_size * sizeof(DST_DTYPE));
 
 #pragma unroll
-    for (uint32_t j = 0; j < vec_size; ++j) {
-      float val = static_cast<float>(input_vec[j]);
-      float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
-      output_buf_ptr[j] = DST_DTYPE(q_val);
+      for (uint32_t j = 0; j < vec_size; ++j) {
+        float val = static_cast<float>(input_vec[j]);
+        float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
+        output_buf_ptr[j] = DST_DTYPE(q_val);
+      }
     }
 
     st_global_v2_s32(reinterpret_cast<int2*>(group_output + i * vec_size), output_buf);
