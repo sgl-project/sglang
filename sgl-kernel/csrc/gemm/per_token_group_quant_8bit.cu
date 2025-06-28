@@ -86,8 +86,6 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int global_group_id = block_group_id + local_group_id;
   const int block_group_offset = global_group_id * group_size;
 
-  float local_absmax = eps;
-
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
@@ -114,6 +112,8 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   const int32_t num_vec_elems = group_size / vec_size;
 
+  T local_absmax_16bit = eps;
+
   for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
     vec_t input_vec;
     input_vec.cast_load(group_input + i * vec_size);
@@ -122,10 +122,11 @@ __global__ void per_token_group_quant_8bit_kernel(
     for (uint32_t j = 0; j < vec_size; ++j) {
       float val = static_cast<float>(input_vec[j]);
       float abs_val = fabsf(val);
-      local_absmax = fmaxf(local_absmax, abs_val);
+      local_absmax_16bit = fmaxf(local_absmax, abs_val);
     }
   }
 
+  float local_absmax = (float) local_absmax_16bit;
   local_absmax = GroupReduceMax(local_absmax, lane_id);
 
   float y_scale, y_scale_inv;
