@@ -17,10 +17,6 @@ __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
 }
 
 // Copied and modified from DeepEP
-constexpr float kFinfoAmaxE4M3 = 448.0f;
-constexpr float kFinfoAmaxInvE4M3 = 1 / 448.0f;
-
-// Copied and modified from DeepEP
 __forceinline__ __device__ float fast_pow2(int x) {
     // We can ensure `-126 <= x and x <= 127`
     uint32_t bits_x = (x + 127) << 23;
@@ -36,15 +32,15 @@ __forceinline__ __device__ int fast_log2_ceil(float x) {
 }
 
 // Copied and modified from DeepEP
-template <bool ROUND_SCALE>
+template <bool ROUND_SCALE, float MAX_8BIT, float MAX_8BIT_INV>
 __forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, float& scale_inv) {
     if constexpr (ROUND_SCALE) {
-        auto exp_scale_inv = fast_log2_ceil(amax * kFinfoAmaxInvE4M3);
+        auto exp_scale_inv = fast_log2_ceil(amax * MAX_8BIT_INV);
         scale = fast_pow2(-exp_scale_inv);
         scale_inv = fast_pow2(exp_scale_inv);
     } else {
-        scale_inv = amax * kFinfoAmaxInvE4M3;
-        scale = kFinfoAmaxE4M3 / amax;
+        scale_inv = amax * MAX_8BIT_INV;
+        scale = MAX_8BIT / amax;
     }
 }
 
@@ -127,7 +123,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   local_absmax = GroupReduceMax(local_absmax, lane_id);
 
   float y_scale, y_scale_inv;
-  calculate_fp8_scales(local_absmax, y_scale, y_scale_inv);
+  calculate_fp8_scales<USE_SCALE_UE8M0, MAX_8BIT, MAX_8BIT_INV>(local_absmax, y_scale, y_scale_inv);
 //   float y_s = local_absmax / max_8bit;
 //   if constexpr (SCALE_UE8M0) {
 //     y_s = exp2f(ceilf(log2f(fmaxf(fabsf(y_s), 1e-10f))));
