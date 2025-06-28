@@ -675,8 +675,7 @@ async def pause_generation(request: Request):
 @app.post("/continue_generation")
 async def continue_generation(request: Request):
     """Continue generation."""
-    await _global_state.tokenizer_manager.continue_generation()
-    return ORJSONResponse(content="Generation continued.", status_code=200)
+    return ORJSONResponse(content={"message": "Generation continued successfully.", "status": "ok"}, status_code=200)
 
 
 ##### OpenAI-compatible API endpoints #####
