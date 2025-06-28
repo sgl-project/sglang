@@ -35,8 +35,9 @@ __forceinline__ __device__ int fast_log2_ceil(float x) {
 }
 
 // Copied and modified from DeepEP
-__forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, float& scale_inv, bool round_scale) {
-    if (round_scale) {
+template <bool ROUND_SCALE>
+__forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, float& scale_inv) {
+    if constexpr (ROUND_SCALE) {
         auto exp_scale_inv = fast_log2_ceil(amax * kFinfoAmaxInvE4M3);
         scale = fast_pow2(-exp_scale_inv);
         scale_inv = fast_pow2(exp_scale_inv);
@@ -47,9 +48,9 @@ __forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, f
 }
 
 // Copied and modified from DeepEP
-template <bool kIsUE8M0, typename out_dtype_t = std::conditional_t<kIsUE8M0, uint8_t, float>>
-__forceinline__ __device__ out_dtype_t extract_required_scale_format(float value) {
-    if constexpr (kIsUE8M0) {
+template <bool SCALE_UE8M0, typename OUT_DTYPE_T = std::conditional_t<SCALE_UE8M0, uint8_t, float>>
+__forceinline__ __device__ OUT_DTYPE_T extract_required_scale_format(float value) {
+    if constexpr (SCALE_UE8M0) {
         return static_cast<uint8_t>((*reinterpret_cast<uint32_t*>(&value)) >> 23);
     } else {
         return value;
