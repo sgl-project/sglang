@@ -62,12 +62,12 @@ __forceinline__ __device__ OUT_DTYPE_T extract_required_scale_format(float value
 
 __device__ __forceinline__ void st_global(const int2* ptr, const int2& value) {
   asm volatile(
-      "st.global.v4.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(value.x), "r"(value.y));
+      "st.global.v2.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(value.x), "r"(value.y));
 }
 
 __device__ __forceinline__ void st_global(const int4* ptr, const int4& value) {
   asm volatile(
-      "st.global.v2.s32 [%0], {%1, %2, %3, %4};" ::"l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w));
+      "st.global.v4.s32 [%0], {%1, %2, %3, %4};" ::"l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w));
 }
 
 __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
