@@ -73,7 +73,7 @@ __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
   return ret;
 }
 
-constexpr int THREADS_PER_HYPERGROUP = 8;
+constexpr int THREADS_PER_HYPERGROUP = 16;
 constexpr uint32_t VEC_NUM_BYTES = 32;
 constexpr int GROUP_SIZE_CONST = 128;
 
