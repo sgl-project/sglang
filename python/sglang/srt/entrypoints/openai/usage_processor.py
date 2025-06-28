@@ -19,6 +19,7 @@ class UsageProcessor:
         responses: List[Dict[str, Any]],
         n_choices: int = 1,
         enable_cache_report: bool = False,
+        enable_spec_report: bool = False,
     ) -> UsageInfo:
         completion_tokens = sum(r["meta_info"]["completion_tokens"] for r in responses)
 
@@ -34,10 +35,15 @@ class UsageProcessor:
             )
             cached_details = UsageProcessor._details_if_cached(cached_total)
 
+        spec_verify_ct = None
+        if enable_spec_report:
+            spec_verify_ct = sum(r["meta_info"].get("spec_verify_ct", 0) for r in responses)
+
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cached_tokens=cached_details,
+            spec_verify_ct=spec_verify_ct,
         )
 
     @staticmethod
@@ -45,7 +51,9 @@ class UsageProcessor:
         prompt_tokens: Mapping[int, int],
         completion_tokens: Mapping[int, int],
         cached_tokens: Mapping[int, int],
+        spec_verify_ct: Optional[Mapping[int, int]],
         n_choices: int,
+        enable_spec_report: bool = False,
         enable_cache_report: bool = False,
     ) -> UsageInfo:
         # index % n_choices == 0 marks the first choice of a prompt
@@ -60,10 +68,13 @@ class UsageProcessor:
             else None
         )
 
+        spec_verified_tokens = sum(spec_verify_ct.values()) if enable_spec_report else None
+
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
             cached_tokens=cached_details,
+            spec_verify_ct=spec_verified_tokens,
         )
 
     @staticmethod
@@ -71,6 +82,7 @@ class UsageProcessor:
         prompt_tokens: int,
         completion_tokens: int,
         cached_tokens: Optional[Dict[str, int]] = None,
+        spec_verify_ct: Optional[int] = None,
     ) -> UsageInfo:
         """Calculate token usage information"""
         return UsageInfo(
@@ -78,4 +90,5 @@ class UsageProcessor:
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
             prompt_tokens_details=cached_tokens,
+            spec_verify_ct=spec_verify_ct,
         )
