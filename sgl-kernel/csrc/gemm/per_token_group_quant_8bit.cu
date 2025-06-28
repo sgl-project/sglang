@@ -115,7 +115,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   const int32_t num_vec_elems = group_size / vec_size;
 
-  for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
+  for (int32_t i = lane_id; i < num_vec_elems; i += threads_per_group) {
     vec_t input_vec;
     input_vec.cast_load(group_input + i * vec_size);
 
@@ -139,7 +139,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     *scale_output = y_scale_inv_quant;
   }
 
-  for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
+  for (int32_t i = lane_id; i < num_vec_elems; i += threads_per_group) {
     vec_t input_vec;
     input_vec.cast_load(group_input + i * vec_size);
 
