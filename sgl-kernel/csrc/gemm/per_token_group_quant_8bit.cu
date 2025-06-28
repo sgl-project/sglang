@@ -147,6 +147,14 @@ __global__ void per_token_group_quant_8bit_kernel(
       const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
       static_assert(sizeof(output_buf) == vec_size / 2 * sizeof(__nv_fp8x2_storage_t));
 
+#pragma unroll
+      for (uint32_t j = 0; j < vec_size; j += 1) {
+        float2 valx2 = {
+          static_cast<float>(input_vec[j]) * y_scale,
+          static_cast<float>(input_vec[j + 1]) * y_scale
+        };
+        output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(valx2, __NV_SATFINITE, __NV_E4M3);
+      }
     } else {
       const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
       static_assert(sizeof(output_buf) == vec_size * sizeof(DST_DTYPE));
