@@ -132,22 +132,22 @@ __global__ void per_token_group_quant_8bit_kernel(
   int4 input_int4[VEC_INT4_SIZE];
 
 #pragma unroll
-  for (uint32_t iteration_index = 0; iteration_index < NUM_GROUPS_PER_THREADCHUNK; ++iteration_index) {
-    input_int4[iteration_index] = ld_global_nc(reinterpret_cast<const int4*>(
-        input + global_threadchunk_id * NUM_GROUPS_PER_THREADCHUNK * GROUP_SIZE_CONST +
-        iteration_index * GROUP_SIZE_CONST + lane_id * VEC_TYPED_SIZE_PER_ITERATION));
+  for (uint32_t iter_idx = 0; iter_idx < NUM_GROUPS_PER_THREADCHUNK; ++iter_idx) {
+    input_int4[iter_idx] = ld_global_nc(reinterpret_cast<const int4*>(
+        input + global_threadchunk_id * NUM_GROUPS_PER_THREADCHUNK * GROUP_SIZE_CONST + iter_idx * GROUP_SIZE_CONST +
+        lane_id * VEC_TYPED_SIZE_PER_ITERATION));
   }
 
 #pragma unroll
-  for (uint32_t iteration_index = 0; iteration_index < NUM_GROUPS_PER_THREADCHUNK; ++iteration_index) {
-    T* input_vec_curr_iteration = reinterpret_cast<T*>(input_int4 + iteration_index);
-    static_assert(sizeof(input_vec_curr_iteration[0]) * VEC_TYPED_SIZE_PER_ITERATION == sizeof(input_int4[0]));
+  for (uint32_t iter_idx = 0; iter_idx < NUM_GROUPS_PER_THREADCHUNK; ++iter_idx) {
+    T* input_vec_curr_iter = reinterpret_cast<T*>(input_int4 + iter_idx);
+    static_assert(sizeof(input_vec_curr_iter[0]) * VEC_TYPED_SIZE_PER_ITERATION == sizeof(input_int4[0]));
 
     float local_absmax = eps;
 
 #pragma unroll
     for (uint32_t j = 0; j < VEC_TYPED_SIZE_PER_ITERATION; ++j) {
-      float val = static_cast<float>(input_vec_curr_iteration[j]);
+      float val = static_cast<float>(input_vec_curr_iter[j]);
       float abs_val = fabsf(val);
       local_absmax = fmaxf(local_absmax, abs_val);
     }
@@ -174,8 +174,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 
 #pragma unroll
       for (uint32_t j = 0; j < VEC_TYPED_SIZE_PER_ITERATION; j += 2) {
-        float2 inputx2 = {
-            static_cast<float>(input_vec_curr_iteration[j]), static_cast<float>(input_vec_curr_iteration[j + 1])};
+        float2 inputx2 = {static_cast<float>(input_vec_curr_iter[j]), static_cast<float>(input_vec_curr_iter[j + 1])};
         float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
         output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
       }
@@ -184,7 +183,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 
 #pragma unroll
       for (uint32_t j = 0; j < VEC_TYPED_SIZE_PER_ITERATION; ++j) {
-        float val = static_cast<float>(input_vec_curr_iteration[j]);
+        float val = static_cast<float>(input_vec_curr_iter[j]);
         float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
         output_buf_ptr[j] = DST_DTYPE(q_val);
       }
@@ -192,10 +191,8 @@ __global__ void per_token_group_quant_8bit_kernel(
 
     st_global(
         reinterpret_cast<int4*>(
-            output_q
-            + global_threadchunk_id * NUM_GROUPS_PER_THREADCHUNK * GROUP_SIZE_CONST +
-            +  iteration_index * GROUP_SIZE_CONST
-            + lane_id * VEC_TYPED_SIZE_PER_ITERATION),
+            output_q + global_threadchunk_id * NUM_GROUPS_PER_THREADCHUNK * GROUP_SIZE_CONST +
+            +iter_idx * GROUP_SIZE_CONST + lane_id * VEC_TYPED_SIZE_PER_ITERATION),
         output_buf);
   }
 }
