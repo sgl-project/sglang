@@ -124,7 +124,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   local_absmax = GroupReduceMax(local_absmax, lane_id);
 
   float y_scale, y_scale_inv;
-  calculate_fp8_scales<USE_SCALE_UE8M0>(local_absmax, y_scale, y_scale_inv, max_8bit, max_8bit_inv);
+  calculate_fp8_scales<SCALE_UE8M0>(local_absmax, y_scale, y_scale_inv, max_8bit, max_8bit_inv);
 
   scale_element_t y_scale_inv_quant = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
 
