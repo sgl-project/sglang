@@ -75,6 +75,7 @@ __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
 
 constexpr int THREADS_PER_GROUP = 8;
 constexpr uint32_t VEC_NUM_BYTES = 32;
+constexpr int GROUP_SIZE_CONST = 128;
 
 template <
     typename T,
@@ -100,7 +101,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   const int block_group_id = blockIdx.x * groups_per_block;
   const int global_group_id = block_group_id + local_group_id;
-  const int block_group_offset = global_group_id * group_size;
+  const int block_group_offset = global_group_id * GROUP_SIZE_CONST;
 
   float local_absmax = eps;
 
@@ -127,6 +128,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);
   constexpr uint32_t VEC_INT4_SIZE = VEC_NUM_BYTES / sizeof(int4);
+  constexpr uint32_t NUM_ITERATIONS = THREADS_PER_GROUP * VEC_TYPED_SIZE / GROUP_SIZE_CONST;
 
   int4 input_int4[VEC_INT4_SIZE];
   T* input_vec = reinterpret_cast<T*>(input_int4);
@@ -225,11 +227,13 @@ void sgl_per_token_group_quant_8bit(
 
   const double max_8bit_inv = 1.0f / max_8bit;
 
+  TORCH_CHECK(GROUP_SIZE_CONST == group_size);
+
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
   do {                                                                                            \
     /* TODO do not copy paste */                                                                  \
     constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);                                \
-    TORCH_CHECK(THREADS_PER_GROUP == group_size / VEC_TYPED_SIZE);                                \
+    TORCH_CHECK(THREADS_PER_GROUP == GROUP_SIZE_CONST / VEC_TYPED_SIZE);                          \
                                                                                                   \
     dim3 grid(num_blocks);                                                                        \
     dim3 block(num_threads);                                                                      \
