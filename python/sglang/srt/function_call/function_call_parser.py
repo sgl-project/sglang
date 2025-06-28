@@ -1,6 +1,12 @@
 import logging
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
+from sglang.srt.entrypoints.openai.protocol import (
+    StructuralTagResponseFormat,
+    StructuresResponseFormat,
+    Tool,
+    ToolChoice,
+)
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
@@ -8,12 +14,6 @@ from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
-from sglang.srt.openai_api.protocol import (
-    StructuralTagResponseFormat,
-    StructuresResponseFormat,
-    Tool,
-    ToolChoice,
-)
 
 logger = logging.getLogger(__name__)
 
