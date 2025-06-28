@@ -88,7 +88,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     void* __restrict__ output_q,
     scale_packed_t* __restrict__ output_s,
     const int group_size,
-    const int groups_per_block,
+    const int hypergroups_per_block,
     const float eps,
     const float min_8bit,
     const float max_8bit,
@@ -102,11 +102,11 @@ __global__ void per_token_group_quant_8bit_kernel(
   static_assert(NUM_ITERATIONS == VEC_INT4_SIZE);
   static_assert(sizeof(int4) == BYTES_PER_ITERATION);
 
-  const int local_group_id = threadIdx.x / THREADS_PER_GROUP;
+  const int local_hypergroup_id = threadIdx.x / THREADS_PER_GROUP;
   const int lane_id = threadIdx.x % THREADS_PER_GROUP;
 
-  const int block_group_id = blockIdx.x * groups_per_block;
-  const int global_group_id = block_group_id + local_group_id;
+  const int block_hypergroup_id = blockIdx.x * hypergroups_per_block;
+  const int global_hypergroup_id = block_hypergroup_id + local_hypergroup_id;
 
   float local_absmax = eps;
 
@@ -119,15 +119,15 @@ __global__ void per_token_group_quant_8bit_kernel(
   if constexpr (IS_COLUMN_MAJOR) {
     constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
     const int scale_num_rows_element = scale_num_rows * num_elems_per_pack;
-    const int row_idx = global_group_id / scale_num_rows_element;
-    const int col_idx_raw = global_group_id % scale_num_rows_element;
+    const int row_idx = global_hypergroup_id / scale_num_rows_element;
+    const int col_idx_raw = global_hypergroup_id % scale_num_rows_element;
     const int col_idx = col_idx_raw / num_elems_per_pack;
     const int pack_idx = col_idx_raw % num_elems_per_pack;
     scale_output = reinterpret_cast<scale_element_t*>(output_s) +
                    (col_idx * scale_stride * num_elems_per_pack + row_idx * num_elems_per_pack + pack_idx);
   } else {
     static_assert(!SCALE_UE8M0);
-    scale_output = output_s + global_group_id;
+    scale_output = output_s + global_hypergroup_id;
   }
 
   int4 input_int4[VEC_INT4_SIZE];
@@ -138,7 +138,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   for (uint32_t iteration_index = 0; iteration_index < NUM_ITERATIONS; ++iteration_index) {
     input_int4[iteration_index] = ld_global_nc(reinterpret_cast<const int4*>(
         input
-        + global_group_id * GROUP_SIZE_CONST
+        + global_hypergroup_id * GROUP_SIZE_CONST
         + iteration_index * GROUP_SIZE_CONST
         + lane_id * VEC_TYPED_SIZE_PER_ITERATION
     ));
@@ -210,21 +210,21 @@ void sgl_per_token_group_quant_8bit(
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  int groups_per_block = 1;
+  int hypergroups_per_block = 1;
 
   if (num_groups % 16 == 0) {
-    groups_per_block = 16;
+    hypergroups_per_block = 16;
   } else if (num_groups % 8 == 0) {
-    groups_per_block = 8;
+    hypergroups_per_block = 8;
   } else if (num_groups % 4 == 0) {
-    groups_per_block = 4;
+    hypergroups_per_block = 4;
   } else if (num_groups % 2 == 0) {
-    groups_per_block = 2;
+    hypergroups_per_block = 2;
   }
 
   auto dst_type = output_q.scalar_type();
-  const int num_blocks = num_groups / groups_per_block;
-  const int num_threads = groups_per_block * THREADS_PER_GROUP;
+  const int num_blocks = num_groups / hypergroups_per_block;
+  const int num_threads = hypergroups_per_block * THREADS_PER_GROUP;
 
   const bool is_column_major = output_s.stride(0) < output_s.stride(1);
   const int scale_num_rows = output_s.size(1);
@@ -249,7 +249,7 @@ void sgl_per_token_group_quant_8bit(
             output_q.data_ptr(),                                                                  \
             static_cast<uint32_t*>(output_s.data_ptr()),                                          \
             group_size,                                                                           \
-            groups_per_block,                                                                     \
+            hypergroups_per_block,                                                                     \
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
             (float)max_8bit,                                                                      \
@@ -262,7 +262,7 @@ void sgl_per_token_group_quant_8bit(
             output_q.data_ptr(),                                                                  \
             static_cast<float*>(output_s.data_ptr()),                                             \
             group_size,                                                                           \
-            groups_per_block,                                                                     \
+            hypergroups_per_block,                                                                     \
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
             (float)max_8bit,                                                                      \
@@ -277,7 +277,7 @@ void sgl_per_token_group_quant_8bit(
           output_q.data_ptr(),                                                                    \
           static_cast<float*>(output_s.data_ptr()),                                               \
           group_size,                                                                             \
-          groups_per_block,                                                                       \
+          hypergroups_per_block,                                                                       \
           (float)eps,                                                                             \
           (float)min_8bit,                                                                        \
           (float)max_8bit,                                                                        \
