@@ -185,7 +185,10 @@ impl Router {
                     Self::wait_for_healthy_workers(&worker_urls, timeout_secs, interval_secs)
                 })
                 .join()
-                .map_err(|e| format!("Health-check thread panicked: {e:?}"))??;
+                .map_err(|e| {
+                    error!("Health-check thread panicked: {:?}", e);
+                    format!("Health-check thread panicked: {e:?}")
+                })??;
             }
         }
 
