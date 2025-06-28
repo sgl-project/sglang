@@ -61,7 +61,8 @@ __forceinline__ __device__ OUT_DTYPE_T extract_required_scale_format(float value
 }
 
 __device__ __forceinline__ void st_global(const int4* ptr, const int4& value) {
-  asm volatile("st.global.v4.s32 [%0], {%1, %2, %3, %4};" ::"l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w));
+  asm volatile(
+      "st.global.v4.s32 [%0], {%1, %2, %3, %4};" ::"l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w));
 }
 
 __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
@@ -165,7 +166,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     static_assert(vec_size % 2 == 0);
 
 #pragma unroll
-  for (uint32_t j = 0; j < vec_size; j += 2) {
+    for (uint32_t j = 0; j < vec_size; j += 2) {
       float2 inputx2 = {static_cast<float>(input_vec[j]), static_cast<float>(input_vec[j + 1])};
       float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
       output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
