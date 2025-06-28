@@ -108,21 +108,6 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   const T* group_input = input + block_group_offset;
   DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + block_group_offset;
-  scale_element_t* scale_output;
-
-  if constexpr (IS_COLUMN_MAJOR) {
-    constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
-    const int scale_num_rows_element = scale_num_rows * num_elems_per_pack;
-    const int row_idx = global_group_id / scale_num_rows_element;
-    const int col_idx_raw = global_group_id % scale_num_rows_element;
-    const int col_idx = col_idx_raw / num_elems_per_pack;
-    const int pack_idx = col_idx_raw % num_elems_per_pack;
-    scale_output = reinterpret_cast<scale_element_t*>(output_s) +
-                   (col_idx * scale_stride * num_elems_per_pack + row_idx * num_elems_per_pack + pack_idx);
-  } else {
-    static_assert(!SCALE_UE8M0);
-    scale_output = output_s + global_group_id;
-  }
 
   constexpr uint32_t vec_num_bytes = 32;
   constexpr uint32_t vec_size = vec_num_bytes / sizeof(T);
@@ -136,6 +121,21 @@ __global__ void per_token_group_quant_8bit_kernel(
 #pragma unroll
   for (uint32_t j = 0; j < INPUT_INT4_SIZE; ++j) {
     input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * vec_size) + j);
+  }
+
+  scale_element_t* scale_output;
+  if constexpr (IS_COLUMN_MAJOR) {
+    constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
+    const int scale_num_rows_element = scale_num_rows * num_elems_per_pack;
+    const int row_idx = global_group_id / scale_num_rows_element;
+    const int col_idx_raw = global_group_id % scale_num_rows_element;
+    const int col_idx = col_idx_raw / num_elems_per_pack;
+    const int pack_idx = col_idx_raw % num_elems_per_pack;
+    scale_output = reinterpret_cast<scale_element_t*>(output_s) +
+                   (col_idx * scale_stride * num_elems_per_pack + row_idx * num_elems_per_pack + pack_idx);
+  } else {
+    static_assert(!SCALE_UE8M0);
+    scale_output = output_s + global_group_id;
   }
 
 #pragma unroll
