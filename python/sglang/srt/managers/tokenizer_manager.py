@@ -417,8 +417,8 @@ class TokenizerManager:
         request: Optional[fastapi.Request] = None,
     ):
         created_time = time.time()
-
         self.auto_create_handle_loop()
+        obj.normalize_batch_and_arguments()
 
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
@@ -426,21 +426,23 @@ class TokenizerManager:
                 "Please add `--is-embedding` when launching the server or try another model."
             )
 
-        obj.normalize_batch_and_arguments()
-
-        if isinstance(obj, GenerateReqInput):
-            return_hidden_states = obj.return_hidden_states
-            has_return_hidden_states = return_hidden_states == True or (
-                isinstance(return_hidden_states, list) and any(return_hidden_states)
+        if (
+            obj.return_hidden_states
+            and not self.server_args.enable_return_hidden_states
+        ):
+            raise ValueError(
+                "The server is not configured to return the hidden states. "
+                "Please set `--enable-return-hidden-states` to enable this feature."
             )
-            if (
-                not self.server_args.enable_return_hidden_states
-                and has_return_hidden_states
-            ):
-                raise ValueError(
-                    "return_hidden_states=True requires the server to be started "
-                    "with --enable-return-hidden-states (ServerArgs.enable_return_hidden_states)."
-                )
+
+        if (
+            obj.custom_logit_processor
+            and not self.server_args.enable_custom_logit_processor
+        ):
+            raise ValueError(
+                "The server is not configured to enable custom logit processor. "
+                "Please set `--enable-custom-logits-processor` to enable this feature."
+            )
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -449,8 +451,7 @@ class TokenizerManager:
             )
 
         async with self.model_update_lock.reader_lock:
-            is_single = obj.is_single
-            if is_single:
+            if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
                 state = self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj, state, request):
@@ -556,24 +557,6 @@ class TokenizerManager:
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
-
-        if self.is_generation:
-            return_logprob = obj.return_logprob
-            logprob_start_len = obj.logprob_start_len
-            top_logprobs_num = obj.top_logprobs_num
-            token_ids_logprob = obj.token_ids_logprob
-            session_params = (
-                SessionParams(**obj.session_params) if obj.session_params else None
-            )
-            if (
-                obj.custom_logit_processor
-                and not self.server_args.enable_custom_logit_processor
-            ):
-                raise ValueError(
-                    "The server is not configured to enable custom logit processor. "
-                    "Please set `--enable-custom-logits-processor` to enable this feature."
-                )
-
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
@@ -587,16 +570,20 @@ class TokenizerManager:
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
+            session_params = (
+                SessionParams(**obj.session_params) if obj.session_params else None
+            )
+
             tokenized_obj = TokenizedGenerateReqInput(
                 obj.rid,
                 input_text,
                 input_ids,
                 image_inputs,
                 sampling_params,
-                return_logprob,
-                logprob_start_len,
-                top_logprobs_num,
-                token_ids_logprob,
+                obj.return_logprob,
+                obj.logprob_start_len,
+                obj.top_logprobs_num,
+                obj.token_ids_logprob,
                 obj.stream,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
