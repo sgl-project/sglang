@@ -108,6 +108,8 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int block_hypergroup_id = blockIdx.x * hypergroups_per_block;
   const int global_hypergroup_id = block_hypergroup_id + local_hypergroup_id;
 
+  float local_absmax = eps;
+
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
@@ -141,12 +143,6 @@ __global__ void per_token_group_quant_8bit_kernel(
         + iteration_index * GROUP_SIZE_CONST
         + lane_id * VEC_TYPED_SIZE / NUM_GROUPS_PER_HYPERGROUP
     ));
-  }
-
-  float local_absmax[NUM_GROUPS_PER_HYPERGROUP];
-#pragma unroll
-  for (uint32_t j = 0; j < NUM_GROUPS_PER_HYPERGROUP; ++j) {
-    local_absmax[j] = eps;
   }
 
 #pragma unroll
