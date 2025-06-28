@@ -126,12 +126,9 @@ __global__ void per_token_group_quant_8bit_kernel(
   int4 input_int4;
   T* input_vec = reinterpret_cast<T*>(&input_int4);
   static_assert(sizeof(input_vec[0]) * vec_size == sizeof(input_int4));
-  int32_t i = lane_id;  // TODO remove this
 
-  //   static_assert(THREADS_PER_GROUP >= num_vec_elems);
-  //   for (int32_t i = lane_id; i < num_vec_elems; i += THREADS_PER_GROUP) {
-  if (i < num_vec_elems) {
-    input_int4 = ld_global_nc(reinterpret_cast<const int4*>(group_input + i * vec_size));
+  if (lane_id < num_vec_elems) {
+    input_int4 = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * vec_size));
 
 #pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
@@ -153,8 +150,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     *scale_output = y_scale_inv_quant;
   }
 
-  //   for (int32_t i = lane_id; i < num_vec_elems; i += THREADS_PER_GROUP) {
-  if (i < num_vec_elems) {
+  if (lane_id < num_vec_elems) {
     int2 output_buf;
 
     if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
@@ -180,7 +176,7 @@ __global__ void per_token_group_quant_8bit_kernel(
       }
     }
 
-    st_global_v2_s32(reinterpret_cast<int2*>(group_output + i * vec_size), output_buf);
+    st_global_v2_s32(reinterpret_cast<int2*>(group_output + lane_id * vec_size), output_buf);
   }
 }
 
