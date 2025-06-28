@@ -116,6 +116,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + global_group_id * GROUP_SIZE_CONST;
   scale_element_t* scale_output;
 
+  // TODO not handled multi-group scale output yet!
   if constexpr (IS_COLUMN_MAJOR) {
     constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
     const int scale_num_rows_element = scale_num_rows * num_elems_per_pack;
