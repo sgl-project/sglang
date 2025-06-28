@@ -124,10 +124,6 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   float y_scale, y_scale_inv;
   calculate_fp8_scales<USE_SCALE_UE8M0, MAX_8BIT, MAX_8BIT_INV>(local_absmax, y_scale, y_scale_inv);
-//   float y_s = local_absmax / max_8bit;
-//   if constexpr (SCALE_UE8M0) {
-//     y_s = exp2f(ceilf(log2f(fmaxf(fabsf(y_s), 1e-10f))));
-//   }
 
   scale_element_t y_scale_inv_quant = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
 
