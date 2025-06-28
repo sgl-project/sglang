@@ -127,7 +127,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   static_assert(sizeof(input_vec[0]) * vec_size == sizeof(input_int4));
   int32_t i = lane_id; // TODO remove this
 
-  static_assert(THREADS_PER_GROUP >= num_vec_elems);
+//   static_assert(THREADS_PER_GROUP >= num_vec_elems);
 //   for (int32_t i = lane_id; i < num_vec_elems; i += THREADS_PER_GROUP) {
   if (i < num_vec_elems) {
     input_int4 = ld_global_nc(reinterpret_cast<const int4*>(group_input + i * vec_size));
@@ -226,6 +226,12 @@ void sgl_per_token_group_quant_8bit(
   const int scale_stride = output_s.stride(1);
 
   const double max_8bit_inv = 1.0f / max_8bit;
+
+  // TODO do not copy paste
+  constexpr uint32_t vec_num_bytes = 16;
+  constexpr uint32_t vec_size = vec_num_bytes / sizeof(T);
+  const int32_t num_vec_elems = group_size / vec_size;
+  TORCH_CHECK(THREADS_PER_GROUP >= num_vec_elems);
 
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
   do {                                                                                            \
