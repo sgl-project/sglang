@@ -27,6 +27,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_flashinfer_available
 )
 
 _is_cuda = is_cuda()
@@ -162,6 +163,31 @@ class RMSNorm(CustomOp):
             )
         else:
             return self.forward_native(x, residual)
+
+    def forward_with_allreduce_fusion(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Forward method with allreduce fusion, prioritizing flashinfer fused operations
+        """
+        if is_flashinfer_available() and residual is not None:
+            from sglang.srt.layers.flashinfer_fusion import flashinfer_allreduce_add_rmsnorm
+            from sglang.srt.distributed import get_tensor_model_parallel_world_size
+            
+            # Only use fusion operation in multi-GPU environment
+            if get_tensor_model_parallel_world_size() > 1:
+                fused_result = flashinfer_allreduce_add_rmsnorm(
+                    input_tensor=x,
+                    residual=residual,
+                    weight=self.weight,
+                    eps=self.variance_epsilon,
+                )
+                if fused_result[0] is not None:
+                    return fused_result
+        
+        return self.forward(x, residual)
 
 
 class GemmaRMSNorm(CustomOp):
