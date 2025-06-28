@@ -159,8 +159,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     float2 y_scale_repeated = {y_scale, y_scale};
 
     scale_element_t y_scale_inv_quant = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
-
-    if (lane_id == 0) {
+    // TODO bad - hack only run on iter 0, but should vectorize
+    if ((iter_idx == 0) and (lane_id == 0)) {
       *scale_output = y_scale_inv_quant;
     }
 
