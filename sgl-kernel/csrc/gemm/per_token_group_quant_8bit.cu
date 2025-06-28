@@ -62,8 +62,8 @@ __device__ __forceinline__ void st_global_v2_s32(const int2* ptr, const int2& va
 
 __device__ __forceinline__ float2 fmul2_rn(float2 x, float2 y) {
   float2 out;
-  uint64_t x_u64 = *reinterpret_cast<uint64_t>(x);
-  uint64_t y_u64 = *reinterpret_cast<uint64_t>(y);
+  uint64_t x_u64 = *reinterpret_cast<uint64_t*>(&x);
+  uint64_t y_u64 = *reinterpret_cast<uint64_t*>(&y);
   asm volatile("mul.rn.f32x2 %0, %1, %2;"
                : "=l"(out)
                : "l"(x_u64), "l"(y_u64));
