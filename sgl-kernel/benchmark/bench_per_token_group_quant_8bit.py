@@ -22,7 +22,9 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 
 if int(os.environ.get("SGLANG_NSYS_PROFILING", "0")):
-    num_tokens_range = [768]
+    # TODO temp
+    # num_tokens_range = [768]
+    num_tokens_range = [16384]
     hidden_dim_range = [18432]  # For DeepSeek V3/R1
     group_size_range = [128]  # For DeepSeek V3/R1
     dst_dtype_range = [fp8_type_]
