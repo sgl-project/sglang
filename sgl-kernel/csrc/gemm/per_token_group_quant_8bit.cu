@@ -6,15 +6,75 @@
 
 #include "utils.h"
 
+template <int THREADS_PER_GROUP>
 __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   unsigned mask = 0xffff;
 
-  val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
+  static_assert((THREADS_PER_GROUP == 16) or (THREADS_PER_GROUP == 8));
+
+  if constexpr (THREADS_PER_GROUP == 16) {
+    val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
+  }
   val = fmaxf(val, __shfl_xor_sync(mask, val, 4));
   val = fmaxf(val, __shfl_xor_sync(mask, val, 2));
   val = fmaxf(val, __shfl_xor_sync(mask, val, 1));
   return val;
 }
+
+// Copied and modified from DeepEP
+__forceinline__ __device__ float fast_pow2(int x) {
+  // We can ensure `-126 <= x and x <= 127`
+  uint32_t bits_x = (x + 127) << 23;
+  return *reinterpret_cast<float*>(&bits_x);
+}
+
+// Copied and modified from DeepEP
+__forceinline__ __device__ int fast_log2_ceil(float x) {
+  auto bits_x = *reinterpret_cast<uint32_t*>(&x);
+  auto exp_x = (bits_x >> 23) & 0xff;
+  auto man_bits = bits_x & ((1 << 23) - 1);
+  return exp_x - 127 + (man_bits != 0);
+}
+
+// Copied and modified from DeepEP
+template <bool ROUND_SCALE>
+__forceinline__ __device__ void
+calculate_fp8_scales(float amax, float& scale, float& scale_inv, float max_8bit, float max_8bit_inv) {
+  if constexpr (ROUND_SCALE) {
+    auto exp_scale_inv = fast_log2_ceil(amax * max_8bit_inv);
+    scale = fast_pow2(-exp_scale_inv);
+    scale_inv = fast_pow2(exp_scale_inv);
+  } else {
+    scale_inv = amax * max_8bit_inv;
+    scale = max_8bit / amax;
+  }
+}
+
+// Copied and modified from DeepEP
+template <bool SCALE_UE8M0, typename OUT_DTYPE_T = std::conditional_t<SCALE_UE8M0, uint8_t, float>>
+__forceinline__ __device__ OUT_DTYPE_T extract_required_scale_format(float value) {
+  if constexpr (SCALE_UE8M0) {
+    return static_cast<uint8_t>((*reinterpret_cast<uint32_t*>(&value)) >> 23);
+  } else {
+    return value;
+  }
+}
+
+__device__ __forceinline__ void st_global(const int4* ptr, const int4& value) {
+  asm volatile(
+      "st.global.v4.s32 [%0], {%1, %2, %3, %4};" ::"l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w));
+}
+
+__device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
+  int4 ret;
+  asm volatile("ld.global.nc.v4.s32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w)
+               : "l"(ptr));
+  return ret;
+}
+
+constexpr int THREADS_PER_GROUP = 8;
+constexpr int INPUT_INT4_SIZE = 2;
 
 template <
     typename T,
@@ -32,11 +92,11 @@ __global__ void per_token_group_quant_8bit_kernel(
     const float eps,
     const float min_8bit,
     const float max_8bit,
+    const float max_8bit_inv,
     const int scale_num_rows = 0,
     const int scale_stride = 0) {
-  const int threads_per_group = 16;
-  const int local_group_id = threadIdx.x / threads_per_group;
-  const int lane_id = threadIdx.x % threads_per_group;
+  const int local_group_id = threadIdx.x / THREADS_PER_GROUP;
+  const int lane_id = threadIdx.x % THREADS_PER_GROUP;
 
   const int block_group_id = blockIdx.x * groups_per_block;
   const int global_group_id = block_group_id + local_group_id;
@@ -52,7 +112,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   scale_element_t* scale_output;
 
   if constexpr (IS_COLUMN_MAJOR) {
-    const int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
+    constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
     const int scale_num_rows_element = scale_num_rows * num_elems_per_pack;
     const int row_idx = global_group_id / scale_num_rows_element;
     const int col_idx_raw = global_group_id % scale_num_rows_element;
@@ -65,53 +125,65 @@ __global__ void per_token_group_quant_8bit_kernel(
     scale_output = output_s + global_group_id;
   }
 
-  constexpr uint32_t vec_size = 16 / sizeof(T);
-  using vec_t = flashinfer::vec_t<T, vec_size>;
+  constexpr uint32_t vec_num_bytes = 32;
+  constexpr uint32_t vec_size = vec_num_bytes / sizeof(T);
 
   const int32_t num_vec_elems = group_size / vec_size;
 
-  for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
-    vec_t input_vec;
-    input_vec.cast_load(group_input + i * vec_size);
+  int4 input_int4[INPUT_INT4_SIZE];
+  T* input_vec = reinterpret_cast<T*>(input_int4);
+  static_assert(sizeof(input_vec[0]) * vec_size == sizeof(input_int4));
 
 #pragma unroll
-    for (uint32_t j = 0; j < vec_size; ++j) {
-      float val = static_cast<float>(input_vec[j]);
-      float abs_val = fabsf(val);
-      local_absmax = fmaxf(local_absmax, abs_val);
-    }
+  for (uint32_t j = 0; j < INPUT_INT4_SIZE; ++j) {
+    input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * vec_size) + j);
   }
 
-  local_absmax = GroupReduceMax(local_absmax, lane_id);
-
-  float y_s = local_absmax / max_8bit;
-  if constexpr (SCALE_UE8M0) {
-    y_s = exp2f(ceilf(log2f(fmaxf(fabsf(y_s), 1e-10f))));
+#pragma unroll
+  for (uint32_t j = 0; j < vec_size; ++j) {
+    float val = static_cast<float>(input_vec[j]);
+    float abs_val = fabsf(val);
+    local_absmax = fmaxf(local_absmax, abs_val);
   }
 
-  // TODO can optimize
-  scale_element_t y_s_quant;
-  if constexpr (SCALE_UE8M0) {
-    y_s_quant = (uint8_t)(((int)log2f(y_s)) + 127);
-  } else {
-    y_s_quant = y_s;
-  }
+  local_absmax = GroupReduceMax<THREADS_PER_GROUP>(local_absmax, lane_id);
+
+  float y_scale, y_scale_inv;
+  calculate_fp8_scales<SCALE_UE8M0>(local_absmax, y_scale, y_scale_inv, max_8bit, max_8bit_inv);
+  float2 y_scale_repeated = {y_scale, y_scale};
+
+  scale_element_t y_scale_inv_quant = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
 
   if (lane_id == 0) {
-    *scale_output = y_s_quant;
+    *scale_output = y_scale_inv_quant;
   }
 
-  for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
-    vec_t input_vec;
-    input_vec.cast_load(group_input + i * vec_size);
+  int4 output_buf;
+
+  if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
+    const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
+    static_assert(sizeof(output_buf) == vec_size / 2 * sizeof(__nv_fp8x2_storage_t));
+    static_assert(vec_size % 2 == 0);
+
+#pragma unroll
+    for (uint32_t j = 0; j < vec_size; j += 2) {
+      float2 inputx2 = {static_cast<float>(input_vec[j]), static_cast<float>(input_vec[j + 1])};
+      float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
+      output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+    }
+  } else {
+    const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
+    static_assert(sizeof(output_buf) == vec_size * sizeof(DST_DTYPE));
 
 #pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
       float val = static_cast<float>(input_vec[j]);
-      float q_val = fminf(fmaxf(val / y_s, min_8bit), max_8bit);
-      group_output[i * vec_size + j] = DST_DTYPE(q_val);
+      float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
+      output_buf_ptr[j] = DST_DTYPE(q_val);
     }
   }
+
+  st_global(reinterpret_cast<int4*>(group_output + lane_id * vec_size), output_buf);
 }
 
 void sgl_per_token_group_quant_8bit(
@@ -133,8 +205,6 @@ void sgl_per_token_group_quant_8bit(
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  constexpr int THREADS_PER_GROUP = 16;
-
   int groups_per_block = 1;
 
   if (num_groups % 16 == 0) {
@@ -155,8 +225,16 @@ void sgl_per_token_group_quant_8bit(
   const int scale_num_rows = output_s.size(1);
   const int scale_stride = output_s.stride(1);
 
+  const double max_8bit_inv = 1.0f / max_8bit;
+
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
   do {                                                                                            \
+    /* TODO do not copy paste */                                                                  \
+    constexpr uint32_t vec_num_bytes = 32;                                                        \
+    constexpr uint32_t vec_size = vec_num_bytes / sizeof(T);                                      \
+    const int32_t num_vec_elems = group_size / vec_size;                                          \
+    TORCH_CHECK(THREADS_PER_GROUP == num_vec_elems);                                              \
+                                                                                                  \
     dim3 grid(num_blocks);                                                                        \
     dim3 block(num_threads);                                                                      \
     if (is_column_major) {                                                                        \
@@ -171,6 +249,7 @@ void sgl_per_token_group_quant_8bit(
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
             (float)max_8bit,                                                                      \
+            (float)max_8bit_inv,                                                                  \
             scale_num_rows,                                                                       \
             scale_stride);                                                                        \
       } else {                                                                                    \
@@ -184,6 +263,7 @@ void sgl_per_token_group_quant_8bit(
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
             (float)max_8bit,                                                                      \
+            (float)max_8bit_inv,                                                                  \
             scale_num_rows,                                                                       \
             scale_stride);                                                                        \
       }                                                                                           \
@@ -198,11 +278,12 @@ void sgl_per_token_group_quant_8bit(
           groups_per_block,                                                                       \
           (float)eps,                                                                             \
           (float)min_8bit,                                                                        \
-          (float)max_8bit);                                                                       \
+          (float)max_8bit,                                                                        \
+          (float)max_8bit_inv);                                                                   \
     }                                                                                             \
   } while (0)
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), scalar_t, [&] {
     if (dst_type == at::ScalarType::Char) {
       LAUNCH_KERNEL(scalar_t, int8_t);
       return true;
