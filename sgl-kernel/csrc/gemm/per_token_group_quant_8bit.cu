@@ -145,6 +145,9 @@ __global__ void per_token_group_quant_8bit_kernel(
   }
 
   float local_absmax[NUM_GROUPS_PER_HYPERGROUP];
+  float y_scale[NUM_GROUPS_PER_HYPERGROUP], y_scale_inv[NUM_GROUPS_PER_HYPERGROUP];
+  float2 y_scale_repeated[NUM_GROUPS_PER_HYPERGROUP];
+
 #pragma unroll
   for (uint32_t j = 0; j < NUM_GROUPS_PER_HYPERGROUP; ++j) {
     local_absmax[j] = eps;
@@ -159,11 +162,9 @@ __global__ void per_token_group_quant_8bit_kernel(
       local_absmax[group_in_hypergroup_index] = fmaxf(local_absmax, abs_val);
     }
     local_absmax[group_in_hypergroup_index] = GroupReduceMax<THREADS_PER_HYPERGROUP>(local_absmax[group_in_hypergroup_index], lane_id);
+    calculate_fp8_scales<SCALE_UE8M0>(local_absmax[group_in_hypergroup_index], y_scale[group_in_hypergroup_index], y_scale_inv[group_in_hypergroup_index], max_8bit, max_8bit_inv);
+    y_scale_repeated[group_in_hypergroup_index] = {y_scale, y_scale};
   }
-
-  float y_scale, y_scale_inv;
-  calculate_fp8_scales<SCALE_UE8M0>(local_absmax, y_scale, y_scale_inv, max_8bit, max_8bit_inv);
-  float2 y_scale_repeated = {y_scale, y_scale};
 
   scale_element_t y_scale_inv_quant = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
 
