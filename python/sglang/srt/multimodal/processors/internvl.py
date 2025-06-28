@@ -5,12 +5,12 @@ import torch
 from decord import VideoReader, cpu
 from PIL import Image
 
-from sglang.srt.managers.multimodal_processors.base_processor import (
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.models.internvl import InternVLChatModel
+from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.models.internvl import InternVLChatModel
 
 
 class InternVLImageProcessor(BaseMultimodalProcessor):

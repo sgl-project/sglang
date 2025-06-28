@@ -56,7 +56,7 @@ from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.metrics.collector import TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -214,6 +214,10 @@ class MultimodalDataItem:
     audio_feature_lens: Optional[List[torch.Tensor]] = None
     audio_offsets: Optional[List[Tuple[int, int]]] = None
 
+    # gemma3n related
+    input_features: Optional[torch.Tensor] = None
+    input_features_mask: Optional[torch.Tensor] = None
+
     precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     @staticmethod
@@ -277,7 +281,10 @@ class MultimodalDataItem:
         if self.precomputed_features is not None:
             self.hash = hash_feature(self.precomputed_features)
         elif self.is_audio():
-            self.hash = hash_feature(self.audio_features)
+            if self.audio_features is not None:
+                self.hash = hash_feature(self.audio_features)
+            elif self.input_features is not None:
+                self.hash = hash_feature(self.input_features)
         else:
             self.hash = hash_feature(self.pixel_values)
 
@@ -288,6 +295,7 @@ class MultimodalDataItem:
         return (self.modality == Modality.AUDIO) and (
             self.precomputed_features is not None
             or not MultimodalDataItem.is_empty_list(self.audio_features)
+            or not MultimodalDataItem.is_empty_list(self.input_features)
         )
 
     def is_image(self):
@@ -476,6 +484,9 @@ class Req:
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
+
+        # The length of KV that have been removed in local attention chunked prefill
+        self.evicted_seqlen_local = 0
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -1183,6 +1194,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_to_token_pool.write(
                     (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
                 )
+                if isinstance(self.tree_cache, SWAChunkCache):
+                    self.tree_cache.evict(
+                        req, pre_len, self.model_config.attention_chunk_size
+                    )
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -1375,7 +1390,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             * buf_multiplier
             * self.token_to_kv_pool_allocator.page_size
         )
-
         if self.token_to_kv_pool_allocator.available_size() >= tokens_required:
             return True
 
@@ -1555,6 +1569,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # A faster in-place version
             self.seq_lens.add_(1)
         self.seq_lens_sum += bs
+
+        # free memory
+        if isinstance(self.tree_cache, SWAChunkCache):
+            for req in self.reqs:
+                self.tree_cache.evict(
+                    req, req.seqlen - 1, self.model_config.attention_chunk_size
+                )
 
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
@@ -1790,7 +1811,6 @@ class ModelWorkerBatch:
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool_allocator
     out_cache_loc: torch.Tensor
-
     # The sequence length tensor on CPU
     seq_lens_cpu: Optional[torch.Tensor]
     seq_lens_sum: int

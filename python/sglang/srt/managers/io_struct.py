@@ -20,9 +20,9 @@ import copy
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
-from sglang.srt.mm_utils import has_valid_data
+from sglang.srt.multimodal.mm_utils import has_valid_data
 
 # handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -319,8 +319,16 @@ class GenerateReqInput:
         """Normalize request IDs for batch processing."""
         if self.rid is None:
             self.rid = [uuid.uuid4().hex for _ in range(num)]
-        elif not isinstance(self.rid, list):
-            raise ValueError("The rid should be a list for batch processing.")
+        elif isinstance(self.rid, str):
+            new_rids = [f"{self.rid}_{i}" for i in range(num)]
+            self.rid = new_rids
+        elif isinstance(self.rid, list):
+            if len(self.rid) != num:
+                raise ValueError(
+                    "The specified rids length mismatch with the batch_size for batch processing."
+                )
+        else:
+            raise ValueError("The rid should be a string or a list of strings.")
 
     def _normalize_logprob_params(self, num):
         """Normalize logprob-related parameters for batch processing."""
@@ -994,3 +1002,27 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
+
+
+@dataclass
+class LoadLoRAAdapterReqInput:
+    # The name of the lora module to newly loaded.
+    lora_name: str
+    # The path of loading.
+    lora_path: str
+
+
+@dataclass
+class UnloadLoRAAdapterReqInput:
+    # The name of lora module to unload.
+    lora_name: str
+
+
+@dataclass
+class LoRAUpdateResult:
+    success: bool
+    error_message: Optional[str] = None
+    loaded_adapters: Dict[str, str] = field(default_factory=dict)
+
+
+LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
