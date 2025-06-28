@@ -32,15 +32,15 @@ __forceinline__ __device__ int fast_log2_ceil(float x) {
 }
 
 // Copied and modified from DeepEP
-template <bool ROUND_SCALE, float MAX_8BIT, float MAX_8BIT_INV>
-__forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, float& scale_inv) {
+template <bool ROUND_SCALE>
+__forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, float& scale_inv, float max_8bit, float max_8bit_inv) {
   if constexpr (ROUND_SCALE) {
-    auto exp_scale_inv = fast_log2_ceil(amax * MAX_8BIT_INV);
+    auto exp_scale_inv = fast_log2_ceil(amax * max_8bit_inv);
     scale = fast_pow2(-exp_scale_inv);
     scale_inv = fast_pow2(exp_scale_inv);
   } else {
-    scale_inv = amax * MAX_8BIT_INV;
-    scale = MAX_8BIT / amax;
+    scale_inv = amax * max_8bit_inv;
+    scale = max_8bit / amax;
   }
 }
 
@@ -124,7 +124,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   local_absmax = GroupReduceMax(local_absmax, lane_id);
 
   float y_scale, y_scale_inv;
-  calculate_fp8_scales<USE_SCALE_UE8M0, MAX_8BIT, MAX_8BIT_INV>(local_absmax, y_scale, y_scale_inv);
+  calculate_fp8_scales<USE_SCALE_UE8M0>(local_absmax, y_scale, y_scale_inv, max_8bit, max_8bit_inv);
 
   scale_element_t y_scale_inv_quant = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
 
