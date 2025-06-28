@@ -88,7 +88,6 @@ __global__ void per_token_group_quant_8bit_kernel(
     void* __restrict__ output_q,
     scale_packed_t* __restrict__ output_s,
     const int group_size,
-    const int num_groups,
     const int groups_per_block,
     const float eps,
     const float min_8bit,
@@ -250,7 +249,6 @@ void sgl_per_token_group_quant_8bit(
             output_q.data_ptr(),                                                                  \
             static_cast<uint32_t*>(output_s.data_ptr()),                                          \
             group_size,                                                                           \
-            num_groups,                                                                           \
             groups_per_block,                                                                     \
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
@@ -264,7 +262,6 @@ void sgl_per_token_group_quant_8bit(
             output_q.data_ptr(),                                                                  \
             static_cast<float*>(output_s.data_ptr()),                                             \
             group_size,                                                                           \
-            num_groups,                                                                           \
             groups_per_block,                                                                     \
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
@@ -280,7 +277,6 @@ void sgl_per_token_group_quant_8bit(
           output_q.data_ptr(),                                                                    \
           static_cast<float*>(output_s.data_ptr()),                                               \
           group_size,                                                                             \
-          num_groups,                                                                             \
           groups_per_block,                                                                       \
           (float)eps,                                                                             \
           (float)min_8bit,                                                                        \
