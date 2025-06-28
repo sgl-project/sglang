@@ -74,7 +74,6 @@ __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
 }
 
 constexpr int THREADS_PER_GROUP = 8;
-constexpr int INPUT_INT4_SIZE = 2;
 constexpr uint32_t VEC_NUM_BYTES = 32;
 
 template <
@@ -126,19 +125,20 @@ __global__ void per_token_group_quant_8bit_kernel(
     scale_output = output_s + global_group_id;
   }
 
-  constexpr uint32_t VEC_SIZE = VEC_NUM_BYTES / sizeof(T);
+  constexpr uint32_t INPUT_VEC_SIZE = VEC_NUM_BYTES / sizeof(T);
+  constexpr uint32_t INPUT_INT4_SIZE = VEC_NUM_BYTES / sizeof(int4);
 
   int4 input_int4[INPUT_INT4_SIZE];
   T* input_vec = reinterpret_cast<T*>(input_int4);
-  static_assert(sizeof(input_vec[0]) * VEC_SIZE == sizeof(input_int4));
+  static_assert(sizeof(input_vec[0]) * INPUT_VEC_SIZE == sizeof(input_int4));
 
 #pragma unroll
   for (uint32_t j = 0; j < INPUT_INT4_SIZE; ++j) {
-    input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * VEC_SIZE) + j);
+    input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * INPUT_VEC_SIZE) + j);
   }
 
 #pragma unroll
-  for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+  for (uint32_t j = 0; j < INPUT_VEC_SIZE; ++j) {
     float val = static_cast<float>(input_vec[j]);
     float abs_val = fabsf(val);
     local_absmax = fmaxf(local_absmax, abs_val);
@@ -160,28 +160,28 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
     const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
-    static_assert(sizeof(output_buf) == VEC_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
-    static_assert(VEC_SIZE % 2 == 0);
+    static_assert(sizeof(output_buf) == INPUT_VEC_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
+    static_assert(INPUT_VEC_SIZE % 2 == 0);
 
 #pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; j += 2) {
+    for (uint32_t j = 0; j < INPUT_VEC_SIZE; j += 2) {
       float2 inputx2 = {static_cast<float>(input_vec[j]), static_cast<float>(input_vec[j + 1])};
       float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
       output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
     }
   } else {
     const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
-    static_assert(sizeof(output_buf) == VEC_SIZE * sizeof(DST_DTYPE));
+    static_assert(sizeof(output_buf) == INPUT_VEC_SIZE * sizeof(DST_DTYPE));
 
 #pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+    for (uint32_t j = 0; j < INPUT_VEC_SIZE; ++j) {
       float val = static_cast<float>(input_vec[j]);
       float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
       output_buf_ptr[j] = DST_DTYPE(q_val);
     }
   }
 
-  st_global(reinterpret_cast<int4*>(group_output + lane_id * VEC_SIZE), output_buf);
+  st_global(reinterpret_cast<int4*>(group_output + lane_id * INPUT_VEC_SIZE), output_buf);
 }
 
 void sgl_per_token_group_quant_8bit(
@@ -228,8 +228,8 @@ void sgl_per_token_group_quant_8bit(
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
   do {                                                                                            \
     /* TODO do not copy paste */                                                                  \
-    constexpr uint32_t VEC_SIZE = VEC_NUM_BYTES / sizeof(T);                                      \
-    TORCH_CHECK(THREADS_PER_GROUP == group_size / VEC_SIZE);                                      \
+    constexpr uint32_t INPUT_VEC_SIZE = VEC_NUM_BYTES / sizeof(T);                                \
+    TORCH_CHECK(THREADS_PER_GROUP == group_size / INPUT_VEC_SIZE);                                \
                                                                                                   \
     dim3 grid(num_blocks);                                                                        \
     dim3 block(num_threads);                                                                      \
