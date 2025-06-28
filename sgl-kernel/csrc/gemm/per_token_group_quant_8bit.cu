@@ -136,12 +136,15 @@ __global__ void per_token_group_quant_8bit_kernel(
     vec_t input_vec;
     input_vec.cast_load(group_input + i * vec_size);
 
+    DST_DTYPE[vec_size] output_temp;
 #pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
       float val = static_cast<float>(input_vec[j]);
       float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
-      group_output[i * vec_size + j] = DST_DTYPE(q_val);
+      output_temp[j] = DST_DTYPE(q_val);
     }
+
+    group_output[i * vec_size + j] = TODO;
   }
 }
 
