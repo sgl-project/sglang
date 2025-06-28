@@ -99,6 +99,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   constexpr uint32_t VEC_INT4_SIZE = VEC_NUM_BYTES / sizeof(int4);
   constexpr uint32_t BYTES_PER_ITERATION = GROUP_SIZE_CONST * sizeof(T) / THREADS_PER_HYPERGROUP;
   constexpr uint32_t NUM_GROUPS_PER_HYPERGROUP = VEC_NUM_BYTES / BYTES_PER_ITERATION;
+  constexpr uint32_t VEC_TYPED_SIZE_PER_GROUP = VEC_TYPED_SIZE / NUM_GROUPS_PER_HYPERGROUP;
   static_assert(NUM_GROUPS_PER_HYPERGROUP == VEC_INT4_SIZE);
   static_assert(sizeof(int4) == BYTES_PER_ITERATION);
 
@@ -134,12 +135,12 @@ __global__ void per_token_group_quant_8bit_kernel(
   static_assert(sizeof(input_vec[0]) * VEC_TYPED_SIZE == sizeof(input_int4));
 
 #pragma unroll
-  for (uint32_t iteration_index = 0; iteration_index < NUM_GROUPS_PER_HYPERGROUP; ++iteration_index) {
-    input_int4[iteration_index] = ld_global_nc(reinterpret_cast<const int4*>(
+  for (uint32_t group_in_hypergroup_index = 0; group_in_hypergroup_index < NUM_GROUPS_PER_HYPERGROUP; ++group_in_hypergroup_index) {
+    input_int4[group_in_hypergroup_index] = ld_global_nc(reinterpret_cast<const int4*>(
         input
         + global_hypergroup_id * NUM_GROUPS_PER_HYPERGROUP * GROUP_SIZE_CONST
-        + iteration_index * GROUP_SIZE_CONST
-        + lane_id * VEC_TYPED_SIZE / NUM_GROUPS_PER_HYPERGROUP
+        + group_in_hypergroup_index * GROUP_SIZE_CONST
+        + lane_id * VEC_TYPED_SIZE_PER_GROUP
     ));
   }
 
@@ -150,10 +151,13 @@ __global__ void per_token_group_quant_8bit_kernel(
   }
 
 #pragma unroll
-  for (uint32_t j = 0; j < VEC_TYPED_SIZE; ++j) {
-    float val = static_cast<float>(input_vec[j]);
-    float abs_val = fabsf(val);
-    local_absmax = fmaxf(local_absmax, abs_val);
+  for (uint32_t group_in_hypergroup_index = 0; group_in_hypergroup_index < NUM_GROUPS_PER_HYPERGROUP; ++group_in_hypergroup_index) {
+#pragma unroll
+    for (uint32_t elem_index = 0; elem_index < VEC_TYPED_SIZE_PER_GROUP; ++elem_index) {
+      float val = static_cast<float>(input_vec[group_in_hypergroup_index * VEC_TYPED_SIZE_PER_GROUP + elem_index]);
+      float abs_val = fabsf(val);
+      local_absmax[group_in_hypergroup_index] = fmaxf(local_absmax, abs_val);
+    }
   }
 
   local_absmax = GroupReduceMax<THREADS_PER_HYPERGROUP>(local_absmax, lane_id);
