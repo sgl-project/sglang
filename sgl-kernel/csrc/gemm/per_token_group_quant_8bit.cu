@@ -65,7 +65,7 @@ __device__ __forceinline__ float2 fmul2_rn(float2 x, float2 y) {
   uint64_t x_u64 = *reinterpret_cast<uint64_t*>(&x);
   uint64_t y_u64 = *reinterpret_cast<uint64_t*>(&y);
   asm volatile("mul.rn.f32x2 %0, %1, %2;"
-               : "=l"(out)
+               : "=l"(out_u64)
                : "l"(x_u64), "l"(y_u64));
   return *reinterpret_cast<float2*>(&out_u64);
 }
