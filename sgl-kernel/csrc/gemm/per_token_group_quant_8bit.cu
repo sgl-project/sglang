@@ -18,40 +18,40 @@ __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
 
 // Copied and modified from DeepEP
 __forceinline__ __device__ float fast_pow2(int x) {
-    // We can ensure `-126 <= x and x <= 127`
-    uint32_t bits_x = (x + 127) << 23;
-    return *reinterpret_cast<float*>(&bits_x);
+  // We can ensure `-126 <= x and x <= 127`
+  uint32_t bits_x = (x + 127) << 23;
+  return *reinterpret_cast<float*>(&bits_x);
 }
 
 // Copied and modified from DeepEP
 __forceinline__ __device__ int fast_log2_ceil(float x) {
-    auto bits_x = *reinterpret_cast<uint32_t*>(&x);
-    auto exp_x = (bits_x >> 23) & 0xff;
-    auto man_bits = bits_x & ((1 << 23) - 1);
-    return exp_x - 127 + (man_bits != 0);
+  auto bits_x = *reinterpret_cast<uint32_t*>(&x);
+  auto exp_x = (bits_x >> 23) & 0xff;
+  auto man_bits = bits_x & ((1 << 23) - 1);
+  return exp_x - 127 + (man_bits != 0);
 }
 
 // Copied and modified from DeepEP
 template <bool ROUND_SCALE, float MAX_8BIT, float MAX_8BIT_INV>
 __forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, float& scale_inv) {
-    if constexpr (ROUND_SCALE) {
-        auto exp_scale_inv = fast_log2_ceil(amax * MAX_8BIT_INV);
-        scale = fast_pow2(-exp_scale_inv);
-        scale_inv = fast_pow2(exp_scale_inv);
-    } else {
-        scale_inv = amax * MAX_8BIT_INV;
-        scale = MAX_8BIT / amax;
-    }
+  if constexpr (ROUND_SCALE) {
+    auto exp_scale_inv = fast_log2_ceil(amax * MAX_8BIT_INV);
+    scale = fast_pow2(-exp_scale_inv);
+    scale_inv = fast_pow2(exp_scale_inv);
+  } else {
+    scale_inv = amax * MAX_8BIT_INV;
+    scale = MAX_8BIT / amax;
+  }
 }
 
 // Copied and modified from DeepEP
 template <bool SCALE_UE8M0, typename OUT_DTYPE_T = std::conditional_t<SCALE_UE8M0, uint8_t, float>>
 __forceinline__ __device__ OUT_DTYPE_T extract_required_scale_format(float value) {
-    if constexpr (SCALE_UE8M0) {
-        return static_cast<uint8_t>((*reinterpret_cast<uint32_t*>(&value)) >> 23);
-    } else {
-        return value;
-    }
+  if constexpr (SCALE_UE8M0) {
+    return static_cast<uint8_t>((*reinterpret_cast<uint32_t*>(&value)) >> 23);
+  } else {
+    return value;
+  }
 }
 
 template <
@@ -185,7 +185,7 @@ void sgl_per_token_group_quant_8bit(
   const bool is_column_major = output_s.stride(0) < output_s.stride(1);
   const int scale_num_rows = output_s.size(1);
   const int scale_stride = output_s.stride(1);
-  
+
   const double max_8bit_inv = 1.0f / max_8bit;
 
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
@@ -204,7 +204,7 @@ void sgl_per_token_group_quant_8bit(
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
             (float)max_8bit,                                                                      \
-            (float)max_8bit_inv,                                                                      \
+            (float)max_8bit_inv,                                                                  \
             scale_num_rows,                                                                       \
             scale_stride);                                                                        \
       } else {                                                                                    \
@@ -218,7 +218,7 @@ void sgl_per_token_group_quant_8bit(
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
             (float)max_8bit,                                                                      \
-            (float)max_8bit_inv,                                                                      \
+            (float)max_8bit_inv,                                                                  \
             scale_num_rows,                                                                       \
             scale_stride);                                                                        \
       }                                                                                           \
@@ -233,9 +233,8 @@ void sgl_per_token_group_quant_8bit(
           groups_per_block,                                                                       \
           (float)eps,                                                                             \
           (float)min_8bit,                                                                        \
-          (float)max_8bit, \
-            (float)max_8bit_inv                                                                      \
-          );                                                                       \
+          (float)max_8bit,                                                                        \
+          (float)max_8bit_inv);                                                                   \
     }                                                                                             \
   } while (0)
 
