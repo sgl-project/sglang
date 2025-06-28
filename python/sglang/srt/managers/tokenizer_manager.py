@@ -150,7 +150,9 @@ class ReqState:
 
     # For streaming output
     last_output_offset: int = 0
+
     # For incremental state update.
+    # TODO(lianmin): do not initialize some lists if not needed.
     text: str = ""
     output_ids: List[int] = dataclasses.field(default_factory=list)
     input_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
@@ -199,7 +201,6 @@ class TokenizerManager:
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
         self.model_config = ModelConfig.from_server_args(server_args)
-
         self.is_generation = self.model_config.is_generation
         self.is_image_gen = self.model_config.is_image_gen
         self.context_len = self.model_config.context_len
@@ -251,19 +252,36 @@ class TokenizerManager:
         self.dump_requests_threshold = 1000
         self.dump_request_list: List[Tuple] = []
         self.log_request_metadata = self.get_log_request_metadata()
+        self.asyncio_tasks = set()
+        self.session_futures = {}  # session_id -> asyncio event
+        self.max_req_input_len = None
 
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
             None
         )
-        self.asyncio_tasks = set()
 
-        # For session info
-        self.session_futures = {}  # session_id -> asyncio event
+        # For pd disaggregtion
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
+        self.transfer_backend = TransferBackend(
+            self.server_args.disaggregation_transfer_backend
+        )
+        # Start kv boostrap server on prefill
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # only start bootstrap server on prefill tm
+            kv_bootstrap_server_class = get_kv_class(
+                self.transfer_backend, KVClassType.BOOTSTRAP_SERVER
+            )
+            self.bootstrap_server = kv_bootstrap_server_class(
+                self.server_args.disaggregation_bootstrap_port
+            )
 
-        # Set after scheduler is initialized
-        self.max_req_input_len = None
+        # For load balancing
+        self.current_load = 0
+        self.current_load_lock = asyncio.Lock()
 
         # Metrics
         if self.enable_metrics:
@@ -392,26 +410,6 @@ class TokenizerManager:
                 (HealthCheckOutput, lambda x: None),
             ]
         )
-
-        # For pd disaggregtion
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
-        self.transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
-        )
-        # Start kv boostrap server on prefill
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # only start bootstrap server on prefill tm
-            kv_bootstrap_server_class = get_kv_class(
-                self.transfer_backend, KVClassType.BOOTSTRAP_SERVER
-            )
-            self.bootstrap_server = kv_bootstrap_server_class(
-                self.server_args.disaggregation_bootstrap_port
-            )
-
-        self.current_load = 0
-        self.current_load_lock = asyncio.Lock()
 
     async def generate_request(
         self,
