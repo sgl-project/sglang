@@ -6,7 +6,6 @@ import torch
 from sgl_kernel import silu_and_mul
 from torch.nn import Module
 
-from sglang.srt.utils import ceil_div
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -47,6 +46,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import (
     DeepEPMode,
+    ceil_div,
     dispose_tensor,
     get_bool_env_var,
     is_hip,
