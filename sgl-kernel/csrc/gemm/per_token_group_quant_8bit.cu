@@ -126,15 +126,17 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   local_absmax = GroupReduceMax(local_absmax, lane_id);
 
-  float y_s = local_absmax / max_8bit;
-  if constexpr (SCALE_UE8M0) {
-    y_s = exp2f(ceilf(log2f(fmaxf(fabsf(y_s), 1e-10f))));
-  }
+  float y_scale, y_scale_inv;
+  calculate_fp8_scales(local_absmax, y_scale, y_scale_inv);
+//   float y_s = local_absmax / max_8bit;
+//   if constexpr (SCALE_UE8M0) {
+//     y_s = exp2f(ceilf(log2f(fmaxf(fabsf(y_s), 1e-10f))));
+//   }
 
-  scale_element_t y_s_quant = extract_required_scale_format<SCALE_UE8M0>(y_s);
+  scale_element_t y_scale_inv_quant = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
 
   if (lane_id == 0) {
-    *scale_output = y_s_quant;
+    *scale_output = y_scale_inv_quant;
   }
 
   for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
@@ -144,7 +146,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 #pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
       float val = static_cast<float>(input_vec[j]);
-      float q_val = fminf(fmaxf(val / y_s, min_8bit), max_8bit);
+      float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
       group_output[i * vec_size + j] = DST_DTYPE(q_val);
     }
   }
