@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <flashinfer/vec_dtypes.cuh>
+#include <cuda_runtime.h>
 
 #include "utils.h"
 
