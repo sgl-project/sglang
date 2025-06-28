@@ -85,7 +85,7 @@ template <
     typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>>
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
-    void* __restrict__ output_q,
+    DST_DTYPE* __restrict__ output_q,
     scale_packed_t* __restrict__ output_s,
     const int group_size,
     const int threadchunks_per_block,
@@ -192,8 +192,10 @@ __global__ void per_token_group_quant_8bit_kernel(
 
     st_global(
         reinterpret_cast<int4*>(
-            static_cast<DST_DTYPE*>(output_q) + global_group_id * GROUP_SIZE_CONST +
-            lane_id * VEC_TYPED_SIZE_PER_ITERATION),
+            output_q
+            + global_threadchunk_id * NUM_GROUPS_PER_THREADCHUNK * GROUP_SIZE_CONST +
+            +  iteration_index * GROUP_SIZE_CONST
+            + lane_id * VEC_TYPED_SIZE_PER_ITERATION),
         output_buf);
   }
 }
