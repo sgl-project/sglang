@@ -130,7 +130,8 @@ from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import validate_input_length
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
@@ -576,7 +577,11 @@ class Scheduler(
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
         ):
-            self.tree_cache = ChunkCache(
+            if self.model_config.is_hybrid:
+                ChunkCacheClass = SWAChunkCache
+            else:
+                ChunkCacheClass = ChunkCache
+            self.tree_cache = ChunkCacheClass(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 page_size=self.page_size,
@@ -1289,9 +1294,8 @@ class Scheduler(
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
 
-        num_used = self.max_total_num_tokens - (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
+        usage_msg, num_used = self.token_to_kv_pool_allocator.log_usage(
+            self.tree_cache.evictable_size()
         )
 
         num_new_seq = len(can_run_list)
@@ -1300,7 +1304,7 @@ class Scheduler(
             f"#new-seq: {num_new_seq}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
-            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+            f"{usage_msg}"
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1343,9 +1347,8 @@ class Scheduler(
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
-        num_used = self.max_total_num_tokens - (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
+        usage_msg, num_used = self.token_to_kv_pool_allocator.log_usage(
+            self.tree_cache.evictable_size()
         )
 
         if RECORD_STEP_TIME:
@@ -1353,12 +1356,7 @@ class Scheduler(
                 gap_latency / self.server_args.decode_log_interval
             )
 
-        msg = (
-            f"Decode batch. "
-            f"#running-req: {num_running_reqs}, "
-            f"#token: {num_used}, "
-            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-        )
+        msg = f"Decode batch. " f"#running-req: {num_running_reqs}, " f"{usage_msg}"
 
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
@@ -1396,10 +1394,11 @@ class Scheduler(
         self._publish_kv_events()
 
     def check_memory(self):
-        available_size = (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
-        )
+        if isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+            available_token_size = self.token_to_kv_pool_allocator.full_available_size()
+        else:
+            available_token_size = self.token_to_kv_pool_allocator.available_size()
+        available_size = available_token_size + self.tree_cache.evictable_size()
         protected_size = self.tree_cache.protected_size()
         memory_leak = available_size != (
             self.max_total_num_tokens
@@ -1410,7 +1409,7 @@ class Scheduler(
             msg = (
                 "token_to_kv_pool_allocator memory leak detected! "
                 f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
-                f"{self.token_to_kv_pool_allocator.available_size()=}\n"
+                f"{available_token_size=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
             raise ValueError(msg)
