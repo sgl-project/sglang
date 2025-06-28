@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 pub mod config;
+pub mod core;
 pub mod logging;
 use std::collections::HashMap;
 pub mod openai_api_types;
@@ -11,6 +12,7 @@ pub mod router;
 pub mod server;
 pub mod service_discovery;
 pub mod tree;
+pub mod utils;
 use crate::prometheus::PrometheusConfig;
 
 #[pyclass(eq)]
