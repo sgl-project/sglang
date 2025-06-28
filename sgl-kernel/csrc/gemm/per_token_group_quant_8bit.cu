@@ -76,6 +76,15 @@ __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
 constexpr int THREADS_PER_THREADCHUNK = 16;
 constexpr uint32_t VEC_NUM_BYTES = 32;
 constexpr int GROUP_SIZE_CONST = 128;
+constexpr int SIZEOF_T = 2;
+constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / SIZEOF_T;
+constexpr uint32_t VEC_INT4_SIZE = VEC_NUM_BYTES / sizeof(int4);
+constexpr uint32_t BYTES_PER_ITERATION = GROUP_SIZE_CONST * SIZEOF_T / THREADS_PER_THREADCHUNK;
+constexpr uint32_t VEC_TYPED_SIZE_PER_ITERATION = VEC_TYPED_SIZE / NUM_GROUPS_PER_THREADCHUNK;
+constexpr uint32_t NUM_GROUPS_PER_THREADCHUNK = VEC_NUM_BYTES / BYTES_PER_ITERATION;
+static_assert(NUM_GROUPS_PER_THREADCHUNK == VEC_INT4_SIZE);
+static_assert(sizeof(int4) == BYTES_PER_ITERATION);
+static_assert(THREADS_PER_THREADCHUNK == GROUP_SIZE_CONST / VEC_TYPED_SIZE);
 
 template <
     typename T,
@@ -95,13 +104,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     const float max_8bit_inv,
     const int scale_num_rows = 0,
     const int scale_stride = 0) {
-  constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);
-  constexpr uint32_t VEC_INT4_SIZE = VEC_NUM_BYTES / sizeof(int4);
-  constexpr uint32_t BYTES_PER_ITERATION = GROUP_SIZE_CONST * sizeof(T) / THREADS_PER_THREADCHUNK;
-  constexpr uint32_t VEC_TYPED_SIZE_PER_ITERATION = VEC_TYPED_SIZE / NUM_GROUPS_PER_THREADCHUNK;
-  constexpr uint32_t NUM_GROUPS_PER_THREADCHUNK = VEC_NUM_BYTES / BYTES_PER_ITERATION;
-  static_assert(NUM_GROUPS_PER_THREADCHUNK == VEC_INT4_SIZE);
-  static_assert(sizeof(int4) == BYTES_PER_ITERATION);
+  static_assert(sizeof(T) == SIZEOF_T);
 
   const int local_threadchunk_id = threadIdx.x / THREADS_PER_THREADCHUNK;
   const int lane_id = threadIdx.x % THREADS_PER_THREADCHUNK;
@@ -242,10 +245,6 @@ void sgl_per_token_group_quant_8bit(
 
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
   do {                                                                                            \
-    /* TODO do not copy paste */                                                                  \
-    constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);                                \
-    TORCH_CHECK(THREADS_PER_THREADCHUNK == GROUP_SIZE_CONST / VEC_TYPED_SIZE);                    \
-                                                                                                  \
     dim3 grid(num_blocks);                                                                        \
     dim3 block(num_threads);                                                                      \
     if (is_column_major) {                                                                        \
