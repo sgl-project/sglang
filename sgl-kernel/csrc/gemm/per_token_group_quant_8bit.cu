@@ -158,9 +158,8 @@ __global__ void per_token_group_quant_8bit_kernel(
       float abs_val = fabsf(val);
       local_absmax[group_in_hypergroup_index] = fmaxf(local_absmax, abs_val);
     }
+    local_absmax[group_in_hypergroup_index] = GroupReduceMax<THREADS_PER_HYPERGROUP>(local_absmax[group_in_hypergroup_index], lane_id);
   }
-
-  local_absmax = GroupReduceMax<THREADS_PER_HYPERGROUP>(local_absmax, lane_id);
 
   float y_scale, y_scale_inv;
   calculate_fp8_scales<SCALE_UE8M0>(local_absmax, y_scale, y_scale_inv, max_8bit, max_8bit_inv);
