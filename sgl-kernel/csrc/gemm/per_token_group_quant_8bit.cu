@@ -130,13 +130,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     y_s = exp2f(ceilf(log2f(fmaxf(fabsf(y_s), 1e-10f))));
   }
 
-  // TODO can optimize
-  scale_element_t y_s_quant;
-  if constexpr (SCALE_UE8M0) {
-    y_s_quant = (uint8_t)(((int)log2f(y_s)) + 127);
-  } else {
-    y_s_quant = y_s;
-  }
+  scale_element_t y_s_quant = extract_required_scale_format<SCALE_UE8M0>(y_s);
 
   if (lane_id == 0) {
     *scale_output = y_s_quant;
