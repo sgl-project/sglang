@@ -59,19 +59,6 @@ __device__ __forceinline__ void st_global_v2_s32(const int2* ptr, const int2& va
   asm volatile("st.global.v2.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(value.x), "r"(value.y));
 }
 
-template <typename T>
-struct Vec2Type;
-
-template <>
-struct Vec2Type<__nv_bfloat16> {
-    using type = __nv_bfloat162;
-};
-
-template <>
-struct Vec2Type<__half> {
-    using type = __half2;
-};
-
 template <
     typename T,
     typename DST_DTYPE,
@@ -99,10 +86,10 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int global_group_id = block_group_id + local_group_id;
   const int block_group_offset = global_group_id * group_size;
 
+  float local_absmax = eps;
+
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
-
-  using Tx2 = typename Vec2Type<T>::type;
 
   const T* group_input = input + block_group_offset;
   DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + block_group_offset;
@@ -127,22 +114,18 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   const int32_t num_vec_elems = group_size / vec_size;
 
-  Tx2 local_absmax_x2 = {eps, eps};
-
   for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
     vec_t input_vec;
     input_vec.cast_load(group_input + i * vec_size);
 
 #pragma unroll
-    for (uint32_t j = 0; j < vec_size; j += 2) {
-      Tx2 val_x2 = {input_vec[j], input_vec[j+1]};
-      Tx2 abs_val_x2 = __habs2(val_x2);
-      // TODO is this faster or slower?
-      local_absmax_x2 = __hmax2(local_absmax_x2, abs_val_x2);
+    for (uint32_t j = 0; j < vec_size; ++j) {
+      float val = static_cast<float>(input_vec[j]);
+      float abs_val = fabsf(val);
+      local_absmax = fmaxf(local_absmax, abs_val);
     }
   }
 
-  float local_absmax = (float) __hmax(local_absmax_x2.x, local_absmax_x2.y);
   local_absmax = GroupReduceMax(local_absmax, lane_id);
 
   float y_scale, y_scale_inv;
