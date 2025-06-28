@@ -59,11 +59,12 @@ __device__ __forceinline__ void st_global_v2_s32(const int2* ptr, const int2& va
   asm volatile("st.global.v2.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(value.x), "r"(value.y));
 }
 
-__device__  __forceinline__ int4 ld_global_nc(const int4 *ptr) {
-    int4 ret;
-    asm volatile("ld.global.nc.v4.s32 {%0, %1, %2, %3}, [%4];"
-            : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w) : "l"(ptr));
-    return ret;
+__device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
+  int4 ret;
+  asm volatile("ld.global.nc.v4.s32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w)
+               : "l"(ptr));
+  return ret;
 }
 
 constexpr int THREADS_PER_GROUP = 16;
@@ -125,10 +126,10 @@ __global__ void per_token_group_quant_8bit_kernel(
   int4 input_int4;
   T* input_vec = reinterpret_cast<T*>(&input_int4);
   static_assert(sizeof(input_vec[0]) * vec_size == sizeof(input_int4));
-  int32_t i = lane_id; // TODO remove this
+  int32_t i = lane_id;  // TODO remove this
 
-//   static_assert(THREADS_PER_GROUP >= num_vec_elems);
-//   for (int32_t i = lane_id; i < num_vec_elems; i += THREADS_PER_GROUP) {
+  //   static_assert(THREADS_PER_GROUP >= num_vec_elems);
+  //   for (int32_t i = lane_id; i < num_vec_elems; i += THREADS_PER_GROUP) {
   if (i < num_vec_elems) {
     input_int4 = ld_global_nc(reinterpret_cast<const int4*>(group_input + i * vec_size));
 
@@ -152,7 +153,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     *scale_output = y_scale_inv_quant;
   }
 
-//   for (int32_t i = lane_id; i < num_vec_elems; i += THREADS_PER_GROUP) {
+  //   for (int32_t i = lane_id; i < num_vec_elems; i += THREADS_PER_GROUP) {
   if (i < num_vec_elems) {
     int2 output_buf;
 
@@ -163,10 +164,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 
 #pragma unroll
       for (uint32_t j = 0; j < vec_size; j += 2) {
-        float2 inputx2 = {
-          static_cast<float>(input_vec[j]),
-          static_cast<float>(input_vec[j + 1])
-        };
+        float2 inputx2 = {static_cast<float>(input_vec[j]), static_cast<float>(input_vec[j + 1])};
         float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
         output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
       }
@@ -227,14 +225,14 @@ void sgl_per_token_group_quant_8bit(
 
   const double max_8bit_inv = 1.0f / max_8bit;
 
-  // TODO do not copy paste
-  constexpr uint32_t vec_num_bytes = 16;
-  constexpr uint32_t vec_size = vec_num_bytes / sizeof(T);
-  const int32_t num_vec_elems = group_size / vec_size;
-  TORCH_CHECK(THREADS_PER_GROUP >= num_vec_elems);
-
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
   do {                                                                                            \
+    /* TODO do not copy paste */                                                                  \
+    constexpr uint32_t vec_num_bytes = 16;                                                        \
+    constexpr uint32_t vec_size = vec_num_bytes / sizeof(T);                                      \
+    const int32_t num_vec_elems = group_size / vec_size;                                          \
+    TORCH_CHECK(THREADS_PER_GROUP >= num_vec_elems);                                              \
+                                                                                                  \
     dim3 grid(num_blocks);                                                                        \
     dim3 block(num_threads);                                                                      \
     if (is_column_major) {                                                                        \
