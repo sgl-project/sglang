@@ -25,7 +25,7 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 class ExpertLocationDispatchInfo:
     ep_dispatch_algorithm: Literal["static", "random"]
     # (num_logical_experts,)
-    partial_logical_to_rank_dispatch_physical_map: torch.Tensor
+    partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # (num_logical_experts, X)
     partial_logical_to_all_physical_map: torch.Tensor
     # (num_logical_experts,)
@@ -42,9 +42,14 @@ class ExpertLocationDispatchInfo:
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
-            partial_logical_to_rank_dispatch_physical_map=expert_location_metadata.logical_to_rank_dispatch_physical_map[
-                layer_id, :
-            ],
+            partial_logical_to_rank_dispatch_physical_map=(
+                expert_location_metadata.logical_to_rank_dispatch_physical_map[
+                    layer_id, :
+                ]
+                if expert_location_metadata.logical_to_rank_dispatch_physical_map
+                is not None
+                else None
+            ),
             partial_logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map[
                 layer_id, :
             ],
@@ -55,6 +60,18 @@ class ExpertLocationDispatchInfo:
         )
 
 
+def transform_select_experts_inputs(
+    router_logits: torch.Tensor,
+    correction_bias: Optional[torch.Tensor],
+    info: Optional[ExpertLocationDispatchInfo],
+):
+    if (info is not None) and (info.ep_dispatch_algorithm == "fake"):
+        router_logits = torch.randn_like(router_logits)
+        if correction_bias is not None:
+            correction_bias = torch.zeros_like(correction_bias)
+    return router_logits, correction_bias
+
+
 def topk_ids_logical_to_physical(
     topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
@@ -63,9 +80,9 @@ def topk_ids_logical_to_physical(
 
     if info.ep_dispatch_algorithm == "static":
         return _topk_ids_logical_to_physical_static(topk_ids, info)
-    if info.ep_dispatch_algorithm == "dynamic":
+    if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
         return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
-    raise NotImplementedError
+    raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
 
 
 def _topk_ids_logical_to_physical_static(

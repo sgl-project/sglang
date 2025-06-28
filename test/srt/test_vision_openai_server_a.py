@@ -4,6 +4,8 @@ python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_mixed_
 python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_multi_images_chat_completion
 """
 
+import unittest
+
 from test_vision_openai_server_common import *
 
 from sglang.srt.utils import kill_process_tree

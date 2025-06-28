@@ -9,7 +9,7 @@ else
 fi
 
 # Pull the image
-IMAGE="ghcr.io/saienduri/sglang-aiter-backend-v0.1.2:518"
+IMAGE="ghcr.io/saienduri/sglang:aiter-1.3"
 echo "Pulling Docker image: $IMAGE"
 docker pull "$IMAGE"
 
