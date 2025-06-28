@@ -26,7 +26,6 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from sglang.srt import debug_utils
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -819,8 +818,47 @@ class ModelRunner:
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
         )
-        self.lora_manager.load_lora_adapters(self.server_args.lora_paths)
-        logger.info("LoRA manager ready.")
+        result = self.lora_manager.load_lora_adapters(self.server_args.lora_paths)
+        if result.success:
+            logger.info(
+                f"LoRA manager ready. Loaded LoRA adapters: {', '.join(result.loaded_adapters)}"
+            )
+        else:
+            raise RuntimeError(f"Failed to load LoRA adapters: {result.error_message}")
+
+    def load_lora_adapter(self, lora_name: str, lora_path: str):
+        """Load a new lora adapter from disk or huggingface."""
+
+        logger.info(
+            f"LoRA adapter loading starts: name={lora_name}, path={lora_path}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        result = self.lora_manager.load_lora_adapter(lora_name, lora_path)
+
+        logger.info(
+            f"LoRA adapter loading completes: name={lora_name}, path={lora_path}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        return result
+
+    def unload_lora_adapter(self, lora_name: str):
+        """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
+
+        logger.info(
+            f"LoRA adapter unloading starts: name={lora_name}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        result = self.lora_manager.unload_lora_adapter(lora_name)
+
+        logger.info(
+            f"LoRA adapter unloading completes: name={lora_name}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        return result
 
     def profile_max_num_token(self, total_gpu_memory: int):
         available_gpu_memory = get_available_gpu_memory(
