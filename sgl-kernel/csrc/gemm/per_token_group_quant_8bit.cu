@@ -133,18 +133,16 @@ __global__ void per_token_group_quant_8bit_kernel(
   T* input_vec = reinterpret_cast<T*>(input_int4);
   static_assert(sizeof(input_vec[0]) * vec_size == sizeof(input_int4));
 
-  if (lane_id < num_vec_elems) {
 #pragma unroll
-    for (uint32_t j = 0; j < INPUT_INT4_SIZE; ++j) {
-      input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * vec_size) + j);
-    }
+  for (uint32_t j = 0; j < INPUT_INT4_SIZE; ++j) {
+    input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * vec_size) + j);
+  }
 
 #pragma unroll
-    for (uint32_t j = 0; j < vec_size; ++j) {
-      float val = static_cast<float>(input_vec[j]);
-      float abs_val = fabsf(val);
-      local_absmax = fmaxf(local_absmax, abs_val);
-    }
+  for (uint32_t j = 0; j < vec_size; ++j) {
+    float val = static_cast<float>(input_vec[j]);
+    float abs_val = fabsf(val);
+    local_absmax = fmaxf(local_absmax, abs_val);
   }
 
   local_absmax = GroupReduceMax<THREADS_PER_GROUP>(local_absmax, lane_id);
@@ -159,34 +157,32 @@ __global__ void per_token_group_quant_8bit_kernel(
     *scale_output = y_scale_inv_quant;
   }
 
-  if (lane_id < num_vec_elems) {
-    int4 output_buf;
+  int4 output_buf;
 
-    if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
-      const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
-      static_assert(sizeof(output_buf) == vec_size / 2 * sizeof(__nv_fp8x2_storage_t));
-      static_assert(vec_size % 2 == 0);
-
-#pragma unroll
-      for (uint32_t j = 0; j < vec_size; j += 2) {
-        float2 inputx2 = {static_cast<float>(input_vec[j]), static_cast<float>(input_vec[j + 1])};
-        float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
-        output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
-      }
-    } else {
-      const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
-      static_assert(sizeof(output_buf) == vec_size * sizeof(DST_DTYPE));
+  if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
+    const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
+    static_assert(sizeof(output_buf) == vec_size / 2 * sizeof(__nv_fp8x2_storage_t));
+    static_assert(vec_size % 2 == 0);
 
 #pragma unroll
-      for (uint32_t j = 0; j < vec_size; ++j) {
-        float val = static_cast<float>(input_vec[j]);
-        float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
-        output_buf_ptr[j] = DST_DTYPE(q_val);
-      }
+  for (uint32_t j = 0; j < vec_size; j += 2) {
+      float2 inputx2 = {static_cast<float>(input_vec[j]), static_cast<float>(input_vec[j + 1])};
+      float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
+      output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
     }
+  } else {
+    const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
+    static_assert(sizeof(output_buf) == vec_size * sizeof(DST_DTYPE));
 
-    st_global(reinterpret_cast<int4*>(group_output + lane_id * vec_size), output_buf);
+#pragma unroll
+    for (uint32_t j = 0; j < vec_size; ++j) {
+      float val = static_cast<float>(input_vec[j]);
+      float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
+      output_buf_ptr[j] = DST_DTYPE(q_val);
+    }
   }
+
+  st_global(reinterpret_cast<int4*>(group_output + lane_id * vec_size), output_buf);
 }
 
 void sgl_per_token_group_quant_8bit(
@@ -236,7 +232,7 @@ void sgl_per_token_group_quant_8bit(
     constexpr uint32_t vec_num_bytes = 32;                                                        \
     constexpr uint32_t vec_size = vec_num_bytes / sizeof(T);                                      \
     const int32_t num_vec_elems = group_size / vec_size;                                          \
-    TORCH_CHECK(THREADS_PER_GROUP >= num_vec_elems);                                              \
+    TORCH_CHECK(THREADS_PER_GROUP == num_vec_elems);                                              \
                                                                                                   \
     dim3 grid(num_blocks);                                                                        \
     dim3 block(num_threads);                                                                      \
