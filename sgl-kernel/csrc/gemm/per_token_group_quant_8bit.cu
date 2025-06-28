@@ -6,10 +6,15 @@
 
 #include "utils.h"
 
+template <int THREADS_PER_GROUP>
 __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   unsigned mask = 0xffff;
 
-  val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
+  static_assert((THREADS_PER_GROUP == 16) or (THREADS_PER_GROUP == 8));
+
+  if constexpr (THREADS_PER_GROUP == 16) {
+    val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
+  }
   val = fmaxf(val, __shfl_xor_sync(mask, val, 4));
   val = fmaxf(val, __shfl_xor_sync(mask, val, 2));
   val = fmaxf(val, __shfl_xor_sync(mask, val, 1));
@@ -55,8 +60,8 @@ __forceinline__ __device__ OUT_DTYPE_T extract_required_scale_format(float value
   }
 }
 
-__device__ __forceinline__ void st_global_v2_s32(const int2* ptr, const int2& value) {
-  asm volatile("st.global.v2.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(value.x), "r"(value.y));
+__device__ __forceinline__ void st_global(const int4* ptr, const int4& value) {
+  asm volatile("st.global.v4.s32 [%0], {%1, %2, %3, %4};" ::"l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w));
 }
 
 __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
@@ -67,7 +72,8 @@ __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
   return ret;
 }
 
-constexpr int THREADS_PER_GROUP = 16;
+constexpr int THREADS_PER_GROUP = 8;
+constexpr int INPUT_INT4_SIZE = 2;
 
 template <
     typename T,
@@ -118,17 +124,20 @@ __global__ void per_token_group_quant_8bit_kernel(
     scale_output = output_s + global_group_id;
   }
 
-  constexpr uint32_t vec_num_bytes = 16;
+  constexpr uint32_t vec_num_bytes = 32;
   constexpr uint32_t vec_size = vec_num_bytes / sizeof(T);
 
   const int32_t num_vec_elems = group_size / vec_size;
 
-  int4 input_int4;
-  T* input_vec = reinterpret_cast<T*>(&input_int4);
+  int4 input_int4[INPUT_INT4_SIZE];
+  T* input_vec = reinterpret_cast<T*>(input_int4);
   static_assert(sizeof(input_vec[0]) * vec_size == sizeof(input_int4));
 
   if (lane_id < num_vec_elems) {
-    input_int4 = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * vec_size));
+#pragma unroll
+    for (uint32_t j = 0; j < INPUT_INT4_SIZE; ++j) {
+      input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * vec_size) + j);
+    }
 
 #pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
@@ -138,7 +147,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     }
   }
 
-  local_absmax = GroupReduceMax(local_absmax, lane_id);
+  local_absmax = GroupReduceMax<THREADS_PER_GROUP>(local_absmax, lane_id);
 
   float y_scale, y_scale_inv;
   calculate_fp8_scales<SCALE_UE8M0>(local_absmax, y_scale, y_scale_inv, max_8bit, max_8bit_inv);
@@ -151,7 +160,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   }
 
   if (lane_id < num_vec_elems) {
-    int2 output_buf;
+    int4 output_buf;
 
     if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
       const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
@@ -176,7 +185,7 @@ __global__ void per_token_group_quant_8bit_kernel(
       }
     }
 
-    st_global_v2_s32(reinterpret_cast<int2*>(group_output + lane_id * vec_size), output_buf);
+    st_global(reinterpret_cast<int4*>(group_output + lane_id * vec_size), output_buf);
   }
 }
 
@@ -224,7 +233,7 @@ void sgl_per_token_group_quant_8bit(
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
   do {                                                                                            \
     /* TODO do not copy paste */                                                                  \
-    constexpr uint32_t vec_num_bytes = 16;                                                        \
+    constexpr uint32_t vec_num_bytes = 32;                                                        \
     constexpr uint32_t vec_size = vec_num_bytes / sizeof(T);                                      \
     const int32_t num_vec_elems = group_size / vec_size;                                          \
     TORCH_CHECK(THREADS_PER_GROUP >= num_vec_elems);                                              \
