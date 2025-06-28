@@ -129,7 +129,8 @@ __global__ void per_token_group_quant_8bit_kernel(
   constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);
   constexpr uint32_t VEC_INT4_SIZE = VEC_NUM_BYTES / sizeof(int4);
   constexpr uint32_t BYTES_PER_ITERATION = GROUP_SIZE_CONST * sizeof(T) / THREADS_PER_GROUP;
-  constexpr uint32_t NUM_ITERATIONS = VEC_INT4_SIZE / BYTES_PER_ITERATION;
+  constexpr uint32_t NUM_ITERATIONS = VEC_NUM_BYTES / BYTES_PER_ITERATION;
+  static_assert(NUM_ITERATIONS == VEC_INT4_SIZE);
   static_assert(sizeof(int4) == BYTES_PER_ITERATION);
 
   int4 input_int4[VEC_INT4_SIZE];
@@ -137,9 +138,12 @@ __global__ void per_token_group_quant_8bit_kernel(
   static_assert(sizeof(input_vec[0]) * VEC_TYPED_SIZE == sizeof(input_int4));
 
 #pragma unroll
-  for (uint32_t j = 0; j < VEC_INT4_SIZE; ++j) {
-    TODO_address;
-    input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * VEC_TYPED_SIZE) + j);
+  for (uint32_t iteration_index = 0; iteration_index < NUM_ITERATIONS; ++iteration_index) {
+    input_int4[iteration_index] = ld_global_nc(reinterpret_cast<const int4*>(
+        group_input
+        + iteration_index * GROUP_SIZE_CONST
+        + lane_id * VEC_TYPED_SIZE_PER_ITERATION
+    ));
   }
 
 #pragma unroll
