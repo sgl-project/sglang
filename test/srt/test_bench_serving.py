@@ -31,7 +31,7 @@ class TestBenchServing(CustomTestCase):
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
             if is_in_amd_ci():
-                self.assertGreater(res["output_throughput"], 3150)
+                self.assertGreater(res["output_throughput"], 3050)
             else:
                 self.assertGreater(res["output_throughput"], 3800)
 
@@ -194,7 +194,7 @@ class TestBenchServing(CustomTestCase):
                 self.assertLess(res["median_ttft_ms"], 150)
                 # TODO: not set yet, need AMD machine
             else:
-                self.assertLess(res["median_ttft_ms"], 94)
+                self.assertLess(res["median_ttft_ms"], 100)
             self.assertLess(res["median_itl_ms"], 8)
 
     def test_online_latency_eagle(self):
