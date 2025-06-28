@@ -122,8 +122,11 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   const int32_t num_vec_elems = group_size / vec_size;
 
-  for (int32_t i = lane_id; i < num_vec_elems; i += THREADS_PER_GROUP) {
-    int4 input_int4;
+  int4 input_int4;
+
+  static_assert(THREADS_PER_GROUP >= num_vec_elems);
+//   for (int32_t i = lane_id; i < num_vec_elems; i += THREADS_PER_GROUP) {
+  if ((int32_t i = lane_id) < num_vec_elems) {
     T* input_vec = reinterpret_cast<T*>(&input_int4);
     static_assert(sizeof(input_vec[0]) * vec_size == sizeof(input_int4));
     input_int4 = ld_global_nc(reinterpret_cast<const int4*>(group_input + i * vec_size));
@@ -148,12 +151,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     *scale_output = y_scale_inv_quant;
   }
 
-  for (int32_t i = lane_id; i < num_vec_elems; i += THREADS_PER_GROUP) {
-    int4 input_int4;
-    T* input_vec = reinterpret_cast<T*>(&input_int4);
-    static_assert(sizeof(input_vec[0]) * vec_size == sizeof(input_int4));
-    input_int4 = ld_global_nc(reinterpret_cast<const int4*>(group_input + i * vec_size));
-
+//   for (int32_t i = lane_id; i < num_vec_elems; i += THREADS_PER_GROUP) {
+  if ((int32_t i = lane_id) < num_vec_elems) {
     int2 output_buf;
 
     if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
