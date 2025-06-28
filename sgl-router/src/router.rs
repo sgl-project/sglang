@@ -182,7 +182,6 @@ impl Router {
                 // Wait until all workers are healthy for regular modes
                 let worker_urls = worker_urls.clone();
                 std::thread::spawn(move || {
-                    // If the function returns Result<_, String> keep it, otherwise adjust
                     Self::wait_for_healthy_workers(&worker_urls, timeout_secs, interval_secs)
                 })
                 .join()
