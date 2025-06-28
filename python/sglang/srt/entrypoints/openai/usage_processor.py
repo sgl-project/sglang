@@ -37,7 +37,9 @@ class UsageProcessor:
 
         spec_verify_ct = None
         if enable_spec_report:
-            spec_verify_ct = sum(r["meta_info"].get("spec_verify_ct", 0) for r in responses)
+            spec_verify_ct = sum(
+                r["meta_info"].get("spec_verify_ct", 0) for r in responses
+            )
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
@@ -68,7 +70,9 @@ class UsageProcessor:
             else None
         )
 
-        spec_verified_tokens = sum(spec_verify_ct.values()) if enable_spec_report else None
+        spec_verified_tokens = (
+            sum(spec_verify_ct.values()) if enable_spec_report else None
+        )
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=total_prompt_tokens,

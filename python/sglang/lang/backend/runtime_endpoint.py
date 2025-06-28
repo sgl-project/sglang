@@ -226,12 +226,12 @@ class RuntimeEndpoint(BaseBackend):
             # chat api response is different from completion api
             # so we re-organize the meta_info
             meta_info = dict()
-            meta_info['id'] = obj['id']
-            meta_info['finish_reason'] = obj['choices'][0]['finish_reason']
+            meta_info["id"] = obj["id"]
+            meta_info["finish_reason"] = obj["choices"][0]["finish_reason"]
             meta_info["prompt_tokens"] = obj["usage"]["prompt_tokens"]
-            meta_info['completion_tokens'] = obj['usage']['completion_tokens']
-            meta_info['cached_tokens'] = obj['usage'].get('cached_tokens', None)
-            meta_info["spec_verify_ct"] = obj["usage"].get('spec_verify_ct', None)
+            meta_info["completion_tokens"] = obj["usage"]["completion_tokens"]
+            meta_info["cached_tokens"] = obj["usage"].get("cached_tokens", None)
+            meta_info["spec_verify_ct"] = obj["usage"].get("spec_verify_ct", None)
         else:
             obj = res.json()
             comp = obj["text"]

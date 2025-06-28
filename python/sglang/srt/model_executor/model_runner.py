@@ -309,16 +309,18 @@ class ModelRunner:
             # load draft config
             draft_model_config = ModelConfig.from_server_args(
                 server_args,
-                model_path=(
-                    server_args.speculative_draft_model_path
-                ),
-                is_draft_model=True
+                model_path=(server_args.speculative_draft_model_path),
+                is_draft_model=True,
             )
 
             try:
                 # get the aux layer from draft model config
-                eagle_config = getattr(draft_model_config.hf_config, "eagle_config", None)
-                eagle_aux_hidden_state_layer_ids = eagle_config["eagle_aux_hidden_state_layer_ids"]
+                eagle_config = getattr(
+                    draft_model_config.hf_config, "eagle_config", None
+                )
+                eagle_aux_hidden_state_layer_ids = eagle_config[
+                    "eagle_aux_hidden_state_layer_ids"
+                ]
             except:
                 # if there is no aux layer, set to None
                 eagle_aux_hidden_state_layer_ids = None

@@ -709,7 +709,7 @@ class LlamaForCausalLM(nn.Module):
             self.capture_aux_hidden_states = True
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
-            self.model.layers_to_capture = [val + 1  for val in layer_ids]
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):
