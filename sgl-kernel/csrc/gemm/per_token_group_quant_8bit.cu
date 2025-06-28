@@ -149,7 +149,7 @@ __global__ void per_token_group_quant_8bit_kernel(
       static_assert(vec_size % 2 == 0);
 
 #pragma unroll
-      for (uint32_t j = 0; j < vec_size; j += 1) {
+      for (uint32_t j = 0; j < vec_size; j += 2) {
         float2 valx2 = {
           static_cast<float>(input_vec[j]) * y_scale,
           static_cast<float>(input_vec[j + 1]) * y_scale
