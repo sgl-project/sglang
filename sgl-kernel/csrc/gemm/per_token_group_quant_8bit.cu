@@ -54,6 +54,11 @@ __forceinline__ __device__ OUT_DTYPE_T extract_required_scale_format(float value
   }
 }
 
+__device__  __forceinline__ void st_global_v2_s32(const int2 *ptr, const int2& value) {
+    asm volatile("st.global.v2.s32 [%0], {%1, %2};"
+            ::"l"(ptr), "r"(value.x), "r"(value.y));
+}
+
 template <
     typename T,
     typename DST_DTYPE,
@@ -136,15 +141,18 @@ __global__ void per_token_group_quant_8bit_kernel(
     vec_t input_vec;
     input_vec.cast_load(group_input + i * vec_size);
 
-    DST_DTYPE[vec_size] output_temp;
+    int2 output_buf;
+    const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
+    static_assert(sizeof(output_buf) == vec_size * sizeof(DST_DTYPE));
+
 #pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
       float val = static_cast<float>(input_vec[j]);
       float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
-      output_temp[j] = DST_DTYPE(q_val);
+      output_buf_ptr[j] = DST_DTYPE(q_val);
     }
 
-    group_output[i * vec_size + j] = TODO;
+    st_global_v2_s32(reinterpret_cast<int2*>(group_output + i * vec_size), output_buf);
   }
 }
 
