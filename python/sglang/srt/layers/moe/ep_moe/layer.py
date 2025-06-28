@@ -6,7 +6,7 @@ import torch
 from sgl_kernel import silu_and_mul
 from torch.nn import Module
 
-from sglang.math_utils import ceil_div
+from sglang.srt.utils import ceil_div
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
