@@ -123,6 +123,7 @@ suites = {
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_function_call_parser.py", 10),
+        TestFile("test_fused_moe.py", 30),
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_metrics.py", 32),
         TestFile("test_no_chunked_prefill.py", 108),
@@ -139,6 +140,7 @@ suites = {
         TestFile("test_update_weights_from_disk.py", 114),
         TestFile("test_vertex_endpoint.py", 31),
         TestFile("test_vision_chunked_prefill.py", 175),
+        TestFile("test_rope_rocm.py", 3),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
