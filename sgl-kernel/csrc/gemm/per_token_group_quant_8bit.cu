@@ -59,6 +59,8 @@ __device__ __forceinline__ void st_global_v2_s32(const int2* ptr, const int2& va
   asm volatile("st.global.v2.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(value.x), "r"(value.y));
 }
 
+constexpr int THREADS_PER_GROUP = 16;
+
 template <
     typename T,
     typename DST_DTYPE,
@@ -78,9 +80,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     const float max_8bit_inv,
     const int scale_num_rows = 0,
     const int scale_stride = 0) {
-  const int threads_per_group = 16;
-  const int local_group_id = threadIdx.x / threads_per_group;
-  const int lane_id = threadIdx.x % threads_per_group;
+  const int local_group_id = threadIdx.x / THREADS_PER_GROUP;
+  const int lane_id = threadIdx.x % THREADS_PER_GROUP;
 
   const int block_group_id = blockIdx.x * groups_per_block;
   const int global_group_id = block_group_id + local_group_id;
@@ -115,7 +116,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   const int32_t num_vec_elems = group_size / vec_size;
 
-  for (int32_t i = lane_id; i < num_vec_elems; i += threads_per_group) {
+  for (int32_t i = lane_id; i < num_vec_elems; i += THREADS_PER_GROUP) {
     vec_t input_vec;
     input_vec.cast_load(group_input + i * vec_size);
 
@@ -139,7 +140,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     *scale_output = y_scale_inv_quant;
   }
 
-  for (int32_t i = lane_id; i < num_vec_elems; i += threads_per_group) {
+  for (int32_t i = lane_id; i < num_vec_elems; i += THREADS_PER_GROUP) {
     vec_t input_vec;
     input_vec.cast_load(group_input + i * vec_size);
 
@@ -193,8 +194,6 @@ void sgl_per_token_group_quant_8bit(
   CHECK_EQ(output_s.dim(), 2);
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-  constexpr int THREADS_PER_GROUP = 16;
 
   int groups_per_block = 1;
 
