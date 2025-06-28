@@ -18,10 +18,8 @@ from typing import Dict, List, Optional, Union
 from sglang.srt.managers.multimodal_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.managers.multimodal_processors.base_processor import (
-    MultimodalSpecialTokens,
-)
 from sglang.srt.models.gemma3n_mm import Gemma3nForConditionalGeneration
+from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 
 
 class Gemma3nSGLangProcessor(SGLangBaseProcessor):

@@ -13,10 +13,11 @@ class TestFile:
 
 suites = {
     "per-commit": [
-        TestFile("models/lora/test_lora.py", 76),
+        TestFile("models/lora/test_lora.py", 200),
         TestFile("models/lora/test_lora_backend.py", 99),
         TestFile("models/lora/test_multi_lora_backend.py", 60),
         TestFile("models/lora/test_lora_cuda_graph.py", 250),
+        TestFile("models/lora/test_lora_update.py", 400),
         TestFile("models/test_embedding_models.py", 73),
         # TestFile("models/test_clip_models.py", 52),
         TestFile("models/test_encoder_embedding_models.py", 100),
@@ -145,7 +146,6 @@ suites = {
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_dp_attention.py", 137),
         TestFile("test_mla_tp.py", 170),
-        TestFile("test_moe_ep.py", 181),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_update_weights_from_distributed.py", 103),
         TestFile("test_release_memory_occupation.py", 44),
@@ -174,6 +174,7 @@ suites = {
         TestFile("test_disaggregation.py", 270),
         TestFile("test_disaggregation_different_tp.py", 155),
         TestFile("test_full_deepseek_v3.py", 463),
+        TestFile("test_moe_ep.py", 181),
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
