@@ -135,13 +135,11 @@ __global__ void per_token_group_quant_8bit_kernel(
   static_assert(sizeof(input_vec[0]) * VEC_TYPED_SIZE == sizeof(input_int4));
 
 #pragma unroll
-  for (uint32_t group_in_hypergroup_index = 0; group_in_hypergroup_index < NUM_GROUPS_PER_HYPERGROUP; ++group_in_hypergroup_index) {
+  for (uint32_t group_in_hypergroup_index = 0; group_in_hypergroup_index < NUM_GROUPS_PER_HYPERGROUP;
+       ++group_in_hypergroup_index) {
     input_int4[group_in_hypergroup_index] = ld_global_nc(reinterpret_cast<const int4*>(
-        input
-        + global_hypergroup_id * NUM_GROUPS_PER_HYPERGROUP * GROUP_SIZE_CONST
-        + group_in_hypergroup_index * GROUP_SIZE_CONST
-        + lane_id * VEC_TYPED_SIZE_PER_GROUP
-    ));
+        input + global_hypergroup_id * NUM_GROUPS_PER_HYPERGROUP * GROUP_SIZE_CONST +
+        group_in_hypergroup_index * GROUP_SIZE_CONST + lane_id * VEC_TYPED_SIZE_PER_GROUP));
   }
 
   float local_absmax[NUM_GROUPS_PER_HYPERGROUP];
@@ -154,50 +152,57 @@ __global__ void per_token_group_quant_8bit_kernel(
   }
 
 #pragma unroll
-  for (uint32_t group_in_hypergroup_index = 0; group_in_hypergroup_index < NUM_GROUPS_PER_HYPERGROUP; ++group_in_hypergroup_index) {
+  for (uint32_t group_in_hypergroup_index = 0; group_in_hypergroup_index < NUM_GROUPS_PER_HYPERGROUP;
+       ++group_in_hypergroup_index) {
 #pragma unroll
     for (uint32_t elem_index = 0; elem_index < VEC_TYPED_SIZE_PER_GROUP; ++elem_index) {
       float val = static_cast<float>(input_vec[group_in_hypergroup_index * VEC_TYPED_SIZE_PER_GROUP + elem_index]);
       float abs_val = fabsf(val);
       local_absmax[group_in_hypergroup_index] = fmaxf(local_absmax, abs_val);
     }
-    local_absmax[group_in_hypergroup_index] = GroupReduceMax<THREADS_PER_HYPERGROUP>(local_absmax[group_in_hypergroup_index], lane_id);
-    calculate_fp8_scales<SCALE_UE8M0>(local_absmax[group_in_hypergroup_index], y_scale[group_in_hypergroup_index], y_scale_inv[group_in_hypergroup_index], max_8bit, max_8bit_inv);
+    local_absmax[group_in_hypergroup_index] =
+        GroupReduceMax<THREADS_PER_HYPERGROUP>(local_absmax[group_in_hypergroup_index], lane_id);
+    calculate_fp8_scales<SCALE_UE8M0>(
+        local_absmax[group_in_hypergroup_index],
+        y_scale[group_in_hypergroup_index],
+        y_scale_inv[group_in_hypergroup_index],
+        max_8bit,
+        max_8bit_inv);
     y_scale_repeated[group_in_hypergroup_index] = {y_scale, y_scale};
-  }
 
-  scale_element_t y_scale_inv_quant = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
+    // TODO should have multiple scale output addrs
+    scale_element_t y_scale_inv_quant = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
+    if (lane_id == 0) {
+      *scale_output = y_scale_inv_quant;
+    }
 
-  if (lane_id == 0) {
-    *scale_output = y_scale_inv_quant;
-  }
+    int4 output_buf;
 
-  int4 output_buf;
-
-  if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
-    const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
-    static_assert(sizeof(output_buf) == VEC_TYPED_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
-    static_assert(VEC_TYPED_SIZE % 2 == 0);
+    if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
+      const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
+      static_assert(sizeof(output_buf) == VEC_TYPED_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
+      static_assert(VEC_TYPED_SIZE % 2 == 0);
 
 #pragma unroll
-    for (uint32_t j = 0; j < VEC_TYPED_SIZE; j += 2) {
-      float2 inputx2 = {static_cast<float>(input_vec[j]), static_cast<float>(input_vec[j + 1])};
-      float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
-      output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
-    }
-  } else {
-    const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
-    static_assert(sizeof(output_buf) == VEC_TYPED_SIZE * sizeof(DST_DTYPE));
+      for (uint32_t j = 0; j < VEC_TYPED_SIZE; j += 2) {
+        float2 inputx2 = {static_cast<float>(input_vec[j]), static_cast<float>(input_vec[j + 1])};
+        float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
+        output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+      }
+    } else {
+      const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
+      static_assert(sizeof(output_buf) == VEC_TYPED_SIZE * sizeof(DST_DTYPE));
 
 #pragma unroll
-    for (uint32_t j = 0; j < VEC_TYPED_SIZE; ++j) {
-      float val = static_cast<float>(input_vec[j]);
-      float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
-      output_buf_ptr[j] = DST_DTYPE(q_val);
+      for (uint32_t j = 0; j < VEC_TYPED_SIZE; ++j) {
+        float val = static_cast<float>(input_vec[j]);
+        float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
+        output_buf_ptr[j] = DST_DTYPE(q_val);
+      }
     }
-  }
 
-  st_global(reinterpret_cast<int4*>(group_output + lane_id * VEC_TYPED_SIZE), output_buf);
+    st_global(reinterpret_cast<int4*>(group_output + lane_id * VEC_TYPED_SIZE), output_buf);
+  }
 }
 
 void sgl_per_token_group_quant_8bit(
@@ -247,7 +252,7 @@ void sgl_per_token_group_quant_8bit(
   do {                                                                                            \
     /* TODO do not copy paste */                                                                  \
     constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);                                \
-    TORCH_CHECK(THREADS_PER_HYPERGROUP == GROUP_SIZE_CONST / VEC_TYPED_SIZE);                          \
+    TORCH_CHECK(THREADS_PER_HYPERGROUP == GROUP_SIZE_CONST / VEC_TYPED_SIZE);                     \
                                                                                                   \
     dim3 grid(num_blocks);                                                                        \
     dim3 block(num_threads);                                                                      \
@@ -258,7 +263,7 @@ void sgl_per_token_group_quant_8bit(
             output_q.data_ptr(),                                                                  \
             static_cast<uint32_t*>(output_s.data_ptr()),                                          \
             group_size,                                                                           \
-            hypergroups_per_block,                                                                     \
+            hypergroups_per_block,                                                                \
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
             (float)max_8bit,                                                                      \
@@ -271,7 +276,7 @@ void sgl_per_token_group_quant_8bit(
             output_q.data_ptr(),                                                                  \
             static_cast<float*>(output_s.data_ptr()),                                             \
             group_size,                                                                           \
-            hypergroups_per_block,                                                                     \
+            hypergroups_per_block,                                                                \
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
             (float)max_8bit,                                                                      \
@@ -286,7 +291,7 @@ void sgl_per_token_group_quant_8bit(
           output_q.data_ptr(),                                                                    \
           static_cast<float*>(output_s.data_ptr()),                                               \
           group_size,                                                                             \
-          hypergroups_per_block,                                                                       \
+          hypergroups_per_block,                                                                  \
           (float)eps,                                                                             \
           (float)min_8bit,                                                                        \
           (float)max_8bit,                                                                        \
