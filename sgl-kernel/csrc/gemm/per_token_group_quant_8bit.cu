@@ -59,6 +59,14 @@ __device__ __forceinline__ void st_global_v2_s32(const int2* ptr, const int2& va
   asm volatile("st.global.v2.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(value.x), "r"(value.y));
 }
 
+__device__ __forceinline__ __nv_fp8x2_storage_t float2_to_fp8x2(const float2 x) {
+  __nv_fp8x2_storage_t storage;
+  asm("{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}\n"
+    : "=h"(storage)
+    : "f"(x.x), "f"(x.y));
+  return storage;
+}
+
 template <
     typename T,
     typename DST_DTYPE,
@@ -154,7 +162,7 @@ __global__ void per_token_group_quant_8bit_kernel(
           static_cast<float>(input_vec[j]) * y_scale,
           static_cast<float>(input_vec[j + 1]) * y_scale
         };
-        output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(valx2, __NV_SATFINITE, __NV_E4M3);
+        output_buf_ptr[j / 2] = float2_to_fp8x2(valx2);
       }
     } else {
       const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
