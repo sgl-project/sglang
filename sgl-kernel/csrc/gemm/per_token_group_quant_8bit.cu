@@ -127,21 +127,22 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   const int32_t num_vec_elems = group_size / vec_size;
 
-  T local_absmax_16bit = eps;
+  Tx2 local_absmax_x2 = {eps, eps};
 
   for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
     vec_t input_vec;
     input_vec.cast_load(group_input + i * vec_size);
 
 #pragma unroll
-    for (uint32_t j = 0; j < vec_size; ++j) {
-      T val = input_vec[j];
-      T abs_val = __habs2(val);
-      local_absmax_16bit = __hmax2(local_absmax_16bit, abs_val);
+    for (uint32_t j = 0; j < vec_size; j += 2) {
+      Tx2 val_x2 = {input_vec[j], input_vec[j+1]};
+      Tx2 abs_val_x2 = __habs2(val_x2);
+      // TODO is this faster or slower?
+      local_absmax_x2 = __hmax2(local_absmax_x2, abs_val_x2);
     }
   }
 
-  float local_absmax = (float) local_absmax_16bit;
+  float local_absmax = (float) __hmax(local_absmax_x2.x, local_absmax_x2.y);
   local_absmax = GroupReduceMax(local_absmax, lane_id);
 
   float y_scale, y_scale_inv;
