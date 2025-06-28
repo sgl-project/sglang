@@ -98,6 +98,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);
   constexpr uint32_t VEC_INT4_SIZE = VEC_NUM_BYTES / sizeof(int4);
   constexpr uint32_t BYTES_PER_ITERATION = GROUP_SIZE_CONST * sizeof(T) / THREADS_PER_THREADCHUNK;
+  constexpr uint32_t VEC_TYPED_SIZE_PER_ITERATION = VEC_TYPED_SIZE / NUM_GROUPS_PER_THREADCHUNK;
   constexpr uint32_t NUM_GROUPS_PER_THREADCHUNK = VEC_NUM_BYTES / BYTES_PER_ITERATION;
   static_assert(NUM_GROUPS_PER_THREADCHUNK == VEC_INT4_SIZE);
   static_assert(sizeof(int4) == BYTES_PER_ITERATION);
@@ -130,23 +131,24 @@ __global__ void per_token_group_quant_8bit_kernel(
   }
 
   int4 input_int4[VEC_INT4_SIZE];
-  T* input_vec = reinterpret_cast<T*>(input_int4);
-  static_assert(sizeof(input_vec[0]) * VEC_TYPED_SIZE == sizeof(input_int4));
 
 #pragma unroll
   for (uint32_t iteration_index = 0; iteration_index < NUM_GROUPS_PER_THREADCHUNK; ++iteration_index) {
     input_int4[iteration_index] = ld_global_nc(reinterpret_cast<const int4*>(
         input + global_threadchunk_id * NUM_GROUPS_PER_THREADCHUNK * GROUP_SIZE_CONST +
-        iteration_index * GROUP_SIZE_CONST + lane_id * VEC_TYPED_SIZE / NUM_GROUPS_PER_THREADCHUNK));
+        iteration_index * GROUP_SIZE_CONST + lane_id * VEC_TYPED_SIZE_PER_ITERATION));
   }
 
 #pragma unroll
   for (uint32_t iteration_index = 0; iteration_index < NUM_GROUPS_PER_THREADCHUNK; ++iteration_index) {
+    T* input_vec_curr_iteration = reinterpret_cast<T*>(input_int4 + iteration_index);
+    static_assert(sizeof(input_vec_curr_iteration[0]) * VEC_TYPED_SIZE_PER_ITERATION == sizeof(input_int4[0]));
+
     float local_absmax = eps;
 
 #pragma unroll
-    for (uint32_t j = 0; j < VEC_TYPED_SIZE; ++j) {
-      float val = static_cast<float>(input_vec[j]);
+    for (uint32_t j = 0; j < VEC_TYPED_SIZE_PER_ITERATION; ++j) {
+      float val = static_cast<float>(input_vec_curr_iteration[j]);
       float abs_val = fabsf(val);
       local_absmax = fmaxf(local_absmax, abs_val);
     }
@@ -167,28 +169,28 @@ __global__ void per_token_group_quant_8bit_kernel(
 
     if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
       const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
-      static_assert(sizeof(output_buf) == VEC_TYPED_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
-      static_assert(VEC_TYPED_SIZE % 2 == 0);
+      static_assert(sizeof(output_buf) == VEC_TYPED_SIZE_PER_ITERATION / 2 * sizeof(__nv_fp8x2_storage_t));
+      static_assert(VEC_TYPED_SIZE_PER_ITERATION % 2 == 0);
 
 #pragma unroll
-      for (uint32_t j = 0; j < VEC_TYPED_SIZE; j += 2) {
-        float2 inputx2 = {static_cast<float>(input_vec[j]), static_cast<float>(input_vec[j + 1])};
+      for (uint32_t j = 0; j < VEC_TYPED_SIZE_PER_ITERATION; j += 2) {
+        float2 inputx2 = {static_cast<float>(input_vec_curr_iteration[j]), static_cast<float>(input_vec_curr_iteration[j + 1])};
         float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
         output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
       }
     } else {
       const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
-      static_assert(sizeof(output_buf) == VEC_TYPED_SIZE * sizeof(DST_DTYPE));
+      static_assert(sizeof(output_buf) == VEC_TYPED_SIZE_PER_ITERATION * sizeof(DST_DTYPE));
 
 #pragma unroll
-      for (uint32_t j = 0; j < VEC_TYPED_SIZE; ++j) {
-        float val = static_cast<float>(input_vec[j]);
+      for (uint32_t j = 0; j < VEC_TYPED_SIZE_PER_ITERATION; ++j) {
+        float val = static_cast<float>(input_vec_curr_iteration[j]);
         float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
         output_buf_ptr[j] = DST_DTYPE(q_val);
       }
     }
 
-    st_global(reinterpret_cast<int4*>(group_output + lane_id * VEC_TYPED_SIZE), output_buf);
+    st_global(reinterpret_cast<int4*>(group_output + lane_id * VEC_TYPED_SIZE_PER_ITERATION), output_buf);
   }
 }
 
