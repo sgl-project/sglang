@@ -57,6 +57,9 @@ __forceinline__ __device__ OUT_DTYPE_T extract_required_scale_format(float value
 template <
     typename T,
     typename DST_DTYPE,
+    const float MIN_8BIT,
+    const float MAX_8BIT,
+    const float MAX_8BIT_INV,
     bool IS_COLUMN_MAJOR = false,
     bool SCALE_UE8M0 = false,
     typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>>
@@ -68,8 +71,6 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int num_groups,
     const int groups_per_block,
     const float eps,
-    const float min_8bit,
-    const float max_8bit,
     const int scale_num_rows = 0,
     const int scale_stride = 0) {
   const int threads_per_group = 16;
@@ -138,7 +139,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 #pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
       float val = static_cast<float>(input_vec[j]);
-      float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
+      float q_val = fminf(fmaxf(val * y_scale, MIN_8BIT), MAX_8BIT);
       group_output[i * vec_size + j] = DST_DTYPE(q_val);
     }
   }
