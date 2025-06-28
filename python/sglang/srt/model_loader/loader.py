@@ -420,9 +420,9 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config,
                 )
 
-        self.load_weights_and_postprocess(
-            model, self._get_all_weights(model_config, model), target_device
-        )
+            self.load_weights_and_postprocess(
+                model, self._get_all_weights(model_config, model), target_device
+            )
 
         return model.eval()
 
