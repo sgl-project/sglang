@@ -96,20 +96,25 @@ __global__ void per_token_group_quant_8bit_kernel(
     const float max_8bit_inv,
     const int scale_num_rows = 0,
     const int scale_stride = 0) {
+  constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);
+  constexpr uint32_t VEC_INT4_SIZE = VEC_NUM_BYTES / sizeof(int4);
+  constexpr uint32_t BYTES_PER_ITERATION = GROUP_SIZE_CONST * sizeof(T) / THREADS_PER_GROUP;
+  constexpr uint32_t NUM_ITERATIONS = VEC_NUM_BYTES / BYTES_PER_ITERATION;
+  static_assert(NUM_ITERATIONS == VEC_INT4_SIZE);
+  static_assert(sizeof(int4) == BYTES_PER_ITERATION);
+
   const int local_group_id = threadIdx.x / THREADS_PER_GROUP;
   const int lane_id = threadIdx.x % THREADS_PER_GROUP;
 
   const int block_group_id = blockIdx.x * groups_per_block;
   const int global_group_id = block_group_id + local_group_id;
-  const int block_group_offset = global_group_id * GROUP_SIZE_CONST;
 
   float local_absmax = eps;
 
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
-  const T* group_input = input + block_group_offset;
-  DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + block_group_offset;
+  DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + global_group_id * GROUP_SIZE_CONST;
   scale_element_t* scale_output;
 
   if constexpr (IS_COLUMN_MAJOR) {
@@ -126,13 +131,6 @@ __global__ void per_token_group_quant_8bit_kernel(
     scale_output = output_s + global_group_id;
   }
 
-  constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);
-  constexpr uint32_t VEC_INT4_SIZE = VEC_NUM_BYTES / sizeof(int4);
-  constexpr uint32_t BYTES_PER_ITERATION = GROUP_SIZE_CONST * sizeof(T) / THREADS_PER_GROUP;
-  constexpr uint32_t NUM_ITERATIONS = VEC_NUM_BYTES / BYTES_PER_ITERATION;
-  static_assert(NUM_ITERATIONS == VEC_INT4_SIZE);
-  static_assert(sizeof(int4) == BYTES_PER_ITERATION);
-
   int4 input_int4[VEC_INT4_SIZE];
   T* input_vec = reinterpret_cast<T*>(input_int4);
   static_assert(sizeof(input_vec[0]) * VEC_TYPED_SIZE == sizeof(input_int4));
@@ -140,7 +138,8 @@ __global__ void per_token_group_quant_8bit_kernel(
 #pragma unroll
   for (uint32_t iteration_index = 0; iteration_index < NUM_ITERATIONS; ++iteration_index) {
     input_int4[iteration_index] = ld_global_nc(reinterpret_cast<const int4*>(
-        group_input
+        input
+        + global_group_id * GROUP_SIZE_CONST
         + iteration_index * GROUP_SIZE_CONST
         + lane_id * VEC_TYPED_SIZE_PER_ITERATION
     ));
