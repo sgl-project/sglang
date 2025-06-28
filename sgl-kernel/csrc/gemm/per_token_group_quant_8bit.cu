@@ -33,7 +33,8 @@ __forceinline__ __device__ int fast_log2_ceil(float x) {
 
 // Copied and modified from DeepEP
 template <bool ROUND_SCALE>
-__forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, float& scale_inv, float max_8bit, float max_8bit_inv) {
+__forceinline__ __device__ void
+calculate_fp8_scales(float amax, float& scale, float& scale_inv, float max_8bit, float max_8bit_inv) {
   if constexpr (ROUND_SCALE) {
     auto exp_scale_inv = fast_log2_ceil(amax * max_8bit_inv);
     scale = fast_pow2(-exp_scale_inv);
@@ -54,9 +55,8 @@ __forceinline__ __device__ OUT_DTYPE_T extract_required_scale_format(float value
   }
 }
 
-__device__  __forceinline__ void st_global_v2_s32(const int2 *ptr, const int2& value) {
-    asm volatile("st.global.v2.s32 [%0], {%1, %2};"
-            ::"l"(ptr), "r"(value.x), "r"(value.y));
+__device__ __forceinline__ void st_global_v2_s32(const int2* ptr, const int2& value) {
+  asm volatile("st.global.v2.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(value.x), "r"(value.y));
 }
 
 template <
