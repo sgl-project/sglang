@@ -170,7 +170,7 @@ __global__ void per_token_group_quant_8bit_kernel(
         max_8bit_inv);
     y_scale_repeated[group_in_threadgroup_index] = {y_scale, y_scale};
 
-    // TODO should have multiple scale output addrs
+    // TODO do vec output for scale
     scale_element_t y_scale_inv_quant = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
     if (lane_id == 0) {
       *scale_output = y_scale_inv_quant;
@@ -252,7 +252,7 @@ void sgl_per_token_group_quant_8bit(
   do {                                                                                            \
     /* TODO do not copy paste */                                                                  \
     constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);                                \
-    TORCH_CHECK(THREADS_PER_THREADGROUP == GROUP_SIZE_CONST / VEC_TYPED_SIZE);                     \
+    TORCH_CHECK(THREADS_PER_THREADGROUP == GROUP_SIZE_CONST / VEC_TYPED_SIZE);                    \
                                                                                                   \
     dim3 grid(num_blocks);                                                                        \
     dim3 block(num_threads);                                                                      \
@@ -263,7 +263,7 @@ void sgl_per_token_group_quant_8bit(
             output_q.data_ptr(),                                                                  \
             static_cast<uint32_t*>(output_s.data_ptr()),                                          \
             group_size,                                                                           \
-            threadgroups_per_block,                                                                \
+            threadgroups_per_block,                                                               \
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
             (float)max_8bit,                                                                      \
@@ -276,7 +276,7 @@ void sgl_per_token_group_quant_8bit(
             output_q.data_ptr(),                                                                  \
             static_cast<float*>(output_s.data_ptr()),                                             \
             group_size,                                                                           \
-            threadgroups_per_block,                                                                \
+            threadgroups_per_block,                                                               \
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
             (float)max_8bit,                                                                      \
@@ -291,7 +291,7 @@ void sgl_per_token_group_quant_8bit(
           output_q.data_ptr(),                                                                    \
           static_cast<float*>(output_s.data_ptr()),                                               \
           group_size,                                                                             \
-          threadgroups_per_block,                                                                  \
+          threadgroups_per_block,                                                                 \
           (float)eps,                                                                             \
           (float)min_8bit,                                                                        \
           (float)max_8bit,                                                                        \
