@@ -120,9 +120,9 @@ __global__ void per_token_group_quant_8bit_kernel(
 
 #pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
-      float val = static_cast<float>(input_vec[j]);
-      float abs_val = fabsf(val);
-      local_absmax_16bit = fmaxf(local_absmax, abs_val);
+      T val = input_vec[j];
+      T abs_val = TODO(val);
+      local_absmax_16bit = TODO(local_absmax_16bit, abs_val);
     }
   }
 
