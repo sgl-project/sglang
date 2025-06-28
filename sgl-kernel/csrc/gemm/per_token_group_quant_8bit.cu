@@ -61,8 +61,7 @@ __forceinline__ __device__ OUT_DTYPE_T extract_required_scale_format(float value
 }
 
 __device__ __forceinline__ void st_global(const int2* ptr, const int2& value) {
-  asm volatile(
-      "st.global.v2.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(value.x), "r"(value.y));
+  asm volatile("st.global.v2.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(value.x), "r"(value.y));
 }
 
 __device__ __forceinline__ void st_global(const int4* ptr, const int4& value) {
@@ -257,7 +256,7 @@ void sgl_per_token_group_quant_8bit(
       if (scale_ue8m0) {                                                                          \
         per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, true><<<grid, block, 0, stream>>>(  \
             static_cast<T*>(input.data_ptr()),                                                    \
-            output_q.data_ptr(),                                                                  \
+            static_cast<DST_DTYPE*>(output_q.data_ptr()),                                         \
             static_cast<uint32_t*>(output_s.data_ptr()),                                          \
             group_size,                                                                           \
             threadchunks_per_block,                                                               \
@@ -270,7 +269,7 @@ void sgl_per_token_group_quant_8bit(
       } else {                                                                                    \
         per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, false><<<grid, block, 0, stream>>>( \
             static_cast<T*>(input.data_ptr()),                                                    \
-            output_q.data_ptr(),                                                                  \
+            static_cast<DST_DTYPE*>(output_q.data_ptr()),                                         \
             static_cast<float*>(output_s.data_ptr()),                                             \
             group_size,                                                                           \
             threadchunks_per_block,                                                               \
@@ -285,7 +284,7 @@ void sgl_per_token_group_quant_8bit(
       assert(!scale_ue8m0);                                                                       \
       per_token_group_quant_8bit_kernel<T, DST_DTYPE, false><<<grid, block, 0, stream>>>(         \
           static_cast<T*>(input.data_ptr()),                                                      \
-          output_q.data_ptr(),                                                                    \
+          static_cast<DST_DTYPE*>(output_q.data_ptr()),                                           \
           static_cast<float*>(output_s.data_ptr()),                                               \
           group_size,                                                                             \
           threadchunks_per_block,                                                                 \
