@@ -60,6 +60,16 @@ __device__ __forceinline__ void st_global_v2_s32(const int2* ptr, const int2& va
   asm volatile("st.global.v2.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(value.x), "r"(value.y));
 }
 
+__device__ __forceinline__ float2 fmul2_rn(float2 x, float2 y) {
+  float2 out;
+  uint64_t x_u64 = *reinterpret_cast<uint64_t>(x);
+  uint64_t y_u64 = *reinterpret_cast<uint64_t>(y);
+  asm volatile("mul.rn.f32x2 %0, %1, %2;"
+               : "=l"(out)
+               : "l"(x_u64), "l"(y_u64));
+  return out;
+}
+
 template <
     typename T,
     typename DST_DTYPE,
@@ -156,7 +166,7 @@ __global__ void per_token_group_quant_8bit_kernel(
           static_cast<float>(input_vec[j]),
           static_cast<float>(input_vec[j + 1])
         };
-        float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
+        float2 outputx2 = fmul2_rn(inputx2, y_scale_repeated);
         output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
       }
     } else {
