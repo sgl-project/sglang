@@ -224,20 +224,23 @@ void sgl_per_token_group_quant_8bit(
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  int threadchunks_per_block = 1;
+  int groups_per_block = 1;
 
-  if (num_groups % 16 == 0) {
-    threadchunks_per_block = 16;
+  if (num_groups % 32 == 0) {
+    groups_per_block = 32;
+  } else if (num_groups % 16 == 0) {
+    groups_per_block = 16;
   } else if (num_groups % 8 == 0) {
-    threadchunks_per_block = 8;
+    groups_per_block = 8;
   } else if (num_groups % 4 == 0) {
-    threadchunks_per_block = 4;
+    groups_per_block = 4;
   } else if (num_groups % 2 == 0) {
-    threadchunks_per_block = 2;
+    groups_per_block = 2;
   }
 
   auto dst_type = output_q.scalar_type();
-  const int num_blocks = num_groups / threadchunks_per_block / NUM_GROUPS_PER_THREADCHUNK;
+  const int threadchunks_per_block = groups_per_block / NUM_GROUPS_PER_THREADCHUNK;
+  const int num_blocks = num_groups / threadchunks_per_block;
   const int num_threads = threadchunks_per_block * THREADS_PER_THREADCHUNK;
 
   const bool is_column_major = output_s.stride(0) < output_s.stride(1);
