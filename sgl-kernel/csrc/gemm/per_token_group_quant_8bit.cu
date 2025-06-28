@@ -59,6 +59,19 @@ __device__ __forceinline__ void st_global_v2_s32(const int2* ptr, const int2& va
   asm volatile("st.global.v2.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(value.x), "r"(value.y));
 }
 
+template <typename T>
+struct Vec2Type;
+
+template <>
+struct Vec2Type<__nv_bfloat16> {
+    using type = __nv_bfloat162;
+};
+
+template <>
+struct Vec2Type<__half> {
+    using type = __half2;
+};
+
 template <
     typename T,
     typename DST_DTYPE,
@@ -88,6 +101,8 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
+
+  using Tx2 = typename Vec2Type<T>::type;
 
   const T* group_input = input + block_group_offset;
   DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + block_group_offset;
