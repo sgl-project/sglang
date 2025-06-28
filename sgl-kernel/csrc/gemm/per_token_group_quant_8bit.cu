@@ -130,6 +130,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   float y_scale, y_scale_inv;
   calculate_fp8_scales<SCALE_UE8M0>(local_absmax, y_scale, y_scale_inv, max_8bit, max_8bit_inv);
+  float2 y_scale_repeated = {y_scale, y_scale};
 
   scale_element_t y_scale_inv_quant = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
 
@@ -150,11 +151,12 @@ __global__ void per_token_group_quant_8bit_kernel(
 
 #pragma unroll
       for (uint32_t j = 0; j < vec_size; j += 2) {
-        float2 valx2 = {
-          static_cast<float>(input_vec[j]) * y_scale,
-          static_cast<float>(input_vec[j + 1]) * y_scale
+        float2 inputx2 = {
+          static_cast<float>(input_vec[j]),
+          static_cast<float>(input_vec[j + 1])
         };
-        output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(valx2, __NV_SATFINITE, __NV_E4M3);
+        float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
+        output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
       }
     } else {
       const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
