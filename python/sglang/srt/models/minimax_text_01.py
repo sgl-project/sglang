@@ -937,8 +937,8 @@ def default_weight_loader(
         if param.numel() == 1 and loaded_weight.numel() == 1:
             param.data.fill_(loaded_weight.item())
         else:
-            assert param.size() == loaded_weight.size() (
-                f"Attempted to lead weight ({loaded_weight.size()})"
+            assert param.size() == loaded_weight.size(), (
+                f"Attempted to load weight ({loaded_weight.size()}) "
                 f"into parameter ({param.size()})"
             )
             param.data.copy_(loaded_weight)
@@ -1260,8 +1260,11 @@ class MiniMaxText01ForCausalLM(nn.Module):
                         device=device),
         })
     
-    def load_weights(self, weights: Iterable[tuple[str,
-                                                   torch.Tensor]]) -> set[str]:
+    def load_weights(
+        self, 
+        weights: Iterable[tuple[str,
+        torch.Tensor]],
+    ) -> set[str]:
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
