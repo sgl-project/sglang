@@ -324,7 +324,7 @@ class ServerArgs:
                 elif gpu_mem < 160 * 1024:  # H100, H200, A100, H20
                     self.chunked_prefill_size = 8192
                 else:  # B200, MI300
-                    self.chunked_prefill_size = 16384
+                    self.chunked_prefill_size = 8192
             else:
                 self.chunked_prefill_size = 4096
         assert self.chunked_prefill_size % self.page_size == 0

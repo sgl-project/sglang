@@ -27,7 +27,6 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
-    is_flashinfer_available
 )
 
 _is_cuda = is_cuda()
@@ -172,11 +171,10 @@ class RMSNorm(CustomOp):
         """
         Forward method with allreduce fusion, prioritizing flashinfer fused operations
         """
-        if is_flashinfer_available() and residual is not None:
+        if residual is not None:
             from sglang.srt.layers.flashinfer_comm_fusion import flashinfer_allreduce_add_rmsnorm
             from sglang.srt.distributed import get_tensor_model_parallel_world_size
             
-            # Only use fusion operation in multi-GPU environment
             if get_tensor_model_parallel_world_size() > 1:
                 fused_result = flashinfer_allreduce_add_rmsnorm(
                     input_tensor=x,

@@ -19,6 +19,8 @@ from typing import Dict, Optional
 
 import torch.distributed
 
+from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -397,7 +399,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if hidden_states.shape[0] != 0:
                 hidden_states = layernorm(hidden_states)
         else:
-            if hasattr(layernorm, 'forward_with_allreduce_fusion'):
+            if is_sm100_supported() and is_flashinfer_available() and hasattr(layernorm, 'forward_with_allreduce_fusion'):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(hidden_states, residual)
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
