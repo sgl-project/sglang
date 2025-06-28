@@ -57,9 +57,6 @@ __forceinline__ __device__ OUT_DTYPE_T extract_required_scale_format(float value
 template <
     typename T,
     typename DST_DTYPE,
-    const float MIN_8BIT,
-    const float MAX_8BIT,
-    const float MAX_8BIT_INV,
     bool IS_COLUMN_MAJOR = false,
     bool SCALE_UE8M0 = false,
     typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>>
@@ -71,6 +68,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int num_groups,
     const int groups_per_block,
     const float eps,
+    const float min_8bit,
+    const float max_8bit,
     const int scale_num_rows = 0,
     const int scale_stride = 0) {
   const int threads_per_group = 16;
@@ -139,7 +138,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 #pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
       float val = static_cast<float>(input_vec[j]);
-      float q_val = fminf(fmaxf(val * y_scale, MIN_8BIT), MAX_8BIT);
+      float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
       group_output[i * vec_size + j] = DST_DTYPE(q_val);
     }
   }
@@ -186,15 +185,13 @@ void sgl_per_token_group_quant_8bit(
   const int scale_num_rows = output_s.size(1);
   const int scale_stride = output_s.stride(1);
 
-  const double max_8bit_inv = 1.0f / max_8bit;
-
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
   do {                                                                                            \
     dim3 grid(num_blocks);                                                                        \
     dim3 block(num_threads);                                                                      \
     if (is_column_major) {                                                                        \
       if (scale_ue8m0) {                                                                          \
-        per_token_group_quant_8bit_kernel<T, DST_DTYPE, min_8bit, max_8bit, max_8bit_inv, true, true><<<grid, block, 0, stream>>>(  \
+        per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, true><<<grid, block, 0, stream>>>(  \
             static_cast<T*>(input.data_ptr()),                                                    \
             output_q.data_ptr(),                                                                  \
             static_cast<uint32_t*>(output_s.data_ptr()),                                          \
@@ -207,7 +204,7 @@ void sgl_per_token_group_quant_8bit(
             scale_num_rows,                                                                       \
             scale_stride);                                                                        \
       } else {                                                                                    \
-        per_token_group_quant_8bit_kernel<T, DST_DTYPE, min_8bit, max_8bit, max_8bit_inv, true, false><<<grid, block, 0, stream>>>( \
+        per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, false><<<grid, block, 0, stream>>>( \
             static_cast<T*>(input.data_ptr()),                                                    \
             output_q.data_ptr(),                                                                  \
             static_cast<float*>(output_s.data_ptr()),                                             \
@@ -222,7 +219,7 @@ void sgl_per_token_group_quant_8bit(
       }                                                                                           \
     } else {                                                                                      \
       assert(!scale_ue8m0);                                                                       \
-      per_token_group_quant_8bit_kernel<T, DST_DTYPE, min_8bit, max_8bit, max_8bit_inv, false><<<grid, block, 0, stream>>>(         \
+      per_token_group_quant_8bit_kernel<T, DST_DTYPE, false><<<grid, block, 0, stream>>>(         \
           static_cast<T*>(input.data_ptr()),                                                      \
           output_q.data_ptr(),                                                                    \
           static_cast<float*>(output_s.data_ptr()),                                               \
