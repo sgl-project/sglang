@@ -237,7 +237,7 @@ void sgl_per_token_group_quant_8bit(
   }
 
   auto dst_type = output_q.scalar_type();
-  const int num_blocks = num_groups / threadchunks_per_block;
+  const int num_blocks = num_groups / threadchunks_per_block / NUM_GROUPS_PER_THREADCHUNK;
   const int num_threads = threadchunks_per_block * THREADS_PER_THREADCHUNK;
 
   const bool is_column_major = output_s.stride(0) < output_s.stride(1);
