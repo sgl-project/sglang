@@ -127,7 +127,6 @@ __global__ void per_token_group_quant_8bit_kernel(
   }
 
   constexpr uint32_t VEC_SIZE = VEC_NUM_BYTES / sizeof(T);
-  const int32_t num_vec_elems = group_size / VEC_SIZE;
 
   int4 input_int4[INPUT_INT4_SIZE];
   T* input_vec = reinterpret_cast<T*>(input_int4);
@@ -230,8 +229,7 @@ void sgl_per_token_group_quant_8bit(
   do {                                                                                            \
     /* TODO do not copy paste */                                                                  \
     constexpr uint32_t VEC_SIZE = VEC_NUM_BYTES / sizeof(T);                                      \
-    const int32_t num_vec_elems = group_size / VEC_SIZE;                                          \
-    TORCH_CHECK(THREADS_PER_GROUP == num_vec_elems);                                              \
+    TORCH_CHECK(THREADS_PER_GROUP == group_size / VEC_SIZE);                                      \
                                                                                                   \
     dim3 grid(num_blocks);                                                                        \
     dim3 block(num_threads);                                                                      \
