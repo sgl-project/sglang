@@ -70,6 +70,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     const float eps,
     const float min_8bit,
     const float max_8bit,
+    const float max_8bit_inv,
     const int scale_num_rows = 0,
     const int scale_stride = 0) {
   const int threads_per_group = 16;
@@ -184,6 +185,8 @@ void sgl_per_token_group_quant_8bit(
   const bool is_column_major = output_s.stride(0) < output_s.stride(1);
   const int scale_num_rows = output_s.size(1);
   const int scale_stride = output_s.stride(1);
+  
+  const double max_8bit_inv = 1.0f / max_8bit;
 
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
   do {                                                                                            \
@@ -201,6 +204,7 @@ void sgl_per_token_group_quant_8bit(
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
             (float)max_8bit,                                                                      \
+            (float)max_8bit_inv,                                                                      \
             scale_num_rows,                                                                       \
             scale_stride);                                                                        \
       } else {                                                                                    \
@@ -214,6 +218,7 @@ void sgl_per_token_group_quant_8bit(
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
             (float)max_8bit,                                                                      \
+            (float)max_8bit_inv,                                                                      \
             scale_num_rows,                                                                       \
             scale_stride);                                                                        \
       }                                                                                           \
@@ -228,7 +233,9 @@ void sgl_per_token_group_quant_8bit(
           groups_per_block,                                                                       \
           (float)eps,                                                                             \
           (float)min_8bit,                                                                        \
-          (float)max_8bit);                                                                       \
+          (float)max_8bit, \
+            (float)max_8bit_inv                                                                      \
+          );                                                                       \
     }                                                                                             \
   } while (0)
 
