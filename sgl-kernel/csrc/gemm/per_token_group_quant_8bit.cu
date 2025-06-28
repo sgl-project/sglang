@@ -251,9 +251,9 @@ void sgl_per_token_group_quant_8bit(
     if (is_column_major) {                                                                        \
       if (scale_ue8m0) {                                                                          \
         per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, true><<<grid, block, 0, stream>>>(  \
-            static_cast<T*>(input.data_ptr()),                                                    \
-            output_q.data_ptr(),                                                                  \
-            static_cast<uint32_t*>(output_s.data_ptr()),                                          \
+            input.data_ptr<T>(),                                                                  \
+            output_q.data_ptr<DST_DTYPE>(),                                                       \
+            output_s.data_ptr<uint32_t>(),                                                        \
             group_size,                                                                           \
             threadchunks_per_block,                                                               \
             (float)eps,                                                                           \
@@ -264,9 +264,9 @@ void sgl_per_token_group_quant_8bit(
             scale_stride);                                                                        \
       } else {                                                                                    \
         per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, false><<<grid, block, 0, stream>>>( \
-            static_cast<T*>(input.data_ptr()),                                                    \
-            output_q.data_ptr(),                                                                  \
-            static_cast<float*>(output_s.data_ptr()),                                             \
+            input.data_ptr<T>(),                                                                  \
+            output_q.data_ptr<DST_DTYPE>(),                                                       \
+            output_s.data_ptr<float>(),                                                           \
             group_size,                                                                           \
             threadchunks_per_block,                                                               \
             (float)eps,                                                                           \
@@ -279,9 +279,9 @@ void sgl_per_token_group_quant_8bit(
     } else {                                                                                      \
       assert(!scale_ue8m0);                                                                       \
       per_token_group_quant_8bit_kernel<T, DST_DTYPE, false><<<grid, block, 0, stream>>>(         \
-          static_cast<T*>(input.data_ptr()),                                                      \
-          output_q.data_ptr(),                                                                    \
-          static_cast<float*>(output_s.data_ptr()),                                               \
+          input.data_ptr<T>(),                                                                    \
+          output_q.data_ptr<DST_DTYPE>(),                                                         \
+          output_s.data_ptr<float>(),                                                             \
           group_size,                                                                             \
           threadchunks_per_block,                                                                 \
           (float)eps,                                                                             \
