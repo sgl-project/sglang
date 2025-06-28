@@ -174,7 +174,8 @@ __global__ void per_token_group_quant_8bit_kernel(
 
 #pragma unroll
       for (uint32_t j = 0; j < VEC_TYPED_SIZE_PER_ITERATION; j += 2) {
-        float2 inputx2 = {static_cast<float>(input_vec_curr_iteration[j]), static_cast<float>(input_vec_curr_iteration[j + 1])};
+        float2 inputx2 = {
+            static_cast<float>(input_vec_curr_iteration[j]), static_cast<float>(input_vec_curr_iteration[j + 1])};
         float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
         output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
       }
