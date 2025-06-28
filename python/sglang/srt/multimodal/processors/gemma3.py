@@ -1,27 +1,31 @@
 import re
-from typing import Any, Dict, List, Optional, Union
+from typing import Dict, List, Union
 
-import torch
-
-from sglang.srt.managers.multimodal_processors.base_processor import (
+from sglang.srt.managers.multimodal_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.managers.multimodal_processors.base_processor import (
-    MultimodalSpecialTokens,
-)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.models.kimi_vl import KimiVLForConditionalGeneration
+from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
+from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+
+# Copied from: https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/image_processing_gemma3_fast.py
+# will be removed in the future
 
 
-# Compatible with KimiVLForConditionalGeneration
-class KimiVLImageProcessor(SGLangBaseProcessor):
-    models = [KimiVLForConditionalGeneration]
+class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
+    models = [Gemma3ForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor):
         super().__init__(hf_config, server_args, _processor)
-        self.IMAGE_TOKEN = "<|media_pad|>"
-        self.IMAGE_TOKEN_REGEX = re.compile(r"(?:<\|media_pad\|>)+")
-        self.IM_TOKEN_ID = _processor.tokenizer.convert_tokens_to_ids(self.IMAGE_TOKEN)
+        # The single, pre-expanded image token.
+        self.IMAGE_TOKEN = "<start_of_image>"
+        # The regex that matches expanded image tokens.
+        self.IMAGE_TOKEN_REGEX = re.compile(
+            r"<start_of_image>(?:(?:<image_soft_token>)*<end_of_image>)?"
+        )
+        self.IM_START_TOKEN_ID = hf_config.boi_token_index
+        self.IM_END_TOKEN_ID = hf_config.eoi_token_index
+        self.IM_TOKEN_ID = hf_config.image_token_index
 
     async def process_mm_data_async(
         self,
@@ -44,6 +48,7 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
                 image_token=self.IMAGE_TOKEN, image_token_regex=self.IMAGE_TOKEN_REGEX
             ),
             max_req_input_len=max_req_input_len,
+            discard_alpha_channel=True,
         )
 
         combined_mm_item, input_ids = self.process_and_combine_mm_data(base_output)
@@ -51,5 +56,6 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": [combined_mm_item] if combined_mm_item is not None else [],
-            "im_token_id": self.IM_TOKEN_ID,
+            "im_start_id": self.IM_START_TOKEN_ID,
+            "im_end_id": self.IM_END_TOKEN_ID,
         }
