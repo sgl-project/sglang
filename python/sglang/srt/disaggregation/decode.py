@@ -433,9 +433,7 @@ class DecodePreallocQueue:
             else 0
         )
 
-        available_size = self.token_to_kv_pool_allocator.available_size()
-
-        allocatable_tokens = available_size - max(
+        allocatable_tokens = self.token_to_kv_pool_allocator.available_size() - max(
             # preserve some space for future decode
             self.num_reserved_decode_tokens
             * (

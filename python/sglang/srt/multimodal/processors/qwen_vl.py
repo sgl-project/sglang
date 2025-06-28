@@ -7,15 +7,13 @@ import torch
 from PIL import Image
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.multimodal_processors.base_processor import (
-    BaseMultimodalProcessor as SGLangBaseProcessor,
-)
-from sglang.srt.managers.multimodal_processors.base_processor import (
-    MultimodalSpecialTokens,
-)
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor as SGLangBaseProcessor,
+)
+from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 
 
 # Compatible with Qwen2VL and Qwen2_5VL

@@ -20,12 +20,12 @@ from typing import List, Union
 
 import torch
 
-from sglang.srt.managers.multimodal_processors.base_processor import (
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.models.deepseek_vl2 import DeepseekVL2ForCausalLM
+from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.models.deepseek_vl2 import DeepseekVL2ForCausalLM
 
 
 class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
