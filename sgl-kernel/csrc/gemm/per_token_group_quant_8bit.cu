@@ -108,8 +108,6 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int block_threadchunk_id = blockIdx.x * threadchunks_per_block;
   const int global_threadchunk_id = block_threadchunk_id + local_threadchunk_id;
 
-  float local_absmax = eps;
-
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
@@ -144,6 +142,8 @@ __global__ void per_token_group_quant_8bit_kernel(
         + lane_id * VEC_TYPED_SIZE / NUM_GROUPS_PER_THREADCHUNK
     ));
   }
+
+  float local_absmax = eps;
 
 #pragma unroll
   for (uint32_t j = 0; j < VEC_TYPED_SIZE; ++j) {
