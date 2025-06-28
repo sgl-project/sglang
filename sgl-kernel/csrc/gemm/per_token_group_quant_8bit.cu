@@ -112,7 +112,6 @@ __global__ void per_token_group_quant_8bit_kernel(
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
-  DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + global_group_id * GROUP_SIZE_CONST;
   scale_element_t* scale_output;
 
   // TODO not handled multi-group scale output yet!
@@ -191,7 +190,11 @@ __global__ void per_token_group_quant_8bit_kernel(
       }
     }
 
-    st_global(reinterpret_cast<int4*>(group_output + lane_id * VEC_TYPED_SIZE_PER_ITERATION), output_buf);
+    st_global(
+        reinterpret_cast<int4*>(
+            static_cast<DST_DTYPE*>(output_q) + global_group_id * GROUP_SIZE_CONST +
+            lane_id * VEC_TYPED_SIZE_PER_ITERATION),
+        output_buf);
   }
 }
 
