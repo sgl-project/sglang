@@ -1,4 +1,5 @@
 import itertools
+import os
 import time
 from functools import partial
 from pathlib import Path
@@ -20,46 +21,46 @@ _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 
-# num_tokens_range = [768]
-# hidden_dim_range = [18432]  # For DeepSeek V3/R1
-# group_size_range = [128]  # For DeepSeek V3/R1
-# dst_dtype_range = [fp8_type_]
-# flags_range = [
-#     dict(
-#         column_major_scales=True,
-#         scale_tma_aligned=True,
-#         scale_ue8m0=True,
-#     ),
-# ]
-
-
-num_tokens_range = [1, 4, 16, 64, 256, 768, 2048, 8192, 16384]
-hidden_dim_range = [1536, 7168, 18432]  # For DeepSeek V3/R1
-group_size_range = [128]  # For DeepSeek V3/R1
-# TODO test int8
-dst_dtype_range = [fp8_type_]
-flags_range = [
-    dict(
-        column_major_scales=False,
-        scale_tma_aligned=False,
-        scale_ue8m0=False,
-    ),
-    dict(
-        column_major_scales=True,
-        scale_tma_aligned=False,
-        scale_ue8m0=False,
-    ),
-    dict(
-        column_major_scales=True,
-        scale_tma_aligned=True,
-        scale_ue8m0=False,
-    ),
-    dict(
-        column_major_scales=True,
-        scale_tma_aligned=True,
-        scale_ue8m0=True,
-    ),
-]
+if int(os.environ.get("SGLANG_NSYS_PROFILING", "0")):
+    num_tokens_range = [768]
+    hidden_dim_range = [18432]  # For DeepSeek V3/R1
+    group_size_range = [128]  # For DeepSeek V3/R1
+    dst_dtype_range = [fp8_type_]
+    flags_range = [
+        dict(
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+        ),
+    ]
+else:
+    num_tokens_range = [1, 4, 16, 64, 256, 768, 2048, 8192, 16384]
+    hidden_dim_range = [1536, 7168, 18432]  # For DeepSeek V3/R1
+    group_size_range = [128]  # For DeepSeek V3/R1
+    # TODO test int8
+    dst_dtype_range = [fp8_type_]
+    flags_range = [
+        dict(
+            column_major_scales=False,
+            scale_tma_aligned=False,
+            scale_ue8m0=False,
+        ),
+        dict(
+            column_major_scales=True,
+            scale_tma_aligned=False,
+            scale_ue8m0=False,
+        ),
+        dict(
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=False,
+        ),
+        dict(
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+        ),
+    ]
 
 
 configs = list(
