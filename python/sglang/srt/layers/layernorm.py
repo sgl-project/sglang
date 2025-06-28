@@ -173,7 +173,7 @@ class RMSNorm(CustomOp):
         Forward method with allreduce fusion, prioritizing flashinfer fused operations
         """
         if is_flashinfer_available() and residual is not None:
-            from sglang.python.sglang.srt.layers.flashinfer_comm_fusion import flashinfer_allreduce_add_rmsnorm
+            from sglang.srt.layers.flashinfer_comm_fusion import flashinfer_allreduce_add_rmsnorm
             from sglang.srt.distributed import get_tensor_model_parallel_world_size
             
             # Only use fusion operation in multi-GPU environment
