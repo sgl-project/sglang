@@ -143,7 +143,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 
     int2 output_buf;
 
-    if constexpr (std::is_same_v<T, c10::Float8_e4m3fn>) {
+    if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
       const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
       static_assert(sizeof(output_buf) == vec_size / 2 * sizeof(__nv_fp8x2_storage_t));
       static_assert(vec_size % 2 == 0);
