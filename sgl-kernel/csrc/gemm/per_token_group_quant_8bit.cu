@@ -60,9 +60,14 @@ __forceinline__ __device__ OUT_DTYPE_T extract_required_scale_format(float value
   }
 }
 
+__device__ __forceinline__ void st_global(const int2* ptr, const int2& value) {
+  asm volatile(
+      "st.global.v4.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(value.x), "r"(value.y));
+}
+
 __device__ __forceinline__ void st_global(const int4* ptr, const int4& value) {
   asm volatile(
-      "st.global.v4.s32 [%0], {%1, %2, %3, %4};" ::"l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w));
+      "st.global.v2.s32 [%0], {%1, %2, %3, %4};" ::"l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w));
 }
 
 __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
@@ -167,7 +172,8 @@ __global__ void per_token_group_quant_8bit_kernel(
       *scale_output = y_scale_inv_quant;
     }
 
-    int4 output_buf;
+    // TODO back to int4?
+    int2 output_buf;
     static_assert(sizeof(output_buf) == VEC_TYPED_SIZE_PER_ITERATION * sizeof(DST_DTYPE));
 
     if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
@@ -193,7 +199,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     }
 
     st_global(
-        reinterpret_cast<int4*>(
+        reinterpret_cast<int2*>(
             output_q + global_threadchunk_id * NUM_GROUPS_PER_THREADCHUNK * GROUP_SIZE_CONST +
             +iter_idx * GROUP_SIZE_CONST + lane_id * VEC_TYPED_SIZE_PER_ITERATION),
         output_buf);
