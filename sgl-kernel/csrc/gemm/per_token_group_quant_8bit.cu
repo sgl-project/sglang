@@ -59,6 +59,13 @@ __device__ __forceinline__ void st_global_v2_s32(const int2* ptr, const int2& va
   asm volatile("st.global.v2.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(value.x), "r"(value.y));
 }
 
+__device__  __forceinline__ int4 ld_global_nc(const int4 *ptr) {
+    int4 ret;
+    asm volatile("ld.global.nc.v4.s32 {%0, %1, %2, %3}, [%4];"
+            : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w) : "l"(ptr));
+    return ret;
+}
+
 constexpr int THREADS_PER_GROUP = 16;
 
 template <
@@ -117,8 +124,10 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int32_t num_vec_elems = group_size / vec_size;
 
   for (int32_t i = lane_id; i < num_vec_elems; i += THREADS_PER_GROUP) {
-    vec_t input_vec;
-    input_vec.cast_load(group_input + i * vec_size);
+    int4 input_int4;
+    T* input_vec = reinterpret_cast<T*>(&input_int4);
+    static_assert(sizeof(input_vec) * vec_size = sizeof(input_int4));
+    input_int4 = ld_global_nc(reinterpret_cast<int4*>(group_input + i * vec_size));
 
 #pragma unroll
     for (uint32_t j = 0; j < vec_size; ++j) {
