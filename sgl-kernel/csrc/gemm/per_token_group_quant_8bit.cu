@@ -109,7 +109,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     scale_output = output_s + global_group_id;
   }
 
-  constexpr uint32_t vec_size = 16 / sizeof(T);
+  constexpr uint32_t vec_num_bytes = 16;
+  constexpr uint32_t vec_size = vec_num_bytes / sizeof(T);
   using vec_t = flashinfer::vec_t<T, vec_size>;
 
   const int32_t num_vec_elems = group_size / vec_size;
