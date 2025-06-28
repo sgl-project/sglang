@@ -249,7 +249,7 @@ void sgl_per_token_group_quant_8bit(
     }                                                                                             \
   } while (0)
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), scalar_t, [&] {
     if (dst_type == at::ScalarType::Char) {
       LAUNCH_KERNEL(scalar_t, int8_t);
       return true;
