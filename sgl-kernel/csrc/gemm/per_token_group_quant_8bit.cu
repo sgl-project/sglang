@@ -75,8 +75,6 @@ __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
 constexpr int THREADS_PER_GROUP = 8;
 constexpr int INPUT_INT4_SIZE = 2;
 
-constexpr int SCALE_NUM_ROWS_CONST = 18432 / 128 / 4;
-
 template <
     typename T,
     typename DST_DTYPE,
@@ -114,7 +112,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   if constexpr (IS_COLUMN_MAJOR) {
     constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
-    constexpr int scale_num_rows_element = SCALE_NUM_ROWS_CONST * num_elems_per_pack;
+    const int scale_num_rows_element = scale_num_rows * num_elems_per_pack;
     const int row_idx = global_group_id / scale_num_rows_element;
     const int col_idx_raw = global_group_id % scale_num_rows_element;
     const int col_idx = col_idx_raw / num_elems_per_pack;
@@ -229,8 +227,6 @@ void sgl_per_token_group_quant_8bit(
   const bool is_column_major = output_s.stride(0) < output_s.stride(1);
   const int scale_num_rows = output_s.size(1);
   const int scale_stride = output_s.stride(1);
-
-  CHECK_EQ(scale_num_rows, SCALE_NUM_ROWS_CONST);
 
   const double max_8bit_inv = 1.0f / max_8bit;
 
