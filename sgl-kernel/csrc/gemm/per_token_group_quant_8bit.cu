@@ -88,6 +88,8 @@ template <
     bool IS_COLUMN_MAJOR = false,
     bool SCALE_UE8M0 = false,
     typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>>
+// TODO limit num register?
+__maxnreg__(32)
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
     void* __restrict__ output_q,
