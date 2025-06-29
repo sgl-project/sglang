@@ -34,7 +34,9 @@ if int(os.environ.get("SGLANG_NSYS_PROFILING", "0")):
         ),
     ]
 else:
-    num_tokens_range = [1, 4, 16, 64, 256, 768, 2048, 8192, 16384]
+    # TODO support few tokens
+    # num_tokens_range = [1, 4, 16, 64, 256, 768, 2048, 8192, 16384]
+    num_tokens_range = [4, 16, 64, 256, 768, 2048, 8192, 16384]
     hidden_dim_range = [1536, 7168, 16384]  # For DeepSeek V3/R1
     group_size_range = [128]  # For DeepSeek V3/R1
     # TODO test int8
