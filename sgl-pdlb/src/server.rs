@@ -60,6 +60,17 @@ pub async fn generate(
         .await
 }
 
+#[post("/v1/completions")]
+pub async fn completions(
+    _req: HttpRequest,
+    req: web::Json<GenerateReqInput>,
+    app_state: web::Data<LBState>,
+) -> Result<HttpResponse, actix_web::Error> {
+    app_state
+        .generate("/v1/completions", Box::new(req.into_inner()))
+        .await
+}
+
 #[post("/v1/chat/completions")]
 pub async fn chat_completions(
     _req: HttpRequest,
@@ -162,6 +173,7 @@ pub async fn startup(lb_config: LBConfig, lb_state: LBState) -> std::io::Result<
             .service(get_loads)
             .service(generate)
             .service(chat_completions)
+            .service(completions)
     })
     .bind((lb_config.host, lb_config.port))?
     .run()
