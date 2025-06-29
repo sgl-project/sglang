@@ -112,7 +112,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
 if _is_cuda:
-    from sgl_kernel import awq_dequantize, bmm_fp8, merge_state_v2, router_gemm
+    from sgl_kernel import awq_dequantize, bmm_fp8, merge_state_v2
 elif _is_cpu and _is_cpu_amx_available:
     pass
 else:
@@ -224,11 +224,7 @@ class MoEGate(nn.Module):
                 True,  # is_vnni
             )
 
-        # Use cutomized router gemm for small batch sizes
-        if hidden_states.shape[0] <= 16:
-            logits = router_gemm(hidden_states, self.weight)
-        else:
-            logits = F.linear(hidden_states, self.weight, None)
+        logits = F.linear(hidden_states, self.weight, None)
         return logits
 
 
