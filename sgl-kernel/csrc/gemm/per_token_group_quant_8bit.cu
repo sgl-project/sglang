@@ -140,7 +140,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     for (uint32_t j = 0; j < VEC_INT4_SIZE; ++j) {
       __pipeline_memcpy_async(
         input_prefetch_smem + (wave_index - 1) * THREADS_PER_BLOCK * VEC_INT4_SIZE + threadIdx.x * VEC_INT4_SIZE + j,
-        input + global_group_id * group_size + lane_id * VEC_TYPED_SIZE,
+        input + global_group_id * group_size + lane_id * VEC_TYPED_SIZE + j,
         sizeof(int4)
       );
     }
