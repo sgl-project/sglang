@@ -93,6 +93,7 @@ def test_per_token_group_quant_with_column_major(
             x_q_sglang=x_q_sglang, x_s_sglang=x_s_sglang,
         )
         path = f'/data/numa0/tom/temp_sglang_server2local/test_dump_{time.time()}.pt'
+        print(f"Dump error data to {path=}")
         torch.save(data, path)
         raise
 
