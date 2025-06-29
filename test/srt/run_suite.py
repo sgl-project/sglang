@@ -102,6 +102,7 @@ suites = {
         TestFile("test_vision_openai_server_a.py", 584),
         TestFile("test_vision_openai_server_b.py", 556),
         TestFile("test_w8a8_quantization.py", 46),
+        TestFile("test_reasoning_parser.py", 5),
     ],
     "per-commit-amd": [
         TestFile("models/lora/test_lora_backend.py", 99),
@@ -140,6 +141,7 @@ suites = {
         TestFile("test_update_weights_from_disk.py", 114),
         TestFile("test_vertex_endpoint.py", 31),
         TestFile("test_vision_chunked_prefill.py", 175),
+        TestFile("test_reasoning_parser.py", 5),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
