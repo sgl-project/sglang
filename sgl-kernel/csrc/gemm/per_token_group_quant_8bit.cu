@@ -155,17 +155,17 @@ __global__ void per_token_group_quant_8bit_kernel(
     input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * VEC_TYPED_SIZE) + j);
   }
 
-  T local_absmax_lowbit = eps;
+  T local_absmax_lowprec = eps;
 
 #pragma unroll
   for (uint32_t j = 0; j < VEC_TYPED_SIZE; ++j) {
     const T val = input_vec[j];
     const T abs_val = my_abs(val);
-    local_absmax_lowbit = my_max(local_absmax_lowbit, abs_val);
+    local_absmax_lowprec = my_max(local_absmax_lowprec, abs_val);
   }
 
-  local_absmax_lowbit = GroupReduceMax<T, THREADS_PER_GROUP>(local_absmax_lowbit, lane_id);
-  float local_absmax = (float) local_absmax_lowbit;
+  local_absmax_lowprec = GroupReduceMax<T, THREADS_PER_GROUP>(local_absmax_lowprec, lane_id);
+  float local_absmax = (float) local_absmax_lowprec;
 
   float y_scale, y_scale_inv;
   calculate_fp8_scales<SCALE_UE8M0>(local_absmax, y_scale, y_scale_inv, max_8bit, max_8bit_inv);
