@@ -77,21 +77,22 @@ def test_per_token_group_quant_with_column_major(
     x_q_triton, x_s_triton = triton_per_token_group_quant_8bit(**execute_kwargs)
     x_q_sglang, x_s_sglang = sglang_per_token_group_quant_8bit(**execute_kwargs)
 
-    # torch.set_printoptions(profile="full")
-    # print(f"{x_q_triton=}")
-    # print(f"{x_s_triton=}")
-    # print(f"{x_q_sglang=}")
-    # print(f"{x_s_sglang=}")
-    # torch.set_printoptions(profile="default")
-
-    assert_fp8_all_close(x_q_triton, x_q_sglang)
-    torch.testing.assert_close(
-        x_s_triton.contiguous(),
-        x_s_sglang.contiguous(),
-        rtol=1e-3,
-        atol=1e-5,
-        msg=lambda message: message + f" {x_s_triton=} {x_s_sglang=}",
-    )
+    try:
+        assert_fp8_all_close(x_q_triton, x_q_sglang)
+        torch.testing.assert_close(
+            x_s_triton.contiguous(),
+            x_s_sglang.contiguous(),
+            rtol=1e-3,
+            atol=1e-5,
+        )
+    except AssertionError:
+        torch.set_printoptions(profile="full")
+        print(f"{x_q_triton=}")
+        print(f"{x_s_triton=}")
+        print(f"{x_q_sglang=}")
+        print(f"{x_s_sglang=}")
+        torch.set_printoptions(profile="default")
+        raise
 
 
 if __name__ == "__main__":
