@@ -220,7 +220,7 @@ class MHATokenToKVPool(KVCache):
         logger.info(
             f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
         )
-        self.mem_usage = k_size + v_size
+        self.mem_usage = (k_size + v_size) / GB
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):

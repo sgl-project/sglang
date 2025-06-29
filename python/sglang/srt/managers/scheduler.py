@@ -2121,7 +2121,7 @@ class Scheduler(
             "cuda_graph": round(
                 self.tp_worker.worker.model_runner.cuda_graph_mem_usage, 2
             ),
-            "token_capacity": self.max_total_num_tokens,
+            "token_capacity": int(self.max_total_num_tokens),
         }
         if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
             ret["avg_spec_accept_length"] = (
