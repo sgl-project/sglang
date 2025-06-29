@@ -75,11 +75,11 @@ __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
 
 template <typename dtype_t>
 __host__ __device__ dtype_t ceil_div(dtype_t a, dtype_t b) {
-    return (a + b - 1) / b;
+  return (a + b - 1) / b;
 }
 
 constexpr int THREADS_PER_GROUP = 8;
-constexpr uint32_t VEC_NUM_BYTES = 32;
+constexpr uint32_t VEC_NUM_BYTES_PER_WAVE = 32;
 constexpr int NUM_WAVES_CONSTEXPR = 3;
 
 template <
@@ -106,6 +106,24 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int lane_id = threadIdx.x % THREADS_PER_GROUP;
   const int block_group_id = blockIdx.x * groups_per_block;
 
+  int4 input_int4[VEC_NUM_BYTES_PER_WAVE * NUM_WAVES_CONSTEXPR / sizeof(int4)];
+  constexpr uint32_t VEC_TYPED_SIZE_PER_WAVE = VEC_NUM_BYTES_PER_WAVE / sizeof(T);
+
+#pragma unroll
+  for (int wave_index = 0; wave_index < NUM_WAVES_CONSTEXPR; ++wave_index) {
+    const int global_group_id = block_group_id + local_group_id + wave_index * num_groups_per_wave;
+    if (global_group_id >= num_groups) [[unlikely]] {
+      return;
+    }
+
+    const int block_group_offset = global_group_id * group_size;
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_INT4_SIZE; ++j) {
+      input_int4[j] = ld_global_nc(
+          reinterpret_cast<const int4*>(input + block_group_offset + lane_id * VEC_TYPED_SIZE_PER_WAVE) + j);
+    }
+  }
+
 #pragma unroll
   for (int wave_index = 0; wave_index < NUM_WAVES_CONSTEXPR; ++wave_index) {
     const int global_group_id = block_group_id + local_group_id + wave_index * num_groups_per_wave;
@@ -119,7 +137,6 @@ __global__ void per_token_group_quant_8bit_kernel(
     using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
     static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
-    const T* group_input = input + block_group_offset;
     DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + block_group_offset;
     scale_element_t* scale_output;
 
@@ -137,23 +154,14 @@ __global__ void per_token_group_quant_8bit_kernel(
       scale_output = output_s + global_group_id;
     }
 
-    constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);
-    constexpr uint32_t VEC_INT4_SIZE = VEC_NUM_BYTES / sizeof(int4);
-
-    int4 input_int4[VEC_INT4_SIZE];
-    T* input_vec = reinterpret_cast<T*>(input_int4);
-    static_assert(sizeof(input_vec[0]) * VEC_TYPED_SIZE == sizeof(input_int4));
-
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_INT4_SIZE; ++j) {
-      input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * VEC_TYPED_SIZE) + j);
-    }
+    T* input_vec_local =
+        reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(input_int4) + VEC_NUM_BYTES_PER_WAVE * wave_index);
 
     float local_absmax = eps;
 
 #pragma unroll
-    for (uint32_t j = 0; j < VEC_TYPED_SIZE; ++j) {
-      float val = static_cast<float>(input_vec[j]);
+    for (uint32_t j = 0; j < VEC_TYPED_SIZE_PER_WAVE; ++j) {
+      float val = static_cast<float>(input_vec_local[j]);
       float abs_val = fabsf(val);
       local_absmax = fmaxf(local_absmax, abs_val);
     }
@@ -174,28 +182,28 @@ __global__ void per_token_group_quant_8bit_kernel(
 
     if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
       const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
-      static_assert(sizeof(output_buf) == VEC_TYPED_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
-      static_assert(VEC_TYPED_SIZE % 2 == 0);
+      static_assert(sizeof(output_buf) == VEC_TYPED_SIZE_PER_WAVE / 2 * sizeof(__nv_fp8x2_storage_t));
+      static_assert(VEC_TYPED_SIZE_PER_WAVE % 2 == 0);
 
 #pragma unroll
-      for (uint32_t j = 0; j < VEC_TYPED_SIZE; j += 2) {
-        float2 inputx2 = {static_cast<float>(input_vec[j]), static_cast<float>(input_vec[j + 1])};
+      for (uint32_t j = 0; j < VEC_TYPED_SIZE_PER_WAVE; j += 2) {
+        float2 inputx2 = {static_cast<float>(input_vec_local[j]), static_cast<float>(input_vec_local[j + 1])};
         float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
         output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
       }
     } else {
       const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
-      static_assert(sizeof(output_buf) == VEC_TYPED_SIZE * sizeof(DST_DTYPE));
+      static_assert(sizeof(output_buf) == VEC_TYPED_SIZE_PER_WAVE * sizeof(DST_DTYPE));
 
 #pragma unroll
-      for (uint32_t j = 0; j < VEC_TYPED_SIZE; ++j) {
-        float val = static_cast<float>(input_vec[j]);
+      for (uint32_t j = 0; j < VEC_TYPED_SIZE_PER_WAVE; ++j) {
+        float val = static_cast<float>(input_vec_local[j]);
         float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
         output_buf_ptr[j] = DST_DTYPE(q_val);
       }
     }
 
-    st_global(reinterpret_cast<int4*>(group_output + lane_id * VEC_TYPED_SIZE), output_buf);
+    st_global(reinterpret_cast<int4*>(group_output + lane_id * VEC_TYPED_SIZE_PER_WAVE), output_buf);
   }
 }
 
@@ -254,8 +262,8 @@ void sgl_per_token_group_quant_8bit(
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
   do {                                                                                            \
     /* TODO do not copy paste */                                                                  \
-    constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);                                \
-    TORCH_CHECK(THREADS_PER_GROUP == group_size / VEC_TYPED_SIZE);                                \
+    constexpr uint32_t VEC_TYPED_SIZE_PER_WAVE = VEC_NUM_BYTES_PER_WAVE / sizeof(T);              \
+    TORCH_CHECK(THREADS_PER_GROUP == group_size / VEC_TYPED_SIZE_PER_WAVE);                       \
                                                                                                   \
     dim3 grid(num_blocks);                                                                        \
     dim3 block(num_threads);                                                                      \
