@@ -113,7 +113,6 @@ class ServerArgs:
     api_key: Optional[str] = None
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
-    enable_spec_report: bool = False
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
 
@@ -1010,11 +1009,6 @@ class ServerArgs:
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
-        )
-        parser.add_argument(
-            "--enable-spec-report",
-            action="store_true",
-            help="Return number of tokens accepted by the target model during speculative decoding in usage.spec_verify_ct for each openai request.",
         )
         parser.add_argument(
             "--reasoning-parser",
