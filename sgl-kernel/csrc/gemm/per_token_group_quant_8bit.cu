@@ -83,6 +83,7 @@ constexpr int THREADS_PER_GROUP = 8;
 constexpr uint32_t VEC_NUM_BYTES = 32;
 constexpr int NUM_WAVES_CONSTEXPR = 3;
 constexpr int GROUPS_PER_BLOCK_CONSTEXPR = 16;
+constexpr int THREADS_PER_BLOCK = THREADS_PER_GROUP * GROUPS_PER_BLOCK_CONSTEXPR;
 
 template <
     typename T,
@@ -111,7 +112,6 @@ __global__ void per_token_group_quant_8bit_kernel(
   constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);
   constexpr uint32_t VEC_INT4_SIZE = VEC_NUM_BYTES / sizeof(int4);
 
-  constexpr int THREADS_PER_BLOCK = THREADS_PER_GROUP * GROUPS_PER_BLOCK_CONSTEXPR;
   __shared__ int4 input_prefetch_smem[(NUM_WAVES_CONSTEXPR - 1) * THREADS_PER_BLOCK * VEC_INT4_SIZE];
 
   int4 input_int4[VEC_INT4_SIZE];
@@ -268,6 +268,7 @@ void sgl_per_token_group_quant_8bit(
 
   auto dst_type = output_q.scalar_type();
   const int num_threads = groups_per_block * THREADS_PER_GROUP;
+  CHECK_EQ(num_threads, THREADS_PER_BLOCK);
   // TODO dynamically determine it
   const int blocks_per_sm = 2048 / num_threads;
   CHECK_EQ(blocks_per_sm, 16);
