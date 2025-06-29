@@ -53,8 +53,8 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
     uint32_t num_speculative_tokens,
     uint32_t num_draft_tokens,
     uint32_t d,
-    DType threshold_single,
-    DType threshold_acc) {
+    DType* threshold_singles,
+    DType* threshold_accs) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
   extern __shared__ __align__(alignof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>))
@@ -78,7 +78,8 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
       DType target_prob_single = target_probs[cur_prob_offset + draft_token_id];
       prob_acc += target_prob_single;
 
-      if (coin <= prob_acc / threshold_acc || target_prob_single >= threshold_single) {
+      Dtype threshold_single = threshold_singles[bx * num_draft_tokens] Dtype threshold_acc = threshold_accs
+          [bx * num_draft_tokens] if (coin <= prob_acc / threshold_acc || target_prob_single >= threshold_single) {
         // accept token
         prob_acc = 0.;
         cur_prob_offset = (bx * num_draft_tokens + cur_index) * d;
@@ -88,7 +89,8 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
         accept_index[bx * num_speculative_tokens + num_accepted_tokens] = draft_index;
         last_accepted_retrive_idx = draft_index;
         break;
-      } else {
+      }
+      else {
         // FIXME: leverage draft probs
         draft_probs[cur_prob_offset + draft_token_id] = target_probs[cur_prob_offset + draft_token_id];
         cur_index = retrive_next_sibling[bx * num_draft_tokens + cur_index];

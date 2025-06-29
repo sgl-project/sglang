@@ -442,6 +442,12 @@ class EagleVerifyInput:
             coins_for_final_sampling = torch.rand(
                 (bs,), dtype=torch.float32, device="cuda"
             )
+
+            threshold_singles = torch.ones_like(
+                coins, dtype=torch.float32, device="cuda"
+            )
+            threshold_accs = torch.ones_like(coins, dtype=torch.float32, device="cuda")
+
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
@@ -454,12 +460,8 @@ class EagleVerifyInput:
                 uniform_samples_for_final_sampling=coins_for_final_sampling,
                 target_probs=target_probs,
                 draft_probs=draft_probs,
-                threshold_single=global_server_args_dict[
-                    "speculative_accept_threshold_single"
-                ],
-                threshold_acc=global_server_args_dict[
-                    "speculative_accept_threshold_acc"
-                ],
+                threshold_singles=threshold_singles,
+                threshold_accs=threshold_accs,
                 deterministic=True,
             )
 

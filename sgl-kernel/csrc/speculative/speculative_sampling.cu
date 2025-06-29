@@ -40,8 +40,8 @@ void tree_speculative_sampling_target_only(
     at::Tensor uniform_samples_for_final_sampling,
     at::Tensor target_probs,
     at::Tensor draft_probs,
-    double threshold_single,
-    double threshold_acc,
+    at::Tensor threshold_singles,
+    at::Tensor threshold_accs,
     bool deterministic = true,
     int64_t cuda_stream = 0) {
   CHECK_INPUT(candidates);
@@ -119,8 +119,8 @@ void tree_speculative_sampling_target_only(
   if (draft_probs.scalar_type() != at::kFloat) {
     throw std::runtime_error("Expected 'target_probs' to be of type float (torch.float32).");
   }
-  CHECK_GE(threshold_single, 0);
-  CHECK_GE(1, threshold_single);
+  // CHECK_GE(threshold_single, 0);
+  // CHECK_GE(1, threshold_single);
   CHECK_GE(threshold_acc, 0);
   CHECK_GE(1, threshold_acc);
 
@@ -141,8 +141,8 @@ void tree_speculative_sampling_target_only(
       num_spec_step,
       num_draft_tokens,
       vocab_size,
-      static_cast<float>(threshold_single),
-      static_cast<float>(threshold_acc),
+      static_cast<float*>(threshold_singles.data_ptr()),
+      static_cast<float*>(threshold_accs.data_ptr()),
       deterministic,
       stream);
 
