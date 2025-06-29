@@ -20,7 +20,7 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
         itertools.product(
             # [127, 128, 512, 1024, 4096, 8192],  # num_tokens
             # TODO temp
-            [1],  # num_tokens
+            [4],  # num_tokens
             # [256, 512, 1024, 2048, 4096],  # hidden_dim
             # TODO temp
             # TODO cannot be too small
