@@ -196,50 +196,82 @@ void invokeRouterGemm(float* output, T const* mat_a, T const* mat_b, cudaStream_
         &config, router_gemm_kernel<T, kBlockSize, VPT, kNumTokens, kNumExperts, kHiddenDim>, output, mat_a, mat_b));
 }
 
-template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 1, 256, 7168>(
+template void invokeRouterGemm<__nv_bfloat16, 1, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 2, 256, 7168>(
+template void invokeRouterGemm<__nv_bfloat16, 2, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 3, 256, 7168>(
+template void invokeRouterGemm<__nv_bfloat16, 3, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 4, 256, 7168>(
+template void invokeRouterGemm<__nv_bfloat16, 4, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 5, 256, 7168>(
+template void invokeRouterGemm<__nv_bfloat16, 5, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 6, 256, 7168>(
+template void invokeRouterGemm<__nv_bfloat16, 6, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 7, 256, 7168>(
+template void invokeRouterGemm<__nv_bfloat16, 7, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 8, 256, 7168>(
+template void invokeRouterGemm<__nv_bfloat16, 8, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 9, 256, 7168>(
+template void invokeRouterGemm<__nv_bfloat16, 9, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 10, 256, 7168>(
+template void invokeRouterGemm<__nv_bfloat16, 10, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 11, 256, 7168>(
+template void invokeRouterGemm<__nv_bfloat16, 11, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 12, 256, 7168>(
+template void invokeRouterGemm<__nv_bfloat16, 12, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 13, 256, 7168>(
+template void invokeRouterGemm<__nv_bfloat16, 13, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 14, 256, 7168>(
+template void invokeRouterGemm<__nv_bfloat16, 14, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 15, 256, 7168>(
+template void invokeRouterGemm<__nv_bfloat16, 15, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 16, 256, 7168>(
+template void invokeRouterGemm<__nv_bfloat16, 16, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
+
+
+void router_gemm(
+    torch::Tensor& output,          // [num_tokens, num_experts]
+    torch::Tensor& mat_a,           // [num_tokens, hidden_dim]
+    torch::Tensor& mat_b,           // [num_experts, hidden_dim]
+)
+{
+    CHECK_INPUT(output);
+    CHECK_INPUT(mat_a);
+    CHECK_INPUT(mat_b);
+  
+    const int num_experts = mat_b.size(0);
+    const int num_tokens = mat_a.size(0);
+    const int hidden_dim = mat_a.size(1);
+
+    TORCH_CHECK(mat_a.size(1) == mat_b.size(1), "mat_a and mat_b must have the same hidden_dim");
+    TORCH_CHECK(num_tokens <= 16, "Currently num_tokens must be less than or equal to 16 for router_gemm");
+    TORCH_CHECK(mat_a.dtype() == torch::kBFloat16, "mat_a must be bf16");
+    TORCH_CHECK(mat_b.dtype() == torch::kBFloat16, "mat_b must be bf16");
+    TORCH_CHECK(output.dtype() == torch::kBFloat16, "output must be bf16");
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    invokeRouterGemm<__nv_bfloat16, num_tokens, num_experts, hidden_dim>(
+        static_cast<__nv_bfloat16*>(output.data_ptr()),
+        static_cast<__nv_bfloat16*>(mat_a.data_ptr()),
+        static_cast<__nv_bfloat16*>(mat_b.data_ptr()),
+        stream
+    );
+}
