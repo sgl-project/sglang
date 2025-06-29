@@ -1,6 +1,8 @@
 import json
 import random
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -84,17 +86,21 @@ class TestServerUpdateWeightsFromDisk(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def run_decode(self):
+    def _run_decode(self, max_new_tokens=32):
         response = requests.post(
             self.base_url + "/generate",
             json={
                 "text": "The capital of France is",
-                "sampling_params": {"temperature": 0, "max_new_tokens": 32},
+                "sampling_params": {"temperature": 0, "max_new_tokens": max_new_tokens},
             },
         )
+        return response.json()
+
+    def run_decode(self):
+        response = self._run_decode()
         print("=" * 100)
-        print(f"[Server Mode] Generated text: {response.json()['text']}")
-        return response.json()["text"]
+        print(f"[Server Mode] Generated text: {response['text']}")
+        return response["text"]
 
     def get_model_info(self):
         response = requests.get(self.base_url + "/get_model_info")
@@ -102,10 +108,13 @@ class TestServerUpdateWeightsFromDisk(CustomTestCase):
         print(json.dumps(response.json()))
         return model_path
 
-    def run_update_weights(self, model_path):
+    def run_update_weights(self, model_path, abort_all_requests=False):
         response = requests.post(
             self.base_url + "/update_weights_from_disk",
-            json={"model_path": model_path},
+            json={
+                "model_path": model_path,
+                "abort_all_requests": abort_all_requests,
+            },
         )
         ret = response.json()
         print(json.dumps(ret))
@@ -151,6 +160,33 @@ class TestServerUpdateWeightsFromDisk(CustomTestCase):
 
         updated_response = self.run_decode()
         self.assertEqual(origin_response[:32], updated_response[:32])
+
+    def test_update_weights_abort_all_requests(self):
+        origin_model_path = self.get_model_info()
+        print(f"[Server Mode] origin_model_path: {origin_model_path}")
+
+        num_requests = 32
+        with ThreadPoolExecutor(num_requests) as executor:
+            futures = [
+                executor.submit(self._run_decode, 16000) for _ in range(num_requests)
+            ]
+
+            # ensure the decode has been started
+            time.sleep(2)
+
+            new_model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST.replace("-Instruct", "")
+            ret = self.run_update_weights(new_model_path, abort_all_requests=True)
+            self.assertTrue(ret["success"])
+
+            for future in as_completed(futures):
+                self.assertEqual(
+                    future.result()["meta_info"]["finish_reason"]["type"], "abort"
+                )
+
+        updated_model_path = self.get_model_info()
+        print(f"[Server Mode] updated_model_path: {updated_model_path}")
+        self.assertEqual(updated_model_path, new_model_path)
+        self.assertNotEqual(updated_model_path, origin_model_path)
 
 
 ###############################################################################
