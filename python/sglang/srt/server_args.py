@@ -927,8 +927,8 @@ class ServerArgs:
             "--log-requests-level",
             type=int,
             default=0,
-            help="0: Log metadata. 1. Log metadata and partial input/output. 2. Log every input/output.",
-            choices=[0, 1, 2],
+            help="0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial input/output. 3: Log every input/output.",
+            choices=[0, 1, 2, 3],
         )
         parser.add_argument(
             "--show-time-cost",

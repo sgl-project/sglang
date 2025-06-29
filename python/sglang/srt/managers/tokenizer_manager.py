@@ -1096,12 +1096,31 @@ class TokenizerManager:
                         "image_data",
                         "audio_data",
                         "lora_path",
+                        "sampling_params",
                     ]
                 )
                 out_skip_names = set(["text", "output_ids", "embedding"])
             elif self.log_requests_level == 1:
-                max_length = 2048
+                max_length = 1 << 30
+                skip_names = set(
+                    [
+                        "text",
+                        "input_ids",
+                        "input_embeds",
+                        "image_data",
+                        "audio_data",
+                        "lora_path",
+                    ]
+                )
+                out_skip_names = set(
+                    [
+                        "text",
+                        "output_ids",
+                    ]
+                )
             elif self.log_requests_level == 2:
+                max_length = 2048
+            elif self.log_requests_level == 3:
                 max_length = 1 << 30
             else:
                 raise ValueError(
