@@ -436,7 +436,7 @@ class BaseMultimodalProcessor(ABC):
                 values[k] = v
         return values
 
-    def _create_mm_items_from_dict(self, data_dict: dict) -> List[MultimodalDataItem]:
+    def collect_mm_items_from_processor_output(self, data_dict: dict) -> List[MultimodalDataItem]:
         """Create mm_items directly from processor output."""
         items = {}  # modality -> MultimodalDataItem
 
@@ -469,7 +469,7 @@ class BaseMultimodalProcessor(ABC):
 
         return list(items.values())
 
-    def _process_and_create_mm_items(
+    def _process_and_collect_mm_items(
         self, input_text: str, images=None, audios=None, videos=None, **kwargs
     ) -> Tuple[List[MultimodalDataItem], torch.Tensor]:
         """
@@ -483,9 +483,9 @@ class BaseMultimodalProcessor(ABC):
         )
 
         input_ids = ret["input_ids"].flatten()
-        created_items = self._create_mm_items_from_dict(ret)
+        collected_items = self.collect_mm_items_from_processor_output(ret)
 
-        return created_items, input_ids
+        return collected_items, input_ids
 
     def process_and_combine_mm_data(
         self, base_output: BaseMultiModalProcessorOutput
@@ -521,21 +521,21 @@ class BaseMultimodalProcessor(ABC):
                 raise ValueError(f"Unknown multimodal item type: {type(item)}")
 
         # Process items and get input_ids
-        all_created_items = []
+        all_collected_items = []
         input_ids = None
 
         # Handle dict items (already processed)
         for dict_item in dict_items:
-            all_created_items.extend(self._create_mm_items_from_dict(dict_item))
+            all_collected_items.extend(self.collect_mm_items_from_processor_output(dict_item))
 
         # Handle raw items (need processing)
         if raw_images or raw_audios:
-            created_items, input_ids = self._process_and_create_mm_items(
+            collected_items, input_ids = self._process_and_collect_mm_items(
                 input_text=base_output.input_text,
                 images=raw_images,
                 audios=raw_audios,
             )
-            all_created_items.extend(created_items)
+            all_collected_items.extend(collected_items)
 
         # Fallback tokenization if no raw items were processed
         if input_ids is None:
@@ -546,7 +546,7 @@ class BaseMultimodalProcessor(ABC):
             ).input_ids.flatten()
 
         # Add offsets to all items
-        for mm_item in all_created_items:
+        for mm_item in all_collected_items:
             if mm_item.modality in [Modality.IMAGE, Modality.MULTI_IMAGES]:
                 mm_item.image_offsets = self.get_mm_items_offset(
                     input_ids=input_ids,
@@ -565,4 +565,4 @@ class BaseMultimodalProcessor(ABC):
             else:
                 raise ValueError(f"Unknown modality: {mm_item.modality}")
 
-        return all_created_items, input_ids
+        return all_collected_items, input_ids
