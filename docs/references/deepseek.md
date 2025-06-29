@@ -14,6 +14,7 @@ To run DeepSeek V3/R1 models, the requirements are as follows:
 | **Full precision FP8**<br>*(recommended)* | 8 x H200 |
 | | 8 x MI300X |
 | | 2 x 8 x H100/800/20 |
+| | 32 x L40S |
 | **Full precision BF16** | 2 x 8 x H200 |
 | | 2 x 8 x MI300X |
 | | 4 x 8 x H100/800/20 |
@@ -57,6 +58,7 @@ Detailed commands for reference:
 - [8 x H200](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended)
 - [8 x MI300X](https://docs.sglang.ai/references/amd.html#running-deepseek-v3)
 - [2 x 8 x H200](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-two-h208-nodes)
+- [32 x L40S (FP8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-32-l40s-with-resizing-fp8-quantization-block-to-64x64)
 - [4 x 8 x A100](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-four-a1008-nodes)
 - [8 x A100 (AWQ)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-8-a100a800-with-awq-quantization)
 - [16 x A100 (int8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-16-a100a800-with-int8-quantization)
