@@ -109,7 +109,7 @@ class TestAbortRequest(CustomTestCase):
 
         completion_thread = threading.Thread(target=run_completion)
         completion_thread.start()
-        time.sleep(0.01)
+        time.sleep(0.1)
         
         abort_response = self._send_abort_request(request_id)
         completion_thread.join()
