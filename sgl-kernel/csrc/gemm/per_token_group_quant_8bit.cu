@@ -80,6 +80,7 @@ __host__ __device__ dtype_t ceil_div(dtype_t a, dtype_t b) {
 
 constexpr int THREADS_PER_GROUP = 8;
 constexpr uint32_t VEC_NUM_BYTES = 32;
+constexpr int NUM_WAVES_CONSTEXPR = 3;
 
 template <
     typename T,
@@ -94,7 +95,6 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int group_size,
     const int num_groups,
     const int num_groups_per_wave,
-    const int num_waves,
     const int groups_per_block,
     const float eps,
     const float min_8bit,
@@ -107,7 +107,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int block_group_id = blockIdx.x * groups_per_block;
 
 #pragma unroll
-  for (int wave_index = 0; wave_index < num_waves; ++wave_index) {
+  for (int wave_index = 0; wave_index < NUM_WAVES_CONSTEXPR; ++wave_index) {
     const int global_group_id = block_group_id + local_group_id + wave_index * num_groups_per_wave;
     // TODO optimize
     if (global_group_id >= num_groups) [[unlikely]] {
@@ -236,10 +236,12 @@ void sgl_per_token_group_quant_8bit(
 
   auto dst_type = output_q.scalar_type();
   const int num_threads = groups_per_block * THREADS_PER_GROUP;
-  // TODO ensure really have 2048 threads (there is API?)
+  // TODO dynamically determine it
   const int blocks_per_sm = 2048 / num_threads;
+  CHECK_EQ(blocks_per_sm, 16);
   const int num_blocks = num_sms * blocks_per_sm;
   const int num_waves = ceil_div(num_groups, groups_per_block * num_blocks);
+  CHECK_EQ(num_waves, NUM_WAVES_CONSTEXPR);
 
   const int num_groups_per_wave = num_blocks * groups_per_block;
 
@@ -266,7 +268,6 @@ void sgl_per_token_group_quant_8bit(
             group_size,                                                                           \
             num_groups,                                                                           \
             num_groups_per_wave,                                                                  \
-            num_waves,                                                                            \
             groups_per_block,                                                                     \
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
@@ -282,7 +283,6 @@ void sgl_per_token_group_quant_8bit(
             group_size,                                                                           \
             num_groups,                                                                           \
             num_groups_per_wave,                                                                  \
-            num_waves,                                                                            \
             groups_per_block,                                                                     \
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
@@ -300,7 +300,6 @@ void sgl_per_token_group_quant_8bit(
           group_size,                                                                             \
           num_groups,                                                                             \
           num_groups_per_wave,                                                                    \
-          num_waves,                                                                              \
           groups_per_block,                                                                       \
           (float)eps,                                                                             \
           (float)min_8bit,                                                                        \
