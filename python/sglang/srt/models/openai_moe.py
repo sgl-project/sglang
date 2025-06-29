@@ -71,7 +71,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.model_loader.weight_utils import default_weight_loader, sharded_weight_loader
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher, model_forward_maybe_tbo
 from sglang.srt.utils import DeepEPMode, add_prefix, is_non_idle_and_non_empty, make_layers
 
