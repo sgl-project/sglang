@@ -341,10 +341,6 @@ class MultimodalInputs:
     image_pad_len: Optional[list] = None
     num_image_tokens: Optional[int] = None
 
-    # QWen2-VL related
-    mrope_positions: Optional[torch.Tensor] = None
-    mrope_position_delta: Optional[torch.Tensor] = None
-
     # image
     im_token_id: Optional[int] = None
     im_start_id: Optional[int] = None
@@ -359,6 +355,10 @@ class MultimodalInputs:
     audio_token_id: Optional[int] = None
     audio_start_id: Optional[int] = None
     audio_end_id: Optional[int] = None
+
+    # QWen2-VL related
+    mrope_positions: Optional[torch.Tensor] = None
+    mrope_position_delta: Optional[torch.Tensor] = None
 
     @staticmethod
     def from_dict(obj: dict):
