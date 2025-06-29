@@ -529,24 +529,23 @@ class TokenizerManager:
             )
             raise ValueError(error_msg)
 
-        if (
-            getattr(obj, "return_hidden_states", False)
-            and not self.server_args.enable_return_hidden_states
-        ):
-            raise ValueError(
-                "The server is not configured to return the hidden states. "
-                "Please set `--enable-return-hidden-states` to enable this feature."
-            )
-
-        if (
-            getattr(obj, "custom_logit_processor", False)
-            and not self.server_args.enable_custom_logit_processor
-        ):
-            print(f"custom_logit_processor: {obj.custom_logit_processor}")
-            raise ValueError(
-                "The server is not configured to enable custom logit processor. "
-                "Please set `--enable-custom-logits-processor` to enable this feature."
-            )
+        if isinstance(obj, GenerateReqInput):
+            if (
+                obj.return_hidden_states
+                and not self.server_args.enable_return_hidden_states
+            ):
+                raise ValueError(
+                    "The server is not configured to return the hidden states. "
+                    "Please set `--enable-return-hidden-states` to enable this feature."
+                )
+            if (
+                obj.custom_logit_processor
+                and not self.server_args.enable_custom_logit_processor
+            ):
+                raise ValueError(
+                    "The server is not configured to enable custom logit processor. "
+                    "Please set `--enable-custom-logits-processor` to enable this feature."
+                )
 
     def _create_tokenized_object(
         self,
