@@ -243,6 +243,7 @@ set(SOURCES
     "csrc/moe/prepare_moe_input.cu"
     "csrc/moe/ep_moe_reorder_kernel.cu"
     "csrc/moe/ep_moe_silu_and_mul_kernel.cu"
+    "csrc/moe/balance_topk_ids.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/packbit.cu"
     "csrc/speculative/speculative_sampling.cu"
