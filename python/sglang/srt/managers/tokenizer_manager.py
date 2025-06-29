@@ -111,11 +111,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.managers.multimodal_processor import (
-    get_dummy_processor,
-    get_mm_processor,
-    import_processors,
-)
+from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -252,9 +248,9 @@ class TokenizerManager:
         self.dump_requests_threshold = 1000
         self.dump_request_list: List[Tuple] = []
         self.log_request_metadata = self.get_log_request_metadata()
-        self.asyncio_tasks = set()
         self.session_futures = {}  # session_id -> asyncio event
         self.max_req_input_len = None
+        self.asyncio_tasks = set()
 
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
