@@ -310,7 +310,7 @@ class Scheduler(
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
 
-        if self.scheduler_metrics_enabled():
+        if self.current_scheduler_metrics_enabled():
             self.send_metrics_from_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
@@ -540,7 +540,10 @@ class Scheduler(
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
 
-    def scheduler_metrics_enabled(self):
+    # Enable enable_metrics_for_all_schedulers when you want schedulers on all TP ranks (not just TP 0) to record
+    # request metrics separately. This is especially useful when dp_attention is enabled, as otherwise all metrics
+    # appear to come from TP 0.
+    def current_scheduler_metrics_enabled(self):
         return self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
 
     def maybe_sleep_on_idle(self):
@@ -644,14 +647,14 @@ class Scheduler(
         self.stats = SchedulerStats()
         if self.enable_metrics:
             engine_type = "unified"
-            self.metrics_collector = SchedulerMetricsCollector(
-                labels={
-                    "model_name": self.server_args.served_model_name,
-                    "engine_type": engine_type,
-                    "tp_rank": tp_rank,
-                    **({"dp_rank": dp_rank} if dp_rank is not None else {}),
-                },
-            )
+            labels={
+                "model_name": self.server_args.served_model_name,
+                "engine_type": engine_type,
+                "tp_rank": tp_rank,
+            }
+            if dp_rank is not None:
+                labels["dp_rank"] = dp_rank
+            self.metrics_collector = SchedulerMetricsCollector(labels=labels)
 
     def init_kv_events(self, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
@@ -1440,7 +1443,7 @@ class Scheduler(
 
         if (
             self.enable_metrics
-            and self.scheduler_metrics_enabled()
+            and self.current_scheduler_metrics_enabled()
             and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
@@ -1630,7 +1633,7 @@ class Scheduler(
             self.chunked_req.is_chunked += 1
 
         # Print stats
-        if self.scheduler_metrics_enabled():
+        if self.current_scheduler_metrics_enabled():
             self.log_prefill_stats(adder, can_run_list, running_bs)
 
         # Create a new batch
