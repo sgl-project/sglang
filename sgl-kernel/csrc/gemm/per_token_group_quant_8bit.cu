@@ -6,38 +6,18 @@
 
 #include "utils.h"
 
-__device__ __forceinline__ float my_max(float a, float b) {
-  return fmaxf(a, b);
-}
-__device__ __forceinline__ __nv_bfloat16 my_max(__nv_bfloat16 a, __nv_bfloat16 b) {
-  return __hmax(a, b);
-}
-__device__ __forceinline__ __half my_max(__half a, __half b) {
-  return __hmax(a, b);
-}
-
-__device__ __forceinline__ float my_abs(float a) {
-  return fabsf(a);
-}
-__device__ __forceinline__ __nv_bfloat16 my_abs(__nv_bfloat16 a) {
-  return __habs(a);
-}
-__device__ __forceinline__ __half my_abs(__half a) {
-  return __habs(a);
-}
-
-template <typename T, int THREADS_PER_GROUP>
-__device__ __forceinline__ T GroupReduceMax(T val, const int tid) {
+template <int THREADS_PER_GROUP>
+__device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   unsigned mask = 0xffff;
 
   static_assert((THREADS_PER_GROUP == 16) or (THREADS_PER_GROUP == 8));
 
   if constexpr (THREADS_PER_GROUP == 16) {
-    val = my_max(val, __shfl_xor_sync(mask, val, 8));
+    val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
   }
-  val = my_max(val, __shfl_xor_sync(mask, val, 4));
-  val = my_max(val, __shfl_xor_sync(mask, val, 2));
-  val = my_max(val, __shfl_xor_sync(mask, val, 1));
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 4));
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 2));
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 1));
   return val;
 }
 
@@ -122,6 +102,8 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int global_group_id = block_group_id + local_group_id;
   const int block_group_offset = global_group_id * group_size;
 
+  float local_absmax = eps;
+
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
@@ -155,17 +137,14 @@ __global__ void per_token_group_quant_8bit_kernel(
     input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * VEC_TYPED_SIZE) + j);
   }
 
-  T local_absmax_lowprec = eps;
-
 #pragma unroll
   for (uint32_t j = 0; j < VEC_TYPED_SIZE; ++j) {
-    const T val = input_vec[j];
-    const T abs_val = my_abs(val);
-    local_absmax_lowprec = my_max(local_absmax_lowprec, abs_val);
+    float val = static_cast<float>(input_vec[j]);
+    float abs_val = fabsf(val);
+    local_absmax = fmaxf(local_absmax, abs_val);
   }
 
-  local_absmax_lowprec = GroupReduceMax<T, THREADS_PER_GROUP>(local_absmax_lowprec, lane_id);
-  float local_absmax = (float) local_absmax_lowprec;
+  local_absmax = GroupReduceMax<THREADS_PER_GROUP>(local_absmax, lane_id);
 
   float y_scale, y_scale_inv;
   calculate_fp8_scales<SCALE_UE8M0>(local_absmax, y_scale, y_scale_inv, max_8bit, max_8bit_inv);
