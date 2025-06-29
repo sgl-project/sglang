@@ -137,9 +137,9 @@ class BaseMultimodalProcessor(ABC):
             kwargs["videos"] = videos
         if audios is not None:
             kwargs["audios"] = audios
-            kwargs["audio"] = (
-                audios  # Note(Xinyuan): for gemma3n, ref: https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/processing_gemma3n.py#L107
-            )
+            if isinstance(self, Gemma3nSGLangProcessor):
+                # Note(Xinyuan): for gemma3n, ref: https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/processing_gemma3n.py#L107
+                kwargs["audio"] = audios
 
         processor = self._processor
         if hasattr(processor, "image_processor") and isinstance(
