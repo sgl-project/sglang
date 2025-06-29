@@ -113,15 +113,13 @@ __global__ void per_token_group_quant_8bit_kernel(
 #pragma unroll
   for (int wave_index = 0; wave_index < NUM_WAVES_CONSTEXPR; ++wave_index) {
     const int global_group_id = block_group_id + local_group_id + wave_index * num_groups_per_wave;
-    if (global_group_id >= num_groups) [[unlikely]] {
-      break;
-    }
-
-    const int block_group_offset = global_group_id * group_size;
+    if (global_group_id < num_groups) [[likely]] {
+      const int block_group_offset = global_group_id * group_size;
 #pragma unroll
-    for (uint32_t j = 0; j < VEC_INT4_SIZE_PER_WAVE; ++j) {
-      input_int4[wave_index * VEC_INT4_SIZE_PER_WAVE + j] = ld_global_nc(
-          reinterpret_cast<const int4*>(input + block_group_offset + lane_id * VEC_TYPED_SIZE_PER_WAVE) + j);
+      for (uint32_t j = 0; j < VEC_INT4_SIZE_PER_WAVE; ++j) {
+        input_int4[wave_index * VEC_INT4_SIZE_PER_WAVE + j] = ld_global_nc(
+            reinterpret_cast<const int4*>(input + block_group_offset + lane_id * VEC_TYPED_SIZE_PER_WAVE) + j);
+      }
     }
   }
 
