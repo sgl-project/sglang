@@ -112,6 +112,16 @@ class QuickGELU(CustomOp):
         return self.forward_native(x)
 
 
+class SwiGLU(CustomOp):
+    def forward_native(self, x: torch.Tensor, alpha: float = 1.702) -> torch.Tensor:
+        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+        out_glu = x_glu * torch.sigmoid(alpha * x_glu)
+        return out_glu * (x_linear + 1) # Note that here add an extra bias of 1 to the linear layer
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
+
 class ScaledActivation(nn.Module):
     """An activation function with post-scale parameters.
 

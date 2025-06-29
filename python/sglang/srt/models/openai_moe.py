@@ -29,7 +29,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.activation import SwiGLU
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes, ScatterMode
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
@@ -71,13 +71,17 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import default_weight_loader, sharded_weight_loader
 from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher, model_forward_maybe_tbo
 from sglang.srt.utils import DeepEPMode, add_prefix, is_non_idle_and_non_empty, make_layers
 
 OpenAIMoeConfig = None
 
 logger = logging.getLogger(__name__)
+
+
+def get_attention_sliding_window_size(config):
+    return config.sliding_window - 1
 
 
 class OpenAIMoeMLP(nn.Module):
@@ -106,11 +110,11 @@ class OpenAIMoeMLP(nn.Module):
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
         )
-        # if hidden_act != "swiglu":
-        #     raise ValueError(
-        #         f"Unsupported activation: {hidden_act}. Only swiglu is supported for now."
-        #     )
-        self.act_fn = SiluAndMul()
+        if hidden_act != "swiglu":
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. Only swiglu is supported for now."
+            )
+        self.act_fn = SwiGLU()
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
@@ -376,6 +380,7 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
 class OpenAIMoeAttention(nn.Module):
     def __init__(
         self,
+        config: OpenAIMoeConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -412,6 +417,7 @@ class OpenAIMoeAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
+        self.sinks = nn.Parameter(torch.empty(self.num_heads))
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -462,12 +468,19 @@ class OpenAIMoeAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+
+        use_sliding_window = True if config.layer_types[layer_id] == "sliding_attention" else False
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            sliding_window_size=(
+                get_attention_sliding_window_size(config)
+                if use_sliding_window
+                else None
+            ),
             prefix=add_prefix("attn", prefix),
         )
 
@@ -516,6 +529,7 @@ class OpenAIMoeAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+        # Todo: use hyperparam self.sinks
         attn_output = self.attn(*inner_state)
         output, _ = self.o_proj(attn_output)
         return output
@@ -554,6 +568,7 @@ class OpenAIMoeDecoderLayer(nn.Module):
         rms_norm_eps = config.rms_norm_eps
         attention_bias = config.attention_bias
         self.self_attn = OpenAIMoeAttention(
+            config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -917,6 +932,18 @@ class OpenAIMoeForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                if "sinks" in name:
+                    if name in params_dict:
+                        param = params_dict[name]
+                        attn_tp_rank = get_attention_tp_rank()
+                        shard_size = param.shape[0]
+                        start_idx = attn_tp_rank * shard_size
+                        loaded_weight = loaded_weight[
+                            start_idx : start_idx + shard_size
+                        ]
+                        default_weight_loader(param, loaded_weight)
+                    continue
+
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
