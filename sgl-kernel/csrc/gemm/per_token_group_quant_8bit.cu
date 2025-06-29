@@ -157,7 +157,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     if (wave_index > 0) {
 //       __pipeline_wait_prior(NUM_WAVES_CONSTEXPR - 1 - wave_index);
       for (uint32_t j = 0; j < VEC_INT4_SIZE; ++j) {
-        input_int4[j] = input_prefetch_smem[wave_index * THREADS_PER_BLOCK * VEC_INT4_SIZE + threadIdx.x * VEC_INT4_SIZE + j];
+        input_int4[j] = input_prefetch_smem[(wave_index - 1) * THREADS_PER_BLOCK * VEC_INT4_SIZE + threadIdx.x * VEC_INT4_SIZE + j];
       }
     }
 
