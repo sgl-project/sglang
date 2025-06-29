@@ -1,5 +1,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/Float8_e4m3fn.h>
+// #include <cuda_pipeline_primitives.h>
 
 #include <cmath>
 #include <flashinfer/vec_dtypes.cuh>
@@ -81,6 +82,7 @@ __host__ __device__ dtype_t ceil_div(dtype_t a, dtype_t b) {
 constexpr int THREADS_PER_GROUP = 8;
 constexpr uint32_t VEC_NUM_BYTES = 32;
 constexpr int NUM_WAVES_CONSTEXPR = 3;
+constexpr int GROUPS_PER_BLOCK_CONSTEXPR = 16;
 
 template <
     typename T,
@@ -106,6 +108,44 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int lane_id = threadIdx.x % THREADS_PER_GROUP;
   const int block_group_id = blockIdx.x * groups_per_block;
 
+  constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);
+  constexpr uint32_t VEC_INT4_SIZE = VEC_NUM_BYTES / sizeof(int4);
+
+  constexpr int THREADS_PER_BLOCK = THREADS_PER_GROUP * GROUPS_PER_BLOCK_CONSTEXPR;
+  __shared__ int4 input_prefetch_smem[(NUM_WAVES_CONSTEXPR - 1) * THREADS_PER_BLOCK * VEC_INT4_SIZE];
+
+  int4 input_int4[VEC_INT4_SIZE];
+  T* input_vec = reinterpret_cast<T*>(input_int4);
+  static_assert(sizeof(input_vec[0]) * VEC_TYPED_SIZE == sizeof(input_int4));
+
+  // TODO not consider only 1 wave case
+  {
+    int wave_index = 0;
+    const int global_group_id = block_group_id + local_group_id + wave_index * num_groups_per_wave;
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_INT4_SIZE; ++j) {
+      input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(input + global_group_id * group_size + lane_id * VEC_TYPED_SIZE) + j);
+    }
+  }
+
+#pragma unroll
+  for (int wave_index = 1; wave_index < NUM_WAVES_CONSTEXPR; ++wave_index) {
+    const int global_group_id = block_group_id + local_group_id + wave_index * num_groups_per_wave;
+    // TODO optimize
+    if (global_group_id >= num_groups) [[unlikely]] {
+      break;
+    }
+
+    int4 my_var = {1,2,3,4};
+    *(input_prefetch_smem + (wave_index - 1) * THREADS_PER_BLOCK * VEC_INT4_SIZE + threadIdx.x * VEC_INT4_SIZE) = my_var;
+//     __pipeline_memcpy_async(
+//       input_prefetch_smem + (wave_index - 1) * THREADS_PER_BLOCK * VEC_INT4_SIZE + threadIdx.x * VEC_INT4_SIZE,
+//       input + global_group_id * group_size + lane_id * VEC_TYPED_SIZE,
+//       VEC_NUM_BYTES
+//     );
+//     __pipeline_commit();
+  }
+
 #pragma unroll
   for (int wave_index = 0; wave_index < NUM_WAVES_CONSTEXPR; ++wave_index) {
     const int global_group_id = block_group_id + local_group_id + wave_index * num_groups_per_wave;
@@ -114,13 +154,17 @@ __global__ void per_token_group_quant_8bit_kernel(
       break;
     }
 
-    const int block_group_offset = global_group_id * group_size;
+    if (wave_index > 0) {
+//       __pipeline_wait_prior(NUM_WAVES_CONSTEXPR - 1 - wave_index);
+      for (uint32_t j = 0; j < VEC_INT4_SIZE; ++j) {
+        input_int4[j] = input_prefetch_smem[wave_index * THREADS_PER_BLOCK * VEC_INT4_SIZE + threadIdx.x * VEC_INT4_SIZE + j];
+      }
+    }
 
     using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
     static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
-    const T* group_input = input + block_group_offset;
-    DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + block_group_offset;
+    DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + global_group_id * group_size;
     scale_element_t* scale_output;
 
     if constexpr (IS_COLUMN_MAJOR) {
@@ -135,18 +179,6 @@ __global__ void per_token_group_quant_8bit_kernel(
     } else {
       static_assert(!SCALE_UE8M0);
       scale_output = output_s + global_group_id;
-    }
-
-    constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);
-    constexpr uint32_t VEC_INT4_SIZE = VEC_NUM_BYTES / sizeof(int4);
-
-    int4 input_int4[VEC_INT4_SIZE];
-    T* input_vec = reinterpret_cast<T*>(input_int4);
-    static_assert(sizeof(input_vec[0]) * VEC_TYPED_SIZE == sizeof(input_int4));
-
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_INT4_SIZE; ++j) {
-      input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * VEC_TYPED_SIZE) + j);
     }
 
     float local_absmax = eps;
@@ -242,6 +274,7 @@ void sgl_per_token_group_quant_8bit(
   const int num_blocks = num_sms * blocks_per_sm;
   const int num_waves = ceil_div(num_groups, groups_per_block * num_blocks);
   CHECK_EQ(num_waves, NUM_WAVES_CONSTEXPR);
+  CHECK_EQ(groups_per_block, GROUPS_PER_BLOCK_CONSTEXPR);
 
   const int num_groups_per_wave = num_blocks * groups_per_block;
 
