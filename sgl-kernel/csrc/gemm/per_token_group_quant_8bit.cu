@@ -108,20 +108,22 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   constexpr uint32_t VEC_INT4_SIZE_PER_WAVE = VEC_NUM_BYTES_PER_WAVE / sizeof(int4);
   constexpr uint32_t VEC_TYPED_SIZE_PER_WAVE = VEC_NUM_BYTES_PER_WAVE / sizeof(T);
-  int4 input_int4[VEC_INT4_SIZE_PER_WAVE * NUM_WAVES_CONSTEXPR];
+  int4 input_int4[VEC_INT4_SIZE_PER_WAVE * 2];
 
-#pragma unroll
-  for (int wave_index = 0; wave_index < NUM_WAVES_CONSTEXPR; ++wave_index) {
+  auto load_one_wave = [&](const int wave_index) {
     const int global_group_id = block_group_id + local_group_id + wave_index * num_groups_per_wave;
     if (global_group_id < num_groups) [[likely]] {
       const int block_group_offset = global_group_id * group_size;
 #pragma unroll
       for (uint32_t j = 0; j < VEC_INT4_SIZE_PER_WAVE; ++j) {
-        input_int4[wave_index * VEC_INT4_SIZE_PER_WAVE + j] = ld_global_nc(
+        input_int4[(wave_index % 2) * VEC_INT4_SIZE_PER_WAVE + j] = ld_global_nc(
             reinterpret_cast<const int4*>(input + block_group_offset + lane_id * VEC_TYPED_SIZE_PER_WAVE) + j);
       }
     }
-  }
+  };
+
+  // TODO not handle only 1 wave case
+  load_one_wave(0);
 
 #pragma unroll
   for (int wave_index = 0; wave_index < NUM_WAVES_CONSTEXPR; ++wave_index) {
@@ -130,6 +132,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     if (global_group_id >= num_groups) [[unlikely]] {
       break;
     }
+
+    load_one_wave(wave_index + 1);
 
     const int block_group_offset = global_group_id * group_size;
 
@@ -154,7 +158,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     }
 
     T* input_vec_local =
-        reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(input_int4) + VEC_NUM_BYTES_PER_WAVE * wave_index);
+        reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(input_int4) + VEC_NUM_BYTES_PER_WAVE * (wave_index % 2));
 
     float local_absmax = eps;
 
