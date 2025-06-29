@@ -164,7 +164,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     local_absmax_lowbit = my_max(local_absmax_lowbit, abs_val);
   }
 
-  local_absmax_lowbit = GroupReduceMax<THREADS_PER_GROUP>(local_absmax_lowbit, lane_id);
+  local_absmax_lowbit = GroupReduceMax<T, THREADS_PER_GROUP>(local_absmax_lowbit, lane_id);
   float local_absmax = (float) local_absmax_lowbit;
 
   float y_scale, y_scale_inv;
