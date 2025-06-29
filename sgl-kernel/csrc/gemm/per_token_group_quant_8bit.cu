@@ -111,7 +111,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int global_group_id = block_group_id + local_group_id + wave_index * num_groups_per_wave;
     // TODO optimize
     if (global_group_id >= num_groups) [[unlikely]] {
-      return;
+      break;
     }
 
     const int block_group_offset = global_group_id * group_size;
