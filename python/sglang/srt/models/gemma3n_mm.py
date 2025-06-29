@@ -21,7 +21,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
+    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -250,20 +250,8 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         if mm_inputs is None:
             return input_ids
 
-        # Collect available media token pairs
-        media_token_pairs = []
-        if mm_inputs.im_start_id is not None:
-            media_token_pairs.append((mm_inputs.im_start_id, mm_inputs.im_end_id))
-        if mm_inputs.audio_start_id is not None:
-            media_token_pairs.append((mm_inputs.audio_start_id, mm_inputs.audio_end_id))
-        print(f"DEBUG: gemma3n_mm.pad_input_ids: {media_token_pairs=}")
-
-        # Apply padding pattern if we have media tokens
-        if media_token_pairs:
-            pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
-            return pattern.pad_input_tokens(input_ids, mm_inputs)
-
-        return input_ids
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens(None)
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()

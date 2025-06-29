@@ -88,8 +88,6 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
         return {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
-            "im_start_id": self.IM_START_TOKEN_ID,
-            "im_end_id": self.IM_END_TOKEN_ID,
-            "audio_start_id": self.AUDIO_START_TOKEN_ID,
-            "audio_end_id": self.AUDIO_END_TOKEN_ID,
+            "im_token_id": self.IM_TOKEN_ID,
+            "audio_token_id": self.AUDIO_TOKEN_ID,
         }
