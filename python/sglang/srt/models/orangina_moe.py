@@ -441,7 +441,7 @@ class OpenAIMoeAttention(nn.Module):
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
-        print("self.qkv_proj.weight.shape", self.qkv_proj.weight.shape) # (5120, 2880)
+        # print("self.qkv_proj.weight.shape", self.qkv_proj.weight.shape) # (5120, 2880)
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -450,10 +450,10 @@ class OpenAIMoeAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
-            reduce_results=True # False,
+            reduce_results=True, # False,
             prefix=add_prefix("o_proj", prefix),
         )
-        print("self.o_proj.weight.shape", self.o_proj.weight.shape) # (2880, 4096)
+        # print("self.o_proj.weight.shape", self.o_proj.weight.shape) # (2880, 4096)
 
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -807,6 +807,15 @@ class OpenAIMoeForCausalLM(nn.Module):
         super().__init__()
         self.pp_group = get_pp_group()
         self.config = config
+        '''
+        Add this to make the model compatible with the common config attribute name
+        '''
+        ###########################################################################
+        self.config.num_experts = self.config.num_local_experts
+        self.config.moe_intermediate_size = self.config.intermediate_size * 2
+        self.config.norm_topk_prob = True
+        ###########################################################################
+
         self.quant_config = quant_config
         self.model = OpenAIMoeModel(
             config, quant_config, prefix=add_prefix("model", prefix)

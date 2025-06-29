@@ -1202,7 +1202,7 @@ def get_rope(
             )
         elif scaling_type == "yarn":
             scaling_factor = rope_scaling["factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
+            original_max_position = rope_scaling["original_max_position_embeddings"] if "original_max_position_embeddings" in rope_scaling else 4096
             extra_kwargs = {
                 k: v
                 for k, v in rope_scaling.items()
