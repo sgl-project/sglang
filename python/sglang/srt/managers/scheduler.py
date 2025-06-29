@@ -540,9 +540,6 @@ class Scheduler(
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
 
-    # Enable enable_metrics_for_all_schedulers when you want schedulers on all TP ranks (not just TP 0) to record
-    # request metrics separately. This is especially useful when dp_attention is enabled, as otherwise all metrics
-    # appear to come from TP 0.
     def current_scheduler_metrics_enabled(self):
         return self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
 
@@ -647,7 +644,7 @@ class Scheduler(
         self.stats = SchedulerStats()
         if self.enable_metrics:
             engine_type = "unified"
-            labels={
+            labels = {
                 "model_name": self.server_args.served_model_name,
                 "engine_type": engine_type,
                 "tp_rank": tp_rank,

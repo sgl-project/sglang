@@ -950,7 +950,9 @@ class ServerArgs:
         parser.add_argument(
             "--enable-metrics-for-all-schedulers",
             action="store_true",
-            help="Enable log prometheus metrics for all schedulers.",
+            help="Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) "
+            "to record request metrics separately. This is especially useful when dp_attention is enabled, as "
+            "otherwise all metrics appear to come from TP 0.",
         )
         parser.add_argument(
             "--bucket-time-to-first-token",
