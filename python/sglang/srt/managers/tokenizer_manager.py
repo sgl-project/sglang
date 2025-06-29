@@ -530,7 +530,7 @@ class TokenizerManager:
             raise ValueError(error_msg)
 
         if (
-            obj.return_hidden_states
+            getattr(obj, "return_hidden_states", False)
             and not self.server_args.enable_return_hidden_states
         ):
             raise ValueError(
@@ -539,7 +539,7 @@ class TokenizerManager:
             )
 
         if (
-            obj.custom_logit_processor
+            getattr(obj, "custom_logit_processor", False)
             and not self.server_args.enable_custom_logit_processor
         ):
             print(f"custom_logit_processor: {obj.custom_logit_processor}")
