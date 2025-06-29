@@ -10,6 +10,8 @@ from sglang.srt.layers.rotary_embedding import (
 )
 from sglang.test.test_utils import CustomTestCase
 
+torch.manual_seed(1234)
+
 
 class TestROPE(CustomTestCase):
     def test_deepseek_v2_rope(self):
@@ -75,8 +77,8 @@ class TestROPE(CustomTestCase):
                 )
 
                 atol = rtol = precision[q_pe.dtype]
-                self.assertTrue(torch.allclose(q_pe, q_pe_clone, atol=atol, rtol=rtol))
-                self.assertTrue(torch.allclose(k_pe, k_pe_clone, atol=atol, rtol=rtol))
+                torch.testing.assert_close(q_pe, q_pe_clone, atol=atol, rtol=rtol)
+                torch.testing.assert_close(k_pe, k_pe_clone, atol=atol, rtol=rtol)
                 torch.testing.assert_close(k_pe, k_pe_clone)
 
     def test_origin_rope(self):
