@@ -436,7 +436,9 @@ class BaseMultimodalProcessor(ABC):
                 values[k] = v
         return values
 
-    def collect_mm_items_from_processor_output(self, data_dict: dict) -> List[MultimodalDataItem]:
+    def collect_mm_items_from_processor_output(
+        self, data_dict: dict
+    ) -> List[MultimodalDataItem]:
         """Create mm_items directly from processor output."""
         items = {}  # modality -> MultimodalDataItem
 
@@ -526,7 +528,9 @@ class BaseMultimodalProcessor(ABC):
 
         # Handle dict items (already processed)
         for dict_item in dict_items:
-            all_collected_items.extend(self.collect_mm_items_from_processor_output(dict_item))
+            all_collected_items.extend(
+                self.collect_mm_items_from_processor_output(dict_item)
+            )
 
         # Handle raw items (need processing)
         if raw_images or raw_audios:
