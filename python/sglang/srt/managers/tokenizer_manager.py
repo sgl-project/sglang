@@ -426,24 +426,6 @@ class TokenizerManager:
                 "Please add `--is-embedding` when launching the server or try another model."
             )
 
-        if (
-            obj.return_hidden_states
-            and not self.server_args.enable_return_hidden_states
-        ):
-            raise ValueError(
-                "The server is not configured to return the hidden states. "
-                "Please set `--enable-return-hidden-states` to enable this feature."
-            )
-
-        if (
-            obj.custom_logit_processor
-            and not self.server_args.enable_custom_logit_processor
-        ):
-            raise ValueError(
-                "The server is not configured to enable custom logit processor. "
-                "Please set `--enable-custom-logits-processor` to enable this feature."
-            )
-
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
             logger.info(
@@ -513,12 +495,12 @@ class TokenizerManager:
         else:
             image_inputs: Optional[Dict] = None
 
-        self._validate_token_len(obj, input_ids)
+        self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, image_inputs, token_type_ids
         )
 
-    def _validate_token_len(
+    def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
@@ -546,6 +528,25 @@ class TokenizerManager:
                 f"of tokens in the input messages or the completion to fit within the limit."
             )
             raise ValueError(error_msg)
+
+        if (
+            obj.return_hidden_states
+            and not self.server_args.enable_return_hidden_states
+        ):
+            raise ValueError(
+                "The server is not configured to return the hidden states. "
+                "Please set `--enable-return-hidden-states` to enable this feature."
+            )
+
+        if (
+            obj.custom_logit_processor
+            and not self.server_args.enable_custom_logit_processor
+        ):
+            print(f"custom_logit_processor: {obj.custom_logit_processor}")
+            raise ValueError(
+                "The server is not configured to enable custom logit processor. "
+                "Please set `--enable-custom-logits-processor` to enable this feature."
+            )
 
     def _create_tokenized_object(
         self,
