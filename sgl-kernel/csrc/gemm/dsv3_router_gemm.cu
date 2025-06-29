@@ -247,8 +247,8 @@ template void invokeRouterGemm<__nv_bfloat16, 16, 256, 7168>(
 
 void router_gemm(
     torch::Tensor& output,          // [num_tokens, num_experts]
-    torch::Tensor& mat_a,           // [num_tokens, hidden_dim]
-    torch::Tensor& mat_b,           // [num_experts, hidden_dim]
+    const torch::Tensor& mat_a,           // [num_tokens, hidden_dim]
+    const torch::Tensor& mat_b,           // [num_experts, hidden_dim]
 )
 {
     CHECK_INPUT(output);
@@ -265,7 +265,6 @@ void router_gemm(
     TORCH_CHECK(mat_b.dtype() == torch::kBFloat16, "mat_b must be bf16");
     TORCH_CHECK(output.dtype() == torch::kBFloat16, "output must be bf16");
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     invokeRouterGemm<__nv_bfloat16, num_tokens, num_experts, hidden_dim>(

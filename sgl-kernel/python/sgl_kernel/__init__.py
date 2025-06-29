@@ -39,6 +39,7 @@ from sgl_kernel.gemm import (
     int8_scaled_mm,
     qserve_w4a8_per_chn_gemm,
     qserve_w4a8_per_group_gemm,
+    router_gemm,
     scaled_fp4_experts_quant,
     scaled_fp4_quant,
     sgl_per_tensor_quant_fp8,
