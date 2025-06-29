@@ -2,6 +2,7 @@
 Multi-modality utils
 """
 
+import hashlib
 from abc import abstractmethod
 from typing import Callable, List, Optional, Tuple
 
