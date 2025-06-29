@@ -1,6 +1,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/Float8_e4m3fn.h>
-// #include <cuda_pipeline_primitives.h>
+#include <cuda_pipeline_primitives.h>
 
 #include <cmath>
 #include <flashinfer/vec_dtypes.cuh>
@@ -137,13 +137,12 @@ __global__ void per_token_group_quant_8bit_kernel(
     }
 
     int4 my_var = {1,2,3,4};
-    *(input_prefetch_smem + (wave_index - 1) * THREADS_PER_BLOCK * VEC_INT4_SIZE + threadIdx.x * VEC_INT4_SIZE) = my_var;
-//     __pipeline_memcpy_async(
-//       input_prefetch_smem + (wave_index - 1) * THREADS_PER_BLOCK * VEC_INT4_SIZE + threadIdx.x * VEC_INT4_SIZE,
-//       input + global_group_id * group_size + lane_id * VEC_TYPED_SIZE,
-//       VEC_NUM_BYTES
-//     );
-//     __pipeline_commit();
+    __pipeline_memcpy_async(
+      input_prefetch_smem + (wave_index - 1) * THREADS_PER_BLOCK * VEC_INT4_SIZE + threadIdx.x * VEC_INT4_SIZE,
+      input + global_group_id * group_size + lane_id * VEC_TYPED_SIZE,
+      VEC_NUM_BYTES
+    );
+    __pipeline_commit();
   }
 
 #pragma unroll
@@ -155,7 +154,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     }
 
     if (wave_index > 0) {
-//       __pipeline_wait_prior(NUM_WAVES_CONSTEXPR - 1 - wave_index);
+      __pipeline_wait_prior(NUM_WAVES_CONSTEXPR - 1 - wave_index);
       for (uint32_t j = 0; j < VEC_INT4_SIZE; ++j) {
         input_int4[j] = input_prefetch_smem[(wave_index - 1) * THREADS_PER_BLOCK * VEC_INT4_SIZE + threadIdx.x * VEC_INT4_SIZE + j];
       }
