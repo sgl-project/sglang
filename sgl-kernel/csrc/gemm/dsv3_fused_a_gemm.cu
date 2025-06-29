@@ -20,11 +20,9 @@
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
 
-#include <cstdio>
-
-#include "cuda_bf16.h"
-#include "cuda_runtime.h"
 #include "utils.h"
 
 using bf16_t = __nv_bfloat16;
@@ -628,53 +626,47 @@ template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 8>(
 template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 16>(
     __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
 
-torch::Tensor dsv3_fused_a_gemm(
-    torch::Tensor const& mat_a,
-    torch::Tensor const& mat_b,
-    std::optional<at::Tensor> const& bias,
-    std::optional<c10::ScalarType> const& out_dtype) {
-  int const num_tokens = mat_a.sizes()[0];
-  int const hd_in = mat_a.sizes()[1];
-  int const hd_out = mat_b.sizes()[1];
-
-  TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
-  TORCH_CHECK(mat_a.strides()[1] == 1);  // Row-major
-  TORCH_CHECK(mat_b.strides()[0] == 1);  // Column-major
-  TORCH_CHECK(!bias.has_value(), "bias is not support yet");
+void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b) {
+  TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2 && output.dim() == 2);
+  int const num_tokens = mat_a.size(0);
+  int const hd_in = mat_a.size(1);
+  int const hd_out = mat_b.size(1);
 
   constexpr int kHdIn = 7168;
   constexpr int kHdOut = 2112;
   TORCH_CHECK(num_tokens >= 1 && num_tokens <= 16, "required 1 <= mat_a.shape[0] <= 16")
   TORCH_CHECK(hd_in == kHdIn, "required mat_a.shape[1] == 7168")
   TORCH_CHECK(hd_out == kHdOut, "required mat_b.shape[1] == 2112")
+  TORCH_CHECK(output.size(0) == num_tokens, "required output.shape[0] == mat_a.shape[0]")
+  TORCH_CHECK(output.size(1) == hd_out, "required output.shape[1] == mat_b.shape[1]")
 
-  auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
+  TORCH_CHECK(mat_a.strides()[1] == 1);   // Row-major
+  TORCH_CHECK(output.strides()[1] == 1);  // Row-major
+  TORCH_CHECK(mat_b.strides()[0] == 1);   // Column-major
+
   auto const data_type = mat_a.scalar_type();
-  TORCH_CHECK(out_dtype_ == torch::kBFloat16, "Only BFloat16 output dtype is supported")
-  TORCH_CHECK(data_type == torch::kBFloat16, "Only BFloat16 input dtype is supported")
+  TORCH_CHECK(
+      mat_a.scalar_type() == torch::kBFloat16 && mat_b.scalar_type() == torch::kBFloat16,
+      "Only BFloat16 input dtype is supported")
+  TORCH_CHECK(output.scalar_type() == torch::kBFloat16, "Only BFloat16 output dtype is supported")
 
   auto const sm = getSMVersion();
   TORCH_CHECK(sm >= 90, "required CUDA ARCH >= SM_90");
 
-  std::vector<int64_t> output_size = {num_tokens, hd_out};
-  torch::Tensor out = torch::empty(output_size, mat_a.options().dtype(out_dtype_));
-
   auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
   if (num_tokens <= 8) {
     invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 8>(
-        reinterpret_cast<__nv_bfloat16*>(out.mutable_data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
         reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
         reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
         num_tokens,
         stream);
   } else {
     invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 16>(
-        reinterpret_cast<__nv_bfloat16*>(out.mutable_data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
         reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
         reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
         num_tokens,
         stream);
   }
-
-  return out;
 }
