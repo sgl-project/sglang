@@ -362,18 +362,12 @@ void sm89_fp8_dispatch_shape(
     }
   } else if (m <= 128) {
     // M in (64, 128]
-    if (n <= 8192) {
+    if (n <= 16384) {
       return sm89_fp8_dispatch_bias<
           OutType,
           cutlass::gemm::GemmShape<64, 64, 128>,
-          cutlass::gemm::GemmShape<32, 64, 64>,
-          4>(out, a, b, scales_a, scales_b, bias);
-    } else if (n <= 16384) {
-      return sm89_fp8_dispatch_bias<
-          OutType,
-          cutlass::gemm::GemmShape<64, 64, 128>,
-          cutlass::gemm::GemmShape<32, 64, 64>,
-          5>(out, a, b, scales_a, scales_b, bias);
+          cutlass::gemm::GemmShape<32, 32, 128>,
+          6>(out, a, b, scales_a, scales_b, bias);
     } else {
       return sm89_fp8_dispatch_bias<
           OutType,
@@ -383,18 +377,12 @@ void sm89_fp8_dispatch_shape(
     }
   } else if (m <= 256) {
     // M in (128, 256]
-    if (n <= 8192) {
+    if (n <= 16384) {
       return sm89_fp8_dispatch_bias<
           OutType,
-          cutlass::gemm::GemmShape<128, 64, 64>,
+          cutlass::gemm::GemmShape<128, 128, 64>,
           cutlass::gemm::GemmShape<64, 32, 64>,
-          5>(out, a, b, scales_a, scales_b, bias);
-    } else if (n <= 16384) {
-      return sm89_fp8_dispatch_bias<
-          OutType,
-          cutlass::gemm::GemmShape<64, 128, 64>,
-          cutlass::gemm::GemmShape<64, 32, 64>,
-          7>(out, a, b, scales_a, scales_b, bias);
+          6>(out, a, b, scales_a, scales_b, bias);
     } else {
       return sm89_fp8_dispatch_bias<
           OutType,
@@ -402,36 +390,13 @@ void sm89_fp8_dispatch_shape(
           cutlass::gemm::GemmShape<64, 32, 128>,
           4>(out, a, b, scales_a, scales_b, bias);
     }
-  } else if (m <= 512) {
-    // M in (256, 512)
-    if (n <= 16384) {
-      return sm89_fp8_dispatch_bias<
-          OutType,
-          cutlass::gemm::GemmShape<128, 128, 64>,
-          cutlass::gemm::GemmShape<64, 32, 64>,
-          2>(out, a, b, scales_a, scales_b, bias);
-    } else {
-      return sm89_fp8_dispatch_bias<
-          OutType,
-          cutlass::gemm::GemmShape<128, 128, 64>,
-          cutlass::gemm::GemmShape<64, 32, 64>,
-          4>(out, a, b, scales_a, scales_b, bias);
-    }
   } else {
-    // M in (512, inf)
-    if (n <= 8192) {
-      return sm89_fp8_dispatch_bias<
-          OutType,
-          cutlass::gemm::GemmShape<128, 128, 64>,
-          cutlass::gemm::GemmShape<64, 32, 64>,
-          3>(out, a, b, scales_a, scales_b, bias);
-    } else {
-      return sm89_fp8_dispatch_bias<
-          OutType,
-          cutlass::gemm::GemmShape<128, 128, 64>,
-          cutlass::gemm::GemmShape<64, 32, 64>,
-          2>(out, a, b, scales_a, scales_b, bias);
-    }
+    // M in (256, inf)
+    return sm89_fp8_dispatch_bias<
+        OutType,
+        cutlass::gemm::GemmShape<128, 128, 64>,
+        cutlass::gemm::GemmShape<64, 32, 64>,
+        6>(out, a, b, scales_a, scales_b, bias);
   }
 }
 #endif
