@@ -297,6 +297,8 @@ class LoRAManager:
         self.lora_modules: Dict[int, Dict[str, BaseLayerWithLoRA]] = {
             i: {} for i in range(self.base_hf_config.num_hidden_layers)
         }
+        self.max_extra_vocab_size: int = 0
+        self.lora_embeddings_modules: Dict[str, BaseLayerWithLoRA] = {}
 
         # Initialize memory pool
         self.memory_pool = LoRAMemoryPool(
@@ -305,6 +307,7 @@ class LoRAManager:
             self.dtype,
             self.tp_size,
             self.tp_rank,
+            self.max_extra_vocab_size,
         )
 
     def update_state_from_configs(self):
@@ -378,6 +381,9 @@ class LoRAManager:
                 logger.info(f"Unloading LoRA adapter {name}")
                 del self.loras[name]
 
+        # current max extra vocab size
+        self.cur_max_extra_vocab_size: int = max([x.extra_vocab_size for x in self.loras.values()])
+
         # Additional checks for flashinfer backend
         # FIXME remove the restrictions after supporting multi-rank for flashinfer backend
         if self.lora_backend == "flashinfer":
@@ -395,7 +401,7 @@ class LoRAManager:
         """
 
         self.memory_pool.init_buffers(
-            self.lora_weight_names, self.base_model, max_lora_dim
+            self.lora_weight_names, self.base_model, max_lora_dim, self.cur_max_extra_vocab_size
         )
 
     def set_lora_module(self, module_name, module):
@@ -423,8 +429,11 @@ class LoRAManager:
 
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in customized_target_names:
-                layer_id = get_layer_id(module_name)
-                if module_name not in self.lora_modules[layer_id]:
-                    self.lora_modules[layer_id][module_name] = self.set_lora_module(
-                        module_name, module
-                    )
+                if "embed_tokens" in module_name and "embed_tokens" not in self.lora_embeddings_modules:
+                    self.lora_embeddings_modules["embed_tokens"] = self.set_lora_module(module_name, module)
+                else:
+                    layer_id = get_layer_id(module_name)
+                    if module_name not in self.lora_modules[layer_id]:
+                        self.lora_modules[layer_id][module_name] = self.set_lora_module(
+                            module_name, module
+                        )

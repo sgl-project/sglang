@@ -2,8 +2,10 @@ from typing import List, Tuple
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from sglang.srt.distributed import (
+    divide,
     get_tensor_model_parallel_rank,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
@@ -17,6 +19,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.utils import LoRABatchInfo
 
 
 class BaseLayerWithLoRA(nn.Module):
@@ -59,6 +62,186 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     ) -> None:
         super().__init__(base_layer, lora_backend)
         self.weight = base_layer.weight
+        self.vocab_size = base_layer.org_vocab_size
+
+    def set_lora_info(
+        self,
+        new_embeddings_buffer: Optional[torch.Tensor],
+        embedding_A_buffer: torch.Tensor,
+        embedding_B_buffer: torch.Tensor,
+    ):
+        self.set_lora = True
+        self.new_embeddings_buffer = new_embeddings_buffer
+        self.embedding_A_buffer = embedding_A_buffer
+        self.embedding_B_buffer = embedding_B_buffer
+
+    def apply_lora(self, base_output: torch.Tensor, input_: torch.Tensor) -> torch.Tensor:
+        """
+        Apply LoRA to base embedding output.
+        Formula: output = base_output + lora_a_embedding(input_) @ lora_b_weights
+        """
+        # Use F.embedding for LoRA A lookup (no new triton ops needed)
+        batch_info = self.lora_backend.batch_info
+        
+        # Create expanded input for all batch elements
+        # input_: (batch_size * seq_len,)
+        # Need to map each token to its corresponding LoRA adapter
+        
+        device = input_.device
+        total_tokens = input_.shape[0]
+        
+        # Get weight indices for each token based on batch_info
+        # This maps each token position to its LoRA adapter index
+        token_weight_indices = self._get_token_weight_indices(input_, batch_info)
+        
+        # Perform LoRA A embedding lookup using F.embedding
+        # We need to handle the batch dimension properly
+        lora_a_output = self._run_lora_a_embedding(input_, token_weight_indices)
+        
+        # Use existing sgemm_lora_b kernel for B matrix multiplication
+        lora_b_output = self.lora_backend.run_lora_b_sgemm(
+            lora_a_output,
+            self.embedding_B_buffer[0],  # Remove stacked dimension for embeddings
+            base_output=base_output if self.lora_backend.fuse_output_add else None,
+        )
+        
+        return (
+            lora_b_output
+            if self.lora_backend.fuse_output_add
+            else base_output + lora_b_output
+        )
+
+    def _get_token_weight_indices(self, input_: torch.Tensor, batch_info: LoRABatchInfo) -> torch.Tensor:
+        """Map each token position to its corresponding LoRA adapter index."""
+        device = input_.device
+        total_tokens = input_.shape[0]
+        
+        # Create weight indices for each token based on segment info
+        token_weight_indices = torch.zeros(total_tokens, dtype=torch.int32, device=device)
+        
+        current_pos = 0
+        for i in range(batch_info.bs):
+            seg_len = batch_info.seg_lens[i]
+            weight_idx = batch_info.weight_indices[i]
+            token_weight_indices[current_pos:current_pos + seg_len] = weight_idx
+            current_pos += seg_len
+            
+        return token_weight_indices
+
+    def _run_lora_a_embedding(self, input_: torch.Tensor, weight_indices: torch.Tensor) -> torch.Tensor:
+        """
+        Perform LoRA A embedding lookup using F.embedding.
+        No new triton ops needed - use standard PyTorch operations.
+        """
+        batch_info = self.lora_backend.batch_info
+        device = input_.device
+        total_tokens = input_.shape[0]
+        max_rank = self.embedding_A_buffer.shape[1]
+        
+        # Initialize output tensor
+        lora_a_output = torch.zeros(
+            (total_tokens, max_rank), 
+            dtype=self.embedding_A_buffer.dtype, 
+            device=device
+        )
+        
+        # Process each unique LoRA adapter
+        unique_indices = torch.unique(weight_indices)
+        
+        for lora_idx in unique_indices:
+            if lora_idx == 0:  # Skip base model (no LoRA)
+                continue
+                
+            # Get mask for tokens using this LoRA adapter
+            mask = weight_indices == lora_idx
+            if not mask.any():
+                continue
+                
+            # Get the actual rank for this LoRA adapter
+            actual_rank = batch_info.lora_ranks[lora_idx]
+            if actual_rank == 0:
+                continue
+                
+            # Get tokens for this LoRA adapter
+            lora_tokens = input_[mask]
+            
+            # Use F.embedding for lookup - this is efficient and uses existing ops
+            # embedding_A_buffer: (max_loras, max_rank, vocab_size + extra_vocab)
+            lora_a_weights = self.embedding_A_buffer[lora_idx, :actual_rank, :]
+            
+            # Perform embedding lookup
+            lora_a_result = F.embedding(lora_tokens, lora_a_weights.t())
+            
+            # Store result
+            lora_a_output[mask, :actual_rank] = lora_a_result
+            
+        return lora_a_output
+
+    def forward(self, input_: torch.Tensor):
+        if self.new_embeddings_buffer is not None:
+            base_output = self._forward(input_)
+        else:
+            base_output = self.base_layer.forward(input_)
+
+        if self.set_lora:
+            output = self.apply_lora(base_output, input_)
+        else:
+            output = base_output
+
+        return output
+
+    def _forward(self, input_: torch.Tensor) -> torch.Tensor:
+        base_token_mask = input_ < self.vocab_size
+        added_token_mask = ~base_token_mask
+        
+        # Process base tokens through base embedding
+        base_input = input_.clone()
+        base_input[added_token_mask] = 0  # Mask added tokens for base embedding
+        base_output = self.base_layer.forward(base_input)
+        
+        # Process added tokens if any exist
+        if added_token_mask.any():
+            added_tokens = input_[added_token_mask] - self.vocab_size  # Adjust indices
+            batch_info = self.lora_backend.batch_info
+            
+            # Get weight indices for added tokens
+            token_weight_indices = self._get_token_weight_indices(input_, batch_info)
+            added_weight_indices = token_weight_indices[added_token_mask]
+            
+            # Process each unique LoRA adapter for added tokens
+            unique_indices = torch.unique(added_weight_indices)
+            
+            for lora_idx in unique_indices:
+                if lora_idx == 0:
+                    continue
+                    
+                lora_mask = added_weight_indices == lora_idx
+                if not lora_mask.any():
+                    continue
+                    
+                lora_added_tokens = added_tokens[lora_mask]
+                
+                # Use F.embedding for new embeddings lookup
+                new_embeddings = F.embedding(
+                    lora_added_tokens, 
+                    self.new_embeddings_buffer[lora_idx]
+                )
+                
+                # Update base output for added tokens
+                added_token_positions = torch.where(added_token_mask)[0][lora_mask]
+                base_output[added_token_positions] = new_embeddings
+        
+        return base_output
+
+    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+        return A
+
+    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
+        shard_size = divide(self.base_layer.embedding_dim, self.base_layer.tp_size)
+        start_idx = tp_rank * shard_size
+        end_idx = (tp_rank + 1) * shard_size
+        B = B[start_idx:end_idx, :]
+        return B
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):

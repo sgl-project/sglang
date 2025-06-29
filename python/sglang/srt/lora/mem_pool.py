@@ -7,6 +7,7 @@ from sglang.srt.hf_transformers_utils import AutoConfig
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.utils import (
+    VOCAB_PARALLELISM_EMBEDDING_NAMES,
     ROW_PARALLELISM_LINEAR_LORA_NAMES,
     LoRAType,
     get_hidden_dim,
@@ -25,6 +26,7 @@ class LoRAMemoryPool:
         dtype: torch.dtype,
         tp_size: int,
         tp_rank: int,
+        max_extra_vocab_size: int,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
@@ -32,6 +34,7 @@ class LoRAMemoryPool:
         self.dtype: torch.dtype = dtype
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
+        self.max_extra_vocab_size: int = max_extra_vocab_size
 
         # Both A_buffer and B_buffer maps lora weight names to its buffer space.
         # A_buffer contains num_layer number of row-major tensors with shape
@@ -40,6 +43,13 @@ class LoRAMemoryPool:
         #   (stacked_num, max_loras_per_batch, output_dim, max_lora_dim)
         self.A_buffer: Dict[str, List[torch.Tensor]] = {}
         self.B_buffer: Dict[str, List[torch.Tensor]] = {}
+
+        self.new_embeddings_buffer: Optional[Dict[str, torch.Tensor]] = None
+        self.embedding_A_buffer: Optional[Dict[str, torch.Tensor]] = None
+        self.embedding_B_buffer: Optional[Dict[str, torch.Tensor]] = None
+
+        self.embedding_dim: int = self.base_hf_config.hidden_size
+        self.base_vocab_size: int = self.base_hf_config.vocab_size
 
         # Lora uid -> buffer idx in memory pool
         self.uid_to_buffer_id: Dict[Optional[str], int] = {}
@@ -82,22 +92,31 @@ class LoRAMemoryPool:
             max_lora_dim,
         )
 
+    def get_embedding_shape(
+        self,
+    ) -> Tuple[int]:
+        return (self.max_loras_per_batch, self.max_extra_vocab_size, self.embedding_dim)
+
     def init_buffers(
         self,
         lora_weight_names: Tuple[Set[str]],
         base_model: torch.nn.Module,
         max_lora_dim: int,
+        cur_max_extra_vocab_size: int,
     ):
         # lora_weight_names is a set of name pairs indicating each pair of lora modules to load
         #   e.g., {("qkv_proj", "q_proj"), ("qkv_proj", "kv_proj"), ("o_proj", "o_proj")}
         self.lora_weight_names: Tuple[Set[str]] = lora_weight_names
         device = next(base_model.parameters()).device
+        max_vocab_size = self.base_vocab_size + cur_max_extra_vocab_size
 
         def update_buffer(
             buffer: Dict[str, List[torch.Tensor]],
             lora_weight_names: Set[str],
             get_lora_shape_fn: Callable[[str, torch.nn.Module, int], Tuple[int]],
         ):
+            if "embed_tokens" in lora_weight_names:
+
             new_weight_names = lora_weight_names - buffer.keys()
             for module_name in new_weight_names:
                 lora_shape = get_lora_shape_fn(module_name, base_model, max_lora_dim)
@@ -109,6 +128,27 @@ class LoRAMemoryPool:
                     )
                     for _ in range(self.num_layer)
                 ]
+            
+        if cur_max_extra_vocab_size != self.max_extra_vocab_size:
+            self.max_extra_vocab_size = cur_max_extra_vocab_size
+            self.new_embeddings_buffer = {}
+            update_buffer(
+                self.new_embeddings_buffer,
+                set(["input_embeddings"]),
+                self.get_embedding_shape,
+            )
+
+        update_buffer(
+            self.embedding_A_buffer,
+            lora_weight_names[0],
+            self.get_embedding_shape,
+        )
+
+        update_buffer(
+            self.embedding_B_buffer,
+            lora_weight_names[1],
+            self.get_embedding_shape,
+        )
 
         update_buffer(
             self.A_buffer,
@@ -121,6 +161,8 @@ class LoRAMemoryPool:
             lora_weight_names[1],
             self.get_lora_B_shape,
         )
+
+        
 
     def prepare_lora_batch(
         self,
