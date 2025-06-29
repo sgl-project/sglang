@@ -67,7 +67,7 @@ __device__ __forceinline__ void st_global(const int4* ptr, const int4& value) {
 
 __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
   int4 ret;
-  asm volatile("ld.global.nc.L1::no_allocate.v4.s32 {%0, %1, %2, %3}, [%4];"
+  asm volatile("ld.global.nc.v4.s32 {%0, %1, %2, %3}, [%4];"
                : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w)
                : "l"(ptr));
   return ret;
