@@ -14,6 +14,7 @@ from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.multimodal.processors.gemma3n import Gemma3nSGLangProcessor
 from sglang.srt.utils import encode_video, load_audio, load_image
 
 
