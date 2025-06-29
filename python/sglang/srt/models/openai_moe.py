@@ -155,6 +155,7 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
                 if global_server_args_dict["enable_deepep_moe"]
                 else {}
             ),
+            activation=config.hidden_act,
         )
 
         self.gate = ReplicatedLinear(
@@ -829,6 +830,8 @@ class OpenAIMoeForCausalLM(nn.Module):
         self.config.num_experts = self.config.num_local_experts
         self.config.moe_intermediate_size = self.config.intermediate_size * 2
         self.config.norm_topk_prob = True
+        # Todo: remove this, currently use silu as a workaround because the swiglu activation is not supported in FusedMoE
+        # self.config.hidden_act = "swiglu"
         ###########################################################################
 
         self.quant_config = quant_config
