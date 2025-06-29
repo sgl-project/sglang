@@ -1,4 +1,3 @@
-import pickle
 import time
 import itertools
 from pathlib import Path
@@ -90,13 +89,12 @@ def test_per_token_group_quant_with_column_major(
         )
     except AssertionError:
         data = dict(
-            x_q_triton=x_q_triton.cpu().numpy(), x_s_triton=x_s_triton.cpu().numpy(),
-            x_q_sglang=x_q_sglang.cpu().numpy(), x_s_sglang=x_s_sglang.cpu().numpy(),
+            x_q_triton=x_q_triton, x_s_triton=x_s_triton,
+            x_q_sglang=x_q_sglang, x_s_sglang=x_s_sglang,
         )
-        path = f'/data/numa0/tom/temp_sglang_server2local/test_dump_{time.time()}.pickle'
+        path = f'/data/numa0/tom/temp_sglang_server2local/test_dump_{time.time()}.pt'
         print(f"Dump error data to {path=}")
-        with open(path, 'wb') as f:
-            pickle.dump(data, f)
+        torch.save(data, path)
         raise
 
 
