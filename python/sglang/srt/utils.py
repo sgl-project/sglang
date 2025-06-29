@@ -1949,13 +1949,6 @@ def rank0_log(msg: str):
         logger.info(msg)
 
 
-def rank0_print(msg: str):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-    if get_tensor_model_parallel_rank() == 0:
-        print(msg, flush=True)
-
-
 def get_cuda_version():
     if torch.version.cuda:
         return tuple(map(int, torch.version.cuda.split(".")))
@@ -2373,45 +2366,6 @@ def require_mlp_sync(server_args):
     return server_args.enable_dp_attention or require_gathered_buffer(server_args)
 
 
-def merge_bias_tensor(
-    lhs: Optional[torch.Tensor],
-    rhs: Optional[torch.Tensor],
-    bs1: int,
-    bs2: int,
-    device: str,
-    default: float,
-):
-    """Merge two bias tensors for batch merging.
-
-    Args:
-        lhs: Left-hand side tensor
-        rhs: Right-hand side tensor
-        bs1: Batch size of left-hand side tensor
-        bs2: Batch size of right-hand side tensor
-        device: Device to place the merged tensor on
-        default: Default value for missing tensor elements
-
-    Returns:
-        Merged tensor or None if both inputs are None
-    """
-    if lhs is None and rhs is None:
-        return None
-
-    if lhs is not None and rhs is not None:
-        return torch.cat([lhs, rhs])
-    else:
-        if lhs is not None:
-            shape, dtype = lhs.shape[1:], lhs.dtype
-        else:
-            shape, dtype = rhs.shape[1:], rhs.dtype
-
-        if lhs is None:
-            lhs = torch.empty((bs1, *shape), device=device, dtype=dtype).fill_(default)
-        if rhs is None:
-            rhs = torch.empty((bs2, *shape), device=device, dtype=dtype).fill_(default)
-        return torch.cat([lhs, rhs])
-
-
 def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
     import huggingface_hub as hf
 
@@ -2486,6 +2440,77 @@ def cpu_has_amx_support():
     return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
 
 
+def prepack_weight_if_needed(weight):
+    if weight.device != torch.device("cpu"):
+        return weight
+    if not cpu_has_amx_support():
+        return weight
+
+    return torch.ops.sgl_kernel.convert_weight_packed(weight)
+
+
+# TODO: currently gemm kernel has the below requirements:
+# OC % TILE_N == 0, where TILE_N = 16
+# IC % TILE_K == 0, where TILE_K = 32
+def dim_is_supported(weight):
+    return weight.size(0) % 16 == 0 and weight.size(1) % 32 == 0
+
+
+def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
+    # Pack weight for get better performance on CPU
+    devices = {getattr(module, weight_name).device for weight_name in weight_names}
+    assert len(devices) == 1, f"Expects all weights to be on the same device"
+    device = devices.pop()
+
+    if transpose_dims:
+        assert len(weight_names) == len(
+            transpose_dims
+        ), "len(weight_names) should be equal to len(transpose_dims)"
+
+    for i, weight_name in enumerate(weight_names):
+        weight_tensor = getattr(module, weight_name)
+
+        # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
+        if not dim_is_supported(weight_tensor):
+            logger.warning(
+                f"Expects weight.size(0) % 16 == 0 and weight.size(1) % 32 == 0 "
+                f"but {weight_tensor.size(0)=} and {weight_tensor.size(1)=} in {module}. "
+                f"{module} won't use intel amx backend."
+            )
+            module.use_intel_amx_backend = False
+            return
+
+        if transpose_dims and transpose_dims[i]:
+            weight_tensor = weight_tensor.transpose(*transpose_dims[i])
+
+        packed_weight = torch.nn.Parameter(
+            prepack_weight_if_needed(weight_tensor),
+            requires_grad=False,
+        )
+        packed_weight.__dict__ = weight_tensor.__dict__
+        setattr(module, weight_name, packed_weight)
+
+    module.use_intel_amx_backend = (
+        device == torch.device("cpu") and cpu_has_amx_support()
+    )
+
+    if (
+        module.use_intel_amx_backend
+        and hasattr(module, "bias")
+        and module.bias is not None
+    ):
+        module.bias = torch.nn.Parameter(module.bias.data.float(), requires_grad=False)
+
+
+class PackWeightMethod:
+    def __init__(self, weight_names, transpose_dims=None):
+        self.weight_names = weight_names
+        self.transpose_dims = transpose_dims
+
+    def process_weights_after_loading(self, module) -> None:
+        _process_weight_after_loading(module, self.weight_names, self.transpose_dims)
+
+
 class LazyValue:
     def __init__(self, creator: Callable):
         self._creator = creator
@@ -2535,3 +2560,13 @@ def configure_gc_logger():
             )
 
     gc.callbacks.append(gc_callback)
+
+
+# COPIED FROM DeepGEMM
+def align(x: int, y: int) -> int:
+    return ceil_div(x, y) * y
+
+
+# COPIED FROM DeepGEMM
+def ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
