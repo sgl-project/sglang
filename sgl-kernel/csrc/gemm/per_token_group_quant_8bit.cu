@@ -73,8 +73,14 @@ __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
   return ret;
 }
 
+template <typename dtype_t>
+__host__ __device__ dtype_t ceil_div(dtype_t a, dtype_t b) {
+    return (a + b - 1) / b;
+}
+
 constexpr int THREADS_PER_GROUP = 8;
 constexpr uint32_t VEC_NUM_BYTES = 32;
+constexpr int NUM_WAVES_CONSTEXPR = 3;
 
 template <
     typename T,
@@ -88,6 +94,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     scale_packed_t* __restrict__ output_s,
     const int group_size,
     const int num_groups,
+    const int num_groups_per_wave,
     const int groups_per_block,
     const float eps,
     const float min_8bit,
@@ -97,91 +104,99 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int scale_stride = 0) {
   const int local_group_id = threadIdx.x / THREADS_PER_GROUP;
   const int lane_id = threadIdx.x % THREADS_PER_GROUP;
-
   const int block_group_id = blockIdx.x * groups_per_block;
-  const int global_group_id = block_group_id + local_group_id;
-  const int block_group_offset = global_group_id * group_size;
-
-  float local_absmax = eps;
-
-  using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
-  static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
-
-  const T* group_input = input + block_group_offset;
-  DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + block_group_offset;
-  scale_element_t* scale_output;
-
-  if constexpr (IS_COLUMN_MAJOR) {
-    constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
-    const int scale_num_rows_element = scale_num_rows * num_elems_per_pack;
-    const int row_idx = global_group_id / scale_num_rows_element;
-    const int col_idx_raw = global_group_id % scale_num_rows_element;
-    const int col_idx = col_idx_raw / num_elems_per_pack;
-    const int pack_idx = col_idx_raw % num_elems_per_pack;
-    scale_output = reinterpret_cast<scale_element_t*>(output_s) +
-                   (col_idx * scale_stride * num_elems_per_pack + row_idx * num_elems_per_pack + pack_idx);
-  } else {
-    static_assert(!SCALE_UE8M0);
-    scale_output = output_s + global_group_id;
-  }
-
-  constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);
-  constexpr uint32_t VEC_INT4_SIZE = VEC_NUM_BYTES / sizeof(int4);
-
-  int4 input_int4[VEC_INT4_SIZE];
-  T* input_vec = reinterpret_cast<T*>(input_int4);
-  static_assert(sizeof(input_vec[0]) * VEC_TYPED_SIZE == sizeof(input_int4));
 
 #pragma unroll
-  for (uint32_t j = 0; j < VEC_INT4_SIZE; ++j) {
-    input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * VEC_TYPED_SIZE) + j);
-  }
-
-#pragma unroll
-  for (uint32_t j = 0; j < VEC_TYPED_SIZE; ++j) {
-    float val = static_cast<float>(input_vec[j]);
-    float abs_val = fabsf(val);
-    local_absmax = fmaxf(local_absmax, abs_val);
-  }
-
-  local_absmax = GroupReduceMax<THREADS_PER_GROUP>(local_absmax, lane_id);
-
-  float y_scale, y_scale_inv;
-  calculate_fp8_scales<SCALE_UE8M0>(local_absmax, y_scale, y_scale_inv, max_8bit, max_8bit_inv);
-  float2 y_scale_repeated = {y_scale, y_scale};
-
-  scale_element_t y_scale_inv_quant = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
-
-  if (lane_id == 0) {
-    *scale_output = y_scale_inv_quant;
-  }
-
-  int4 output_buf;
-
-  if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
-    const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
-    static_assert(sizeof(output_buf) == VEC_TYPED_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
-    static_assert(VEC_TYPED_SIZE % 2 == 0);
-
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_TYPED_SIZE; j += 2) {
-      float2 inputx2 = {static_cast<float>(input_vec[j]), static_cast<float>(input_vec[j + 1])};
-      float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
-      output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+  for (int wave_index = 0; wave_index < NUM_WAVES_CONSTEXPR; ++wave_index) {
+    const int global_group_id = block_group_id + local_group_id + wave_index * num_groups_per_wave;
+    // TODO optimize
+    if (global_group_id >= num_groups) [[unlikely]] {
+      return;
     }
-  } else {
-    const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
-    static_assert(sizeof(output_buf) == VEC_TYPED_SIZE * sizeof(DST_DTYPE));
+
+    const int block_group_offset = global_group_id * group_size;
+
+    float local_absmax = eps;
+
+    using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
+    static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
+
+    const T* group_input = input + block_group_offset;
+    DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + block_group_offset;
+    scale_element_t* scale_output;
+
+    if constexpr (IS_COLUMN_MAJOR) {
+      constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
+      const int scale_num_rows_element = scale_num_rows * num_elems_per_pack;
+      const int row_idx = global_group_id / scale_num_rows_element;
+      const int col_idx_raw = global_group_id % scale_num_rows_element;
+      const int col_idx = col_idx_raw / num_elems_per_pack;
+      const int pack_idx = col_idx_raw % num_elems_per_pack;
+      scale_output = reinterpret_cast<scale_element_t*>(output_s) +
+                     (col_idx * scale_stride * num_elems_per_pack + row_idx * num_elems_per_pack + pack_idx);
+    } else {
+      static_assert(!SCALE_UE8M0);
+      scale_output = output_s + global_group_id;
+    }
+
+    constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);
+    constexpr uint32_t VEC_INT4_SIZE = VEC_NUM_BYTES / sizeof(int4);
+
+    int4 input_int4[VEC_INT4_SIZE];
+    T* input_vec = reinterpret_cast<T*>(input_int4);
+    static_assert(sizeof(input_vec[0]) * VEC_TYPED_SIZE == sizeof(input_int4));
+
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_INT4_SIZE; ++j) {
+      input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * VEC_TYPED_SIZE) + j);
+    }
 
 #pragma unroll
     for (uint32_t j = 0; j < VEC_TYPED_SIZE; ++j) {
       float val = static_cast<float>(input_vec[j]);
-      float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
-      output_buf_ptr[j] = DST_DTYPE(q_val);
+      float abs_val = fabsf(val);
+      local_absmax = fmaxf(local_absmax, abs_val);
     }
-  }
 
-  st_global(reinterpret_cast<int4*>(group_output + lane_id * VEC_TYPED_SIZE), output_buf);
+    local_absmax = GroupReduceMax<THREADS_PER_GROUP>(local_absmax, lane_id);
+
+    float y_scale, y_scale_inv;
+    calculate_fp8_scales<SCALE_UE8M0>(local_absmax, y_scale, y_scale_inv, max_8bit, max_8bit_inv);
+    float2 y_scale_repeated = {y_scale, y_scale};
+
+    scale_element_t y_scale_inv_quant = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
+
+    if (lane_id == 0) {
+      *scale_output = y_scale_inv_quant;
+    }
+
+    int4 output_buf;
+
+    if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
+      const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
+      static_assert(sizeof(output_buf) == VEC_TYPED_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
+      static_assert(VEC_TYPED_SIZE % 2 == 0);
+
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_TYPED_SIZE; j += 2) {
+        float2 inputx2 = {static_cast<float>(input_vec[j]), static_cast<float>(input_vec[j + 1])};
+        float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
+        output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+      }
+    } else {
+      const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
+      static_assert(sizeof(output_buf) == VEC_TYPED_SIZE * sizeof(DST_DTYPE));
+
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_TYPED_SIZE; ++j) {
+        float val = static_cast<float>(input_vec[j]);
+        float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
+        output_buf_ptr[j] = DST_DTYPE(q_val);
+      }
+    }
+
+    st_global(reinterpret_cast<int4*>(group_output + lane_id * VEC_TYPED_SIZE), output_buf);
+  }
 }
 
 void sgl_per_token_group_quant_8bit(
@@ -215,9 +230,20 @@ void sgl_per_token_group_quant_8bit(
     groups_per_block = 2;
   }
 
+  int device_id = at::cuda::current_device();
+  const cudaDeviceProp* prop = at::cuda::getDeviceProperties(device_id);
+  int num_sms = prop->multiProcessorCount;
+
   auto dst_type = output_q.scalar_type();
-  const int num_blocks = num_groups / groups_per_block;
   const int num_threads = groups_per_block * THREADS_PER_GROUP;
+  // TODO dynamically determine it
+  const int blocks_per_sm = 2048 / num_threads;
+  CHECK_EQ(blocks_per_sm, 16);
+  const int num_blocks = num_sms * blocks_per_sm;
+  const int num_waves = ceil_div(num_groups, groups_per_block * num_blocks);
+  CHECK_EQ(num_waves, NUM_WAVES_CONSTEXPR);
+
+  const int num_groups_per_wave = num_blocks * groups_per_block;
 
   const bool is_column_major = output_s.stride(0) < output_s.stride(1);
   const int scale_num_rows = output_s.size(1);
@@ -241,6 +267,7 @@ void sgl_per_token_group_quant_8bit(
             static_cast<uint32_t*>(output_s.data_ptr()),                                          \
             group_size,                                                                           \
             num_groups,                                                                           \
+            num_groups_per_wave,                                                                  \
             groups_per_block,                                                                     \
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
@@ -255,6 +282,7 @@ void sgl_per_token_group_quant_8bit(
             static_cast<float*>(output_s.data_ptr()),                                             \
             group_size,                                                                           \
             num_groups,                                                                           \
+            num_groups_per_wave,                                                                  \
             groups_per_block,                                                                     \
             (float)eps,                                                                           \
             (float)min_8bit,                                                                      \
@@ -271,6 +299,7 @@ void sgl_per_token_group_quant_8bit(
           static_cast<float*>(output_s.data_ptr()),                                               \
           group_size,                                                                             \
           num_groups,                                                                             \
+          num_groups_per_wave,                                                                    \
           groups_per_block,                                                                       \
           (float)eps,                                                                             \
           (float)min_8bit,                                                                        \
