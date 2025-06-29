@@ -353,11 +353,19 @@ class ModelConfig:
             is_local = os.path.exists(self.model_path)
             modelopt_quant_config = {"quant_method": "modelopt"}
             if not is_local:
-                from huggingface_hub import HfApi
+                from huggingface_hub import hf_hub_download
+                from huggingface_hub.errors import (
+                    EntryNotFoundError,
+                    OfflineModeIsEnabled,
+                )
 
-                hf_api = HfApi()
-                if hf_api.file_exists(self.model_path, "hf_quant_config.json"):
+                try:
+                    hf_hub_download(self.model_path, "hf_quant_config.json")
+                except (OfflineModeIsEnabled, EntryNotFoundError):
+                    pass
+                else:
                     quant_cfg = modelopt_quant_config
+
             elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
                 quant_cfg = modelopt_quant_config
         return quant_cfg
