@@ -252,11 +252,11 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
 
         # Collect available media token pairs
         media_token_pairs = []
-        for attr_name in ["im_start_id", "audio_start_id"]:
-            if hasattr(mm_inputs, attr_name):
-                start_id = getattr(mm_inputs, attr_name)
-                end_id = getattr(mm_inputs, attr_name.replace("start", "end"))
-                media_token_pairs.append((start_id, end_id))
+        if mm_inputs.im_start_id is not None:
+            media_token_pairs.append((mm_inputs.im_start_id, mm_inputs.im_end_id))
+        if mm_inputs.audio_start_id is not None:
+            media_token_pairs.append((mm_inputs.audio_start_id, mm_inputs.audio_end_id))
+        print(f"DEBUG: gemma3n_mm.pad_input_ids: {media_token_pairs=}")
 
         # Apply padding pattern if we have media tokens
         if media_token_pairs:
@@ -431,7 +431,6 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             )
 
         positions += 1
-
         if input_ids is not None:
             # Prepare per-layer inputs from inputs_ids
             per_layer_inputs_mask = torch.logical_and(

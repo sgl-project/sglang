@@ -176,6 +176,10 @@ class Modality(Enum):
     VIDEO = auto()
     AUDIO = auto()
 
+    @staticmethod
+    def from_str(modality_str: str):
+        return Modality[modality_str]
+
 
 @dataclasses.dataclass
 class MultimodalDataItem:
