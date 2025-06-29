@@ -881,6 +881,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.use_min_latency_fused_a_gemm = (
             hasattr(self, "fused_qkv_a_proj_with_mqa")
             and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
+            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
+            and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
             and is_cuda
             and get_device_sm() >= 90
         )
