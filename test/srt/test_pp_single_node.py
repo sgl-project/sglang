@@ -2,7 +2,9 @@
 Usage:
 python3 -m unittest test_pp_single_node.TestPPAccuracy.test_gsm8k
 python3 -m unittest test_pp_single_node.TestQwenPPAccuracy.test_pp_consistency
+python3 -m unittest test_pp_single_node.TestQwenMoePPAccuracy.test_pp_consistency
 python3 -m unittest test_pp_single_node.TestFixedBugs.test_chunked_prefill_with_small_bs
+python3 -m unittest test_pp_single_node.TestTritonAttentionBackend.test_triton_attention_backend_with_small_bs
 """
 
 import time
@@ -242,6 +244,26 @@ class TestFixedBugs(unittest.TestCase):
             "--max-running-requests",
             2,
         ]
+        run_bench_one_batch_server(
+            model,
+            DEFAULT_URL_FOR_TEST,
+            server_args,
+            bench_args,
+            other_server_args,
+        )
+
+
+class TestTritonAttentionBackend(unittest.TestCase):
+    def test_triton_attention_backend_with_small_bs(self):
+        model = DEFAULT_MODEL_NAME_FOR_TEST
+        server_args = ServerArgs(model_path=model)
+        bench_args = OneBatchBenchArgs(
+            batch_size=(1,),
+            input_len=(1,),
+            output_len=(1,),
+            base_url=DEFAULT_URL_FOR_TEST,
+        )
+        other_server_args = ["--pp-size", 4, "--attention-backend", "triton"]
         run_bench_one_batch_server(
             model,
             DEFAULT_URL_FOR_TEST,
