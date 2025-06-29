@@ -33,6 +33,7 @@ from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
     cutlass_scaled_fp4_mm,
+    dsv3_fused_a_gemm,
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
     int8_scaled_mm,
@@ -47,6 +48,12 @@ from sgl_kernel.gemm import (
     shuffle_rows,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+from sgl_kernel.kvcacheio import (
+    transfer_kv_all_layer,
+    transfer_kv_all_layer_mla,
+    transfer_kv_per_layer,
+    transfer_kv_per_layer_mla,
+)
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     cutlass_fp4_group_mm,
