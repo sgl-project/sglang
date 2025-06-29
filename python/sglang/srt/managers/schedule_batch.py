@@ -38,7 +38,7 @@ import logging
 import threading
 from enum import Enum, auto
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -54,9 +54,10 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.layers.multimodal import gpu_tensor_hash
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
+from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.metrics.collector import TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -85,6 +86,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_deepep_moe",
     "deepep_mode",
     "enable_ep_moe",
+    "enable_flashinfer_moe",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
     "deepep_config",
@@ -99,6 +101,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "torchao_config",
     "triton_attention_reduce_in_fp32",
     "num_reserved_decode_tokens",
+    "weight_loader_disable_mmap",
 ]
 
 # Put some global args for easy access
@@ -177,41 +180,47 @@ class Modality(Enum):
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
-    A single multimodal data, from a single image/video/audio or others
+    A single multimodal data, from a single image/video/audio or others.
+
+    We put the common fields first and the model-specific fields last.
     """
 
     modality: Modality
-
     hash: int = None
     pad_value: int = None
-
-    aspect_ratio_id: Optional[List[torch.Tensor]] = None
-    aspect_ratio_mask: Optional[List[torch.Tensor]] = None
-
     image_sizes: Tuple[int, int] = None
     image_offsets: Optional[list] = None
 
     # the real data, pixel_values or audio_features
     # data: Union[List[torch.Tensor], List[np.ndarray]]
     pixel_values: Union[torch.Tensor, np.ndarray] = None
-    image_grid_thw: Union[torch.Tensor, np.ndarray] = None
-    video_grid_thws: Union[torch.Tensor, np.ndarray] = None
-
-    image_emb_mask: Optional[torch.Tensor] = None
-    image_spatial_crop: Optional[torch.Tensor] = None
-    second_per_grid_ts: Optional[List[torch.Tensor]] = None
-
-    # [num_images, (n, w, h)]
-    tgt_size: Tuple[int, int] = None
-
-    # kimi-vl related
-    image_grid_hws: Optional[List[torch.Tensor]] = None
-
     audio_features: Union[torch.Tensor, np.ndarray] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
     audio_offsets: Optional[List[Tuple[int, int]]] = None
-
     precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
+
+    # For qwen-vl
+    image_grid_thw: Union[torch.Tensor, np.ndarray] = None
+    second_per_grid_ts: Optional[List[torch.Tensor]] = None
+
+    # For deepseek-vl
+    image_emb_mask: Optional[torch.Tensor] = None
+    image_spatial_crop: Optional[torch.Tensor] = None
+
+    # For minicpmv
+    # [num_images, (n, w, h)]
+    tgt_size: Tuple[int, int] = None
+
+    # For mllama
+    aspect_ratio_id: Optional[List[torch.Tensor]] = None
+    aspect_ratio_mask: Optional[List[torch.Tensor]] = None
+
+    # For kimi-vl
+    image_grid_hws: Optional[List[torch.Tensor]] = None
+
+    # For gemma3n
+    input_features: Optional[torch.Tensor] = None
+    input_features_mask: Optional[torch.Tensor] = None
 
     @staticmethod
     def is_empty_list(l):
@@ -274,7 +283,10 @@ class MultimodalDataItem:
         if self.precomputed_features is not None:
             self.hash = hash_feature(self.precomputed_features)
         elif self.is_audio():
-            self.hash = hash_feature(self.audio_features)
+            if self.audio_features is not None:
+                self.hash = hash_feature(self.audio_features)
+            elif self.input_features is not None:
+                self.hash = hash_feature(self.input_features)
         else:
             self.hash = hash_feature(self.pixel_values)
 
@@ -285,6 +297,7 @@ class MultimodalDataItem:
         return (self.modality == Modality.AUDIO) and (
             self.precomputed_features is not None
             or not MultimodalDataItem.is_empty_list(self.audio_features)
+            or not MultimodalDataItem.is_empty_list(self.input_features)
         )
 
     def is_image(self):
@@ -328,10 +341,6 @@ class MultimodalInputs:
     image_pad_len: Optional[list] = None
     num_image_tokens: Optional[int] = None
 
-    # QWen2-VL related
-    mrope_positions: Optional[torch.Tensor] = None
-    mrope_position_delta: Optional[torch.Tensor] = None
-
     # image
     im_token_id: Optional[int] = None
     im_start_id: Optional[int] = None
@@ -346,6 +355,10 @@ class MultimodalInputs:
     audio_token_id: Optional[int] = None
     audio_start_id: Optional[int] = None
     audio_end_id: Optional[int] = None
+
+    # QWen2-VL related
+    mrope_positions: Optional[torch.Tensor] = None
+    mrope_position_delta: Optional[torch.Tensor] = None
 
     @staticmethod
     def from_dict(obj: dict):
@@ -436,7 +449,7 @@ class Req:
         self,
         rid: str,
         origin_input_text: str,
-        origin_input_ids: Tuple[int],
+        origin_input_ids: List[int],
         sampling_params: SamplingParams,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
@@ -467,12 +480,15 @@ class Req:
         # Each decode stage's output ids
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
-        self.fill_ids = None
+        self.fill_ids = []
         self.session_id = session_id
         self.input_embeds = input_embeds
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
+
+        # The length of KV that have been removed in local attention chunked prefill
+        self.evicted_seqlen_local = 0
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -519,13 +535,14 @@ class Req:
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
-        self.prefix_indices = []
+        self.prefix_indices: torch.Tensor = []
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
-        self.last_node = None
-        self.last_node_global = None
+        self.last_node: Any = None
+        self.last_host_node: Any = None
+        self.host_hit_length = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -583,6 +600,7 @@ class Req:
                 self.output_token_ids_logprobs_idx
             ) = None
         self.hidden_states: List[List[float]] = []
+        self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
 
         # Embedding (return values)
         self.embedding = None
@@ -644,21 +662,17 @@ class Req:
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
-        enable_hierarchical_cache=False,
     ):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
-            # tree cache is None if the prefix is not computed with tree cache.
-            if enable_hierarchical_cache:
-                self.prefix_indices, self.last_node, self.last_node_global = (
-                    tree_cache.match_prefix(
-                        key=self.adjust_max_prefix_ids(), include_evicted=True
-                    )
-                )
-            else:
-                self.prefix_indices, self.last_node = tree_cache.match_prefix(
-                    rid=self.rid, key=self.adjust_max_prefix_ids()
-                )
+            (
+                self.prefix_indices,
+                self.last_node,
+                self.last_host_node,
+                self.host_hit_length,
+            ) = tree_cache.match_prefix(
+                key=self.adjust_max_prefix_ids(),
+            )
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
@@ -788,6 +802,7 @@ class Req:
         self.multimodal_inputs = None
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
+        self.return_logprob = False
         self.finished_reason = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
@@ -812,7 +827,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Request, memory pool, and cache
     reqs: List[Req]
     req_to_token_pool: ReqToTokenPool = None
-    token_to_kv_pool_allocator: TokenToKVPoolAllocator = None
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
 
     # Batch configs
@@ -909,7 +924,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         cls,
         reqs: List[Req],
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tree_cache: BasePrefixCache,
         model_config: ModelConfig,
         enable_overlap: bool,
@@ -1181,6 +1196,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_to_token_pool.write(
                     (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices
                 )
+                if isinstance(self.tree_cache, SWAChunkCache):
+                    self.tree_cache.evict(
+                        req, pre_len, self.model_config.attention_chunk_size
+                    )
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -1361,7 +1380,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return len(self.reqs)
         # In the decoding phase, the length of a request's KV cache should be
         # the total length of the request minus 1
-        return sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
+        return (
+            sum(1 for req in self.reqs if req.seqlen % page_size == 0)
+            if self.enable_overlap
+            else sum(1 for req in self.reqs if (req.seqlen - 1) % page_size == 0)
+        )
 
     def check_decode_mem(self, buf_multiplier=1):
         tokens_required = (
@@ -1369,7 +1392,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             * buf_multiplier
             * self.token_to_kv_pool_allocator.page_size
         )
-
         if self.token_to_kv_pool_allocator.available_size() >= tokens_required:
             return True
 
@@ -1549,6 +1571,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # A faster in-place version
             self.seq_lens.add_(1)
         self.seq_lens_sum += bs
+
+        # free memory
+        if isinstance(self.tree_cache, SWAChunkCache):
+            for req in self.reqs:
+                self.tree_cache.evict(
+                    req, req.seqlen - 1, self.model_config.attention_chunk_size
+                )
 
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
@@ -1784,7 +1813,6 @@ class ModelWorkerBatch:
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool_allocator
     out_cache_loc: torch.Tensor
-
     # The sequence length tensor on CPU
     seq_lens_cpu: Optional[torch.Tensor]
     seq_lens_sum: int

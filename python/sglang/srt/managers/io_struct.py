@@ -20,18 +20,17 @@ import copy
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
-from sglang.srt.mm_utils import has_valid_data
+from sglang.srt.managers.schedule_batch import BaseFinishReason
+from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.sampling.sampling_params import SamplingParams
 
-# handle serialization of Image for pydantic
+# Handle serialization of Image for pydantic
 if TYPE_CHECKING:
     from PIL.Image import Image
 else:
     Image = Any
-
-from sglang.srt.managers.schedule_batch import BaseFinishReason
-from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 @dataclass
@@ -182,6 +181,7 @@ class GenerateReqInput:
         # Determine parallel sample count
         if self.sampling_params is None:
             self.parallel_sample_num = 1
+            return
         elif isinstance(self.sampling_params, dict):
             self.parallel_sample_num = self.sampling_params.get("n", 1)
         else:  # isinstance(self.sampling_params, list):
@@ -226,11 +226,11 @@ class GenerateReqInput:
 
         # Expand input based on type
         self._expand_inputs(num)
+        self._normalize_rid(num)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
-        self._normalize_rid(num)
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
 
@@ -319,8 +319,16 @@ class GenerateReqInput:
         """Normalize request IDs for batch processing."""
         if self.rid is None:
             self.rid = [uuid.uuid4().hex for _ in range(num)]
-        elif not isinstance(self.rid, list):
-            raise ValueError("The rid should be a list for batch processing.")
+        elif isinstance(self.rid, str):
+            new_rids = [f"{self.rid}_{i}" for i in range(num)]
+            self.rid = new_rids
+        elif isinstance(self.rid, list):
+            if len(self.rid) != num:
+                raise ValueError(
+                    "The specified rids length mismatch with the batch_size for batch processing."
+                )
+        else:
+            raise ValueError("The rid should be a string or a list of strings.")
 
     def _normalize_logprob_params(self, num):
         """Normalize logprob-related parameters for batch processing."""
@@ -530,6 +538,7 @@ class EmbeddingReqInput:
         if self.text is not None:
             if isinstance(self.text, list):
                 self.batch_size += len(self.text)
+                self.is_single = False
             else:
                 self.batch_size += 1
 
@@ -537,11 +546,9 @@ class EmbeddingReqInput:
         if self.input_ids is not None:
             if isinstance(self.input_ids[0], list):
                 self.batch_size += len(self.input_ids)
+                self.is_single = False
             else:
                 self.batch_size += 1
-
-        if self.batch_size > 1:
-            self.is_single = False
 
         # Fill in default arguments
         if self.is_single:
@@ -812,7 +819,9 @@ class GetWeightsByNameReqOutput:
 
 @dataclass
 class ReleaseMemoryOccupationReqInput:
-    pass
+    # Optional tags to identify the memory region, which is primarily used for RL
+    # Currently we only support `weights` and `kv_cache`
+    tags: Optional[List[str]] = None
 
 
 @dataclass
@@ -822,7 +831,9 @@ class ReleaseMemoryOccupationReqOutput:
 
 @dataclass
 class ResumeMemoryOccupationReqInput:
-    pass
+    # Optional tags to identify the memory region, which is primarily used for RL
+    # Currently we only support `weights` and `kv_cache`
+    tags: Optional[List[str]] = None
 
 
 @dataclass
@@ -859,12 +870,6 @@ class GetInternalStateReqOutput:
 @dataclass
 class SetInternalStateReq:
     server_args: Dict[str, Any]
-
-
-@dataclass
-class V1RerankReqInput:
-    query: str
-    documents: List[str]
 
 
 @dataclass
@@ -997,3 +1002,27 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
+
+
+@dataclass
+class LoadLoRAAdapterReqInput:
+    # The name of the lora module to newly loaded.
+    lora_name: str
+    # The path of loading.
+    lora_path: str
+
+
+@dataclass
+class UnloadLoRAAdapterReqInput:
+    # The name of lora module to unload.
+    lora_name: str
+
+
+@dataclass
+class LoRAUpdateResult:
+    success: bool
+    error_message: Optional[str] = None
+    loaded_adapters: Dict[str, str] = field(default_factory=dict)
+
+
+LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult
