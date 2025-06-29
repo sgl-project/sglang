@@ -1,10 +1,8 @@
 import logging
 from dataclasses import dataclass
 
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.quantization import deep_gemm_wrapper
-from sglang.srt.managers.expert_distribution import (
-    get_global_expert_distribution_recorder,
-)
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     DeepEPMode,

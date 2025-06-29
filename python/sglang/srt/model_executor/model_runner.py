@@ -39,6 +39,19 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.eplb.eplb_manager import EPLBManager
+from sglang.srt.eplb.expert_distribution import (
+    ExpertDistributionRecorder,
+    get_global_expert_distribution_recorder,
+    set_global_expert_distribution_recorder,
+)
+from sglang.srt.eplb.expert_location import (
+    ExpertLocationMetadata,
+    compute_initial_expert_location_metadata,
+    get_global_expert_location_metadata,
+    set_global_expert_location_metadata,
+)
+from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -54,18 +67,6 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.managers.eplb_manager import EPLBManager
-from sglang.srt.managers.expert_distribution import (
-    ExpertDistributionRecorder,
-    get_global_expert_distribution_recorder,
-    set_global_expert_distribution_recorder,
-)
-from sglang.srt.managers.expert_location import (
-    ExpertLocationMetadata,
-    compute_initial_expert_location_metadata,
-    get_global_expert_location_metadata,
-    set_global_expert_location_metadata,
-)
 from sglang.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
@@ -84,7 +85,6 @@ from sglang.srt.mem_cache.memory_pool import (
     SWAKVPool,
 )
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
