@@ -161,6 +161,7 @@ class BaseMultimodalProcessor(ABC):
     async def process_mm_data_async(
         self,
         image_data,
+        audio_data,
         input_text,
         request_obj,
         max_req_input_len,

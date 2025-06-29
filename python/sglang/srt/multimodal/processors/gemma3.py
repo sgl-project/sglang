@@ -36,11 +36,6 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        if not image_data:
-            return None
-        if isinstance(image_data, str):
-            image_data = [image_data]
-
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,

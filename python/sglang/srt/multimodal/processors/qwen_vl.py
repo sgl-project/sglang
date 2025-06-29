@@ -49,9 +49,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        if isinstance(image_data, str):
-            image_data = [image_data]
-
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
