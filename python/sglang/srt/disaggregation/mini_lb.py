@@ -5,7 +5,9 @@ Minimal HTTP load balancer for prefill and decode servers for testing.
 import asyncio
 import dataclasses
 import logging
+import os
 import random
+import time
 import urllib
 from itertools import chain
 from typing import List, Optional
@@ -53,6 +55,10 @@ class MiniLoadBalancer:
         self.prefill_configs = prefill_configs
         self.prefill_servers = [p.url for p in prefill_configs]
         self.decode_servers = decode_servers
+        self.profiling = False
+
+        profile_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "./tmp")
+        os.makedirs(profile_dir, exist_ok=True)
 
     def add_prefill_server(self, new_prefill_config: PrefillConfig):
         self.prefill_configs.append(new_prefill_config)
@@ -69,6 +75,46 @@ class MiniLoadBalancer:
         prefill_config = random.choice(self.prefill_configs)
         decode_server = random.choice(self.decode_servers)
         return prefill_config.url, prefill_config.bootstrap_port, decode_server
+
+    async def start_profile(self):
+        """Start profiling on all servers."""
+        if self.profiling:
+            return {"success": False, "message": "Profiling is already in progress"}
+
+        self.profiling = True
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for server in chain(self.prefill_servers, self.decode_servers):
+                tasks.append(session.post(f"{server}/start_profile"))
+
+            responses = await asyncio.gather(*tasks)
+            success = all(response.status == 200 for response in responses)
+            return {
+                "success": success,
+                "message": (
+                    "Profiling started" if success else "Failed to start profiling"
+                ),
+            }
+
+    async def stop_profile(self):
+        """Stop profiling on all servers."""
+        if not self.profiling:
+            return {"success": False, "message": "Profiling is not in progress"}
+
+        self.profiling = False
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for server in chain(self.prefill_servers, self.decode_servers):
+                tasks.append(session.post(f"{server}/stop_profile"))
+
+            responses = await asyncio.gather(*tasks)
+            success = all(response.status == 200 for response in responses)
+            return {
+                "success": success,
+                "message": (
+                    "Profiling stopped" if success else "Failed to stop profiling"
+                ),
+            }
 
     async def generate(
         self, modified_request, prefill_server, decode_server, endpoint
@@ -398,6 +444,22 @@ async def register(obj: PDRegistryRequest):
     )
 
     return Response(status_code=200)
+
+
+@app.post("/start_profile")
+async def start_profile():
+    """Start profiling on all servers."""
+    if load_balancer is None:
+        raise HTTPException(status_code=500, detail="Load balancer not initialized")
+    return await load_balancer.start_profile()
+
+
+@app.post("/stop_profile")
+async def stop_profile():
+    """Stop profiling on all servers."""
+    if load_balancer is None:
+        raise HTTPException(status_code=500, detail="Load balancer not initialized")
+    return await load_balancer.stop_profile()
 
 
 def run(prefill_configs, decode_addrs, host, port):
