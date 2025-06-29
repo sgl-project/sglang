@@ -155,7 +155,7 @@ class TestAbortRequest(CustomTestCase):
             thread.start()
         
         # Abort one request
-        time.sleep(0.05)
+        time.sleep(0.1)
         abort_response = self._send_abort_request(abort_target_id)
         
         # Wait for completion
