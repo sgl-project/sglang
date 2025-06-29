@@ -722,21 +722,17 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int], # [start, end) 0-based
+        split_interval: Tuple[int, int],  # [start, end) 0-based
         input_embeds: torch.Tensor = None,
-        measure_speed: bool = True,
     ):
-        if measure_speed:
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
-        # embed
         start, end = split_interval
+        # embed
         if start == 0:
             if input_embeds is None:
                 forward_batch.hidden_states = self.model.embed_tokens(input_ids)
             else:
                 forward_batch.hidden_states = input_embeds
+
         # decoder layer
         for i in range(start, end):
             with get_global_expert_distribution_recorder().with_current_layer(i):
@@ -747,23 +743,19 @@ class Qwen3MoeForCausalLM(nn.Module):
                     forward_batch,
                     forward_batch.residual,
                 )
-        
+
         if end == self.model.config.num_hidden_layers:
             # norm
-            hidden_states, _ = self.model.norm(forward_batch.hidden_states, forward_batch.residual)
+            hidden_states, _ = self.model.norm(
+                forward_batch.hidden_states, forward_batch.residual
+            )
             forward_batch.hidden_states = hidden_states
             # logits process
             result = self.logits_processor(
                 input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )                
+            )
         else:
             result = None
-        
-        if measure_speed:
-            end_event.record()
-            torch.cuda.synchronize()
-            layer_time = start_event.elapsed_time(end_event)  # Returns time in milliseconds
-            print(f"split_prefill layer [{start}, {end}) time: {layer_time:.2f} ms")
 
         return result
 

@@ -653,22 +653,17 @@ class Gemma3ForCausalLM(PreTrainedModel):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int], # [start, end) 0-based
+        split_interval: Tuple[int, int],  # [start, end) 0-based
         input_embeds: torch.Tensor = None,
-        measure_speed: bool = True,
     ):
-        if measure_speed:
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
-        # embed
         start, end = split_interval
+        # embed
         if start == 0:
             if input_embeds is None:
                 hidden_states = self.model.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
-            
+
             if positions.dim() == 1:
                 positions = einops.rearrange(positions, "s -> 1 s")
             position_embeddings_global = self.rotary_emb(hidden_states, positions)
@@ -686,32 +681,32 @@ class Gemma3ForCausalLM(PreTrainedModel):
             layer = self.model.layers[i]
             layer_output = layer(
                 positions=forward_batch.model_specific_states["positions"],
-                position_embeddings_global=forward_batch.model_specific_states["position_embeddings_global"],
-                position_embeddings_local=forward_batch.model_specific_states["position_embeddings_local"],
+                position_embeddings_global=forward_batch.model_specific_states[
+                    "position_embeddings_global"
+                ],
+                position_embeddings_local=forward_batch.model_specific_states[
+                    "position_embeddings_local"
+                ],
                 hidden_states=forward_batch.hidden_states,
                 forward_batch=forward_batch,
             )
             forward_batch.hidden_states = layer_output[0]
-            
+
         if end == self.model.config.num_hidden_layers:
             # norm
             forward_batch.hidden_states = self.model.norm(forward_batch.hidden_states)
 
             # logits process
             result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.model.embed_tokens, forward_batch
-            )                
+                input_ids,
+                forward_batch.hidden_states,
+                self.model.embed_tokens,
+                forward_batch,
+            )
         else:
             result = None
-        
-        if measure_speed:
-            end_event.record()
-            torch.cuda.synchronize()
-            layer_time = start_event.elapsed_time(end_event)  # Returns time in milliseconds
-            print(f"split_prefill layer [{start}, {end}) time: {layer_time:.2f} ms")
 
         return result
-
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
