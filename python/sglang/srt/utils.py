@@ -1332,6 +1332,7 @@ def init_custom_process_group(
     store=None,
     group_name=None,
     pg_options=None,
+    device_id = -1,
 ):
     from torch.distributed.distributed_c10d import (
         Backend,
@@ -1360,6 +1361,11 @@ def init_custom_process_group(
     if timeout is None:
         timeout = default_pg_timeout
 
+    if device_id >= 0:
+        device_idx = torch.device(f"cuda:{device_id}")
+    else:
+        device_idx = torch.device(f"cuda:{0}")
+
     # backward compatible API
     if store is None:
         rendezvous_iterator = rendezvous(init_method, rank, world_size, timeout=timeout)
@@ -1385,6 +1391,7 @@ def init_custom_process_group(
         group_name=group_name,
         **{pg_options_param_name: pg_options},
         timeout=timeout,
+        device_id=device_idx,
     )
 
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
