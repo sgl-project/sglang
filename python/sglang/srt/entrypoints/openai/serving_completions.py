@@ -150,6 +150,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
+        spec_verify_ct = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -162,6 +163,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
+                spec_verify_ct[index] = content["meta_info"].get("spec_verify_ct", None)
 
                 stream_buffer = stream_buffers.get(index, "")
                 # Handle echo for first chunk
@@ -254,8 +256,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     prompt_tokens,
                     completion_tokens,
                     cached_tokens,
+                    spec_verify_ct,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    enable_spec_report=self.tokenizer_manager.server_args.enable_spec_report,
                 )
                 final_usage_chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
