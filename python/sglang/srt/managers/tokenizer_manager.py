@@ -83,6 +83,9 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    LoadLoRAAdapterReqInput,
+    LoadLoRAAdapterReqOutput,
+    LoRAUpdateResult,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -99,6 +102,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UnloadLoRAAdapterReqInput,
+    UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -145,7 +150,9 @@ class ReqState:
 
     # For streaming output
     last_output_offset: int = 0
+
     # For incremental state update.
+    # TODO(lianmin): do not initialize some lists if not needed.
     text: str = ""
     output_ids: List[int] = dataclasses.field(default_factory=list)
     input_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
@@ -194,7 +201,6 @@ class TokenizerManager:
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
         self.model_config = ModelConfig.from_server_args(server_args)
-
         self.is_generation = self.model_config.is_generation
         self.is_image_gen = self.model_config.is_image_gen
         self.context_len = self.model_config.context_len
@@ -246,19 +252,36 @@ class TokenizerManager:
         self.dump_requests_threshold = 1000
         self.dump_request_list: List[Tuple] = []
         self.log_request_metadata = self.get_log_request_metadata()
+        self.asyncio_tasks = set()
+        self.session_futures = {}  # session_id -> asyncio event
+        self.max_req_input_len = None
 
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
             None
         )
-        self.asyncio_tasks = set()
 
-        # For session info
-        self.session_futures = {}  # session_id -> asyncio event
+        # For pd disaggregtion
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
+        self.transfer_backend = TransferBackend(
+            self.server_args.disaggregation_transfer_backend
+        )
+        # Start kv boostrap server on prefill
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # only start bootstrap server on prefill tm
+            kv_bootstrap_server_class = get_kv_class(
+                self.transfer_backend, KVClassType.BOOTSTRAP_SERVER
+            )
+            self.bootstrap_server = kv_bootstrap_server_class(
+                self.server_args.disaggregation_bootstrap_port
+            )
 
-        # Set after scheduler is initialized
-        self.max_req_input_len = None
+        # For load balancing
+        self.current_load = 0
+        self.current_load_lock = asyncio.Lock()
 
         # Metrics
         if self.enable_metrics:
@@ -309,6 +332,9 @@ class TokenizerManager:
             self.send_to_scheduler, server_args.dp_size
         )
         self.expert_distribution_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.update_lora_adapter_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
 
@@ -377,29 +403,13 @@ class TokenizerManager:
                     ExpertDistributionReqOutput,
                     self.expert_distribution_communicator.handle_recv,
                 ),
+                (
+                    LoRAUpdateResult,
+                    self.update_lora_adapter_communicator.handle_recv,
+                ),
                 (HealthCheckOutput, lambda x: None),
             ]
         )
-
-        # For pd disaggregtion
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
-        self.transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
-        )
-        # Start kv boostrap server on prefill
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # only start bootstrap server on prefill tm
-            kv_bootstrap_server_class = get_kv_class(
-                self.transfer_backend, KVClassType.BOOTSTRAP_SERVER
-            )
-            self.bootstrap_server = kv_bootstrap_server_class(
-                self.server_args.disaggregation_bootstrap_port
-            )
-
-        self.current_load = 0
-        self.current_load_lock = asyncio.Lock()
 
     async def generate_request(
         self,
@@ -407,30 +417,14 @@ class TokenizerManager:
         request: Optional[fastapi.Request] = None,
     ):
         created_time = time.time()
-
         self.auto_create_handle_loop()
+        obj.normalize_batch_and_arguments()
 
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
                 "This model does not appear to be an embedding model by default. "
                 "Please add `--is-embedding` when launching the server or try another model."
             )
-
-        obj.normalize_batch_and_arguments()
-
-        if isinstance(obj, GenerateReqInput):
-            return_hidden_states = obj.return_hidden_states
-            has_return_hidden_states = return_hidden_states == True or (
-                isinstance(return_hidden_states, list) and any(return_hidden_states)
-            )
-            if (
-                not self.server_args.enable_return_hidden_states
-                and has_return_hidden_states
-            ):
-                raise ValueError(
-                    "return_hidden_states=True requires the server to be started "
-                    "with --enable-return-hidden-states (ServerArgs.enable_return_hidden_states)."
-                )
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -439,8 +433,7 @@ class TokenizerManager:
             )
 
         async with self.model_update_lock.reader_lock:
-            is_single = obj.is_single
-            if is_single:
+            if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
                 state = self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj, state, request):
@@ -502,12 +495,12 @@ class TokenizerManager:
         else:
             image_inputs: Optional[Dict] = None
 
-        self._validate_token_len(obj, input_ids)
+        self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, image_inputs, token_type_ids
         )
 
-    def _validate_token_len(
+    def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
@@ -536,6 +529,24 @@ class TokenizerManager:
             )
             raise ValueError(error_msg)
 
+        if isinstance(obj, GenerateReqInput):
+            if (
+                obj.return_hidden_states
+                and not self.server_args.enable_return_hidden_states
+            ):
+                raise ValueError(
+                    "The server is not configured to return the hidden states. "
+                    "Please set `--enable-return-hidden-states` to enable this feature."
+                )
+            if (
+                obj.custom_logit_processor
+                and not self.server_args.enable_custom_logit_processor
+            ):
+                raise ValueError(
+                    "The server is not configured to enable custom logit processor. "
+                    "Please set `--enable-custom-logits-processor` to enable this feature."
+                )
+
     def _create_tokenized_object(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -546,24 +557,6 @@ class TokenizerManager:
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
-
-        if self.is_generation:
-            return_logprob = obj.return_logprob
-            logprob_start_len = obj.logprob_start_len
-            top_logprobs_num = obj.top_logprobs_num
-            token_ids_logprob = obj.token_ids_logprob
-            session_params = (
-                SessionParams(**obj.session_params) if obj.session_params else None
-            )
-            if (
-                obj.custom_logit_processor
-                and not self.server_args.enable_custom_logit_processor
-            ):
-                raise ValueError(
-                    "The server is not configured to enable custom logit processor. "
-                    "Please set `--enable-custom-logits-processor` to enable this feature."
-                )
-
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
@@ -577,16 +570,20 @@ class TokenizerManager:
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
+            session_params = (
+                SessionParams(**obj.session_params) if obj.session_params else None
+            )
+
             tokenized_obj = TokenizedGenerateReqInput(
                 obj.rid,
                 input_text,
                 input_ids,
                 image_inputs,
                 sampling_params,
-                return_logprob,
-                logprob_start_len,
-                top_logprobs_num,
-                token_ids_logprob,
+                obj.return_logprob,
+                obj.logprob_start_len,
+                obj.top_logprobs_num,
+                obj.token_ids_logprob,
                 obj.stream,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
@@ -959,6 +956,49 @@ class TokenizerManager:
         async with self.model_update_lock.writer_lock:
             result = (await self.update_weights_from_tensor_communicator(obj))[0]
             return result.success, result.message
+
+    async def load_lora_adapter(
+        self,
+        obj: LoadLoRAAdapterReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> LoadLoRAAdapterReqOutput:
+        self.auto_create_handle_loop()
+
+        # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+        # with dp_size > 1.
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be 1 for dynamic lora loading"
+        logger.info(
+            "Start load Lora adapter. Lora name=%s, path=%s",
+            obj.lora_name,
+            obj.lora_path,
+        )
+
+        async with self.model_update_lock.writer_lock:
+            result = (await self.update_lora_adapter_communicator(obj))[0]
+            return result
+
+    async def unload_lora_adapter(
+        self,
+        obj: UnloadLoRAAdapterReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> UnloadLoRAAdapterReqOutput:
+        self.auto_create_handle_loop()
+
+        # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+        # with dp_size > 1.
+        assert (
+            self.server_args.dp_size == 1
+        ), "dp_size must be 1 for dynamic lora loading"
+        logger.info(
+            "Start unload Lora adapter. Lora name=%s",
+            obj.lora_name,
+        )
+
+        async with self.model_update_lock.writer_lock:
+            result = (await self.update_lora_adapter_communicator(obj))[0]
+            return result
 
     async def get_weights_by_name(
         self, obj: GetWeightsByNameReqInput, request: Optional[fastapi.Request] = None
