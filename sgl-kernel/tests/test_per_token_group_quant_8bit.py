@@ -1,4 +1,6 @@
+import time
 import itertools
+from pathlib import Path
 
 import pytest
 import torch
@@ -86,12 +88,12 @@ def test_per_token_group_quant_with_column_major(
             atol=1e-5,
         )
     except AssertionError:
-        torch.set_printoptions(profile="full")
-        print(f"{x_q_triton=}")
-        print(f"{x_s_triton=}")
-        print(f"{x_q_sglang=}")
-        print(f"{x_s_sglang=}")
-        torch.set_printoptions(profile="default")
+        data = dict(
+            x_q_triton=x_q_triton, x_s_triton=x_s_triton,
+            x_q_sglang=x_q_sglang, x_s_sglang=x_s_sglang,
+        )
+        path = f'/data/numa0/tom/temp_sglang_server2local/test_dump_{time.time()}.pt'
+        torch.save(data, path)
         raise
 
 
