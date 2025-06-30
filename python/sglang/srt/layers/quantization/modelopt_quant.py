@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed import parallel_state
 from sglang.srt.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -36,6 +37,7 @@ if is_cuda():
 
 try:
     from flashinfer import fp4_quantize as fp4_quantize
+    from flashinfer import fp4_swizzle_blockscale
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
 except ImportError:
     flashinfer_cutlass_fused_moe = None
@@ -777,24 +779,30 @@ class ModelOptNvFp4FusedMoEMethod:
         ep_size: Optional[int] = None,
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
+        dp_size: Optional[int] = None,
+        global_num_tokens_cpu: Optional[List[int]] = None,
     ) -> torch.Tensor:
 
         assert activation == "silu", "Only SiLU activation is supported."
         from sglang.srt.layers.moe.topk import select_experts
 
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
+        if x.shape[0] > 0:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                num_fused_shared_experts=num_fused_shared_experts,
+                custom_routing_function=custom_routing_function,
+                correction_bias=correction_bias,
+                routed_scaling_factor=routed_scaling_factor,
+            )
+        else:
+            topk_weights = torch.empty((0, top_k), dtype=torch.float32, device=x.device)
+            topk_ids = torch.full((0, top_k), -1, dtype=torch.int, device=x.device)
 
         if self.enable_flashinfer_moe:
             assert (
@@ -802,13 +810,33 @@ class ModelOptNvFp4FusedMoEMethod:
             ), "apply_router_weight_on_input is not supported for Flashinfer"
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
+            output_dtype = x.dtype
+            # Swizzle after communication for dp.
+            x_row = x.shape[0]
+            x_col = x.shape[1]
+            x, x_sf = fp4_quantize(
+                x, layer.w13_input_scale_quant, is_sf_swizzled_layout=dp_size == 1
+            )
+
+            if dp_size > 1:
+                (
+                    topk_weights,
+                    topk_ids,
+                    x,
+                    x_sf,
+                ) = parallel_state.get_tp_group().all_gatherv(
+                    [topk_weights, topk_ids, x, x_sf], sizes=global_num_tokens_cpu
+                )
+                x_sf = fp4_swizzle_blockscale(x_sf, x_row, x_col)
+
             output = flashinfer_cutlass_fused_moe(
                 x,
                 topk_ids.to(torch.int),
                 topk_weights,
                 layer.w13_weight.view(torch.long),
                 layer.w2_weight.view(torch.long),
-                x.dtype,
+                output_dtype,
+                input_sf=x_sf,
                 quant_scales=[
                     layer.w13_input_scale_quant,
                     layer.w13_blockscale_swizzled.view(torch.int32),
@@ -823,7 +851,14 @@ class ModelOptNvFp4FusedMoEMethod:
                 tp_rank=tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
             )
-            return output[0]
+            output = output[0]
+
+            if dp_size > 1:
+                output = parallel_state.get_tp_group().reduce_scatterv(
+                    output, sizes=global_num_tokens_cpu
+                )
+
+            return output
 
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 

@@ -31,6 +31,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_local_attention_dp_size,
 )
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -39,6 +40,21 @@ from sglang.srt.utils import is_cuda, is_flashinfer_available
 
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
+
+
+def will_handle_dispatch_combine_in_moe_layer():
+    """
+    These configurations will handle dispatch/combine inside the MoE layer, so the layer communicator doesn't need to do it.
+    """
+    if global_server_args_dict["enable_deepep_moe"]:
+        return True
+    if (
+        global_server_args_dict["enable_ep_moe"]
+        and global_server_args_dict["enable_flashinfer_moe"]
+        and get_local_attention_dp_size() > 1
+    ):
+        return True
+    return False
 
 
 class ScatterMode(Enum):
@@ -108,7 +124,7 @@ class LayerScatterModes:
         if context.is_layer_sparse:
             return (
                 ScatterMode.SCATTERED
-                if global_server_args_dict["enable_deepep_moe"]
+                if will_handle_dispatch_combine_in_moe_layer()
                 else ScatterMode.FULL
             )
         else:
