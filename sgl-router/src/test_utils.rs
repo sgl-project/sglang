@@ -2,8 +2,6 @@
 //!
 //! This module provides shared test infrastructure that can be used across
 //! different test modules to create realistic test scenarios.
-
-#[cfg(test)]
 pub mod mock_servers {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;

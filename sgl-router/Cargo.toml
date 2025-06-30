@@ -49,6 +49,11 @@ name = "request_processing"
 harness = false
 path = "benches/request_processing.rs"
 
+[[bench]]
+name = "worker_trait_overhead"
+harness = false
+path = "benches/worker_trait_overhead.rs"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

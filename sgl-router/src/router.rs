@@ -1,4 +1,5 @@
 use crate::core::worker::{worker_adapter, Worker, WorkerFactory};
+use crate::core::WorkerType;
 use crate::pd_router::PDRouter;
 use crate::pd_types::PDSelectionPolicy;
 use crate::tree::Tree;
@@ -149,6 +150,28 @@ pub enum PolicyConfig {
 
 impl Router {
     pub fn new(worker_urls: Vec<String>, policy_config: PolicyConfig) -> Result<Self, String> {
+        if let PolicyConfig::PrefillDecodeConfig {
+            selection_policy,
+            prefill_urls,
+            decode_urls,
+            timeout_secs,
+            interval_secs,
+        } = &policy_config
+        {
+            // Create PDRouter instance
+            let pd_router = PDRouter::new(
+                prefill_urls.clone(),
+                decode_urls.clone(),
+                selection_policy.clone(),
+                *timeout_secs,
+                *interval_secs,
+            )?;
+
+            return Ok(Router::PrefillDecode {
+                pd_router: Arc::new(pd_router),
+            });
+        }
+
         // Update active workers gauge
         let workers = worker_adapter::from_regular_vec(worker_urls.clone());
         gauge!("sgl_router_active_workers").set(workers.len() as f64);
@@ -263,25 +286,8 @@ impl Router {
                     _eviction_thread: Some(eviction_thread),
                 }
             }
-            PolicyConfig::PrefillDecodeConfig {
-                selection_policy,
-                prefill_urls,
-                decode_urls,
-                timeout_secs,
-                interval_secs,
-            } => {
-                // Create PDRouter instance
-                let pd_router = PDRouter::new(
-                    prefill_urls,
-                    decode_urls,
-                    selection_policy,
-                    timeout_secs,
-                    interval_secs,
-                )?;
-
-                Router::PrefillDecode {
-                    pd_router: Arc::new(pd_router),
-                }
+            PolicyConfig::PrefillDecodeConfig { .. } => {
+                unreachable!();
             }
         })
     }
@@ -907,6 +913,10 @@ impl Router {
             } => (*timeout_secs, *interval_secs),
         };
 
+        if matches!(worker.worker_type(), WorkerType::Decode | WorkerType::Prefill(_)) {
+            return Err(format!("PD workers are only supported in PD mode"));
+        }
+
         // Check for duplicates BEFORE health check to avoid unnecessary work
         match self {
             Router::RoundRobin { workers, .. }
@@ -1409,7 +1419,8 @@ mod tests {
         }
 
         // Remove a worker
-        router.remove_worker_by_url("http://worker1:8080");
+        let result = router.remove_worker_by_url("http://worker1:8080");
+        assert!(result.is_ok());
 
         // Verify worker was removed
         {
@@ -1425,7 +1436,8 @@ mod tests {
         let router = create_test_regular_router();
 
         // Remove a worker that doesn't exist - should not panic
-        router.remove_worker_by_url("http://nonexistent:8080");
+        let result = router.remove_worker_by_url("http://nonexistent:8080");
+        assert!(result.is_ok());
 
         // Verify workers are unchanged
         {
@@ -1440,7 +1452,8 @@ mod tests {
         let router = create_test_cache_aware_router();
 
         // Remove a worker from cache-aware router
-        router.remove_worker_by_url("http://worker1:8080");
+        let result = router.remove_worker_by_url("http://worker1:8080");
+        assert!(result.is_ok());
 
         // Verify worker was removed from all data structures
         {
@@ -1467,33 +1480,19 @@ mod tests {
     // PD Router Integration Tests
     // ============================================================================
 
-    // #[tokio::test]
-    // async fn test_add_pd_worker_with_regular_router() {
-    //     let router = create_test_regular_router();
+    #[tokio::test]
+    async fn test_add_pd_worker_with_regular_router() {
+        let router = create_test_regular_router();
+        let url = "http://new-worker:8080";
 
-    //     let result = router
-    //         .add_pd_worker("http://new-worker:8080", PodType::Prefill, Some(8081))
-    //         .await;
+        let result = router.add_worker(WorkerFactory::create_decode(url.to_string()))
+            .await;
 
-    //     assert!(result.is_err());
-    //     assert!(result
-    //         .unwrap_err()
-    //         .contains("add_pd_worker only supported in PD mode"));
-    // }
-
-    // #[tokio::test]
-    // async fn test_remove_pd_worker_with_regular_router() {
-    //     let router = create_test_regular_router();
-
-    //     let result = router
-    //         .remove_pd_worker("http://worker:8080", PodType::Decode)
-    //         .await;
-
-    //     assert!(result.is_err());
-    //     assert!(result
-    //         .unwrap_err()
-    //         .contains("remove_pd_worker only supported in PD mode"));
-    // }
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("PD workers are only supported in PD mode"));
+    }
 
     #[tokio::test]
     async fn test_pd_endpoints_with_regular_router() {
