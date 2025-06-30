@@ -310,7 +310,7 @@ def per_token_group_quant_8bit(
         assert column_major_scales
         assert scale_tma_aligned
 
-        needs_unsqueeze = len(x.shape) == 2
+        needs_unsqueeze = x.dim() == 2
         if needs_unsqueeze:
             num_tokens, _ = x.shape
             x = x.unsqueeze(0)
