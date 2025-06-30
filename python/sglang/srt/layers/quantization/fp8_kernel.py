@@ -312,9 +312,10 @@ def per_token_group_quant_8bit(
 
         needs_unsqueeze = len(x.shape) == 2
         if needs_unsqueeze:
+            num_tokens, _ = x.shape
             x = x.unsqueeze(0)
             assert masked_m is None
-            masked_m = TODO
+            masked_m = torch.tensor([num_tokens], device=x.device, dtype=torch.int32)
 
         output = torch.empty(
             (*x.shape[:-1], x.shape[-1] // 2),
