@@ -241,6 +241,10 @@ class TokenizerManager:
                     revision=server_args.revision,
                 )
 
+        # Initialize loaded loRA adapters with the initial lora paths in the server_args.
+        # This list will be updated when new LoRA adapters are loaded or unloaded dynamically.
+        self.loaded_lora_adapters: Dict[str, str] = self.server_args.lora_paths.copy()
+
         # Store states
         self.no_create_loop = False
         self.rid_to_state: Dict[str, ReqState] = {}
@@ -443,6 +447,18 @@ class TokenizerManager:
                     "return_hidden_states=True requires the server to be started "
                     "with --enable-return-hidden-states (ServerArgs.enable_return_hidden_states)."
                 )
+
+            # Verify requested LoRA adapters are loaded.
+            if obj.lora_path:
+                assert isinstance(
+                    obj.lora_path, list
+                ), "lora_path should be a list of LoRA adapter paths."
+                unfound_adapters = set(obj.lora_path) - self.loaded_lora_adapters.keys()
+                if unfound_adapters:
+                    raise ValueError(
+                        f"The following requested LoRA adapters are not found: {unfound_adapters}."
+                        f"Please load them before using. Loaded adapters: {self.loaded_lora_adapters}."
+                    )
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -992,6 +1008,7 @@ class TokenizerManager:
 
         async with self.model_update_lock.writer_lock:
             result = (await self.update_lora_adapter_communicator(obj))[0]
+            self.loaded_lora_adapters = result.loaded_adapters
             return result
 
     async def unload_lora_adapter(
@@ -1013,6 +1030,7 @@ class TokenizerManager:
 
         async with self.model_update_lock.writer_lock:
             result = (await self.update_lora_adapter_communicator(obj))[0]
+            self.loaded_lora_adapters = result.loaded_adapters
             return result
 
     async def get_weights_by_name(
