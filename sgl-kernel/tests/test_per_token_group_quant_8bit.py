@@ -2,6 +2,7 @@ import itertools
 
 import pytest
 import torch
+from sgl_kernel.test_utils import create_per_token_group_quant_test_data
 
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
@@ -9,7 +10,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
 from sglang.srt.layers.quantization.utils import assert_fp8_all_close
 from sglang.srt.utils import is_hip
-from sgl_kernel.test_utils import create_per_token_group_quant_test_data
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
@@ -77,7 +77,10 @@ configs = list(
     )
 )
 
-@pytest.mark.parametrize("num_tokens, hidden_dim, group_size, dst_dtype, flags", configs)
+
+@pytest.mark.parametrize(
+    "num_tokens, hidden_dim, group_size, dst_dtype, flags", configs
+)
 def test_per_token_group_quant_with_column_major(
     num_tokens,
     hidden_dim,
@@ -98,7 +101,7 @@ def test_per_token_group_quant_with_column_major(
         group_size=group_size,
         eps=1e-10,
         dst_dtype=dst_dtype,
-        **{k:v for k,v in flags.items() if k not in ["masked_data_generation_mode"]},
+        **{k: v for k, v in flags.items() if k not in ["masked_data_generation_mode"]},
     )
 
     x_q_triton, x_s_triton = triton_per_token_group_quant_8bit(**execute_kwargs)

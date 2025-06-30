@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 import triton
+from sgl_kernel.test_utils import create_per_token_group_quant_test_data
 
 from sglang.srt.bench_utils import bench_kineto
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -16,7 +17,6 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
 from sglang.srt.utils import is_hip
-from sgl_kernel.test_utils import create_per_token_group_quant_test_data
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
@@ -121,15 +121,20 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
     )
 
     fn, kernel_names = {
-        "triton": (triton_per_token_group_quant_8bit, "_per_token_group_quant_fp8|_silu_and_mul_post_quant_kernel"),
+        "triton": (
+            triton_per_token_group_quant_8bit,
+            "_per_token_group_quant_fp8|_silu_and_mul_post_quant_kernel",
+        ),
         "sglang": (
             sglang_per_token_group_quant_8bit,
             "per_token_group_quant_8bit_kernel",
         ),
     }[provider]
     bench_fn = lambda: fn(
-        x=x.clone(), group_size=group_size, dst_dtype=dst_dtype,
-        **{k:v for k,v in flags.items() if k not in ["masked_data_generation_mode"]},
+        x=x.clone(),
+        group_size=group_size,
+        dst_dtype=dst_dtype,
+        **{k: v for k, v in flags.items() if k not in ["masked_data_generation_mode"]},
     )
 
     time_s = bench_kineto(bench_fn, kernel_names=kernel_names)

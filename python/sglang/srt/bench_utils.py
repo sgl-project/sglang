@@ -109,7 +109,8 @@ def bench_kineto(
     if not with_multiple_kernels:
         for name in kernel_names:
             assert (
-                sum([int(re.search(name, line) is not None) for line in prof_lines]) == 1
+                sum([int(re.search(name, line) is not None) for line in prof_lines])
+                == 1
             ), f"Errors of the kernel {name} in the profiling table (table: {prof_lines})"
 
     # Save chrome traces
