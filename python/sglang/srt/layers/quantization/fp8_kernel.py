@@ -310,22 +310,17 @@ def per_token_group_quant_8bit(
         assert column_major_scales
         assert scale_tma_aligned
         output = torch.empty(
-            (
-                x.shape[0],
-                x.shape[1],
-                x.shape[2] // 2,
-            ),
+            (x.shape[0], x.shape[1], x.shape[2] // 2),
             device=x.device,
             dtype=dst_dtype,
         )
-        output_scale = torch.empty(
-            (
-                x.shape[0],
-                x.shape[1],
-                x.shape[2] // 2 // group_size,
-            ),
-            device=gateup_output.device,
-            dtype=torch.float32,
+        output_scale = create_per_token_group_quant_fp8_output_scale(
+            x_shape=output.shape,
+            device=output.device,
+            group_size=group_size,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=scale_ue8m0,
         )
         silu_and_mul_masked_post_quant_fwd(
             input=TODO,
