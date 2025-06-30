@@ -22,55 +22,52 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 
 if int(os.environ.get("SGLANG_NSYS_PROFILING", "0")):
-    num_tokens_range = [768]
-    hidden_dim_range = [16384]  # For DeepSeek V3/R1
-    group_size_range = [128]  # For DeepSeek V3/R1
-    dst_dtype_range = [fp8_type_]
-    flags_range = [
-        dict(
-            column_major_scales=True,
-            scale_tma_aligned=True,
-            scale_ue8m0=True,
-        ),
-    ]
-else:
-    num_tokens_range = [1, 4, 16, 64, 256, 768, 2048, 8192, 16384]
-    hidden_dim_range = [1536, 7168, 16384]  # For DeepSeek V3/R1
-    group_size_range = [128]  # For DeepSeek V3/R1
-    dst_dtype_range = [fp8_type_, torch.int8]
-    flags_range = [
-        dict(
-            column_major_scales=False,
-            scale_tma_aligned=False,
-            scale_ue8m0=False,
-        ),
-        dict(
-            column_major_scales=True,
-            scale_tma_aligned=False,
-            scale_ue8m0=False,
-        ),
-        dict(
-            column_major_scales=True,
-            scale_tma_aligned=True,
-            scale_ue8m0=False,
-        ),
-        dict(
-            column_major_scales=True,
-            scale_tma_aligned=True,
-            scale_ue8m0=True,
-        ),
-    ]
-
-
-configs = list(
-    itertools.product(
-        num_tokens_range,
-        hidden_dim_range,
-        group_size_range,
-        dst_dtype_range,
-        flags_range,
+    configs = list(
+        itertools.product(
+            [768],
+            [16384],
+            [128],
+            [fp8_type_],
+            [
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=True,
+                ),
+            ],
+        )
     )
-)
+else:
+    configs = list(
+        itertools.product(
+            [1, 4, 16, 64, 256, 768, 2048, 8192, 16384],
+            [1536, 7168, 16384],
+            [128],
+            [fp8_type_, torch.int8],
+            [
+                dict(
+                    column_major_scales=False,
+                    scale_tma_aligned=False,
+                    scale_ue8m0=False,
+                ),
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=False,
+                    scale_ue8m0=False,
+                ),
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=False,
+                ),
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=True,
+                ),
+            ],
+        )
+    )
 
 
 @triton.testing.perf_report(
