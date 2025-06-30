@@ -79,37 +79,37 @@ else:
             ],
         )
     ) + list(
-        # TODO
-        # itertools.product(
-        #     [1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
-        #     [2048],
-        #     [128],
-        #     [fp8_type_],
-        #     [
-        #         dict(
-        #             column_major_scales=True,
-        #             scale_tma_aligned=True,
-        #             scale_ue8m0=True,
-        #             fuse_silu_and_mul=True,
-        #             masked_layout_mode=None,
-        #         ),
-        #         dict(
-        #             column_major_scales=True,
-        #             scale_tma_aligned=True,
-        #             scale_ue8m0=True,
-        #             fuse_silu_and_mul=True,
-        #             masked_layout_mode="balanced",
-        #         ),
-        #         dict(
-        #             column_major_scales=True,
-        #             scale_tma_aligned=True,
-        #             scale_ue8m0=True,
-        #             fuse_silu_and_mul=True,
-        #             masked_layout=True,
-        #             masked_layout_mode="imbalanced",
-        #         ),
-        #     ],
-        # )
+        itertools.product(
+            [1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
+            [2048],
+            [128],
+            [fp8_type_],
+            [
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=True,
+                    fuse_silu_and_mul=True,
+                    masked_layout_mode=None,
+                ),
+                # TODO
+                # dict(
+                #     column_major_scales=True,
+                #     scale_tma_aligned=True,
+                #     scale_ue8m0=True,
+                #     fuse_silu_and_mul=True,
+                #     masked_layout_mode="balanced",
+                # ),
+                # dict(
+                #     column_major_scales=True,
+                #     scale_tma_aligned=True,
+                #     scale_ue8m0=True,
+                #     fuse_silu_and_mul=True,
+                #     masked_layout=True,
+                #     masked_layout_mode="imbalanced",
+                # ),
+            ],
+        )
     )
 
 
