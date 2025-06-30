@@ -69,13 +69,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             config.hidden_size, inter_size, config.hidden_act, quant_config, prefix
         )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
 
     def forward(
         self,
