@@ -37,16 +37,16 @@ __forceinline__ __device__ int fast_log2_ceil(float x) {
 }
 
 // Copied and modified from DeepEP
-template <bool ROUND_SCALE>
-__forceinline__ __device__ void
-calculate_fp8_scales(float amax, float& scale, float& scale_inv, float max_8bit, float max_8bit_inv) {
+template <bool ROUND_SCALE, float MAX_8BIT>
+__forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, float& scale_inv) {
+  constexpr float MAX_8BIT_INV = 1.0f / MAX_8BIT;
   if constexpr (ROUND_SCALE) {
-    auto exp_scale_inv = fast_log2_ceil(amax * max_8bit_inv);
+    auto exp_scale_inv = fast_log2_ceil(amax * MAX_8BIT_INV);
     scale = fast_pow2(-exp_scale_inv);
     scale_inv = fast_pow2(exp_scale_inv);
   } else {
-    scale_inv = amax * max_8bit_inv;
-    scale = max_8bit / amax;
+    scale_inv = amax * MAX_8BIT_INV;
+    scale = MAX_8BIT / amax;
   }
 }
 
@@ -73,6 +73,22 @@ __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
   return ret;
 }
 
+template <typename T>
+struct DtypeInfo;
+
+template <>
+struct DtypeInfo<int8_t> {
+  static constexpr float MIN = -128;
+  static constexpr float MAX = 127;
+};
+
+template <>
+struct DtypeInfo<c10::Float8_e4m3fn> {
+  static constexpr float MIN = -448;
+  static constexpr float MAX = 448;
+};
+
+constexpr float LOCAL_ABSMAX_ABS = 1e-10;
 constexpr int THREADS_PER_GROUP = 8;
 constexpr uint32_t VEC_NUM_BYTES = 32;
 
@@ -89,10 +105,6 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int group_size,
     const int num_groups,
     const int groups_per_block,
-    const float eps,
-    const float min_8bit,
-    const float max_8bit,
-    const float max_8bit_inv,
     const int scale_num_rows = 0,
     const int scale_stride = 0) {
   const int local_group_id = threadIdx.x / THREADS_PER_GROUP;
@@ -102,6 +114,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int global_group_id = block_group_id + local_group_id;
   const int block_group_offset = global_group_id * group_size;
 
+  using dst_dtype_info = DtypeInfo<DST_DTYPE>;
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
@@ -135,7 +148,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     input_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * VEC_TYPED_SIZE) + j);
   }
 
-  float local_absmax = eps;
+  float local_absmax = LOCAL_ABSMAX_ABS;
 
 #pragma unroll
   for (uint32_t j = 0; j < VEC_TYPED_SIZE; ++j) {
@@ -147,7 +160,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   local_absmax = GroupReduceMax<THREADS_PER_GROUP>(local_absmax, lane_id);
 
   float y_scale, y_scale_inv;
-  calculate_fp8_scales<SCALE_UE8M0>(local_absmax, y_scale, y_scale_inv, max_8bit, max_8bit_inv);
+  calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info::MAX>(local_absmax, y_scale, y_scale_inv);
   float2 y_scale_repeated = {y_scale, y_scale};
 
   if (lane_id == 0) {
@@ -174,7 +187,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 #pragma unroll
     for (uint32_t j = 0; j < VEC_TYPED_SIZE; ++j) {
       float val = static_cast<float>(input_vec[j]);
-      float q_val = fminf(fmaxf(val * y_scale, min_8bit), max_8bit);
+      float q_val = fminf(fmaxf(val * y_scale, dst_dtype_info::MIN), dst_dtype_info::MAX);
       output_buf_ptr[j] = DST_DTYPE(q_val);
     }
   }
@@ -193,6 +206,8 @@ void sgl_per_token_group_quant_8bit(
     bool scale_ue8m0 = false) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
+
+  CHECK_EQ(LOCAL_ABSMAX_ABS, eps);
 
   const int num_groups = input.numel() / group_size;
 
@@ -221,13 +236,15 @@ void sgl_per_token_group_quant_8bit(
   const int scale_num_rows = output_s.size(1);
   const int scale_stride = output_s.stride(1);
 
-  const double max_8bit_inv = 1.0f / max_8bit;
-
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
   do {                                                                                            \
     /* TODO do not copy paste */                                                                  \
     constexpr uint32_t VEC_TYPED_SIZE = VEC_NUM_BYTES / sizeof(T);                                \
     TORCH_CHECK(THREADS_PER_GROUP == group_size / VEC_TYPED_SIZE);                                \
+                                                                                                  \
+    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                  \
+    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                      \
+    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                                                      \
                                                                                                   \
     dim3 grid(num_blocks);                                                                        \
     dim3 block(num_threads);                                                                      \
@@ -240,10 +257,6 @@ void sgl_per_token_group_quant_8bit(
             group_size,                                                                           \
             num_groups,                                                                           \
             groups_per_block,                                                                     \
-            (float)eps,                                                                           \
-            (float)min_8bit,                                                                      \
-            (float)max_8bit,                                                                      \
-            (float)max_8bit_inv,                                                                  \
             scale_num_rows,                                                                       \
             scale_stride);                                                                        \
       } else {                                                                                    \
@@ -254,10 +267,6 @@ void sgl_per_token_group_quant_8bit(
             group_size,                                                                           \
             num_groups,                                                                           \
             groups_per_block,                                                                     \
-            (float)eps,                                                                           \
-            (float)min_8bit,                                                                      \
-            (float)max_8bit,                                                                      \
-            (float)max_8bit_inv,                                                                  \
             scale_num_rows,                                                                       \
             scale_stride);                                                                        \
       }                                                                                           \
@@ -269,11 +278,7 @@ void sgl_per_token_group_quant_8bit(
           static_cast<float*>(output_s.data_ptr()),                                               \
           group_size,                                                                             \
           num_groups,                                                                             \
-          groups_per_block,                                                                       \
-          (float)eps,                                                                             \
-          (float)min_8bit,                                                                        \
-          (float)max_8bit,                                                                        \
-          (float)max_8bit_inv);                                                                   \
+          groups_per_block);                                                                      \
     }                                                                                             \
   } while (0)
 
