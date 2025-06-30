@@ -125,9 +125,6 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
     e.g. <image><image>....<image>, or <audio><audio>...<audio>
     """
 
-    def __init__(self, token_ids: List[int]) -> None:
-        self.token_ids = token_ids
-
     def pad_input_tokens(
         self, input_ids: List[int], mm_inputs: MultimodalInputs
     ) -> List[int]:

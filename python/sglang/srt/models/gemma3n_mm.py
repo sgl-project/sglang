@@ -244,13 +244,10 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
     def pad_input_ids(
         self,
         input_ids: List[int],
-        mm_inputs: Optional[MultimodalInputs] = None,
+        mm_inputs: MultimodalInputs,
     ) -> List[int]:
         """Pad input IDs with image and audio tokens."""
-        if mm_inputs is None:
-            return input_ids
-
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens(None)
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_input_embeddings(self) -> nn.Embedding:
