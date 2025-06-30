@@ -37,7 +37,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     scaled_fp8_quant,
     sglang_per_token_group_quant_fp8,
-    sglang_per_token_quant_fp8,
+    sglang_per_token_quant_fp8, sglang_per_token_group_quant_8bit,
 )
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
@@ -1495,13 +1495,18 @@ class DeepEPMoE(EPMoE):
             device=gateup_output.device,
             dtype=torch.float32,
         )
-        silu_and_mul_masked_post_quant_fwd(
-            gateup_output,
+        sglang_per_token_group_quant_8bit(
+            x=gateup_output,
             down_input,
             down_input_scale,
-            scale_block_size,
-            masked_m,
+            dst_dtype=self.fp8_dtype,
+            group_size=scale_block_size,
+            masked_m=masked_m,
+            column_major_scales=True,
+            scale_tma_aligned=True,
             scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            fuse_silu_and_mul=True,
+            masked_layout=True,
         )
         del gateup_output
 
