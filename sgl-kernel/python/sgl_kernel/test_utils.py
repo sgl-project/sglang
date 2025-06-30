@@ -55,6 +55,7 @@ def _compute_balanced_split(total: int, arr_len: int):
     assert sum(ans) == total
     return torch.tensor(ans, dtype=torch.int)
 
+
 def _compute_imbalanced_split(total: int, arr_len: int, dtype=torch.int) -> list[int]:
     # can use `rand ** 2`, `rand ** 3`, etc, to change how imbalanced it is
     noise_raw = torch.rand(arr_len) ** 3
