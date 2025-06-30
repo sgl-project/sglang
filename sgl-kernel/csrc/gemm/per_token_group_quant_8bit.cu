@@ -93,6 +93,7 @@ struct DtypeInfo<c10::Float8_e4m3fn> {
 };
 
 template<bool FUSE_SILU_AND_MUL>
+__device__ __forceinline__
 int compute_input_group_start_offset(
     int expert_idx,
     int token_idx,
