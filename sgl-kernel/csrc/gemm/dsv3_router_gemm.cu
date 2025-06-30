@@ -21,8 +21,6 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 
-#include <cstdio>
-
 #include "cuda_bf16.h"
 #include "cuda_runtime.h"
 #include "utils.h"
