@@ -844,7 +844,7 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
         request, raw_request
     )
 
- 
+
 @app.api_route(
     "/v1/rerank", methods=["POST", "PUT"], dependencies=[Depends(validate_json_request)]
 )
