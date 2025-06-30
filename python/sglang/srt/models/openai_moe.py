@@ -87,6 +87,7 @@ def get_attention_sliding_window_size(config):
 class OpenAIMoeMLP(nn.Module):
     def __init__(
         self,
+        config: OpenAIMoeConfig,
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
@@ -98,14 +99,14 @@ class OpenAIMoeMLP(nn.Module):
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
-            bias=False,
+            bias=config.mlp_bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
-            bias=False,
+            bias=config.mlp_bias,
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
@@ -126,8 +127,8 @@ class OpenAIMoeMLP(nn.Module):
 class OpenAIMoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
-        layer_id: int,
         config: OpenAIMoeConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -140,6 +141,7 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
+        # Todo: add bias support in MoE impl class
         self.experts = get_moe_impl_class()(
             num_experts=config.num_experts
             + global_server_args_dict["ep_num_redundant_experts"],
@@ -148,6 +150,7 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             renormalize=config.norm_topk_prob,
+            # bias=config.mlp_bias, # Todo: add bias support in MoE impl class
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
             **(
@@ -161,7 +164,7 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
-            bias=False,
+            bias=config.mlp_bias,
             quant_config=None,
             prefix=add_prefix("gate", prefix),
         )
@@ -603,13 +606,14 @@ class OpenAIMoeDecoderLayer(nn.Module):
 
         if self.is_layer_sparse:
             self.mlp = OpenAIMoeSparseMoeBlock(
-                layer_id=self.layer_id,
                 config=config,
+                layer_id=self.layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
         else:
             self.mlp = OpenAIMoeMLP(
+                config=config,
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -832,6 +836,8 @@ class OpenAIMoeForCausalLM(nn.Module):
         self.config.norm_topk_prob = True
         # Todo: remove this, currently use silu as a workaround because the swiglu activation is not supported in FusedMoE
         # self.config.hidden_act = "swiglu"
+        # Todo: remove this, currently set as True (Gate and up/down bias are True)
+        self.config.mlp_bias = True
         ###########################################################################
 
         self.quant_config = quant_config
