@@ -118,6 +118,9 @@ def test_per_token_group_quant_with_column_major(
         num_tokens=num_tokens, hidden_dim=hidden_dim, flags=flags
     )
 
+    print("hack data!!!")
+    x = torch.full_like(x, fill_value=100)
+
     execute_kwargs = dict(
         x=x,
         masked_m=masked_m,
