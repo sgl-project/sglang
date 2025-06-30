@@ -310,7 +310,7 @@ def per_token_group_quant_8bit(
         assert column_major_scales
         assert scale_tma_aligned
         output = torch.empty(
-            (x.shape[0], x.shape[1], x.shape[2] // 2),
+            (*x.shape[:-1], x.shape[-1] // 2),
             device=x.device,
             dtype=dst_dtype,
         )
