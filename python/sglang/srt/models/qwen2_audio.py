@@ -39,7 +39,6 @@ from transformers.models.qwen2_audio.modeling_qwen2_audio import (
     Qwen2AudioMultiModalProjector,
 )
 
-from python.sglang.srt.layers.utils import get_layer_id
 from sglang.srt.hf_transformers_utils import get_processor
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import VisionAttention
@@ -47,6 +46,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
