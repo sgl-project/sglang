@@ -115,8 +115,12 @@ struct NaiveScheduler {
   }
 
   template <bool FUSE_SILU_AND_MUL, typename FUNC>
-  __device__ __forceinline__ static void
-  execute(const int subwarps_per_block, const int hidden_dim_num_groups, const int group_size, const int32_t* masked_m, FUNC fn) {
+  __device__ __forceinline__ static void execute(
+      const int subwarps_per_block,
+      const int hidden_dim_num_groups,
+      const int group_size,
+      const int32_t* masked_m,
+      FUNC fn) {
     constexpr int expert_idx = 0;
 
     const int local_group_id = threadIdx.x / THREADS_PER_SUBWARP;
@@ -158,8 +162,12 @@ struct MaskedLayoutScheduler {
   }
 
   template <bool FUSE_SILU_AND_MUL, typename FUNC>
-  __device__ __forceinline__ static void
-  execute(const int subwarps_per_block, const int hidden_dim_num_groups, const int group_size, const int32_t* masked_m, FUNC fn) {
+  __device__ __forceinline__ static void execute(
+      const int subwarps_per_block,
+      const int hidden_dim_num_groups,
+      const int group_size,
+      const int32_t* masked_m,
+      FUNC fn) {
     const int expert_idx = blockIdx.z;
     const int token_idx_start = blockIdx.y;
     const int hidden_dim_block_index = blockIdx.x;
@@ -203,7 +211,11 @@ __global__ void per_token_group_quant_8bit_kernel(
       subwarps_per_block,
       hidden_dim_num_groups,
       group_size,
-      [&](const int expert_idx, const int token_idx, const int hidden_dim_group_idx, const int lane_id, const int input_group_start_offset) {
+      [&](const int expert_idx,
+          const int token_idx,
+          const int hidden_dim_group_idx,
+          const int lane_id,
+          const int input_group_start_offset) {
         constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
         constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
@@ -240,10 +252,9 @@ __global__ void per_token_group_quant_8bit_kernel(
 
           const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
           const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
-          scale_output = reinterpret_cast<scale_element_t*>(output_s) +
-          expert_idx * TODO +
+          scale_output = reinterpret_cast<scale_element_t*>(output_s) + expert_idx * TODO +
                          hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
-                          token_idx * scale_token_stride * num_elems_per_pack + pack_idx;
+                         token_idx * scale_token_stride * num_elems_per_pack + pack_idx;
         } else {
           static_assert(!SCALE_UE8M0);
           scale_output = output_s + offset_num_groups;
