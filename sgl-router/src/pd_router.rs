@@ -25,10 +25,7 @@ use uuid::Uuid;
 pub struct PDRouter {
     pub prefill_workers: Arc<RwLock<Vec<Arc<dyn Worker>>>>,
     pub decode_workers: Arc<RwLock<Vec<Arc<dyn Worker>>>>,
-    // pub prefill_workers: Arc<RwLock<Vec<EngineInfo>>>,
-    // pub decode_workers: Arc<RwLock<Vec<EngineInfo>>>,
     pub selection_policy: PDSelectionPolicy,
-    // pub load_tracking: Arc<dashmap::DashMap<String, Arc<AtomicUsize>>>,
     pub prefill_tree: Option<Arc<Mutex<Tree>>>,
     pub timeout_secs: u64,
     pub interval_secs: u64,

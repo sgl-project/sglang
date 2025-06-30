@@ -913,7 +913,10 @@ impl Router {
             } => (*timeout_secs, *interval_secs),
         };
 
-        if matches!(worker.worker_type(), WorkerType::Decode | WorkerType::Prefill(_)) {
+        if matches!(
+            worker.worker_type(),
+            WorkerType::Decode | WorkerType::Prefill(_)
+        ) {
             return Err(format!("PD workers are only supported in PD mode"));
         }
 
@@ -1485,7 +1488,8 @@ mod tests {
         let router = create_test_regular_router();
         let url = "http://new-worker:8080";
 
-        let result = router.add_worker(WorkerFactory::create_decode(url.to_string()))
+        let result = router
+            .add_worker(WorkerFactory::create_decode(url.to_string()))
             .await;
 
         assert!(result.is_err());
