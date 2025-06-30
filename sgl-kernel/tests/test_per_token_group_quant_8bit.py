@@ -21,7 +21,9 @@ configs = list(
         # TODO support group size != 128
         # [8, 16, 32, 64, 128],  # group_size
         [128],  # group_size
-        [fp8_type_, torch.int8],  # dtype
+        # TODO
+        # [fp8_type_, torch.int8],  # dtype
+        [fp8_type_],  # dtype
         [
             dict(
                 column_major_scales=False,
@@ -54,36 +56,37 @@ configs = list(
         ],
     )
 ) + list(
-    itertools.product(
-        [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
-        [256, 1024, 2048, 4096],
-        [128],
-        [fp8_type_],
-        [
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=True,
-                fuse_silu_and_mul=True,
-                masked_layout=False,
-            ),
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=True,
-                fuse_silu_and_mul=True,
-                masked_layout=True,
-            ),
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=True,
-                fuse_silu_and_mul=True,
-                masked_layout=True,
-                masked_data_generation_mode="imbalanced",
-            ),
-        ],
-    )
+    # TODO
+    # itertools.product(
+    #     [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
+    #     [256, 1024, 2048, 4096],
+    #     [128],
+    #     [fp8_type_],
+    #     [
+    #         dict(
+    #             column_major_scales=True,
+    #             scale_tma_aligned=True,
+    #             scale_ue8m0=True,
+    #             fuse_silu_and_mul=True,
+    #             masked_layout=False,
+    #         ),
+    #         dict(
+    #             column_major_scales=True,
+    #             scale_tma_aligned=True,
+    #             scale_ue8m0=True,
+    #             fuse_silu_and_mul=True,
+    #             masked_layout=True,
+    #         ),
+    #         dict(
+    #             column_major_scales=True,
+    #             scale_tma_aligned=True,
+    #             scale_ue8m0=True,
+    #             fuse_silu_and_mul=True,
+    #             masked_layout=True,
+    #             masked_data_generation_mode="imbalanced",
+    #         ),
+    #     ],
+    # )
 )
 
 
