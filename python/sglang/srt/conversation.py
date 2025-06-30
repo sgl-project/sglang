@@ -59,6 +59,7 @@ class SeparatorStyle(IntEnum):
     METAMATH = auto()
     DeepSeekVL2 = auto()
     QWEN2_VL_EMBED = auto()
+    QWEN2_AUDIO = auto()
     GEMMA3 = auto()
     MPT = auto()
 
@@ -349,6 +350,23 @@ class Conversation:
                     ret += role + message + self.sep
                 else:
                     ret += role
+            return ret
+        elif self.sep_style == SeparatorStyle.QWEN2_AUDIO:
+            ret = "" if system_prompt == "" else system_prompt + self.sep
+
+            counter = 1
+            for role, message in self.messages:
+                if message:
+                    while self.audio_token in message:
+                        message = message.replace(
+                            self.audio_token, self.audio_token.format(idx=counter), 1
+                        )
+                        counter += 1
+
+                    ret += role + "\n" + message + self.sep
+                else:
+                    ret += role + "\n"
+
             return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
@@ -904,6 +922,20 @@ register_conv_template(
 )
 
 
+register_conv_template(
+    Conversation(
+        name="qwen2-audio",
+        system_template="<|im_start|>system\n{system_message}",
+        system_message="You are a helpful assistant.",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.QWEN2_AUDIO,
+        stop_str=["<|im_end|>"],
+        audio_token="Audio {idx}: <|audio_bos|><|AUDIO|><|audio_eos|>\n",
+    )
+)
+
+
 @register_conv_template_matching_function
 def match_internvl(model_path: str):
     if re.search(r"internvl2_5", model_path, re.IGNORECASE):
@@ -956,6 +988,8 @@ def match_qwen_chat_ml(model_path: str):
         return "gme-qwen2-vl"
     if re.search(r"qwen.*vl", model_path, re.IGNORECASE):
         return "qwen2-vl"
+    if re.search(r"qwen.*audio", model_path, re.IGNORECASE):
+        return "qwen2-audio"
     if re.search(
         r"llava-v1\.6-34b|llava-v1\.6-yi-34b|llava-next-video-34b|llava-onevision-qwen2",
         model_path,

@@ -398,6 +398,7 @@ class Qwen2ForCausalLM(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
                 )
+
         else:
             # ranks other than the last rank will have a placeholder layer
             self.lm_head = PPMissingLayer()
