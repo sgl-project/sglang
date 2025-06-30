@@ -307,6 +307,8 @@ def per_token_group_quant_8bit(
         )
 
     if fuse_silu_and_mul:
+        from deep_gemm.utils.layout import transform_sf_into_required_layout
+
         assert column_major_scales
         assert scale_tma_aligned
         assert scale_ue8m0
@@ -337,21 +339,19 @@ def per_token_group_quant_8bit(
             scale_ue8m0=scale_ue8m0,
         )
 
-        if needs_unsqueeze:
-            output = output.squeeze(0)
-            output_scale_for_kernel = output_scale_for_kernel.squeeze(0)
-
-        from deep_gemm.utils.layout import transform_sf_into_required_layout
-
         assert group_size == 128
         output_scale = transform_sf_into_required_layout(
             output_scale_for_kernel,
-            num_groups=None if needs_unsqueeze else output.shape[0],
+            num_groups=output.shape[0],
             mn=output.shape[-2],
             k=output.shape[-1],
             recipe=(1, group_size, group_size),
             is_sfa=True,
         )
+
+        if needs_unsqueeze:
+            output = output.squeeze(0)
+            output_scale = output_scale.squeeze(0)
 
         return output, output_scale
 
