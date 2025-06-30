@@ -264,7 +264,7 @@ void sgl_per_token_group_quant_8bit(
   TORCH_CHECK(std::abs(LOCAL_ABSMAX_ABS - eps) < 1e-13);
 
   CHECK_EQ(input.numel() % group_size, 0);
-  const int num_groups = input.numel() / group_size;
+  const int num_groups = input.numel() / group_size / (fuse_silu_and_mul ? 2 : 1);
 
   const bool masked_layout = masked_m.has_value();
 
@@ -275,7 +275,7 @@ void sgl_per_token_group_quant_8bit(
   auto dst_type = output_q.scalar_type();
 
   const bool is_column_major = output_s.stride(-2) < output_s.stride(-1);
-  const int hidden_size_num_groups = output_q.size(-1) / group_size;
+  const int hidden_size_num_groups = output_q.size(-1) / group_size / (fuse_silu_and_mul ? 2 : 1);
   const int scale_hidden_stride = output_s.stride(-1);
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, T, DST_DTYPE, output_s_dtype, ...)                                \
