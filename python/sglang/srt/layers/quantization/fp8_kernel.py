@@ -303,7 +303,6 @@ def per_token_group_quant_8bit(
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
-    masked_layout: bool = False,
     masked_m: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     from sglang.srt.layers.quantization.int8_kernel import per_token_group_quant_int8
@@ -424,7 +423,6 @@ def sglang_per_token_group_quant_fp8(
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
-    masked_layout: bool = False,
     masked_m: Optional[torch.Tensor] = None,
 ):
     assert (
@@ -466,7 +464,6 @@ def sglang_per_token_group_quant_8bit(
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
-    masked_layout: bool = False,
     masked_m: Optional[torch.Tensor] = None,
 ):
     from sglang.srt.layers.quantization.int8_kernel import (
@@ -477,7 +474,7 @@ def sglang_per_token_group_quant_8bit(
         assert not column_major_scales
         assert not scale_tma_aligned
         assert not fuse_silu_and_mul
-        assert not masked_layout
+        assert masked_m is None
         return sglang_per_token_group_quant_int8(
             x=x,
             group_size=group_size,
@@ -493,7 +490,6 @@ def sglang_per_token_group_quant_8bit(
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=scale_ue8m0,
         fuse_silu_and_mul=fuse_silu_and_mul,
-        masked_layout=masked_layout,
         masked_m=masked_m,
     )
 

@@ -11,7 +11,7 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
         effective_hidden_dim = hidden_dim
     del hidden_dim
 
-    if flags["masked_layout"]:
+    if (masked_layout_mode := flags["masked_layout_mode"]) is not None:
         num_local_experts = 6
         num_max_dispatch_tokens_per_rank = 768
         num_ranks = 48
@@ -27,16 +27,13 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
             dtype=dtype,
         )
 
-        masked_data_generation_mode = flags.get(
-            "masked_data_generation_mode", "default"
-        )
-        if masked_data_generation_mode == "default":
+        if masked_layout_mode == "balanced":
             masked_m = _compute_balanced_split(num_tokens, num_local_experts)
-        elif masked_data_generation_mode == "imbalanced":
+        elif masked_layout_mode == "imbalanced":
             masked_m = _compute_imbalanced_split(num_tokens, num_local_experts)
         else:
             raise NotImplementedError
-        print(f"{masked_data_generation_mode=} {masked_m=} {x.shape=}")
+        print(f"{masked_layout_mode=} {masked_m=} {x.shape=}")
 
         masked_m = masked_m.to(device)
 
