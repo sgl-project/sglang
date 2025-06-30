@@ -113,7 +113,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
 if _is_cuda:
-    from sgl_kernel import awq_dequantize, bmm_fp8, dsv3_fused_a_gemm, merge_state_v2
+    from sgl_kernel import awq_dequantize, bmm_fp8, dsv3_fused_a_gemm, dsv3_router_gemm, merge_state_v2
 elif _is_cpu and _is_cpu_amx_available:
     pass
 else:
@@ -225,7 +225,16 @@ class MoEGate(nn.Module):
                 True,  # is_vnni
             )
 
-        logits = F.linear(hidden_states, self.weight, None)
+        if (
+            hidden_states.shape[0] <= 16
+            and hidden_states.shape[1] == 7168
+            and self.weight.shape[0] == 256
+            and get_device_sm() >= 90
+        ):
+            logits = dsv3_router_gemm(hidden_states, self.weight)
+        else:
+            logits = F.linear(hidden_states, self.weight, None)
+
         return logits
 
 
