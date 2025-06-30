@@ -1024,15 +1024,16 @@ class Scheduler(
                 self.return_health_check_ct += 1
                 continue
 
-            if len(self.waiting_queue) >= self.max_queued_requests:
-                setattr(recv_req, "finished_reason", FINISH_ABORT(
-                    "Request queue is full.", HTTPStatus.TOO_MANY_REQUESTS, "TOO_MANY_REQUESTS")
-                )
-                rid = getattr(recv_req, "rid", "")
-                self.send_to_tokenizer.send_pyobj(AbortReq(rid))
-                logger.error(f"The request queue is full. Abort request {rid}.")
-                continue
-
+            # If it is a work request, accept or reject the request based on the request queue size. 
+            if is_work_request(recv_req):
+                if len(self.waiting_queue) + 1 > self.max_queued_requests:
+                    abort_req = AbortReq(recv_req.rid, finished_reason={
+                        "type": "abort",
+                        "status_code": HTTPStatus.TOO_MANY_REQUESTS,
+                        "message": "The request queue is full.",
+                    })
+                    self.send_to_tokenizer.send_pyobj(abort_req)
+                    continue
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 if isinstance(output, RpcReqOutput):
@@ -2618,6 +2619,8 @@ class Scheduler(
 def is_health_check_generate_req(recv_req):
     return getattr(recv_req, "rid", "").startswith("HEALTH_CHECK")
 
+def is_work_request(recv_req):
+    return isinstance(recv_req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
 
 def _export_static_state(model):
     return dict(
