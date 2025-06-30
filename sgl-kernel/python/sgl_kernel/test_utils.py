@@ -43,7 +43,7 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
         return x, masked_m
     else:
         x = torch.randn(num_tokens, effective_hidden_dim, device=device, dtype=dtype)
-        x[torch.randn(x.shape) < 0.001] *= 10
+        x[torch.randn(x.shape, device=device) < 0.001] *= 10
         return x, None
 
 
