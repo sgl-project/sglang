@@ -304,6 +304,9 @@ def per_token_group_quant_8bit(
             dtype=dst_dtype,
         )
 
+    if fuse_silu_and_mul:
+        return TODO
+
     return per_token_group_quant_fp8(
         x=x,
         group_size=group_size,
@@ -420,6 +423,9 @@ def sglang_per_token_group_quant_8bit(
             eps=eps,
             dtype=dst_dtype,
         )
+
+    if fuse_silu_and_mul:
+        return TODO
 
     return sglang_per_token_group_quant_fp8(
         x=x,
