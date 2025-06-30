@@ -311,7 +311,7 @@ void sgl_per_token_group_quant_8bit(
         LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, true);                          \
       }                                                                                          \
     } else {                                                                                     \
-      LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float);                                  \
+      LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, false);                           \
     }                                                                                            \
   } while (0)
 
