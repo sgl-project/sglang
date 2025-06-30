@@ -131,6 +131,20 @@ struct NaiveScheduler {
   }
 };
 
+struct MaskedLayoutScheduler {
+  static void compute_exec_config(int num_groups, int subwarps_per_block, dim3& grid, dim3& block) {
+    grid = TODO;
+    block = TODO;
+  }
+
+  template <bool FUSE_SILU_AND_MUL, typename FUNC>
+  __device__ __forceinline__ static void
+  execute(int subwarps_per_block, int hidden_size_num_groups, int group_size, FUNC fn) {
+    TODO;
+    fn(token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
+  }
+};
+
 template <
     typename SCHEDULER,
     typename T,
@@ -337,7 +351,7 @@ void sgl_per_token_group_quant_8bit(
       if (scale_ue8m0) {                                                                         \
         if (fuse_silu_and_mul) {                                                                 \
           if (masked_layout) {                                                                   \
-            LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true, true, true); \
+            LAUNCH_KERNEL_INNER(MaskedLayoutScheduler, T, DST_DTYPE, uint32_t, true, true, true, true); \
           } else {                                                                               \
             LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true, true);       \
           }                                                                                      \
