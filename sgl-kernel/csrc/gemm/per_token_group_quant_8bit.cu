@@ -125,6 +125,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     scale_packed_t* __restrict__ output_s,
     const int group_size,
     const int subwarps_per_block,
+    // TODO can remove?
     const int scale_hidden_size = 0,
     const int scale_hidden_stride = 0) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
@@ -149,10 +150,12 @@ __global__ void per_token_group_quant_8bit_kernel(
     if constexpr (IS_COLUMN_MAJOR) {
       constexpr int scale_token_stride = 1;
       constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
-      const int scale_hidden_size_unpacked = scale_hidden_size * num_elems_per_pack;
+
       // TODO unify w/ other places?
+      const int scale_hidden_size_unpacked = scale_hidden_size * num_elems_per_pack;
       const int token_idx = group_id / scale_hidden_size_unpacked;
       const int hidden_idx = group_id % scale_hidden_size_unpacked;
+
       const int hidden_idx_packed = hidden_idx / num_elems_per_pack;
       const int pack_idx = hidden_idx % num_elems_per_pack;
       scale_output = reinterpret_cast<scale_element_t*>(output_s) +
