@@ -2,13 +2,12 @@ import itertools
 
 import pytest
 import torch
-from sgl_kernel.test_utils import create_per_token_group_quant_test_data
+from sgl_kernel.test_utils import create_per_token_group_quant_test_data, assert_fp8_all_close
 
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
-from sglang.srt.layers.quantization.utils import assert_fp8_all_close
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
