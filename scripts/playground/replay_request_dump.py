@@ -1,10 +1,10 @@
 """
 Usage:
 # replay from a folder
-python3 replay_request_dump.py --file-number 100 --parallel 512 --input-folder /data/folder
+python3 replay_request_dump.py --file-number 100 --parallel 512 --input-folder /data/lianmin/sglang_request_dump/grok-mini-0220-engine-5756f8f94-28bm6/
 
 # replay from a single file
-python3 replay_request_dump.py --parallel 512 --input-file /data/file.pkl
+python3 replay_request_dump.py --parallel 512 --input-file /data/sglang_crash_dump/memx-cti-34-sr1.xpop.twttr.net/crash_dump_2025-06-04_20-13-18.pkl
 """
 
 import argparse
@@ -38,8 +38,18 @@ def run_one_request_internal(record):
     (req, output, replay_init_time, start_time, end_time, idx) = record
     time.sleep(max(0, start_time - (time.time() - replay_init_time)))
 
+    if "completion_tokens" in output.get("meta_info", {}):
+        recorded_completion_tokens = output["meta_info"]["completion_tokens"]
+    else:
+        recorded_completion_tokens = ""
+
     json_data = asdict(req)
     stream = json_data["stream"]
+
+    if args.ignore_eos:
+        json_data["sampling_params"]["ignore_eos"] = True
+        if recorded_completion_tokens:
+            json_data["sampling_params"]["max_new_tokens"] = recorded_completion_tokens
 
     response = requests.post(
         f"http://{args.host}:{args.port}/generate",
@@ -59,10 +69,6 @@ def run_one_request_internal(record):
 
     prompt_tokens = ret["meta_info"]["prompt_tokens"]
     completion_tokens = ret["meta_info"]["completion_tokens"]
-    if "completion_tokens" in ret["meta_info"]:
-        recorded_completion_tokens = ret["meta_info"]["completion_tokens"]
-    else:
-        recorded_completion_tokens = ""
     print(
         f"{idx=}, {start_time=:.2f}, {prompt_tokens=}, "
         f"{completion_tokens=}, {recorded_completion_tokens=}"
@@ -114,6 +120,7 @@ if __name__ == "__main__":
     parser.add_argument("--req-start", type=int, default=0)
     parser.add_argument("--parallel", type=int, default=512)
     parser.add_argument("--idx", type=int, default=None)
+    parser.add_argument("--ignore-eos", action="store_true")
     args = parser.parse_args()
 
     set_ulimit()
