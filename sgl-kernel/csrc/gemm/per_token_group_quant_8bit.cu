@@ -109,17 +109,18 @@ struct NaiveScheduler {
     const int block_group_id = blockIdx.x * subwarps_per_block;
     const int group_id = block_group_id + local_group_id;
 
+    const int token_idx = group_id / hidden_size_num_groups;
+    // At hidden_size dim, we are handling idx-th group
+    const int hidden_dim_group_idx = group_id % hidden_size_num_groups;
+
     int input_group_start_offset;
     if (FUSE_SILU_AND_MUL) {
-      input_group_start_offset = token_idx * hidden_size_num_groups * group_size * 2 + group_start_hidden_idx * group_size;
+      input_group_start_offset = token_idx * hidden_size_num_groups * group_size * 2 + hidden_dim_group_idx * group_size;
     } else {
       input_group_start_offset = group_id * group_size;
     }
 
-    const int token_idx = group_id / hidden_size_num_groups;
-    const int group_start_hidden_idx = group_id % hidden_size_num_groups;
-
-    fn(token_idx, group_start_hidden_idx, lane_id, input_group_start_offset);
+    fn(token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
   }
 };
 
@@ -149,11 +150,11 @@ __global__ void per_token_group_quant_8bit_kernel(
       subwarps_per_block,
       hidden_size_num_groups,
       group_size,
-      [&](int token_idx, int group_start_hidden_idx, int lane_id, int input_group_start_offset) {
+      [&](int token_idx, int hidden_dim_group_idx, int lane_id, int input_group_start_offset) {
         constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
         constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
-        const int offset_num_groups = token_idx * hidden_size_num_groups + group_start_hidden_idx;
+        const int offset_num_groups = token_idx * hidden_size_num_groups + hidden_dim_group_idx;
 
         int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
         T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
@@ -170,8 +171,8 @@ __global__ void per_token_group_quant_8bit_kernel(
           constexpr int scale_token_stride = 1;
           constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
 
-          const int hidden_idx_packed = group_start_hidden_idx / num_elems_per_pack;
-          const int pack_idx = group_start_hidden_idx % num_elems_per_pack;
+          const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
+          const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
           scale_output = reinterpret_cast<scale_element_t*>(output_s) +
                          (hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
                           token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
