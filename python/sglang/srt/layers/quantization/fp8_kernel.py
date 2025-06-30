@@ -352,16 +352,16 @@ def create_per_token_group_quant_fp8_output_scale(
 ):
     if scale_ue8m0:
         assert column_major_scales and scale_tma_aligned
-        x_q_mn, x_q_k = x_shape
+        *x_batch, x_q_mn, x_q_k = x_shape
         x_s_mn, x_s_k = x_q_mn, x_q_k // 128
         aligned_mn = align(x_s_mn, 4)
         aligned_k = align(x_s_k, 4)
         # TODO(FIXME): Fix cuda kernel and recover here to empty.
         return torch.zeros(
-            (aligned_k // 4, aligned_mn),
+            (*x_batch, aligned_k // 4, aligned_mn),
             device=device,
             dtype=torch.int,
-        ).transpose(0, 1)[:x_s_mn, :]
+        ).transpose(-1, -2)[..., :x_s_mn, :]
     elif column_major_scales:
         if scale_tma_aligned:
             # TODO extract "align" function
