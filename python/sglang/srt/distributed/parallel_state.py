@@ -1039,12 +1039,12 @@ def init_model_parallel_group(
 _TP: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
-_PDMUX_P_TP: Optional[GroupCoordinator] = None
+_PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
 
 _ENABLE_PDMUX_P_TP: bool = False
 
 
-def set_pdmux_status(enable_p: bool):
+def set_pdmux_status(enable_prefill_multiplexing: bool):
     global _ENABLE_PDMUX_P_TP
     _ENABLE_PDMUX_P_TP = enable_p
 
@@ -1052,9 +1052,9 @@ def set_pdmux_status(enable_p: bool):
 def get_tp_group() -> GroupCoordinator:
     if _ENABLE_PDMUX_P_TP:
         assert (
-            _PDMUX_P_TP is not None
+            _PDMUX_PREFILL_TP_GROUP is not None
         ), "tensor model parallel group for PD-Multiplexing Prefill is not initialized"
-        return _PDMUX_P_TP
+        return _PDMUX_PREFILL_TP_GROUP
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
 
@@ -1229,18 +1229,18 @@ def initialize_model_parallel(
     )
 
     if duplicate_tp_group:
-        global _PDMUX_P_TP
+        global _PDMUX_PREFILL_TP_GROUP
         assert (
-            _PDMUX_P_TP is None
+            _PDMUX_PREFILL_TP_GROUP is None
         ), "tensor model parallel group for PD-Multiplexing Prefill is already initialized"
-        _PDMUX_P_TP = init_model_parallel_group(
+        _PDMUX_PREFILL_TP_GROUP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
             backend,
             use_message_queue_broadcaster=get_bool_env_var(
                 "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
             ),
-            group_name="tp",
+            group_name="pdmux_prefill_tp",
         )
 
     # Build the pipeline model-parallel groups.
