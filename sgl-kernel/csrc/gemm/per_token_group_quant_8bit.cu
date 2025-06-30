@@ -225,6 +225,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int group_size,
     const int subwarps_per_block,
     const int hidden_dim_num_groups,
+    // TODO can this be removed?
+    const int scale_expert_stride,
     const int scale_hidden_stride,
     const int num_tokens_per_expert) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
@@ -278,7 +280,6 @@ __global__ void per_token_group_quant_8bit_kernel(
           const int hidden_size = hidden_dim_num_groups * group_size;
 
           constexpr int scale_token_stride = 1;
-          const int scale_expert_stride = (hidden_size / num_elems_per_pack) * scale_hidden_stride;
 
           const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
           const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
@@ -384,6 +385,7 @@ void sgl_per_token_group_quant_8bit(
   const bool is_column_major = output_s.stride(-2) < output_s.stride(-1);
   const int hidden_dim_num_groups = output_q.size(-1) / group_size / (fuse_silu_and_mul ? 2 : 1);
   const int num_tokens_per_expert = output_q.size(-2);
+  const int scale_expert_stride = masked_layout ? output_s.stride(0) : 0;
   const int scale_hidden_stride = output_s.stride(-1);
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, T, DST_DTYPE, output_s_dtype, ...)                                \
@@ -401,6 +403,7 @@ void sgl_per_token_group_quant_8bit(
         group_size,                                                                                      \
         subwarps_per_block,                                                                              \
         hidden_dim_num_groups,                                                                           \
+        scale_expert_stride,                                                                             \
         scale_hidden_stride,                                                                             \
         num_tokens_per_expert);                                                                          \
   } while (0)
