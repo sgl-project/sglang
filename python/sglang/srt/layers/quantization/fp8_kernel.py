@@ -309,6 +309,7 @@ def per_token_group_quant_8bit(
     if fuse_silu_and_mul:
         assert column_major_scales
         assert scale_tma_aligned
+        assert scale_ue8m0
 
         needs_unsqueeze = x.dim() == 2
         if needs_unsqueeze:
@@ -322,19 +323,15 @@ def per_token_group_quant_8bit(
             device=x.device,
             dtype=dst_dtype,
         )
-        TODO_wrong
-        output_scale = create_per_token_group_quant_fp8_output_scale(
-            x_shape=output.shape,
-            device=output.device,
-            group_size=group_size,
-            column_major_scales=column_major_scales,
-            scale_tma_aligned=scale_tma_aligned,
-            scale_ue8m0=scale_ue8m0,
+        output_scale_for_kernel = torch.empty(
+            (*x.shape[:-1], x.shape[-1] // 2 // group_size),
+            device=x.device,
+            dtype=torch.float32,
         )
         silu_and_mul_masked_post_quant_fwd(
             input=x,
             output=output,
-            output_scale=output_scale,
+            output_scale=output_scale_for_kernel,
             quant_group_size=group_size,
             masked_m=masked_m,
             scale_ue8m0=scale_ue8m0,
@@ -342,7 +339,7 @@ def per_token_group_quant_8bit(
 
         if needs_unsqueeze:
             output = output.squeeze(0)
-            output_scale = output_scale.squeeze(0)
+            output_scale_for_kernel = output_scale_for_kernel.squeeze(0)
 
         return output, output_scale
 
