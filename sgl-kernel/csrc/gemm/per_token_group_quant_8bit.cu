@@ -226,12 +226,16 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int subwarps_per_block,
     const int hidden_dim_num_groups,
     // TODO can this be removed?
-    const int scale_expert_stride,
-    const int scale_hidden_stride,
-    const int num_tokens_per_expert) {
+    // const int scale_expert_stride,
+    const int scale_hidden_stride
+    // const int num_tokens_per_expert
+    ) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
+
+  constexpr int scale_expert_stride = 0;
+  constexpr int num_tokens_per_expert = 0;
 
   SCHEDULER::execute<FUSE_SILU_AND_MUL>(
       subwarps_per_block,
@@ -402,9 +406,8 @@ void sgl_per_token_group_quant_8bit(
         group_size,                                                                                      \
         subwarps_per_block,                                                                              \
         hidden_dim_num_groups,                                                                           \
-        scale_expert_stride,                                                                             \
-        scale_hidden_stride,                                                                             \
-        num_tokens_per_expert);                                                                          \
+        scale_hidden_stride                                                                             \
+        );                                                                          \
   } while (0)
 
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                                     \
