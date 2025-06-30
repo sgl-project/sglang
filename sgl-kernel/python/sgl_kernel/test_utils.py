@@ -74,10 +74,10 @@ def _compute_imbalanced_split(total: int, arr_len: int, dtype=torch.int) -> list
 
 
 def assert_all_close_or_tiny_diff(a: torch.Tensor, b: torch.Tensor):
-    assert a.shape == b.shape
+    assert (a.shape == b.shape) and (a.dtype == b.dtype), f"{a.shape=} {b.shape=} {a.dtype=} {b.dtype=}"
     numel = a.numel()
 
-    if a.dtype == b.dtype == torch.float8_e4m3fn:
+    if a.dtype == torch.float8_e4m3fn:
         a_u8 = a.view(torch.uint8)
         b_u8 = b.view(torch.uint8)
         diff_u8 = (a_u8.to(torch.int16) - b_u8.to(torch.int16)).abs()
@@ -85,7 +85,7 @@ def assert_all_close_or_tiny_diff(a: torch.Tensor, b: torch.Tensor):
         count_diff_sign = ((a_u8 >= 0) & (b_u8 < 0)).sum().item()
         count_tiny_diff = (diff_u8 == 1).sum().item()
         count_large_diff = (diff_u8 >= 2).sum().item()
-    elif a.dtype == b.dtype == torch.int8:
+    elif a.dtype == torch.int8:
         diff = (a.to(torch.int16) - a.to(torch.int16)).abs()
         count_diff_sign = ((a >= 0) & (b < 0)).sum().item()
         count_tiny_diff = (diff == 1).sum().item()
