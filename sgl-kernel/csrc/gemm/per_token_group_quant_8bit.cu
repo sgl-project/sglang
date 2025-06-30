@@ -268,7 +268,7 @@ void sgl_per_token_group_quant_8bit(
       }                                                            \
     } else {                                                       \
       TORCH_CHECK(!scale_ue8m0);                                   \
-      LAUNCH_KERNEL_INNER(T, DST_DTYPE, uint32_t, false);          \
+      LAUNCH_KERNEL_INNER(T, DST_DTYPE, float, false);             \
     }                                                              \
   } while (0)
 
