@@ -313,6 +313,18 @@ class ChatCompletionMessageGenericParam(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
 
+    @field_validator("role", mode="before")
+    @classmethod
+    def _normalize_role(cls, v):
+        if isinstance(v, str):
+            v_lower = v.lower()
+            if v_lower not in {"system", "assistant", "tool"}:
+                raise ValueError(
+                    "'role' must be one of 'system', 'assistant', or 'tool' (case-insensitive)."
+                )
+            return v_lower
+        raise ValueError("'role' must be a string")
+
 
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
