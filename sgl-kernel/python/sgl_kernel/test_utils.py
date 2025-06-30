@@ -15,6 +15,8 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
         num_local_experts = 6
         num_max_dispatch_tokens_per_rank = 768
         num_ranks = 48
+        num_global_experts = 288
+        assert num_local_experts * num_ranks == num_global_experts
 
         # mimic DeepEP low_latency_dispatch output
         x = torch.randn(num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, effective_hidden_dim, device=device, dtype=dtype)
