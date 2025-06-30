@@ -16,6 +16,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
 from sglang.srt.utils import is_hip
+from sgl_kernel.test_utils import create_per_token_group_quant_test_data
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
@@ -115,12 +116,7 @@ else:
     )
 )
 def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
-    if flags["scale_ue8m0"] and group_size != 128:
-        return
-
-    device = torch.device("cuda")
-
-    x = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.bfloat16)
+    x = create_per_token_group_quant_test_data()
 
     fn, kernel_names = {
         "triton": (triton_per_token_group_quant_8bit, "_per_token_group_quant_fp8|_silu_and_mul_post_quant_kernel"),

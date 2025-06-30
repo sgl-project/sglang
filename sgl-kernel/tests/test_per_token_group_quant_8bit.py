@@ -9,6 +9,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
 from sglang.srt.layers.quantization.utils import assert_fp8_all_close
 from sglang.srt.utils import is_hip
+from sgl_kernel.test_utils import create_per_token_group_quant_test_data
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
@@ -84,11 +85,11 @@ def test_per_token_group_quant_with_column_major(
     dst_dtype,
     flags,
 ):
-    if flags["scale_ue8m0"] and ((group_size != 128) or (hidden_dim % 512 != 0)):
+    if flags["scale_ue8m0"] and (group_size != 128):
         pytest.skip()
         return
 
-    x = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)
+    x = create_per_token_group_quant_test_data()
 
     execute_kwargs = dict(
         x=x,
