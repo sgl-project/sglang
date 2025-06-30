@@ -105,8 +105,8 @@ def _per_token_group_quant_fp8(
     # Avoid to divide zero
     eps,
     # Information for float8
-    fp8_min,
-    fp8_max,
+    bit8_min,
+    bit8_max,
     # Meta-parameters
     BLOCK: tl.constexpr,
 ):
@@ -127,9 +127,9 @@ def _per_token_group_quant_fp8(
     y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     # Quant
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
-    y_s = _absmax / fp8_max
+    y_s = _absmax / bit8_max
     y_s_inv = 1.0 / y_s
-    y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    y_q = tl.clamp(y * y_s_inv, bit8_min, bit8_max).to(y_q_ptr.dtype.element_ty)
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
@@ -149,8 +149,8 @@ def _per_token_group_quant_fp8_colmajor(
     # Avoid to divide zero
     eps,
     # Information for float8
-    fp8_min,
-    fp8_max,
+    bit8_min,
+    bit8_max,
     # Meta-parameters
     BLOCK: tl.constexpr,
     SCALE_UE8M0: tl.constexpr,
@@ -177,10 +177,10 @@ def _per_token_group_quant_fp8_colmajor(
     y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     # Quant
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
-    y_s = _absmax / fp8_max
+    y_s = _absmax / bit8_max
     if SCALE_UE8M0:
         y_s = tl.exp2(tl.ceil(tl.log2(tl.abs(y_s))))
-    y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    y_q = tl.clamp(y / y_s, bit8_min, bit8_max).to(y_q_ptr.dtype.element_ty)
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
@@ -219,15 +219,15 @@ def per_token_group_quant_fp8(
     else:
         finfo = torch.finfo(dtype)
 
-    fp8_max = finfo.max
+    bit8_max = finfo.max
 
     if _is_hip:
         if dtype == torch.int8:
-            fp8_max = 127.0
+            bit8_max = 127.0
         else:
-            fp8_max = 224.0
+            bit8_max = 224.0
 
-    fp8_min = -fp8_max
+    bit8_min = -bit8_max
 
     x_q = torch.empty_like(x, device=x.device, dtype=dtype)
     x_s = create_per_token_group_quant_fp8_output_scale(
@@ -255,8 +255,8 @@ def per_token_group_quant_fp8(
             x.shape[1],
             x_s.stride(1),
             eps,
-            fp8_min=fp8_min,
-            fp8_max=fp8_max,
+            bit8_min=bit8_min,
+            bit8_max=bit8_max,
             BLOCK=BLOCK,
             num_warps=num_warps,
             num_stages=num_stages,
@@ -271,8 +271,8 @@ def per_token_group_quant_fp8(
             group_size,
             N,
             eps,
-            fp8_min=fp8_min,
-            fp8_max=fp8_max,
+            bit8_min=bit8_min,
+            bit8_max=bit8_max,
             BLOCK=BLOCK,
             num_warps=num_warps,
             num_stages=num_stages,
