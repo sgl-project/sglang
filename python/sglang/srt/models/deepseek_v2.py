@@ -59,6 +59,7 @@ from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_tensor_quant_mla_fp8,
@@ -251,6 +252,9 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
 
+        # for debug purpose
+        self.prefix = prefix
+
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -324,13 +328,14 @@ class DeepseekV2MoE(nn.Module):
                 self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
             )
             if self.shared_experts_is_fp8:
-                assert (
-                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                    == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
-                )
-                self.shared_experts_weight_block_size = (
-                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                )
+                if isinstance(self.shared_experts.gate_up_proj.quant_method, Fp8Config):
+                    assert (
+                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                        == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
+                    )
+                    self.shared_experts_weight_block_size = (
+                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                    )
 
         self.top_k = config.num_experts_per_tok
 
@@ -531,6 +536,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights=topk_weights,
                 forward_mode=forward_mode,
             )
+
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_idx=topk_idx,
@@ -742,6 +748,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
+                fused_parameters=2,
+                fused_rank=1,
+                fused_shapes=(
+                    self.q_lora_rank,
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                ),
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
@@ -885,14 +897,17 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
         self.weight_block_size = None
+
         if self.qkv_proj_with_rope_is_fp8:
-            assert (
-                self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
-                == self.q_b_proj.quant_method.quant_config.weight_block_size
-            )
-            self.weight_block_size = (
-                self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
-            )
+            # NOTE (yiakwy) : quick fix to PR#6641, we cannot always assume the config is Fp8Config
+            if isinstance(self.fused_qkv_a_proj_with_mqa.quant_method, Fp8Config):
+                assert (
+                    self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
+                    == self.q_b_proj.quant_method.quant_config.weight_block_size
+                )
+                self.weight_block_size = (
+                    self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
+                )
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch

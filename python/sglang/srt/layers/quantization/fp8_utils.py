@@ -476,6 +476,22 @@ def _process_scaled_mm_output(output, input_2d_shape, output_shape):
     return torch.narrow(output, 0, 0, input_2d_shape[0]).view(*output_shape)
 
 
+def _is_column_major(tensor: torch.Tensor):
+    return tensor.stride()[0] == 1 and tensor.stride()[1] > 1
+
+
+def _clone_in_column_major(tensor: torch.Tensor):
+    shape = tensor.shape
+
+    assert len(shape) == 2
+
+    M, N = shape
+    cloned_tensor = torch.empty((N, M), device=tensor.device, dtype=tensor.dtype)
+    cloned_tensor = torch.transpose(cloned_tensor, 0, 1)
+    cloned_tensor[:] = tensor[:]
+    return cloned_tensor
+
+
 def _apply_fallback_scaled_mm(
     qinput,
     weight,
@@ -490,9 +506,14 @@ def _apply_fallback_scaled_mm(
     if TORCH_DEVICE_IDENTITY is None:
         TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32, device=weight.device)
 
+    if not _is_column_major(weight):
+        cloned_weight = _clone_in_column_major(weight)
+    else:
+        cloned_weight = weight
+
     output = torch._scaled_mm(
         qinput,
-        weight,
+        cloned_weight,
         scale_a=TORCH_DEVICE_IDENTITY,
         scale_b=TORCH_DEVICE_IDENTITY,
         out_dtype=torch.float32,

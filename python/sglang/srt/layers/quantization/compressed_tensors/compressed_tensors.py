@@ -85,6 +85,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         kv_cache_scheme: Optional[Dict[str, Any]] = None,
         config: Optional[Dict[str, Any]] = None,
         packed_modules_mapping: Dict[str, List[str]] = {},
+        is_checkpoint_fp8_serialized: bool = False,
+        activation_scheme: str = "dynamic",
+        weight_scheme: str = "static",
     ):
         super().__init__()
         self.ignore = ignore
@@ -96,6 +99,14 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.sparsity_ignore_list = sparsity_ignore_list
         self.config = config
         self.packed_modules_mapping = packed_modules_mapping
+
+        # NOTE(yiakwy) : ref to FP8Config
+        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        self.activation_scheme = activation_scheme
+        self.weight_scheme = weight_scheme
+
+        # NOTE(yiakwy) : blockScale is not supported now , will be added soon; temp work around is broadcsating tensor-wise scalars
+        self.weight_block_size = None
 
     def get_linear_method(self) -> "CompressedTensorsLinearMethod":
         return CompressedTensorsLinearMethod(self)
@@ -118,7 +129,6 @@ class CompressedTensorsConfig(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional["QuantizeMethodBase"]:
-
         # Check if the layer is skipped for quantization.
         # TODO (@robertgshaw2): support module names
         if should_ignore_layer(
@@ -147,6 +157,27 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
         packed_modules_mapping = config.get("packed_modules_mapping", {})
 
+        is_checkpoint_fp8_serialized = False
+
+        for _, group in config["config_groups"].items():
+            weight_desc = group["weights"]
+            num_bits_desc = weight_desc["num_bits"]
+
+            if num_bits_desc == 8:
+                is_checkpoint_fp8_serialized = True
+                break
+
+        # (yiakwy) : weights static quantized, while input activation should be dynamic quantized
+        activation_scheme = "dynamic"
+        weight_scheme = "static"
+
+        for _, group in config["config_groups"].items():
+            act_desc = group["input_activations"]
+            weight_desc = group["weights"]
+
+            activation_scheme = "dynamic" if act_desc["dynamic"] else "static"
+            weight_scheme = "dynamic" if weight_desc["dynamic"] else "static"
+
         return cls(
             target_scheme_map=target_scheme_map,
             ignore=ignore,
@@ -155,6 +186,9 @@ class CompressedTensorsConfig(QuantizationConfig):
             sparsity_ignore_list=sparsity_ignore_list,
             config=config,
             packed_modules_mapping=packed_modules_mapping,
+            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            activation_scheme=activation_scheme,
+            weight_scheme=weight_scheme,
         )
 
     @classmethod

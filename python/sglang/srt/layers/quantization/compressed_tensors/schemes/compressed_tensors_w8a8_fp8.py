@@ -40,54 +40,133 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         # If per tensor, when we have a fused module (e.g. QKV) with per
         # tensor scales (thus N scales being passed to the kernel),
         # requantize so we can always run per tensor
-        if self.strategy == QuantizationStrategy.TENSOR:
-            max_w_scale, weight = requantize_with_max_scale(
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                logical_widths=layer.logical_widths,
+
+        def _process_input_scale_after_loading(layer):
+            if (
+                self.strategy == QuantizationStrategy.TENSOR
+                or self.strategy == QuantizationStrategy.CHANNEL
+            ):
+                if is_fp8_fnuz():
+                    input_scale = getattr(layer, "input_scale", None)
+
+                    if input_scale is not None:
+                        input_scale = input_scale * 2.0
+                        layer.input_scale = Parameter(input_scale, requires_grad=False)
+
+            # INPUT SCALE
+            if self.is_static_input_scheme and hasattr(layer, "input_scale"):
+                layer.input_scale = Parameter(
+                    layer.input_scale.max(), requires_grad=False
+                )
+            else:
+                layer.input_scale = None
+
+            return
+
+        def _process_weights_after_loading(weight, weight_scale, logical_widths):
+            rectified_weight = None
+            rectified_weight_scale = None
+
+            if self.strategy == QuantizationStrategy.TENSOR:
+                max_w_scale, rectified_weight = requantize_with_max_scale(
+                    weight=weight,
+                    weight_scale=weight_scale,
+                    logical_widths=logical_widths,
+                )
+
+                if is_fp8_fnuz():
+                    # input_scale = getattr(layer, "input_scale", None)
+
+                    # NOTE (yiakwy) : for fused kv parameter, this function is exclusive to ROCm to load NV fp8 data correctly
+                    # but it does not make sense to double (2*input_scale) a shared input scale twice for different weight shards
+                    rectified_weight, max_w_scale, input_scale = (
+                        normalize_e4m3fn_to_e4m3fnuz(
+                            weight=rectified_weight,
+                            weight_scale=max_w_scale,
+                            input_scale=None,
+                        )
+                    )
+
+                rectified_weight = Parameter(rectified_weight.t(), requires_grad=False)
+                rectified_weight_scale = Parameter(max_w_scale, requires_grad=False)
+
+            # If channelwise, scales are already lined up, so just transpose.
+            elif self.strategy == QuantizationStrategy.CHANNEL:
+                if is_fp8_fnuz():
+                    # input_scale = getattr(layer, "input_scale", None)
+
+                    # NOTE (yiakwy) : the same issue as above
+                    rectified_weight, rectified_weight_scale, input_scale = (
+                        normalize_e4m3fn_to_e4m3fnuz(
+                            weight=weight,
+                            weight_scale=weight_scale,
+                            input_scale=None,
+                        )
+                    )
+                else:
+                    rectified_weight_scale = weight_scale.data
+
+                rectified_weight = Parameter(rectified_weight.t(), requires_grad=False)
+                # required by torch.compile to be torch.nn.Parameter
+                rectified_weight_scale = Parameter(
+                    rectified_weight_scale, requires_grad=False
+                )
+
+            else:
+                raise ValueError(f"Unknown quantization strategy {self.strategy}")
+
+            return rectified_weight, rectified_weight_scale
+
+        if "fused_qkv_a_proj_with_mqa" in layer.prefix:
+
+            # See DeepSeek V2
+            assert layer.fused_parameters == 2
+
+            q_a_proj_w, kv_a_proj_with_mqa_w = layer.weight.split(
+                layer.fused_shapes, dim=0
+            )
+            q_a_proj_w_scale, kv_a_proj_with_mqa_w_scale = layer.weight_scale.split(
+                [1, 1], dim=0
             )
 
-            if is_fp8_fnuz():
-                input_scale = getattr(layer, "input_scale", None)
-
-                weight, max_w_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=weight, weight_scale=max_w_scale, input_scale=input_scale
+            rectified_q_a_proj_w_t, rectified_q_a_proj_w_t_scale = (
+                _process_weights_after_loading(
+                    q_a_proj_w, q_a_proj_w_scale, [layer.fused_shapes[0]]
                 )
-                if input_scale is not None:
-                    layer.input_scale = Parameter(input_scale, requires_grad=False)
-
-            layer.weight = Parameter(weight.t(), requires_grad=False)
-            layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
-
-        # If channelwise, scales are already lined up, so just transpose.
-        elif self.strategy == QuantizationStrategy.CHANNEL:
-            weight = layer.weight
-
-            if is_fp8_fnuz():
-                input_scale = getattr(layer, "input_scale", None)
-
-                weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=weight,
-                    weight_scale=layer.weight_scale,
-                    input_scale=input_scale,
+            )
+            rectified_kv_a_proj_with_mqa_w_t, rectified_kv_a_proj_with_mqa_w_t_scale = (
+                _process_weights_after_loading(
+                    kv_a_proj_with_mqa_w,
+                    kv_a_proj_with_mqa_w_scale,
+                    [layer.fused_shapes[1]],
                 )
-                if input_scale is not None:
-                    layer.input_scale = Parameter(input_scale, requires_grad=False)
-            else:
-                weight_scale = layer.weight_scale.data
+            )
 
-            layer.weight = Parameter(weight.t(), requires_grad=False)
-            # required by torch.compile to be torch.nn.Parameter
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+            # assigned merged weights back
+            merged_weight = torch.cat(
+                [rectified_q_a_proj_w_t.data, rectified_kv_a_proj_with_mqa_w_t.data],
+                dim=1,
+            )
 
+            merged_weight_scale = torch.cat(
+                [
+                    rectified_q_a_proj_w_t_scale.data.unsqueeze(0),
+                    rectified_kv_a_proj_with_mqa_w_t_scale.data.unsqueeze(0),
+                ],
+            )
+
+            layer.weight = Parameter(merged_weight, requires_grad=False)
+            layer.weight_scale = Parameter(merged_weight_scale, requires_grad=False)
         else:
-            raise ValueError(f"Unknown quantization strategy {self.strategy}")
+            rectified_weight, rectified_weight_scale = _process_weights_after_loading(
+                layer.weight, layer.weight_scale, layer.logical_widths
+            )
+            layer.weight = rectified_weight
+            layer.weight_scale = rectified_weight_scale
 
-        # INPUT SCALE
-        if self.is_static_input_scheme and hasattr(layer, "input_scale"):
-            layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
-        else:
-            layer.input_scale = None
+        _process_input_scale_after_loading(layer)
+
+        return
 
     def create_weights(
         self,
@@ -117,16 +196,34 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         # WEIGHT SCALE
         # TODO: update create_xxx_parameter functions to return
         # the newly added parameters
+
+        if hasattr(layer, "fused_parameters") and layer.fused_parameters > 0:
+            fused_parameters = layer.fused_parameters
+        else:
+            fused_parameters = 1
+
         if self.strategy == QuantizationStrategy.CHANNEL:
+            if fused_parameters > 1:
+                raise NotImplemented(
+                    "Support for channel-wise weight scaling for fused parameters is not supported yet. Stay tuned!"
+                )
+
             weight_scale = ChannelQuantScaleParameter(
-                data=torch.empty((sum(output_partition_sizes), 1), dtype=torch.float32),
+                data=torch.empty(
+                    (sum(output_partition_sizes), 1),
+                    dtype=torch.float32,
+                ),
                 output_dim=0,
                 weight_loader=weight_loader,
             )
         else:
             assert self.strategy == QuantizationStrategy.TENSOR
             weight_scale = PerTensorScaleParameter(
-                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                data=torch.empty(
+                    # TODO (yiakwy) : impl logics inside PerTensorScaleParameter, i.e. each of fused prameteres has (fused_parameters,) tensor-wise weight scale parameters
+                    len(output_partition_sizes) * fused_parameters,
+                    dtype=torch.float32,
+                ),
                 weight_loader=weight_loader,
             )
 
@@ -137,7 +234,9 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         # INPUT SCALE
         if self.is_static_input_scheme:
             input_scale = PerTensorScaleParameter(
-                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                data=torch.empty(
+                    len(output_partition_sizes) * fused_parameters, dtype=torch.float32
+                ),
                 weight_loader=weight_loader,
             )
             input_scale[:] = torch.finfo(torch.float32).min
@@ -149,12 +248,54 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return apply_fp8_linear(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            input_scale=layer.input_scale,
-            bias=bias,
-            use_per_token_if_dynamic=True,
-            compressed_tensor_quant=True,
-        )
+
+        # NOTE (fallback to non-fused solution) : concat([input * w[:shard1] * w_shard1_scale, input * w[shart1:shart1+shart2] * w_shard2_scale], dim=1)
+        # Will write kernel to improve it later
+
+        if hasattr(layer, "fused_parameters") and layer.fused_parameters > 0:
+            if "fused_qkv_a_proj_with_mqa" in layer.prefix:
+                assert layer.fused_parameters == 2
+
+                q_a_proj_w, kv_a_proj_with_mqa_w = layer.weight.split(
+                    layer.fused_shapes, dim=1
+                )
+                q_a_proj_w_scale, kv_a_proj_with_mqa_w_scale = layer.weight_scale.split(
+                    [1, 1], dim=0
+                )
+
+                partial_out_q = apply_fp8_linear(
+                    input=x,
+                    weight=Parameter(q_a_proj_w, requires_grad=False),
+                    weight_scale=Parameter(q_a_proj_w_scale, requires_grad=False),
+                    input_scale=layer.input_scale,
+                    bias=bias,
+                    use_per_token_if_dynamic=True,
+                    compressed_tensor_quant=True,
+                )
+                partial_out_kv_latent_cache = apply_fp8_linear(
+                    input=x,
+                    weight=Parameter(kv_a_proj_with_mqa_w, requires_grad=False),
+                    weight_scale=Parameter(
+                        kv_a_proj_with_mqa_w_scale, requires_grad=False
+                    ),
+                    input_scale=layer.input_scale,
+                    bias=bias,
+                    use_per_token_if_dynamic=True,
+                    compressed_tensor_quant=True,
+                )
+
+                return torch.concat([partial_out_q, partial_out_kv_latent_cache], dim=1)
+            else:
+                raise Exception(
+                    f"fused_parameters for this type of layer#{layer.prefix}: {type(layer)} is not supported yet."
+                )
+        else:
+            return apply_fp8_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+                bias=bias,
+                use_per_token_if_dynamic=True,
+                compressed_tensor_quant=True,
+            )

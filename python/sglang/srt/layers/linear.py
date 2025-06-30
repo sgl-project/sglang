@@ -212,13 +212,24 @@ class LinearBase(torch.nn.Module):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        fused_parameters: int = 0,
+        fused_rank: int = -1,
+        fused_shapes: tuple = (),
     ):
         super().__init__()
+
+        # for debug prupose
+        self.prefix = prefix
 
         # Keep input parameters
         self.input_size = input_size
         self.output_size = output_size
         self.skip_bias_add = skip_bias_add
+        # Fix to PR#5619, to create fused weight/input scalars with correct size
+        self.fused_parameters = fused_parameters
+        # Fix to PR#5619, to apply fused scalars to each shard
+        self.fused_rank = fused_rank
+        self.fused_shapes = fused_shapes
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
@@ -254,6 +265,9 @@ class ReplicatedLinear(LinearBase):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        fused_parameters: int = 0,
+        fused_rank: int = -1,
+        fused_shapes: tuple = (),
     ):
         super().__init__(
             input_size,
@@ -262,6 +276,9 @@ class ReplicatedLinear(LinearBase):
             params_dtype,
             quant_config,
             prefix=prefix,
+            fused_parameters=fused_parameters,
+            fused_rank=fused_rank,
+            fused_shapes=fused_shapes,
         )
 
         # All the linear layer supports quant method.
@@ -296,7 +313,6 @@ class ReplicatedLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

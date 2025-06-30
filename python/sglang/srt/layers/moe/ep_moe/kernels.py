@@ -682,13 +682,19 @@ def grouped_gemm_triton(
 
         assert len(block_shape) == 2
         block_n, block_k = block_shape[0], block_shape[1]
-        a, scale_a = per_token_group_quant_fp8(a, block_k)
 
-        assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
-        assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
-        assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
+        if torch.finfo(a.dtype).bits > 8:
+            a, scale_a = per_token_group_quant_fp8(a, block_k)
 
-        dispose_tensor(a_original)
+            assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
+            assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
+            assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
+
+            dispose_tensor(a_original)
+        else:
+            assert triton.cdiv(a.shape[-1], block_k) == scale_a.shape[-1]
+            assert triton.cdiv(b.shape[-2], block_n) == scale_b.shape[-2]
+            assert triton.cdiv(b.shape[-1], block_k) == scale_b.shape[-1]
 
     # TODO: adjust config or tune kernel
     # Reduce block size to prevent L40 shared memory overflow.

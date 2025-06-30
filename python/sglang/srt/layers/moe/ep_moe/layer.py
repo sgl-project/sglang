@@ -34,6 +34,9 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (  # Note (yiakwy) : `CompressedTensorsMoEMethod`` will be supported soon
+    CompressedTensorsConfig,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
@@ -136,7 +139,9 @@ class GroupedGemmRunner(torch.nn.Module):
                 scale_b,
                 block_shape=block_shape,
                 c_dtype=c_dtype,
-                use_per_token_if_dynamic=self.use_per_token_if_dynamic,
+                # support broadcasting if self.use_per_token_if_dynamic is True
+                use_per_token_if_dynamic=self.use_per_token_if_dynamic
+                or block_shape is not None,
             )
         return c
 
@@ -172,6 +177,9 @@ class EPMoE(torch.nn.Module):
     ):
         super().__init__()
 
+        # for debug purpose
+        self.prefix = prefix
+
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
@@ -205,6 +213,10 @@ class EPMoE(torch.nn.Module):
         self.routed_scaling_factor = routed_scaling_factor
         self.use_per_token_if_dynamic = use_per_token_if_dynamic
 
+        # NOTE(yiakwy) : record original config, later we will use CompressedEPMoEMethod to do the job,
+        # currently we just broadcasting tensor-wise scalars to adapt to deepgemm
+        self.quant_config = quant_config
+
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedEPMoEMethod()
             self.use_fp8_w8a8 = False
@@ -216,14 +228,22 @@ class EPMoE(torch.nn.Module):
                 quant_config
             )
             self.use_fp8_w8a8 = True
+
             self.use_block_quant = getattr(self.quant_method, "block_quant", False)
+
             self.block_shape = (
                 self.quant_method.quant_config.weight_block_size
                 if self.use_block_quant
                 else None
             )
             self.fp8_dtype = torch.float8_e4m3fn
-            self.activation_scheme = quant_config.activation_scheme
+            if not hasattr(quant_config, "activation_scheme"):
+                # (yiakwy) : weights static quantized, while input activation should be dynamic quantized
+                self.activation_scheme = "dynamic"
+                # (yiakwy) : will be used inside EPFp8 quantization method
+                setattr(quant_config, "activation_scheme", self.activation_scheme)
+            else:
+                self.activation_scheme = quant_config.activation_scheme
 
         self.quant_method.create_weights(
             layer=self,
@@ -501,6 +521,7 @@ class EPMoE(torch.nn.Module):
             device=hidden_states_device,
             dtype=torch.int64,
         )
+
         # GroupGemm-0
         gateup_output = self.grouped_gemm_runner(
             a=gateup_input,
@@ -842,9 +863,15 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: Fp8Config):
+    def __init__(self, quant_config: Fp8Config | CompressedTensorsConfig):
         self.quant_config = quant_config
-        self.block_quant = self.quant_config.weight_block_size is not None
+        if (
+            not hasattr(self.quant_config, "weight_block_size")
+            and self.quant_config.weight_block_size is not None
+        ):
+            self.block_quant = False
+        else:
+            self.block_quant = self.quant_config.weight_block_size is not None
 
     def create_weights(
         self,
@@ -917,6 +944,7 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                 ),
                 requires_grad=False,
             )
+
             w2_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts_per_partition,
@@ -928,6 +956,7 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
             )
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+
             assert self.quant_config.activation_scheme == "dynamic"
         else:
             # WEIGHT_SCALES
@@ -1208,19 +1237,80 @@ class DeepEPMoE(EPMoE):
                 hidden_states.device, use_flashinfer=False  # TODO: use flashinfer
             )
 
-        if self.activation_scheme == "dynamic" and not self.use_block_quant:
+        # NOTE (yiakwy) : currently we force mock block-wise scaling from tensor-wise scalars
+        if False and self.activation_scheme == "dynamic" and not self.use_block_quant:
+            # NOTE (yiakwy) : wrong input_scale shape
+            # max_value = (
+            #     torch.max(hidden_states)
+            #     .repeat(self.num_experts_per_partition)
+            #     .to(torch.float32)
+            # )
             max_value = (
                 torch.max(hidden_states)
-                .repeat(self.num_experts_per_partition)
+                .repeat(hidden_states.shape[0])
                 .to(torch.float32)
             )
             self.w13_input_scale = max_value / torch.finfo(self.fp8_dtype).max
+
         weight_indices_cur_rank = torch.arange(
             0,
             self.num_experts_per_partition,
             device=hidden_states.device,
             dtype=torch.int64,
         )
+
+        # NOTE (yiakwy) : for the moment deepgeem only supports block_scaled_gemm
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsConfig,
+        )
+
+        w13_weight_scale = (
+            self.w13_weight_scale_inv if self.use_block_quant else self.w13_weight_scale
+        )
+        w2_weight_scale = (
+            self.w2_weight_scale_inv if self.use_block_quant else self.w2_weight_scale
+        )
+        block_shape = (
+            self.block_shape if self.block_shape is not None else [128, 128]
+        )  # self.quant_method.quant_config.weight_block_size
+        if isinstance(self.quant_method.quant_config, CompressedTensorsConfig):
+            hidden_size = hidden_states.shape[1]  # 7168
+            intermediate_size = 2048
+
+            block_n, block_k = block_shape
+
+            def ceil_div(a, b):
+                return (a + b - 1) // b
+
+            batch_size = self.num_experts_per_partition
+
+            w1_scale_shard = (
+                self.w13_weight_scale[:, 0]
+                .view(batch_size, 1, 1)
+                .expand(
+                    batch_size,
+                    ceil_div(intermediate_size, block_n),
+                    ceil_div(hidden_size, block_k),
+                )
+            )
+            w3_scale_shard = (
+                self.w13_weight_scale[:, 1]
+                .view(batch_size, 1, 1)
+                .expand(
+                    batch_size,
+                    ceil_div(intermediate_size, block_n),
+                    ceil_div(hidden_size, block_k),
+                )
+            )
+
+            w13_weight_scale = torch.cat([w1_scale_shard, w3_scale_shard], dim=1)
+
+            w2_weight_scale = self.w2_weight_scale.view(batch_size, 1, 1).expand(
+                batch_size,
+                ceil_div(hidden_size, block_k),
+                ceil_div(intermediate_size, block_n),
+            )
+            pass
 
         # GroupGemm-0
         if hidden_states.shape[0] > 0:
@@ -1238,9 +1328,9 @@ class DeepEPMoE(EPMoE):
                 scale_b=(
                     self.w13_weight_scale_inv
                     if self.use_block_quant
-                    else self.w13_weight_scale
+                    else w13_weight_scale
                 ),
-                block_shape=self.block_shape,
+                block_shape=block_shape,
             )
         else:
             gateup_output = torch.empty(
@@ -1292,6 +1382,8 @@ class DeepEPMoE(EPMoE):
             dtype=hidden_states_dtype,
         )
         if down_input.shape[0] > 0:
+            # from remote_pdb import set_trace
+            # set_trace()
             down_output = self.grouped_gemm_runner(
                 a=down_input,
                 b=self.w2_weight,
@@ -1305,9 +1397,9 @@ class DeepEPMoE(EPMoE):
                 scale_b=(
                     self.w2_weight_scale_inv
                     if self.use_block_quant
-                    else self.w2_weight_scale
+                    else w2_weight_scale
                 ),
-                block_shape=self.block_shape,
+                block_shape=block_shape,
             )
         return down_output
 

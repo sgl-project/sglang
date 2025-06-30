@@ -420,7 +420,6 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         if self.use_marlin:
             return apply_fp8_marlin_linear(
                 input=x,
