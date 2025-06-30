@@ -76,7 +76,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             layer.input_scale = torch.nn.Parameter(
                 layer.input_scale.data, requires_grad=False
             )
-        prepare_fp8_layer_for_marlin(layer, strategy="channel")
+        prepare_fp8_layer_for_marlin(layer, size_k_first=True)
 
     def create_weights(
         self,
