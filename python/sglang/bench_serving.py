@@ -1678,7 +1678,6 @@ def run_benchmark(args_: argparse.Namespace):
             if args.base_url
             else f"http://{args.host}:{args.port}/generate"
         )
-        args.apply_chat_template = True
     elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
         api_url = (
             f"{args.base_url}/v1/completions"
