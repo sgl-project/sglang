@@ -1178,6 +1178,7 @@ pub(crate) async fn get_loads_helper(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::worker::WorkerFactory;
     use crate::test_utils::mock_servers::create_enhanced_mock_health_server;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
