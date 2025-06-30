@@ -122,14 +122,16 @@ __global__ void per_token_group_quant_8bit_kernel(
   scale_element_t* scale_output;
 
   if constexpr (IS_COLUMN_MAJOR) {
+    constexpr int scale_token_stride = 1;
     constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
     const int scale_hidden_size_unpacked = scale_hidden_size * num_elems_per_pack;
     const int token_idx = global_group_id / scale_hidden_size_unpacked;
     const int hidden_idx_unpacked = global_group_id % scale_hidden_size_unpacked;
     const int hidden_idx = hidden_idx_unpacked / num_elems_per_pack;
     const int pack_idx = hidden_idx_unpacked % num_elems_per_pack;
-    scale_output = reinterpret_cast<scale_element_t*>(output_s) +
-                   (hidden_idx * scale_hidden_stride * num_elems_per_pack + token_idx * num_elems_per_pack + pack_idx);
+    scale_output =
+        reinterpret_cast<scale_element_t*>(output_s) + (hidden_idx * scale_hidden_stride * num_elems_per_pack +
+                                                        token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
   } else {
     static_assert(!SCALE_UE8M0);
     scale_output = output_s + global_group_id;
@@ -250,8 +252,8 @@ void sgl_per_token_group_quant_8bit(
         static_cast<output_s_dtype*>(output_s.data_ptr()),                                    \
         group_size,                                                                           \
         groups_per_block,                                                                     \
-        scale_hidden_size,                                                                       \
-        scale_hidden_stride);                                                                        \
+        scale_hidden_size,                                                                    \
+        scale_hidden_stride);                                                                 \
   } while (0)
 
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                        \
