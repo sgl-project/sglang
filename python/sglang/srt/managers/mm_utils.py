@@ -2,12 +2,15 @@
 Multi-modality utils
 """
 
+import hashlib
 from abc import abstractmethod
 from typing import Callable, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch import nn
 
+from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -678,3 +681,52 @@ def get_multimodal_data_bounds(
     # Convert valid pairs to tensor
     valid_pairs_tensor = torch.tensor(valid_pairs, device=input_ids.device)
     return valid_pairs_tensor
+
+
+def data_hash(data) -> int:
+    hash_bytes = hashlib.sha256(data).digest()[:8]
+    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+
+
+def tensor_hash(tensor_list) -> int:
+    """
+    hash a tensor or a tensor list
+    """
+    tensor = tensor_list
+    if isinstance(tensor_list, list):
+        tensor_list = flatten_nested_list(tensor_list)
+        tensor_list = [
+            x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
+        ]
+        tensor = torch.concat(tensor_list)
+    if tensor.is_cuda:
+        return gpu_tensor_hash(tensor)
+    tensor = tensor.detach().contiguous()
+
+    if tensor.dtype == torch.bfloat16:
+        # memoryview() doesn't support PyTorch's BFloat16 dtype
+        tensor = tensor.float()
+
+    assert isinstance(tensor, torch.Tensor)
+    if tensor.is_cuda:
+        # TODO: improve this
+        tensor_cpu = tensor.cpu()
+    else:
+        tensor_cpu = tensor
+
+    mv = memoryview(tensor_cpu.numpy())
+    return data_hash(mv.tobytes())
+
+
+def hash_feature(f):
+    if isinstance(f, list):
+        if isinstance(f[0], torch.Tensor):
+            return tensor_hash(f)
+        return data_hash(tuple(flatten_nested_list(f)))
+    elif isinstance(f, np.ndarray):
+        arr = np.ascontiguousarray(f)
+        arr_bytes = arr.tobytes()
+        return data_hash(arr_bytes)
+    elif isinstance(f, torch.Tensor):
+        return tensor_hash([f])
+    return data_hash(f)
