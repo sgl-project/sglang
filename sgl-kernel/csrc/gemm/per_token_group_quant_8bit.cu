@@ -333,8 +333,7 @@ __global__ void per_token_group_quant_8bit_kernel(
             uint32_t inputx2 = *reinterpret_cast<uint32_t>(input_primary_vec + j);
             uint32_t scaledx2 = inputx2 + adder_for_scaling;
             __nv_bfloat162 scaledx2_bf162 = *reinterpret_cast<__nv_bfloat162*>(scaledx2);
-            // TODO use vectorization
-            float2 scaled_floatx2 = __bfloat1622float2(scaledx2_bf162);
+            float2 outputx2 = __bfloat1622float2(scaledx2_bf162);
             output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
           }
         } else {
