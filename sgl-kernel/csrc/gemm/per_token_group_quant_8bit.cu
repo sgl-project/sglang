@@ -93,8 +93,8 @@ struct DtypeInfo<c10::Float8_e4m3fn> {
 };
 
 int compute_input_group_start_offset<bool FUSE_SILU_AND_MUL>(
-    int token_idx, int hidden_dim_group_idx, int hidden_dim_num_groups, int group_size) {
-  return token_idx * hidden_dim_num_groups * group_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
+    int expert_idx, int token_idx, int hidden_dim_group_idx, int hidden_dim_num_groups, int group_size) {
+  return expert_idx * TODO + token_idx * hidden_dim_num_groups * group_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
          hidden_dim_group_idx * group_size;
 }
 
@@ -117,6 +117,8 @@ struct NaiveScheduler {
   template <bool FUSE_SILU_AND_MUL, typename FUNC>
   __device__ __forceinline__ static void
   execute(int subwarps_per_block, int hidden_dim_num_groups, int group_size, FUNC fn) {
+    constexpr int expert_idx = 0;
+
     const int local_group_id = threadIdx.x / THREADS_PER_SUBWARP;
     const int lane_id = threadIdx.x % THREADS_PER_SUBWARP;
     const int block_group_id = blockIdx.x * subwarps_per_block;
@@ -133,10 +135,10 @@ struct NaiveScheduler {
 
     if constexpr (FUSE_SILU_AND_MUL) {
       input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
-          token_idx, hidden_dim_group_idx, hidden_dim_num_groups, group_size);
+          expert_idx, token_idx, hidden_dim_group_idx, hidden_dim_num_groups, group_size);
     }
 
-    fn(token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
+    fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
   }
 };
 
@@ -158,19 +160,19 @@ struct MaskedLayoutScheduler {
   template <bool FUSE_SILU_AND_MUL, typename FUNC>
   __device__ __forceinline__ static void
   execute(int subwarps_per_block, int hidden_dim_num_groups, int group_size, const int32_t* masked_m, FUNC fn) {
-    const int expert_id = blockIdx.z;
+    const int expert_idx = blockIdx.z;
     const int token_idx_start = blockIdx.y;
     const int hidden_dim_block_index = blockIdx.x;
 
     const int hidden_dim_group_idx = TODO;
 
-    const int curr_expert_token_num = masked_m[expert_id];
+    const int curr_expert_token_num = masked_m[expert_idx];
 
     for (int token_idx = token_idx_start; token_idx < curr_expert_token_num;
          token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
       const int input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
-          token_idx, hidden_dim_group_idx, hidden_dim_num_groups, group_size);
-      fn(token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
+          expert_idx, token_idx, hidden_dim_group_idx, hidden_dim_num_groups, group_size);
+      fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
     }
   }
 };
@@ -201,7 +203,7 @@ __global__ void per_token_group_quant_8bit_kernel(
       subwarps_per_block,
       hidden_dim_num_groups,
       group_size,
-      [&](int token_idx, int hidden_dim_group_idx, int lane_id, int input_group_start_offset) {
+      [&](int expert_idx, int token_idx, int hidden_dim_group_idx, int lane_id, int input_group_start_offset) {
         constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
         constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
