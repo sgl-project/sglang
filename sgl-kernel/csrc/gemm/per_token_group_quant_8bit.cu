@@ -132,8 +132,20 @@ __global__ void per_token_group_quant_8bit_kernel(
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
   SCHEDULER::execute(subwarps_per_block, [&](int group_id, int lane_id) {
-    scale_element_t* scale_output;
+    constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
+    constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
+    int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
+    T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
+    static_assert(sizeof(input_primary_vec[0]) * INPUT_PRIMARY_VEC_SIZE == sizeof(input_primary_int4));
+
+#pragma unroll
+    for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
+      input_primary_int4[j] = ld_global_nc(
+          reinterpret_cast<const int4*>(input + group_id * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
+    }
+
+    scale_element_t* scale_output;
     if constexpr (IS_COLUMN_MAJOR) {
       constexpr int scale_token_stride = 1;
       constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
@@ -149,19 +161,6 @@ __global__ void per_token_group_quant_8bit_kernel(
     } else {
       static_assert(!SCALE_UE8M0);
       scale_output = output_s + group_id;
-    }
-
-    constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
-    constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
-
-    int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
-    T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
-    static_assert(sizeof(input_primary_vec[0]) * INPUT_PRIMARY_VEC_SIZE == sizeof(input_primary_int4));
-
-#pragma unroll
-    for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
-      input_primary_int4[j] = ld_global_nc(
-          reinterpret_cast<const int4*>(input + group_id * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
     }
 
     float local_absmax = LOCAL_ABSMAX_ABS;
