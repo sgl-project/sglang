@@ -20,7 +20,7 @@ import torch
 import torch.distributed
 from torch.distributed import P2POp
 
-from sglang.srt.managers.expert_location import (
+from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
 )
@@ -28,6 +28,9 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+
+
+_LOG_INPUT = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT")
 
 
 class ExpertLocationUpdater:
@@ -174,6 +177,19 @@ def update_expert_weights_single_layer(
     ), f"{num_local_physical_experts=} {[x.shape for x in routed_experts_weights]=}"
     assert isinstance(old_physical_to_logical_map, list)
     assert isinstance(new_physical_to_logical_map, list)
+
+    if _LOG_INPUT:
+        logger.info(
+            "update_expert_weights_single_layer "
+            f"{[x.shape for x in routed_experts_weights]=} "
+            f"{[x.shape for x in temp_buffers]=} "
+            f"{old_physical_to_logical_map=} "
+            f"{new_physical_to_logical_map=} "
+            f"{num_local_physical_experts=} "
+            f"{num_gpu_per_node=} "
+            f"{rank=} "
+            f"{world_size=} "
+        )
 
     output_logs = [] if debug else None
 

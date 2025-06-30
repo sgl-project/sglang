@@ -3,7 +3,6 @@ import importlib
 import inspect
 import logging
 import pkgutil
-from functools import lru_cache
 
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.server_args import ServerArgs
@@ -25,7 +24,6 @@ def get_dummy_processor():
     return DummyMultimodalProcessor()
 
 
-@lru_cache()
 def import_processors():
     package_name = "sglang.srt.multimodal.processors"
     package = importlib.import_module(package_name)
