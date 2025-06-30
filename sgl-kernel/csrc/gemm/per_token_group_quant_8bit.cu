@@ -153,14 +153,14 @@ __global__ void per_token_group_quant_8bit_kernel(
 
       // TODO unify w/ other places?
       const int scale_hidden_size_unpacked = scale_hidden_size * num_elems_per_pack;
-      const int group_start_token_idx = group_id / scale_hidden_size_unpacked;
+      const int token_idx = group_id / scale_hidden_size_unpacked;
       const int group_start_hidden_idx = group_id % scale_hidden_size_unpacked;
 
       const int hidden_idx_packed = group_start_hidden_idx / num_elems_per_pack;
       const int pack_idx = group_start_hidden_idx % num_elems_per_pack;
       scale_output = reinterpret_cast<scale_element_t*>(output_s) +
                      (hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
-                      group_start_token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
+                      token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
     } else {
       static_assert(!SCALE_UE8M0);
       scale_output = output_s + group_id;
