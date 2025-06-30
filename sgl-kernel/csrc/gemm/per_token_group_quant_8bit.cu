@@ -114,7 +114,7 @@ struct NaiveScheduler {
     const int hidden_dim_group_idx = group_id % hidden_size_num_groups;
 
     int input_group_start_offset;
-    if (FUSE_SILU_AND_MUL) {
+    if constexpr (FUSE_SILU_AND_MUL) {
       input_group_start_offset = token_idx * hidden_size_num_groups * group_size * 2 + hidden_dim_group_idx * group_size;
     } else {
       input_group_start_offset = group_id * group_size;
