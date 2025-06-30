@@ -218,7 +218,7 @@ class LinearBase(torch.nn.Module):
     ):
         super().__init__()
 
-        # Debug context
+        # for debug prupose
         self.prefix = prefix
 
         # Keep input parameters

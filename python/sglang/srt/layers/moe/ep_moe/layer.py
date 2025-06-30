@@ -34,6 +34,9 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (  # Note (yiakwy) : `CompressedTensorsMoEMethod`` will be supported soon
+    CompressedTensorsConfig,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
@@ -174,7 +177,7 @@ class EPMoE(torch.nn.Module):
     ):
         super().__init__()
 
-        # for debug prupose
+        # for debug purpose
         self.prefix = prefix
 
         if params_dtype is None:
@@ -860,9 +863,12 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
         quant_config: The quantization config.
     """
 
-    def __init__(self, quant_config: Fp8Config):
+    def __init__(self, quant_config: Fp8Config | CompressedTensorsConfig):
         self.quant_config = quant_config
-        if not hasattr(self.quant_config, "weight_block_size"):
+        if (
+            not hasattr(self.quant_config, "weight_block_size")
+            and self.quant_config.weight_block_size is not None
+        ):
             self.block_quant = False
         else:
             self.block_quant = self.quant_config.weight_block_size is not None

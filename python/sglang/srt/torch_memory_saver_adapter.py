@@ -11,7 +11,13 @@ try:
     import_error = None
 except ImportError as e:
     import_error = e
-    pass
+except AttributeError as e:
+    # NOTE (yiakwy) : the lib torch_memory_saver is not properly tracked
+    if hasattr(torch_memory_saver, "TorchMemorySaver"):
+        _memory_saver = torch_memory_saver.TorchMemorySaver
+        import_error = None
+    else:
+        raise e
 
 logger = logging.getLogger(__name__)
 
