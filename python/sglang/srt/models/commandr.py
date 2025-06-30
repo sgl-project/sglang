@@ -65,10 +65,15 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, get_compiler_backend, set_weight_attrs
+from sglang.srt.utils import (
+    add_prefix,
+    get_compiler_backend,
+    is_torch_compile_enabled,
+    set_weight_attrs,
+)
 
 
-@torch.compile(backend=get_compiler_backend())
+@torch.compile(backend=get_compiler_backend(), disable=not is_torch_compile_enabled())
 def layer_norm_func(hidden_states, weight, variance_epsilon):
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.to(torch.float32)

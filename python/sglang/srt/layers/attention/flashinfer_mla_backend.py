@@ -16,12 +16,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 
-if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
-    import logging
-
-    torch._logging.set_logs(dynamo=logging.ERROR)
-    torch._dynamo.config.suppress_errors = True
-
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -32,7 +26,17 @@ from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import is_flashinfer_available, next_power_of_2
+from sglang.srt.utils import (
+    is_flashinfer_available,
+    is_torch_compile_enabled,
+    next_power_of_2,
+)
+
+if is_torch_compile_enabled():
+    import logging
+
+    torch._logging.set_logs(dynamo=logging.ERROR)
+    torch._dynamo.config.suppress_errors = True
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

@@ -32,6 +32,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_torch_compile_enabled,
 )
 
 _is_hip = is_hip()
@@ -525,7 +526,7 @@ def apply_fp8_linear(
     # We also don't pad when using torch.compile,
     # as it breaks with dynamic shapes.
     if pad_output is None:
-        pad_output = not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
+        pad_output = not is_torch_compile_enabled()
     output_padding = 17 if pad_output else None
 
     # View input as 2D matrix for fp8 methods

@@ -48,6 +48,7 @@ from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
     is_cuda,
+    is_torch_compile_enabled,
     next_power_of_2,
 )
 
@@ -914,7 +915,7 @@ def load_token_map(token_map_path: str) -> List[int]:
     return torch.tensor(hot_token_id, dtype=torch.int64)
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=not is_torch_compile_enabled())
 def get_last_loc_large_page_size_top_k_1(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -931,7 +932,7 @@ def get_last_loc_large_page_size_top_k_1(
     return prefix_lens, seq_lens, last_loc
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=not is_torch_compile_enabled())
 def get_last_loc_large_page_size_large_top_k(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,

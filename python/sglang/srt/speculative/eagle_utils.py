@@ -23,7 +23,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_torch_compile_enabled, next_power_of_2
 
 logger = logging.getLogger(__name__)
 
@@ -964,7 +964,7 @@ def get_target_cache_loc(
     )
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=not is_torch_compile_enabled())
 def get_src_tgt_cache_loc(
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,
@@ -1014,7 +1014,7 @@ def filter_finished_cache_loc_kernel(
     )
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=not is_torch_compile_enabled())
 def create_accept_length_filter(
     accept_length: torch.Tensor,
     unfinished_index_device: torch.Tensor,
@@ -1028,7 +1028,7 @@ def create_accept_length_filter(
     return accept_length_filter
 
 
-@torch.compile(dynamic=True)
+@torch.compile(dynamic=True, disable=not is_torch_compile_enabled())
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,

@@ -45,6 +45,7 @@ from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
     get_device_memory_capacity,
+    is_torch_compile_enabled,
     rank0_log,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -181,7 +182,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
-        if server_args.enable_torch_compile
+        if is_torch_compile_enabled()
         else []
     )
     return capture_bs, compile_bs
@@ -208,7 +209,6 @@ class CudaGraphRunner:
         self.model_runner = model_runner
         self.graphs = {}
         self.output_buffers = {}
-        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
@@ -261,7 +261,7 @@ class CudaGraphRunner:
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
 
-        if self.enable_torch_compile:
+        if is_torch_compile_enabled():
             set_torch_compile_config()
 
         if self.model_runner.server_args.lora_paths is not None:

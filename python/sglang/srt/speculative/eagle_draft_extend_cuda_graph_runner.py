@@ -22,6 +22,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, fast_topk
 from sglang.srt.utils import (
+    is_torch_compile_enabled,
     require_attn_tp_gather,
     require_gathered_buffer,
     require_mlp_sync,
@@ -39,7 +40,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.model_runner = model_runner = eagle_worker.model_runner
         self.graphs = {}
         self.output_buffers = {}
-        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
@@ -70,7 +70,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
 
-        if self.enable_torch_compile:
+        if is_torch_compile_enabled():
             set_torch_compile_config()
 
         # Graph inputs

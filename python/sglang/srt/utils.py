@@ -183,6 +183,10 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
+def is_torch_compile_enabled() -> bool:
+    return get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
+
+
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
     "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
 )

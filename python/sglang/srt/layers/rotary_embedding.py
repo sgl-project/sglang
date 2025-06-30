@@ -15,6 +15,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_torch_compile_enabled,
 )
 
 _is_cuda = is_cuda()
@@ -175,7 +176,7 @@ class RotaryEmbedding(CustomOp):
         """A PyTorch-npu implementation of forward()."""
         import os
 
-        if get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
+        if is_torch_compile_enabled():
             return self.forward_native(positions, query, key, offsets)
         else:
             rotary_mode = "half"

@@ -35,13 +35,19 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import DynamicGradMode, get_compiler_backend
+from sglang.srt.utils import (
+    DynamicGradMode,
+    get_compiler_backend,
+    is_torch_compile_enabled,
+)
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(
+    dynamic=True, backend=get_compiler_backend(), disable=not is_torch_compile_enabled()
+)
 def resolve_future_token_ids(input_ids, future_token_ids_map):
     input_ids[:] = torch.where(
         input_ids < 0,

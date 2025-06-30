@@ -32,6 +32,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_torch_compile_enabled,
     next_power_of_2,
 )
 
@@ -1486,7 +1487,7 @@ def moe_sum_reduce_triton(
     return
 
 
-@torch.compile
+@torch.compile(disable=not is_torch_compile_enabled())
 def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
     torch.sum(x, dim=1, out=out)
     out.mul_(routed_scaling_factor)
