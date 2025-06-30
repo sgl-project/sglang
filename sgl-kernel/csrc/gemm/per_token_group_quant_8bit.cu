@@ -240,7 +240,7 @@ void sgl_per_token_group_quant_8bit(
     double eps,
     double min_8bit,
     double max_8bit,
-    bool scale_ue8m0 = false) {
+    bool scale_ue8m0) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
   TORCH_CHECK((output_s.dim() == 2) or (output_s.dim() == 3));
@@ -308,27 +308,4 @@ void sgl_per_token_group_quant_8bit(
 
 #undef LAUNCH_KERNEL
 #undef LAUNCH_KERNEL_INNER
-}
-
-void sgl_per_token_group_quant_int8(
-    torch::Tensor input,
-    torch::Tensor output_q,
-    torch::Tensor output_s,
-    int64_t group_size,
-    double eps,
-    double int8_min,
-    double int8_max) {
-  sgl_per_token_group_quant_8bit(input, output_q, output_s, group_size, eps, int8_min, int8_max);
-}
-
-void sgl_per_token_group_quant_fp8(
-    torch::Tensor input,
-    torch::Tensor output_q,
-    torch::Tensor output_s,
-    int64_t group_size,
-    double eps,
-    double fp8_min,
-    double fp8_max,
-    bool scale_ue8m0) {
-  sgl_per_token_group_quant_8bit(input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0);
 }
