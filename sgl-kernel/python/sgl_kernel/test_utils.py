@@ -23,7 +23,9 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
 
         masked_data_generation_mode = flags.get("masked_data_generation_mode", "default")
         if masked_data_generation_mode == "default":
-            masked_m = TODO
+            num_tokens_per_expert, remainder = divmod(num_tokens, num_local_experts)
+            assert remainder == 0
+            masked_m = torch.full((num_local_experts, ), num_tokens_per_expert, device='cuda', dtype=torch.int)
         elif masked_data_generation_mode == "imbalanced":
             masked_m = TODO
         else:
