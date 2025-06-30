@@ -12,7 +12,7 @@ def create_per_token_group_quant_test_data(
         effective_hidden_dim = hidden_dim
     del hidden_dim
 
-    if TODO:
+    if flags["masked_layout"]:
         return TODO
     else:
         return torch.randn(num_tokens, effective_hidden_dim, device=device, dtype=dtype)
