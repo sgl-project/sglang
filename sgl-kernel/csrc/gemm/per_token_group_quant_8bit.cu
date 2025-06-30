@@ -97,17 +97,20 @@ constexpr int THREADS_PER_SUBWARP = 8;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 
 struct NaiveScheduler {
-  static void compute_exec_config(int num_groups, int subwarps_per_block, dim3& grid, dim3& block) {
-    const int num_blocks = num_groups / subwarps_per_block;
-    const int num_threads = subwarps_per_block * THREADS_PER_SUBWARP;
-
-    grid = dim3(num_blocks);
-    block = dim3(num_threads);
+  static void compute_exec_config(
+      int num_local_experts,
+      int hidden_dim_num_groups,
+      int num_groups,
+      int subwarps_per_block,
+      dim3& grid,
+      dim3& block) {
+    grid = dim3(num_groups / subwarps_per_block);
+    block = dim3(subwarps_per_block * THREADS_PER_SUBWARP);
   }
 
   template <bool FUSE_SILU_AND_MUL, typename FUNC>
   __device__ __forceinline__ static void
-  execute(int subwarps_per_block, int hidden_size_num_groups, int group_size, FUNC fn) {
+  execute(int subwarps_per_block, int hidden_dim_num_groups, int group_size, FUNC fn) {
     const int local_group_id = threadIdx.x / THREADS_PER_SUBWARP;
     const int lane_id = threadIdx.x % THREADS_PER_SUBWARP;
     const int block_group_id = blockIdx.x * subwarps_per_block;
@@ -118,13 +121,12 @@ struct NaiveScheduler {
       input_group_start_offset = group_id * group_size;
     }
 
-    const int token_idx = group_id / hidden_size_num_groups;
+    const int token_idx = group_id / hidden_dim_num_groups;
     // At hidden_size dim, we are handling idx-th group
-    const int hidden_dim_group_idx = group_id % hidden_size_num_groups;
+    const int hidden_dim_group_idx = group_id % hidden_dim_num_groups;
 
     if constexpr (FUSE_SILU_AND_MUL) {
-      input_group_start_offset =
-          token_idx * hidden_size_num_groups * group_size * 2 + hidden_dim_group_idx * group_size;
+      input_group_start_offset = token_idx * hidden_dim_num_groups * group_size * 2 + hidden_dim_group_idx * group_size;
     }
 
     fn(token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
@@ -132,14 +134,22 @@ struct NaiveScheduler {
 };
 
 struct MaskedLayoutScheduler {
-  static void compute_exec_config(int num_groups, int subwarps_per_block, dim3& grid, dim3& block) {
-    grid = TODO;
-    block = TODO;
+  static void compute_exec_config(
+      int num_local_experts,
+      int hidden_dim_num_groups,
+      int num_groups,
+      int subwarps_per_block,
+      dim3& grid,
+      dim3& block) {
+    constexpr int BLOCK_NUM_PER_EXPERT = 32;
+
+    grid = dim3(hidden_dim_num_groups, BLOCK_NUM_PER_EXPERT, num_local_experts);
+    block = dim3(subwarps_per_block * THREADS_PER_SUBWARP);
   }
 
   template <bool FUSE_SILU_AND_MUL, typename FUNC>
   __device__ __forceinline__ static void
-  execute(int subwarps_per_block, int hidden_size_num_groups, int group_size, FUNC fn) {
+  execute(int subwarps_per_block, int hidden_dim_num_groups, int group_size, FUNC fn) {
     TODO;
     fn(token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
   }
@@ -161,7 +171,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int32_t* __restrict__ masked_m,
     const int group_size,
     const int subwarps_per_block,
-    const int hidden_size_num_groups,
+    const int hidden_dim_num_groups,
     const int scale_hidden_stride) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
@@ -169,13 +179,13 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   SCHEDULER::execute<FUSE_SILU_AND_MUL>(
       subwarps_per_block,
-      hidden_size_num_groups,
+      hidden_dim_num_groups,
       group_size,
       [&](int token_idx, int hidden_dim_group_idx, int lane_id, int input_group_start_offset) {
         constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
         constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
-        const int offset_num_groups = token_idx * hidden_size_num_groups + hidden_dim_group_idx;
+        const int offset_num_groups = token_idx * hidden_dim_num_groups + hidden_dim_group_idx;
 
         int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
         T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
@@ -192,7 +202,7 @@ __global__ void per_token_group_quant_8bit_kernel(
         }
         if constexpr (FUSE_SILU_AND_MUL) {
 #pragma unroll
-          const int secondary_offset = hidden_size_num_groups * group_size;
+          const int secondary_offset = hidden_dim_num_groups * group_size;
           for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
             input_secondary_int4[j] = ld_global_nc(
                 reinterpret_cast<const int4*>(
@@ -304,7 +314,6 @@ void sgl_per_token_group_quant_8bit(
     const std::optional<torch::Tensor>& masked_m) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
-  TORCH_CHECK((output_s.dim() == 2) or (output_s.dim() == 3));
 
   TORCH_CHECK(std::abs(LOCAL_ABSMAX_ABS - eps) < 1e-13);
 
@@ -312,6 +321,9 @@ void sgl_per_token_group_quant_8bit(
   const int num_groups = input.numel() / group_size / (fuse_silu_and_mul ? 2 : 1);
 
   const bool masked_layout = masked_m.has_value();
+  TORCH_CHECK(output_s.dim() == (masked_layout ? 3 : 2));
+
+  const int num_local_experts = masked_layout ? input.size(0) : 1;
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -320,13 +332,14 @@ void sgl_per_token_group_quant_8bit(
   auto dst_type = output_q.scalar_type();
 
   const bool is_column_major = output_s.stride(-2) < output_s.stride(-1);
-  const int hidden_size_num_groups = output_q.size(-1) / group_size / (fuse_silu_and_mul ? 2 : 1);
+  const int hidden_dim_num_groups = output_q.size(-1) / group_size / (fuse_silu_and_mul ? 2 : 1);
   const int scale_hidden_stride = output_s.stride(-1);
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, T, DST_DTYPE, output_s_dtype, ...)                                \
   do {                                                                                                   \
     dim3 grid, block;                                                                                    \
-    SCHEDULER::compute_exec_config(num_groups, subwarps_per_block, grid, block);                         \
+    SCHEDULER::compute_exec_config(                                                                      \
+        num_local_experts, hidden_dim_num_groups, num_groups, subwarps_per_block, grid, block);          \
                                                                                                          \
     per_token_group_quant_8bit_kernel<SCHEDULER, T, DST_DTYPE, __VA_ARGS__><<<grid, block, 0, stream>>>( \
         static_cast<T*>(input.data_ptr()),                                                               \
@@ -335,35 +348,35 @@ void sgl_per_token_group_quant_8bit(
         static_cast<int32_t*>(masked_m.has_value() ? masked_m->data_ptr() : 0),                          \
         group_size,                                                                                      \
         subwarps_per_block,                                                                              \
-        hidden_size_num_groups,                                                                          \
+        hidden_dim_num_groups,                                                                           \
         scale_hidden_stride);                                                                            \
   } while (0)
 
-#define LAUNCH_KERNEL(T, DST_DTYPE)                                                              \
-  do {                                                                                           \
-    TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));     \
-                                                                                                 \
-    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                 \
-    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                     \
-    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                                                     \
-                                                                                                 \
-    if (is_column_major) {                                                                       \
-      if (scale_ue8m0) {                                                                         \
-        if (fuse_silu_and_mul) {                                                                 \
-          if (masked_layout) {                                                                   \
+#define LAUNCH_KERNEL(T, DST_DTYPE)                                                                     \
+  do {                                                                                                  \
+    TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));            \
+                                                                                                        \
+    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                        \
+    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                            \
+    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                                                            \
+                                                                                                        \
+    if (is_column_major) {                                                                              \
+      if (scale_ue8m0) {                                                                                \
+        if (fuse_silu_and_mul) {                                                                        \
+          if (masked_layout) {                                                                          \
             LAUNCH_KERNEL_INNER(MaskedLayoutScheduler, T, DST_DTYPE, uint32_t, true, true, true, true); \
-          } else {                                                                               \
-            LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true, true);       \
-          }                                                                                      \
-        } else {                                                                                 \
-          LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true);               \
-        }                                                                                        \
-      } else {                                                                                   \
-        LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, true);                          \
-      }                                                                                          \
-    } else {                                                                                     \
-      LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, false);                           \
-    }                                                                                            \
+          } else {                                                                                      \
+            LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true, true);              \
+          }                                                                                             \
+        } else {                                                                                        \
+          LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true);                      \
+        }                                                                                               \
+      } else {                                                                                          \
+        LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, true);                                 \
+      }                                                                                                 \
+    } else {                                                                                            \
+      LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, false);                                  \
+    }                                                                                                   \
   } while (0)
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), scalar_t, [&] {
