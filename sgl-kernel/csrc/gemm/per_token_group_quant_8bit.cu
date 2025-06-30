@@ -382,7 +382,7 @@ void sgl_per_token_group_quant_8bit(
   auto dst_type = output_q.scalar_type();
 
   const bool is_column_major = output_s.stride(-2) < output_s.stride(-1);
-  const int hidden_dim_num_groups = static_cast<int>(output_q.size(-1)) / group_size / (fuse_silu_and_mul ? 2 : 1);
+  const int hidden_dim_num_groups = static_cast<int>(output_q.size(-1)) / group_size;
   const int num_tokens_per_expert = static_cast<int>(output_q.size(-2));
   const int scale_expert_stride = masked_layout ? static_cast<int>(output_s.stride(0)) : 0;
   const int scale_hidden_stride = static_cast<int>(output_s.stride(-1));
