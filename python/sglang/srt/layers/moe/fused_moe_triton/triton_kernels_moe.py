@@ -84,9 +84,6 @@ def triton_kernel_fused_experts(
     assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
     assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
 
-    w1 = w1.transpose(-2, -1).contiguous()
-    w2 = w2.transpose(-2, -1).contiguous()
-
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
     assert (

@@ -112,6 +112,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         w13_weight_raw = torch.empty(
             num_experts, 2 * intermediate_size, hidden_size, dtype=params_dtype
         )
+        if self.use_triton_kernels:
+            w13_weight_raw = w13_weight_raw.transpose(-2, -1).contiguous()
         w13_weight = torch.nn.Parameter(w13_weight_raw, requires_grad=False)
 
         layer.register_parameter("w13_weight", w13_weight)
@@ -121,6 +123,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         w2_weight_raw = torch.empty(
             num_experts, hidden_size, intermediate_size, dtype=params_dtype
         )
+        if self.use_triton_kernels:
+            w2_weight_raw = w2_weight_raw.transpose(-2, -1).contiguous()
         w2_weight = torch.nn.Parameter(w2_weight_raw, requires_grad=False)
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
@@ -622,6 +626,8 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not self.use_presharded_weights:
+                if self.use_triton_kernels:
+                    loaded_weight = loaded_weight.transpose(-2, -1).contiguous()
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )
@@ -655,6 +661,8 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not self.use_presharded_weights:
+                if self.use_triton_kernels:
+                    loaded_weight = loaded_weight.transpose(-2, -1).contiguous()
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )
@@ -741,6 +749,8 @@ class FusedMoE(torch.nn.Module):
         # should be whatever dimension intermediate_size is
         is_transposed = getattr(param, "is_transposed", False)
         shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
+        if self.use_triton_kernels:
+            is_transposed = True
         if is_transposed:
             shard_dim = int(not shard_dim)
 
