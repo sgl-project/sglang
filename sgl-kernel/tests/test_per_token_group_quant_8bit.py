@@ -25,9 +25,7 @@ configs = list(
         # TODO support group size != 128
         # [8, 16, 32, 64, 128],  # group_size
         [128],  # group_size
-        # TODO
-        # [fp8_type_, torch.int8],  # dtype
-        [fp8_type_],  # dtype
+        [fp8_type_, torch.int8],  # dtype
         [
             dict(
                 column_major_scales=False,

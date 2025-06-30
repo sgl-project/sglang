@@ -46,9 +46,7 @@ else:
             [1, 4, 16, 64, 256, 768, 2048, 8192, 16384],
             [1536, 7168, 16384],
             [128],
-            # TODO
-            # [fp8_type_, torch.int8],
-            [fp8_type_],
+            [fp8_type_, torch.int8],
             [
                 dict(
                     column_major_scales=False,
