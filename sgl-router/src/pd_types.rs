@@ -3,6 +3,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::core::{Worker, WorkerType};
+use std::sync::Arc;
+
 // Custom error type for PD router operations
 #[derive(Debug, thiserror::Error)]
 pub enum PDRouterError {
@@ -26,6 +29,9 @@ pub enum PDRouterError {
 
     #[error("Timeout waiting for worker: {url}")]
     Timeout { url: String },
+
+    #[error("Invalid worker type: {url} {worker_type}")]
+    InvalidWorkerType { url: String, worker_type: String },
 }
 
 #[derive(Debug, Clone)]
@@ -112,12 +118,17 @@ pub trait Bootstrap: Send + Sync {
         bootstrap_room: BootstrapRoom,
     );
 
-    fn add_bootstrap_info(&mut self, prefill_info: &EngineInfo) -> Result<(), String> {
+    fn add_bootstrap_info(&mut self, prefill_info: &Arc<dyn Worker>) -> Result<(), String> {
         let batch_size = self.get_batch_size()?;
+        let bootstrap_port = match prefill_info.worker_type() {
+            WorkerType::Prefill(port) => port,
+            _ => return Err(format!("Invalid worker type: {}", prefill_info.worker_type())),
+        };
+        let bootstrap_host = crate::utils::hostname(prefill_info.url());
         if let Some(batch_size) = batch_size {
             self.set_bootstrap_info(
-                BootstrapHost::Batch(vec![prefill_info.get_hostname(); batch_size]),
-                BootstrapPort::Batch(vec![prefill_info.bootstrap_port; batch_size]),
+                BootstrapHost::Batch(vec![bootstrap_host; batch_size]),
+                BootstrapPort::Batch(vec![bootstrap_port; batch_size]),
                 // Use high-quality random numbers to minimize collision risk
                 BootstrapRoom::Batch(
                     (0..batch_size)
@@ -132,8 +143,8 @@ pub trait Bootstrap: Send + Sync {
             );
         } else {
             self.set_bootstrap_info(
-                BootstrapHost::Single(prefill_info.get_hostname()),
-                BootstrapPort::Single(prefill_info.bootstrap_port),
+                BootstrapHost::Single(bootstrap_host),
+                BootstrapPort::Single(bootstrap_port),
                 BootstrapRoom::Single({
                     // Use high-quality random number for single requests too
                     let r1 = rand::random::<u64>();
