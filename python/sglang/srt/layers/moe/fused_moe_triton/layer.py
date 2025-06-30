@@ -425,6 +425,7 @@ class FusedMoE(torch.nn.Module):
         self.reduce_results = reduce_results
         self.renormalize = renormalize
         self.use_grouped_topk = use_grouped_topk
+        self.hidden_size = hidden_size
         if self.use_grouped_topk:
             assert num_expert_group is not None and topk_group is not None
         self.num_expert_group = num_expert_group
@@ -457,6 +458,7 @@ class FusedMoE(torch.nn.Module):
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
+            intermediate_size_full=intermediate_size,
         )
 
     def _load_per_tensor_weight_scale(
@@ -633,7 +635,10 @@ class FusedMoE(torch.nn.Module):
             loaded_weight.t().contiguous()
             if (
                 self.quant_method.__class__.__name__
-                == "CompressedTensorsWNA16MoEMethod"
+                in [
+                    "CompressedTensorsWNA16MarlinMoEMethod",
+                    "CompressedTensorsWNA16MoEMethod",
+                ]
             )
             else loaded_weight
         )

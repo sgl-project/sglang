@@ -29,6 +29,7 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     silu_and_mul,
 )
+from sgl_kernel.fused_moe import fused_marlin_moe
 from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
@@ -54,6 +55,11 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
+)
+from sgl_kernel.marlin import (
+    awq_marlin_moe_repack,
+    awq_marlin_repack,
+    gptq_marlin_repack,
 )
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,

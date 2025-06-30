@@ -27,6 +27,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.compressed_tensors import WNA16_SUPPORTED_BITS
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
     CompressedTensorsMoEMethod,
 )
@@ -47,7 +48,6 @@ try:
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
-
 logger = logging.getLogger(__name__)
 
 __all__ = ["CompressedTensorsLinearMethod"]
@@ -134,7 +134,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            return CompressedTensorsMoEMethod.get_moe_method(self)
+            return CompressedTensorsMoEMethod.get_moe_method(self, layer)
         return None
 
     @classmethod
@@ -365,6 +365,11 @@ class CompressedTensorsConfig(QuantizationConfig):
                 raise ImportError(
                     "vllm is not installed, to use CompressedTensorsW4A16Sparse24 and CompressedTensorsWNA16, please install vllm"
                 )
+            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsW4A16Sparse24,
+                CompressedTensorsWNA16,
+            )
+
             if (
                 self.quant_format == CompressionFormat.marlin_24.value
                 and weight_quant.num_bits in W4A16SPARSE24_SUPPORTED_BITS
