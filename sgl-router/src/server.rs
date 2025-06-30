@@ -1,3 +1,4 @@
+use crate::core::WorkerFactory;
 use crate::logging::{self, LoggingConfig};
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::prometheus::{self, PrometheusConfig};
@@ -228,7 +229,9 @@ async fn add_worker(
         }
     };
 
-    match data.router.add_worker(&worker_url).await {
+    let worker = WorkerFactory::create_regular(worker_url.clone());
+
+    match data.router.add_worker(worker).await {
         Ok(message) => HttpResponse::Ok().body(message),
         Err(error) => HttpResponse::BadRequest().body(error),
     }
@@ -236,9 +239,13 @@ async fn add_worker(
 
 #[get("/list_workers")]
 async fn list_workers(data: web::Data<AppState>) -> impl Responder {
-    let workers = data.router.get_worker_urls();
+    let workers = data.router.get_workers();
     let worker_list = workers.read().unwrap().clone();
-    HttpResponse::Ok().json(serde_json::json!({ "urls": worker_list }))
+    let worker_url_list = worker_list
+        .iter()
+        .map(|w| w.url().to_string())
+        .collect::<Vec<String>>();
+    HttpResponse::Ok().json(serde_json::json!({ "urls": worker_url_list }))
 }
 
 #[post("/remove_worker")]
@@ -250,7 +257,7 @@ async fn remove_worker(
         Some(url) => url.to_string(),
         None => return HttpResponse::BadRequest().finish(),
     };
-    data.router.remove_worker(&worker_url);
+    data.router.remove_worker_by_url(&worker_url);
     HttpResponse::Ok().body(format!("Successfully removed worker: {}", worker_url))
 }
 
@@ -375,7 +382,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     info!("✅ Serving router on {}:{}", config.host, config.port);
     info!(
         "✅ Serving workers on {:?}",
-        app_state.router.get_worker_urls().read().unwrap()
+        app_state.router.get_workers().read().unwrap()
     );
 
     HttpServer::new(move || {
