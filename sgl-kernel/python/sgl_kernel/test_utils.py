@@ -23,9 +23,7 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
 
         masked_data_generation_mode = flags.get("masked_data_generation_mode", "default")
         if masked_data_generation_mode == "default":
-            # NOTE may not fully divide
-            num_tokens_per_expert = num_tokens // num_local_experts
-            masked_m = torch.full((num_local_experts, ), num_tokens_per_expert, device='cuda', dtype=torch.int)
+            masked_m = torch.tensor(_split_evenly(num_tokens, num_local_experts), device='cuda', dtype=torch.int)
         elif masked_data_generation_mode == "imbalanced":
             masked_m = TODO
         else:
@@ -34,3 +32,10 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
         return x, masked_m
     else:
         return torch.randn(num_tokens, effective_hidden_dim, device=device, dtype=dtype), None
+
+def _split_evenly(num: int, arr_len: int) -> list[int]:
+    base = num // arr_len
+    remainder = num % arr_len
+    ans = [base + 1 if i < remainder else base for i in range(arr_len)]
+    assert sum(ans) == num
+    return ans
