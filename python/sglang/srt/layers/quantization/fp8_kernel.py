@@ -289,6 +289,7 @@ def per_token_group_quant_8bit(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_layout: bool = False,
+    masked_m: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     from sglang.srt.layers.quantization.int8_kernel import per_token_group_quant_int8
 
@@ -312,8 +313,8 @@ def per_token_group_quant_8bit(
             input=TODO,
             output=TODO,
             output_scale=TODO,
-            quant_group_size=TODO,
-            masked_m=TODO,
+            quant_group_size=group_size,
+            masked_m=masked_m,
             scale_ue8m0=scale_ue8m0,
         )
 
@@ -417,6 +418,7 @@ def sglang_per_token_group_quant_8bit(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_layout: bool = False,
+    masked_m: Optional[torch.Tensor] = None,
 ):
     from sglang.srt.layers.quantization.int8_kernel import (
         sglang_per_token_group_quant_int8,
