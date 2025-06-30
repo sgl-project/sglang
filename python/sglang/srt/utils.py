@@ -2428,7 +2428,12 @@ def prepack_weight_if_needed(weight):
 # OC % TILE_N == 0, where TILE_N = 16
 # IC % TILE_K == 0, where TILE_K = 32
 def dim_is_supported(weight):
-    return weight.size(0) % 16 == 0 and weight.size(1) % 32 == 0
+    TILE_N = 16
+    TILE_K = 32
+    ndim = weight.ndim
+    OC = weight.size(1) if ndim == 3 else weight.size(0)
+    IC = weight.size(2) if ndim == 3 else weight.size(1)
+    return OC % TILE_N == 0 and IC % TILE_K == 0
 
 
 def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
@@ -2445,18 +2450,17 @@ def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> 
     for i, weight_name in enumerate(weight_names):
         weight_tensor = getattr(module, weight_name)
 
+        if transpose_dims and transpose_dims[i]:
+            weight_tensor = weight_tensor.transpose(*transpose_dims[i])
+
         # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
         if not dim_is_supported(weight_tensor):
             logger.warning(
-                f"Expects weight.size(0) % 16 == 0 and weight.size(1) % 32 == 0 "
-                f"but {weight_tensor.size(0)=} and {weight_tensor.size(1)=} in {module}. "
-                f"{module} won't use intel amx backend."
+                f"Unsupported dimension for prepacking for weight '{weight_name}' with shape {weight_tensor.shape} in {module}. "
+                f"The derived (OC, IC) dimensions must be divisible by (16, 32). "
             )
             module.use_intel_amx_backend = False
             return
-
-        if transpose_dims and transpose_dims[i]:
-            weight_tensor = weight_tensor.transpose(*transpose_dims[i])
 
         packed_weight = torch.nn.Parameter(
             prepack_weight_if_needed(weight_tensor),

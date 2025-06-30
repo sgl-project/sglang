@@ -885,14 +885,22 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
         self.weight_block_size = None
-        if self.qkv_proj_with_rope_is_fp8:
-            assert (
-                self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
-                == self.q_b_proj.quant_method.quant_config.weight_block_size
+        if self.qkv_proj_with_rope_is_fp8 and _is_cpu and _is_cpu_amx_available:
+            assert getattr(
+                self.fused_qkv_a_proj_with_mqa.quant_method, "block_quant", False
+            ) == getattr(self.q_b_proj.quant_method, "block_quant", False)
+            use_block_quant = getattr(
+                self.fused_qkv_a_proj_with_mqa.quant_method, "block_quant", False
             )
-            self.weight_block_size = (
-                self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
-            )
+
+            if use_block_quant:
+                assert (
+                    self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
+                    == self.q_b_proj.quant_method.quant_config.weight_block_size
+                )
+                self.weight_block_size = (
+                    self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
+                )
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
