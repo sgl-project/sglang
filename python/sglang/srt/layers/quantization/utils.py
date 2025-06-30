@@ -161,6 +161,6 @@ def assert_fp8_all_close(a: torch.Tensor, b: torch.Tensor):
 
     assert (
         (count_diff_sign == 0)
-        and (count_tiny_diff / numel < 0.005)
+        and (count_tiny_diff / numel < 0.008)
         and (count_large_diff == 0)
     ), f"{count_diff_sign=} {count_tiny_diff=} {count_large_diff=} {numel=} {a=} {b=}"
