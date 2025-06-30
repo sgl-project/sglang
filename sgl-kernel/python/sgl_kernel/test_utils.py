@@ -1,7 +1,7 @@
 import torch
 
 
-def create_per_token_group_quant_test_data(num_tokens, hidden_dim, group_size, flags):
+def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
     device = torch.device("cuda")
     dtype = torch.bfloat16
 

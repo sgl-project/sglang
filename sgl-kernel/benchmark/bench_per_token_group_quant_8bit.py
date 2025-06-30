@@ -117,7 +117,7 @@ else:
 )
 def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
     x = create_per_token_group_quant_test_data(
-        num_tokens=num_tokens, hidden_dim=hidden_dim, group_size=group_size, flags=flags
+        num_tokens=num_tokens, hidden_dim=hidden_dim, flags=flags
     )
 
     fn, kernel_names = {
