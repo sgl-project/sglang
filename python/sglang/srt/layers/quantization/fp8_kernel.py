@@ -24,6 +24,7 @@ import triton
 import triton.language as tl
 
 from sglang.math_utils import align
+from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.utils import (
     direct_register_custom_op,
@@ -305,7 +306,16 @@ def per_token_group_quant_8bit(
         )
 
     if fuse_silu_and_mul:
-        return TODO
+        assert column_major_scales
+        assert scale_tma_aligned
+        return silu_and_mul_masked_post_quant_fwd(
+            input=TODO,
+            output=TODO,
+            output_scale=TODO,
+            quant_group_size=TODO,
+            masked_m=TODO,
+            scale_ue8m0=scale_ue8m0,
+        )
 
     return per_token_group_quant_fp8(
         x=x,
