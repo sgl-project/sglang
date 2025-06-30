@@ -60,8 +60,7 @@ configs = list(
     # )
 ) + list(
     itertools.product(
-        # TODO
-        [1],
+        [4],
         [512],
         [128],
         # [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
@@ -118,8 +117,8 @@ def test_per_token_group_quant_with_column_major(
         num_tokens=num_tokens, hidden_dim=hidden_dim, flags=flags
     )
 
-    print("hack data!!!")
-    x = torch.full_like(x, fill_value=100)
+    # print("hack data!!!")
+    # x = torch.full_like(x, fill_value=100)
 
     execute_kwargs = dict(
         x=x,
