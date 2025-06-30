@@ -126,9 +126,9 @@ void sgl_fused_add_rmsnorm(
     torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps, bool enable_pdl);
 void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
-void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
-void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
-void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl);
+void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl);
+void gelu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl);
 void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor q,
     at::Tensor k,
@@ -136,8 +136,7 @@ void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor k_rope,
     at::Tensor cos_sin_cache,
     at::Tensor pos_ids,
-    bool interleave,
-    int64_t cuda_stream);
+    bool interleave);
 
 /*
  * From csrc/gemm
@@ -198,8 +197,7 @@ void bmm_fp8(
     at::Tensor A_scale,
     at::Tensor B_scale,
     at::Tensor workspace_buffer,
-    int64_t cublas_handle,
-    int64_t cuda_stream);
+    int64_t cublas_handle);
 
 void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
 
