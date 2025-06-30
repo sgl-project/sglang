@@ -289,13 +289,13 @@ class LazyImport:
     def __init__(self, module_name: str, class_name: str):
         self.module_name = module_name
         self.class_name = class_name
-        self._class = None
+        self._target_class = None
 
     def _load(self):
-        if self._class is None:
+        if self._target_class is None:
             module = importlib.import_module(self.module_name)
-            self._class = getattr(module, self.class_name)
-        return self._class
+            self._target_class = getattr(module, self.class_name)
+        return self._target_class
 
     def __getattr__(self, name: str):
         target_class = self._load()
