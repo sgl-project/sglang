@@ -13,8 +13,11 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
 
     if flags["masked_layout"]:
         num_local_experts = 6
+        num_max_dispatch_tokens_per_rank = 768
+        num_ranks = 48
 
-        x = torch.randn(num_local_experts, TODO, effective_hidden_dim, device=device, dtype=dtype)
+        # mimic DeepEP low_latency_dispatch output
+        x = torch.randn(num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, effective_hidden_dim, device=device, dtype=dtype)
 
         masked_data_generation_mode = flags.get("masked_data_generation_mode", "default")
         if masked_data_generation_mode == "default":
