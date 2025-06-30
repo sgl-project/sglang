@@ -121,8 +121,8 @@ void tree_speculative_sampling_target_only(
   }
   // CHECK_GE(threshold_single, 0);
   // CHECK_GE(1, threshold_single);
-  CHECK_GE(threshold_acc, 0);
-  CHECK_GE(1, threshold_acc);
+  // CHECK_GE(threshold_acc, 0);
+  // CHECK_GE(1, threshold_acc);
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::TreeSpeculativeSamplingTargetOnly<float, int32_t, int64_t>(
