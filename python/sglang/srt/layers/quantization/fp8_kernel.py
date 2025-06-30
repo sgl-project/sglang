@@ -214,20 +214,19 @@ def per_token_group_quant_fp8(
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    if dtype == torch.int8:
-        finfo = torch.iinfo(dtype)
-    else:
-        finfo = torch.finfo(dtype)
-
-    bit8_max = finfo.max
-
     if _is_hip:
         if dtype == torch.int8:
             bit8_max = 127.0
         else:
             bit8_max = 224.0
-
-    bit8_min = -bit8_max
+        bit8_min = -bit8_max # TODO incorrect for int8
+    else:
+        if dtype == torch.int8:
+            info = torch.iinfo(dtype)
+        else:
+            info = torch.info(dtype)
+        bit8_max = info.max
+        bit8_min = info.min
 
     x_q = torch.empty_like(x, device=x.device, dtype=dtype)
     x_s = create_per_token_group_quant_fp8_output_scale(
