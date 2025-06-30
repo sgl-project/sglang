@@ -92,12 +92,14 @@ struct DtypeInfo<c10::Float8_e4m3fn> {
   static constexpr float MAX = 448;
 };
 
-int compute_input_group_start_offset<bool FUSE_SILU_AND_MUL>(
+template<bool FUSE_SILU_AND_MUL>
+int compute_input_group_start_offset(
     int expert_idx,
     int token_idx,
     int hidden_dim_group_idx,
     int hidden_size,
-    int num_tokens_per_expert) {
+    int num_tokens_per_expert,
+    int group_size) {
   return expert_idx * num_tokens_per_expert * hidden_size+
          token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
          hidden_dim_group_idx * group_size;
@@ -115,8 +117,7 @@ struct NaiveScheduler {
       int& subwarps_per_block,
       dim3& grid,
       dim3& block) {
-
-    int compute_subwarps_per_block(int num_groups) {
+    subwarps_per_block = ([] -> int {
       if (num_groups % 16 == 0) {
         return 16;
       } else if (num_groups % 8 == 0) {
@@ -127,9 +128,7 @@ struct NaiveScheduler {
         return 2;
       }
       return 1;
-    }
-
-    subwarps_per_block = compute_subwarps_per_block(num_groups);
+    })();
     grid = dim3(num_groups / subwarps_per_block);
     block = dim3(subwarps_per_block * THREADS_PER_SUBWARP);
   }
@@ -160,7 +159,7 @@ struct NaiveScheduler {
     if constexpr (FUSE_SILU_AND_MUL) {
       const int hidden_size = hidden_dim_num_groups * group_size;
       input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
-          expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert);
+          expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, group_size);
     }
 
     fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
@@ -200,7 +199,7 @@ struct MaskedLayoutScheduler {
          token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
       const int hidden_size = hidden_dim_num_groups * group_size;
       const int input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
-          expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert);
+          expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, group_size);
       fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
     }
   }
