@@ -19,11 +19,11 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 configs = list(
     itertools.product(
         # [1, 4, 16, 64, 127, 128, 512, 1024, 4096, 8192],  # num_tokens
-        [1],  # num_tokens
+        [1],  # TODO
         # TODO
         # [256, 512, 1024, 1536, 2048, 4096, 7168, 16384],  # hidden_dim
         # [512, 1024, 1536, 2048, 4096, 7168, 16384],  # hidden_dim
-        [512],  # hidden_dim
+        [512],  # TODO
         # TODO support group size != 128
         # [8, 16, 32, 64, 128],  # group_size
         [128],  # group_size
