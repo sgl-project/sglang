@@ -300,7 +300,7 @@ __global__ void per_token_group_quant_8bit_kernel(
             // TODO maybe vectorize
             val = silu(static_cast<float>(input_primary_vec[j])) * static_cast<float>(input_secondary_vec[j]);
             // TODO is it ok we store as bf16? or shall we store as fp32?
-            input_secondary_vec[j] = static_cast<T>(val);
+            input_primary_vec[j] = static_cast<T>(val);
           } else {
             val = static_cast<float>(input_primary_vec[j]);
           }
