@@ -103,7 +103,6 @@ __global__ void per_token_group_quant_8bit_kernel(
     DST_DTYPE* __restrict__ output_q,
     scale_packed_t* __restrict__ output_s,
     const int group_size,
-    const int num_groups,
     const int groups_per_block,
     const int scale_num_rows = 0,
     const int scale_stride = 0) {
@@ -255,7 +254,6 @@ void sgl_per_token_group_quant_8bit(
             static_cast<DST_DTYPE*>(output_q.data_ptr()),                                         \
             static_cast<uint32_t*>(output_s.data_ptr()),                                          \
             group_size,                                                                           \
-            num_groups,                                                                           \
             groups_per_block,                                                                     \
             scale_num_rows,                                                                       \
             scale_stride);                                                                        \
@@ -265,7 +263,6 @@ void sgl_per_token_group_quant_8bit(
             static_cast<DST_DTYPE*>(output_q.data_ptr()),                                         \
             static_cast<float*>(output_s.data_ptr()),                                             \
             group_size,                                                                           \
-            num_groups,                                                                           \
             groups_per_block,                                                                     \
             scale_num_rows,                                                                       \
             scale_stride);                                                                        \
@@ -277,7 +274,6 @@ void sgl_per_token_group_quant_8bit(
           static_cast<DST_DTYPE*>(output_q.data_ptr()),                                           \
           static_cast<float*>(output_s.data_ptr()),                                               \
           group_size,                                                                             \
-          num_groups,                                                                             \
           groups_per_block);                                                                      \
     }                                                                                             \
   } while (0)
