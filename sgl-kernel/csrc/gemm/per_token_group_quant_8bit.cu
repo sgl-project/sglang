@@ -233,6 +233,7 @@ __global__ void per_token_group_quant_8bit_kernel(
       subwarps_per_block,
       hidden_dim_num_groups,
       group_size,
+      masked_m,
       num_tokens_per_expert,
       [&](const int expert_idx,
           const int token_idx,
