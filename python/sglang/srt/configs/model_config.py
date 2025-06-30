@@ -460,10 +460,9 @@ class ModelConfig:
             # Since config files need to exist all the time, so we DO NOT use
             # with statement to avoid closing the client.
             client = create_remote_connector(self.model_path)
-            if is_remote_url(self.model_path):
-                client.pull_files(allow_pattern=["*config.json"])
-                self.model_weights = self.model_path
-                self.model_path = client.get_local_dir()
+            client.pull_files(allow_pattern=["*config.json"])
+            self.model_weights = self.model_path
+            self.model_path = client.get_local_dir()
 
 
 # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
