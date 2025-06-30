@@ -21,6 +21,10 @@ __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   return val;
 }
 
+__device__ __forceinline__ float silu(const float& val) {
+  return val / (1.0f + __expf(-val));
+}
+
 // Copied and modified from DeepEP
 __forceinline__ __device__ float fast_pow2(int x) {
   // We can ensure `-126 <= x and x <= 127`
@@ -119,7 +123,8 @@ struct NaiveScheduler {
     const int hidden_dim_group_idx = group_id % hidden_size_num_groups;
 
     if constexpr (FUSE_SILU_AND_MUL) {
-      input_group_start_offset = token_idx * hidden_size_num_groups * group_size * 2 + hidden_dim_group_idx * group_size;
+      input_group_start_offset =
+          token_idx * hidden_size_num_groups * group_size * 2 + hidden_dim_group_idx * group_size;
     }
 
     fn(token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
@@ -176,7 +181,9 @@ __global__ void per_token_group_quant_8bit_kernel(
           const int secondary_offset = hidden_size_num_groups * group_size;
           for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
             input_secondary_int4[j] = ld_global_nc(
-                reinterpret_cast<const int4*>(input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE + secondary_offset) + j);
+                reinterpret_cast<const int4*>(
+                    input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE + secondary_offset) +
+                j);
           }
         }
 
@@ -199,7 +206,16 @@ __global__ void per_token_group_quant_8bit_kernel(
 
 #pragma unroll
         for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
-          float val = static_cast<float>(input_primary_vec[j]);
+          float val;
+          if constexpr (FUSE_SILU_AND_MUL) {
+            // TODO maybe vectorize
+            val = silu(static_cast<float>(input_primary_vec[j])) * static_cast<float>(input_secondary_vec[j]);
+            // TODO is it ok we store as bf16? or shall we store as fp32?
+            input_secondary_vec[j] = static_cast<T>(val);
+          } else {
+            val = static_cast<float>(input_primary_vec[j]);
+          }
+
           float abs_val = fabsf(val);
           local_absmax = fmaxf(local_absmax, abs_val);
         }
