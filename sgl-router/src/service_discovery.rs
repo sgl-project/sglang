@@ -443,6 +443,7 @@ async fn handle_pod_deletion(
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,24 +532,11 @@ mod tests {
 
     // Helper to create a Router instance for testing event handlers
     fn create_test_router() -> Arc<Router> {
-        // Create router with empty workers for testing
-        let policy_config = PolicyConfig::RandomConfig {
+        Arc::new(Router::Random {
+            workers: Arc::new(std::sync::RwLock::new(Vec::new())),
             timeout_secs: 5,
             interval_secs: 1,
-        };
-        
-        // Router::new expects workers to be healthy, so we'll create it with empty list
-        match Router::new(vec![], policy_config) {
-            Ok(router) => Arc::new(router),
-            Err(_) => {
-                // Fallback to creating manually for tests
-                Arc::new(Router::Random {
-                    workers: Arc::new(std::sync::RwLock::new(Vec::new())),
-                    timeout_secs: 5,
-                    interval_secs: 1,
-                })
-            }
-        }
+        })
     }
 
     // Helper to create a PD config for testing
