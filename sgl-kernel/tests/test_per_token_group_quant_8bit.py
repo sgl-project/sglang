@@ -60,7 +60,7 @@ configs = list(
     # )
 ) + list(
     itertools.product(
-        [4],
+        [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
         [512],
         [128],
         # [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
@@ -132,15 +132,15 @@ def test_per_token_group_quant_with_column_major(
     x_q_triton, x_s_triton = triton_per_token_group_quant_8bit(**execute_kwargs)
     x_q_sglang, x_s_sglang = sglang_per_token_group_quant_8bit(**execute_kwargs)
 
-    torch.set_printoptions(profile="full")
-    print(f"{x.shape=} {x_q_triton.shape=} {x_s_triton.shape=} {x_q_sglang.shape=} {x_s_sglang.shape=}")
-    print(f"{x=}")
-    print(f"{masked_m=}")
-    print(f"{x_q_triton=}")
-    print(f"{x_s_triton=}")
-    print(f"{x_q_sglang=}")
-    print(f"{x_s_sglang=}")
-    torch.set_printoptions(profile="default")
+    # torch.set_printoptions(profile="full")
+    # print(f"{x.shape=} {x_q_triton.shape=} {x_s_triton.shape=} {x_q_sglang.shape=} {x_s_sglang.shape=}")
+    # print(f"{x=}")
+    # print(f"{masked_m=}")
+    # print(f"{x_q_triton=}")
+    # print(f"{x_s_triton=}")
+    # print(f"{x_q_sglang=}")
+    # print(f"{x_s_sglang=}")
+    # torch.set_printoptions(profile="default")
 
     assert_all_close_or_tiny_diff(x_q_triton, x_q_sglang)
     torch.testing.assert_close(
