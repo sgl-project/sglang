@@ -434,8 +434,6 @@ def sglang_per_token_group_quant_fp8(
         # TODO: handle this case by fixing the (token=4, dim=256, group_size=128) UT case
         assert x.shape[-1] % (group_size * 4) == 0
 
-    assert not fuse_silu_and_mul, "TODO"
-
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
     x_s = create_per_token_group_quant_fp8_output_scale(
         x_shape=x.shape,
