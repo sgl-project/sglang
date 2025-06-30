@@ -1,9 +1,7 @@
 from typing import Callable, List, Optional, Tuple
 
-import einops
 import torch
 
-from sglang.math_utils import align
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.utils import is_sm100_supported
@@ -27,6 +25,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_triton,
 )
 from sglang.srt.utils import (
+    align,
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
@@ -42,7 +41,10 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
-    from aiter import gemm_a8w8_blockscale_CK
+    import aiter
+    from aiter import gemm_a8w8_blockscale_CK, get_hip_quant
+
+    aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
 if _is_cuda:
     from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
@@ -241,9 +243,10 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
     )
 
-    if get_bool_env_var("SGLANG_W8A8_DEEPGEMM_SANITY_CHECK_UE8M0"):
-        _check_ue8m0("x_scale", x_scale)
-        _check_ue8m0("weight_scale", weight_scale)
+    # NOTE(alcanderian): Useless when scale is packed to int32
+    # if get_bool_env_var("SGLANG_W8A8_DEEPGEMM_SANITY_CHECK_UE8M0"):
+    #     _check_ue8m0("x_scale", x_scale)
+    #     _check_ue8m0("weight_scale", ws)
 
     output = w8a8_block_fp8_matmul_deepgemm(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
@@ -270,9 +273,7 @@ def aiter_w8a8_block_fp8_linear(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=False
-    )
+    q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
     output = gemm_a8w8_blockscale_CK(
         q_input, weight, x_scale, weight_scale, dtype=input.dtype
     )
