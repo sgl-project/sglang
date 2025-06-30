@@ -103,13 +103,13 @@ __global__ void per_token_group_quant_8bit_kernel(
     DST_DTYPE* __restrict__ output_q,
     scale_packed_t* __restrict__ output_s,
     const int group_size,
-    const int groups_per_block,
+    const int subwarps_per_block,
     const int scale_hidden_size = 0,
     const int scale_hidden_stride = 0) {
   const int local_group_id = threadIdx.x / THREADS_PER_GROUP;
   const int lane_id = threadIdx.x % THREADS_PER_GROUP;
 
-  const int block_group_id = blockIdx.x * groups_per_block;
+  const int block_group_id = blockIdx.x * subwarps_per_block;
   const int global_group_id = block_group_id + local_group_id;
   const int block_group_offset = global_group_id * group_size;
 
@@ -198,7 +198,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   st_global(reinterpret_cast<int4*>(group_output + lane_id * INPUT_PRIMARY_VEC_SIZE), output_buf);
 }
 
-int compute_groups_per_block(int num_groups) {
+int compute_subwarps_per_block(int num_groups) {
   if (num_groups % 16 == 0) {
     return 16;
   } else if (num_groups % 8 == 0) {
@@ -233,11 +233,11 @@ void sgl_per_token_group_quant_8bit(
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  int groups_per_block = compute_groups_per_block(num_groups);
+  int subwarps_per_block = compute_subwarps_per_block(num_groups);
 
   auto dst_type = output_q.scalar_type();
-  const int num_blocks = num_groups / groups_per_block;
-  const int num_threads = groups_per_block * THREADS_PER_GROUP;
+  const int num_blocks = num_groups / subwarps_per_block;
+  const int num_threads = subwarps_per_block * THREADS_PER_GROUP;
 
   const bool is_column_major = output_s.stride(-2) < output_s.stride(-1);
   const int scale_hidden_size = output_s.size(-1);
@@ -253,7 +253,7 @@ void sgl_per_token_group_quant_8bit(
         static_cast<DST_DTYPE*>(output_q.data_ptr()),                                         \
         static_cast<output_s_dtype*>(output_s.data_ptr()),                                    \
         group_size,                                                                           \
-        groups_per_block,                                                                     \
+        subwarps_per_block,                                                                     \
         scale_hidden_size,                                                                    \
         scale_hidden_stride);                                                                 \
   } while (0)
