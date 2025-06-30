@@ -194,6 +194,19 @@ __global__ void per_token_group_quant_8bit_kernel(
   st_global(reinterpret_cast<int4*>(group_output + lane_id * VEC_TYPED_SIZE), output_buf);
 }
 
+int compute_groups_per_block(int num_groups) {
+  if (num_groups % 16 == 0) {
+    return 16;
+  } else if (num_groups % 8 == 0) {
+    return 8;
+  } else if (num_groups % 4 == 0) {
+    return 4;
+  } else if (num_groups % 2 == 0) {
+    return 2;
+  }
+  return 1;
+}
+
 void sgl_per_token_group_quant_8bit(
     torch::Tensor input,
     torch::Tensor output_q,
@@ -215,17 +228,7 @@ void sgl_per_token_group_quant_8bit(
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  int groups_per_block = 1;
-
-  if (num_groups % 16 == 0) {
-    groups_per_block = 16;
-  } else if (num_groups % 8 == 0) {
-    groups_per_block = 8;
-  } else if (num_groups % 4 == 0) {
-    groups_per_block = 4;
-  } else if (num_groups % 2 == 0) {
-    groups_per_block = 2;
-  }
+  int groups_per_block = compute_groups_per_block(num_groups);
 
   auto dst_type = output_q.scalar_type();
   const int num_blocks = num_groups / groups_per_block;
