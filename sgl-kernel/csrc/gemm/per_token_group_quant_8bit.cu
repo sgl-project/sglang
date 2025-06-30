@@ -385,7 +385,10 @@ void sgl_per_token_group_quant_8bit(
   const int hidden_dim_num_groups = output_q.size(-1) / group_size / (fuse_silu_and_mul ? 2 : 1);
   const int num_tokens_per_expert = output_q.size(-2);
   const int scale_hidden_stride = output_s.stride(-1);
-  TORCH_CHECK(num_tokens_per_expert == scale_hidden_stride);  // use one single param in kernel
+  if (is_column_major) {
+    // pass the two variables using one single param to kernel
+    TORCH_CHECK(num_tokens_per_expert == scale_hidden_stride);
+  }
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, T, DST_DTYPE, output_s_dtype, ...)                                \
   do {                                                                                                   \
