@@ -117,7 +117,7 @@ struct NaiveScheduler {
       int& subwarps_per_block,
       dim3& grid,
       dim3& block) {
-    subwarps_per_block = ([] -> int {
+    subwarps_per_block = ([=] () -> int {
       if (num_groups % 16 == 0) {
         return 16;
       } else if (num_groups % 8 == 0) {
@@ -139,6 +139,7 @@ struct NaiveScheduler {
       const int hidden_dim_num_groups,
       const int group_size,
       const int32_t* masked_m,
+      const int num_tokens_per_expert,
       FUNC fn) {
     constexpr int expert_idx = 0;
 
@@ -187,6 +188,7 @@ struct MaskedLayoutScheduler {
       const int hidden_dim_num_groups,
       const int group_size,
       const int32_t* masked_m,
+      const int num_tokens_per_expert,
       FUNC fn) {
     const int expert_idx = blockIdx.z;
     const int token_idx_start = blockIdx.y;
@@ -231,6 +233,7 @@ __global__ void per_token_group_quant_8bit_kernel(
       subwarps_per_block,
       hidden_dim_num_groups,
       group_size,
+      num_tokens_per_expert,
       [&](const int expert_idx,
           const int token_idx,
           const int hidden_dim_group_idx,
@@ -256,8 +259,8 @@ __global__ void per_token_group_quant_8bit_kernel(
               reinterpret_cast<const int4*>(input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
         }
         if constexpr (FUSE_SILU_AND_MUL) {
-#pragma unroll
           const int secondary_offset = hidden_dim_num_groups * group_size;
+#pragma unroll
           for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
             input_secondary_int4[j] = ld_global_nc(
                 reinterpret_cast<const int4*>(
