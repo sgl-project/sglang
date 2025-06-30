@@ -202,6 +202,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int group_size,
     const int subwarps_per_block,
     const int hidden_dim_num_groups,
+    // TODO remove this? since this == num_tokens_per_expert
     const int scale_hidden_stride) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
@@ -219,7 +220,7 @@ __global__ void per_token_group_quant_8bit_kernel(
         constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
         constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
-        const int offset_num_groups = expert_idx * TODO + token_idx * hidden_dim_num_groups + hidden_dim_group_idx;
+        const int offset_num_groups = expert_idx * num_tokens_per_expert * hidden_dim_num_groups + token_idx * hidden_dim_num_groups + hidden_dim_group_idx;
 
         int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
         T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
@@ -249,10 +250,12 @@ __global__ void per_token_group_quant_8bit_kernel(
         if constexpr (IS_COLUMN_MAJOR) {
           constexpr int scale_token_stride = 1;
           constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
+          const int hidden_dim = hidden_dim_num_groups * group_size;
+          const int scale_expert_stride = (hidden_dim / num_elems_per_pack) * scale_hidden_stride;
 
           const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
           const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
-          scale_output = reinterpret_cast<scale_element_t*>(output_s) + expert_idx * TODO +
+          scale_output = reinterpret_cast<scale_element_t*>(output_s) + expert_idx * scale_expert_stride * num_elems_per_pack +
                          hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
                          token_idx * scale_token_stride * num_elems_per_pack + pack_idx;
         } else {
