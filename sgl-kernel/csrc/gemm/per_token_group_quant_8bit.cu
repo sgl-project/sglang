@@ -202,8 +202,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int group_size,
     const int subwarps_per_block,
     const int hidden_dim_num_groups,
-    // TODO remove this? since this == num_tokens_per_expert
-    const int scale_hidden_stride) {
+    const int num_tokens_per_expert) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
@@ -372,7 +371,9 @@ void sgl_per_token_group_quant_8bit(
 
   const bool is_column_major = output_s.stride(-2) < output_s.stride(-1);
   const int hidden_dim_num_groups = output_q.size(-1) / group_size / (fuse_silu_and_mul ? 2 : 1);
+  const int num_tokens_per_expert = TODO;
   const int scale_hidden_stride = output_s.stride(-1);
+  TORCH_CHECK(num_tokens_per_expert == scale_hidden_stride);
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, T, DST_DTYPE, output_s_dtype, ...)                                \
   do {                                                                                                   \
@@ -388,7 +389,7 @@ void sgl_per_token_group_quant_8bit(
         group_size,                                                                                      \
         subwarps_per_block,                                                                              \
         hidden_dim_num_groups,                                                                           \
-        scale_hidden_stride);                                                                            \
+        num_tokens_per_expert);                                                                          \
   } while (0)
 
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                                     \
