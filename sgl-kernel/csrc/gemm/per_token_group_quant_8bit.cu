@@ -132,8 +132,6 @@ __global__ void per_token_group_quant_8bit_kernel(
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
   SCHEDULER::execute(subwarps_per_block, [&](int group_id, int lane_id) {
-    const T* group_input = input + group_id * group_size;
-    DST_DTYPE* group_output = output_q + group_id * group_size;
     scale_element_t* scale_output;
 
     if constexpr (IS_COLUMN_MAJOR) {
@@ -163,7 +161,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 #pragma unroll
     for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
       input_primary_int4[j] =
-          ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
+          ld_global_nc(reinterpret_cast<const int4*>(input + group_id * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
     }
 
     float local_absmax = LOCAL_ABSMAX_ABS;
@@ -210,7 +208,7 @@ __global__ void per_token_group_quant_8bit_kernel(
       }
     }
 
-    st_global(reinterpret_cast<int4*>(group_output + lane_id * INPUT_PRIMARY_VEC_SIZE), output_buf);
+    st_global(reinterpret_cast<int4*>(output_q + group_id * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE), output_buf);
   });
 }
 
