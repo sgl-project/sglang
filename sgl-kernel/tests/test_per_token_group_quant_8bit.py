@@ -101,12 +101,13 @@ def test_per_token_group_quant_with_column_major(
         pytest.skip()
         return
 
-    x = create_per_token_group_quant_test_data(
+    x, masked_m = create_per_token_group_quant_test_data(
         num_tokens=num_tokens, hidden_dim=hidden_dim, flags=flags
     )
 
     execute_kwargs = dict(
         x=x,
+        masked_m=masked_m,
         group_size=group_size,
         eps=1e-10,
         dst_dtype=dst_dtype,

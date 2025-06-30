@@ -125,7 +125,7 @@ else:
     )
 )
 def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
-    x = create_per_token_group_quant_test_data(
+    x, masked_m = create_per_token_group_quant_test_data(
         num_tokens=num_tokens, hidden_dim=hidden_dim, flags=flags
     )
 
@@ -140,7 +140,9 @@ def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
         ),
     }[provider]
     bench_fn = lambda: fn(
+        # TODO shall we clone it or not?
         x=x.clone(),
+        masked_m=masked_m.clone(),
         group_size=group_size,
         dst_dtype=dst_dtype,
         **{k: v for k, v in flags.items() if k not in ["masked_data_generation_mode"]},
