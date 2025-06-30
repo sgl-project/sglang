@@ -34,6 +34,7 @@ from sgl_kernel.gemm import (
     bmm_fp8,
     cutlass_scaled_fp4_mm,
     dsv3_fused_a_gemm,
+    dsv3_router_gemm,
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
     int8_scaled_mm,
