@@ -142,6 +142,7 @@ suites = {
         TestFile("test_vertex_endpoint.py", 31),
         TestFile("test_vision_chunked_prefill.py", 175),
         TestFile("test_reasoning_parser.py", 5),
+        TestFile("test_rope_rocm.py", 3),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
