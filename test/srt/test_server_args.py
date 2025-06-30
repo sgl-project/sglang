@@ -76,7 +76,7 @@ class TestPortArgs(unittest.TestCase):
         port_args = PortArgs.init_new(server_args, dp_rank=2)
 
         print(f"{port_args=}")
-        self.assertTrue(port_args.scheduler_input_ipc_name.endswith(":25007"))
+        self.assertTrue(port_args.scheduler_input_ipc_name.endswith(":25008"))
 
         self.assertTrue(port_args.tokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
