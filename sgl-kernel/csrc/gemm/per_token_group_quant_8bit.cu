@@ -152,8 +152,6 @@ __global__ void per_token_group_quant_8bit_kernel(
               reinterpret_cast<const int4*>(input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
         }
 
-        DST_DTYPE* output_ptr = output_q + token_idx * hidden_size_num_groups * group_size + group_start_hidden_idx * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE;
-
         scale_element_t* scale_output;
         if constexpr (IS_COLUMN_MAJOR) {
           constexpr int scale_token_stride = 1;
@@ -213,7 +211,8 @@ __global__ void per_token_group_quant_8bit_kernel(
           }
         }
 
-        st_global(reinterpret_cast<int4*>(output_ptr), output_buf);
+        st_global(
+            reinterpret_cast<int4*>(output_q + token_idx * hidden_size_num_groups * group_size + group_start_hidden_idx * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE), output_buf);
       });
 }
 
