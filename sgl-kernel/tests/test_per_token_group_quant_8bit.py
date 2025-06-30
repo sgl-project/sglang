@@ -134,6 +134,7 @@ def test_per_token_group_quant_with_column_major(
     x_q_sglang, x_s_sglang = sglang_per_token_group_quant_8bit(**execute_kwargs)
 
     torch.set_printoptions(profile="full")
+    print(f"{x.shape=} {x_q_triton.shape=} {x_s_triton.shape=} {x_q_sglang.shape=} {x_s_sglang.shape=}")
     print(f"{x=}")
     print(f"{masked_m=}")
     print(f"{x_q_triton=}")
