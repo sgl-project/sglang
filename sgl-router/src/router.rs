@@ -1130,54 +1130,6 @@ impl Router {
         return Ok(format!("Successfully removed worker: {}", worker_url));
     }
 
-    /// Add a worker with PD mode support
-    pub async fn add_pd_worker(
-        &self,
-        worker_url: &str,
-        pod_type: crate::service_discovery::PodType,
-        bootstrap_port: Option<u16>,
-    ) -> Result<String, String> {
-        match self {
-            Router::PrefillDecode { pd_router } => match pod_type {
-                crate::service_discovery::PodType::Prefill => pd_router
-                    .add_prefill_server(worker_url.to_string(), bootstrap_port)
-                    .await
-                    .map_err(|e| e.to_string()),
-                crate::service_discovery::PodType::Decode => pd_router
-                    .add_decode_server(worker_url.to_string())
-                    .await
-                    .map_err(|e| e.to_string()),
-                crate::service_discovery::PodType::Regular => {
-                    Err("Regular pod type not supported in PD mode".to_string())
-                }
-            },
-            _ => Err("add_pd_worker only supported in PD mode".to_string()),
-        }
-    }
-
-    /// Remove a worker with PD mode support
-    pub async fn remove_pd_worker(
-        &self,
-        worker_url: &str,
-        pod_type: crate::service_discovery::PodType,
-    ) -> Result<String, String> {
-        match self {
-            Router::PrefillDecode { pd_router } => match pod_type {
-                crate::service_discovery::PodType::Prefill => pd_router
-                    .remove_prefill_server(worker_url)
-                    .await
-                    .map_err(|e| e.to_string()),
-                crate::service_discovery::PodType::Decode => pd_router
-                    .remove_decode_server(worker_url)
-                    .await
-                    .map_err(|e| e.to_string()),
-                crate::service_discovery::PodType::Regular => {
-                    Err("Regular pod type not supported in PD mode".to_string())
-                }
-            },
-            _ => Err("remove_pd_worker only supported in PD mode".to_string()),
-        }
-    }
 
     // PD-specific wrapper methods that delegate to PDRouter
     pub async fn route_pd_health_generate(
@@ -1310,7 +1262,6 @@ pub(crate) async fn get_loads_helper(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service_discovery::PodType;
     use crate::test_utils::mock_servers::create_enhanced_mock_health_server;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1603,33 +1554,33 @@ mod tests {
     // PD Router Integration Tests
     // ============================================================================
 
-    #[tokio::test]
-    async fn test_add_pd_worker_with_regular_router() {
-        let router = create_test_regular_router();
+    // #[tokio::test]
+    // async fn test_add_pd_worker_with_regular_router() {
+    //     let router = create_test_regular_router();
 
-        let result = router
-            .add_pd_worker("http://new-worker:8080", PodType::Prefill, Some(8081))
-            .await;
+    //     let result = router
+    //         .add_pd_worker("http://new-worker:8080", PodType::Prefill, Some(8081))
+    //         .await;
 
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("add_pd_worker only supported in PD mode"));
-    }
+    //     assert!(result.is_err());
+    //     assert!(result
+    //         .unwrap_err()
+    //         .contains("add_pd_worker only supported in PD mode"));
+    // }
 
-    #[tokio::test]
-    async fn test_remove_pd_worker_with_regular_router() {
-        let router = create_test_regular_router();
+    // #[tokio::test]
+    // async fn test_remove_pd_worker_with_regular_router() {
+    //     let router = create_test_regular_router();
 
-        let result = router
-            .remove_pd_worker("http://worker:8080", PodType::Decode)
-            .await;
+    //     let result = router
+    //         .remove_pd_worker("http://worker:8080", PodType::Decode)
+    //         .await;
 
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("remove_pd_worker only supported in PD mode"));
-    }
+    //     assert!(result.is_err());
+    //     assert!(result
+    //         .unwrap_err()
+    //         .contains("remove_pd_worker only supported in PD mode"));
+    // }
 
     #[tokio::test]
     async fn test_pd_endpoints_with_regular_router() {
