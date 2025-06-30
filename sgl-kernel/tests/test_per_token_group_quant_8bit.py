@@ -17,78 +17,84 @@ _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 configs = list(
-    itertools.product(
-        [1, 4, 16, 64, 127, 128, 512, 1024, 4096, 8192],  # num_tokens
-        # TODO
-        # [256, 512, 1024, 1536, 2048, 4096, 7168, 16384],  # hidden_dim
-        [512, 1024, 1536, 2048, 4096, 7168, 16384],  # hidden_dim
-        # TODO support group size != 128
-        # [8, 16, 32, 64, 128],  # group_size
-        [128],  # group_size
-        [fp8_type_, torch.int8],  # dtype
-        [
-            dict(
-                column_major_scales=False,
-                scale_tma_aligned=False,
-                scale_ue8m0=False,
-                fuse_silu_and_mul=False,
-                masked_layout_mode=None,
-            ),
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=False,
-                scale_ue8m0=False,
-                fuse_silu_and_mul=False,
-                masked_layout_mode=None,
-            ),
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=False,
-                fuse_silu_and_mul=False,
-                masked_layout_mode=None,
-            ),
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=True,
-                fuse_silu_and_mul=False,
-                masked_layout_mode=None,
-            ),
-        ],
-    )
-) + list(
     # TODO
     # itertools.product(
-    #     [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
-    #     [256, 1024, 2048, 4096],
-    #     [128],
-    #     [fp8_type_],
+    #     [1, 4, 16, 64, 127, 128, 512, 1024, 4096, 8192],  # num_tokens
+    #     # TODO
+    #     # [256, 512, 1024, 1536, 2048, 4096, 7168, 16384],  # hidden_dim
+    #     [512, 1024, 1536, 2048, 4096, 7168, 16384],  # hidden_dim
+    #     # TODO support group size != 128
+    #     # [8, 16, 32, 64, 128],  # group_size
+    #     [128],  # group_size
+    #     [fp8_type_, torch.int8],  # dtype
     #     [
+    #         dict(
+    #             column_major_scales=False,
+    #             scale_tma_aligned=False,
+    #             scale_ue8m0=False,
+    #             fuse_silu_and_mul=False,
+    #             masked_layout_mode=None,
+    #         ),
+    #         dict(
+    #             column_major_scales=True,
+    #             scale_tma_aligned=False,
+    #             scale_ue8m0=False,
+    #             fuse_silu_and_mul=False,
+    #             masked_layout_mode=None,
+    #         ),
     #         dict(
     #             column_major_scales=True,
     #             scale_tma_aligned=True,
-    #             scale_ue8m0=True,
-    #             fuse_silu_and_mul=True,
+    #             scale_ue8m0=False,
+    #             fuse_silu_and_mul=False,
     #             masked_layout_mode=None,
     #         ),
     #         dict(
     #             column_major_scales=True,
     #             scale_tma_aligned=True,
     #             scale_ue8m0=True,
-    #             fuse_silu_and_mul=True,
-    #             masked_layout_mode="balanced",
-    #         ),
-    #         dict(
-    #             column_major_scales=True,
-    #             scale_tma_aligned=True,
-    #             scale_ue8m0=True,
-    #             fuse_silu_and_mul=True,
-    #             masked_layout=True,
-    #             masked_layout_mode="imbalanced",
+    #             fuse_silu_and_mul=False,
+    #             masked_layout_mode=None,
     #         ),
     #     ],
     # )
+) + list(
+    itertools.product(
+        # TODO
+        [1],
+        [512],
+        [128],
+        # [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
+        # # [256, 512, 1024, 2048, 4096], # TODO
+        # [512, 1024, 2048, 4096],
+        # [128],
+        [fp8_type_],
+        [
+            dict(
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=True,
+                fuse_silu_and_mul=True,
+                masked_layout_mode=None,
+            ),
+            # TODO
+            # dict(
+            #     column_major_scales=True,
+            #     scale_tma_aligned=True,
+            #     scale_ue8m0=True,
+            #     fuse_silu_and_mul=True,
+            #     masked_layout_mode="balanced",
+            # ),
+            # dict(
+            #     column_major_scales=True,
+            #     scale_tma_aligned=True,
+            #     scale_ue8m0=True,
+            #     fuse_silu_and_mul=True,
+            #     masked_layout=True,
+            #     masked_layout_mode="imbalanced",
+            # ),
+        ],
+    )
 )
 
 
