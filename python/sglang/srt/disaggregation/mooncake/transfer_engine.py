@@ -120,5 +120,44 @@ class MooncakeTransferEngine:
             )
         return ret
 
+    def batch_transfer_async(
+        self,
+        session_id: str,
+        buffers: List[int],
+        peer_buffer_addresses: List[int],
+        lengths: List[int],
+    ) -> int:
+        """Synchronously transfer data to the specified addresses in batches."""
+        try:
+            micro_batch_size, batch_size = 256, len(lengths)
+            batch_ids = []
+            for i in range(0, batch_size, micro_batch_size):
+                batch_id = self.engine.batch_transfer_async_write(
+                    session_id,
+                    buffers[i: i + micro_batch_size],
+                    peer_buffer_addresses[i: i + micro_batch_size],
+                    lengths[i: i + micro_batch_size]
+                )
+                batch_ids.append(batch_id)
+            
+            ret = self.engine.get_batch_transfer_status(batch_ids)
+        except Exception:
+            ret = -1
+            # Inform user to upgrade mooncake-transfer-engine >= 0.3.4.post2
+            if not hasattr(self.engine, "batch_transfer_async_write"):
+                raise RuntimeError(
+                    "Mooncake's batch transfer requires mooncake-transfer-engine > 0.3.4.post2. "
+                    "Please upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'"
+                )
+
+        if ret < 0:
+            logger.debug(
+                "Failed to batch transfer data asynchronously. Buffers: %s, Session: %s, Peer addresses: %s",
+                buffers,
+                session_id,
+                peer_buffer_addresses,
+            )
+        return ret
+
     def get_session_id(self):
         return self.session_id
