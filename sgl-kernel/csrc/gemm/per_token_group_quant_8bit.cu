@@ -6,13 +6,13 @@
 
 #include "utils.h"
 
-template <int THREADS_PER_GROUP>
+template <int THREADS_PER_SUBWARP>
 __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   unsigned mask = 0xffff;
 
-  static_assert((THREADS_PER_GROUP == 16) or (THREADS_PER_GROUP == 8));
+  static_assert((THREADS_PER_SUBWARP == 16) or (THREADS_PER_SUBWARP == 8));
 
-  if constexpr (THREADS_PER_GROUP == 16) {
+  if constexpr (THREADS_PER_SUBWARP == 16) {
     val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
   }
   val = fmaxf(val, __shfl_xor_sync(mask, val, 4));
@@ -89,7 +89,7 @@ struct DtypeInfo<c10::Float8_e4m3fn> {
 };
 
 constexpr float LOCAL_ABSMAX_ABS = 1e-10;
-constexpr int THREADS_PER_GROUP = 8;
+constexpr int THREADS_PER_SUBWARP = 8;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 
 template <
@@ -106,8 +106,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int subwarps_per_block,
     const int scale_hidden_size = 0,
     const int scale_hidden_stride = 0) {
-  const int local_group_id = threadIdx.x / THREADS_PER_GROUP;
-  const int lane_id = threadIdx.x % THREADS_PER_GROUP;
+  const int local_group_id = threadIdx.x / THREADS_PER_SUBWARP;
+  const int lane_id = threadIdx.x % THREADS_PER_SUBWARP;
 
   const int block_group_id = blockIdx.x * subwarps_per_block;
   const int global_group_id = block_group_id + local_group_id;
@@ -160,7 +160,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     local_absmax = fmaxf(local_absmax, abs_val);
   }
 
-  local_absmax = GroupReduceMax<THREADS_PER_GROUP>(local_absmax, lane_id);
+  local_absmax = GroupReduceMax<THREADS_PER_SUBWARP>(local_absmax, lane_id);
 
   float y_scale, y_scale_inv;
   calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
@@ -236,7 +236,7 @@ void sgl_per_token_group_quant_8bit(
 
   auto dst_type = output_q.scalar_type();
   const int num_blocks = num_groups / subwarps_per_block;
-  const int num_threads = subwarps_per_block * THREADS_PER_GROUP;
+  const int num_threads = subwarps_per_block * THREADS_PER_SUBWARP;
 
   const bool is_column_major = output_s.stride(-2) < output_s.stride(-1);
   const int scale_hidden_size = output_s.size(-1);
@@ -259,7 +259,7 @@ void sgl_per_token_group_quant_8bit(
 
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                        \
   do {                                                                                     \
-    TORCH_CHECK(THREADS_PER_GROUP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T)); \
+    TORCH_CHECK(THREADS_PER_SUBWARP * INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T)); \
                                                                                            \
     using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                           \
     CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                               \
