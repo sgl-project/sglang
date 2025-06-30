@@ -250,8 +250,8 @@ __global__ void per_token_group_quant_8bit_kernel(
         if constexpr (IS_COLUMN_MAJOR) {
           constexpr int scale_token_stride = 1;
           constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
-          const int hidden_dim = hidden_dim_num_groups * group_size;
-          const int scale_expert_stride = (hidden_dim / num_elems_per_pack) * scale_hidden_stride;
+          const int hidden_size = hidden_dim_num_groups * group_size;
+          const int scale_expert_stride = (hidden_size / num_elems_per_pack) * scale_hidden_stride;
 
           const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
           const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
