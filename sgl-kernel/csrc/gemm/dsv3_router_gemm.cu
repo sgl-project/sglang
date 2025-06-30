@@ -178,8 +178,8 @@ void invokeRouterGemm(float* output, T const* mat_a, T const* mat_b, cudaStream_
   attrs[0].val.programmaticStreamSerializationAllowed = getEnvEnablePDL();
   config.numAttrs = 1;
   config.attrs = attrs;
-  TORCH_CHECK(cudaLaunchKernelEx(
-      &config, router_gemm_kernel<T, kBlockSize, VPT, kNumTokens, kNumExperts, kHiddenDim>, output, mat_a, mat_b));
+  cudaLaunchKernelEx(
+      &config, router_gemm_kernel<T, kBlockSize, VPT, kNumTokens, kNumExperts, kHiddenDim>, output, mat_a, mat_b);
 }
 
 template void
