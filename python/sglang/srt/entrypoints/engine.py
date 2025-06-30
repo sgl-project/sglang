@@ -276,6 +276,7 @@ class Engine(EngineBase):
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
+            return_hidden_states=return_hidden_states,
             lora_path=lora_path,
             return_hidden_states=return_hidden_states,
             stream=stream,
