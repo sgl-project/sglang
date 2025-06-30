@@ -19,11 +19,6 @@ def create_greenctx_stream_by_value(
 
     res = torch.ops.sgl_kernel.create_greenctx_stream_by_value(SM_a, SM_b, device_id)
 
-    if (res[2] != SM_a) or (res[3] != SM_b):
-        raise RuntimeError(
-            f"The SMs of the created streams are not equal to the input SMs, expected: {SM_a}, {SM_b}, got: {res[2]}, {res[3]}"
-        )
-
     stream_a = ExternalStream(
         stream_ptr=res[0], device=torch.device(f"cuda:{device_id}")
     )

@@ -7,7 +7,17 @@
     if (_status != cudaSuccess) {                                                                            \
       std::cerr << "ERROR: CUDA RT call \"" << #call << "\" in line " << __LINE__ << " of file " << __FILE__ \
                 << " failed with " << cudaGetErrorString(_status) << std::endl;                              \
-      exit(1);                                                                                               \
+      TORCH_CHECK(                                                                                           \
+          false,                                                                                             \
+          c10::str(                                                                                          \
+              "ERROR: CUDA RT call \"",                                                                      \
+              #call,                                                                                         \
+              "\" in line ",                                                                                 \
+              __LINE__,                                                                                      \
+              " of file ",                                                                                   \
+              __FILE__,                                                                                      \
+              " failed with ",                                                                               \
+              cudaGetErrorString(_status)));                                                                 \
     }                                                                                                        \
   } while (0)
 
@@ -19,6 +29,16 @@
       cuGetErrorString(_status, &err_str);                                                                    \
       std::cerr << "ERROR: CUDA DRV call \"" << #call << "\" in line " << __LINE__ << " of file " << __FILE__ \
                 << " failed with " << err_str << std::endl;                                                   \
-      exit(1);                                                                                                \
+      TORCH_CHECK(                                                                                            \
+          false,                                                                                              \
+          c10::str(                                                                                           \
+              "ERROR: CUDA DRV call \"",                                                                      \
+              #call,                                                                                          \
+              "\" in line ",                                                                                  \
+              __LINE__,                                                                                       \
+              " of file ",                                                                                    \
+              __FILE__,                                                                                       \
+              " failed with ",                                                                                \
+              err_str));                                                                                      \
     }                                                                                                         \
   } while (0)
