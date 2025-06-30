@@ -430,8 +430,6 @@ class TokenizerManager:
                 "Please add `--is-embedding` when launching the server or try another model."
             )
 
-        obj.normalize_batch_and_arguments()
-
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
             logger.info(
