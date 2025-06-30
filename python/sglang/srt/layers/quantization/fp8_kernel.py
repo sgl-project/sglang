@@ -190,6 +190,7 @@ def per_token_group_quant_fp8(
     x: torch.Tensor,
     group_size: int,
     eps: float = 1e-10,
+    dtype: torch.dtype = fp8_dtype,
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
@@ -203,6 +204,7 @@ def per_token_group_quant_fp8(
         x: The input tenosr with ndim >= 2.
         group_size: The group size used for quantization.
         eps: The minimum to avoid dividing zero.
+        dtype: The dype of output tensor.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
@@ -212,7 +214,22 @@ def per_token_group_quant_fp8(
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
+    if dtype == torch.int8:
+        finfo = torch.iinfo(dtype)
+    else:
+        finfo = torch.finfo(dtype)
+
+    fp8_max = finfo.max
+
+    if _is_hip:
+        if dtype == torch.int8:
+            fp8_max = 127.0
+        else:
+            fp8_max = 224.0
+
+    fp8_min = -fp8_max
+
+    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
     x_s = create_per_token_group_quant_fp8_output_scale(
         x_shape=x.shape,
         device=x.device,
