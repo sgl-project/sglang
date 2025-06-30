@@ -27,21 +27,29 @@ configs = list(
                 column_major_scales=False,
                 scale_tma_aligned=False,
                 scale_ue8m0=False,
+                fuse_silu_and_mul=False,
+                masked_layout=False,
             ),
             dict(
                 column_major_scales=True,
                 scale_tma_aligned=False,
                 scale_ue8m0=False,
+                fuse_silu_and_mul=False,
+                masked_layout=False,
             ),
             dict(
                 column_major_scales=True,
                 scale_tma_aligned=True,
                 scale_ue8m0=False,
+                fuse_silu_and_mul=False,
+                masked_layout=False,
             ),
             dict(
                 column_major_scales=True,
                 scale_tma_aligned=True,
                 scale_ue8m0=True,
+                fuse_silu_and_mul=False,
+                masked_layout=False,
             ),
         ],
     )
@@ -57,6 +65,7 @@ configs = list(
                 scale_tma_aligned=True,
                 scale_ue8m0=True,
                 fuse_silu_and_mul=True,
+                masked_layout=False,
             ),
             dict(
                 column_major_scales=True,
