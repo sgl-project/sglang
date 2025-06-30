@@ -180,7 +180,8 @@ void sgl_per_token_group_quant_8bit(
     double eps,
     double fp8_min,
     double fp8_max,
-    bool scale_ue8m0);
+    bool scale_ue8m0,
+    );
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 void bmm_fp8(
