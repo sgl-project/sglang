@@ -122,7 +122,12 @@ pub trait Bootstrap: Send + Sync {
         let batch_size = self.get_batch_size()?;
         let bootstrap_port = match prefill_info.worker_type() {
             WorkerType::Prefill(port) => port,
-            _ => return Err(format!("Invalid worker type: {}", prefill_info.worker_type())),
+            _ => {
+                return Err(format!(
+                    "Invalid worker type: {}",
+                    prefill_info.worker_type()
+                ))
+            }
         };
         let bootstrap_host = crate::utils::hostname(prefill_info.url());
         if let Some(batch_size) = batch_size {

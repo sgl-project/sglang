@@ -67,17 +67,26 @@ impl PDRouter {
             self.timeout_secs,
             self.interval_secs,
         )
-        .await.map_err(|_| PDRouterError::HealthCheckFailed {
+        .await
+        .map_err(|_| PDRouterError::HealthCheckFailed {
             url: worker.url().to_string(),
         })?;
 
         let mut target_workers = match worker.worker_type() {
-            WorkerType::Decode => self.decode_workers.write().map_err(|_| PDRouterError::LockError {
-                operation: "decode_workers write".to_string(),
-            })?,
-            WorkerType::Prefill(_) => self.prefill_workers.write().map_err(|_| PDRouterError::LockError {
-                operation: "prefill_workers write".to_string(),
-            })?,
+            WorkerType::Decode => {
+                self.decode_workers
+                    .write()
+                    .map_err(|_| PDRouterError::LockError {
+                        operation: "decode_workers write".to_string(),
+                    })?
+            }
+            WorkerType::Prefill(_) => {
+                self.prefill_workers
+                    .write()
+                    .map_err(|_| PDRouterError::LockError {
+                        operation: "prefill_workers write".to_string(),
+                    })?
+            }
             other_type => {
                 return Err(PDRouterError::InvalidWorkerType {
                     url: worker.url().to_string(),
@@ -106,7 +115,6 @@ impl PDRouter {
         Ok(format!("Successfully added worker: {}", worker))
     }
 
-
     // Dynamic worker management methods for service discovery
     pub async fn add_prefill_server(
         &self,
@@ -123,20 +131,31 @@ impl PDRouter {
     }
 
     pub async fn remove_decode_server(&self, url: &str) -> Result<String, PDRouterError> {
-        let target_workers = self.decode_workers.write().map_err(|_| PDRouterError::LockError {
-            operation: "remove_workers write".to_string(),
-        })?;
+        let target_workers = self
+            .decode_workers
+            .write()
+            .map_err(|_| PDRouterError::LockError {
+                operation: "remove_workers write".to_string(),
+            })?;
         self.remove_worker(url, target_workers)
     }
 
     pub fn unified_remove_worker(&self, worker: Arc<dyn Worker>) -> Result<String, PDRouterError> {
         let target_workers = match worker.worker_type() {
-            WorkerType::Decode => self.decode_workers.write().map_err(|_| PDRouterError::LockError {
-                operation: "decode_workers write".to_string(),
-            })?,
-            WorkerType::Prefill(_) => self.prefill_workers.write().map_err(|_| PDRouterError::LockError {
-                operation: "prefill_workers write".to_string(),
-            })?,
+            WorkerType::Decode => {
+                self.decode_workers
+                    .write()
+                    .map_err(|_| PDRouterError::LockError {
+                        operation: "decode_workers write".to_string(),
+                    })?
+            }
+            WorkerType::Prefill(_) => {
+                self.prefill_workers
+                    .write()
+                    .map_err(|_| PDRouterError::LockError {
+                        operation: "prefill_workers write".to_string(),
+                    })?
+            }
             other_type => {
                 return Err(PDRouterError::InvalidWorkerType {
                     url: worker.url().to_string(),
@@ -146,8 +165,12 @@ impl PDRouter {
         };
         self.remove_worker(worker.url(), target_workers)
     }
-    
-    fn remove_worker(&self, url: &str, mut target_workers: RwLockWriteGuard<'_, Vec<Arc<dyn Worker>>>) -> Result<String, PDRouterError> {
+
+    fn remove_worker(
+        &self,
+        url: &str,
+        mut target_workers: RwLockWriteGuard<'_, Vec<Arc<dyn Worker>>>,
+    ) -> Result<String, PDRouterError> {
         let worker = target_workers.iter().find(|w| w.url() == url);
         if worker.is_none() {
             return Err(PDRouterError::WorkerNotFound {
@@ -175,12 +198,14 @@ impl PDRouter {
     }
 
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
-        let target_workers = self.prefill_workers.write().map_err(|_| PDRouterError::LockError {
-            operation: "prefill_workers write".to_string(),
-        })?;
+        let target_workers =
+            self.prefill_workers
+                .write()
+                .map_err(|_| PDRouterError::LockError {
+                    operation: "prefill_workers write".to_string(),
+                })?;
         self.remove_worker(url, target_workers)
     }
-
 
     pub fn new(
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -304,7 +329,9 @@ impl PDRouter {
         // Log routing decision
         info!(
             "PD routing: {} -> prefill={}, decode={}",
-            route, prefill.url(), decode.url()
+            route,
+            prefill.url(),
+            decode.url()
         );
 
         // Add bootstrap info using the trait method
@@ -371,7 +398,9 @@ impl PDRouter {
         // Log routing decision
         info!(
             "PD routing: {} -> prefill={}, decode={}",
-            route, prefill.url(), decode.url()
+            route,
+            prefill.url(),
+            decode.url()
         );
 
         // Add bootstrap info using the trait method
@@ -464,11 +493,11 @@ impl PDRouter {
                     .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
 
                 if !status.is_success() {
-                    counter!("sgl_router_pd_decode_errors_total", "worker" => decode_url.clone()).increment(1);
+                    counter!("sgl_router_pd_decode_errors_total", "worker" => decode_url.clone())
+                        .increment(1);
                     error!(
                         "Decode server {} returned error status: {}",
-                        &decode_url,
-                        status
+                        &decode_url, status
                     );
 
                     // Return the error response from decode server
@@ -490,7 +519,8 @@ impl PDRouter {
                         prefill.url(),
                         e
                     );
-                    counter!("sgl_router_pd_prefill_errors_total", "worker" => prefill_url).increment(1);
+                    counter!("sgl_router_pd_prefill_errors_total", "worker" => prefill_url)
+                        .increment(1);
                 }
 
                 if is_stream {
@@ -736,7 +766,11 @@ impl PDRouter {
             let workers: Vec<_> = {
                 let prefill_workers_guard = prefill_workers.read().unwrap();
                 let decode_workers_guard = decode_workers.read().unwrap();
-                prefill_workers_guard.iter().chain(decode_workers_guard.iter()).cloned().collect()
+                prefill_workers_guard
+                    .iter()
+                    .chain(decode_workers_guard.iter())
+                    .cloned()
+                    .collect()
             };
 
             let futures: Vec<_> = workers
@@ -744,7 +778,8 @@ impl PDRouter {
                 .map(|worker| {
                     let client = client.clone();
                     async move {
-                        let load = crate::core::worker::utils::get_worker_load(&client, worker).await;
+                        let load =
+                            crate::core::worker::utils::get_worker_load(&client, worker).await;
                         (worker.url().to_string(), load.unwrap_or(0))
                     }
                 })
@@ -1111,23 +1146,25 @@ mod tests {
     use crate::pd_types::PDSelectionPolicy;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::net::TcpListener;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     // ============================================================================
     // Test Helper Functions and Mock Servers
     // ============================================================================
 
     async fn create_mock_health_server(port: u16) -> String {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await.unwrap();
+        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
-        
+
         tokio::spawn(async move {
             loop {
                 if let Ok((mut stream, _)) = listener.accept().await {
                     let mut buffer = [0; 1024];
                     let _ = stream.read(&mut buffer).await;
-                    
+
                     let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}";
                     let _ = stream.write_all(response.as_bytes()).await;
                     let _ = stream.flush().await;
@@ -1135,7 +1172,7 @@ mod tests {
                 }
             }
         });
-        
+
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         format!("http://127.0.0.1:{}", addr.port())
     }
@@ -1143,14 +1180,14 @@ mod tests {
     async fn create_mock_load_server(load_value: isize) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        
+
         let response_body = format!("{{\"load\": {}}}", load_value);
         tokio::spawn(async move {
             loop {
                 if let Ok((mut stream, _)) = listener.accept().await {
                     let mut buffer = [0; 1024];
                     let _ = stream.read(&mut buffer).await;
-                    
+
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         response_body.len(),
@@ -1162,7 +1199,7 @@ mod tests {
                 }
             }
         });
-        
+
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         format!("http://127.0.0.1:{}", addr.port())
     }
@@ -1170,14 +1207,14 @@ mod tests {
     async fn create_mock_generate_server(response_body: &str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        
+
         let response_body = response_body.to_string();
         tokio::spawn(async move {
             loop {
                 if let Ok((mut stream, _)) = listener.accept().await {
                     let mut buffer = [0; 1024];
                     let _ = stream.read(&mut buffer).await;
-                    
+
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         response_body.len(),
@@ -1189,7 +1226,7 @@ mod tests {
                 }
             }
         });
-        
+
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         format!("http://127.0.0.1:{}", addr.port())
     }
@@ -1262,7 +1299,7 @@ mod tests {
     #[test]
     fn test_pd_router_creation() {
         let router = create_test_pd_router_with_mocks();
-        
+
         assert!(router.prefill_workers.read().unwrap().len() == 2);
         assert!(router.decode_workers.read().unwrap().len() == 2);
         assert!(matches!(router.selection_policy, PDSelectionPolicy::Random));
@@ -1272,13 +1309,16 @@ mod tests {
     #[test]
     fn test_cache_aware_pd_router_creation() {
         let router = create_test_cache_aware_pd_router();
-        
+
         assert!(router.prefill_workers.read().unwrap().len() == 2);
         assert!(router.decode_workers.read().unwrap().len() == 2);
-        assert!(matches!(router.selection_policy, PDSelectionPolicy::CacheAware { .. }));
+        assert!(matches!(
+            router.selection_policy,
+            PDSelectionPolicy::CacheAware { .. }
+        ));
         assert!(router.prefill_tree.is_some());
     }
-    
+
     // ============================================================================
     // Worker Selection Tests
     // ============================================================================
@@ -1287,10 +1327,10 @@ mod tests {
     async fn test_select_random_pd_pair() {
         let router = create_test_pd_router_with_mocks();
         let client = reqwest::Client::new();
-        
+
         let result = router.select_pd_pair(&client).await;
         assert!(result.is_ok());
-        
+
         let (prefill, decode) = result.unwrap();
         assert!(matches!(prefill.worker_type(), WorkerType::Prefill(_)));
         assert!(matches!(decode.worker_type(), WorkerType::Decode));
@@ -1300,10 +1340,10 @@ mod tests {
     async fn test_select_pd_pair_empty_prefill_workers() {
         let router = create_test_pd_router_with_mocks();
         *router.prefill_workers.write().unwrap() = vec![];
-        
+
         let client = reqwest::Client::new();
         let result = router.select_pd_pair(&client).await;
-        
+
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
     }
@@ -1312,10 +1352,10 @@ mod tests {
     async fn test_select_pd_pair_empty_decode_workers() {
         let router = create_test_pd_router_with_mocks();
         *router.decode_workers.write().unwrap() = vec![];
-        
+
         let client = reqwest::Client::new();
         let result = router.select_pd_pair(&client).await;
-        
+
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No decode workers available"));
     }
@@ -1324,21 +1364,21 @@ mod tests {
     async fn test_select_power_of_two() {
         let mut router = create_test_pd_router_with_mocks();
         router.selection_policy = PDSelectionPolicy::PowerOfTwo;
-        
+
         // Set up load data
         let mut load_data = HashMap::new();
         load_data.insert("http://prefill1:8080".to_string(), 5);
         load_data.insert("http://prefill2:8080".to_string(), 10);
         load_data.insert("http://decode1:8080".to_string(), 3);
         load_data.insert("http://decode2:8080".to_string(), 7);
-        
+
         // Update the watch channel
         let (_tx, rx) = tokio::sync::watch::channel(load_data);
         router.worker_loads = Arc::new(rx);
-        
+
         let result = router.select_power_of_two().await;
         assert!(result.is_ok());
-        
+
         let (prefill, decode) = result.unwrap();
         assert!(matches!(prefill.worker_type(), WorkerType::Prefill(_)));
         assert!(matches!(decode.worker_type(), WorkerType::Decode));
@@ -1351,15 +1391,19 @@ mod tests {
     #[tokio::test]
     async fn test_add_worker_health_check_failure() {
         let router = create_test_pd_router_with_mocks();
-        
+
         // Create a worker with non-existent URL - should fail health check
-        let failing_worker = WorkerFactory::create_prefill("http://nonexistent:8080".to_string(), Some(8081));
-        
+        let failing_worker =
+            WorkerFactory::create_prefill("http://nonexistent:8080".to_string(), Some(8081));
+
         let result = router.add_worker(failing_worker).await;
-        
+
         // Should fail because health check fails
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), PDRouterError::HealthCheckFailed { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            PDRouterError::HealthCheckFailed { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1367,35 +1411,42 @@ mod tests {
         // Create a mock server that will pass health checks
         let mock_url = create_mock_health_server(0).await;
         let router = create_test_pd_router_with_mocks();
-        
+
         // First, add a worker with the mock URL to the router manually
         let new_worker = WorkerFactory::create_prefill(mock_url.clone(), Some(8081));
         router.prefill_workers.write().unwrap().push(new_worker);
-        
+
         // Now try to add another worker with the same URL - should fail as duplicate
         let duplicate_worker = WorkerFactory::create_prefill(mock_url, Some(8081));
         let result = router.add_worker(duplicate_worker).await;
-        
+
         // Should fail because worker already exists (after health check passes)
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), PDRouterError::WorkerAlreadyExists { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            PDRouterError::WorkerAlreadyExists { .. }
+        ));
     }
 
-    #[test] 
+    #[test]
     fn test_worker_creation_and_management() {
         let router = create_test_pd_router_with_mocks();
-        
+
         // Test initial state
         assert_eq!(router.prefill_workers.read().unwrap().len(), 2);
         assert_eq!(router.decode_workers.read().unwrap().len(), 2);
-        
+
         // Test that we can create workers with proper types
-        let prefill_worker = WorkerFactory::create_prefill("http://new-prefill:8080".to_string(), Some(8083));
+        let prefill_worker =
+            WorkerFactory::create_prefill("http://new-prefill:8080".to_string(), Some(8083));
         let decode_worker = WorkerFactory::create_decode("http://new-decode:8080".to_string());
-        
-        assert!(matches!(prefill_worker.worker_type(), WorkerType::Prefill(_)));
+
+        assert!(matches!(
+            prefill_worker.worker_type(),
+            WorkerType::Prefill(_)
+        ));
         assert!(matches!(decode_worker.worker_type(), WorkerType::Decode));
-        
+
         // Test URL generation
         assert_eq!(prefill_worker.url(), "http://new-prefill:8080");
         assert_eq!(decode_worker.url(), "http://new-decode:8080");
@@ -1404,10 +1455,10 @@ mod tests {
     #[tokio::test]
     async fn test_remove_prefill_server() {
         let router = create_test_pd_router_with_mocks();
-        
+
         let result = router.remove_prefill_server("http://prefill1:8080").await;
         assert!(result.is_ok());
-        
+
         // Verify worker was removed
         let workers = router.prefill_workers.read().unwrap();
         assert_eq!(workers.len(), 1);
@@ -1417,10 +1468,10 @@ mod tests {
     #[tokio::test]
     async fn test_remove_decode_server() {
         let router = create_test_pd_router_with_mocks();
-        
+
         let result = router.remove_decode_server("http://decode1:8080").await;
         assert!(result.is_ok());
-        
+
         // Verify worker was removed
         let workers = router.decode_workers.read().unwrap();
         assert_eq!(workers.len(), 1);
@@ -1430,10 +1481,15 @@ mod tests {
     #[tokio::test]
     async fn test_remove_nonexistent_worker() {
         let router = create_test_pd_router_with_mocks();
-        
-        let result = router.remove_prefill_server("http://nonexistent:8080").await;
+
+        let result = router
+            .remove_prefill_server("http://nonexistent:8080")
+            .await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), PDRouterError::WorkerNotFound { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            PDRouterError::WorkerNotFound { .. }
+        ));
     }
 
     // ============================================================================
@@ -1446,18 +1502,18 @@ mod tests {
             WorkerFactory::create_decode("http://worker1:8080".to_string()),
             WorkerFactory::create_prefill("http://worker2:8080".to_string(), Some(8081)),
         ];
-        
+
         // Check initial load values
         assert_eq!(workers[0].load().load(Ordering::Relaxed), 0);
         assert_eq!(workers[1].load().load(Ordering::Relaxed), 0);
-        
+
         {
             let _guard = LoadGuard::new(workers.clone());
             // Load should be incremented
             assert_eq!(workers[0].load().load(Ordering::Relaxed), 1);
             assert_eq!(workers[1].load().load(Ordering::Relaxed), 1);
         } // Guard drops here
-        
+
         // Load should be decremented back to 0
         assert_eq!(workers[0].load().load(Ordering::Relaxed), 0);
         assert_eq!(workers[1].load().load(Ordering::Relaxed), 0);
@@ -1474,7 +1530,7 @@ mod tests {
         assert!(idx1 < 5);
         assert!(idx2 < 5);
         assert_ne!(idx1, idx2);
-        
+
         // Test with single element
         let (idx1, idx2) = get_two_random_indices(1);
         assert_eq!(idx1, 0);
@@ -1485,7 +1541,7 @@ mod tests {
     async fn test_get_worker_load_success() {
         let mock_url = create_mock_load_server(42).await;
         let client = reqwest::Client::new();
-        
+
         let load = get_worker_load(&client, &mock_url).await;
         assert_eq!(load, Some(42));
     }
@@ -1493,7 +1549,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_worker_load_failure() {
         let client = reqwest::Client::new();
-        
+
         let load = get_worker_load(&client, "http://nonexistent:8080").await;
         assert_eq!(load, None);
     }
@@ -1506,10 +1562,10 @@ mod tests {
     fn test_merge_streaming_logprobs_success() {
         let prefill_logprobs = Some(serde_json::json!([1.0, 2.0, 3.0]));
         let decode_chunk = b"data: {\"meta_info\": {\"input_token_logprobs\": [4.0, 5.0]}}\n\n";
-        
+
         let result = PDRouter::merge_streaming_logprobs(prefill_logprobs, decode_chunk);
         assert!(result.is_ok());
-        
+
         let merged = result.unwrap();
         let merged_str = std::str::from_utf8(&merged).unwrap();
         assert!(merged_str.contains("data:"));
@@ -1521,7 +1577,7 @@ mod tests {
     fn test_merge_streaming_logprobs_skip_non_data() {
         let prefill_logprobs = Some(serde_json::json!([1.0, 2.0, 3.0]));
         let non_data_chunk = b"event: ping\n\n";
-        
+
         let result = PDRouter::merge_streaming_logprobs(prefill_logprobs, non_data_chunk);
         assert!(result.is_err());
     }
@@ -1530,7 +1586,7 @@ mod tests {
     fn test_merge_streaming_logprobs_done_chunk() {
         let prefill_logprobs = Some(serde_json::json!([1.0, 2.0, 3.0]));
         let done_chunk = b"data: [DONE]\n\n";
-        
+
         let result = PDRouter::merge_streaming_logprobs(prefill_logprobs, done_chunk);
         assert!(result.is_err());
     }
@@ -1542,8 +1598,9 @@ mod tests {
     #[test]
     fn test_generate_request_bootstrap() {
         use crate::pd_types::{GenerateReqInput, InputText};
-        
-        let prefill_worker = WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(8081));
+
+        let prefill_worker =
+            WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(8081));
         let mut req = GenerateReqInput {
             text: Some(InputText::Single("test input".to_string())),
             input_ids: None,
@@ -1553,10 +1610,10 @@ mod tests {
             bootstrap_room: None,
             other: serde_json::Value::Object(serde_json::Map::new()),
         };
-        
+
         let result = req.add_bootstrap_info(&prefill_worker);
         assert!(result.is_ok());
-        
+
         // Check that bootstrap info was added
         assert!(req.bootstrap_host.is_some());
         assert!(req.bootstrap_port.is_some());
@@ -1566,8 +1623,9 @@ mod tests {
     #[test]
     fn test_chat_request_bootstrap() {
         use crate::pd_types::ChatReqInput;
-        
-        let prefill_worker = WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(8081));
+
+        let prefill_worker =
+            WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(8081));
         let mut req = ChatReqInput {
             stream: false,
             bootstrap_host: None,
@@ -1575,10 +1633,10 @@ mod tests {
             bootstrap_room: None,
             other: serde_json::Value::Object(serde_json::Map::new()),
         };
-        
+
         let result = req.add_bootstrap_info(&prefill_worker);
         assert!(result.is_ok());
-        
+
         // Check that bootstrap info was added
         assert!(req.bootstrap_host.is_some());
         assert!(req.bootstrap_port.is_some());
@@ -1593,14 +1651,13 @@ mod tests {
     async fn test_health_generate_all_healthy() {
         let prefill_url = create_mock_health_server(0).await;
         let decode_url = create_mock_health_server(0).await;
-        
+
         let router = PDRouter {
-            prefill_workers: Arc::new(RwLock::new(vec![
-                WorkerFactory::create_prefill(prefill_url, Some(8081))
-            ])),
-            decode_workers: Arc::new(RwLock::new(vec![
-                WorkerFactory::create_decode(decode_url)
-            ])),
+            prefill_workers: Arc::new(RwLock::new(vec![WorkerFactory::create_prefill(
+                prefill_url,
+                Some(8081),
+            )])),
+            decode_workers: Arc::new(RwLock::new(vec![WorkerFactory::create_decode(decode_url)])),
             selection_policy: PDSelectionPolicy::Random,
             prefill_tree: None,
             timeout_secs: 5,
@@ -1609,10 +1666,10 @@ mod tests {
             load_monitor_handle: None,
             http_client: reqwest::Client::new(),
         };
-        
+
         let client = reqwest::Client::new();
         let response = router.health_generate(&client).await;
-        
+
         assert_eq!(response.status(), actix_web::http::StatusCode::OK);
     }
 
@@ -1620,14 +1677,13 @@ mod tests {
     async fn test_get_loads() {
         let prefill_url = create_mock_load_server(10).await;
         let decode_url = create_mock_load_server(20).await;
-        
+
         let router = PDRouter {
-            prefill_workers: Arc::new(RwLock::new(vec![
-                WorkerFactory::create_prefill(prefill_url, Some(8081))
-            ])),
-            decode_workers: Arc::new(RwLock::new(vec![
-                WorkerFactory::create_decode(decode_url)
-            ])),
+            prefill_workers: Arc::new(RwLock::new(vec![WorkerFactory::create_prefill(
+                prefill_url,
+                Some(8081),
+            )])),
+            decode_workers: Arc::new(RwLock::new(vec![WorkerFactory::create_decode(decode_url)])),
             selection_policy: PDSelectionPolicy::Random,
             prefill_tree: None,
             timeout_secs: 5,
@@ -1636,10 +1692,10 @@ mod tests {
             load_monitor_handle: None,
             http_client: reqwest::Client::new(),
         };
-        
+
         let client = reqwest::Client::new();
         let response = router.get_loads(&client).await;
-        
+
         assert_eq!(response.status(), actix_web::http::StatusCode::OK);
     }
 
@@ -1647,11 +1703,12 @@ mod tests {
     async fn test_get_models() {
         let model_response = r#"{"data": [{"id": "test-model"}]}"#;
         let mock_url = create_mock_generate_server(model_response).await;
-        
+
         let router = PDRouter {
-            prefill_workers: Arc::new(RwLock::new(vec![
-                WorkerFactory::create_prefill(mock_url, Some(8081))
-            ])),
+            prefill_workers: Arc::new(RwLock::new(vec![WorkerFactory::create_prefill(
+                mock_url,
+                Some(8081),
+            )])),
             decode_workers: Arc::new(RwLock::new(vec![])),
             selection_policy: PDSelectionPolicy::Random,
             prefill_tree: None,
@@ -1661,11 +1718,11 @@ mod tests {
             load_monitor_handle: None,
             http_client: reqwest::Client::new(),
         };
-        
+
         let client = reqwest::Client::new();
         let req = actix_web::test::TestRequest::get().to_http_request();
         let response = router.get_models(&client, &req).await;
-        
+
         assert_eq!(response.status(), actix_web::http::StatusCode::OK);
     }
 
@@ -1673,12 +1730,10 @@ mod tests {
     async fn test_get_server_info() {
         let server_info_response = r#"{"internal_states": [{"last_gen_throughput": 100.0}]}"#;
         let mock_url = create_mock_generate_server(server_info_response).await;
-        
+
         let router = PDRouter {
             prefill_workers: Arc::new(RwLock::new(vec![])),
-            decode_workers: Arc::new(RwLock::new(vec![
-                WorkerFactory::create_decode(mock_url)
-            ])),
+            decode_workers: Arc::new(RwLock::new(vec![WorkerFactory::create_decode(mock_url)])),
             selection_policy: PDSelectionPolicy::Random,
             prefill_tree: None,
             timeout_secs: 5,
@@ -1687,10 +1742,10 @@ mod tests {
             load_monitor_handle: None,
             http_client: reqwest::Client::new(),
         };
-        
+
         let client = reqwest::Client::new();
         let response = router.get_server_info(&client).await;
-        
+
         assert_eq!(response.status(), actix_web::http::StatusCode::OK);
     }
 
@@ -1698,11 +1753,12 @@ mod tests {
     async fn test_get_model_info() {
         let model_info_response = r#"{"model_name": "test-model", "vocab_size": 50000}"#;
         let mock_url = create_mock_generate_server(model_info_response).await;
-        
+
         let router = PDRouter {
-            prefill_workers: Arc::new(RwLock::new(vec![
-                WorkerFactory::create_prefill(mock_url, Some(8081))
-            ])),
+            prefill_workers: Arc::new(RwLock::new(vec![WorkerFactory::create_prefill(
+                mock_url,
+                Some(8081),
+            )])),
             decode_workers: Arc::new(RwLock::new(vec![])),
             selection_policy: PDSelectionPolicy::Random,
             prefill_tree: None,
@@ -1712,11 +1768,11 @@ mod tests {
             load_monitor_handle: None,
             http_client: reqwest::Client::new(),
         };
-        
+
         let client = reqwest::Client::new();
         let req = actix_web::test::TestRequest::get().to_http_request();
         let response = router.get_model_info(&client, &req).await;
-        
+
         assert_eq!(response.status(), actix_web::http::StatusCode::OK);
     }
 
@@ -1737,10 +1793,10 @@ mod tests {
             load_monitor_handle: None,
             http_client: reqwest::Client::new(),
         };
-        
+
         let client = reqwest::Client::new();
         let response = router.health_generate(&client).await;
-        
+
         // Should still return OK even with no workers
         assert_eq!(response.status(), actix_web::http::StatusCode::OK);
     }
@@ -1758,12 +1814,15 @@ mod tests {
             load_monitor_handle: None,
             http_client: reqwest::Client::new(),
         };
-        
+
         let client = reqwest::Client::new();
         let req = actix_web::test::TestRequest::get().to_http_request();
         let response = router.get_models(&client, &req).await;
-        
-        assert_eq!(response.status(), actix_web::http::StatusCode::SERVICE_UNAVAILABLE);
+
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     // ============================================================================
@@ -1774,25 +1833,27 @@ mod tests {
     async fn test_add_prefill_worker_cache_aware() {
         let router = create_test_cache_aware_pd_router();
         let mock_url = create_mock_health_server(0).await;
-        
+
         // Get initial tree state
         let initial_tree_size = if let Some(tree) = &router.prefill_tree {
             tree.lock().unwrap().get_used_size_per_tenant().len()
         } else {
             0
         };
-        
+
         let initial_worker_count = router.prefill_workers.read().unwrap().len();
-        
+
         // Add a new prefill worker
-        let result = router.add_prefill_server(mock_url.clone(), Some(8084)).await;
+        let result = router
+            .add_prefill_server(mock_url.clone(), Some(8084))
+            .await;
         assert!(result.is_ok());
-        
+
         // Verify worker was added
         let workers = router.prefill_workers.read().unwrap();
         assert_eq!(workers.len(), initial_worker_count + 1);
         assert!(workers.iter().any(|w| w.url() == mock_url));
-        
+
         // Verify worker was added to cache tree
         if let Some(tree) = &router.prefill_tree {
             let tree_tenants = tree.lock().unwrap().get_used_size_per_tenant();
@@ -1804,20 +1865,20 @@ mod tests {
     #[tokio::test]
     async fn test_remove_prefill_worker_cache_aware() {
         let router = create_test_cache_aware_pd_router();
-        
+
         // Get initial state
         let initial_worker_count = router.prefill_workers.read().unwrap().len();
         let worker_to_remove = router.prefill_workers.read().unwrap()[0].url().to_string();
-        
+
         // Remove the prefill worker
         let result = router.remove_prefill_server(&worker_to_remove).await;
         assert!(result.is_ok());
-        
+
         // Verify worker was removed
         let workers = router.prefill_workers.read().unwrap();
         assert_eq!(workers.len(), initial_worker_count - 1);
         assert!(!workers.iter().any(|w| w.url() == worker_to_remove));
-        
+
         // Verify worker was removed from cache tree
         if let Some(tree) = &router.prefill_tree {
             let tree_tenants = tree.lock().unwrap().get_used_size_per_tenant();
@@ -1831,25 +1892,25 @@ mod tests {
     async fn test_add_decode_worker_no_cache_impact() {
         let router = create_test_cache_aware_pd_router();
         let mock_url = create_mock_health_server(0).await;
-        
+
         // Get initial tree state
         let initial_tree_size = if let Some(tree) = &router.prefill_tree {
             tree.lock().unwrap().get_used_size_per_tenant().len()
         } else {
             0
         };
-        
+
         let initial_worker_count = router.decode_workers.read().unwrap().len();
-        
+
         // Add a new decode worker
         let result = router.add_decode_server(mock_url.clone()).await;
         assert!(result.is_ok());
-        
+
         // Verify decode worker was added
         let workers = router.decode_workers.read().unwrap();
         assert_eq!(workers.len(), initial_worker_count + 1);
         assert!(workers.iter().any(|w| w.url() == mock_url));
-        
+
         // Verify cache tree was NOT affected (decode workers don't use cache)
         if let Some(tree) = &router.prefill_tree {
             let tree_tenants = tree.lock().unwrap().get_used_size_per_tenant();
@@ -1861,41 +1922,41 @@ mod tests {
     #[tokio::test]
     async fn test_cache_aware_selection_with_multiple_workers() {
         let mut router = create_test_cache_aware_pd_router();
-        
+
         // Set up power-of-two selection for comparison
         router.selection_policy = PDSelectionPolicy::PowerOfTwo;
-        
+
         // Set up load data to test selection
         let mut load_data = HashMap::new();
         load_data.insert("http://prefill1:8080".to_string(), 5);
         load_data.insert("http://prefill2:8080".to_string(), 10);
         load_data.insert("http://decode1:8080".to_string(), 3);
         load_data.insert("http://decode2:8080".to_string(), 7);
-        
+
         let (_tx, rx) = tokio::sync::watch::channel(load_data);
         router.worker_loads = Arc::new(rx);
-        
+
         // Test that power-of-two selection works
         let result = router.select_power_of_two().await;
         assert!(result.is_ok());
-        
+
         let (prefill, decode) = result.unwrap();
-        
+
         // Should select workers with lower load
         assert!(prefill.url() == "http://prefill1:8080"); // load 5 < 10
-        assert!(decode.url() == "http://decode1:8080");   // load 3 < 7
+        assert!(decode.url() == "http://decode1:8080"); // load 3 < 7
     }
 
     #[test]
     fn test_cache_aware_pd_router_tree_initialization() {
         let router = create_test_cache_aware_pd_router();
-        
+
         // Verify cache tree exists and is properly initialized
         assert!(router.prefill_tree.is_some());
-        
+
         if let Some(tree) = &router.prefill_tree {
             let tree_tenants = tree.lock().unwrap().get_used_size_per_tenant();
-            
+
             // Should have entries for both prefill workers
             assert_eq!(tree_tenants.len(), 2);
             assert!(tree_tenants.contains_key("http://prefill1:8080"));
@@ -1906,13 +1967,14 @@ mod tests {
     #[tokio::test]
     async fn test_cache_aware_worker_selection_policy() {
         let router = create_test_cache_aware_pd_router();
-        
+
         // Verify the selection policy is properly set
-        if let PDSelectionPolicy::CacheAware { 
-            cache_threshold, 
-            balance_abs_threshold, 
-            balance_rel_threshold 
-        } = &router.selection_policy {
+        if let PDSelectionPolicy::CacheAware {
+            cache_threshold,
+            balance_abs_threshold,
+            balance_rel_threshold,
+        } = &router.selection_policy
+        {
             assert_eq!(*cache_threshold, 0.5);
             assert_eq!(*balance_abs_threshold, 10);
             assert_eq!(*balance_rel_threshold, 1.5);
@@ -1931,22 +1993,22 @@ mod tests {
             url: "http://test:8080".to_string(),
         };
         assert!(format!("{:?}", health_check_error).contains("HealthCheckFailed"));
-        
+
         let worker_not_found_error = PDRouterError::WorkerNotFound {
             url: "http://test:8080".to_string(),
         };
         assert!(format!("{:?}", worker_not_found_error).contains("WorkerNotFound"));
-        
+
         let lock_error = PDRouterError::LockError {
             operation: "test operation".to_string(),
         };
         assert!(format!("{:?}", lock_error).contains("LockError"));
-        
+
         let worker_already_exists_error = PDRouterError::WorkerAlreadyExists {
             url: "http://test:8080".to_string(),
         };
         assert!(format!("{:?}", worker_already_exists_error).contains("WorkerAlreadyExists"));
-        
+
         let invalid_worker_type_error = PDRouterError::InvalidWorkerType {
             url: "http://test:8080".to_string(),
             worker_type: "Regular".to_string(),
@@ -1958,14 +2020,15 @@ mod tests {
     async fn test_flush_cache() {
         let mock_prefill_url = create_mock_generate_server("{}").await;
         let mock_decode_url = create_mock_generate_server("{}").await;
-        
+
         let router = PDRouter {
-            prefill_workers: Arc::new(RwLock::new(vec![
-                WorkerFactory::create_prefill(mock_prefill_url, Some(8081))
-            ])),
-            decode_workers: Arc::new(RwLock::new(vec![
-                WorkerFactory::create_decode(mock_decode_url)
-            ])),
+            prefill_workers: Arc::new(RwLock::new(vec![WorkerFactory::create_prefill(
+                mock_prefill_url,
+                Some(8081),
+            )])),
+            decode_workers: Arc::new(RwLock::new(vec![WorkerFactory::create_decode(
+                mock_decode_url,
+            )])),
             selection_policy: PDSelectionPolicy::Random,
             prefill_tree: None,
             timeout_secs: 5,
@@ -1974,10 +2037,10 @@ mod tests {
             load_monitor_handle: None,
             http_client: reqwest::Client::new(),
         };
-        
+
         let client = reqwest::Client::new();
         let response = router.flush_cache(&client).await;
-        
+
         assert_eq!(response.status(), actix_web::http::StatusCode::OK);
     }
 
@@ -1988,16 +2051,16 @@ mod tests {
     #[tokio::test]
     async fn test_cache_aware_with_load_balancing() {
         let router = create_test_cache_aware_pd_router();
-        
+
         // Test that cache-aware selection falls back to power-of-two when needed
         // This simulates the behavior in the actual cache-aware implementation
         let client = reqwest::Client::new();
-        
+
         // Test multiple selections to ensure they don't panic
         for _ in 0..5 {
             let result = router.select_pd_pair(&client).await;
             assert!(result.is_ok());
-            
+
             let (prefill, decode) = result.unwrap();
             assert!(matches!(prefill.worker_type(), WorkerType::Prefill(_)));
             assert!(matches!(decode.worker_type(), WorkerType::Decode));

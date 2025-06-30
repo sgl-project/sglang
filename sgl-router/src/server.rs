@@ -1,3 +1,4 @@
+use crate::core::WorkerFactory;
 use crate::logging::{self, LoggingConfig};
 use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
 use crate::prometheus::{self, PrometheusConfig};
@@ -228,7 +229,9 @@ async fn add_worker(
         }
     };
 
-    match data.router.add_worker(&worker_url).await {
+    let worker = WorkerFactory::create_regular(worker_url.clone());
+
+    match data.router.add_worker(worker).await {
         Ok(message) => HttpResponse::Ok().body(message),
         Err(error) => HttpResponse::BadRequest().body(error),
     }

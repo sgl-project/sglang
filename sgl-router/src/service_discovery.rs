@@ -61,12 +61,11 @@ pub struct PodInfo {
     pub worker: Arc<dyn Worker>,
 }
 
-
 impl PartialEq for PodInfo {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name 
-            && self.ip == other.ip 
-            && self.status == other.status 
+        self.name == other.name
+            && self.ip == other.ip
+            && self.status == other.status
             && self.is_ready == other.is_ready
             && self.worker.worker_type() == other.worker.worker_type()
     }
@@ -140,12 +139,13 @@ impl PodInfo {
         let worker = if config.pd_mode {
             if Self::matches_selector(pod, &config.prefill_selector) {
                 // Extract bootstrap port from annotations for prefill pods
-                let bootstrap_port = pod.metadata
+                let bootstrap_port = pod
+                    .metadata
                     .annotations
                     .as_ref()
                     .and_then(|annotations| annotations.get(&config.bootstrap_port_annotation))
                     .and_then(|port_str| port_str.parse::<u16>().ok());
-                
+
                 WorkerFactory::create_prefill(worker_url, bootstrap_port)
             } else if Self::matches_selector(pod, &config.decode_selector) {
                 WorkerFactory::create_decode(worker_url)
@@ -298,19 +298,10 @@ pub async fn start_service_discovery(
 
                         if let Some(pod_info) = pod_info {
                             if pod.metadata.deletion_timestamp.is_some() {
-                                handle_pod_deletion(
-                                    &pod_info,
-                                    tracked_pods_inner,
-                                    router_inner,
-                                )
-                                .await;
+                                handle_pod_deletion(&pod_info, tracked_pods_inner, router_inner)
+                                    .await;
                             } else {
-                                handle_pod_event(
-                                    &pod_info,
-                                    tracked_pods_inner,
-                                    router_inner,
-                                )
-                                .await;
+                                handle_pod_event(&pod_info, tracked_pods_inner, router_inner).await;
                             }
                         }
                         Ok(())
@@ -376,20 +367,24 @@ async fn handle_pod_event(
         if should_add {
             info!(
                 "Healthy pod found: {} (type: {:?}). Adding worker: {}",
-                pod_info.name, 
-                pod_info.worker_type(), 
+                pod_info.name,
+                pod_info.worker_type(),
                 pod_info.worker_url()
             );
 
             // Use unified worker management interface
-            let result = router.unified_add_worker(pod_info.worker.clone()).await;
+            let result = router.add_worker(pod_info.worker.clone()).await;
 
             match result {
                 Ok(msg) => {
                     info!("Successfully added worker: {}", msg);
                 }
                 Err(e) => {
-                    error!("Failed to add worker {} to router: {}", pod_info.worker_url(), e);
+                    error!(
+                        "Failed to add worker {} to router: {}",
+                        pod_info.worker_url(),
+                        e
+                    );
                     // Remove from tracking since addition failed
                     if let Ok(mut tracker) = tracked_pods.lock() {
                         tracker.remove(pod_info);
@@ -419,16 +414,17 @@ async fn handle_pod_deletion(
     if was_tracked {
         info!(
             "Pod deleted: {} (type: {:?}). Removing worker: {}",
-            pod_info.name, 
-            pod_info.worker_type(), 
+            pod_info.name,
+            pod_info.worker_type(),
             pod_info.worker_url()
         );
 
         // Use unified worker removal interface
-        if let Err(e) = router.unified_remove_worker(pod_info.worker.clone()) {
+        if let Err(e) = router.remove_worker(pod_info.worker.clone()) {
             error!(
                 "Failed to remove worker {} from router: {}",
-                pod_info.worker_url(), e
+                pod_info.worker_url(),
+                e
             );
         }
     } else {
@@ -436,13 +432,12 @@ async fn handle_pod_deletion(
         // Or if the event is duplicated. No action needed on the router if it wasn't tracked (and thus not added).
         debug!(
             "Pod deletion event for untracked/already removed pod: {} (type: {:?}). Worker URL: {}",
-            pod_info.name, 
-            pod_info.worker_type(), 
+            pod_info.name,
+            pod_info.worker_type(),
             pod_info.worker_url()
         );
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -804,7 +799,7 @@ mod tests {
     #[test]
     fn test_pod_info_equality_with_worker_type() {
         let config = create_pd_config();
-        
+
         let k8s_pod1 = create_pd_k8s_pod("prefill-pod", "1.2.3.4", "prefill", Some(8081));
         let pod1 = PodInfo::from_pod(&k8s_pod1, &config).unwrap();
 
@@ -822,7 +817,7 @@ mod tests {
     async fn test_handle_pod_event_add_unhealthy_pod() {
         let router = create_test_router();
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
-        
+
         let config = ServiceDiscoveryConfig::default();
         let k8s_pod = create_k8s_pod(
             Some("unhealthy-pod"),
@@ -833,12 +828,7 @@ mod tests {
         );
         let pod_info = PodInfo::from_pod(&k8s_pod, &config).unwrap();
 
-        handle_pod_event(
-            &pod_info,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-        )
-        .await;
+        handle_pod_event(&pod_info, Arc::clone(&tracked_pods), Arc::clone(&router)).await;
 
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
     }
@@ -847,7 +837,7 @@ mod tests {
     async fn test_handle_pod_deletion_non_existing_pod() {
         let router = create_test_router();
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
-        
+
         let config = ServiceDiscoveryConfig::default();
         let k8s_pod = create_k8s_pod(
             Some("test-pod"),
@@ -858,12 +848,7 @@ mod tests {
         );
         let pod_info = PodInfo::from_pod(&k8s_pod, &config).unwrap();
 
-        handle_pod_deletion(
-            &pod_info,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-        )
-        .await;
+        handle_pod_deletion(&pod_info, Arc::clone(&tracked_pods), Arc::clone(&router)).await;
 
         assert!(tracked_pods.lock().unwrap().is_empty());
     }
@@ -872,7 +857,7 @@ mod tests {
     async fn test_handle_pd_pod_deletion_tracked_pod() {
         let router = create_test_router();
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
-        
+
         let config = create_pd_config();
         let k8s_pod = create_pd_k8s_pod("prefill-pod", "1.2.3.4", "prefill", Some(8081));
         let pod_info = PodInfo::from_pod(&k8s_pod, &config).unwrap();
@@ -883,12 +868,7 @@ mod tests {
             tracked.insert(pod_info.clone());
         }
 
-        handle_pod_deletion(
-            &pod_info,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-        )
-        .await;
+        handle_pod_deletion(&pod_info, Arc::clone(&tracked_pods), Arc::clone(&router)).await;
 
         // Pod should be removed from tracking
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
@@ -898,19 +878,14 @@ mod tests {
     async fn test_handle_pd_pod_deletion_untracked_pod() {
         let router = create_test_router();
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
-        
+
         let config = create_pd_config();
         let k8s_pod = create_pd_k8s_pod("decode-pod", "1.2.3.4", "decode", None);
         let pod_info = PodInfo::from_pod(&k8s_pod, &config).unwrap();
 
         // Don't add pod to tracked set
 
-        handle_pod_deletion(
-            &pod_info,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-        )
-        .await;
+        handle_pod_deletion(&pod_info, Arc::clone(&tracked_pods), Arc::clone(&router)).await;
 
         // Tracked set should remain empty
         assert!(tracked_pods.lock().unwrap().is_empty());
@@ -920,7 +895,7 @@ mod tests {
     async fn test_unified_handler_regular_mode() {
         let router = create_test_router();
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
-        
+
         let config = ServiceDiscoveryConfig::default();
         let k8s_pod = create_k8s_pod(
             Some("regular-pod"),
@@ -932,12 +907,7 @@ mod tests {
         let pod_info = PodInfo::from_pod(&k8s_pod, &config).unwrap();
 
         // Test that unified handler works for regular mode
-        handle_pod_event(
-            &pod_info,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-        )
-        .await;
+        handle_pod_event(&pod_info, Arc::clone(&tracked_pods), Arc::clone(&router)).await;
 
         // Pod should not be tracked since router.unified_add_worker will fail for non-running server
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
@@ -947,18 +917,13 @@ mod tests {
     async fn test_unified_handler_pd_mode_with_prefill() {
         let router = create_test_router();
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
-        
+
         let config = create_pd_config();
         let k8s_pod = create_pd_k8s_pod("prefill-pod", "1.2.3.4", "prefill", Some(8081));
         let pod_info = PodInfo::from_pod(&k8s_pod, &config).unwrap();
 
         // Test that unified handler works for PD mode with prefill
-        handle_pod_event(
-            &pod_info,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-        )
-        .await;
+        handle_pod_event(&pod_info, Arc::clone(&tracked_pods), Arc::clone(&router)).await;
 
         // Pod should not be tracked since router.unified_add_worker will fail for non-running server
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
@@ -968,7 +933,7 @@ mod tests {
     async fn test_unified_handler_deletion_with_pd_mode() {
         let router = create_test_router();
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
-        
+
         let config = create_pd_config();
         let k8s_pod = create_pd_k8s_pod("decode-pod", "1.2.3.4", "decode", None);
         let pod_info = PodInfo::from_pod(&k8s_pod, &config).unwrap();
@@ -980,12 +945,7 @@ mod tests {
         }
 
         // Test that unified handler works for deletion in PD mode
-        handle_pod_deletion(
-            &pod_info,
-            Arc::clone(&tracked_pods),
-            Arc::clone(&router),
-        )
-        .await;
+        handle_pod_deletion(&pod_info, Arc::clone(&tracked_pods), Arc::clone(&router)).await;
 
         // Pod should be removed from tracking
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
