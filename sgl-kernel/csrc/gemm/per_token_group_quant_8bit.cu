@@ -93,19 +93,19 @@ constexpr int THREADS_PER_SUBWARP = 8;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 
 struct NaiveScheduler {
-  static void compute_exec_config(int num_groups, int subwarps_per_block, dim3& grid, dim3& block) {
-    const int num_blocks = num_groups / subwarps_per_block;
-    const int num_threads = subwarps_per_block * THREADS_PER_SUBWARP;
+  static void compute_exec_config(int num_groups, int subwarps_per_block_log2, dim3& grid, dim3& block) {
+    const int num_blocks = num_groups >> subwarps_per_block_log2;
+    const int num_threads = THREADS_PER_SUBWARP << subwarps_per_block_log2;
 
     grid = dim3(num_blocks);
     block = dim3(num_threads);
   }
 
   template <typename FUNC>
-  __device__ __forceinline__ static void execute(int subwarps_per_block, FUNC fn) {
+  __device__ __forceinline__ static void execute(int subwarps_per_block_log2, FUNC fn) {
     const int local_group_id = threadIdx.x / THREADS_PER_SUBWARP;
     const int lane_id = threadIdx.x % THREADS_PER_SUBWARP;
-    const int block_group_id = blockIdx.x * subwarps_per_block;
+    const int block_group_id = blockIdx.x << subwarps_per_block_log2;
     const int group_id = block_group_id + local_group_id;
 
     fn(group_id, lane_id);
@@ -124,7 +124,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     DST_DTYPE* __restrict__ output_q,
     scale_packed_t* __restrict__ output_s,
     const int group_size,
-    const int subwarps_per_block,
+    const int subwarps_per_block_log2,
     // TODO can remove?
     const int scale_hidden_size = 0,
     const int scale_hidden_stride = 0) {
@@ -132,7 +132,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
-  SCHEDULER::execute(subwarps_per_block, [&](int group_id, int lane_id) {
+  SCHEDULER::execute(subwarps_per_block_log2, [&](int group_id, int lane_id) {
     constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
     constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
@@ -214,17 +214,17 @@ __global__ void per_token_group_quant_8bit_kernel(
   });
 }
 
-int compute_subwarps_per_block(int num_groups) {
+int compute_subwarps_per_block_log2(int num_groups) {
   if (num_groups % 16 == 0) {
-    return 16;
-  } else if (num_groups % 8 == 0) {
-    return 8;
-  } else if (num_groups % 4 == 0) {
     return 4;
-  } else if (num_groups % 2 == 0) {
+  } else if (num_groups % 8 == 0) {
+    return 3;
+  } else if (num_groups % 4 == 0) {
     return 2;
+  } else if (num_groups % 2 == 0) {
+    return 1;
   }
-  return 1;
+  return 0;
 }
 
 void sgl_per_token_group_quant_8bit(
@@ -248,7 +248,7 @@ void sgl_per_token_group_quant_8bit(
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  int subwarps_per_block = compute_subwarps_per_block(num_groups);
+  int subwarps_per_block_log2 = compute_subwarps_per_block_log2(num_groups);
 
   auto dst_type = output_q.scalar_type();
 
@@ -259,14 +259,14 @@ void sgl_per_token_group_quant_8bit(
 #define LAUNCH_KERNEL_INNER(SCHEDULER, T, DST_DTYPE, output_s_dtype, ...)                                \
   do {                                                                                                   \
     dim3 grid, block;                                                                                    \
-    SCHEDULER::compute_exec_config(num_groups, subwarps_per_block, grid, block);                         \
+    SCHEDULER::compute_exec_config(num_groups, subwarps_per_block_log2, grid, block);                    \
                                                                                                          \
     per_token_group_quant_8bit_kernel<SCHEDULER, T, DST_DTYPE, __VA_ARGS__><<<grid, block, 0, stream>>>( \
         static_cast<T*>(input.data_ptr()),                                                               \
         static_cast<DST_DTYPE*>(output_q.data_ptr()),                                                    \
         static_cast<output_s_dtype*>(output_s.data_ptr()),                                               \
         group_size,                                                                                      \
-        subwarps_per_block,                                                                              \
+        subwarps_per_block_log2,                                                                         \
         scale_hidden_size,                                                                               \
         scale_hidden_stride);                                                                            \
   } while (0)
