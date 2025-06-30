@@ -1242,6 +1242,8 @@ def initialize_model_parallel(
             ),
             group_name="pdmux_prefill_tp",
         )
+        _TP.pynccl_comm.disabled = False
+        _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
