@@ -20,6 +20,7 @@ The radix tree data structure for managing the KV cache.
 """
 
 import heapq
+import warnings
 import time
 from collections import defaultdict
 from functools import partial
