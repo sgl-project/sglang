@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
+import threading
 from functools import lru_cache
 from typing import Any, Optional, Tuple, Union
 
@@ -52,6 +53,31 @@ class SingletonCache:
         return self.get_data() is None
 
 
+class AttentionMaskCacheEntry:
+    """Cache entry that stores both the mask and the cu_seqlens used to generate it"""
+
+    def __init__(
+        self, mask: torch.Tensor, cu_seqlens: torch.Tensor, s: int, flatten_batch: bool
+    ):
+        self.mask = mask
+        self.cu_seqlens = cu_seqlens
+        self.s = s
+        self.flatten_batch = flatten_batch
+
+
+# GPU-based cache for attention masks with cu_seqlens validation and thread safety
+_attention_mask_cache_gpu = {}
+_attention_mask_cache_lock_gpu = threading.Lock()
+
+
+def _get_attention_mask_cache_key(
+    s: int, flatten_batch: bool, cu_seqlens: torch.Tensor
+) -> str:
+    """Generate a cache key based on shape and device properties"""
+    batch_size = len(cu_seqlens) - 1
+    return f"{s}_{flatten_batch}_{batch_size}_{cu_seqlens.device}"
+
+
 # TODO: requires real seqlens from images
 @functools.lru_cache(maxsize=128)
 def _get_cu_seqlens_for_shape(batch_size: int, seqlen: int, device) -> torch.Tensor:
@@ -95,35 +121,26 @@ class VisionSdpaAttention(nn.Module):
         self.scale = 1.0 / math.sqrt(self.head_size)
 
     @staticmethod
-    @lru_cache(maxsize=128)
-    def _generate_mask_cache(
-        s: int, flatten_batch: bool, cu_seqlens: tuple
+    def _generate_mask_gpu(
+        s: int, flatten_batch: bool, cu_seqlens: torch.Tensor, device: torch.device
     ) -> torch.BoolTensor:
         """
-        Generate a boolean attention mask with caching mechanism.
-        Args:
-            s: sequence length
-            flatten_batch: whether to flatten batch dimension
-            cu_seqlens: tuple of cumulative sequence lengths
-        Returns:
-            attention mask tensor of shape [b, 1, s, s] or [1, s, s]
+        Generate a boolean attention mask directly on GPU without CPU transfers.
         """
         if flatten_batch:
-            mask = torch.zeros([1, s, s], dtype=torch.bool)
+            mask = torch.zeros([1, s, s], dtype=torch.bool, device=device)
+            # Use GPU operations to set mask values
             for i in range(1, len(cu_seqlens)):
                 start = cu_seqlens[i - 1]
                 end = cu_seqlens[i]
                 mask[..., start:end, start:end] = True
         else:
-            # [1, 1, 1, s]
-            row_indices = torch.arange(s).view(1, 1, 1, s)
-            # [1, 1, s, 1]
-            col_indices = torch.arange(s).view(1, 1, s, 1)
-            # [b, 1, 1, 1]
-            seq_lens = torch.tensor(
-                [end - start for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])],
-            ).view(-1, 1, 1, 1)
+            # Create indices directly on GPU
+            row_indices = torch.arange(s, device=device).view(1, 1, 1, s)
+            col_indices = torch.arange(s, device=device).view(1, 1, s, 1)
 
+            # Calculate sequence lengths on GPU
+            seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).view(-1, 1, 1, 1)
             mask = (row_indices < seq_lens) & (col_indices < seq_lens)
 
         return mask
@@ -136,19 +153,72 @@ class VisionSdpaAttention(nn.Module):
     ) -> Optional[torch.Tensor]:
         r"""
         Creates a non-causal 4D mask of shape `(b, 1, s, s)` or `(1, 1, s, s)`.
-        Args:
-            s: sequence length
-            cu_seqlens: cumulative sequence lengths tensor. If not, returns an empty mask
-            flatten_batch: whether to flatten batch dimension
-        Returns:
-            attention mask tensor or None
+        Thread-safe optimized version that avoids CPU transfers and validates cu_seqlens values.
         """
         if cu_seqlens is None:
             return None
 
-        cu_seqlens_tuple = tuple(cu_seqlens.cpu().tolist())
+        # Generate cache key
+        cache_key = _get_attention_mask_cache_key(s, flatten_batch, cu_seqlens)
 
-        return self._generate_mask_cache(s, flatten_batch, cu_seqlens_tuple)
+        # Thread-safe cache operations
+        with _attention_mask_cache_lock_gpu:
+            # Check if mask is already cached
+            if cache_key in _attention_mask_cache_gpu:
+                cache_entry = _attention_mask_cache_gpu[cache_key]
+
+                # Validate that the cached entry matches current parameters
+                if (
+                    cache_entry.s == s
+                    and cache_entry.flatten_batch == flatten_batch
+                    and cache_entry.mask.device == cu_seqlens.device
+                    and torch.equal(cache_entry.cu_seqlens, cu_seqlens)
+                ):
+                    return cache_entry.mask
+                else:
+                    # Cache entry is stale, remove it atomically
+                    del _attention_mask_cache_gpu[cache_key]
+
+            # Generate mask on GPU (outside the critical section for performance)
+            # We'll re-check the cache after generation to handle race conditions
+            should_generate = True
+
+        # Generate mask outside the lock to minimize lock contention
+        if should_generate:
+            mask = self._generate_mask_gpu(
+                s, flatten_batch, cu_seqlens, cu_seqlens.device
+            )
+
+            # Re-acquire lock to update cache
+            with _attention_mask_cache_lock_gpu:
+                # Double-check if another thread already added this entry
+                if cache_key in _attention_mask_cache_gpu:
+                    cache_entry = _attention_mask_cache_gpu[cache_key]
+                    if (
+                        cache_entry.s == s
+                        and cache_entry.flatten_batch == flatten_batch
+                        and cache_entry.mask.device == cu_seqlens.device
+                        and torch.equal(cache_entry.cu_seqlens, cu_seqlens)
+                    ):
+                        # Another thread already cached the same mask, use it
+                        return cache_entry.mask
+
+                # Cache the result with cu_seqlens validation data
+                cache_entry = AttentionMaskCacheEntry(
+                    mask=mask,
+                    cu_seqlens=cu_seqlens.clone(),  # Store a copy for validation
+                    s=s,
+                    flatten_batch=flatten_batch,
+                )
+
+                # Simple cache eviction to prevent memory issues
+                if len(_attention_mask_cache_gpu) > 128:
+                    # Remove oldest entries (simple FIFO) - atomic operation
+                    oldest_key = next(iter(_attention_mask_cache_gpu))
+                    del _attention_mask_cache_gpu[oldest_key]
+
+                _attention_mask_cache_gpu[cache_key] = cache_entry
+                return mask
 
     def forward(
         self,
