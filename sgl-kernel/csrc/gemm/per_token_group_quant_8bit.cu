@@ -134,6 +134,8 @@ struct NaiveScheduler {
 };
 
 struct MaskedLayoutScheduler {
+  static constexpr int TOKEN_DIM_BLOCK_NUM_PER_EXPERT = 32;
+
   static void compute_exec_config(
       int num_local_experts,
       int hidden_dim_num_groups,
@@ -141,17 +143,22 @@ struct MaskedLayoutScheduler {
       int subwarps_per_block,
       dim3& grid,
       dim3& block) {
-    constexpr int BLOCK_NUM_PER_EXPERT = 32;
-
-    grid = dim3(hidden_dim_num_groups, BLOCK_NUM_PER_EXPERT, num_local_experts);
+    grid = dim3(hidden_dim_num_groups, TOKEN_DIM_BLOCK_NUM_PER_EXPERT, num_local_experts);
     block = dim3(subwarps_per_block * THREADS_PER_SUBWARP);
   }
 
   template <bool FUSE_SILU_AND_MUL, typename FUNC>
   __device__ __forceinline__ static void
-  execute(int subwarps_per_block, int hidden_dim_num_groups, int group_size, FUNC fn) {
-    TODO;
-    fn(token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
+  execute(int subwarps_per_block, int hidden_dim_num_groups, int group_size, const int32_t* masked_m, FUNC fn) {
+    const int expert_id = blockIdx.z;
+    const int token_idx_start = blockIdx.y;
+    const int hidden_dim_block_index = blockIdx.x;
+
+    const int curr_expert_token_num = masked_m[expert_id];
+
+    for (int token_idx = token_idx_start; token_idx < curr_expert_token_num; token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
+      fn(token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
+    }
   }
 };
 
