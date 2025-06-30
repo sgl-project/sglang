@@ -238,12 +238,12 @@ void sgl_per_token_group_quant_8bit(
   dim3 grid(num_blocks);
   dim3 block(num_threads);
 
-#define LAUNCH_KERNEL_INNER(T, DST_DTYPE, ...)                                                \
+#define LAUNCH_KERNEL_INNER(T, DST_DTYPE, output_s_dtype, ...)                                \
   do {                                                                                        \
     per_token_group_quant_8bit_kernel<T, DST_DTYPE, __VA_ARGS__><<<grid, block, 0, stream>>>( \
         static_cast<T*>(input.data_ptr()),                                                    \
         static_cast<DST_DTYPE*>(output_q.data_ptr()),                                         \
-        static_cast<uint32_t*>(output_s.data_ptr()),                                          \
+        static_cast<output_s_dtype*>(output_s.data_ptr()),                                    \
         group_size,                                                                           \
         groups_per_block,                                                                     \
         scale_num_rows,                                                                       \
@@ -262,13 +262,13 @@ void sgl_per_token_group_quant_8bit(
                                                                    \
     if (is_column_major) {                                         \
       if (scale_ue8m0) {                                           \
-        LAUNCH_KERNEL_INNER(T, DST_DTYPE, true, true);             \
+        LAUNCH_KERNEL_INNER(T, DST_DTYPE, uint32_t, true, true);   \
       } else {                                                     \
-        LAUNCH_KERNEL_INNER(T, DST_DTYPE, true, false);            \
+        LAUNCH_KERNEL_INNER(T, DST_DTYPE, float, true, false);     \
       }                                                            \
     } else {                                                       \
       TORCH_CHECK(!scale_ue8m0);                                   \
-      LAUNCH_KERNEL_INNER(T, DST_DTYPE, false);                    \
+      LAUNCH_KERNEL_INNER(T, DST_DTYPE, uint32_t, false);          \
     }                                                              \
   } while (0)
 
