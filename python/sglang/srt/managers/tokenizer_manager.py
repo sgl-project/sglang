@@ -150,7 +150,9 @@ class ReqState:
 
     # For streaming output
     last_output_offset: int = 0
+
     # For incremental state update.
+    # TODO(lianmin): do not initialize some lists if not needed.
     text: str = ""
     output_ids: List[int] = dataclasses.field(default_factory=list)
     input_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
@@ -199,7 +201,6 @@ class TokenizerManager:
         self.model_path = server_args.model_path
         self.served_model_name = server_args.served_model_name
         self.model_config = ModelConfig.from_server_args(server_args)
-
         self.is_generation = self.model_config.is_generation
         self.is_image_gen = self.model_config.is_image_gen
         self.context_len = self.model_config.context_len
@@ -255,19 +256,36 @@ class TokenizerManager:
         self.dump_requests_threshold = 1000
         self.dump_request_list: List[Tuple] = []
         self.log_request_metadata = self.get_log_request_metadata()
+        self.asyncio_tasks = set()
+        self.session_futures = {}  # session_id -> asyncio event
+        self.max_req_input_len = None
 
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
             None
         )
-        self.asyncio_tasks = set()
 
-        # For session info
-        self.session_futures = {}  # session_id -> asyncio event
+        # For pd disaggregtion
+        self.disaggregation_mode = DisaggregationMode(
+            self.server_args.disaggregation_mode
+        )
+        self.transfer_backend = TransferBackend(
+            self.server_args.disaggregation_transfer_backend
+        )
+        # Start kv boostrap server on prefill
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # only start bootstrap server on prefill tm
+            kv_bootstrap_server_class = get_kv_class(
+                self.transfer_backend, KVClassType.BOOTSTRAP_SERVER
+            )
+            self.bootstrap_server = kv_bootstrap_server_class(
+                self.server_args.disaggregation_bootstrap_port
+            )
 
-        # Set after scheduler is initialized
-        self.max_req_input_len = None
+        # For load balancing
+        self.current_load = 0
+        self.current_load_lock = asyncio.Lock()
 
         # Metrics
         if self.enable_metrics:
@@ -397,34 +415,14 @@ class TokenizerManager:
             ]
         )
 
-        # For pd disaggregtion
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
-        self.transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
-        )
-        # Start kv boostrap server on prefill
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # only start bootstrap server on prefill tm
-            kv_bootstrap_server_class = get_kv_class(
-                self.transfer_backend, KVClassType.BOOTSTRAP_SERVER
-            )
-            self.bootstrap_server = kv_bootstrap_server_class(
-                self.server_args.disaggregation_bootstrap_port
-            )
-
-        self.current_load = 0
-        self.current_load_lock = asyncio.Lock()
-
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         request: Optional[fastapi.Request] = None,
     ):
         created_time = time.time()
-
         self.auto_create_handle_loop()
+        obj.normalize_batch_and_arguments()
 
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
@@ -434,36 +432,6 @@ class TokenizerManager:
 
         obj.normalize_batch_and_arguments()
 
-        if isinstance(obj, GenerateReqInput):
-            return_hidden_states = obj.return_hidden_states
-            has_return_hidden_states = return_hidden_states == True or (
-                isinstance(return_hidden_states, list) and any(return_hidden_states)
-            )
-            if (
-                not self.server_args.enable_return_hidden_states
-                and has_return_hidden_states
-            ):
-                raise ValueError(
-                    "return_hidden_states=True requires the server to be started "
-                    "with --enable-return-hidden-states (ServerArgs.enable_return_hidden_states)."
-                )
-
-            # Verify requested LoRA adapters are loaded.
-            if obj.lora_path:
-                requested_adapters = (
-                    set(obj.lora_path)
-                    if isinstance(obj.lora_path, list)
-                    else {obj.lora_path}
-                )
-                unloaded_adapters = (
-                    requested_adapters - self.loaded_lora_adapters.keys()
-                )
-                if unloaded_adapters:
-                    raise ValueError(
-                        f"The following requested LoRA adapters are not loaded: {unloaded_adapters}\n"
-                        f"Loaded adapters: {self.loaded_lora_adapters}."
-                    )
-
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
             logger.info(
@@ -471,8 +439,7 @@ class TokenizerManager:
             )
 
         async with self.model_update_lock.reader_lock:
-            is_single = obj.is_single
-            if is_single:
+            if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
                 state = self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj, state, request):
@@ -534,12 +501,12 @@ class TokenizerManager:
         else:
             image_inputs: Optional[Dict] = None
 
-        self._validate_token_len(obj, input_ids)
+        self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, image_inputs, token_type_ids
         )
 
-    def _validate_token_len(
+    def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
@@ -568,6 +535,27 @@ class TokenizerManager:
             )
             raise ValueError(error_msg)
 
+        if isinstance(obj, GenerateReqInput):
+            if (
+                obj.return_hidden_states
+                and not self.server_args.enable_return_hidden_states
+            ):
+                raise ValueError(
+                    "The server is not configured to return the hidden states. "
+                    "Please set `--enable-return-hidden-states` to enable this feature."
+                )
+            if (
+                obj.custom_logit_processor
+                and not self.server_args.enable_custom_logit_processor
+            ):
+                raise ValueError(
+                    "The server is not configured to enable custom logit processor. "
+                    "Please set `--enable-custom-logits-processor` to enable this feature."
+                )
+
+            if obj.lora_path:
+                self._validate_lora_adapters(obj)
+
     def _create_tokenized_object(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -578,24 +566,6 @@ class TokenizerManager:
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
-
-        if self.is_generation:
-            return_logprob = obj.return_logprob
-            logprob_start_len = obj.logprob_start_len
-            top_logprobs_num = obj.top_logprobs_num
-            token_ids_logprob = obj.token_ids_logprob
-            session_params = (
-                SessionParams(**obj.session_params) if obj.session_params else None
-            )
-            if (
-                obj.custom_logit_processor
-                and not self.server_args.enable_custom_logit_processor
-            ):
-                raise ValueError(
-                    "The server is not configured to enable custom logit processor. "
-                    "Please set `--enable-custom-logits-processor` to enable this feature."
-                )
-
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
@@ -609,16 +579,20 @@ class TokenizerManager:
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
+            session_params = (
+                SessionParams(**obj.session_params) if obj.session_params else None
+            )
+
             tokenized_obj = TokenizedGenerateReqInput(
                 obj.rid,
                 input_text,
                 input_ids,
                 image_inputs,
                 sampling_params,
-                return_logprob,
-                logprob_start_len,
-                top_logprobs_num,
-                token_ids_logprob,
+                obj.return_logprob,
+                obj.logprob_start_len,
+                obj.top_logprobs_num,
+                obj.token_ids_logprob,
                 obj.stream,
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
@@ -685,6 +659,18 @@ class TokenizerManager:
                 raise ValueError(
                     "Batch tokenization is not needed for input_embeds. Do not set `enable_tokenizer_batch_encode`."
                 )
+
+    def _validate_lora_adapters(self, obj: GenerateReqInput):
+        """Validate that the requested LoRA adapters are loaded."""
+        requested_adapters = (
+            set(obj.lora_path) if isinstance(obj.lora_path, list) else {obj.lora_path}
+        )
+        unloaded_adapters = requested_adapters - self.loaded_lora_adapters.keys()
+        if unloaded_adapters:
+            raise ValueError(
+                f"The following requested LoRA adapters are not loaded: {unloaded_adapters}\n"
+                f"Loaded adapters: {self.loaded_lora_adapters}."
+            )
 
     def _send_one_request(
         self,
