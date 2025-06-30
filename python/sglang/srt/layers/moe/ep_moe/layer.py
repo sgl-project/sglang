@@ -1476,29 +1476,9 @@ class DeepEPMoE(EPMoE):
         dispose_tensor(hidden_states_fp8[0])
 
         # Act
-        down_input = torch.empty(
-            (
-                gateup_output.shape[0],
-                gateup_output.shape[1],
-                gateup_output.shape[2] // 2,
-            ),
-            device=gateup_output.device,
-            dtype=self.fp8_dtype,
-        )
         scale_block_size = 128
-        down_input_scale = torch.empty(
-            (
-                gateup_output.shape[0],
-                gateup_output.shape[1],
-                gateup_output.shape[2] // 2 // scale_block_size,
-            ),
-            device=gateup_output.device,
-            dtype=torch.float32,
-        )
-        sglang_per_token_group_quant_8bit(
+        down_input, down_input_scale = sglang_per_token_group_quant_8bit(
             x=gateup_output,
-            down_input,
-            down_input_scale,
             dst_dtype=self.fp8_dtype,
             group_size=scale_block_size,
             masked_m=masked_m,
