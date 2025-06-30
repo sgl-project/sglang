@@ -80,8 +80,8 @@ template <
     typename T,
     typename DST_DTYPE,
     bool IS_COLUMN_MAJOR = false,
-    bool SCALE_UE8M0 = false,
-    typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>>
+    bool SCALE_UE8M0 = false
+>
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
     DST_DTYPE* __restrict__ output_q,
@@ -102,6 +102,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int global_group_id = block_group_id + local_group_id;
   const int block_group_offset = global_group_id * group_size;
 
+  using scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>;
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
