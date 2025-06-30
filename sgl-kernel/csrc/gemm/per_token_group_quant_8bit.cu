@@ -102,7 +102,8 @@ struct NaiveScheduler {
   }
 
   template <typename FUNC>
-  __device__ __forceinline__ static void execute(int subwarps_per_block, int hidden_size_num_groups, int group_size, FUNC fn) {
+  __device__ __forceinline__ static void
+  execute(int subwarps_per_block, int hidden_size_num_groups, int group_size, FUNC fn) {
     const int local_group_id = threadIdx.x / THREADS_PER_SUBWARP;
     const int lane_id = threadIdx.x % THREADS_PER_SUBWARP;
     const int block_group_id = blockIdx.x * subwarps_per_block;
@@ -124,6 +125,8 @@ template <
     typename DST_DTYPE,
     bool IS_COLUMN_MAJOR = false,
     bool SCALE_UE8M0 = false,
+    bool FUSE_SILU_AND_MUL = false,
+    bool MASKED_LAYOUT = false,
     typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>>
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
@@ -138,7 +141,10 @@ __global__ void per_token_group_quant_8bit_kernel(
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
   SCHEDULER::execute(
-      subwarps_per_block, hidden_size_num_groups, group_size, [&](int token_idx, int group_start_hidden_idx, int lane_id, int input_group_start_offset) {
+      subwarps_per_block,
+      hidden_size_num_groups,
+      group_size,
+      [&](int token_idx, int group_start_hidden_idx, int lane_id, int input_group_start_offset) {
         constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
         constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
@@ -214,7 +220,8 @@ __global__ void per_token_group_quant_8bit_kernel(
         }
 
         st_global(
-            reinterpret_cast<int4*>(output_q + offset_num_groups * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE), output_buf);
+            reinterpret_cast<int4*>(output_q + offset_num_groups * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE),
+            output_buf);
       });
 }
 
@@ -252,6 +259,8 @@ void sgl_per_token_group_quant_8bit(
   CHECK_EQ(input.numel() % group_size, 0);
   const int num_groups = input.numel() / group_size;
 
+  const bool masked_layout = masked_m.has_value();
+
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   int subwarps_per_block = compute_subwarps_per_block(num_groups);
@@ -277,24 +286,31 @@ void sgl_per_token_group_quant_8bit(
         scale_hidden_stride);                                                                            \
   } while (0)
 
-#define LAUNCH_KERNEL(T, DST_DTYPE)                                                          \
-  do {                                                                                       \
-    TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T)); \
-                                                                                             \
-    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                             \
-    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                 \
-    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                                                 \
-                                                                                             \
-    if (is_column_major) {                                                                   \
-      if (scale_ue8m0) {                                                                     \
-        LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true);             \
-      } else {                                                                               \
-        LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, true, false);               \
-      }                                                                                      \
-    } else {                                                                                 \
-      TORCH_CHECK(!scale_ue8m0);                                                             \
-      LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, false);                       \
-    }                                                                                        \
+#define LAUNCH_KERNEL(T, DST_DTYPE)                                                              \
+  do {                                                                                           \
+    TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));     \
+                                                                                                 \
+    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                 \
+    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                     \
+    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                                                     \
+                                                                                                 \
+    if (is_column_major) {                                                                       \
+      if (scale_ue8m0) {                                                                         \
+        if (fuse_silu_and_mul) {                                                                 \
+          if (masked_layout) {                                                                   \
+            LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true, true, true); \
+          } else {                                                                               \
+            LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true, true);       \
+          }                                                                                      \
+        } else {                                                                                 \
+          LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true);               \
+        }                                                                                        \
+      } else {                                                                                   \
+        LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, true);                          \
+      }                                                                                          \
+    } else {                                                                                     \
+      LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float);                                  \
+    }                                                                                            \
   } while (0)
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), scalar_t, [&] {

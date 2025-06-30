@@ -448,7 +448,16 @@ def sglang_per_token_group_quant_fp8(
 
     if x.shape[0] > 0:
         sgl_per_token_group_quant_8bit(
-            x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0, fuse_silu_and_mul, masked_m
+            x,
+            x_q,
+            x_s,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            scale_ue8m0,
+            fuse_silu_and_mul,
+            masked_m,
         )
 
     return x_q, x_s
