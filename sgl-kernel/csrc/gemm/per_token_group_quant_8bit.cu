@@ -219,7 +219,8 @@ __global__ void per_token_group_quant_8bit_kernel(
         constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
         constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
-        const int offset_num_groups = expert_idx * num_tokens_per_expert * hidden_dim_num_groups + token_idx * hidden_dim_num_groups + hidden_dim_group_idx;
+        const int offset_num_groups = expert_idx * num_tokens_per_expert * hidden_dim_num_groups +
+                                      token_idx * hidden_dim_num_groups + hidden_dim_group_idx;
 
         int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
         T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
@@ -256,7 +257,8 @@ __global__ void per_token_group_quant_8bit_kernel(
 
           const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
           const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
-          scale_output = reinterpret_cast<scale_element_t*>(output_s) + expert_idx * scale_expert_stride * num_elems_per_pack +
+          scale_output = reinterpret_cast<scale_element_t*>(output_s) +
+                         expert_idx * scale_expert_stride * num_elems_per_pack +
                          hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
                          token_idx * scale_token_stride * num_elems_per_pack + pack_idx;
         } else {
@@ -373,7 +375,7 @@ void sgl_per_token_group_quant_8bit(
   const int hidden_dim_num_groups = output_q.size(-1) / group_size / (fuse_silu_and_mul ? 2 : 1);
   const int num_tokens_per_expert = output_q.size(-2);
   const int scale_hidden_stride = output_s.stride(-1);
-  TORCH_CHECK(num_tokens_per_expert == scale_hidden_stride); // use one single param in kernel
+  TORCH_CHECK(num_tokens_per_expert == scale_hidden_stride);  // use one single param in kernel
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, T, DST_DTYPE, output_s_dtype, ...)                                \
   do {                                                                                                   \
