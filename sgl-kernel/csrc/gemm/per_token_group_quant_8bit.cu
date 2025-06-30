@@ -92,6 +92,12 @@ struct DtypeInfo<c10::Float8_e4m3fn> {
   static constexpr float MAX = 448;
 };
 
+int compute_input_group_start_offset<bool FUSE_SILU_AND_MUL>(
+    int token_idx, int hidden_dim_group_idx, int hidden_dim_num_groups, int group_size) {
+  return token_idx * hidden_dim_num_groups * group_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
+         hidden_dim_group_idx * group_size;
+}
+
 constexpr float LOCAL_ABSMAX_ABS = 1e-10;
 constexpr int THREADS_PER_SUBWARP = 8;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
@@ -126,7 +132,8 @@ struct NaiveScheduler {
     const int hidden_dim_group_idx = group_id % hidden_dim_num_groups;
 
     if constexpr (FUSE_SILU_AND_MUL) {
-      input_group_start_offset = token_idx * hidden_dim_num_groups * group_size * 2 + hidden_dim_group_idx * group_size;
+      input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
+          token_idx, hidden_dim_group_idx, hidden_dim_num_groups, group_size);
     }
 
     fn(token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
@@ -159,7 +166,10 @@ struct MaskedLayoutScheduler {
 
     const int curr_expert_token_num = masked_m[expert_id];
 
-    for (int token_idx = token_idx_start; token_idx < curr_expert_token_num; token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
+    for (int token_idx = token_idx_start; token_idx < curr_expert_token_num;
+         token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
+      const int input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
+          token_idx, hidden_dim_group_idx, hidden_dim_num_groups, group_size);
       fn(token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
     }
   }
