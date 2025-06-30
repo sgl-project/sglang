@@ -144,7 +144,8 @@ __global__ void per_token_group_quant_8bit_kernel(
 
 #pragma unroll
   for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
-    input_primary_int4[j] = ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
+    input_primary_int4[j] =
+        ld_global_nc(reinterpret_cast<const int4*>(group_input + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
   }
 
   float local_absmax = LOCAL_ABSMAX_ABS;
@@ -253,24 +254,24 @@ void sgl_per_token_group_quant_8bit(
         scale_stride);                                                                        \
   } while (0)
 
-#define LAUNCH_KERNEL(T, DST_DTYPE)                                \
-  do {                                                             \
-    TORCH_CHECK(THREADS_PER_GROUP * INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T)); \
-                                                                   \
-    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                   \
-    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                       \
-    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                       \
-                                                                   \
-    if (is_column_major) {                                         \
-      if (scale_ue8m0) {                                           \
-        LAUNCH_KERNEL_INNER(T, DST_DTYPE, uint32_t, true, true);   \
-      } else {                                                     \
-        LAUNCH_KERNEL_INNER(T, DST_DTYPE, float, true, false);     \
-      }                                                            \
-    } else {                                                       \
-      TORCH_CHECK(!scale_ue8m0);                                   \
-      LAUNCH_KERNEL_INNER(T, DST_DTYPE, float, false);             \
-    }                                                              \
+#define LAUNCH_KERNEL(T, DST_DTYPE)                                                        \
+  do {                                                                                     \
+    TORCH_CHECK(THREADS_PER_GROUP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T)); \
+                                                                                           \
+    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                           \
+    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                               \
+    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                                               \
+                                                                                           \
+    if (is_column_major) {                                                                 \
+      if (scale_ue8m0) {                                                                   \
+        LAUNCH_KERNEL_INNER(T, DST_DTYPE, uint32_t, true, true);                           \
+      } else {                                                                             \
+        LAUNCH_KERNEL_INNER(T, DST_DTYPE, float, true, false);                             \
+      }                                                                                    \
+    } else {                                                                               \
+      TORCH_CHECK(!scale_ue8m0);                                                           \
+      LAUNCH_KERNEL_INNER(T, DST_DTYPE, float, false);                                     \
+    }                                                                                      \
   } while (0)
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), scalar_t, [&] {
