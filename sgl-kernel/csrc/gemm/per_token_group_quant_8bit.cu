@@ -102,16 +102,13 @@ struct NaiveScheduler {
   }
 
   template <typename FUNC>
-  __device__ __forceinline__ static void execute(int subwarps_per_block, int hidden_size_num_groups, FUNC fn) {
+  __device__ __forceinline__ static void execute(int subwarps_per_block, FUNC fn) {
     const int local_group_id = threadIdx.x / THREADS_PER_SUBWARP;
     const int lane_id = threadIdx.x % THREADS_PER_SUBWARP;
     const int block_group_id = blockIdx.x * subwarps_per_block;
     const int group_id = block_group_id + local_group_id;
 
-    const int token_idx = group_id / hidden_size_num_groups;
-    const int group_start_hidden_idx = group_id % hidden_size_num_groups;
-
-    fn(token_idx, group_start_hidden_idx, lane_id);
+    fn(group_id, lane_id);
   }
 };
 
@@ -128,92 +125,93 @@ __global__ void per_token_group_quant_8bit_kernel(
     scale_packed_t* __restrict__ output_s,
     const int group_size,
     const int subwarps_per_block,
-    const int hidden_size_num_groups,
-    const int scale_hidden_stride) {
+    // TODO can remove?
+    const int scale_hidden_size = 0,
+    const int scale_hidden_stride = 0) {
   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
-  SCHEDULER::execute(
-      subwarps_per_block, hidden_size_num_groups, [&](int token_idx, int group_start_hidden_idx, int lane_id) {
-        constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
-        constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
+  SCHEDULER::execute(subwarps_per_block, [&](int group_id, int lane_id) {
+    constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
+    constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
-        // TODO consider stride
-        const int group_id = token_idx * hidden_size_num_groups + group_start_hidden_idx;
-
-        int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
-        T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
-        static_assert(sizeof(input_primary_vec[0]) * INPUT_PRIMARY_VEC_SIZE == sizeof(input_primary_int4));
+    int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
+    T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
+    static_assert(sizeof(input_primary_vec[0]) * INPUT_PRIMARY_VEC_SIZE == sizeof(input_primary_int4));
 
 #pragma unroll
-        for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
-          input_primary_int4[j] = ld_global_nc(
-              reinterpret_cast<const int4*>(input + group_id * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
-        }
+    for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
+      input_primary_int4[j] = ld_global_nc(
+          reinterpret_cast<const int4*>(input + group_id * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
+    }
 
-        scale_element_t* scale_output;
-        if constexpr (IS_COLUMN_MAJOR) {
-          constexpr int scale_token_stride = 1;
-          constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
+    scale_element_t* scale_output;
+    if constexpr (IS_COLUMN_MAJOR) {
+      constexpr int scale_token_stride = 1;
+      constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
 
-          const int hidden_idx_packed = group_start_hidden_idx / num_elems_per_pack;
-          const int pack_idx = group_start_hidden_idx % num_elems_per_pack;
-          scale_output = reinterpret_cast<scale_element_t*>(output_s) +
-                         (hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
-                          token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
-        } else {
-          static_assert(!SCALE_UE8M0);
-          scale_output = output_s + group_id;
-        }
+      // TODO unify w/ other places?
+      const int scale_hidden_size_unpacked = scale_hidden_size * num_elems_per_pack;
+      const int token_idx = group_id / scale_hidden_size_unpacked;
+      const int group_start_hidden_idx = group_id % scale_hidden_size_unpacked;
 
-        float local_absmax = LOCAL_ABSMAX_ABS;
+      const int hidden_idx_packed = group_start_hidden_idx / num_elems_per_pack;
+      const int pack_idx = group_start_hidden_idx % num_elems_per_pack;
+      scale_output = reinterpret_cast<scale_element_t*>(output_s) +
+                     (hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
+                      token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
+    } else {
+      static_assert(!SCALE_UE8M0);
+      scale_output = output_s + group_id;
+    }
 
-#pragma unroll
-        for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
-          float val = static_cast<float>(input_primary_vec[j]);
-          float abs_val = fabsf(val);
-          local_absmax = fmaxf(local_absmax, abs_val);
-        }
-
-        local_absmax = GroupReduceMax<THREADS_PER_SUBWARP>(local_absmax, lane_id);
-
-        float y_scale, y_scale_inv;
-        calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
-        float2 y_scale_repeated = {y_scale, y_scale};
-
-        if (lane_id == 0) {
-          *scale_output = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
-        }
-
-        int4 output_buf;
-        static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE * sizeof(DST_DTYPE));
-
-        if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
-          const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
-          static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
-          static_assert(INPUT_PRIMARY_VEC_SIZE % 2 == 0);
+    float local_absmax = LOCAL_ABSMAX_ABS;
 
 #pragma unroll
-          for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
-            float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
-            float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
-            output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
-          }
-        } else {
-          const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
+    for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
+      float val = static_cast<float>(input_primary_vec[j]);
+      float abs_val = fabsf(val);
+      local_absmax = fmaxf(local_absmax, abs_val);
+    }
+
+    local_absmax = GroupReduceMax<THREADS_PER_SUBWARP>(local_absmax, lane_id);
+
+    float y_scale, y_scale_inv;
+    calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
+    float2 y_scale_repeated = {y_scale, y_scale};
+
+    if (lane_id == 0) {
+      *scale_output = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
+    }
+
+    int4 output_buf;
+    static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE * sizeof(DST_DTYPE));
+
+    if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
+      const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
+      static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
+      static_assert(INPUT_PRIMARY_VEC_SIZE % 2 == 0);
 
 #pragma unroll
-          for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
-            float val = static_cast<float>(input_primary_vec[j]);
-            float q_val = fminf(fmaxf(val * y_scale, dst_dtype_info::MIN), dst_dtype_info::MAX);
-            output_buf_ptr[j] = DST_DTYPE(q_val);
-          }
-        }
+      for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
+        float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
+        float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
+        output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+      }
+    } else {
+      const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
 
-        st_global(
-            reinterpret_cast<int4*>(output_q + group_id * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE), output_buf);
-      });
+#pragma unroll
+      for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
+        float val = static_cast<float>(input_primary_vec[j]);
+        float q_val = fminf(fmaxf(val * y_scale, dst_dtype_info::MIN), dst_dtype_info::MAX);
+        output_buf_ptr[j] = DST_DTYPE(q_val);
+      }
+    }
+
+    st_global(reinterpret_cast<int4*>(output_q + group_id * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE), output_buf);
+  });
 }
 
 int compute_subwarps_per_block(int num_groups) {
@@ -255,7 +253,7 @@ void sgl_per_token_group_quant_8bit(
   auto dst_type = output_q.scalar_type();
 
   const bool is_column_major = output_s.stride(-2) < output_s.stride(-1);
-  const int hidden_size_num_groups = output_q.size(-1) / group_size;
+  const int scale_hidden_size = output_s.size(-1);
   const int scale_hidden_stride = output_s.stride(-1);
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, T, DST_DTYPE, output_s_dtype, ...)                                \
@@ -269,7 +267,7 @@ void sgl_per_token_group_quant_8bit(
         static_cast<output_s_dtype*>(output_s.data_ptr()),                                               \
         group_size,                                                                                      \
         subwarps_per_block,                                                                              \
-        hidden_size_num_groups,                                                                          \
+        scale_hidden_size,                                                                               \
         scale_hidden_stride);                                                                            \
   } while (0)
 
