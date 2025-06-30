@@ -266,6 +266,12 @@ class DeepseekV2MoE(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.local_dp_size = get_local_attention_dp_size()
+        self.using_flashinfer_ep_moe_comm = (
+            self.local_dp_size > 1
+            and global_server_args_dict["enable_flashinfer_moe"]
+            and global_server_args_dict["enable_ep_moe"]
+        )
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
@@ -331,7 +337,7 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_weight_block_size = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            # disable tp for shared experts when enable deepep moe
+            # disable tp for shared experts when enable deepep moe, or with DP + flashinfer MoE
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -342,6 +348,7 @@ class DeepseekV2MoE(nn.Module):
                 **(
                     dict(tp_rank=0, tp_size=1)
                     if global_server_args_dict["enable_deepep_moe"]
+                    or self.using_flashinfer_ep_moe_comm
                     else {}
                 ),
             )
@@ -416,15 +423,18 @@ class DeepseekV2MoE(nn.Module):
             if (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
+                and hidden_states.shape[0] > 0
                 and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             ):
-                return self.forward_normal_dual_stream(hidden_states)
+                return self.forward_normal_dual_stream(hidden_states, forward_batch)
             else:
-                return self.forward_normal(hidden_states)
+                return self.forward_normal(hidden_states, forward_batch)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
-    def forward_normal_dual_stream(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_normal_dual_stream(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
 
@@ -434,34 +444,43 @@ class DeepseekV2MoE(nn.Module):
 
         with torch.cuda.stream(self.alt_stream):
             final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=router_logits
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                forward_batch=forward_batch,
             )
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not self.using_flashinfer_ep_moe_comm:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
-    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_normal(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states)
 
-        shared_output = self._forward_shared_experts(hidden_states)
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states)
+        if hidden_states.shape[0] > 0:
+            shared_output = self._forward_shared_experts(hidden_states)
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
+        else:
+            shared_output = None
+            router_logits = None
+
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            forward_batch=forward_batch,
         )
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not self.using_flashinfer_ep_moe_comm:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 

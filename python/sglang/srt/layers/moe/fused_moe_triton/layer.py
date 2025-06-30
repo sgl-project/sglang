@@ -14,6 +14,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.layers.dp_attention import get_local_attention_dp_size
 from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
@@ -22,6 +23,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -454,6 +456,7 @@ class FusedMoE(torch.nn.Module):
         self.tp_size = (
             tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
         )
+        self.local_dp_size = get_local_attention_dp_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.num_experts = num_experts
         self.expert_map = None
@@ -880,7 +883,12 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
         assert self.quant_method is not None
 
         # Matrix multiply.
@@ -905,6 +913,8 @@ class FusedMoE(torch.nn.Module):
                     tp_size=self.tp_size,
                     ep_rank=self.ep_rank,
                     ep_size=self.ep_size,
+                    dp_size=self.local_dp_size,
+                    global_num_tokens_cpu=forward_batch.global_num_tokens_cpu,
                 )
                 if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod"
                 else {}
