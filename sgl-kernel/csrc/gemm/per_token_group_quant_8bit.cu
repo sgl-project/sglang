@@ -101,7 +101,7 @@ struct NaiveScheduler {
     block = dim3(num_threads);
   }
 
-  template <typename FUNC>
+  template <bool FUSE_SILU_AND_MUL, typename FUNC>
   __device__ __forceinline__ static void
   execute(int subwarps_per_block, int hidden_size_num_groups, int group_size, FUNC fn) {
     const int local_group_id = threadIdx.x / THREADS_PER_SUBWARP;
@@ -109,8 +109,12 @@ struct NaiveScheduler {
     const int block_group_id = blockIdx.x * subwarps_per_block;
     const int group_id = block_group_id + local_group_id;
 
-    // TODO consider non-contiguous case
-    const int input_group_start_offset = group_id * group_size;
+    int input_group_start_offset;
+    if (FUSE_SILU_AND_MUL) {
+      input_group_start_offset = token_idx * hidden_size_num_groups * 2 + group_start_hidden_idx;
+    } else {
+      input_group_start_offset = group_id * group_size;
+    }
 
     const int token_idx = group_id / hidden_size_num_groups;
     const int group_start_hidden_idx = group_id % hidden_size_num_groups;
@@ -141,7 +145,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
-  SCHEDULER::execute(
+  SCHEDULER::execute<FUSE_SILU_AND_MUL>(
       subwarps_per_block,
       hidden_size_num_groups,
       group_size,
@@ -240,7 +244,9 @@ int compute_subwarps_per_block(int num_groups) {
 }
 
 void sgl_per_token_group_quant_8bit(
-    // (optional num_experts, num_tokens, hidden_size)
+    // vanilla: (num_tokens, hidden_size)
+    // fuse_silu_and_mul: (num_tokens, hidden_size * 2)
+    // fuse_silu_and_mul + masked_layout: (num_experts, num_tokens-with-padding, hidden_size * 2)
     torch::Tensor input,
     torch::Tensor output_q,
     torch::Tensor output_s,
