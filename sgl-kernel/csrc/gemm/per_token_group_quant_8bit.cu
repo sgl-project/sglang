@@ -104,8 +104,8 @@ __global__ void per_token_group_quant_8bit_kernel(
     scale_packed_t* __restrict__ output_s,
     const int group_size,
     const int groups_per_block,
-    const int scale_num_rows = 0,
-    const int scale_stride = 0) {
+    const int scale_hidden_size = 0,
+    const int scale_hidden_stride = 0) {
   const int local_group_id = threadIdx.x / THREADS_PER_GROUP;
   const int lane_id = threadIdx.x % THREADS_PER_GROUP;
 
@@ -123,13 +123,13 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   if constexpr (IS_COLUMN_MAJOR) {
     constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
-    const int scale_num_rows_element = scale_num_rows * num_elems_per_pack;
-    const int row_idx = global_group_id / scale_num_rows_element;
-    const int col_idx_raw = global_group_id % scale_num_rows_element;
-    const int col_idx = col_idx_raw / num_elems_per_pack;
-    const int pack_idx = col_idx_raw % num_elems_per_pack;
+    const int scale_hidden_size_unpacked = scale_hidden_size * num_elems_per_pack;
+    const int token_idx = global_group_id / scale_hidden_size_unpacked;
+    const int hidden_idx_unpacked = global_group_id % scale_hidden_size_unpacked;
+    const int hidden_idx = hidden_idx_unpacked / num_elems_per_pack;
+    const int pack_idx = hidden_idx_unpacked % num_elems_per_pack;
     scale_output = reinterpret_cast<scale_element_t*>(output_s) +
-                   (col_idx * scale_stride * num_elems_per_pack + row_idx * num_elems_per_pack + pack_idx);
+                   (hidden_idx * scale_hidden_stride * num_elems_per_pack + token_idx * num_elems_per_pack + pack_idx);
   } else {
     static_assert(!SCALE_UE8M0);
     scale_output = output_s + global_group_id;
@@ -236,8 +236,8 @@ void sgl_per_token_group_quant_8bit(
   const int num_threads = groups_per_block * THREADS_PER_GROUP;
 
   const bool is_column_major = output_s.stride(0) < output_s.stride(1);
-  const int scale_num_rows = output_s.size(1);
-  const int scale_stride = output_s.stride(1);
+  const int scale_hidden_size = output_s.size(1);
+  const int scale_hidden_stride = output_s.stride(1);
 
   dim3 grid(num_blocks);
   dim3 block(num_threads);
@@ -250,8 +250,8 @@ void sgl_per_token_group_quant_8bit(
         static_cast<output_s_dtype*>(output_s.data_ptr()),                                    \
         group_size,                                                                           \
         groups_per_block,                                                                     \
-        scale_num_rows,                                                                       \
-        scale_stride);                                                                        \
+        scale_hidden_size,                                                                       \
+        scale_hidden_stride);                                                                        \
   } while (0)
 
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                        \
