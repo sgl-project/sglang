@@ -160,8 +160,8 @@ __global__ void per_token_group_quant_8bit_kernel(
 
 #pragma unroll
     for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
-      input_primary_int4[j] =
-          ld_global_nc(reinterpret_cast<const int4*>(input + group_id * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
+      input_primary_int4[j] = ld_global_nc(
+          reinterpret_cast<const int4*>(input + group_id * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
     }
 
     float local_absmax = LOCAL_ABSMAX_ABS;
