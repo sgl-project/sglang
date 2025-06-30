@@ -1,18 +1,3 @@
-# Copyright 2023-2024 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""FlashInfer fusion operations for allreduce + RMS norm."""
-
 import logging
 from typing import Tuple
 
@@ -59,12 +44,9 @@ class FlashInferWorkspaceManager:
                 "initialization"
             )
             return
-            
-        # try:
-        # Clean up previous workspace
+
         self.cleanup()
         
-        # Create new workspace
         self.ipc_handles, self.workspace_tensor = (
             comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
                 rank,
@@ -104,7 +86,7 @@ class FlashInferWorkspaceManager:
 _workspace_manager = FlashInferWorkspaceManager()
 
 
-def ensure_workspace_initialized(max_token_num: int = 8192, 
+def ensure_workspace_initialized(max_token_num: int = 4096, 
                                  hidden_dim: int = 4096, 
                                  use_fp32_lamport: bool = False):
     """Ensure workspace is initialized"""
@@ -134,7 +116,7 @@ def flashinfer_allreduce_add_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    max_token_num: int = 8192,
+    max_token_num: int = 4096,
     use_oneshot: bool = True,
     trigger_completion_at_end: bool = True,
     fp32_acc: bool = False,

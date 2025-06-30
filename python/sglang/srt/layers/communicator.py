@@ -399,7 +399,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if hidden_states.shape[0] != 0:
                 hidden_states = layernorm(hidden_states)
         else:
-            if is_sm100_supported() and is_flashinfer_available() and hasattr(layernorm, 'forward_with_allreduce_fusion'):
+            if is_sm100_supported() and is_flashinfer_available() and hasattr(layernorm, 'forward_with_allreduce_fusion') and global_server_args_dict['enable_flashinfer_allreduce_fusion'] and hidden_states.shape[0] <= 4096:
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(hidden_states, residual)
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
