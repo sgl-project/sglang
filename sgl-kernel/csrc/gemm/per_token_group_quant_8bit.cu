@@ -92,6 +92,16 @@ constexpr float LOCAL_ABSMAX_ABS = 1e-10;
 constexpr int THREADS_PER_SUBWARP = 8;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 
+class NaiveScheduler {
+  static void compute_exec_config(int num_groups, int subwarps_per_block, dim3& grid, dim3& block) {
+    const int num_blocks = num_groups / subwarps_per_block;
+    const int num_threads = subwarps_per_block * THREADS_PER_SUBWARP;
+
+    grid = dim3(num_blocks);
+    block = dim3(num_threads);
+  }
+};
+
 template <
     typename T,
     typename DST_DTYPE,
@@ -235,46 +245,44 @@ void sgl_per_token_group_quant_8bit(
   int subwarps_per_block = compute_subwarps_per_block(num_groups);
 
   auto dst_type = output_q.scalar_type();
-  const int num_blocks = num_groups / subwarps_per_block;
-  const int num_threads = subwarps_per_block * THREADS_PER_SUBWARP;
 
   const bool is_column_major = output_s.stride(-2) < output_s.stride(-1);
   const int scale_hidden_size = output_s.size(-1);
   const int scale_hidden_stride = output_s.stride(-1);
 
-  dim3 grid(num_blocks);
-  dim3 block(num_threads);
-
-#define LAUNCH_KERNEL_INNER(T, DST_DTYPE, output_s_dtype, ...)                                \
+#define LAUNCH_KERNEL_INNER(SCHEDULER, T, DST_DTYPE, output_s_dtype, ...)                     \
   do {                                                                                        \
+    dim3 grid, block;                                                                         \
+    SCHEDULER::compute_exec_config(num_groups, subwarps_per_block, grid, block);              \
+                                                                                              \
     per_token_group_quant_8bit_kernel<T, DST_DTYPE, __VA_ARGS__><<<grid, block, 0, stream>>>( \
         static_cast<T*>(input.data_ptr()),                                                    \
         static_cast<DST_DTYPE*>(output_q.data_ptr()),                                         \
         static_cast<output_s_dtype*>(output_s.data_ptr()),                                    \
         group_size,                                                                           \
-        subwarps_per_block,                                                                     \
+        subwarps_per_block,                                                                   \
         scale_hidden_size,                                                                    \
         scale_hidden_stride);                                                                 \
   } while (0)
 
-#define LAUNCH_KERNEL(T, DST_DTYPE)                                                        \
-  do {                                                                                     \
-    TORCH_CHECK(THREADS_PER_SUBWARP * INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T)); \
-                                                                                           \
-    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                           \
-    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                               \
-    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                                               \
-                                                                                           \
-    if (is_column_major) {                                                                 \
-      if (scale_ue8m0) {                                                                   \
-        LAUNCH_KERNEL_INNER(T, DST_DTYPE, uint32_t, true, true);                           \
-      } else {                                                                             \
-        LAUNCH_KERNEL_INNER(T, DST_DTYPE, float, true, false);                             \
-      }                                                                                    \
-    } else {                                                                               \
-      TORCH_CHECK(!scale_ue8m0);                                                           \
-      LAUNCH_KERNEL_INNER(T, DST_DTYPE, float, false);                                     \
-    }                                                                                      \
+#define LAUNCH_KERNEL(T, DST_DTYPE)                                                          \
+  do {                                                                                       \
+    TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T)); \
+                                                                                             \
+    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                             \
+    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                 \
+    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                                                 \
+                                                                                             \
+    if (is_column_major) {                                                                   \
+      if (scale_ue8m0) {                                                                     \
+        LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true);             \
+      } else {                                                                               \
+        LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, true, false);               \
+      }                                                                                      \
+    } else {                                                                                 \
+      TORCH_CHECK(!scale_ue8m0);                                                             \
+      LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, false);                       \
+    }                                                                                        \
   } while (0)
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), scalar_t, [&] {
