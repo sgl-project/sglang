@@ -277,7 +277,6 @@ __global__ void per_token_group_quant_8bit_kernel(
         scale_element_t* scale_output;
         if constexpr (IS_COLUMN_MAJOR) {
           constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
-          const int hidden_size = hidden_dim_num_groups * group_size;
 
           constexpr int scale_token_stride = 1;
 
@@ -371,7 +370,7 @@ void sgl_per_token_group_quant_8bit(
   TORCH_CHECK(std::abs(LOCAL_ABSMAX_ABS - eps) < 1e-13);
 
   CHECK_EQ(input.numel() % group_size, 0);
-  const int num_groups = input.numel() / group_size / (fuse_silu_and_mul ? 2 : 1);
+  const int num_groups = static_cast<int>(input.numel()) / group_size / (fuse_silu_and_mul ? 2 : 1);
 
   const bool masked_layout = masked_m.has_value();
   TORCH_CHECK(output_s.dim() == (masked_layout ? 3 : 2));
@@ -383,10 +382,10 @@ void sgl_per_token_group_quant_8bit(
   auto dst_type = output_q.scalar_type();
 
   const bool is_column_major = output_s.stride(-2) < output_s.stride(-1);
-  const int hidden_dim_num_groups = output_q.size(-1) / group_size / (fuse_silu_and_mul ? 2 : 1);
-  const int num_tokens_per_expert = output_q.size(-2);
-  const int scale_expert_stride = masked_layout ? output_s.stride(0) : 0;
-  const int scale_hidden_stride = output_s.stride(-1);
+  const int hidden_dim_num_groups = static_cast<int>(output_q.size(-1)) / group_size / (fuse_silu_and_mul ? 2 : 1);
+  const int num_tokens_per_expert = static_cast<int>(output_q.size(-2));
+  const int scale_expert_stride = masked_layout ? static_cast<int>(output_s.stride(0)) : 0;
+  const int scale_hidden_stride = static_cast<int>(output_s.stride(-1));
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, T, DST_DTYPE, output_s_dtype, ...)                                \
   do {                                                                                                   \
