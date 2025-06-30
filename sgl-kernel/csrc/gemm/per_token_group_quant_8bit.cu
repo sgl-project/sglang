@@ -125,6 +125,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     constexpr int scale_token_stride = 1;
     constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
     const int scale_hidden_size_unpacked = scale_hidden_size * num_elems_per_pack;
+    // TODO unify w/ other places?
     const int token_idx = global_group_id / scale_hidden_size_unpacked;
     const int hidden_idx_unpacked = global_group_id % scale_hidden_size_unpacked;
     const int hidden_idx = hidden_idx_unpacked / num_elems_per_pack;
