@@ -1046,7 +1046,7 @@ _ENABLE_PDMUX_P_TP: bool = False
 
 def set_pdmux_status(enable_prefill_multiplexing: bool):
     global _ENABLE_PDMUX_P_TP
-    _ENABLE_PDMUX_P_TP = enable_p
+    _ENABLE_PDMUX_P_TP = enable_prefill_multiplexing
 
 
 def get_tp_group() -> GroupCoordinator:
