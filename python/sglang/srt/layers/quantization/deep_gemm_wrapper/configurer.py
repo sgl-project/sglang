@@ -25,7 +25,12 @@ try:
     from deep_gemm import fp8_gemm_nt
 
     # They have not given a name to this breaking change
-    DEEPGEMM_BLACKWELL = True
+    sm_version = get_device_sm()
+    if sm_version < 90:
+        # deep_gemm.fp8_gemm_nt can also be imported in SM90 chip
+        DEEPGEMM_BLACKWELL = False
+    else:
+        DEEPGEMM_BLACKWELL = True
 except ImportError:
     DEEPGEMM_BLACKWELL = False
 
