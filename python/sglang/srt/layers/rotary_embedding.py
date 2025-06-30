@@ -174,7 +174,6 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
-        import os
 
         if is_torch_compile_enabled():
             return self.forward_native(positions, query, key, offsets)
