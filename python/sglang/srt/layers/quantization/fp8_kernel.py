@@ -224,7 +224,7 @@ def per_token_group_quant_fp8(
         if dtype == torch.int8:
             info = torch.iinfo(dtype)
         else:
-            info = torch.info(dtype)
+            info = torch.finfo(dtype)
         bit8_max = info.max
         bit8_min = info.min
 
