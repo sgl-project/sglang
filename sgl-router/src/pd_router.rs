@@ -109,7 +109,7 @@ impl PDRouter {
                 .insert("", worker.url());
         }
         info!("Added worker: {}", worker);
-        Ok(format!("Successfully added worker: {}", worker))
+        Ok(format!("Successfully added worker: {worker}"))
     }
 
     // Dynamic worker management methods for service discovery
@@ -191,7 +191,7 @@ impl PDRouter {
         }
 
         info!("Removed worker: {}", worker);
-        Ok(format!("Successfully removed worker: {}", worker))
+        Ok(format!("Successfully removed worker: {worker}"))
     }
 
     pub async fn remove_prefill_server(&self, url: &str) -> Result<String, PDRouterError> {
@@ -240,7 +240,7 @@ impl PDRouter {
                 let tree = Arc::new(Mutex::new(Tree::new()));
                 // Initialize tree with prefill workers
                 for worker in &prefill_workers {
-                    tree.lock().unwrap().insert("", &worker.url());
+                    tree.lock().unwrap().insert("", worker.url());
                 }
                 Some(tree)
             }
@@ -258,7 +258,7 @@ impl PDRouter {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+            .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
         let load_monitor_handle = if matches!(selection_policy, PDSelectionPolicy::PowerOfTwo) {
             let monitor_interval = interval_secs;
@@ -319,7 +319,7 @@ impl PDRouter {
                 error!("Failed to select PD pair: {}", e);
                 counter!("sgl_router_pd_errors_total", "error" => "server_selection").increment(1);
                 return HttpResponse::ServiceUnavailable()
-                    .body(format!("No available servers: {}", e));
+                    .body(format!("No available servers: {e}"));
             }
         };
 
@@ -336,7 +336,7 @@ impl PDRouter {
             error!("Failed to add bootstrap info: {}", e);
             counter!("sgl_router_pd_errors_total", "error" => "bootstrap_injection").increment(1);
             return HttpResponse::InternalServerError()
-                .body(format!("Bootstrap injection failed: {}", e));
+                .body(format!("Bootstrap injection failed: {e}"));
         }
 
         // Convert to JSON after bootstrap injection
@@ -388,7 +388,7 @@ impl PDRouter {
                 error!("Failed to select PD pair: {}", e);
                 counter!("sgl_router_pd_errors_total", "error" => "server_selection").increment(1);
                 return HttpResponse::ServiceUnavailable()
-                    .body(format!("No available servers: {}", e));
+                    .body(format!("No available servers: {e}"));
             }
         };
 
@@ -405,7 +405,7 @@ impl PDRouter {
             error!("Failed to add bootstrap info: {}", e);
             counter!("sgl_router_pd_errors_total", "error" => "bootstrap_injection").increment(1);
             return HttpResponse::InternalServerError()
-                .body(format!("Bootstrap injection failed: {}", e));
+                .body(format!("Bootstrap injection failed: {e}"));
         }
 
         // Convert to JSON after bootstrap injection
@@ -504,7 +504,7 @@ impl PDRouter {
                         }
                         Err(e) => {
                             return HttpResponse::build(status)
-                                .body(format!("Decode server error: {}", e));
+                                .body(format!("Decode server error: {e}"));
                         }
                     }
                 }
@@ -557,7 +557,7 @@ impl PDRouter {
                                         }
                                     }
                                     Err(e) => Err(actix_web::error::ErrorInternalServerError(
-                                        format!("Stream error: {}", e),
+                                        format!("Stream error: {e}"),
                                     )),
                                 }
                             }))
@@ -569,7 +569,7 @@ impl PDRouter {
                                 res.bytes_stream().map_err(move |e| {
                                     error!("Stream error from decode server {}: {}", &decode_url, e);
                                     counter!("sgl_router_pd_stream_errors_total", "worker" => decode_url.clone()).increment(1);
-                                    actix_web::error::ErrorInternalServerError(format!("Stream error: {}", e))
+                                    actix_web::error::ErrorInternalServerError(format!("Stream error: {e}"))
                                 })
                             })
                     }
@@ -595,7 +595,7 @@ impl PDRouter {
                 error!("Decode request failed: {}", e);
                 counter!("sgl_router_pd_decode_errors_total", "worker" => decode.url().to_string())
                     .increment(1);
-                HttpResponse::BadGateway().body(format!("Decode server error: {}", e))
+                HttpResponse::BadGateway().body(format!("Decode server error: {e}"))
             }
         }
     }
@@ -663,7 +663,7 @@ impl PDRouter {
         if self
             .prefill_workers
             .read()
-            .map_err(|e| format!("Failed to acquire prefill workers lock: {}", e))?
+            .map_err(|e| format!("Failed to acquire prefill workers lock: {e}"))?
             .is_empty()
         {
             return Err("No prefill workers available. Please check if prefill servers are configured and healthy.".to_string());
@@ -671,7 +671,7 @@ impl PDRouter {
         if self
             .decode_workers
             .read()
-            .map_err(|e| format!("Failed to acquire decode workers lock: {}", e))?
+            .map_err(|e| format!("Failed to acquire decode workers lock: {e}"))?
             .is_empty()
         {
             return Err("No decode workers available. Please check if decode servers are configured and healthy.".to_string());
@@ -854,7 +854,7 @@ fn get_two_random_indices(len: usize) -> (usize, usize) {
 }
 
 async fn get_worker_load(client: &reqwest::Client, worker_url: &str) -> Option<isize> {
-    match client.get(format!("{}/get_load", worker_url)).send().await {
+    match client.get(format!("{worker_url}/get_load")).send().await {
         Ok(res) if res.status().is_success() => match res.bytes().await {
             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(data) => data
@@ -907,7 +907,7 @@ impl PDRouter {
         let tasks: Vec<_> = worker_infos
             .iter()
             .map(|(url, _)| {
-                let health_url = format!("{}/health_generate", url);
+                let health_url = format!("{url}/health_generate");
                 client.get(&health_url).send()
             })
             .collect();
@@ -932,7 +932,7 @@ impl PDRouter {
                 }
                 Err(e) => {
                     all_healthy = false;
-                    let msg = format!("{} server {} error: {}", worker_type, url, e);
+                    let msg = format!("{worker_type} server {url} error: {e}");
                     error!("{}", msg);
                     unhealthy_servers.push(msg);
                 }
@@ -943,7 +943,7 @@ impl PDRouter {
             HttpResponse::Ok().body("Health check passed on all servers")
         } else {
             HttpResponse::ServiceUnavailable()
-                .body(format!("Health check failed: {:?}", unhealthy_servers))
+                .body(format!("Health check failed: {unhealthy_servers:?}"))
         }
     }
 
@@ -963,7 +963,7 @@ impl PDRouter {
 
         for worker_url in worker_urls {
             match client
-                .get(format!("{}/get_server_info", worker_url))
+                .get(format!("{worker_url}/get_server_info"))
                 .send()
                 .await
             {
@@ -1015,7 +1015,7 @@ impl PDRouter {
 
         if let Some(worker_url) = first_worker_url {
             // Send request directly without going through Router
-            let mut request_builder = client.get(format!("{}/v1/models", worker_url));
+            let mut request_builder = client.get(format!("{worker_url}/v1/models"));
             for (name, value) in crate::router::copy_request_headers(req) {
                 if name.to_lowercase() != "content-type" && name.to_lowercase() != "content-length"
                 {
@@ -1029,11 +1029,11 @@ impl PDRouter {
                     match res.bytes().await {
                         Ok(body) => HttpResponse::build(status).body(body.to_vec()),
                         Err(e) => HttpResponse::InternalServerError()
-                            .body(format!("Failed to read response body: {}", e)),
+                            .body(format!("Failed to read response body: {e}")),
                     }
                 }
                 Err(e) => HttpResponse::InternalServerError()
-                    .body(format!("Failed to send request: {}", e)),
+                    .body(format!("Failed to send request: {e}")),
             }
         } else {
             HttpResponse::ServiceUnavailable().body("No prefill servers available")
@@ -1067,7 +1067,7 @@ impl PDRouter {
         };
 
         if let Some(worker_url) = first_worker_url {
-            let mut request_builder = client.get(format!("{}/get_model_info", worker_url));
+            let mut request_builder = client.get(format!("{worker_url}/get_model_info"));
             for (name, value) in crate::router::copy_request_headers(req) {
                 if name.to_lowercase() != "content-type" && name.to_lowercase() != "content-length"
                 {
@@ -1081,11 +1081,11 @@ impl PDRouter {
                     match res.bytes().await {
                         Ok(body) => HttpResponse::build(status).body(body.to_vec()),
                         Err(e) => HttpResponse::InternalServerError()
-                            .body(format!("Failed to read response body: {}", e)),
+                            .body(format!("Failed to read response body: {e}")),
                     }
                 }
                 Err(e) => HttpResponse::InternalServerError()
-                    .body(format!("Failed to send request: {}", e)),
+                    .body(format!("Failed to send request: {e}")),
             }
         } else {
             HttpResponse::ServiceUnavailable().body("No prefill servers available")

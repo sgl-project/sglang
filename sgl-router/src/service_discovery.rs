@@ -90,10 +90,10 @@ impl PodInfo {
             return false;
         }
 
-        pod.metadata.labels.as_ref().map_or(false, |labels| {
+        pod.metadata.labels.as_ref().is_some_and(|labels| {
             selector
                 .iter()
-                .all(|(k, v)| labels.get(k).map_or(false, |label_value| label_value == v))
+                .all(|(k, v)| labels.get(k) == Some(v))
         })
     }
 
@@ -206,14 +206,14 @@ pub async fn start_service_discovery(
         let prefill_selector = config
             .prefill_selector
             .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
+            .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join(",");
 
         let decode_selector = config
             .decode_selector
             .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
+            .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join(",");
 
@@ -225,7 +225,7 @@ pub async fn start_service_discovery(
         let label_selector = config
             .selector
             .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
+            .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join(",");
 

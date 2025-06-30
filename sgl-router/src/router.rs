@@ -1,4 +1,4 @@
-use crate::core::worker::{worker_adapter, Worker, WorkerFactory};
+use crate::core::worker::{worker_adapter, Worker};
 use crate::core::WorkerType;
 use crate::pd_router::PDRouter;
 use crate::pd_types::PDSelectionPolicy;
@@ -15,7 +15,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
-use tokio;
 use tracing::{debug, error, info, warn};
 
 pub fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
@@ -314,7 +313,7 @@ impl Router {
         let sync_client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+            .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
         loop {
             if start_time.elapsed() > Duration::from_secs(timeout_secs) {
@@ -323,8 +322,7 @@ impl Router {
                     timeout_secs, worker_urls
                 );
                 return Err(format!(
-                    "Timeout {}s waiting for workers {:?} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
-                    timeout_secs, worker_urls
+                    "Timeout {timeout_secs}s waiting for workers {worker_urls:?} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value"
                 ));
             }
 
@@ -332,7 +330,7 @@ impl Router {
             let mut unhealthy_workers = Vec::new();
 
             for url in worker_urls {
-                match sync_client.get(&format!("{}/health", url)).send() {
+                match sync_client.get(format!("{url}/health")).send() {
                     Ok(res) => {
                         if !res.status().is_success() {
                             let msg = format!(
@@ -345,7 +343,7 @@ impl Router {
                         }
                     }
                     Err(_) => {
-                        let msg = format!("Worker is not ready yet");
+                        let msg = "Worker is not ready yet".to_string();
                         info!("{}", msg);
                         all_healthy = false;
                         unhealthy_workers.push((url, msg));
@@ -431,12 +429,11 @@ impl Router {
                 match res.bytes().await {
                     Ok(body) => HttpResponse::build(status).body(body.to_vec()),
                     Err(e) => HttpResponse::InternalServerError()
-                        .body(format!("Failed to read response body: {}", e)),
+                        .body(format!("Failed to read response body: {e}")),
                 }
             }
             Err(e) => HttpResponse::InternalServerError().body(format!(
-                "Failed to send request to worker {}: {}",
-                worker, e
+                "Failed to send request to worker {worker}: {e}"
             )),
         };
 
@@ -529,7 +526,7 @@ impl Router {
         // Send requests to all workers concurrently
         let mut tasks = Vec::new();
         for worker_url in workers.iter().map(|w| w.url()).collect::<Vec<_>>() {
-            let mut request_builder = client.post(format!("{}{}", worker_url, route));
+            let mut request_builder = client.post(format!("{worker_url}{route}"));
 
             // Copy headers from original request
             for (name, value) in copy_request_headers(req) {
@@ -749,7 +746,7 @@ impl Router {
                         .unwrap_or_else(|| workers.read().unwrap()[0].url().to_string())
                 } else {
                     // Use cache-aware routing when load is balanced
-                    let (matched_text, matched_worker) = tree.prefix_match(&text);
+                    let (matched_text, matched_worker) = tree.prefix_match(text);
                     let matched_rate =
                         matched_text.chars().count() as f32 / text.chars().count() as f32;
 
@@ -775,13 +772,13 @@ impl Router {
                     .set(*running_queue.get(&selected_url).unwrap() as f64);
                 counter!("sgl_router_processed_requests_total", "worker" => selected_url.to_string()).increment(1);
 
-                tree.insert(&text, &selected_url);
+                tree.insert(text, &selected_url);
 
                 selected_url
             }
             Router::PrefillDecode { .. } => {
                 // For PD mode, we don't use this method
-                return "PD_MODE_ERROR".to_string();
+                "PD_MODE_ERROR".to_string()
             }
         }
     }
@@ -804,7 +801,7 @@ impl Router {
         }
 
         let mut request_builder = client
-            .post(format!("{}{}", worker_url, route))
+            .post(format!("{worker_url}{route}"))
             .json(typed_req); // Use json() directly with typed request
 
         // Copy all headers from original request
@@ -819,7 +816,7 @@ impl Router {
             Ok(res) => res,
             Err(e) => {
                 error!("Failed to send request to {}: {}", worker_url, e);
-                return HttpResponse::InternalServerError().body(format!("Request failed: {}", e));
+                return HttpResponse::InternalServerError().body(format!("Request failed: {e}"));
             }
         };
 
@@ -831,7 +828,7 @@ impl Router {
             let response = match res.bytes().await {
                 Ok(body) => HttpResponse::build(status).body(body.to_vec()),
                 Err(e) => {
-                    let error_msg = format!("Failed to get response body: {}", e);
+                    let error_msg = format!("Failed to get response body: {e}");
                     HttpResponse::InternalServerError().body(error_msg)
                 }
             };
@@ -917,7 +914,7 @@ impl Router {
             worker.worker_type(),
             WorkerType::Decode | WorkerType::Prefill(_)
         ) {
-            return Err(format!("PD workers are only supported in PD mode"));
+            return Err("PD workers are only supported in PD mode".to_string());
         }
 
         // Check for duplicates BEFORE health check to avoid unnecessary work
@@ -955,7 +952,7 @@ impl Router {
                 let mut workers_vec = workers.write().unwrap();
                 // Double-check for duplicates after acquiring write lock (race condition protection)
                 if workers_vec.iter().any(|w| w.url() == worker.url()) {
-                    return Err(format!("Worker {} already exists", worker));
+                    return Err(format!("Worker {worker} already exists"));
                 }
                 info!("Added worker: {}", worker);
                 // Use the same worker instance that passed the health check
@@ -989,7 +986,7 @@ impl Router {
             tree.lock().unwrap().insert("", worker.url());
         }
 
-        return Ok(format!("Successfully added worker: {}", worker));
+        Ok(format!("Successfully added worker: {worker}"))
     }
 
     pub fn remove_worker(&self, worker: Arc<dyn Worker>) -> Result<String, String> {
@@ -1015,8 +1012,7 @@ impl Router {
                 } else {
                     warn!("Worker with url {} not found, skipping removal", worker_url);
                     return Err(format!(
-                        "Worker with url {} not found, skipping removal",
-                        worker_url
+                        "Worker with url {worker_url} not found, skipping removal"
                     ));
                 }
             }
@@ -1037,7 +1033,7 @@ impl Router {
             ..
         } = self
         {
-            tree.lock().unwrap().remove_tenant(&worker_url);
+            tree.lock().unwrap().remove_tenant(worker_url);
             running_queue
                 .lock()
                 .unwrap()
@@ -1051,7 +1047,7 @@ impl Router {
                 worker_url
             );
         }
-        return Ok(format!("Successfully removed worker: {}", worker_url));
+        Ok(format!("Successfully removed worker: {worker_url}"))
     }
 
     // PD-specific wrapper methods that delegate to PDRouter
@@ -1159,7 +1155,7 @@ pub(crate) async fn get_loads_helper(
     // Collect loads from all servers
     let prefill_loads =
         futures_util::future::join_all(prefill_workers.iter().map(|w| async move {
-            let load = crate::core::worker::utils::get_worker_load(&client, w)
+            let load = crate::core::worker::utils::get_worker_load(client, w)
                 .await
                 .unwrap_or(-1);
             serde_json::json!({
@@ -1170,7 +1166,7 @@ pub(crate) async fn get_loads_helper(
         .await;
 
     let decode_loads = futures_util::future::join_all(decode_workers.iter().map(|w| async move {
-        let load = crate::core::worker::utils::get_worker_load(&client, w)
+        let load = crate::core::worker::utils::get_worker_load(client, w)
             .await
             .unwrap_or(-1);
         serde_json::json!({
@@ -1440,7 +1436,7 @@ mod tests {
 
         // Remove a worker that doesn't exist - should not panic
         let result = router.remove_worker_by_url("http://nonexistent:8080");
-        assert!(result.is_ok());
+        assert!(result.is_err());
 
         // Verify workers are unchanged
         {

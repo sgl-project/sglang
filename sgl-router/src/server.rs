@@ -48,7 +48,7 @@ async fn sink_handler(_req: HttpRequest, mut payload: web::Payload) -> Result<Ht
     // Drain the payload
     while let Some(chunk) = payload.next().await {
         if let Err(err) = chunk {
-            println!("Error while draining payload: {:?}", err);
+            println!("Error while draining payload: {err:?}");
             break;
         }
     }
@@ -65,15 +65,14 @@ fn json_error_handler(err: error::JsonPayloadError, _req: &HttpRequest) -> Error
                 length, limit
             );
             error::ErrorPayloadTooLarge(format!(
-                "Payload too large: {} bytes exceeds limit of {} bytes",
-                length, limit
+                "Payload too large: {length} bytes exceeds limit of {limit} bytes"
             ))
         }
         error::JsonPayloadError::Overflow { limit } => {
             error!("Payload overflow: exceeds limit of {} bytes", limit);
-            error::ErrorPayloadTooLarge(format!("Payload exceeds limit of {} bytes", limit))
+            error::ErrorPayloadTooLarge(format!("Payload exceeds limit of {limit} bytes"))
         }
-        _ => error::ErrorBadRequest(format!("Invalid JSON payload: {}", err)),
+        _ => error::ErrorBadRequest(format!("Invalid JSON payload: {err}")),
     }
 }
 
@@ -153,13 +152,13 @@ async fn generate(
         let pd_request = body.into_inner().to_pd_request();
 
         Ok(router
-            .route_pd_generate_typed(&client, &req, pd_request, "/generate")
+            .route_pd_generate_typed(client, &req, pd_request, "/generate")
             .await)
     } else {
         // For regular mode, use typed request directly
         let request = body.into_inner();
         Ok(router
-            .route_typed_request(&client, &req, &request, "/generate")
+            .route_typed_request(client, &req, &request, "/generate")
             .await)
     }
 }
@@ -179,13 +178,13 @@ async fn v1_chat_completions(
         let pd_request = body.into_inner().to_pd_request();
 
         Ok(router
-            .route_pd_chat_typed(&client, &req, pd_request, "/v1/chat/completions")
+            .route_pd_chat_typed(client, &req, pd_request, "/v1/chat/completions")
             .await)
     } else {
         // For regular mode, use typed request directly
         let request = body.into_inner();
         Ok(router
-            .route_typed_request(&client, &req, &request, "/v1/chat/completions")
+            .route_typed_request(client, &req, &request, "/v1/chat/completions")
             .await)
     }
 }
@@ -205,13 +204,13 @@ async fn v1_completions(
         let pd_request = body.into_inner().to_pd_request();
 
         Ok(router
-            .route_pd_generate_typed(&client, &req, pd_request, "/v1/completions")
+            .route_pd_generate_typed(client, &req, pd_request, "/v1/completions")
             .await)
     } else {
         // For regular mode, use typed request directly
         let request = body.into_inner();
         Ok(router
-            .route_typed_request(&client, &req, &request, "/v1/completions")
+            .route_typed_request(client, &req, &request, "/v1/completions")
             .await)
     }
 }
@@ -257,8 +256,10 @@ async fn remove_worker(
         Some(url) => url.to_string(),
         None => return HttpResponse::BadRequest().finish(),
     };
-    data.router.remove_worker_by_url(&worker_url);
-    HttpResponse::Ok().body(format!("Successfully removed worker: {}", worker_url))
+    match data.router.remove_worker_by_url(&worker_url) {
+        Ok(message) => HttpResponse::Ok().body(message),
+        Err(error) => HttpResponse::InternalServerError().body(error),
+    }
 }
 
 #[post("/flush_cache")]
@@ -352,7 +353,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         client.clone(),
         config.policy_config.clone(),
     )
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    .map_err(std::io::Error::other)?;
     let router_arc = Arc::clone(&app_state_init.router);
     let app_state = web::Data::new(app_state_init);
 

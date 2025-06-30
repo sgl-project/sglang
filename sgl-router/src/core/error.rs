@@ -27,30 +27,28 @@ impl fmt::Display for WorkerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WorkerError::HealthCheckFailed { url, reason } => {
-                write!(f, "Health check failed for worker {}: {}", url, reason)
+                write!(f, "Health check failed for worker {url}: {reason}")
             }
             WorkerError::NetworkError { url, error } => {
-                write!(f, "Network error for worker {}: {}", url, error)
+                write!(f, "Network error for worker {url}: {error}")
             }
             WorkerError::WorkerError { url, status, body } => {
                 write!(
                     f,
-                    "Worker {} returned error status {}: {}",
-                    url, status, body
+                    "Worker {url} returned error status {status}: {body}"
                 )
             }
             WorkerError::Timeout { url, timeout_secs } => {
                 write!(
                     f,
-                    "Timeout waiting for worker {} after {}s",
-                    url, timeout_secs
+                    "Timeout waiting for worker {url} after {timeout_secs}s"
                 )
             }
             WorkerError::InvalidConfiguration { reason } => {
-                write!(f, "Invalid worker configuration: {}", reason)
+                write!(f, "Invalid worker configuration: {reason}")
             }
             WorkerError::Unavailable { url } => {
-                write!(f, "Worker {} is not available", url)
+                write!(f, "Worker {url} is not available")
             }
         }
     }

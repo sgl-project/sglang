@@ -59,7 +59,7 @@ impl fmt::Display for WorkerType {
             WorkerType::Decode => write!(f, "Decode"),
             WorkerType::Prefill(port) => {
                 if let Some(port) = port {
-                    write!(f, "Prefill(bootstrap_port={})", port)
+                    write!(f, "Prefill(bootstrap_port={port})")
                 } else {
                     write!(f, "Prefill")
                 }
@@ -80,15 +80,13 @@ pub struct WorkerEndpoints {
 
 impl WorkerType {
     pub fn get_endpoints(&self) -> WorkerEndpoints {
-        match self {
-            _ => WorkerEndpoints {
-                health: HEALTH_ENDPOINT,
-                load: GET_LOAD_ENDPOINT,
-                flush_cache: FLUSH_CACHE_ENDPOINT,
-                server_info: SERVER_INFO_ENDPOINT,
-                models: MODELS_ENDPOINT,
-                model_info: MODEL_INFO_ENDPOINT,
-            },
+        WorkerEndpoints {
+            health: HEALTH_ENDPOINT,
+            load: GET_LOAD_ENDPOINT,
+            flush_cache: FLUSH_CACHE_ENDPOINT,
+            server_info: SERVER_INFO_ENDPOINT,
+            models: MODELS_ENDPOINT,
+            model_info: MODEL_INFO_ENDPOINT,
         }
     }
 }
@@ -476,8 +474,7 @@ pub(crate) mod utils {
                 timeout_secs, workers
             );
             Err(format!(
-                "Timeout {}s waiting for workers {:?} to become healthy.",
-                timeout_secs, workers
+                "Timeout {timeout_secs}s waiting for workers {workers:?} to become healthy."
             ))
         })
     }

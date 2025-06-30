@@ -213,7 +213,7 @@ impl GenerateReqInput {
             // Validate each sequence is not empty
             for (i, seq) in ids.iter().enumerate() {
                 if seq.is_empty() {
-                    return Err(format!("Input sequence at index {} is empty", i));
+                    return Err(format!("Input sequence at index {i} is empty"));
                 }
             }
             return Ok(Some(ids.len()));

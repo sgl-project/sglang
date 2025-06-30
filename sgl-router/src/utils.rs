@@ -1,9 +1,9 @@
 /// Build the full API path for a given route
 pub fn api_path(base_url: &str, route: &str) -> String {
     if route.starts_with('/') {
-        format!("{}{}", base_url, route)
+        format!("{base_url}{route}")
     } else {
-        format!("{}/{}", base_url, route)
+        format!("{base_url}/{route}")
     }
 }
 
