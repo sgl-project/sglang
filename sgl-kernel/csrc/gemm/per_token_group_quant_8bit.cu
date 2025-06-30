@@ -109,15 +109,17 @@ struct NaiveScheduler {
     const int block_group_id = blockIdx.x * subwarps_per_block;
     const int group_id = block_group_id + local_group_id;
 
+    int input_group_start_offset;
+    if constexpr (!FUSE_SILU_AND_MUL) {
+      input_group_start_offset = group_id * group_size;
+    }
+
     const int token_idx = group_id / hidden_size_num_groups;
     // At hidden_size dim, we are handling idx-th group
     const int hidden_dim_group_idx = group_id % hidden_size_num_groups;
 
-    int input_group_start_offset;
     if constexpr (FUSE_SILU_AND_MUL) {
       input_group_start_offset = token_idx * hidden_size_num_groups * group_size * 2 + hidden_dim_group_idx * group_size;
-    } else {
-      input_group_start_offset = group_id * group_size;
     }
 
     fn(token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
