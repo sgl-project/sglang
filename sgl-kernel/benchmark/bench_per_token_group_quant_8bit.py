@@ -79,7 +79,8 @@ configs = list(
         x_vals=configs,
         line_arg="provider",
         line_vals=["triton", "sglang"],
-        line_names=["Triton", "SGL Kernel"],
+        # Triton has multi kernels and we only report the time for the core one
+        line_names=["Triton (Inaccurate)", "SGL Kernel"],
         styles=[("blue", "-"), ("green", "-")],
         ylabel="us",
         plot_name="per-token-group-quant-8bit-performance",
