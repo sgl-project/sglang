@@ -90,14 +90,14 @@ TEST_CASES = [
                     create_batch_data(
                         "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
                     ),
-                    "not found",
+                    "not loaded",
                 ),
             ),
             Operation(
                 type=OperationType.EXPECT_ERROR,
                 data=(
                     create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
-                    "not found",
+                    "not loaded",
                 ),
             ),
             Operation(
@@ -126,7 +126,7 @@ TEST_CASES = [
                 type=OperationType.EXPECT_ERROR,
                 data=(
                     create_batch_data("philschmid/code-llama-3-1-8b-text-to-sql-lora"),
-                    "not found",
+                    "not loaded",
                 ),
             ),
             Operation(
@@ -148,7 +148,7 @@ TEST_CASES = [
                     create_batch_data(
                         "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
                     ),
-                    "not found",
+                    "not loaded",
                 ),
             ),
             Operation(
@@ -191,14 +191,14 @@ TEST_CASES = [
                     create_batch_data(
                         "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
                     ),
-                    "not found",
+                    "not loaded",
                 ),
             ),
             Operation(
                 type=OperationType.EXPECT_ERROR,
                 data=(
                     create_batch_data("pbevan11/llama-3.1-8b-ocr-correction"),
-                    "not found",
+                    "not loaded",
                 ),
             ),
             Operation(
@@ -213,7 +213,7 @@ TEST_CASES = [
                 type=OperationType.EXPECT_ERROR,
                 data=(
                     create_batch_data("philschmid/code-llama-3-1-8b-text-to-sql-lora"),
-                    "not found",
+                    "not loaded",
                 ),
             ),
             Operation(
