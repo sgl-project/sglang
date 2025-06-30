@@ -524,7 +524,7 @@ class Scheduler(
 
         if get_bool_env_var("SGLANG_GC_LOG"):
             configure_gc_logger()
-            
+
         self.balance_meta = dp_balance_meta
         if (
             server_args.enable_dp_attention
