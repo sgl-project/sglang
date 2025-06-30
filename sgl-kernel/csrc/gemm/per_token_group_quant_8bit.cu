@@ -37,16 +37,16 @@ __forceinline__ __device__ int fast_log2_ceil(float x) {
 }
 
 // Copied and modified from DeepEP
-template <bool ROUND_SCALE, float MAX_8BIT>
+template <bool ROUND_SCALE, typename dtype_info>
 __forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, float& scale_inv) {
-  constexpr float MAX_8BIT_INV = 1.0f / MAX_8BIT;
+  constexpr float MAX_8BIT_INV = 1.0f / dtype_info::MAX;
   if constexpr (ROUND_SCALE) {
     auto exp_scale_inv = fast_log2_ceil(amax * MAX_8BIT_INV);
     scale = fast_pow2(-exp_scale_inv);
     scale_inv = fast_pow2(exp_scale_inv);
   } else {
     scale_inv = amax * MAX_8BIT_INV;
-    scale = MAX_8BIT / amax;
+    scale = dtype_info::MAX / amax;
   }
 }
 
@@ -160,7 +160,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   local_absmax = GroupReduceMax<THREADS_PER_GROUP>(local_absmax, lane_id);
 
   float y_scale, y_scale_inv;
-  calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info::MAX>(local_absmax, y_scale, y_scale_inv);
+  calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
   float2 y_scale_repeated = {y_scale, y_scale};
 
   if (lane_id == 0) {
