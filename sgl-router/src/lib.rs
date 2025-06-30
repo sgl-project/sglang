@@ -5,12 +5,14 @@ use std::collections::HashMap;
 pub mod openai_api_types;
 pub mod pd_router;
 pub mod pd_types;
+pub mod policies;
 pub mod prometheus;
 pub mod request_adapter;
 pub mod router;
 pub mod server;
 pub mod service_discovery;
 pub mod tree;
+pub mod worker; // todo(Yingyi): placeholder, replace to core after task 1 freeze
 use crate::prometheus::PrometheusConfig;
 
 #[pyclass(eq)]
