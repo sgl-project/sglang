@@ -1032,8 +1032,9 @@ impl PDRouter {
                             .body(format!("Failed to read response body: {e}")),
                     }
                 }
-                Err(e) => HttpResponse::InternalServerError()
-                    .body(format!("Failed to send request: {e}")),
+                Err(e) => {
+                    HttpResponse::InternalServerError().body(format!("Failed to send request: {e}"))
+                }
             }
         } else {
             HttpResponse::ServiceUnavailable().body("No prefill servers available")
@@ -1084,8 +1085,9 @@ impl PDRouter {
                             .body(format!("Failed to read response body: {e}")),
                     }
                 }
-                Err(e) => HttpResponse::InternalServerError()
-                    .body(format!("Failed to send request: {e}")),
+                Err(e) => {
+                    HttpResponse::InternalServerError().body(format!("Failed to send request: {e}"))
+                }
             }
         } else {
             HttpResponse::ServiceUnavailable().body("No prefill servers available")

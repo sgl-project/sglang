@@ -432,9 +432,8 @@ impl Router {
                         .body(format!("Failed to read response body: {e}")),
                 }
             }
-            Err(e) => HttpResponse::InternalServerError().body(format!(
-                "Failed to send request to worker {worker}: {e}"
-            )),
+            Err(e) => HttpResponse::InternalServerError()
+                .body(format!("Failed to send request to worker {worker}: {e}")),
         };
 
         // Record request metrics
@@ -800,9 +799,7 @@ impl Router {
             debug!("Sending request to {}: {}", route, json_str);
         }
 
-        let mut request_builder = client
-            .post(format!("{worker_url}{route}"))
-            .json(typed_req); // Use json() directly with typed request
+        let mut request_builder = client.post(format!("{worker_url}{route}")).json(typed_req); // Use json() directly with typed request
 
         // Copy all headers from original request
         for (name, value) in copy_request_headers(req) {

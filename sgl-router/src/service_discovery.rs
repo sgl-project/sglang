@@ -90,11 +90,10 @@ impl PodInfo {
             return false;
         }
 
-        pod.metadata.labels.as_ref().is_some_and(|labels| {
-            selector
-                .iter()
-                .all(|(k, v)| labels.get(k) == Some(v))
-        })
+        pod.metadata
+            .labels
+            .as_ref()
+            .is_some_and(|labels| selector.iter().all(|(k, v)| labels.get(k) == Some(v)))
     }
 
     /// Check if a pod should be included in service discovery

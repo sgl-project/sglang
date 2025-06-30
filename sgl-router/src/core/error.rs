@@ -33,16 +33,10 @@ impl fmt::Display for WorkerError {
                 write!(f, "Network error for worker {url}: {error}")
             }
             WorkerError::WorkerError { url, status, body } => {
-                write!(
-                    f,
-                    "Worker {url} returned error status {status}: {body}"
-                )
+                write!(f, "Worker {url} returned error status {status}: {body}")
             }
             WorkerError::Timeout { url, timeout_secs } => {
-                write!(
-                    f,
-                    "Timeout waiting for worker {url} after {timeout_secs}s"
-                )
+                write!(f, "Timeout waiting for worker {url} after {timeout_secs}s")
             }
             WorkerError::InvalidConfiguration { reason } => {
                 write!(f, "Invalid worker configuration: {reason}")
