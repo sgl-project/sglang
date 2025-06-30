@@ -314,6 +314,7 @@ __global__ void per_token_group_quant_8bit_kernel(
         float y_scale, y_scale_inv;
         int y_exp_scale_inv;
         calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv, y_exp_scale_inv);
+        // TODO wrong for neg
         uint32_t adder_for_scaling = (y_exp_scale_inv << (16 + 7)) | (y_exp_scale_inv << 7);
 
         if (lane_id == 0) {
