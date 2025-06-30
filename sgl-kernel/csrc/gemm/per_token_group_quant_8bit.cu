@@ -207,7 +207,7 @@ void sgl_per_token_group_quant_8bit(
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
 
-  CHECK_EQ(LOCAL_ABSMAX_ABS, eps);
+  TORCH_CHECK(std::abs(LOCAL_ABSMAX_ABS - eps) < 1e-13);
 
   const int num_groups = input.numel() / group_size;
 
