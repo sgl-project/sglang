@@ -122,7 +122,7 @@ struct NaiveScheduler {
     }
 
     const int token_idx = group_id / hidden_dim_num_groups;
-    // At hidden_size dim, we are handling idx-th group
+    // At the hidden_size dimension, we are handling idx-th group
     const int hidden_dim_group_idx = group_id % hidden_dim_num_groups;
 
     if constexpr (FUSE_SILU_AND_MUL) {
@@ -143,6 +143,7 @@ struct MaskedLayoutScheduler {
       int subwarps_per_block,
       dim3& grid,
       dim3& block) {
+    TODO_cannot_too_many_subwarps_per_block;
     grid = dim3(hidden_dim_num_groups, TOKEN_DIM_BLOCK_NUM_PER_EXPERT, num_local_experts);
     block = dim3(subwarps_per_block * THREADS_PER_SUBWARP);
   }
@@ -153,6 +154,8 @@ struct MaskedLayoutScheduler {
     const int expert_id = blockIdx.z;
     const int token_idx_start = blockIdx.y;
     const int hidden_dim_block_index = blockIdx.x;
+
+    const int hidden_dim_group_idx = TODO;
 
     const int curr_expert_token_num = masked_m[expert_id];
 
