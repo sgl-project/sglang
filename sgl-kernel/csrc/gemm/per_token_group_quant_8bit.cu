@@ -142,8 +142,7 @@ __global__ void per_token_group_quant_8bit_kernel(
         constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
         constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
-        // TODO consider stride
-        const int group_id = token_idx * hidden_size_num_groups + group_start_hidden_idx;
+        const int offset_num_groups = token_idx * hidden_size_num_groups + group_start_hidden_idx;
 
         int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
         T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
@@ -167,7 +166,7 @@ __global__ void per_token_group_quant_8bit_kernel(
                           token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
         } else {
           static_assert(!SCALE_UE8M0);
-          scale_output = output_s + group_id;
+          scale_output = output_s + offset_num_groups;
         }
 
         float local_absmax = LOCAL_ABSMAX_ABS;
@@ -215,7 +214,7 @@ __global__ void per_token_group_quant_8bit_kernel(
         }
 
         st_global(
-            reinterpret_cast<int4*>(output_q + group_id * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE), output_buf);
+            reinterpret_cast<int4*>(output_q + offset_num_groups * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE), output_buf);
       });
 }
 
