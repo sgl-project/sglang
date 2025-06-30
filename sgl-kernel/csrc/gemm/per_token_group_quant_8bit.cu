@@ -84,7 +84,7 @@ template <
     typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>>
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
-    void* __restrict__ output_q,
+    DST_DTYPE* __restrict__ output_q,
     scale_packed_t* __restrict__ output_s,
     const int group_size,
     const int num_groups,
@@ -106,7 +106,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
   const T* group_input = input + block_group_offset;
-  DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + block_group_offset;
+  DST_DTYPE* group_output = output_q + block_group_offset;
   scale_element_t* scale_output;
 
   if constexpr (IS_COLUMN_MAJOR) {
@@ -237,7 +237,7 @@ void sgl_per_token_group_quant_8bit(
       if (scale_ue8m0) {                                                                          \
         per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, true><<<grid, block, 0, stream>>>(  \
             static_cast<T*>(input.data_ptr()),                                                    \
-            output_q.data_ptr(),                                                                  \
+            static_cast<DST_DTYPE*>(output_q.data_ptr()),                                         \
             static_cast<uint32_t*>(output_s.data_ptr()),                                          \
             group_size,                                                                           \
             num_groups,                                                                           \
@@ -251,7 +251,7 @@ void sgl_per_token_group_quant_8bit(
       } else {                                                                                    \
         per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, false><<<grid, block, 0, stream>>>( \
             static_cast<T*>(input.data_ptr()),                                                    \
-            output_q.data_ptr(),                                                                  \
+            static_cast<DST_DTYPE*>(output_q.data_ptr()),                                         \
             static_cast<float*>(output_s.data_ptr()),                                             \
             group_size,                                                                           \
             num_groups,                                                                           \
@@ -267,7 +267,7 @@ void sgl_per_token_group_quant_8bit(
       assert(!scale_ue8m0);                                                                       \
       per_token_group_quant_8bit_kernel<T, DST_DTYPE, false><<<grid, block, 0, stream>>>(         \
           static_cast<T*>(input.data_ptr()),                                                      \
-          output_q.data_ptr(),                                                                    \
+          static_cast<DST_DTYPE*>(output_q.data_ptr()),                                           \
           static_cast<float*>(output_s.data_ptr()),                                               \
           group_size,                                                                             \
           num_groups,                                                                             \
