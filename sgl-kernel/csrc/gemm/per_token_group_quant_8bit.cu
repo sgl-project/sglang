@@ -6,17 +6,114 @@
 
 #include "utils.h"
 
+template <int THREADS_PER_SUBWARP>
 __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
   unsigned mask = 0xffff;
 
-  val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
+  static_assert((THREADS_PER_SUBWARP == 16) or (THREADS_PER_SUBWARP == 8));
+
+  if constexpr (THREADS_PER_SUBWARP == 16) {
+    val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
+  }
   val = fmaxf(val, __shfl_xor_sync(mask, val, 4));
   val = fmaxf(val, __shfl_xor_sync(mask, val, 2));
   val = fmaxf(val, __shfl_xor_sync(mask, val, 1));
   return val;
 }
 
+// Copied and modified from DeepEP
+__forceinline__ __device__ float fast_pow2(int x) {
+  // We can ensure `-126 <= x and x <= 127`
+  uint32_t bits_x = (x + 127) << 23;
+  return *reinterpret_cast<float*>(&bits_x);
+}
+
+// Copied and modified from DeepEP
+__forceinline__ __device__ int fast_log2_ceil(float x) {
+  auto bits_x = *reinterpret_cast<uint32_t*>(&x);
+  auto exp_x = (bits_x >> 23) & 0xff;
+  auto man_bits = bits_x & ((1 << 23) - 1);
+  return exp_x - 127 + (man_bits != 0);
+}
+
+// Copied and modified from DeepEP
+template <bool ROUND_SCALE, typename dtype_info>
+__forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, float& scale_inv) {
+  constexpr float MAX_8BIT_INV = 1.0f / dtype_info::MAX;
+  if constexpr (ROUND_SCALE) {
+    auto exp_scale_inv = fast_log2_ceil(amax * MAX_8BIT_INV);
+    scale = fast_pow2(-exp_scale_inv);
+    scale_inv = fast_pow2(exp_scale_inv);
+  } else {
+    scale_inv = amax * MAX_8BIT_INV;
+    scale = dtype_info::MAX / amax;
+  }
+}
+
+// Copied and modified from DeepEP
+template <bool SCALE_UE8M0, typename OUT_DTYPE_T = std::conditional_t<SCALE_UE8M0, uint8_t, float>>
+__forceinline__ __device__ OUT_DTYPE_T extract_required_scale_format(float value) {
+  if constexpr (SCALE_UE8M0) {
+    return static_cast<uint8_t>((*reinterpret_cast<uint32_t*>(&value)) >> 23);
+  } else {
+    return value;
+  }
+}
+
+__device__ __forceinline__ void st_global(const int4* ptr, const int4& value) {
+  asm volatile(
+      "st.global.v4.s32 [%0], {%1, %2, %3, %4};" ::"l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w));
+}
+
+__device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
+  int4 ret;
+  asm volatile("ld.global.nc.v4.s32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w)
+               : "l"(ptr));
+  return ret;
+}
+
+template <typename T>
+struct DtypeInfo;
+
+template <>
+struct DtypeInfo<int8_t> {
+  static constexpr float MIN = -128;
+  static constexpr float MAX = 127;
+};
+
+template <>
+struct DtypeInfo<c10::Float8_e4m3fn> {
+  static constexpr float MIN = -448;
+  static constexpr float MAX = 448;
+};
+
+constexpr float LOCAL_ABSMAX_ABS = 1e-10;
+constexpr int THREADS_PER_SUBWARP = 8;
+constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
+
+struct NaiveScheduler {
+  static void compute_exec_config(int num_groups, int subwarps_per_block, dim3& grid, dim3& block) {
+    const int num_blocks = num_groups / subwarps_per_block;
+    const int num_threads = subwarps_per_block * THREADS_PER_SUBWARP;
+
+    grid = dim3(num_blocks);
+    block = dim3(num_threads);
+  }
+
+  template <typename FUNC>
+  __device__ __forceinline__ static void execute(int subwarps_per_block, FUNC fn) {
+    const int local_group_id = threadIdx.x / THREADS_PER_SUBWARP;
+    const int lane_id = threadIdx.x % THREADS_PER_SUBWARP;
+    const int block_group_id = blockIdx.x * subwarps_per_block;
+    const int group_id = block_group_id + local_group_id;
+
+    fn(group_id, lane_id);
+  }
+};
+
 template <
+    typename SCHEDULER,
     typename T,
     typename DST_DTYPE,
     bool IS_COLUMN_MAJOR = false,
@@ -24,97 +121,114 @@ template <
     typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>>
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
-    void* __restrict__ output_q,
+    DST_DTYPE* __restrict__ output_q,
     scale_packed_t* __restrict__ output_s,
     const int group_size,
-    const int num_groups,
-    const int groups_per_block,
-    const float eps,
-    const float min_8bit,
-    const float max_8bit,
-    const int scale_num_rows = 0,
-    const int scale_stride = 0) {
-  const int threads_per_group = 16;
-  const int local_group_id = threadIdx.x / threads_per_group;
-  const int lane_id = threadIdx.x % threads_per_group;
-
-  const int block_group_id = blockIdx.x * groups_per_block;
-  const int global_group_id = block_group_id + local_group_id;
-  const int block_group_offset = global_group_id * group_size;
-
-  float local_absmax = eps;
-
+    const int subwarps_per_block,
+    // TODO can remove?
+    const int scale_hidden_size = 0,
+    const int scale_hidden_stride = 0) {
+  using dst_dtype_info = DtypeInfo<DST_DTYPE>;
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
-  const T* group_input = input + block_group_offset;
-  DST_DTYPE* group_output = static_cast<DST_DTYPE*>(output_q) + block_group_offset;
-  scale_element_t* scale_output;
+  SCHEDULER::execute(subwarps_per_block, [&](int group_id, int lane_id) {
+    constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
+    constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
-  if constexpr (IS_COLUMN_MAJOR) {
-    const int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
-    const int scale_num_rows_element = scale_num_rows * num_elems_per_pack;
-    const int row_idx = global_group_id / scale_num_rows_element;
-    const int col_idx_raw = global_group_id % scale_num_rows_element;
-    const int col_idx = col_idx_raw / num_elems_per_pack;
-    const int pack_idx = col_idx_raw % num_elems_per_pack;
-    scale_output = reinterpret_cast<scale_element_t*>(output_s) +
-                   (col_idx * scale_stride * num_elems_per_pack + row_idx * num_elems_per_pack + pack_idx);
-  } else {
-    static_assert(!SCALE_UE8M0);
-    scale_output = output_s + global_group_id;
-  }
-
-  constexpr uint32_t vec_size = 16 / sizeof(T);
-  using vec_t = flashinfer::vec_t<T, vec_size>;
-
-  const int32_t num_vec_elems = group_size / vec_size;
-
-  for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
-    vec_t input_vec;
-    input_vec.cast_load(group_input + i * vec_size);
+    int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
+    T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
+    static_assert(sizeof(input_primary_vec[0]) * INPUT_PRIMARY_VEC_SIZE == sizeof(input_primary_int4));
 
 #pragma unroll
-    for (uint32_t j = 0; j < vec_size; ++j) {
-      float val = static_cast<float>(input_vec[j]);
+    for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
+      input_primary_int4[j] = ld_global_nc(
+          reinterpret_cast<const int4*>(input + group_id * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
+    }
+
+    scale_element_t* scale_output;
+    if constexpr (IS_COLUMN_MAJOR) {
+      constexpr int scale_token_stride = 1;
+      constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
+
+      // TODO unify w/ other places?
+      const int scale_hidden_size_unpacked = scale_hidden_size * num_elems_per_pack;
+      const int token_idx = group_id / scale_hidden_size_unpacked;
+      const int group_start_hidden_idx = group_id % scale_hidden_size_unpacked;
+
+      const int hidden_idx_packed = group_start_hidden_idx / num_elems_per_pack;
+      const int pack_idx = group_start_hidden_idx % num_elems_per_pack;
+      scale_output = reinterpret_cast<scale_element_t*>(output_s) +
+                     (hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
+                      token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
+    } else {
+      static_assert(!SCALE_UE8M0);
+      scale_output = output_s + group_id;
+    }
+
+    float local_absmax = LOCAL_ABSMAX_ABS;
+
+#pragma unroll
+    for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
+      float val = static_cast<float>(input_primary_vec[j]);
       float abs_val = fabsf(val);
       local_absmax = fmaxf(local_absmax, abs_val);
     }
-  }
 
-  local_absmax = GroupReduceMax(local_absmax, lane_id);
+    local_absmax = GroupReduceMax<THREADS_PER_SUBWARP>(local_absmax, lane_id);
 
-  float y_s = local_absmax / max_8bit;
-  if constexpr (SCALE_UE8M0) {
-    y_s = exp2f(ceilf(log2f(fmaxf(fabsf(y_s), 1e-10f))));
-  }
+    float y_scale, y_scale_inv;
+    calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
+    float2 y_scale_repeated = {y_scale, y_scale};
 
-  // TODO can optimize
-  scale_element_t y_s_quant;
-  if constexpr (SCALE_UE8M0) {
-    y_s_quant = (uint8_t)(((int)log2f(y_s)) + 127);
-  } else {
-    y_s_quant = y_s;
-  }
+    if (lane_id == 0) {
+      *scale_output = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
+    }
 
-  if (lane_id == 0) {
-    *scale_output = y_s_quant;
-  }
+    int4 output_buf;
+    static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE * sizeof(DST_DTYPE));
 
-  for (int32_t i = lane_id; i < num_vec_elems; i += 16) {
-    vec_t input_vec;
-    input_vec.cast_load(group_input + i * vec_size);
+    if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
+      const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
+      static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
+      static_assert(INPUT_PRIMARY_VEC_SIZE % 2 == 0);
 
 #pragma unroll
-    for (uint32_t j = 0; j < vec_size; ++j) {
-      float val = static_cast<float>(input_vec[j]);
-      float q_val = fminf(fmaxf(val / y_s, min_8bit), max_8bit);
-      group_output[i * vec_size + j] = DST_DTYPE(q_val);
+      for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
+        float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
+        float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
+        output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+      }
+    } else {
+      const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
+
+#pragma unroll
+      for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
+        float val = static_cast<float>(input_primary_vec[j]);
+        float q_val = fminf(fmaxf(val * y_scale, dst_dtype_info::MIN), dst_dtype_info::MAX);
+        output_buf_ptr[j] = DST_DTYPE(q_val);
+      }
     }
+
+    st_global(reinterpret_cast<int4*>(output_q + group_id * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE), output_buf);
+  });
+}
+
+int compute_subwarps_per_block(int num_groups) {
+  if (num_groups % 16 == 0) {
+    return 16;
+  } else if (num_groups % 8 == 0) {
+    return 8;
+  } else if (num_groups % 4 == 0) {
+    return 4;
+  } else if (num_groups % 2 == 0) {
+    return 2;
   }
+  return 1;
 }
 
 void sgl_per_token_group_quant_8bit(
+    // (optional num_experts, num_tokens, hidden_size)
     torch::Tensor input,
     torch::Tensor output_q,
     torch::Tensor output_s,
@@ -125,84 +239,59 @@ void sgl_per_token_group_quant_8bit(
     bool scale_ue8m0 = false) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
+  TORCH_CHECK((output_s.dim() == 2) or (output_s.dim() == 3));
 
-  const int num_groups = input.numel() / group_size;
+  TORCH_CHECK(std::abs(LOCAL_ABSMAX_ABS - eps) < 1e-13);
 
   CHECK_EQ(input.numel() % group_size, 0);
-  CHECK_EQ(output_s.dim(), 2);
+  const int num_groups = input.numel() / group_size;
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  constexpr int THREADS_PER_GROUP = 16;
-
-  int groups_per_block = 1;
-
-  if (num_groups % 16 == 0) {
-    groups_per_block = 16;
-  } else if (num_groups % 8 == 0) {
-    groups_per_block = 8;
-  } else if (num_groups % 4 == 0) {
-    groups_per_block = 4;
-  } else if (num_groups % 2 == 0) {
-    groups_per_block = 2;
-  }
+  int subwarps_per_block = compute_subwarps_per_block(num_groups);
 
   auto dst_type = output_q.scalar_type();
-  const int num_blocks = num_groups / groups_per_block;
-  const int num_threads = groups_per_block * THREADS_PER_GROUP;
 
-  const bool is_column_major = output_s.stride(0) < output_s.stride(1);
-  const int scale_num_rows = output_s.size(1);
-  const int scale_stride = output_s.stride(1);
+  const bool is_column_major = output_s.stride(-2) < output_s.stride(-1);
+  const int scale_hidden_size = output_s.size(-1);
+  const int scale_hidden_stride = output_s.stride(-1);
 
-#define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
-  do {                                                                                            \
-    dim3 grid(num_blocks);                                                                        \
-    dim3 block(num_threads);                                                                      \
-    if (is_column_major) {                                                                        \
-      if (scale_ue8m0) {                                                                          \
-        per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, true><<<grid, block, 0, stream>>>(  \
-            static_cast<T*>(input.data_ptr()),                                                    \
-            output_q.data_ptr(),                                                                  \
-            static_cast<uint32_t*>(output_s.data_ptr()),                                          \
-            group_size,                                                                           \
-            num_groups,                                                                           \
-            groups_per_block,                                                                     \
-            (float)eps,                                                                           \
-            (float)min_8bit,                                                                      \
-            (float)max_8bit,                                                                      \
-            scale_num_rows,                                                                       \
-            scale_stride);                                                                        \
-      } else {                                                                                    \
-        per_token_group_quant_8bit_kernel<T, DST_DTYPE, true, false><<<grid, block, 0, stream>>>( \
-            static_cast<T*>(input.data_ptr()),                                                    \
-            output_q.data_ptr(),                                                                  \
-            static_cast<float*>(output_s.data_ptr()),                                             \
-            group_size,                                                                           \
-            num_groups,                                                                           \
-            groups_per_block,                                                                     \
-            (float)eps,                                                                           \
-            (float)min_8bit,                                                                      \
-            (float)max_8bit,                                                                      \
-            scale_num_rows,                                                                       \
-            scale_stride);                                                                        \
-      }                                                                                           \
-    } else {                                                                                      \
-      assert(!scale_ue8m0);                                                                       \
-      per_token_group_quant_8bit_kernel<T, DST_DTYPE, false><<<grid, block, 0, stream>>>(         \
-          static_cast<T*>(input.data_ptr()),                                                      \
-          output_q.data_ptr(),                                                                    \
-          static_cast<float*>(output_s.data_ptr()),                                               \
-          group_size,                                                                             \
-          num_groups,                                                                             \
-          groups_per_block,                                                                       \
-          (float)eps,                                                                             \
-          (float)min_8bit,                                                                        \
-          (float)max_8bit);                                                                       \
-    }                                                                                             \
+#define LAUNCH_KERNEL_INNER(SCHEDULER, T, DST_DTYPE, output_s_dtype, ...)                                \
+  do {                                                                                                   \
+    dim3 grid, block;                                                                                    \
+    SCHEDULER::compute_exec_config(num_groups, subwarps_per_block, grid, block);                         \
+                                                                                                         \
+    per_token_group_quant_8bit_kernel<SCHEDULER, T, DST_DTYPE, __VA_ARGS__><<<grid, block, 0, stream>>>( \
+        static_cast<T*>(input.data_ptr()),                                                               \
+        static_cast<DST_DTYPE*>(output_q.data_ptr()),                                                    \
+        static_cast<output_s_dtype*>(output_s.data_ptr()),                                               \
+        group_size,                                                                                      \
+        subwarps_per_block,                                                                              \
+        scale_hidden_size,                                                                               \
+        scale_hidden_stride);                                                                            \
   } while (0)
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
+#define LAUNCH_KERNEL(T, DST_DTYPE)                                                          \
+  do {                                                                                       \
+    TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T)); \
+                                                                                             \
+    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                             \
+    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                 \
+    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                                                 \
+                                                                                             \
+    if (is_column_major) {                                                                   \
+      if (scale_ue8m0) {                                                                     \
+        LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true);             \
+      } else {                                                                               \
+        LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, true, false);               \
+      }                                                                                      \
+    } else {                                                                                 \
+      TORCH_CHECK(!scale_ue8m0);                                                             \
+      LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, false);                       \
+    }                                                                                        \
+  } while (0)
+
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), scalar_t, [&] {
     if (dst_type == at::ScalarType::Char) {
       LAUNCH_KERNEL(scalar_t, int8_t);
       return true;
@@ -214,6 +303,7 @@ void sgl_per_token_group_quant_8bit(
   });
 
 #undef LAUNCH_KERNEL
+#undef LAUNCH_KERNEL_INNER
 }
 
 void sgl_per_token_group_quant_int8(
