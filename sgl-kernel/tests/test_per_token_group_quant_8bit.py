@@ -13,42 +13,40 @@ from sglang.srt.utils import is_hip
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
-
-@pytest.mark.parametrize(
-    "num_tokens, hidden_dim, group_size, dst_dtype, flags",
-    list(
-        itertools.product(
-            [1, 4, 16, 64, 127, 128, 512, 1024, 4096, 8192],  # num_tokens
-            [256, 512, 1024, 1536, 2048, 4096, 7168, 16384],  # hidden_dim
-            # TODO support group size != 128
-            # [8, 16, 32, 64, 128],  # group_size
-            [128],  # group_size
-            [fp8_type_, torch.int8],  # dtype
-            [
-                dict(
-                    column_major_scales=False,
-                    scale_tma_aligned=False,
-                    scale_ue8m0=False,
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=False,
-                    scale_ue8m0=False,
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=False,
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                ),
-            ],
-        )
-    ),
+configs = list(
+    itertools.product(
+        [1, 4, 16, 64, 127, 128, 512, 1024, 4096, 8192],  # num_tokens
+        [256, 512, 1024, 1536, 2048, 4096, 7168, 16384],  # hidden_dim
+        # TODO support group size != 128
+        # [8, 16, 32, 64, 128],  # group_size
+        [128],  # group_size
+        [fp8_type_, torch.int8],  # dtype
+        [
+            dict(
+                column_major_scales=False,
+                scale_tma_aligned=False,
+                scale_ue8m0=False,
+            ),
+            dict(
+                column_major_scales=True,
+                scale_tma_aligned=False,
+                scale_ue8m0=False,
+            ),
+            dict(
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=False,
+            ),
+            dict(
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=True,
+            ),
+        ],
+    )
 )
+
+@pytest.mark.parametrize("num_tokens, hidden_dim, group_size, dst_dtype, flags", configs)
 def test_per_token_group_quant_with_column_major(
     num_tokens,
     hidden_dim,
