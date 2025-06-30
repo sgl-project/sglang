@@ -127,15 +127,13 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int subwarps_per_block,
     const int scale_hidden_size = 0,
     const int scale_hidden_stride = 0) {
+  using dst_dtype_info = DtypeInfo<DST_DTYPE>;
+  using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
+  static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
+
   SCHEDULER::execute(subwarps_per_block, [&](int group_id, int lane_id) {
-    const int block_group_offset = group_id * group_size;
-
-    using dst_dtype_info = DtypeInfo<DST_DTYPE>;
-    using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
-    static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
-
-    const T* group_input = input + block_group_offset;
-    DST_DTYPE* group_output = output_q + block_group_offset;
+    const T* group_input = input + group_id * group_size;
+    DST_DTYPE* group_output = output_q + group_id * group_size;
     scale_element_t* scale_output;
 
     if constexpr (IS_COLUMN_MAJOR) {
