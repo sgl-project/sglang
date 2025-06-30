@@ -4,15 +4,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rand::seq::SliceRandom;
 
+use crate::config::{PolicyConfig, PolicyError};
 use crate::worker::Worker;
 
-use super::{LoadBalancing, RoutingError, RoutingPolicy};
+use super::error::RoutingError;
+use super::traits::{LoadBalancing, RoutingPolicy};
 
 pub struct PowerOfTwoPolicy;
 
 impl PowerOfTwoPolicy {
-    pub fn new() -> Self {
-        Self
+    pub fn new(_config: &PolicyConfig, _workers: &[Arc<dyn Worker>]) -> Result<Self, PolicyError> {
+        Ok(Self)
     }
 }
 
