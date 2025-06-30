@@ -34,6 +34,8 @@ if int(os.environ.get("SGLANG_NSYS_PROFILING", "0")):
                     column_major_scales=True,
                     scale_tma_aligned=True,
                     scale_ue8m0=True,
+                    fuse_silu_and_mul=False,
+                    masked_layout=False,
                 ),
             ],
         )

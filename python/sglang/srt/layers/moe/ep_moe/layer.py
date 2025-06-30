@@ -36,8 +36,9 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import (
     is_fp8_fnuz,
     scaled_fp8_quant,
+    sglang_per_token_group_quant_8bit,
     sglang_per_token_group_quant_fp8,
-    sglang_per_token_quant_fp8, sglang_per_token_group_quant_8bit,
+    sglang_per_token_quant_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
