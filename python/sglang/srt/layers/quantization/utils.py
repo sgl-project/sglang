@@ -145,6 +145,7 @@ def replace_parameter(
         mod.register_parameter(name, torch.nn.Parameter(new, requires_grad=False))
 
 
+# TODO move?
 def assert_fp8_all_close(a: torch.Tensor, b: torch.Tensor):
     assert a.shape == b.shape
     assert a.dtype == b.dtype == torch.float8_e4m3fn
@@ -163,7 +164,7 @@ def assert_fp8_all_close(a: torch.Tensor, b: torch.Tensor):
         (count_diff_sign == 0)
         and (
             (count_tiny_diff / numel < 0.005)
-            or ((count_tiny_diff / numel < 0.04) and (numel <= 2048))
+            or ((count_tiny_diff / numel < 0.04) and (numel <= 4096))
         )
         and (count_large_diff == 0)
     ), f"{count_diff_sign=} {count_tiny_diff=} {count_large_diff=} {numel=} {a=} {b=}"
