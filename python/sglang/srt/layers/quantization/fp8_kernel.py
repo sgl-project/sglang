@@ -449,7 +449,7 @@ def sglang_per_token_group_quant_fp8(
 
     x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
     x_s = create_per_token_group_quant_fp8_output_scale(
-        x_shape=x.shape,
+        x_shape=out_shape,
         device=x.device,
         group_size=group_size,
         column_major_scales=column_major_scales,
