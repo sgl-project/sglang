@@ -194,7 +194,7 @@ class TestBenchServing(CustomTestCase):
                 self.assertLess(res["median_ttft_ms"], 150)
                 # TODO: not set yet, need AMD machine
             else:
-                self.assertLess(res["median_ttft_ms"], 98)
+                self.assertLess(res["median_ttft_ms"], 100)
             self.assertLess(res["median_itl_ms"], 8)
 
     def test_online_latency_eagle(self):

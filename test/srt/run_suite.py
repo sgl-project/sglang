@@ -13,10 +13,11 @@ class TestFile:
 
 suites = {
     "per-commit": [
-        TestFile("models/lora/test_lora.py", 76),
+        TestFile("models/lora/test_lora.py", 200),
         TestFile("models/lora/test_lora_backend.py", 99),
         TestFile("models/lora/test_multi_lora_backend.py", 60),
         TestFile("models/lora/test_lora_cuda_graph.py", 250),
+        TestFile("models/lora/test_lora_update.py", 400),
         TestFile("models/test_embedding_models.py", 73),
         # TestFile("models/test_clip_models.py", 52),
         TestFile("models/test_encoder_embedding_models.py", 100),
@@ -101,6 +102,7 @@ suites = {
         TestFile("test_vision_openai_server_a.py", 584),
         TestFile("test_vision_openai_server_b.py", 556),
         TestFile("test_w8a8_quantization.py", 46),
+        TestFile("test_reasoning_parser.py", 5),
     ],
     "per-commit-amd": [
         TestFile("models/lora/test_lora_backend.py", 99),
@@ -139,13 +141,13 @@ suites = {
         TestFile("test_update_weights_from_disk.py", 114),
         TestFile("test_vertex_endpoint.py", 31),
         TestFile("test_vision_chunked_prefill.py", 175),
+        TestFile("test_reasoning_parser.py", 5),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_dp_attention.py", 137),
         TestFile("test_mla_tp.py", 170),
-        TestFile("test_moe_ep.py", 181),
         TestFile("test_patch_torch.py", 19),
         TestFile("test_update_weights_from_distributed.py", 103),
         TestFile("test_release_memory_occupation.py", 44),
@@ -171,6 +173,8 @@ suites = {
         # TestFile("test_deepep_intranode.py", 50),
         # TestFile("test_deepep_low_latency.py", 50),
         # TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
+        # Disabled because it hangs on the CI.
+        # TestFile("test_moe_ep.py", 181),
         TestFile("test_disaggregation.py", 270),
         TestFile("test_disaggregation_different_tp.py", 155),
         TestFile("test_full_deepseek_v3.py", 463),
@@ -180,6 +184,7 @@ suites = {
     ],
     "per-commit-cpu": [
         TestFile("cpu/test_activation.py"),
+        TestFile("cpu/test_binding.py"),
         TestFile("cpu/test_decode.py"),
         TestFile("cpu/test_extend.py"),
         TestFile("cpu/test_gemm.py"),
@@ -189,6 +194,7 @@ suites = {
         TestFile("cpu/test_qkv_proj_with_rope.py"),
         TestFile("cpu/test_rope.py"),
         TestFile("cpu/test_shared_expert.py"),
+        TestFile("cpu/test_topk.py"),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),

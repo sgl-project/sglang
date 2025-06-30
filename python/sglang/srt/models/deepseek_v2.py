@@ -32,6 +32,9 @@ from sglang.srt.distributed import (
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -77,11 +80,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.expert_distribution import (
-    get_global_expert_distribution_recorder,
-)
-from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
-from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -300,6 +298,9 @@ class DeepseekV2MoE(nn.Module):
             ),
         )
 
+        self.shared_experts_is_int8 = False
+        self.shared_experts_is_fp8 = False
+        self.shared_experts_weight_block_size = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
@@ -316,6 +317,20 @@ class DeepseekV2MoE(nn.Module):
                     else {}
                 ),
             )
+            self.shared_experts_is_int8 = (
+                self.shared_experts.gate_up_proj.weight.dtype == torch.int8
+            )
+            self.shared_experts_is_fp8 = (
+                self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+            )
+            if self.shared_experts_is_fp8:
+                assert (
+                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                    == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
+                )
+                self.shared_experts_weight_block_size = (
+                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                )
 
         self.top_k = config.num_experts_per_tok
 
@@ -394,6 +409,11 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hasattr(self, "shared_experts") and getattr(
+            self.shared_experts.gate_up_proj, "use_intel_amx_backend", False
+        ):
+            return self.forward_cpu(hidden_states)
+
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
@@ -405,6 +425,59 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
+        if self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        return final_hidden_states
+
+    def forward_cpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # router_logits: (num_tokens, n_experts)
+        router_logits = self.gate(hidden_states)
+        fused_experts_out = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits
+        )
+
+        assert getattr(
+            self.shared_experts.gate_up_proj, "use_intel_amx_backend", False
+        ) == getattr(self.shared_experts.down_proj, "use_intel_amx_backend", False)
+        # [Note] inplace should be False in fused_experts.
+        # If inplace is True in fused_experts (self.experts), hidden_states will be changed after fused_experts
+        # While hidden_states is still needed in shared_expert.
+        final_hidden_states = torch.ops.sgl_kernel.shared_expert_cpu(
+            hidden_states,
+            self.shared_experts.gate_up_proj.weight,
+            self.shared_experts.down_proj.weight,
+            fused_experts_out,
+            self.routed_scaling_factor,
+            True,  # inplace
+            self.shared_experts_is_int8,  # use_int8_w8a8
+            self.shared_experts_is_fp8,  # use_fp8_w8a16
+            (
+                self.shared_experts.gate_up_proj.weight_scale
+                if self.shared_experts_is_int8
+                else (
+                    self.shared_experts.gate_up_proj.weight_scale_inv
+                    if self.shared_experts_is_fp8
+                    else None
+                )
+            ),  # w1_scale
+            (
+                self.shared_experts.down_proj.weight_scale
+                if self.shared_experts_is_int8
+                else (
+                    self.shared_experts.down_proj.weight_scale_inv
+                    if self.shared_experts_is_fp8
+                    else None
+                )
+            ),  # w2_scale
+            (
+                self.shared_experts_weight_block_size
+                if self.shared_experts_is_fp8
+                else None
+            ),  # block_size
+            None,  # a1_scale
+            None,  # a2_scale
+            True,  # is_vnni
+        )
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -2107,6 +2180,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                     )
                     if _is_hip:
                         self_attn.w_scale *= 2.0
+                # TODO: remove this after adding FP8 support in bmm cpu kernel
+                if _is_cpu and _is_cpu_amx_available and w.dtype == torch.float8_e4m3fn:
+                    self_attn.w_kc = (
+                        self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
+                    )
+                    self_attn.w_vc = (
+                        self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
+                    )
             else:
                 num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
                 num_tiles_n = self_attn.v_head_dim // weight_block_size[0]

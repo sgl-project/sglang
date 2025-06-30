@@ -433,9 +433,7 @@ class DecodePreallocQueue:
             else 0
         )
 
-        available_size = self.token_to_kv_pool_allocator.available_size()
-
-        allocatable_tokens = available_size - max(
+        allocatable_tokens = self.token_to_kv_pool_allocator.available_size() - max(
             # preserve some space for future decode
             self.num_reserved_decode_tokens
             * (
@@ -606,9 +604,21 @@ class DecodeTransferQueue:
                             : decode_req.req.top_logprobs_num
                         ].tolist()
                     )
+
                 if hasattr(decode_req.kv_receiver, "clear"):
                     decode_req.kv_receiver.clear()
-                transferred_reqs.append(decode_req.req)
+
+                # special handling for sampling_params.max_new_tokens == 1
+                if decode_req.req.sampling_params.max_new_tokens == 1:
+                    # finish immediately
+                    decode_req.req.check_finished()
+                    self.scheduler.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    self.tree_cache.cache_finished_req(decode_req.req)
+                else:
+                    transferred_reqs.append(decode_req.req)
+
                 indices_to_remove.add(i)
             elif poll in [
                 KVPoll.Bootstrapping,

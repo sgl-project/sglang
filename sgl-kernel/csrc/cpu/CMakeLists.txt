@@ -38,6 +38,24 @@ else()
 endif()
 link_directories(${PLAT_LIB_DIR})
 
+# Conda library path support
+if(DEFINED ENV{CONDA_PREFIX})
+    set(CONDA_LIB_DIR "$ENV{CONDA_PREFIX}/lib")
+    message(STATUS "Using Conda lib dir: ${CONDA_LIB_DIR}")
+    link_directories(${CONDA_LIB_DIR})
+    set(CONDA_INCLUDE_DIR "$ENV{CONDA_PREFIX}/include")
+    include_directories(${CONDA_INCLUDE_DIR})
+
+    # Look for libnuma in Conda's lib directory
+    find_library(NUMA_LIB numa HINTS "${CONDA_LIB_DIR}")
+    if(NUMA_LIB)
+        message(STATUS "Found libnuma: ${NUMA_LIB}")
+    else()
+        message(FATAL_ERROR "libnuma not found in Conda environment at ${CONDA_LIB_DIR}\n"
+                            "Please install it using: conda install libnuma numactl\n")
+    endif()
+endif()
+
 file(GLOB SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
 add_compile_options(
@@ -48,7 +66,7 @@ add_compile_options(
 )
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
-target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES})
+target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB})
 target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
 
 install(TARGETS common_ops
