@@ -102,16 +102,18 @@ struct NaiveScheduler {
   }
 
   template <typename FUNC>
-  __device__ __forceinline__ static void execute(int subwarps_per_block, int hidden_size_num_groups, FUNC fn) {
+  __device__ __forceinline__ static void execute(int subwarps_per_block, int hidden_size_num_groups, int group_size, FUNC fn) {
     const int local_group_id = threadIdx.x / THREADS_PER_SUBWARP;
     const int lane_id = threadIdx.x % THREADS_PER_SUBWARP;
     const int block_group_id = blockIdx.x * subwarps_per_block;
     const int group_id = block_group_id + local_group_id;
 
+    const int input_group_start_offset = group_id * group_size;
+
     const int token_idx = group_id / hidden_size_num_groups;
     const int group_start_hidden_idx = group_id % hidden_size_num_groups;
 
-    fn(token_idx, group_start_hidden_idx, lane_id);
+    fn(token_idx, group_start_hidden_idx, lane_id, input_group_start_offset);
   }
 };
 
@@ -135,7 +137,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
   SCHEDULER::execute(
-      subwarps_per_block, hidden_size_num_groups, [&](int token_idx, int group_start_hidden_idx, int lane_id) {
+      subwarps_per_block, hidden_size_num_groups, group_size, [&](int token_idx, int group_start_hidden_idx, int lane_id, int input_group_start_offset) {
         constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
         constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
@@ -149,7 +151,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 #pragma unroll
         for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
           input_primary_int4[j] = ld_global_nc(
-              reinterpret_cast<const int4*>(input + group_id * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
+              reinterpret_cast<const int4*>(input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
         }
 
         scale_element_t* scale_output;
