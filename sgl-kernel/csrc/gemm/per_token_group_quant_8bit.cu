@@ -223,13 +223,12 @@ void sgl_per_token_group_quant_8bit(
     bool scale_ue8m0 = false) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
+  TORCH_CHECK((output_s.dim() == 2) or (output_s.dim() == 3));
 
   TORCH_CHECK(std::abs(LOCAL_ABSMAX_ABS - eps) < 1e-13);
 
-  const int num_groups = input.numel() / group_size;
-
   CHECK_EQ(input.numel() % group_size, 0);
-  TORCH_CHECK((output_s.dim() == 2) or (output_s.dim() == 3));
+  const int num_groups = input.numel() / group_size;
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
