@@ -647,6 +647,67 @@ class Gemma3ForCausalLM(PreTrainedModel):
             input_ids, hidden_states, self.model.embed_tokens, forward_batch
         )
 
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],  # [start, end) 0-based
+        input_embeds: torch.Tensor = None,
+    ):
+        start, end = split_interval
+        # embed
+        if start == 0:
+            if input_embeds is None:
+                hidden_states = self.model.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+
+            if positions.dim() == 1:
+                positions = einops.rearrange(positions, "s -> 1 s")
+            position_embeddings_global = self.model.rotary_emb(hidden_states, positions)
+            position_embeddings_local = self.model.rotary_emb_local(hidden_states, positions)
+
+            forward_batch.hidden_states = hidden_states
+            forward_batch.model_specific_states = {
+                "positions": positions,
+                "position_embeddings_global": position_embeddings_global,
+                "position_embeddings_local": position_embeddings_local,
+            }
+
+        # decoder layer
+        for i in range(start, end):
+            layer = self.model.layers[i]
+            layer_output = layer(
+                positions=forward_batch.model_specific_states["positions"],
+                position_embeddings_global=forward_batch.model_specific_states[
+                    "position_embeddings_global"
+                ],
+                position_embeddings_local=forward_batch.model_specific_states[
+                    "position_embeddings_local"
+                ],
+                hidden_states=forward_batch.hidden_states,
+                forward_batch=forward_batch,
+            )
+            forward_batch.hidden_states = layer_output[0]
+
+        if end == self.model.config.num_hidden_layers:
+            # norm
+            forward_batch.hidden_states = self.model.norm(forward_batch.hidden_states)
+
+            # logits process
+            result = self.logits_processor(
+                input_ids,
+                forward_batch.hidden_states,
+                self.model.embed_tokens,
+                forward_batch,
+            )
+        else:
+            result = None
+
+        return result
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
