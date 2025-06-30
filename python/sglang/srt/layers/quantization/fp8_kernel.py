@@ -313,6 +313,8 @@ def per_token_group_quant_8bit(
         needs_unsqueeze = len(x.shape) == 2
         if needs_unsqueeze:
             x = x.unsqueeze(0)
+            assert masked_m is None
+            masked_m = TODO
 
         output = torch.empty(
             (*x.shape[:-1], x.shape[-1] // 2),
