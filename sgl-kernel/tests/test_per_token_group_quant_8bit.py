@@ -2,7 +2,10 @@ import itertools
 
 import pytest
 import torch
-from sgl_kernel.test_utils import create_per_token_group_quant_test_data, assert_fp8_all_close
+from sgl_kernel.test_utils import (
+    assert_fp8_all_close,
+    create_per_token_group_quant_test_data,
+)
 
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
