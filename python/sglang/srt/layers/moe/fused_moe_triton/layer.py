@@ -36,7 +36,9 @@ if torch.cuda.is_available():
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
 
     if has_triton_kernels:
-        from .triton_kernels_moe import triton_kernel_moe_forward
+        from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
+            triton_kernel_moe_forward,
+        )
 else:
     fused_experts = None  # type: ignore
 
@@ -110,8 +112,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         w13_weight_raw = torch.empty(
             num_experts, 2 * intermediate_size, hidden_size, dtype=params_dtype
         )
-        if self.use_triton_kernels:
-            w13_weight_raw = w13_weight_raw.transpose(-2, -1).contiguous()
         w13_weight = torch.nn.Parameter(w13_weight_raw, requires_grad=False)
 
         layer.register_parameter("w13_weight", w13_weight)
@@ -121,8 +121,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         w2_weight_raw = torch.empty(
             num_experts, hidden_size, intermediate_size, dtype=params_dtype
         )
-        if self.use_triton_kernels:
-            w2_weight_raw = w2_weight_raw.transpose(-2, -1).contiguous()
         w2_weight = torch.nn.Parameter(w2_weight_raw, requires_grad=False)
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)

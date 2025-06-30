@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Optional
+import sys
+from typing import Callable, List, Optional, Tuple
 
 import torch
 from triton_kernels.matmul_ogs import matmul_ogs
@@ -83,12 +84,17 @@ def triton_kernel_fused_experts(
     assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
     assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
 
+    w1 = w1.transpose(-2, -1).contiguous()
+    w2 = w2.transpose(-2, -1).contiguous()
+
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
     assert (
         hidden_states.shape[-1] == w1.shape[-2]
-    ), "hidden_states shape[-1] must be equal to w1 shape[-2]"
-    assert w2.shape[-1] == w1.shape[1], "w2 shape[-1] must be equal to w1 shape[1]"
+    ), f"hidden_states shape[-1] {hidden_states.shape} must be equal to w1 shape[-2] {w1.shape}"
+    assert (
+        w2.shape[-1] == w1.shape[1]
+    ), f"w2 shape[-1] {w2.shape[-1]} must be equal to w1 shape[1] {w1.shape[1]}"
 
     # feature check
     # assert inplace == False, "Inplace is not supported in new triton MoE kernel"
@@ -115,10 +121,12 @@ def triton_kernel_fused_experts(
         gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
     )
 
+    from sgl_kernel import gelu_and_mul, silu_and_mul
+
     if activation == "silu":
-        torch.ops._C.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+        silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
     elif activation == "gelu":
-        torch.ops._C.gelu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+        gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
