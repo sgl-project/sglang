@@ -92,7 +92,7 @@ constexpr float LOCAL_ABSMAX_ABS = 1e-10;
 constexpr int THREADS_PER_SUBWARP = 8;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 
-class NaiveScheduler {
+struct NaiveScheduler {
   static void compute_exec_config(int num_groups, int subwarps_per_block, dim3& grid, dim3& block) {
     const int num_blocks = num_groups / subwarps_per_block;
     const int num_threads = subwarps_per_block * THREADS_PER_SUBWARP;
