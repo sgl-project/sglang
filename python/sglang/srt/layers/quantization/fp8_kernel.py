@@ -341,6 +341,18 @@ def per_token_group_quant_8bit(
             output = output.squeeze(0)
             output_scale_for_kernel = output_scale_for_kernel.squeeze(0)
 
+        from deep_gemm.utils.layout import transform_sf_into_required_layout
+
+        assert group_size == 128
+        output_scale = transform_sf_into_required_layout(
+            output_scale_for_kernel,
+            num_groups=None if needs_unsqueeze else output.shape[0],
+            mn=output.shape[-2],
+            k=output.shape[-1],
+            recipe=(1, group_size, group_size),
+            is_sfa=True,
+        )
+
         return output, output_scale
 
     return per_token_group_quant_fp8(
