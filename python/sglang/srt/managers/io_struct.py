@@ -855,6 +855,8 @@ class SlowDownReqOutput:
 class AbortReq:
     # The request id
     rid: str
+    # The finished reason data
+    finished_reason: Optional[Dict[str, Any]] = None
 
 
 @dataclass

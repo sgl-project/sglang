@@ -2,7 +2,7 @@ import logging
 import time
 from typing import Any, AsyncGenerator, Dict, List, Union
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.code_completion_parser import generate_completion_prompt_from_request
@@ -270,6 +270,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
         except Exception as e:
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+        except HTTPException as e:
+            error = self.create_streaming_error_response(
+                e.detail,
+                err_type=str(e.status_code),
+                status_code=e.status_code,
+            )
+            yield f"data: {error}\n\n"
 
         yield "data: [DONE]\n\n"
 
@@ -287,6 +294,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
             ret = await generator.__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
+        except HTTPException as e:
+            return self.create_error_response(
+                e.detail,
+                err_type=str(e.status_code),
+                status_code=e.status_code,
+            )
 
         if not isinstance(ret, list):
             ret = [ret]
