@@ -7,6 +7,6 @@ pub mod worker;
 
 // Re-export main types for convenience
 pub use error::WorkerError;
-pub use worker::{Worker, RegularWorker, DecodeWorker, PrefillWorker, WorkerType};
+pub use worker::{DecodeWorker, PrefillWorker, RegularWorker, Worker, WorkerFactory, WorkerType};
 // pub use factory::WorkerFactory;
-// pub use adapters::WorkerAdapters; 
+// pub use adapters::WorkerAdapters;

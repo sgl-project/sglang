@@ -6,15 +6,9 @@ use std::fmt;
 #[derive(Debug, Clone)]
 pub enum WorkerError {
     /// Worker is not responding to health checks
-    HealthCheckFailed {
-        url: String,
-        reason: String,
-    },
+    HealthCheckFailed { url: String, reason: String },
     /// Network error while communicating with worker
-    NetworkError {
-        url: String,
-        error: String,
-    },
+    NetworkError { url: String, error: String },
     /// Worker returned an error status
     WorkerError {
         url: String,
@@ -22,18 +16,11 @@ pub enum WorkerError {
         body: String,
     },
     /// Timeout waiting for worker response
-    Timeout {
-        url: String,
-        timeout_secs: u64,
-    },
+    Timeout { url: String, timeout_secs: u64 },
     /// Invalid worker configuration
-    InvalidConfiguration {
-        reason: String,
-    },
+    InvalidConfiguration { reason: String },
     /// Worker is not available
-    Unavailable {
-        url: String,
-    },
+    Unavailable { url: String },
 }
 
 impl fmt::Display for WorkerError {
@@ -46,10 +33,18 @@ impl fmt::Display for WorkerError {
                 write!(f, "Network error for worker {}: {}", url, error)
             }
             WorkerError::WorkerError { url, status, body } => {
-                write!(f, "Worker {} returned error status {}: {}", url, status, body)
+                write!(
+                    f,
+                    "Worker {} returned error status {}: {}",
+                    url, status, body
+                )
             }
             WorkerError::Timeout { url, timeout_secs } => {
-                write!(f, "Timeout waiting for worker {} after {}s", url, timeout_secs)
+                write!(
+                    f,
+                    "Timeout waiting for worker {} after {}s",
+                    url, timeout_secs
+                )
             }
             WorkerError::InvalidConfiguration { reason } => {
                 write!(f, "Invalid worker configuration: {}", reason)
@@ -78,4 +73,4 @@ impl From<reqwest::Error> for WorkerError {
             }
         }
     }
-} 
+}
