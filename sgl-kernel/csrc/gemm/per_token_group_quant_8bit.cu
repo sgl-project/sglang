@@ -255,9 +255,7 @@ void sgl_per_token_group_quant_8bit(
 
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                \
   do {                                                             \
-    /* TODO do not copy paste */                                   \
-    constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T); \
-    TORCH_CHECK(THREADS_PER_GROUP == group_size / INPUT_PRIMARY_VEC_SIZE); \
+    TORCH_CHECK(THREADS_PER_GROUP * INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T)); \
                                                                    \
     using dst_dtype_info = DtypeInfo<DST_DTYPE>;                   \
     CHECK_EQ(dst_dtype_info::MIN, min_8bit);                       \
