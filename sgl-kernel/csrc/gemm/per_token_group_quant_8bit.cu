@@ -112,9 +112,24 @@ struct NaiveScheduler {
       int num_local_experts,
       int hidden_dim_num_groups,
       int num_groups,
-      int subwarps_per_block,
+      int& subwarps_per_block,
       dim3& grid,
       dim3& block) {
+
+    int compute_subwarps_per_block(int num_groups) {
+      if (num_groups % 16 == 0) {
+        return 16;
+      } else if (num_groups % 8 == 0) {
+        return 8;
+      } else if (num_groups % 4 == 0) {
+        return 4;
+      } else if (num_groups % 2 == 0) {
+        return 2;
+      }
+      return 1;
+    }
+
+    subwarps_per_block = compute_subwarps_per_block(num_groups);
     grid = dim3(num_groups / subwarps_per_block);
     block = dim3(subwarps_per_block * THREADS_PER_SUBWARP);
   }
@@ -159,10 +174,10 @@ struct MaskedLayoutScheduler {
       int num_local_experts,
       int hidden_dim_num_groups,
       int num_groups,
-      int subwarps_per_block,
+      int& subwarps_per_block,
       dim3& grid,
       dim3& block) {
-    TODO_cannot_too_many_subwarps_per_block;
+    subwarps_per_block = 1; // TODO highly inefficient
     grid = dim3(hidden_dim_num_groups, TOKEN_DIM_BLOCK_NUM_PER_EXPERT, num_local_experts);
     block = dim3(subwarps_per_block * THREADS_PER_SUBWARP);
   }
@@ -176,9 +191,8 @@ struct MaskedLayoutScheduler {
       FUNC fn) {
     const int expert_idx = blockIdx.z;
     const int token_idx_start = blockIdx.y;
-    const int hidden_dim_block_index = blockIdx.x;
-
-    const int hidden_dim_group_idx = TODO;
+    const int hidden_dim_group_idx = blockIdx.x;
+    const int lane_id = threadIdx.x;
 
     const int curr_expert_token_num = masked_m[expert_idx];
 
@@ -332,19 +346,6 @@ __global__ void per_token_group_quant_8bit_kernel(
       });
 }
 
-int compute_subwarps_per_block(int num_groups) {
-  if (num_groups % 16 == 0) {
-    return 16;
-  } else if (num_groups % 8 == 0) {
-    return 8;
-  } else if (num_groups % 4 == 0) {
-    return 4;
-  } else if (num_groups % 2 == 0) {
-    return 2;
-  }
-  return 1;
-}
-
 void sgl_per_token_group_quant_8bit(
     // vanilla: (num_tokens, hidden_size)
     // fuse_silu_and_mul: (num_tokens, hidden_size * 2)
@@ -374,8 +375,6 @@ void sgl_per_token_group_quant_8bit(
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  int subwarps_per_block = compute_subwarps_per_block(num_groups);
-
   auto dst_type = output_q.scalar_type();
 
   const bool is_column_major = output_s.stride(-2) < output_s.stride(-1);
@@ -386,6 +385,7 @@ void sgl_per_token_group_quant_8bit(
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, T, DST_DTYPE, output_s_dtype, ...)                                \
   do {                                                                                                   \
+    int subwarps_per_block; \
     dim3 grid, block;                                                                                    \
     SCHEDULER::compute_exec_config(                                                                      \
         num_local_experts, hidden_dim_num_groups, num_groups, subwarps_per_block, grid, block);          \
