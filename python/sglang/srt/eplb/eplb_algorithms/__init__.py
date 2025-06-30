@@ -3,7 +3,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.managers.eplb_algorithms import deepseek, deepseek_vec
+from sglang.srt.eplb.eplb_algorithms import deepseek, deepseek_vec
 
 
 class EplbAlgorithm(Enum):

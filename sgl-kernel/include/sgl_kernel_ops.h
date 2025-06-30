@@ -201,6 +201,8 @@ void bmm_fp8(
     int64_t cublas_handle,
     int64_t cuda_stream);
 
+void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
+
 /*
  * From csrc/moe
  */

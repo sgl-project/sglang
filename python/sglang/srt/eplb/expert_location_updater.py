@@ -20,7 +20,7 @@ import torch
 import torch.distributed
 from torch.distributed import P2POp
 
-from sglang.srt.managers.expert_location import (
+from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
 )

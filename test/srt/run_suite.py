@@ -102,6 +102,7 @@ suites = {
         TestFile("test_vision_openai_server_a.py", 584),
         TestFile("test_vision_openai_server_b.py", 556),
         TestFile("test_w8a8_quantization.py", 46),
+        TestFile("test_reasoning_parser.py", 5),
     ],
     "per-commit-amd": [
         TestFile("models/lora/test_lora_backend.py", 99),
@@ -140,6 +141,7 @@ suites = {
         TestFile("test_update_weights_from_disk.py", 114),
         TestFile("test_vertex_endpoint.py", 31),
         TestFile("test_vision_chunked_prefill.py", 175),
+        TestFile("test_reasoning_parser.py", 5),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
@@ -181,6 +183,7 @@ suites = {
     ],
     "per-commit-cpu": [
         TestFile("cpu/test_activation.py"),
+        TestFile("cpu/test_binding.py"),
         TestFile("cpu/test_decode.py"),
         TestFile("cpu/test_extend.py"),
         TestFile("cpu/test_gemm.py"),
@@ -190,6 +193,7 @@ suites = {
         TestFile("cpu/test_qkv_proj_with_rope.py"),
         TestFile("cpu/test_rope.py"),
         TestFile("cpu/test_shared_expert.py"),
+        TestFile("cpu/test_topk.py"),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),

@@ -98,6 +98,7 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.arch = hf_config.architectures[0]
         self.server_args = server_args
+
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
 

@@ -272,7 +272,12 @@ impl Router {
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
         });
 
-        actix_web::rt::System::new().block_on(async move {
+        // Use tokio runtime instead of actix-web System for better compatibility
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        // Block on the async startup function
+        runtime.block_on(async move {
             server::startup(server::ServerConfig {
                 host: self.host.clone(),
                 port: self.port,
@@ -286,8 +291,7 @@ impl Router {
                 request_timeout_secs: self.request_timeout_secs,
             })
             .await
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-            Ok(())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })
     }
 }

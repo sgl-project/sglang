@@ -180,45 +180,47 @@ class Modality(Enum):
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
-    A single multimodal data, from a single image/video/audio or others
+    A single multimodal data, from a single image/video/audio or others.
+
+    We put the common fields first and the model-specific fields last.
     """
 
     modality: Modality
-
     hash: int = None
     pad_value: int = None
-
-    aspect_ratio_id: Optional[List[torch.Tensor]] = None
-    aspect_ratio_mask: Optional[List[torch.Tensor]] = None
-
     image_sizes: Tuple[int, int] = None
     image_offsets: Optional[list] = None
 
     # the real data, pixel_values or audio_features
     # data: Union[List[torch.Tensor], List[np.ndarray]]
     pixel_values: Union[torch.Tensor, np.ndarray] = None
-    image_grid_thw: Union[torch.Tensor, np.ndarray] = None
-    video_grid_thws: Union[torch.Tensor, np.ndarray] = None
-
-    image_emb_mask: Optional[torch.Tensor] = None
-    image_spatial_crop: Optional[torch.Tensor] = None
-    second_per_grid_ts: Optional[List[torch.Tensor]] = None
-
-    # [num_images, (n, w, h)]
-    tgt_size: Tuple[int, int] = None
-
-    # kimi-vl related
-    image_grid_hws: Optional[List[torch.Tensor]] = None
-
     audio_features: Union[torch.Tensor, np.ndarray] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
     audio_offsets: Optional[List[Tuple[int, int]]] = None
+    precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
-    # gemma3n related
+    # For qwen-vl
+    image_grid_thw: Union[torch.Tensor, np.ndarray] = None
+    second_per_grid_ts: Optional[List[torch.Tensor]] = None
+
+    # For deepseek-vl
+    image_emb_mask: Optional[torch.Tensor] = None
+    image_spatial_crop: Optional[torch.Tensor] = None
+
+    # For minicpmv
+    # [num_images, (n, w, h)]
+    tgt_size: Tuple[int, int] = None
+
+    # For mllama
+    aspect_ratio_id: Optional[List[torch.Tensor]] = None
+    aspect_ratio_mask: Optional[List[torch.Tensor]] = None
+
+    # For kimi-vl
+    image_grid_hws: Optional[List[torch.Tensor]] = None
+
+    # For gemma3n
     input_features: Optional[torch.Tensor] = None
     input_features_mask: Optional[torch.Tensor] = None
-
-    precomputed_features: Optional[Union[torch.Tensor, np.ndarray]] = None
 
     @staticmethod
     def is_empty_list(l):
@@ -339,10 +341,6 @@ class MultimodalInputs:
     image_pad_len: Optional[list] = None
     num_image_tokens: Optional[int] = None
 
-    # QWen2-VL related
-    mrope_positions: Optional[torch.Tensor] = None
-    mrope_position_delta: Optional[torch.Tensor] = None
-
     # image
     im_token_id: Optional[int] = None
     im_start_id: Optional[int] = None
@@ -357,6 +355,10 @@ class MultimodalInputs:
     audio_token_id: Optional[int] = None
     audio_start_id: Optional[int] = None
     audio_end_id: Optional[int] = None
+
+    # QWen2-VL related
+    mrope_positions: Optional[torch.Tensor] = None
+    mrope_position_delta: Optional[torch.Tensor] = None
 
     @staticmethod
     def from_dict(obj: dict):

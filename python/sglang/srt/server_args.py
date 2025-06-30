@@ -487,12 +487,6 @@ class ServerArgs:
                     self.speculative_num_draft_tokens,
                 ) = auto_choose_speculative_params(self)
 
-            if self.page_size > 1 and self.speculative_eagle_topk > 1:
-                self.speculative_eagle_topk = 1
-                logger.warning(
-                    "speculative_eagle_topk is adjusted to 1 when page_size > 1"
-                )
-
             if (
                 self.speculative_eagle_topk == 1
                 and self.speculative_num_draft_tokens != self.speculative_num_steps + 1

@@ -241,6 +241,23 @@ inline int getSMVersion() {
   return sm_major * 10 + sm_minor;
 }
 
+inline bool getBoolEnv(char const* name) {
+  char const* env = std::getenv(name);
+  return env && env[0] == '1' && env[1] == '\0';
+}
+
+inline bool getEnvEnablePDL() {
+  static std::once_flag flag;
+  static bool enablePDL = false;
+  std::call_once(flag, [&]() {
+    if (getSMVersion() >= 90) {
+      // PDL will be enabled by setting the env variables `TRTLLM_ENABLE_PDL` to `1`
+      enablePDL = getBoolEnv("TRTLLM_ENABLE_PDL");
+    }
+  });
+  return enablePDL;
+}
+
 // SGLANG_SHFL_XOR_* adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/csrc/cuda_compat.h#L19-L28
 #ifndef USE_ROCM
 #define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor_sync((mask), (var), (lane_mask))

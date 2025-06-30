@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from sglang.srt.managers.expert_distribution import (
+from sglang.srt.eplb.expert_distribution import (
     _convert_global_physical_count_to_logical_count,
 )
 

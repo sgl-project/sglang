@@ -18,12 +18,12 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.managers import expert_location_dispatch
-from sglang.srt.managers.expert_distribution import (
+from sglang.srt.eplb import expert_location_dispatch
+from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
 )
-from sglang.srt.managers.expert_location_dispatch import (
+from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
