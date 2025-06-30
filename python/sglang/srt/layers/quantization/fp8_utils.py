@@ -243,22 +243,12 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
     )
 
-    # NOTE(alcanderian): Useless when scale is packed to int32
-    # if get_bool_env_var("SGLANG_W8A8_DEEPGEMM_SANITY_CHECK_UE8M0"):
-    #     _check_ue8m0("x_scale", x_scale)
-    #     _check_ue8m0("weight_scale", ws)
-
     output = w8a8_block_fp8_matmul_deepgemm(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
     )
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
-
-
-def _check_ue8m0(name, x):
-    x_ceil = ceil_to_ue8m0(x)
-    assert torch.all(x == x_ceil), f"{name=} {x=} {x_ceil=}"
 
 
 def aiter_w8a8_block_fp8_linear(
