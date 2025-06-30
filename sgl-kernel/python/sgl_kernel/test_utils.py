@@ -37,7 +37,7 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
         else:
             raise NotImplementedError
 
-        masked_m = torch.tensor(masked_m, device="cuda", dtype=torch.int)
+        masked_m = masked_m.to(device)
 
         return x, masked_m
     else:
@@ -47,12 +47,29 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
         )
 
 
-def _compute_balanced_split(total: int, arr_len: int) -> list[int]:
+def _compute_balanced_split(total: int, arr_len: int):
     base = total // arr_len
     remainder = total % arr_len
     ans = [base + 1 if i < remainder else base for i in range(arr_len)]
     assert sum(ans) == total
-    return ans
+    return torch.tensor(ans, dtype=torch.int)
 
-def _compute_imbalanced_split(total: int, arr_len: int) -> list[int]:
-    return TODO
+def _compute_imbalanced_split(total: int, arr_len: int, dtype=torch.int) -> list[int]:
+    # can use `rand ** 2`, `rand ** 3`, etc, to change how imbalanced it is
+    noise_raw = torch.rand(arr_len) ** 2
+
+    noise = noise_raw / noise_raw.sum()
+    ans = (noise * total).round().to(dtype)
+
+    diff = total - ans.sum().item()
+    while diff != 0:
+        idx = torch.randint(0, arr_len, (1,)).item()
+        if diff > 0:
+            ans[idx] += 1
+            diff -= 1
+        elif diff < 0 and ans[idx] > 0:
+            ans[idx] -= 1
+            diff += 1
+
+    assert sum(ans) == total
+    return ans
