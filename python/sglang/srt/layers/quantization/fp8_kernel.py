@@ -322,6 +322,7 @@ def per_token_group_quant_8bit(
             device=x.device,
             dtype=dst_dtype,
         )
+        TODO_wrong
         output_scale = create_per_token_group_quant_fp8_output_scale(
             x_shape=output.shape,
             device=output.device,
