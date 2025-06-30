@@ -96,11 +96,10 @@ int compute_input_group_start_offset<bool FUSE_SILU_AND_MUL>(
     int expert_idx,
     int token_idx,
     int hidden_dim_group_idx,
-    int hidden_dim_num_groups,
-    int group_size,
+    int hidden_size,
     int num_tokens_per_expert) {
-  return expert_idx * num_tokens_per_expert * hidden_dim_num_groups * group_size +
-         token_idx * hidden_dim_num_groups * group_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
+  return expert_idx * num_tokens_per_expert * hidden_size+
+         token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
          hidden_dim_group_idx * group_size;
 }
 
@@ -144,8 +143,9 @@ struct NaiveScheduler {
     const int hidden_dim_group_idx = group_id % hidden_dim_num_groups;
 
     if constexpr (FUSE_SILU_AND_MUL) {
+      const int hidden_size = hidden_dim_num_groups * group_size;
       input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
-          expert_idx, token_idx, hidden_dim_group_idx, hidden_dim_num_groups, group_size, num_tokens_per_expert);
+          expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert);
     }
 
     fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
@@ -184,8 +184,9 @@ struct MaskedLayoutScheduler {
 
     for (int token_idx = token_idx_start; token_idx < curr_expert_token_num;
          token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
+      const int hidden_size = hidden_dim_num_groups * group_size;
       const int input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
-          expert_idx, token_idx, hidden_dim_group_idx, hidden_dim_num_groups, group_size, num_tokens_per_expert);
+          expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert);
       fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
     }
   }
