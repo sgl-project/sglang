@@ -422,7 +422,7 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
-        cur_rem_tokens = self.cur_rem_tokens - len(req.origin_input_ids)
+        cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(req.extend_input_len)
         tokens_freed = 0
         for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
             # tokens_left gives a reservative calculation as the last token is not stored
