@@ -278,7 +278,7 @@ __global__ void per_token_group_quant_8bit_kernel(
           const int hidden_size = hidden_dim_num_groups * group_size;
 
           constexpr int scale_token_stride = 1;
-          const int scale_expert_stride = (hidden_size / num_elems_per_pack) * num_tokens_per_expert;
+          const int scale_expert_stride = (hidden_size / num_elems_per_pack) * scale_hidden_stride;
 
           const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
           const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
