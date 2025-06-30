@@ -200,6 +200,9 @@ void bmm_fp8(
     at::Tensor workspace_buffer,
     int64_t cublas_handle,
     int64_t cuda_stream);
+void dsv3_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
+
+void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b);
 
 /*
  * From csrc/moe
@@ -212,7 +215,8 @@ void moe_align_block_size(
     torch::Tensor experts_ids,
     torch::Tensor num_tokens_post_pad,
     torch::Tensor token_cnts_buffer,
-    torch::Tensor cumsum_buffer);
+    torch::Tensor cumsum_buffer,
+    bool pad_sorted_token_ids);
 
 void topk_softmax(
     torch::Tensor& topk_weights,
