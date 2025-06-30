@@ -11,14 +11,16 @@ from sglang.srt.layers.communicator import (
     CommunicateSummableTensorPairFn,
     ScatterMode,
 )
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
+from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher, NpuDeepEPDispatcher
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.operations import execute_operations, execute_overlapped_operations
 from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.utils import BumpAllocator, DeepEPMode, get_bool_env_var
+from sglang.srt.utils import BumpAllocator, DeepEPMode, get_bool_env_var, is_npu
+
+_is_npu = is_npu()
 
 _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 
@@ -783,6 +785,8 @@ class MaybeTboDeepEPDispatcher:
         num_inner_dispatchers = (
             2 if global_server_args_dict["enable_two_batch_overlap"] else 1
         )
+        if _is_npu:
+            DeepEPDispatcher = NpuDeepEPDispatcher
         self._inners = [
             DeepEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
         ]
