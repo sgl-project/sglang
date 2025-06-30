@@ -309,19 +309,6 @@ def per_token_group_quant_8bit(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     from sglang.srt.layers.quantization.int8_kernel import per_token_group_quant_int8
 
-    if dst_dtype == torch.int8:
-        assert not column_major_scales
-        assert not scale_tma_aligned
-        assert not scale_ue8m0
-        assert not fuse_silu_and_mul
-        assert not masked_layout
-        return per_token_group_quant_int8(
-            x=x,
-            group_size=group_size,
-            eps=eps,
-            dtype=dst_dtype,
-        )
-
     if fuse_silu_and_mul:
         from deep_gemm.utils.layout import transform_sf_into_required_layout
 
@@ -382,6 +369,7 @@ def per_token_group_quant_8bit(
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=scale_ue8m0,
+        dtype=dst_dtype,
     )
 
 
