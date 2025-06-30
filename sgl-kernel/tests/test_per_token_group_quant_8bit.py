@@ -129,17 +129,7 @@ def test_per_token_group_quant_with_column_major(
     # print(f"{x_s_sglang=}")
     # torch.set_printoptions(profile="default")
 
-    if dst_dtype == fp8_type_:
-        assert_fp8_all_close(x_q_triton, x_q_sglang)
-    else:
-        torch.testing.assert_close(
-            x_q_triton,
-            x_q_sglang,
-            rtol=1e-3,
-            atol=1e-5,
-            msg=lambda message: message + f" {x_q_triton=} {x_q_sglang=}",
-        )
-
+    assert_fp8_all_close(x_q_triton, x_q_sglang)
     torch.testing.assert_close(
         x_s_triton.contiguous(),
         x_s_sglang.contiguous(),
