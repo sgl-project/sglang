@@ -44,17 +44,10 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
         *args,
         **kwargs
     ):
-        if not image_data:
-            return None
-
-        if not isinstance(image_data, list):
-            image_data = [image_data]
-
-        image_token = self.IMAGE_TOKEN
         base_output = self.load_mm_data(
             input_text,
             image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(image_token=image_token),
+            multimodal_tokens=MultimodalSpecialTokens(image_token=self.IMAGE_TOKEN),
             max_req_input_len=max_req_input_len,
         )
         res = self.process_mm_data(

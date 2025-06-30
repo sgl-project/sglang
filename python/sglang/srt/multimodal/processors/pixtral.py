@@ -78,12 +78,6 @@ class PixtralProcessor(BaseMultimodalProcessor):
         *args,
         **kwargs,
     ):
-        if not image_data:
-            return None
-
-        if isinstance(image_data, str):
-            image_data = [image_data]
-
         mm_data = self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=self.multimodal_tokens,

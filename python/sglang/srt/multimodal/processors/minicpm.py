@@ -23,19 +23,12 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
+        audio_data: List[Union[str, bytes]],
         input_text,
         request_obj,
         max_req_input_len,
         **kwargs,
     ):
-        audio_data = request_obj.audio_data
-        if not image_data and not audio_data:
-            return None
-        if not isinstance(image_data, list):
-            image_data = [image_data]
-        if not isinstance(audio_data, list):
-            audio_data = [audio_data]
-
         base_output = self.load_mm_data(
             prompt=input_text,
             max_req_input_len=max_req_input_len,
