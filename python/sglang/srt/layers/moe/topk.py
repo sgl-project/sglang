@@ -35,6 +35,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_npu,
 )
 
 _is_cuda = is_cuda()
@@ -42,6 +43,7 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -53,6 +55,9 @@ if _use_aiter:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+
+if _is_npu:
+    import torch_npu
 
 
 def fused_topk_torch_native(
@@ -140,6 +145,31 @@ def _fused_topk_postprocess(
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
+
+
+def npu_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    n_routed_experts: int,
+    topk_group: Optional[int] = 0,
+    num_expert_group: Optional[int] = None,
+    routed_scaling_factor: Optional[float] = None,
+):
+    topk_weight, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
+        gating_output,
+        k=topk,
+        bias=torch.zeros(n_routed_experts, device=gating_output.device, dtype=gating_output.dtype),
+        k_group=topk_group,
+        group_count=num_expert_group,
+        group_select_mode=1,
+        renorm=0,
+        norm_type=1,
+        out_flag=False,
+        routed_scaling_factor=routed_scaling_factor,
+        eps=float(1e-20))
+    return topk_weight, topk_ids
 
 
 # This is used by the Deepseek V2/V3/R1 series models
@@ -450,6 +480,7 @@ def select_experts(
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    n_routed_experts: Optional[int] = None,
 ):
     router_logits, correction_bias = (
         expert_location_dispatch.transform_select_experts_inputs(
@@ -512,15 +543,20 @@ def select_experts(
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
     else:
-        assert (
-            num_token_non_padded is None
-        ), "num_token_non_padded is not yet supported in custom_routing_function"
-        assert expert_location_dispatch_info is None
+        if not _is_npu:
+            assert (
+                num_token_non_padded is None
+            ), "num_token_non_padded is not yet supported in custom_routing_function"
+            assert expert_location_dispatch_info is None
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=top_k,
             renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            routed_scaling_factor=routed_scaling_factor,
+            n_routed_experts=n_routed_experts,
         )
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
