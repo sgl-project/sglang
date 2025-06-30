@@ -19,8 +19,6 @@ from typing import Dict, Optional
 
 import torch.distributed
 
-from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -34,8 +32,10 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
 )
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import is_flashinfer_available
 
 
 class ScatterMode(Enum):
@@ -399,8 +399,16 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if hidden_states.shape[0] != 0:
                 hidden_states = layernorm(hidden_states)
         else:
-            if is_sm100_supported() and is_flashinfer_available() and hasattr(layernorm, 'forward_with_allreduce_fusion') and global_server_args_dict['enable_flashinfer_allreduce_fusion'] and hidden_states.shape[0] <= 4096:
-                hidden_states, residual = layernorm.forward_with_allreduce_fusion(hidden_states, residual)
+            if (
+                is_sm100_supported()
+                and is_flashinfer_available()
+                and hasattr(layernorm, "forward_with_allreduce_fusion")
+                and global_server_args_dict["enable_flashinfer_allreduce_fusion"]
+                and hidden_states.shape[0] <= 4096
+            ):
+                hidden_states, residual = layernorm.forward_with_allreduce_fusion(
+                    hidden_states, residual
+                )
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 hidden_states, residual = layernorm(hidden_states, residual)

@@ -15,6 +15,7 @@ _workspace_manager = None
 if is_flashinfer_available():
     try:
         import flashinfer.comm as comm
+
         _flashinfer_comm = comm
     except ImportError:
         logger.warning(
@@ -30,23 +31,28 @@ class FlashInferWorkspaceManager:
         self.world_size = None
         self.rank = None
         self.initialized = False
-    
-    def initialize(self, world_size: int, rank: int, max_token_num: int, 
-                   hidden_dim: int, group=None, 
-                   use_fp32_lamport: bool = False):
+
+    def initialize(
+        self,
+        world_size: int,
+        rank: int,
+        max_token_num: int,
+        hidden_dim: int,
+        group=None,
+        use_fp32_lamport: bool = False,
+    ):
         """Initialize workspace"""
         if self.initialized and self.world_size == world_size:
             return
-            
+
         if _flashinfer_comm is None:
             logger.warning(
-                "FlashInfer comm not available, skipping workspace "
-                "initialization"
+                "FlashInfer comm not available, skipping workspace " "initialization"
             )
             return
 
         self.cleanup()
-        
+
         self.ipc_handles, self.workspace_tensor = (
             comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
                 rank,
@@ -57,23 +63,22 @@ class FlashInferWorkspaceManager:
                 use_fp32_lamport=use_fp32_lamport,
             )
         )
-        
+
         self.world_size = world_size
         self.rank = rank
         self.initialized = True
-        
+
         logger.info(
             f"FlashInfer workspace initialized for rank {rank}, "
             f"world_size {world_size}"
         )
-    
+
     def cleanup(self):
         """Clean up workspace"""
         if self.initialized and self.ipc_handles is not None:
             try:
                 _flashinfer_comm.trtllm_destroy_ipc_workspace_for_all_reduce(
-                    self.ipc_handles, 
-                    group=dist.group.WORLD
+                    self.ipc_handles, group=dist.group.WORLD
                 )
             except Exception as e:
                 logger.warning(f"Failed to cleanup FlashInfer workspace: {e}")
@@ -86,30 +91,33 @@ class FlashInferWorkspaceManager:
 _workspace_manager = FlashInferWorkspaceManager()
 
 
-def ensure_workspace_initialized(max_token_num: int = 4096, 
-                                 hidden_dim: int = 4096, 
-                                 use_fp32_lamport: bool = False):
+def ensure_workspace_initialized(
+    max_token_num: int = 4096, hidden_dim: int = 4096, use_fp32_lamport: bool = False
+):
     """Ensure workspace is initialized"""
     if not is_flashinfer_available() or _flashinfer_comm is None:
         return False
-        
+
     world_size = get_tensor_model_parallel_world_size()
     if world_size <= 1:
         return False
-        
+
     rank = dist.get_rank()
-    
-    if (not _workspace_manager.initialized or 
-            _workspace_manager.world_size != world_size):
+
+    if (
+        not _workspace_manager.initialized
+        or _workspace_manager.world_size != world_size
+    ):
         _workspace_manager.initialize(
             world_size=world_size,
             rank=rank,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
-            use_fp32_lamport=use_fp32_lamport
+            use_fp32_lamport=use_fp32_lamport,
         )
-    
+
     return _workspace_manager.initialized
+
 
 def flashinfer_allreduce_add_rmsnorm(
     input_tensor: torch.Tensor,
@@ -123,7 +131,7 @@ def flashinfer_allreduce_add_rmsnorm(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Use FlashInfer's fused allreduce + residual + RMS norm operation
-    
+
     Args:
         input_tensor: Input tensor that needs allreduce
         residual: Residual tensor
@@ -133,32 +141,31 @@ def flashinfer_allreduce_add_rmsnorm(
         use_oneshot: Whether to use oneshot mode
         trigger_completion_at_end: Whether to trigger completion at end
         fp32_acc: Whether to use fp32 precision
-    
+
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: (norm_output, residual_output)
     """
     if not is_flashinfer_available() or _flashinfer_comm is None:
         logger.debug(
-            "FlashInfer not available, falling back to standard "
-            "implementation"
+            "FlashInfer not available, falling back to standard " "implementation"
         )
         return None, None
-    
+
     world_size = get_tensor_model_parallel_world_size()
     if world_size <= 1:
         logger.debug("Single GPU, no need for allreduce fusion")
         return None, None
-    
+
     if not ensure_workspace_initialized(
-        max_token_num=max_token_num, 
+        max_token_num=max_token_num,
         hidden_dim=input_tensor.shape[-1],
-        use_fp32_lamport=(input_tensor.dtype == torch.float32)
+        use_fp32_lamport=(input_tensor.dtype == torch.float32),
     ):
         logger.debug("FlashInfer workspace not available")
         return None, None
-    
+
     token_num, hidden_dim = input_tensor.shape
-    
+
     residual_out = torch.empty_like(residual)
     norm_out = torch.empty_like(input_tensor)
 
@@ -173,9 +180,7 @@ def flashinfer_allreduce_add_rmsnorm(
         use_oneshot=use_oneshot,
         trigger_completion_at_end=trigger_completion_at_end,
         fp32_acc=fp32_acc,
-        pattern_code=(
-            _flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm
-        ),
+        pattern_code=(_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm),
         allreduce_out=None,
         residual_in=residual,
         residual_out=residual_out,
@@ -187,7 +192,7 @@ def flashinfer_allreduce_add_rmsnorm(
         scale_factor=None,
         layout_code=None,
     )
-    
+
     return norm_out, residual_out
 
 
