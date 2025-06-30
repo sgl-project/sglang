@@ -173,9 +173,10 @@ __global__ void per_token_group_quant_8bit_kernel(
         }
         if constexpr (FUSE_SILU_AND_MUL) {
 #pragma unroll
+          const int secondary_offset = hidden_size_num_groups * group_size;
           for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
             input_secondary_int4[j] = ld_global_nc(
-                reinterpret_cast<const int4*>(input + input_group_start_offset + TODO + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
+                reinterpret_cast<const int4*>(input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE + secondary_offset) + j);
           }
         }
 
