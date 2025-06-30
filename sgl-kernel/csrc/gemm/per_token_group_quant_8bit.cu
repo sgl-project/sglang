@@ -212,6 +212,7 @@ int compute_groups_per_block(int num_groups) {
 }
 
 void sgl_per_token_group_quant_8bit(
+    // (optional num_experts, num_tokens, hidden_size)
     torch::Tensor input,
     torch::Tensor output_q,
     torch::Tensor output_s,
@@ -228,7 +229,7 @@ void sgl_per_token_group_quant_8bit(
   const int num_groups = input.numel() / group_size;
 
   CHECK_EQ(input.numel() % group_size, 0);
-  CHECK_EQ(output_s.dim(), 2);
+  TORCH_CHECK((output_s.dim() == 2) or (output_s.dim() == 3));
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -238,9 +239,9 @@ void sgl_per_token_group_quant_8bit(
   const int num_blocks = num_groups / groups_per_block;
   const int num_threads = groups_per_block * THREADS_PER_GROUP;
 
-  const bool is_column_major = output_s.stride(0) < output_s.stride(1);
-  const int scale_hidden_size = output_s.size(1);
-  const int scale_hidden_stride = output_s.stride(1);
+  const bool is_column_major = output_s.stride(-2) < output_s.stride(-1);
+  const int scale_hidden_size = output_s.size(-1);
+  const int scale_hidden_stride = output_s.stride(-1);
 
   dim3 grid(num_blocks);
   dim3 block(num_threads);
