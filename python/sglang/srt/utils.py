@@ -2445,18 +2445,18 @@ def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> 
     for i, weight_name in enumerate(weight_names):
         weight_tensor = getattr(module, weight_name)
 
+        if transpose_dims and transpose_dims[i]:
+            weight_tensor = weight_tensor.transpose(*transpose_dims[i])
+
         # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
         if not dim_is_supported(weight_tensor):
             logger.warning(
                 f"Expects weight.size(0) % 16 == 0 and weight.size(1) % 32 == 0 "
-                f"but {weight_tensor.size(0)=} and {weight_tensor.size(1)=} in {module}. "
+                f"but {weight_name} {weight_tensor.size(0)=} and {weight_tensor.size(1)=} in {module}. "
                 f"{module} won't use intel amx backend."
             )
             module.use_intel_amx_backend = False
             return
-
-        if transpose_dims and transpose_dims[i]:
-            weight_tensor = weight_tensor.transpose(*transpose_dims[i])
 
         packed_weight = torch.nn.Parameter(
             prepack_weight_if_needed(weight_tensor),
