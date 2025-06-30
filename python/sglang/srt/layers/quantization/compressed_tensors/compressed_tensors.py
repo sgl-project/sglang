@@ -106,7 +106,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.weight_scheme = weight_scheme
 
         # NOTE(yiakwy) : blockScale is not supported now , will be added soon; temp work around is broadcsating tensor-wise scalars
-        # self.weight_block_size = (128, 128)
+        self.weight_block_size = None
 
     def get_linear_method(self) -> "CompressedTensorsLinearMethod":
         return CompressedTensorsLinearMethod(self)
