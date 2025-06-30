@@ -379,6 +379,9 @@ def sglang_per_token_group_quant_fp8(
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
+    fuse_silu_and_mul: bool = False,
+    masked_layout: bool = False,
+    masked_m: Optional[torch.Tensor] = None,
 ):
     assert (
         x.shape[-1] % group_size == 0
@@ -388,6 +391,8 @@ def sglang_per_token_group_quant_fp8(
     if scale_ue8m0:
         # TODO: handle this case by fixing the (token=4, dim=256, group_size=128) UT case
         assert x.shape[-1] % (group_size * 4) == 0
+
+    assert not fuse_silu_and_mul, "TODO"
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
     x_s = create_per_token_group_quant_fp8_output_scale(
@@ -436,9 +441,6 @@ def sglang_per_token_group_quant_8bit(
             dtype=dst_dtype,
         )
 
-    if fuse_silu_and_mul:
-        return TODO
-
     return sglang_per_token_group_quant_fp8(
         x=x,
         group_size=group_size,
@@ -446,6 +448,9 @@ def sglang_per_token_group_quant_8bit(
         column_major_scales=column_major_scales,
         scale_tma_aligned=scale_tma_aligned,
         scale_ue8m0=scale_ue8m0,
+        fuse_silu_and_mul=fuse_silu_and_mul,
+        masked_layout=masked_layout,
+        masked_m=masked_m,
     )
 
 
