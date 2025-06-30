@@ -184,6 +184,7 @@ def per_token_group_quant_int8(
     return x_q, x_s
 
 
+# TODO unify with fp8
 def sglang_per_token_group_quant_int8(
     x: torch.Tensor,
     group_size: int,
