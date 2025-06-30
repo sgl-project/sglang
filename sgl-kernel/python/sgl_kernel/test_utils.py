@@ -36,6 +36,7 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
             masked_m = _compute_imbalanced_split(num_tokens, num_local_experts)
         else:
             raise NotImplementedError
+        print(f"{masked_data_generation_mode=} {masked_m=} {x.shape=}")
 
         masked_m = masked_m.to(device)
 
