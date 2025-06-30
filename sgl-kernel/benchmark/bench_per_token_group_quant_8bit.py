@@ -116,7 +116,9 @@ else:
     )
 )
 def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
-    x = create_per_token_group_quant_test_data()
+    x = create_per_token_group_quant_test_data(
+        num_tokens=num_tokens, hidden_dim=hidden_dim, group_size=group_size, flags=flags
+    )
 
     fn, kernel_names = {
         "triton": (triton_per_token_group_quant_8bit, "_per_token_group_quant_fp8|_silu_and_mul_post_quant_kernel"),

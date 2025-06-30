@@ -89,7 +89,9 @@ def test_per_token_group_quant_with_column_major(
         pytest.skip()
         return
 
-    x = create_per_token_group_quant_test_data()
+    x = create_per_token_group_quant_test_data(
+        num_tokens=num_tokens, hidden_dim=hidden_dim, group_size=group_size, flags=flags
+    )
 
     execute_kwargs = dict(
         x=x,
