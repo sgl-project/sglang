@@ -2428,7 +2428,12 @@ def prepack_weight_if_needed(weight):
 # OC % TILE_N == 0, where TILE_N = 16
 # IC % TILE_K == 0, where TILE_K = 32
 def dim_is_supported(weight):
-    return weight.size(0) % 16 == 0 and weight.size(1) % 32 == 0
+    TILE_N = 16
+    TILE_K = 32
+    ndim = weight.ndim
+    OC = weight.size(1) if ndim == 3 else weight.size(0)
+    IC = weight.size(2) if ndim == 3 else weight.size(1)
+    return OC % TILE_N == 0 and IC % TILE_K == 0
 
 
 def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
