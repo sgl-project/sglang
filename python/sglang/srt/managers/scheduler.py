@@ -2437,6 +2437,7 @@ class Scheduler(
         stage_suffix = f"-{stage.__str__()}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
+            torch.distributed.barrier(self.tp_cpu_group)
             self.torch_profiler.stop()
             self.torch_profiler.export_chrome_trace(
                 os.path.join(
