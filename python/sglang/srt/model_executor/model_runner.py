@@ -477,6 +477,17 @@ class ModelRunner:
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
 
         if not self.is_draft_worker:
+            if self.device == "cpu":
+                # Bind OpenMP threads to CPU cores
+                assert (
+                    cpu_has_amx_support()
+                ), "init_cpu_threads_env failed since intel amx backend is not available"
+                torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
+
+                # Set local size to hint SGLang to use shared memory based AllReduce
+                os.environ["LOCAL_SIZE"] = str(self.tp_size)
+                torch.ops.sgl_kernel.initialize(self.tp_size, self.tp_rank)
+
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
                 backend=backend,
