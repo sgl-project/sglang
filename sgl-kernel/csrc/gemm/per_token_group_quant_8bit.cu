@@ -240,7 +240,9 @@ void sgl_per_token_group_quant_8bit(
     double eps,
     double min_8bit,
     double max_8bit,
-    bool scale_ue8m0) {
+    bool scale_ue8m0,
+    bool fuse_silu_and_mul,
+    const std::optional<torch::Tensor>& masked_m) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
   TORCH_CHECK((output_s.dim() == 2) or (output_s.dim() == 3));
