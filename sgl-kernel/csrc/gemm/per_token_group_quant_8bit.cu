@@ -116,7 +116,7 @@ struct NaiveScheduler {
 
   template <bool FUSE_SILU_AND_MUL, typename FUNC>
   __device__ __forceinline__ static void
-  execute(int subwarps_per_block, int hidden_dim_num_groups, int group_size, FUNC fn) {
+  execute(const int subwarps_per_block, const int hidden_dim_num_groups, const int group_size, const int32_t* masked_m, FUNC fn) {
     constexpr int expert_idx = 0;
 
     const int local_group_id = threadIdx.x / THREADS_PER_SUBWARP;
@@ -159,7 +159,7 @@ struct MaskedLayoutScheduler {
 
   template <bool FUSE_SILU_AND_MUL, typename FUNC>
   __device__ __forceinline__ static void
-  execute(int subwarps_per_block, int hidden_dim_num_groups, int group_size, const int32_t* masked_m, FUNC fn) {
+  execute(const int subwarps_per_block, const int hidden_dim_num_groups, const int group_size, const int32_t* masked_m, FUNC fn) {
     const int expert_idx = blockIdx.z;
     const int token_idx_start = blockIdx.y;
     const int hidden_dim_block_index = blockIdx.x;
@@ -203,7 +203,7 @@ __global__ void per_token_group_quant_8bit_kernel(
       subwarps_per_block,
       hidden_dim_num_groups,
       group_size,
-      [&](int expert_idx, int token_idx, int hidden_dim_group_idx, int lane_id, int input_group_start_offset) {
+      [&](const int expert_idx, const int token_idx, const int hidden_dim_group_idx, const int lane_id, const int input_group_start_offset) {
         constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
         constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
