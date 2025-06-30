@@ -21,6 +21,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -44,6 +45,12 @@ class DeepseekModelNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+            logger.warning(
+                "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
+            )
+            quant_config = None
+
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -76,7 +83,6 @@ class DeepseekModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-
         zero_allocator = BumpAllocator(
             buffer_size=2,
             dtype=torch.float32,
@@ -102,9 +108,10 @@ class DeepseekModelNextN(nn.Module):
             )
 
         residual = None
-        hidden_states, residual = self.decoder(
-            positions, hidden_states, forward_batch, residual, zero_allocator
-        )
+        with get_global_expert_distribution_recorder().disable_this_region():
+            hidden_states, residual = self.decoder(
+                positions, hidden_states, forward_batch, residual, zero_allocator
+            )
 
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:
