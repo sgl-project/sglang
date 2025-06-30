@@ -131,11 +131,11 @@ class BaseMultimodalProcessor(ABC):
         """
         process multimodal data with transformers AutoProcessor
         """
-        if images is not None:
+        if images:
             kwargs["images"] = images
-        if videos is not None:
+        if videos:
             kwargs["videos"] = videos
-        if audios is not None:
+        if audios:
             kwargs["audios"] = audios
             if self.__class__.__name__ == "Gemma3nSGLangProcessor":
                 # Note(Xinyuan): for gemma3n, ref: https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/processing_gemma3n.py#L107
