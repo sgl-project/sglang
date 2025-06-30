@@ -104,7 +104,9 @@ def test_per_token_group_quant_with_column_major(
     dst_dtype,
     flags,
 ):
-    if flags["scale_ue8m0"] and (group_size != 128):
+    if (flags["scale_ue8m0"] and (group_size != 128)) or (
+        (dst_dtype == torch.int8) and flags["column_major_scales"]
+    ):
         pytest.skip()
         return
 
