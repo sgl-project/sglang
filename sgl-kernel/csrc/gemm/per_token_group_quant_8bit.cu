@@ -162,10 +162,21 @@ __global__ void per_token_group_quant_8bit_kernel(
         T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
         static_assert(sizeof(input_primary_vec[0]) * INPUT_PRIMARY_VEC_SIZE == sizeof(input_primary_int4));
 
+        int4 input_secondary_int4[INPUT_PRIMARY_INT4_SIZE];
+        T* input_secondary_vec = reinterpret_cast<T*>(input_secondary_int4);
+        static_assert(sizeof(input_secondary_vec[0]) * INPUT_PRIMARY_VEC_SIZE == sizeof(input_secondary_int4));
+
 #pragma unroll
         for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
           input_primary_int4[j] = ld_global_nc(
               reinterpret_cast<const int4*>(input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
+        }
+        if constexpr (FUSE_SILU_AND_MUL) {
+#pragma unroll
+          for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
+            input_secondary_int4[j] = ld_global_nc(
+                reinterpret_cast<const int4*>(input + input_group_start_offset + TODO + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
+          }
         }
 
         scale_element_t* scale_output;
