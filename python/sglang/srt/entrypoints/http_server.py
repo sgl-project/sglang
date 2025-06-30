@@ -94,6 +94,7 @@ from sglang.srt.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
+    add_payload_size_limit_middleware,
     add_prometheus_middleware,
     delete_directory,
     get_bool_env_var,
@@ -885,6 +886,9 @@ def launch_server(
     if server_args.enable_metrics:
         add_prometheus_middleware(app)
         enable_func_timer()
+
+    # Add payload size limit middleware
+    add_payload_size_limit_middleware(app, server_args.max_payload_size)
 
     # Send a warmup request - we will create the thread launch it
     # in the lifespan after all other warmups have fired.

@@ -115,6 +115,7 @@ class ServerArgs:
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
+    max_payload_size: int = 50 * 1024 * 1024
 
     # Data parallelism
     dp_size: int = 1
@@ -1017,6 +1018,12 @@ class ServerArgs:
             choices=["qwen25", "mistral", "llama3", "deepseekv3", "pythonic"],
             default=ServerArgs.tool_call_parser,
             help="Specify the parser for handling tool-call interactions. Options include: 'qwen25', 'mistral', 'llama3', 'deepseekv3', and 'pythonic'.",
+        )
+        parser.add_argument(
+            "--max-payload-size",
+            type=int,
+            default=ServerArgs.max_payload_size,
+            help="The maximum payload size in bytes for each request.",
         )
 
         # Data parallelism

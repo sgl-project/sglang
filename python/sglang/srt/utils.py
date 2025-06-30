@@ -879,6 +879,44 @@ def add_api_key_middleware(app, api_key: str):
         return await call_next(request)
 
 
+def add_payload_size_limit_middleware(app, max_payload_size: int):
+    @app.middleware("http")
+    async def upload_size_limit(request, call_next):
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        if request.url.path.startswith("/health"):
+            return await call_next(request)
+        if request.url.path.startswith("/metrics"):
+            return await call_next(request)
+        # check body size
+        try:
+            max_body_size = get_int_env_var("SGLANG_MAX_PAYLOAD_SIZE", max_payload_size)
+        except ValueError as e:
+            logger.warning(
+                "SGLANG_MAX_PAYLOAD_SIZE is not a valid integer, using default value. Exception: %s",
+                str(e),
+            )
+
+        # check content-length header if available
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > max_body_size:
+            return ORJSONResponse(
+                content={"error": "Payload Too Large"}, status_code=413
+            )
+
+        body = await request.body()
+        if len(body) > max_body_size:
+            return ORJSONResponse(
+                content={"error": "Payload Too Large"}, status_code=413
+            )
+        else:
+            logger.debug(
+                f"Request body size: {len(body)} within limit: {max_body_size}"
+            )
+        request._body = body
+        return await call_next(request)
+
+
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
     if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
         if not os.path.exists(model_path):
