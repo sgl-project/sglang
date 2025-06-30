@@ -244,7 +244,9 @@ class TokenizerManager:
 
         # Initialize loaded loRA adapters with the initial lora paths in the server_args.
         # This list will be updated when new LoRA adapters are loaded or unloaded dynamically.
-        self.loaded_lora_adapters: Dict[str, str] = self.server_args.lora_paths.copy()
+        self.loaded_lora_adapters: Dict[str, str] = dict(
+            self.server_args.lora_paths or {}
+        )
 
         # Store states
         self.no_create_loop = False
@@ -551,7 +553,7 @@ class TokenizerManager:
                     "Please set `--enable-custom-logits-processor` to enable this feature."
                 )
 
-            if obj.lora_path:
+            if self.server_args.lora_paths and obj.lora_path:
                 self._validate_lora_adapters(obj)
 
     def _create_tokenized_object(
@@ -663,11 +665,14 @@ class TokenizerManager:
         requested_adapters = (
             set(obj.lora_path) if isinstance(obj.lora_path, list) else {obj.lora_path}
         )
-        unloaded_adapters = requested_adapters - self.loaded_lora_adapters.keys()
+        loaded_adapters = (
+            self.loaded_lora_adapters.keys() if self.loaded_lora_adapters else set()
+        )
+        unloaded_adapters = requested_adapters - loaded_adapters
         if unloaded_adapters:
             raise ValueError(
                 f"The following requested LoRA adapters are not loaded: {unloaded_adapters}\n"
-                f"Loaded adapters: {self.loaded_lora_adapters}."
+                f"Loaded adapters: {loaded_adapters}."
             )
 
     def _send_one_request(

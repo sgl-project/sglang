@@ -16,7 +16,7 @@ import multiprocessing as mp
 import unittest
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 import requests
 import torch
@@ -48,8 +48,10 @@ class OperationType(Enum):
 
 @dataclass
 class Operation:
+    # Operation type, can be LOAD, UNLOAD, FORWARD, or EXPECT_ERROR
     type: OperationType
-    data: Union[str, tuple[str, str]]
+    # Data associated with the operation. Exact type varies depending on the operation
+    data: Optional[Any]
 
 
 @dataclass
