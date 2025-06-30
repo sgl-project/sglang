@@ -43,6 +43,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     import aiter
     from aiter import gemm_a8w8_blockscale_CK, get_hip_quant
+    from aiter import gemm_a8w8_bpreshuffle_CK
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
@@ -56,13 +57,16 @@ use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_K
 TORCH_DEVICE_IDENTITY = None
 
 
-def use_rowwise_torch_scaled_mm():
-    _TORCH_VERSION = torch.__version__.split("+")[0]
-    try:
-        _TORCH_VERSION_TUPLE = tuple(map(int, _TORCH_VERSION.split(".")[:3]))
-    except ValueError:
-        _TORCH_VERSION_TUPLE = (0, 0, 0)
+def use_hip_scaled_mm():
     if _is_hip:
+        if _use_aiter:
+            return get_device_capability() >= (9, 4)
+        
+        _TORCH_VERSION = torch.__version__.split("+")[0]
+        try:
+            _TORCH_VERSION_TUPLE = tuple(map(int, _TORCH_VERSION.split(".")[:3]))
+        except ValueError:
+            _TORCH_VERSION_TUPLE = (0, 0, 0)
         # The condition to determine if it is on a platform that supports
         # torch._scaled_mm rowwise feature.
         # The condition is determined once as the operations
@@ -71,7 +75,7 @@ def use_rowwise_torch_scaled_mm():
     return False
 
 
-USE_ROWWISE_TORCH_SCALED_MM = use_rowwise_torch_scaled_mm()
+USE_HIP_SCALED_MM = use_hip_scaled_mm()
 
 
 def cutlass_fp8_supported():
@@ -606,24 +610,35 @@ def apply_fp8_linear(
                 use_per_token_if_dynamic
                 and not per_tensor_weights
                 and not per_tensor_activations
-                and USE_ROWWISE_TORCH_SCALED_MM
+                and USE_HIP_SCALED_MM
             ):
-                # For now validated on ROCm platform
-                # fp8 rowwise scaling in torch._scaled_mm is introduced in
-                # https://github.com/pytorch/pytorch/pull/144432 using hipBLASLt
-                # and ROCm 6.3, which only exists in torch 2.7 and above.
-                # For CUDA platform please validate if the
-                # torch._scaled_mm support rowwise scaled GEMM
-                # Fused GEMM_DQ Rowwise GEMM
-                output = torch._scaled_mm(
-                    qinput,
-                    weight,
-                    out_dtype=input.dtype,
-                    scale_a=x_scale,
-                    scale_b=weight_scale.t(),
-                    bias=bias,
-                )
-                return _process_scaled_mm_output(output, input_2d.shape, output_shape)
+                if _use_aiter:
+                    output = gemm_a8w8_bpreshuffle_CK(
+                        XQ=qinput,
+                        WQ=weight,
+                        x_scale=x_scale,
+                        w_scale=weight_scale,
+                        dtype=input.dtype)
+                    if bias is not None:
+                        output += bias
+                    return _process_scaled_mm_output(output, input_2d.shape, [*input.shape[:-1], weight.shape[0]])
+                else:
+                    # For now validated on ROCm platform
+                    # fp8 rowwise scaling in torch._scaled_mm is introduced in
+                    # https://github.com/pytorch/pytorch/pull/144432 using hipBLASLt
+                    # and ROCm 6.3, which only exists in torch 2.7 and above.
+                    # For CUDA platform please validate if the
+                    # torch._scaled_mm support rowwise scaled GEMM
+                    # Fused GEMM_DQ Rowwise GEMM
+                    output = torch._scaled_mm(
+                        qinput,
+                        weight,
+                        out_dtype=input.dtype,
+                        scale_a=x_scale,
+                        scale_b=weight_scale.t(),
+                        bias=bias,
+                    )
+                    return _process_scaled_mm_output(output, input_2d.shape, output_shape)
 
             else:
                 # Fallback for channelwise case, where we use unfused DQ
