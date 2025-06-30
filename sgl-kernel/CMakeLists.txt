@@ -249,6 +249,7 @@ set(SOURCES
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/speculative_sampling.cu"
     "csrc/speculative/packbit.cu"
+    "csrc/spatial/greenctx_stream.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
     "csrc/common_extension.cc"
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
