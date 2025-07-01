@@ -88,8 +88,8 @@ def get_wave_kernel(
         subs=hyperparams_0,
         canonicalize=True,
         run_bench=False,
-        use_buffer_load_ops=False,
-        use_buffer_store_ops=False,
+        use_buffer_load_ops=True,
+        use_buffer_store_ops=True,
         waves_per_eu=2,
         dynamic_symbols=dynamic_symbols,
         dynamic_symbols_map=dynamic_symbols_map,
@@ -114,10 +114,6 @@ def get_wave_kernel(
 
     return phase_0, phase_1
 
-
-def view_trunc(tensor, shape):
-    size = math.prod(shape)
-    return tensor.view(-1)[:size].view(shape)
 
 def decode_attention_intermediate_arrays_shapes(num_seqs, head_size_kv, num_query_heads, max_kv_splits):
     # Not all fields are used, but we need to pass them to the function
@@ -161,9 +157,6 @@ def decode_attention_wave(
         num_seqs,
         seq_len,
     )
-
-    k_buffer = view_trunc(k_buffer, (num_seqs, seq_len, num_kv_heads, head_size))
-    v_buffer = view_trunc(v_buffer, (num_seqs, seq_len, num_kv_heads, head_size_kv))
 
     phase_0, phase_1 = get_wave_kernel(
         shape, max_kv_splits, q.dtype, o.dtype, logit_cap
