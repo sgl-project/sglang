@@ -1,4 +1,7 @@
 import itertools
+import os
+import time
+from pathlib import Path
 
 import pytest
 import torch
@@ -12,6 +15,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
 from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_bool_env_var
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
@@ -59,11 +63,10 @@ configs = list(
     # )
 ) + list(
     itertools.product(
-        [32],
-        [512],
-        # [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
+        [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
         # # [256, 512, 1024, 2048, 4096], # TODO
-        # [512, 1024, 2048, 4096],
+        # [512, 1024, 2048, 4096], # TODO
+        [512],
         [128],
         [fp8_type_],
         [
@@ -140,14 +143,30 @@ def test_per_token_group_quant_with_column_major(
     # print(f"{x_s_sglang=}")
     # torch.set_printoptions(profile="default")
 
-    assert_all_close_or_tiny_diff(x_q_triton, x_q_sglang)
-    torch.testing.assert_close(
-        x_s_triton.contiguous(),
-        x_s_sglang.contiguous(),
-        rtol=1e-3,
-        atol=1e-5,
-        msg=lambda message: message + f" {x_s_triton=} {x_s_sglang=}",
-    )
+    try:
+        assert_all_close_or_tiny_diff(x_q_triton, x_q_sglang)
+        torch.testing.assert_close(
+            x_s_triton.contiguous(),
+            x_s_sglang.contiguous(),
+            rtol=1e-3,
+            atol=1e-5,
+            msg=lambda message: message + f" {x_s_triton=} {x_s_sglang=}",
+        )
+    except AssertionError:
+        if d := os.environ.get("SGLANG_DUMP_TEST_ERROR_DIR"):
+            import matplotlib.pyplot as plt
+            base_stem = time.time()
+            for name, value in [
+                ("x_q", x_q_triton != x_q_sglang),
+                ("x_s", x_s_triton != x_s_sglang),
+            ]:
+                plt.figure(figsize=(20, 20))
+                plt.imshow((value * 1.0).cpu().numpy())
+                p = Path(d) / f"{base_stem}_{name}.png"
+                print(f"Write diff to {p}")
+                plt.savefig(p)
+
+        raise
 
 
 if __name__ == "__main__":
