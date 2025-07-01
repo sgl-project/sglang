@@ -14,8 +14,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
 )
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_8bit
-from sglang.srt.utils import is_hip
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
@@ -131,11 +130,15 @@ def test_per_token_group_quant_with_column_major(
         if masked_m is not None:
             print(f"Mask tokens after {masked_m} to be zero")
             for i in range(len(masked_m)):
-                x_q[i, masked_m[i]:, :] = 0
+                x_q[i, masked_m[i] :, :] = 0
         return x_q, x_s
 
-    x_q_triton, x_s_triton = _postprocess(*triton_per_token_group_quant_8bit(**execute_kwargs))
-    x_q_sglang, x_s_sglang = _postprocess(*sglang_per_token_group_quant_8bit(**execute_kwargs))
+    x_q_triton, x_s_triton = _postprocess(
+        *triton_per_token_group_quant_8bit(**execute_kwargs)
+    )
+    x_q_sglang, x_s_sglang = _postprocess(
+        *sglang_per_token_group_quant_8bit(**execute_kwargs)
+    )
 
     try:
         assert_all_close_or_tiny_diff(x_q_triton, x_q_sglang)
@@ -148,7 +151,9 @@ def test_per_token_group_quant_with_column_major(
         )
     except AssertionError:
         # torch.set_printoptions(profile="full")
-        print(f"{x.shape=} {x_q_triton.shape=} {x_s_triton.shape=} {x_q_sglang.shape=} {x_s_sglang.shape=}")
+        print(
+            f"{x.shape=} {x_q_triton.shape=} {x_s_triton.shape=} {x_q_sglang.shape=} {x_s_sglang.shape=}"
+        )
         print(f"{x=}")
         print(f"{masked_m=}")
         print(f"{x_q_triton=}")
@@ -159,6 +164,7 @@ def test_per_token_group_quant_with_column_major(
 
         if (d := os.environ.get("SGLANG_DUMP_TEST_ERROR_DIR", "")) != "":
             import matplotlib.pyplot as plt
+
             base_stem = time.time()
             for name, value in [
                 ("x_q", x_q_triton != x_q_sglang),

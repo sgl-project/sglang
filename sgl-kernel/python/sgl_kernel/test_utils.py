@@ -5,7 +5,7 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
     device = torch.device("cuda")
     dtype = torch.bfloat16
 
-    gen = torch.Generator(device='cuda')
+    gen = torch.Generator(device="cuda")
     gen.manual_seed(num_tokens * 10000 + hidden_dim)
 
     if flags["fuse_silu_and_mul"]:
@@ -43,8 +43,9 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
 
         return x, masked_m
     else:
-        x = torch.randn(num_tokens, effective_hidden_dim, device=device, dtype=dtype,
-                        generator=gen)
+        x = torch.randn(
+            num_tokens, effective_hidden_dim, device=device, dtype=dtype, generator=gen
+        )
         x[torch.randn(x.shape, device=device, generator=gen) < 0.001] *= 10
         return x, None
 
@@ -79,7 +80,9 @@ def _compute_imbalanced_split(total: int, arr_len: int, dtype=torch.int) -> list
 
 
 def assert_all_close_or_tiny_diff(a: torch.Tensor, b: torch.Tensor):
-    assert (a.shape == b.shape) and (a.dtype == b.dtype), f"{a.shape=} {b.shape=} {a.dtype=} {b.dtype=}"
+    assert (a.shape == b.shape) and (
+        a.dtype == b.dtype
+    ), f"{a.shape=} {b.shape=} {a.dtype=} {b.dtype=}"
     numel = a.numel()
 
     if a.dtype == torch.float8_e4m3fn:

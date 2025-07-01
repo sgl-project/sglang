@@ -92,9 +92,8 @@ struct DtypeInfo<c10::Float8_e4m3fn> {
   static constexpr float MAX = 448;
 };
 
-template<bool FUSE_SILU_AND_MUL>
-__device__ __forceinline__
-int compute_input_group_start_offset(
+template <bool FUSE_SILU_AND_MUL>
+__device__ __forceinline__ int compute_input_group_start_offset(
     int expert_idx,
     int token_idx,
     int hidden_dim_group_idx,
@@ -102,8 +101,7 @@ int compute_input_group_start_offset(
     int num_tokens_per_expert,
     int group_size) {
   return expert_idx * num_tokens_per_expert * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
-         token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
-         hidden_dim_group_idx * group_size;
+         token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) + hidden_dim_group_idx * group_size;
 }
 
 constexpr float LOCAL_ABSMAX_ABS = 1e-10;
@@ -118,7 +116,7 @@ struct NaiveScheduler {
       int& subwarps_per_block,
       dim3& grid,
       dim3& block) {
-    subwarps_per_block = ([=] () -> int {
+    subwarps_per_block = ([=]() -> int {
       if (num_groups % 16 == 0) {
         return 16;
       } else if (num_groups % 8 == 0) {
@@ -178,7 +176,7 @@ struct MaskedLayoutScheduler {
       int& subwarps_per_block,
       dim3& grid,
       dim3& block) {
-    subwarps_per_block = 1; // TODO highly inefficient
+    subwarps_per_block = 1;  // TODO highly inefficient
     grid = dim3(hidden_dim_num_groups, TOKEN_DIM_BLOCK_NUM_PER_EXPERT, num_local_experts);
     block = dim3(subwarps_per_block * THREADS_PER_SUBWARP);
   }
@@ -284,8 +282,8 @@ __global__ void per_token_group_quant_8bit_kernel(
           const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
           scale_output = reinterpret_cast<scale_element_t*>(output_s) +
                          (expert_idx * scale_expert_stride * num_elems_per_pack +
-                         hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
-                         token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
+                          hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
+                          token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
         } else {
           static_assert(!SCALE_UE8M0);
           scale_output = output_s + offset_num_groups;
@@ -389,7 +387,7 @@ void sgl_per_token_group_quant_8bit(
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, T, DST_DTYPE, output_s_dtype, ...)                                \
   do {                                                                                                   \
-    int subwarps_per_block; \
+    int subwarps_per_block;                                                                              \
     dim3 grid, block;                                                                                    \
     SCHEDULER::compute_exec_config(                                                                      \
         num_local_experts, hidden_dim_num_groups, num_groups, subwarps_per_block, grid, block);          \
