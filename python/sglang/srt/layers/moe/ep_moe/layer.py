@@ -11,6 +11,8 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.ep_moe.kernels import (
     ep_gather,
     ep_scatter,
@@ -41,12 +43,11 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     sglang_per_token_quant_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
-from sglang.srt.managers.expert_location import get_global_expert_location_metadata
-from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import (
     DeepEPMode,
+    ceil_div,
     dispose_tensor,
     get_bool_env_var,
     is_hip,
@@ -1371,10 +1372,19 @@ class DeepEPMoE(EPMoE):
                 device=hidden_states_fp8.device,
                 dtype=hidden_states_fp8.dtype,
             ),
-            torch.empty(
-                (all_tokens, K // 128),
-                device=hidden_states_fp8.device,
-                dtype=torch.float32,
+            (
+                # TODO check whether need `zeros`
+                torch.zeros(
+                    (ceil_div(K // 128, 4), all_tokens),
+                    device=hidden_states_fp8.device,
+                    dtype=torch.int,
+                ).transpose(0, 1)
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                else torch.empty(
+                    (all_tokens, K // 128),
+                    device=hidden_states_fp8.device,
+                    dtype=torch.float32,
+                )
             ),
         ]
         m_indices = torch.empty(
@@ -1400,6 +1410,7 @@ class DeepEPMoE(EPMoE):
             input_tensor[1],
             m_indices,
             output_index,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
         dispose_tensor(hidden_states_fp8)
 
@@ -1408,7 +1419,8 @@ class DeepEPMoE(EPMoE):
             device=hidden_states_fp8_device,
             dtype=torch.bfloat16,
         )
-        input_tensor[1] = tma_align_input_scale(input_tensor[1])
+        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            input_tensor[1] = tma_align_input_scale(input_tensor[1])
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             input_tensor, self.w13_weight_fp8, gateup_output, m_indices
         )
@@ -1429,10 +1441,15 @@ class DeepEPMoE(EPMoE):
             dtype=torch.bfloat16,
         )
         down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
-            down_input, scale_block_size
+            down_input,
+            scale_block_size,
+            column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
         )
         del down_input
-        down_input_scale = tma_align_input_scale(down_input_scale)
+        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            down_input_scale = tma_align_input_scale(down_input_scale)
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
             self.w2_weight_fp8,
