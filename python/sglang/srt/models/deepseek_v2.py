@@ -1997,17 +1997,12 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         # Only Deepseek V3/R1 can use shared experts fusion optimization now.
         disable_reason = None
-        # FIXME(PZ): make n_share_experts_fusion compatible with compressed tensor
         if (
             not _is_cuda
             or torch.cuda.get_device_capability("cuda") < (8, 0)
             or self.config.architectures[0] != architecture
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
-            or (
-                self.quant_config.get_name()
-                not in ["compressed_tensors", "compressed-tensors"]
-            )
         ):
             disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         elif (
@@ -2082,9 +2077,6 @@ class DeepseekV2ForCausalLM(nn.Module):
                         0,
                         0,
                     ).T
-            # FIXME: adapt to CompressedTensorsWNA16
-            # elif hasattr(self_attn.kv_b_proj, "weight_packed"):
-            #     w = self_attn.kv_b_proj.weight_packed
             else:
                 w = self_attn.kv_b_proj.weight
             # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.

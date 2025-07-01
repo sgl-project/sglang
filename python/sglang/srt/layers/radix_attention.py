@@ -75,22 +75,7 @@ class RadixAttention(nn.Module):
         self.quant_method = None
         if quant_config is not None:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
-        # FIXME: temp patch for moe only quantization
-        if self.quant_method is not None and (
-            quant_config.get_name() in ["compressed_tensors", "compressed-tensors"]
-        ):
-            skip_layers = (
-                QuantizationConfig.get_from_keys(quant_config.config, ["ignore"]) or []
-            )
-
-        if (
-            self.quant_method is not None
-            and (
-                quant_config.get_name()
-                not in ["compressed_tensors", "compressed-tensors"]
-            )
-            and any("attn" in str(layer) for layer in skip_layers)
-        ):
+        if self.quant_method is not None:
             self.quant_method.create_weights(self)
         self.attn_type = attn_type
 

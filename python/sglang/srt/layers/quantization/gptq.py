@@ -3,7 +3,6 @@ from fractions import Fraction
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
-from sgl_kernel import gptq_marlin_repack
 
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.quantization.base_config import (
@@ -31,7 +30,10 @@ try:
     )
     from vllm.scalar_type import scalar_types
 
+    VLLM_AVAILABLE = True
 except ImportError:
+    VLLM_AVAILABLE = False
+
     GPTQLinearMethod = MarlinLinearMethod = Any
 
     FusedMoEMethodBase = QuantizeMethodBase
@@ -50,27 +52,6 @@ def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
     return hf_quant_cfg.get("checkpoint_format") == "marlin" or hf_quant_cfg.get(
         "is_marlin_format", False
     )
-
-
-def gptq_marlin_moe_repack(
-    b_q_weight: torch.Tensor,
-    perm: torch.Tensor,
-    size_k: int,
-    size_n: int,
-    num_bits: int,
-) -> torch.Tensor:
-    num_experts = b_q_weight.shape[0]
-    assert size_k % 16 == 0
-    output = torch.empty(
-        (num_experts, size_k // 16, size_n * (num_bits // 2)),
-        device=b_q_weight.device,
-        dtype=b_q_weight.dtype,
-    )
-    for e in range(num_experts):
-        output[e] = torch.ops.sgl_kernel.gptq_marlin_repack(
-            b_q_weight[e], perm[e], size_k, size_n, num_bits
-        )
-    return output
 
 
 class GPTQConfig(QuantizationConfig):
