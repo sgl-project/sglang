@@ -21,10 +21,8 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 configs = list(
     itertools.product(
-        # [1, 4, 16, 64, 127, 128, 512, 1024, 4096, 8192],  # num_tokens
-        # [128, 256, 384, 512, 1024, 1536, 1664, 2048, 4096, 7168, 16384],  # hidden_dim
-        [1],  # num_tokens
-        [128],  # hidden_dim
+        [1, 4, 16, 64, 127, 128, 512, 1024, 4096, 8192],  # num_tokens
+        [128, 256, 384, 512, 1024, 1536, 1664, 2048, 4096, 7168, 16384],  # hidden_dim
         # TODO support group size != 128
         # [8, 16, 32, 64, 128],  # group_size
         [128],  # group_size
@@ -62,44 +60,44 @@ configs = list(
         ],
     )
 ) + list(
-    # itertools.product(
-    #     [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
-    #     # TODO support more
-    #     [2048],
-    #     [128],
-    #     [8, 16, 32, 48],
-    #     [fp8_type_],
-    #     [
-    #         dict(
-    #             column_major_scales=True,
-    #             scale_tma_aligned=True,
-    #             scale_ue8m0=True,
-    #             fuse_silu_and_mul=True,
-    #             masked_layout_mode=None,
-    #         ),
-    #         dict(
-    #             column_major_scales=True,
-    #             scale_tma_aligned=True,
-    #             scale_ue8m0=True,
-    #             fuse_silu_and_mul=True,
-    #             masked_layout_mode="balanced",
-    #         ),
-    #         dict(
-    #             column_major_scales=True,
-    #             scale_tma_aligned=True,
-    #             scale_ue8m0=True,
-    #             fuse_silu_and_mul=True,
-    #             masked_layout_mode="imbalanced",
-    #         ),
-    #         dict(
-    #             column_major_scales=True,
-    #             scale_tma_aligned=True,
-    #             scale_ue8m0=True,
-    #             fuse_silu_and_mul=True,
-    #             masked_layout_mode="extreme",
-    #         ),
-    #     ],
-    # )
+    itertools.product(
+        [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
+        # TODO support more
+        [2048],
+        [128],
+        [8, 16, 32, 48],
+        [fp8_type_],
+        [
+            dict(
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=True,
+                fuse_silu_and_mul=True,
+                masked_layout_mode=None,
+            ),
+            dict(
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=True,
+                fuse_silu_and_mul=True,
+                masked_layout_mode="balanced",
+            ),
+            dict(
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=True,
+                fuse_silu_and_mul=True,
+                masked_layout_mode="imbalanced",
+            ),
+            dict(
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=True,
+                fuse_silu_and_mul=True,
+                masked_layout_mode="extreme",
+            ),
+        ],
+    )
 )
 
 
