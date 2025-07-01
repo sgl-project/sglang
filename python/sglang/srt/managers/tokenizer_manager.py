@@ -482,20 +482,25 @@ class TokenizerManager:
                 token_type_ids = encoded.get("token_type_ids", [None])[0]
 
         if self.mm_processor and obj.contains_mm_input():
-            image_inputs: Dict = await self.mm_processor.process_mm_data_async(
+            if not isinstance(obj.image_data, list):
+                obj.image_data = [obj.image_data]
+            if not isinstance(obj.audio_data, list):
+                obj.audio_data = [obj.audio_data]
+            mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
+                audio_data=obj.audio_data,
                 input_text=input_text or input_ids,
                 request_obj=obj,
                 max_req_input_len=self.max_req_input_len,
             )
-            if image_inputs and "input_ids" in image_inputs:
-                input_ids = image_inputs["input_ids"]
+            if mm_inputs and "input_ids" in mm_inputs:
+                input_ids = mm_inputs["input_ids"]
         else:
-            image_inputs: Optional[Dict] = None
+            mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
-            obj, input_text, input_ids, input_embeds, image_inputs, token_type_ids
+            obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
 
     def _validate_one_request(
@@ -559,7 +564,7 @@ class TokenizerManager:
         input_text: str,
         input_ids: List[int],
         input_embeds: Optional[Union[List[float], None]] = None,
-        image_inputs: Optional[Dict] = None,
+        mm_inputs: Optional[Dict] = None,
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
@@ -584,7 +589,7 @@ class TokenizerManager:
                 obj.rid,
                 input_text,
                 input_ids,
-                image_inputs,
+                mm_inputs,
                 sampling_params,
                 obj.return_logprob,
                 obj.logprob_start_len,
@@ -606,7 +611,7 @@ class TokenizerManager:
                 obj.rid,
                 input_text,
                 input_ids,
-                image_inputs,
+                mm_inputs,
                 token_type_ids,
                 sampling_params,
             )
@@ -644,9 +649,9 @@ class TokenizerManager:
     ) -> None:
         """Validate constraints for batch tokenization processing."""
         for i in range(batch_size):
-            if self.is_generation and obj[i].image_data:
+            if self.is_generation and obj[i].contains_mm_input():
                 raise ValueError(
-                    "For image input processing do not set `enable_tokenizer_batch_encode`."
+                    "For multimodal input processing do not set `enable_tokenizer_batch_encode`."
                 )
             if obj[i].input_ids is not None:
                 raise ValueError(
