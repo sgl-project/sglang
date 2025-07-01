@@ -38,6 +38,8 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
             masked_m = _compute_balanced_split(num_tokens, num_local_experts)
         elif masked_layout_mode == "imbalanced":
             masked_m = _compute_imbalanced_split(num_tokens, num_local_experts, gen_cpu=gen_cpu)
+        elif masked_layout_mode == "extreme":
+            masked_m = torch.tensor([num_tokens] + [0] * (num_local_experts - 1), dtype=torch.int)
         else:
             raise NotImplementedError
         print(f"{masked_layout_mode=} {masked_m=} {x.shape=}")
