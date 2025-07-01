@@ -483,8 +483,8 @@ class ModelRunner:
 
         if not self.is_draft_worker:
             if self.device == "cpu":
-                # Bind OpenMP threads to CPU cores
                 if _is_cpu_amx_available:
+                    # Bind OpenMP threads to CPU cores
                     torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
                 else:
                     logger.warning(
