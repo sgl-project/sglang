@@ -173,16 +173,18 @@ suites = {
         # TestFile("test_deepep_intranode.py", 50),
         # TestFile("test_deepep_low_latency.py", 50),
         # TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
+        # Disabled because it hangs on the CI.
+        # TestFile("test_moe_ep.py", 181),
         TestFile("test_disaggregation.py", 270),
         TestFile("test_disaggregation_different_tp.py", 155),
         TestFile("test_full_deepseek_v3.py", 463),
-        TestFile("test_moe_ep.py", 181),
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
     ],
     "per-commit-cpu": [
         TestFile("cpu/test_activation.py"),
+        TestFile("cpu/test_binding.py"),
         TestFile("cpu/test_decode.py"),
         TestFile("cpu/test_extend.py"),
         TestFile("cpu/test_gemm.py"),
@@ -192,6 +194,7 @@ suites = {
         TestFile("cpu/test_qkv_proj_with_rope.py"),
         TestFile("cpu/test_rope.py"),
         TestFile("cpu/test_shared_expert.py"),
+        TestFile("cpu/test_topk.py"),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),

@@ -604,12 +604,13 @@ class ModelRunner:
         self.dtype = self.model_config.dtype
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+        self.weight_load_mem_usage = before_avail_memory - after_avail_memory
         logger.info(
             f"Load weight end. "
             f"type={type(self.model).__name__}, "
             f"dtype={self.dtype}, "
             f"avail mem={after_avail_memory:.2f} GB, "
-            f"mem usage={(before_avail_memory - after_avail_memory):.2f} GB."
+            f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
 
         # Handle the case where some ranks do not finish loading.
@@ -1250,6 +1251,7 @@ class ModelRunner:
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None
+        self.cuda_graph_mem_usage = 0
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
@@ -1265,9 +1267,10 @@ class ModelRunner:
         )
         self.cuda_graph_runner = CudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        self.cuda_graph_mem_usage = before_mem - after_mem
         logger.info(
             f"Capture cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
-            f"mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            f"mem usage={self.cuda_graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
     def apply_torch_tp(self):
