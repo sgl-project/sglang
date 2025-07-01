@@ -129,8 +129,15 @@ def test_per_token_group_quant_with_column_major(
         **{k: v for k, v in flags.items() if k not in ["masked_layout_mode"]},
     )
 
-    x_q_triton, x_s_triton = triton_per_token_group_quant_8bit(**execute_kwargs)
-    x_q_sglang, x_s_sglang = sglang_per_token_group_quant_8bit(**execute_kwargs)
+    def _postprocess(x_q, x_s):
+        if masked_m is not None:
+            print(f"Mask tokens after {masked_m} to be zero")
+            for i in range(len(masked_m)):
+                x_q[i, masked_m[i]:, :] = 0
+        return x_q, x_s
+
+    x_q_triton, x_s_triton = _postprocess(*triton_per_token_group_quant_8bit(**execute_kwargs))
+    x_q_sglang, x_s_sglang = _postprocess(*sglang_per_token_group_quant_8bit(**execute_kwargs))
 
     try:
         assert_all_close_or_tiny_diff(x_q_triton, x_q_sglang)
