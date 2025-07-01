@@ -215,7 +215,7 @@ class Ernie4Moe(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.moe_num_shared_experts = config.moe_num_shared_experts
+        self.moe_num_shared_experts = getattr(config, "moe_num_shared_experts", 0)
 
         if self.tp_size > config.moe_num_experts:
             raise ValueError(
@@ -244,7 +244,7 @@ class Ernie4Moe(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-        if config.moe_num_shared_experts > 0:
+        if self.moe_num_shared_experts > 0:
             intermediate_size = (
                 config.moe_intermediate_size * config.moe_num_shared_experts
             )
