@@ -5,6 +5,9 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
     device = torch.device("cuda")
     dtype = torch.bfloat16
 
+    gen = torch.Generator(device='cuda')
+    gen.manual_seed(num_tokens * 10000 + hidden_dim)
+
     if flags["fuse_silu_and_mul"]:
         effective_hidden_dim = hidden_dim * 2
     else:
@@ -25,6 +28,7 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
             effective_hidden_dim,
             device=device,
             dtype=dtype,
+            generator=gen,
         )
 
         if masked_layout_mode == "balanced":
@@ -39,8 +43,9 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
 
         return x, masked_m
     else:
-        x = torch.randn(num_tokens, effective_hidden_dim, device=device, dtype=dtype)
-        x[torch.randn(x.shape, device=device) < 0.001] *= 10
+        x = torch.randn(num_tokens, effective_hidden_dim, device=device, dtype=dtype,
+                        generator=gen)
+        x[torch.randn(x.shape, device=device, generator=gen) < 0.001] *= 10
         return x, None
 
 
