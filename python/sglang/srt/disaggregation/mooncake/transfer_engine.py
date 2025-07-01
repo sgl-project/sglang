@@ -2,6 +2,7 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import List, Optional
+from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -129,9 +130,9 @@ class MooncakeTransferEngine:
     ) -> int:
         """Synchronously transfer data to the specified addresses in batches."""
         try:
-            micro_batch_size, batch_size = 256, len(lengths)
+            micro_batch_size = get_int_env_var('SGLANG_DISAGGREGATION_MICRO_BATCH_SIZE', 256)
             batch_ids = []
-            for i in range(0, batch_size, micro_batch_size):
+            for i in range(0, len(lengths), micro_batch_size):
                 batch_id = self.engine.batch_transfer_async_write(
                     session_id,
                     buffers[i: i + micro_batch_size],
