@@ -126,7 +126,7 @@ def flashinfer_allreduce_add_rmsnorm(
     eps: float = 1e-6,
     max_token_num: int = 1024,
     use_oneshot: bool = True,
-    trigger_completion_at_end: bool = True,
+    trigger_completion_at_end: bool = False,
     fp32_acc: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
