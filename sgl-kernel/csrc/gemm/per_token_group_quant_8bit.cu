@@ -280,10 +280,9 @@ __global__ void per_token_group_quant_8bit_kernel(
           }
         }
 
+        constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
         scale_element_t* scale_output;
         if constexpr (IS_COLUMN_MAJOR) {
-          constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
-
           constexpr int scale_token_stride = 1;
 
           const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
@@ -295,6 +294,15 @@ __global__ void per_token_group_quant_8bit_kernel(
         } else {
           static_assert(!SCALE_UE8M0);
           scale_output = output_s + offset_num_groups;
+        }
+
+        // can speed up if too slow
+        if constexpr (IS_COLUMN_MAJOR and SCALE_UE8M0) {
+          const int remainder_num_groups = hidden_dim_num_groups % num_elems_per_pack;
+          if ((remainder_num_groups != 0) and (hidden_dim_group_idx == hidden_dim_num_groups - 1) and (lane_id < num_elems_per_pack - remainder_num_groups)) {
+            const int shift = 1 + lane_id;
+            *(scale_output + shift) = 0;
+          }
         }
 
         float local_absmax = LOCAL_ABSMAX_ABS;
