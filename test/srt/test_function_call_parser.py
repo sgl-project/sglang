@@ -6,6 +6,7 @@ from xgrammar import GrammarCompiler, TokenizerInfo
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
+from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
@@ -591,6 +592,30 @@ class TestEBNFGeneration(unittest.TestCase):
         except RuntimeError as e:
             self.fail(f"Failed to compile EBNF: {e}")
 
+    def test_hunyuan_detector_ebnf(self):
+        """Test that the HunyuanDetector generates valid EBNF."""
+        hunyuan_detector = HunyuanDetector()
+        ebnf = hunyuan_detector.build_ebnf(self.tools)
+        self.assertIsNotNone(ebnf)
+
+        # Check that the EBNF contains expected Hunyuan patterns
+        self.assertIn("<answer>", ebnf)
+        self.assertIn("<tool_calls>", ebnf)
+        self.assertIn('\\"name\\": \\"get_weather\\"', ebnf)
+        self.assertIn('\\"arguments\\": ', ebnf)
+        self.assertIn("</tool_calls>", ebnf)
+        self.assertIn("</answer>", ebnf)
+
+        # Check for multiple tool support
+        self.assertIn('\\"search\\"', ebnf)
+
+        # Validate that the EBNF can be compiled by GrammarCompiler
+        try:
+            ctx = self.grammar_compiler.compile_grammar(ebnf)
+            self.assertIsNotNone(ctx, "EBNF should be valid and compile successfully")
+        except RuntimeError as e:
+            self.fail(f"Failed to compile EBNF: {e}")
+
     def test_weather_function_optional_parameter_handling(self):
         """Test that weather function with optional unit parameter generates correct EBNF without trailing commas."""
         # Create a weather tool with required location and optional unit
@@ -1136,6 +1161,157 @@ class TestLlama32Detector(unittest.TestCase):
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertTrue(result.normal_text.strip().startswith("Some intro."))
+
+
+class TestHunyuanDetector(unittest.TestCase):
+    def setUp(self):
+        """Set up test tools and detector for Hunyuan format testing."""
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "Location to get weather for",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                                "description": "Temperature unit",
+                            },
+                        },
+                        "required": ["location"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Search for information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query",
+                            }
+                        },
+                        "required": ["query"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = HunyuanDetector()
+
+    def test_basic_tool_call(self):
+        """Test parsing a basic Hunyuan format tool call."""
+        text = '<answer>\n<tool_calls>[{"name": "get_weather", "arguments": {"location": "Paris"}}]</tool_calls>\n</answer>'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[0].parameters, '{"location": "Paris"}')
+        self.assertEqual(result.normal_text, "")
+
+    def test_answer_without_tools(self):
+        """Test parsing answer block without tool calls."""
+        text = "<answer>\nThe weather in Paris is currently sunny.\n</answer>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, "The weather in Paris is currently sunny.")
+
+    def test_no_answer_block(self):
+        """Test parsing text without answer block."""
+        text = "This is just normal text without any answer tags."
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, text)
+
+    def test_multiple_tool_calls(self):
+        """Test parsing multiple tool calls in one array."""
+        text = '<answer>\n<tool_calls>[{"name": "get_weather", "arguments": {"location": "Paris"}}, {"name": "search", "arguments": {"query": "tourist attractions"}}]</tool_calls>\n</answer>'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[0].parameters, '{"location": "Paris"}')
+        self.assertEqual(result.calls[1].name, "search")
+        self.assertEqual(result.calls[1].parameters, '{"query": "tourist attractions"}')
+
+    def test_answer_with_text_and_tools(self):
+        """Test answer block with both text content and tool calls."""
+        text = '<answer>\nHere is the weather information:\n<tool_calls>[{"name": "get_weather", "arguments": {"location": "Paris", "unit": "celsius"}}]</tool_calls>\n</answer>'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(
+            result.calls[0].parameters, '{"location": "Paris", "unit": "celsius"}'
+        )
+        self.assertEqual(result.normal_text, "Here is the weather information:")
+
+    def test_text_before_answer_block(self):
+        """Test parsing with text before the answer block."""
+        text = 'Let me check the weather for you.\n<answer>\n<tool_calls>[{"name": "get_weather", "arguments": {"location": "London"}}]</tool_calls>\n</answer>'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.normal_text, "Let me check the weather for you.")
+
+    def test_malformed_tool_calls(self):
+        """Test handling of malformed JSON in tool_calls."""
+        text = "<answer>\n<tool_calls>[invalid json]</tool_calls>\n</answer>"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        # Should handle gracefully - no calls parsed, empty normal text
+        self.assertEqual(len(result.calls), 0)
+        self.assertEqual(result.normal_text, "")
+
+    def test_nested_data_structures(self):
+        """Test tool calls with nested lists and dicts in arguments."""
+        text = '<answer>\n<tool_calls>[{"name": "search", "arguments": {"query": "weather", "filters": {"cities": ["Paris", "London"], "date": "2024-01-01"}}}]</tool_calls>\n</answer>'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+        # Verify the nested structure is preserved
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["query"], "weather")
+        self.assertIn("filters", params)
+        self.assertEqual(params["filters"]["cities"], ["Paris", "London"])
+
+    def test_single_tool_call_not_in_array(self):
+        """Test handling of single tool call not wrapped in array."""
+        text = '<answer>\n<tool_calls>{"name": "get_weather", "arguments": {"location": "Tokyo"}}</tool_calls>\n</answer>'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        # Should handle single object by converting to array internally
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[0].parameters, '{"location": "Tokyo"}')
+
+    def test_has_tool_call(self):
+        """Test the has_tool_call method."""
+        # Should return True when tool_calls tag is present
+        self.assertTrue(
+            self.detector.has_tool_call(
+                '<answer><tool_calls>[{"name": "test"}]</tool_calls></answer>'
+            )
+        )
+        self.assertTrue(self.detector.has_tool_call("Some text <tool_calls>"))
+
+        # Should return False when no tool_calls tag
+        self.assertFalse(self.detector.has_tool_call("<answer>Just text</answer>"))
+        self.assertFalse(self.detector.has_tool_call("Plain text"))
 
 
 if __name__ == "__main__":
