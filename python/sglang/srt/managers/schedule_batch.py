@@ -33,7 +33,6 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 
 import copy
 import dataclasses
-import hashlib
 import logging
 import threading
 from enum import Enum, auto
@@ -53,7 +52,6 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
-from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
@@ -96,8 +94,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "max_micro_batch_size",
     "disable_shared_experts_fusion",
     "sampling_backend",
-    "speculative_accept_threshold_acc",
     "speculative_accept_threshold_single",
+    "speculative_accept_threshold_acc",
     "torchao_config",
     "triton_attention_reduce_in_fp32",
     "num_reserved_decode_tokens",
@@ -180,7 +178,9 @@ class Modality(Enum):
 @dataclasses.dataclass
 class MultimodalDataItem:
     """
-    A single multimodal data, from a single image/video/audio or others.
+    One MultimodalDataItem contains all inputs for one modality.
+    For example, if there are 3 images and 1 audio inputs, there will be 2 MultimodalDataItem.
+    One for images and one for audio.
 
     We put the common fields first and the model-specific fields last.
     """
@@ -232,53 +232,7 @@ class MultimodalDataItem:
         """
         Set the pad value after first hashing the data
         """
-
-        def data_hash(data) -> int:
-            hash_bytes = hashlib.sha256(data).digest()[:8]
-            return int.from_bytes(hash_bytes, byteorder="big", signed=False)
-
-        def tensor_hash(tensor_list) -> int:
-            """
-            hash a tensor or a tensor list
-            """
-            tensor = tensor_list
-            if isinstance(tensor_list, list):
-                tensor_list = flatten_nested_list(tensor_list)
-                tensor_list = [
-                    x.flatten() if isinstance(x, torch.Tensor) else x
-                    for x in tensor_list
-                ]
-                tensor = torch.concat(tensor_list)
-            if tensor.is_cuda:
-                return gpu_tensor_hash(tensor)
-            tensor = tensor.detach().contiguous()
-
-            if tensor.dtype == torch.bfloat16:
-                # memoryview() doesn't support PyTorch's BFloat16 dtype
-                tensor = tensor.float()
-
-            assert isinstance(tensor, torch.Tensor)
-            if tensor.is_cuda:
-                # TODO: improve this
-                tensor_cpu = tensor.cpu()
-            else:
-                tensor_cpu = tensor
-
-            mv = memoryview(tensor_cpu.numpy())
-            return data_hash(mv.tobytes())
-
-        def hash_feature(f):
-            if isinstance(f, list):
-                if isinstance(f[0], torch.Tensor):
-                    return tensor_hash(f)
-                return data_hash(tuple(flatten_nested_list(f)))
-            elif isinstance(f, np.ndarray):
-                arr = np.ascontiguousarray(f)
-                arr_bytes = arr.tobytes()
-                return data_hash(arr_bytes)
-            elif isinstance(f, torch.Tensor):
-                return tensor_hash([f])
-            return data_hash(f)
+        from sglang.srt.managers.mm_utils import hash_feature
 
         if self.precomputed_features is not None:
             self.hash = hash_feature(self.precomputed_features)

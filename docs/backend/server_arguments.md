@@ -116,7 +116,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--log-level` | The logging level of all loggers. | info |
 | `--log-level-http` | The logging level of HTTP server. If not set, reuse --log-level by default. | None |
 | `--log-requests` | Log metadata, inputs, outputs of all requests. The verbosity is decided by --log-requests-level. | False |
-| `--log-requests-level` | 0: Log metadata. 1. Log metadata and partial input/output. 2. Log every input/output. | 0 |
+| `--log-requests-level` | 0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial input/output. 3: Log every input/output. | 0 |
 | `--show-time-cost` | Show time cost of custom marks. | False |
 | `--enable-metrics` | Enable log prometheus metrics. | False |
 | `--bucket-time-to-first-token` | The buckets of time to first token, specified as a list of floats. | None |
