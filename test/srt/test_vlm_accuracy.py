@@ -266,7 +266,7 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
 #                 extend_seq_lens=[input_ids.shape[0]],
 #                 input_ids=input_ids,
 #                 input_embedding=model.get_input_embeddings(),
-#                 image_data_embedding_func=model.get_image_feature,
+#                 mm_items, input_ids, ret = self.process_and_combine_mm_data(base_output)model.get_image_feature,
 #                 placeholder_tokens={
 #                     Modality.IMAGE: self.processor.tokenizer.unk_token_id,
 #                 },

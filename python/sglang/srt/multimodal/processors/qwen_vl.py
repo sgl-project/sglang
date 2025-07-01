@@ -284,7 +284,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
     ):
         if isinstance(image_data, str):
             image_data = [image_data]
-        # print(f"{request_obj=}")
 
         base_output = self.load_mm_data(
             prompt=input_text,
@@ -293,7 +292,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_special_tokens,
             max_req_input_len=max_req_input_len,
         )
-        # print(f"{base_output=}")
 
         # Qwen-specific: resize images if they are raw Image objects
         if base_output.images and isinstance(base_output.images[0], Image.Image):
@@ -306,27 +304,12 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
             ]
 
         mm_items, input_ids, ret = self.process_and_combine_mm_data(base_output)
-        print(f"{mm_items=}")
 
         if not mm_items:
             # Note(Xinyuan): This is the case where image loading fails.
             return None
 
-        # combined_mm_item = mm_items[0]  # only image is supported for now
-        video_grid_thw = None  # TODO
-        # second_per_grid_ts = getattr(combined_mm_item, "second_per_grid_ts", None)
-
-        # if "pixel_values_videos" in ret:
-        #     combined_mm_item += [
-        #         MultimodalDataItem(
-        #             pixel_values=ret["pixel_values_videos"],
-        #             video_grid_thw=torch.concat([ret["video_grid_thw"]]),
-        #             modality=Modality.VIDEO,
-        #         )
-        #     ]
-
         input_ids = ret["input_ids"].flatten()
-        # print(f"{ret=}")
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.IM_TOKEN_ID,

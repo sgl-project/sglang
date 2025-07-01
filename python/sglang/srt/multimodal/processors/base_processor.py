@@ -30,15 +30,6 @@ class BaseMultiModalProcessorOutput:
     # audios
     audios: Optional[list[Union[np.ndarray, dict]]] = None
 
-    # def __post_init__(self):
-    #     self.normalize()
-
-    # def normalize(self):
-    #     for field_name in ["images", "audios", "videos"]:
-    #         field = getattr(self, field_name, None)
-    #         if field is not None and isinstance(field, list) and len(field) == 0:
-    #             setattr(self, field_name, None)
-
     def organize_results(self) -> List[Tuple[Modality, Any]]:
         """
 
@@ -494,7 +485,6 @@ class BaseMultimodalProcessor(ABC):
                     )
                 except ValueError:
                     modality = Modality.IMAGE
-            print(f"{modality=}, {attr_name=}, {value=}")
             if modality:
                 # Create item if needed
                 if modality not in items:
@@ -556,7 +546,6 @@ class BaseMultimodalProcessor(ABC):
                 raw_videos.append(item)
             else:
                 raise ValueError(f"Unknown multimodal item type: {type(item)}")
-        print(f"{all_items=}")
         # Process items and get input_ids
         all_collected_items = []
         input_ids = None
@@ -587,7 +576,6 @@ class BaseMultimodalProcessor(ABC):
                 add_special_tokens=True,
             ).input_ids.flatten()
 
-        print(f"{all_collected_items=}")
         # Add offsets to all items
         for mm_item in all_collected_items:
             if mm_item.modality in [Modality.IMAGE, Modality.MULTI_IMAGES]:
