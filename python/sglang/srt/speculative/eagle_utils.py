@@ -200,7 +200,7 @@ class EagleVerifyOutput:
     # Accepted indices from logits_output.next_token_logits
     accepted_indices: torch.Tensor
 
-    thinking_states: List[bool]
+    thinking_states: Optional[List[bool]]
 
 
 @dataclass
@@ -393,7 +393,10 @@ class EagleVerifyInput:
             self.grammar.apply_vocab_mask(
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
-
+        relaxed_thinking = global_server_args_dict.get(
+            "speculative_relaxed_thinking", False
+        )
+        thinking_states = None
         # Sample tokens
         if batch.sampling_info.is_all_greedy:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
@@ -444,9 +447,24 @@ class EagleVerifyInput:
             )
 
             threshold_singles = torch.ones_like(
-                coins, dtype=torch.float32, device="cuda"
+                coins_for_final_sampling, dtype=torch.float32, device="cpu"
             )
-            threshold_accs = torch.ones_like(coins, dtype=torch.float32, device="cuda")
+            threshold_accs = torch.ones_like(
+                coins_for_final_sampling, dtype=torch.float32, device="cpu"
+            )
+            if relaxed_thinking:
+                thinking_states = batch.thinking_states()
+                thinking_states_ts = torch.tensor(thinking_states, device="cpu")
+            else:
+                thinking_states_ts = torch.ones(bs, dtype=torch.bool, device="cpu")
+            threshold_singles[thinking_states_ts] = global_server_args_dict[
+                "speculative_accept_threshold_single"
+            ]
+            threshold_accs[thinking_states_ts] = global_server_args_dict[
+                "speculative_accept_threshold_acc"
+            ]
+            threshold_accs = threshold_accs.to(device="cuda")
+            threshold_singles = threshold_singles.to(device="cuda")
 
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
@@ -482,10 +500,6 @@ class EagleVerifyInput:
         predict_cpu = predict.tolist()
         has_finished = False
 
-        thinking_states = None
-        if batch.relax_thinking:
-            thinking_states = batch.thinking_states()
-
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
@@ -497,10 +511,13 @@ class EagleVerifyInput:
 
                 # think_start_token = 128798
                 # think_end_token = 128799
-                if id == 128798:
-                    thinking_states[i] = True
-                elif id == 128799:
-                    thinking_states[i] = False
+                if relaxed_thinking and thinking_states:
+                    if id == req.think_start_token_id:
+                        thinking_states[i] = True
+                        logger.warning("thinking is started in spec!")
+                    if id == req.think_end_token_id:
+                        thinking_states[i] = False
+                        logger.warning("thinking is ended in spec!")
 
                 req.check_finished()
                 if req.finished():

@@ -317,9 +317,6 @@ class Scheduler(
             self.tokenizer.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
-            self.tokenizer.think_start_id = self.tokenizer.encode(
-                reasoning_parser.detector.think_start_token, add_special_tokens=False
-            )[0]
 
         # Check whether overlap can be enabled
         if not self.is_generation:
@@ -345,6 +342,27 @@ class Scheduler(
         if self.spec_algorithm.is_eagle():
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
+            kwargs = {}
+
+            self.relaxed_thinking = global_server_args_dict.get(
+                "speculative_relaxed_thinking", False
+            )
+            if self.server_args.speculative_reasoning_parser and self.tokenizer:
+                spec_reasoning_parser = ReasoningParser(
+                    model_type=self.server_args.speculative_reasoning_parser,
+                    stream_reasoning=False,
+                )
+                self.think_start_id = self.tokenizer.encode(
+                    spec_reasoning_parser.detector.think_start_token,
+                    add_special_tokens=False,
+                )[0]
+                self.think_end_id = self.tokenizer.encode(
+                    spec_reasoning_parser.detector.think_end_token,
+                    add_special_tokens=False,
+                )[0]
+                kwargs["think_start_id"] = self.think_start_id
+                kwargs["think_end_id"] = self.think_end_id
+
             self.draft_worker = EAGLEWorker(
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
@@ -352,6 +370,7 @@ class Scheduler(
                 nccl_port=port_args.nccl_port,
                 target_worker=self.tp_worker,
                 dp_rank=dp_rank,
+                **kwargs,
             )
         else:
             self.draft_worker = None
@@ -1071,6 +1090,8 @@ class Scheduler(
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
                 data_parallel_rank=recv_req.data_parallel_rank,
+                think_start_token_id=self.think_start_id,
+                think_end_token_id=self.think_end_id,
             )
             req.tokenizer = self.tokenizer
 

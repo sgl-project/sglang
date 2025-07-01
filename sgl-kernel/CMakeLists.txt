@@ -51,7 +51,7 @@ FetchContent_Declare(
 FetchContent_Populate(repo-cutlass)
 
 # DeepGEMM
-if("${CUDA_VERSION}" VERSION_EQUAL "12.8")
+if("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
   set(DeepGEMM_REPO "https://github.com/sgl-project/DeepGEMM")
   set(DeepGEMM_TAG "blackwell")
 else()
@@ -101,7 +101,7 @@ if(CCACHE_FOUND AND ENABLE_CCACHE AND DEFINED ENV{CCACHE_DIR})
 endif()
 
 # Enable gencode below SM90
-option(ENABLE_BELOW_SM90 "Enable below SM90" ON)
+option(ENABLE_BELOW_SM90 "Enable below SM90" OFF)
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
     set(ENABLE_BELOW_SM90 OFF)
@@ -146,11 +146,11 @@ set(SGL_KERNEL_CUDA_FLAGS
     # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
 )
 
-option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
-option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
+option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           ON)
+option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            ON)
 option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
-option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
+option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              ON)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
 
 if (ENABLE_BELOW_SM90)

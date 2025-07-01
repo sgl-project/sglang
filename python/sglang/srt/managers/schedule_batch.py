@@ -98,6 +98,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "sampling_backend",
     "speculative_accept_threshold_acc",
     "speculative_accept_threshold_single",
+    "speculative_relaxed_thinking",
     "torchao_config",
     "triton_attention_reduce_in_fp32",
     "num_reserved_decode_tokens",
@@ -457,6 +458,8 @@ class Req:
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
         data_parallel_rank: Optional[int] = None,
+        think_start_token_id: Optional[int] = None,
+        think_end_token_id: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -466,6 +469,26 @@ class Req:
             if origin_input_ids_unpadded
             else origin_input_ids  # Before image padding
         )
+
+        self.relaxed_thinking = global_server_args_dict.get(
+            "speculative_relaxed_thinking", False
+        )
+        if self.relaxed_thinking:
+            assert think_start_token_id is not None
+            self.is_thinking = False
+            self.think_start_token_id = think_start_token_id
+            self.think_end_token_id = think_end_token_id
+            for i in range(len(self.origin_input_ids_unpadded) - 1, -1, -1):
+                if self.origin_input_ids_unpadded[i] == think_start_token_id:
+                    self.is_thinking = True
+                    logger.warning("Thinking started during prefill!")
+                elif self.origin_input_ids_unpadded[i] == think_end_token_id:
+                    logger.warning("Thinking ended during prefill!")
+                    pass
+                else:
+                    continue
+                break
+
         self.origin_input_ids = origin_input_ids
         # Each decode stage's output ids
         self.output_ids = []
@@ -631,8 +654,6 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
-
-        self.is_thinking = False
 
     @property
     def seqlen(self):
@@ -836,7 +857,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
-    relax_thinking = None
     next_batch_sampling_info: SamplingBatchInfo = None
 
     # Batched arguments to model runner
@@ -950,8 +970,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def thinking_states(self):
         return [req.is_thinking for req in self.reqs]
 
-    def update_thinking_states(self, thinking_states):
-        assert len(thinking_states) == len(self.zip)
+    def update_thinking_states(self, thinking_states: Optional[list[bool]]):
+        if thinking_states is None:
+            return
+        assert len(thinking_states) == len(self.reqs)
         for req, s in zip(self.reqs, thinking_states):
             req.is_thinking = s
 
