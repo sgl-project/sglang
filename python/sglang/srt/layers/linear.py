@@ -17,6 +17,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.amx_utils import _process_weight_after_loading
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -31,7 +32,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.utils import (
-    _process_weight_after_loading,
     cpu_has_amx_support,
     is_cpu,
     set_weight_attrs,

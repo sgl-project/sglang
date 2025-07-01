@@ -36,6 +36,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -91,7 +92,6 @@ from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
     LazyValue,
-    PackWeightMethod,
     add_prefix,
     bind_or_assign,
     cpu_has_amx_support,

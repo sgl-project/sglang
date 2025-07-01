@@ -13,6 +13,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -20,12 +21,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
-from sglang.srt.utils import (
-    PackWeightMethod,
-    cpu_has_amx_support,
-    is_cpu,
-    set_weight_attrs,
-)
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, set_weight_attrs
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 

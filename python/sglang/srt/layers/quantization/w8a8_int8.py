@@ -4,6 +4,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.amx_utils import _process_weight_after_loading
 from sglang.srt.layers.linear import LinearMethodBase
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -12,7 +13,6 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.utils import (
-    _process_weight_after_loading,
     cpu_has_amx_support,
     is_cpu,
     is_cuda,

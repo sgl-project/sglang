@@ -27,6 +27,7 @@ except ImportError:
 
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.amx_utils import _process_weight_after_loading
 from sglang.srt.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -64,7 +65,6 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.utils import (
-    _process_weight_after_loading,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
