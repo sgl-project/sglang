@@ -484,10 +484,12 @@ class ModelRunner:
         if not self.is_draft_worker:
             if self.device == "cpu":
                 # Bind OpenMP threads to CPU cores
-                assert (
-                    cpu_has_amx_support()
-                ), "init_cpu_threads_env failed since intel amx backend is not available"
-                torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
+                if _is_cpu_amx_available:
+                    torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
+                else:
+                    logger.warning(
+                        "init_cpu_threads_env is skipped since intel amx backend is not available"
+                    )
 
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
