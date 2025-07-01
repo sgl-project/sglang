@@ -226,7 +226,7 @@ class MoEGate(nn.Module):
             )
 
         if (
-            hidden_states.shape[0] <= 16
+            hidden_states.shape[0] < 4
             and hidden_states.shape[1] == 7168
             and self.weight.shape[0] == 256
             and get_device_sm() >= 90
