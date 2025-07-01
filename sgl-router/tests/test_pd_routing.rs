@@ -12,7 +12,9 @@
 mod test_pd_routing {
     use rand::Rng;
     use serde_json::json;
-    use sglang_router_rs::pd_types::{EngineInfo, EngineType, PDSelectionPolicy};
+    use sglang_router_rs::pd_types::{get_hostname, get_bootstrap_port, get_api_path};
+    use sglang_router_rs::core::worker::{WorkerType, WorkerFactory};
+    use sglang_router_rs::pd_types::{PDSelectionPolicy};
     use sglang_router_rs::router::{PolicyConfig, Router};
 
     // Test-only struct to help validate PD request parsing
@@ -51,38 +53,39 @@ mod test_pd_routing {
     // ========================================================================
 
     #[test]
-    fn test_engine_info_creation() {
-        // Test EngineInfo creation for prefill servers
-        let prefill_engine = EngineInfo::new_prefill("http://prefill:8080".to_string(), Some(9000));
-        match prefill_engine.engine_type {
-            EngineType::Prefill => (),
-            _ => panic!("Expected Prefill engine type"),
+    fn test_worker_creation() {
+        // Test worker creation for prefill servers
+        let prefill_worker = WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(9000));
+        match prefill_worker.worker_type() {
+            WorkerType::Prefill { bootstrap_port } => assert_eq!(bootstrap_port, Some(9000)),
+            _ => panic!("Expected Prefill worker type"),
         }
-        assert_eq!(prefill_engine.url, "http://prefill:8080");
-        assert_eq!(prefill_engine.bootstrap_port, Some(9000));
-        assert_eq!(prefill_engine.get_hostname(), "prefill");
+        assert_eq!(prefill_worker.url(), "http://prefill:8080");
 
-        // Test EngineInfo creation for decode servers
-        let decode_engine = EngineInfo::new_decode("http://decode:8080".to_string());
-        match decode_engine.engine_type {
-            EngineType::Decode => (),
-            _ => panic!("Expected Decode engine type"),
+        assert_eq!(get_bootstrap_port(&*prefill_worker), Some(9000));
+        assert_eq!(get_hostname(&*prefill_worker), "prefill");
+
+        // Test worker creation for decode servers
+        let decode_worker = WorkerFactory::create_decode("http://decode:8080".to_string());
+        match decode_worker.worker_type() {
+            WorkerType::Decode => (),
+            _ => panic!("Expected Decode worker type"),
         }
-        assert_eq!(decode_engine.url, "http://decode:8080");
-        assert_eq!(decode_engine.bootstrap_port, None);
-        assert_eq!(decode_engine.get_hostname(), "decode");
+        assert_eq!(decode_worker.url(), "http://decode:8080");
+        assert_eq!(get_bootstrap_port(&*decode_worker), None);
+        assert_eq!(get_hostname(&*decode_worker), "decode");
 
         // Test API path generation
         assert_eq!(
-            prefill_engine.api_path("/generate"),
+            get_api_path(&*prefill_worker, "/generate"),
             "http://prefill:8080/generate"
         );
         assert_eq!(
-            prefill_engine.api_path("health"),
+            get_api_path(&*prefill_worker, "health"),
             "http://prefill:8080/health"
         );
         assert_eq!(
-            decode_engine.api_path("/v1/chat/completions"),
+            get_api_path(&*decode_worker, "/v1/chat/completions"),
             "http://decode:8080/v1/chat/completions"
         );
     }
@@ -241,9 +244,9 @@ mod test_pd_routing {
         });
 
         // Simulate what inject_bootstrap_fields would do
-        let prefill_info = EngineInfo::new_prefill("http://prefill1:8080".to_string(), Some(9000));
-        single_json["bootstrap_host"] = json!(prefill_info.get_hostname());
-        single_json["bootstrap_port"] = json!(prefill_info.bootstrap_port);
+        let prefill_info = WorkerFactory::create_prefill("http://prefill1:8080".to_string(), Some(9000));
+        single_json["bootstrap_host"] = json!(get_hostname(&*prefill_info));
+        single_json["bootstrap_port"] = json!(get_bootstrap_port(&*prefill_info));
         single_json["bootstrap_room"] = json!(12345u64); // Random room ID
 
         // Verify bootstrap fields are added correctly
@@ -259,8 +262,8 @@ mod test_pd_routing {
         });
 
         let batch_size = 3;
-        batch_json["bootstrap_host"] = json!(vec![prefill_info.get_hostname(); batch_size]);
-        batch_json["bootstrap_port"] = json!(vec![prefill_info.bootstrap_port; batch_size]);
+        batch_json["bootstrap_host"] = json!(vec![get_hostname(&*prefill_info); batch_size]);
+        batch_json["bootstrap_port"] = json!(vec![get_bootstrap_port(&*prefill_info); batch_size]);
         batch_json["bootstrap_room"] = json!(vec![111u64, 222u64, 333u64]);
 
         // Verify batch bootstrap fields
@@ -306,7 +309,7 @@ mod test_pd_routing {
     }
 
     #[test]
-    fn test_engine_info_hostname_extraction() {
+    fn test_worker_hostname_extraction() {
         // Test various URL formats
         let test_cases = vec![
             ("http://localhost:8080", "localhost"),
@@ -318,8 +321,8 @@ mod test_pd_routing {
         ];
 
         for (url, expected_hostname) in test_cases {
-            let engine = EngineInfo::new_prefill(url.to_string(), None);
-            assert_eq!(engine.get_hostname(), expected_hostname);
+            let prefill_worker = WorkerFactory::create_prefill(url.to_string(), None);
+            assert_eq!(get_hostname(&*prefill_worker), expected_hostname);
         }
     }
 
@@ -665,11 +668,11 @@ mod test_pd_routing {
         });
 
         // Simulate bootstrap injection
-        let prefill_info = EngineInfo::new_prefill("http://prefill:8080".to_string(), Some(9000));
+        let prefill_info = WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(9000));
         let batch_size = 16;
 
-        benchmark_request["bootstrap_host"] = json!(vec![prefill_info.get_hostname(); batch_size]);
-        benchmark_request["bootstrap_port"] = json!(vec![prefill_info.bootstrap_port; batch_size]);
+        benchmark_request["bootstrap_host"] = json!(vec![get_hostname(&*prefill_info); batch_size]);
+        benchmark_request["bootstrap_port"] = json!(vec![get_bootstrap_port(&*prefill_info); batch_size]);
         benchmark_request["bootstrap_room"] =
             json!((0..batch_size).map(|_| 12345u64).collect::<Vec<_>>());
 
@@ -789,12 +792,12 @@ mod test_pd_routing {
 
             // Simulate bootstrap injection
             let prefill_info =
-                EngineInfo::new_prefill("http://prefill:8080".to_string(), Some(9000));
+                WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(9000));
 
             large_batch_request["bootstrap_host"] =
-                json!(vec![prefill_info.get_hostname(); batch_size]);
+                json!(vec![get_hostname(&*prefill_info); batch_size]);
             large_batch_request["bootstrap_port"] =
-                json!(vec![prefill_info.bootstrap_port; batch_size]);
+                json!(vec![get_bootstrap_port(&*prefill_info); batch_size]);
             large_batch_request["bootstrap_room"] = json!((0..batch_size)
                 .map(|_| rand::thread_rng().gen::<u64>())
                 .collect::<Vec<_>>());

@@ -3,7 +3,7 @@
 
 use crate::core::{Worker, WorkerFactory};
 use crate::pd_types::{
-    api_path, Bootstrap, ChatReqInput, GenerateReqInput, PDRouterError, PDSelectionPolicy,
+    get_api_path, Bootstrap, ChatReqInput, GenerateReqInput, PDRouterError, PDSelectionPolicy,
 };
 use crate::tree::Tree;
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
@@ -454,9 +454,9 @@ impl PDRouter {
         );
 
         // Build requests using .json() method
-        let mut prefill_request = client.post(api_path(prefill.url(), route)).json(&json_request);
+        let mut prefill_request = client.post(get_api_path(prefill, route)).json(&json_request);
 
-        let mut decode_request = client.post(api_path(decode.url(), route)).json(&json_request);
+        let mut decode_request = client.post(get_api_path(decode, route)).json(&json_request);
 
         // Copy headers from original request
         for (name, value) in crate::router::copy_request_headers(req) {
