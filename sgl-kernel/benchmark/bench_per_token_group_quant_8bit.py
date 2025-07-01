@@ -42,7 +42,7 @@ if int(os.environ.get("SGLANG_NSYS_PROFILING", "0")):
             768 * 8,
             2048,
             128,
-            None,
+            48,
             fp8_type_,
             dict(
                 column_major_scales=True,
