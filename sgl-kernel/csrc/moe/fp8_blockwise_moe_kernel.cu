@@ -71,7 +71,7 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
       cutlass::epilogue::collective::EpilogueTileAuto,
       ElementAccumulator,
       ElementAccumulator,
-      ElementC, // Use void to avoid load Matrix C
+      ElementC,  // Use void to avoid load Matrix C
       LayoutC*,
       AlignmentC,
       ElementD,
@@ -122,7 +122,6 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
   hw_info.device_id = c10::cuda::current_device();
   hw_info.sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
-  
   typename GemmKernel::EpilogueArguments epilogue_args{
       {},
       nullptr,
@@ -459,7 +458,7 @@ void sm90_fp8_blockwise_group_mm_dispatch_shape(
     using ClusterShape = Shape<_2, _1, _1>;
     using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongFP8BlockScaledAccum;
     using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
-    using ScaleConfig   = cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128>;
+    using ScaleConfig = cutlass::detail::Sm90BlockwiseScaleConfig<1, 128, 128>;
 
     using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());
     using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());
@@ -641,7 +640,7 @@ void fp8_blockwise_scaled_grouped_mm(
 #endif
 #endif
 
-#if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED) &&  defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
+#if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED) && defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
   if (sm_version == 90 && a.size(1) > 256) {
     if (output.scalar_type() == torch::kBFloat16) {
       sm90_fp8_blockwise_group_mm_dispatch_shape<cutlass::bfloat16_t>(
@@ -688,5 +687,8 @@ void fp8_blockwise_scaled_grouped_mm(
   }
 #endif
   TORCH_CHECK_NOT_IMPLEMENTED(
-      can_implement, "No implemented fp8_blockwise_scaled_mm for current compute capability or K size: ", sm_version, a.size(1));
+      can_implement,
+      "No implemented fp8_blockwise_scaled_mm for current compute capability or K size: ",
+      sm_version,
+      a.size(1));
 }
