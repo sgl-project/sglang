@@ -34,7 +34,7 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
         if masked_layout_mode == "balanced":
             masked_m = _compute_balanced_split(num_tokens, num_local_experts)
         elif masked_layout_mode == "imbalanced":
-            masked_m = _compute_imbalanced_split(num_tokens, num_local_experts)
+            masked_m = _compute_imbalanced_split(num_tokens, num_local_experts, gen=gen)
         else:
             raise NotImplementedError
         print(f"{masked_layout_mode=} {masked_m=} {x.shape=}")
@@ -58,16 +58,16 @@ def _compute_balanced_split(total: int, arr_len: int):
     return torch.tensor(ans, dtype=torch.int)
 
 
-def _compute_imbalanced_split(total: int, arr_len: int, dtype=torch.int) -> list[int]:
+def _compute_imbalanced_split(total: int, arr_len: int, gen, dtype=torch.int) -> list[int]:
     # can use `rand ** 2`, `rand ** 3`, etc, to change how imbalanced it is
-    noise_raw = torch.rand(arr_len) ** 3
+    noise_raw = torch.rand(arr_len, generator=gen) ** 3
 
     noise = noise_raw / noise_raw.sum()
     ans = (noise * total).round().to(dtype)
 
     diff = total - ans.sum().item()
     while diff != 0:
-        idx = torch.randint(0, arr_len, (1,)).item()
+        idx = torch.randint(0, arr_len, (1,), generator=gen).item()
         if diff > 0:
             ans[idx] += 1
             diff -= 1
