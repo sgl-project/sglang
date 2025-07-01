@@ -313,9 +313,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 
         float y_scale, y_scale_inv;
         calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
-
-        __nv_bfloat16 y_scale_bf16 = static_cast<__nv_bfloat16>(y_scale);
-        __nv_bfloat162 y_scale_repeated = {y_scale_bf16, y_scale_bf16};
+        float2 y_scale_repeated = {y_scale, y_scale};
 
         if (lane_id == 0) {
           *scale_output = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
@@ -331,9 +329,9 @@ __global__ void per_token_group_quant_8bit_kernel(
 
 #pragma unroll
           for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
-            __nv_bfloat162 inputx2 = *reinterpret_cast<__nv_bfloat162*>(input_primary_vec + j);
-            __nv_bfloat162 outputx2 = __hmul2_rn(inputx2, y_scale_repeated);
-            output_buf_ptr[j / 2] = __nv_cvt_bfloat16raw2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+            float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
+            float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
+            output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
           }
         } else {
           const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
