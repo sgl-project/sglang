@@ -74,6 +74,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     print_warning_once,
     set_weight_attrs,
+    use_intel_amx_backend,
 )
 
 _is_hip = is_hip()
@@ -433,7 +434,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.block_quant:
-            if getattr(layer, "use_intel_amx_backend", False):
+            if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
                     x,
                     layer.weight,
@@ -996,7 +997,7 @@ class Fp8MoEMethod:
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        if getattr(layer, "use_intel_amx_backend", False):
+        if use_intel_amx_backend(layer):
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,

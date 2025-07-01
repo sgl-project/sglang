@@ -25,6 +25,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_hip,
     set_weight_attrs,
+    use_intel_amx_backend,
 )
 
 if torch.cuda.is_available():
@@ -264,10 +265,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     ) -> torch.Tensor:
         assert activation == "silu", f"activation = {activation} is not supported."
 
-        if (
-            getattr(layer, "use_intel_amx_backend", False)
-            and not apply_router_weight_on_input
-        ):
+        if use_intel_amx_backend(layer) and not apply_router_weight_on_input:
             topk_weights, topk_ids = select_experts(
                 hidden_states=x,
                 router_logits=router_logits,

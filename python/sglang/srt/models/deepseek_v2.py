@@ -102,6 +102,7 @@ from sglang.srt.utils import (
     is_hip,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
+    use_intel_amx_backend,
 )
 
 _is_hip = is_hip()
@@ -216,7 +217,7 @@ class MoEGate(nn.Module):
             self.quant_method = PackWeightMethod(weight_names=["weight"])
 
     def forward(self, hidden_states):
-        if getattr(self, "use_intel_amx_backend", False):
+        if use_intel_amx_backend(self):
             return torch.ops.sgl_kernel.weight_packed_linear(
                 hidden_states,
                 self.weight,
@@ -409,8 +410,8 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if hasattr(self, "shared_experts") and getattr(
-            self.shared_experts.gate_up_proj, "use_intel_amx_backend", False
+        if hasattr(self, "shared_experts") and use_intel_amx_backend(
+            self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states)
 
@@ -436,9 +437,9 @@ class DeepseekV2MoE(nn.Module):
             hidden_states=hidden_states, router_logits=router_logits
         )
 
-        assert getattr(
-            self.shared_experts.gate_up_proj, "use_intel_amx_backend", False
-        ) == getattr(self.shared_experts.down_proj, "use_intel_amx_backend", False)
+        assert use_intel_amx_backend(
+            self.shared_experts.gate_up_proj
+        ) == use_intel_amx_backend(self.shared_experts.down_proj)
         # [Note] inplace should be False in fused_experts.
         # If inplace is True in fused_experts (self.experts), hidden_states will be changed after fused_experts
         # While hidden_states is still needed in shared_expert.
@@ -915,8 +916,8 @@ class DeepseekV2AttentionMLA(nn.Module):
                 else:
                     return AttnForwardMethod.MLA
             else:
-                if hasattr(self, "fused_qkv_a_proj_with_mqa") and getattr(
-                    self, "use_intel_amx_backend", False
+                if hasattr(self, "fused_qkv_a_proj_with_mqa") and use_intel_amx_backend(
+                    self
                 ):
                     return AttnForwardMethod.MLA_FUSED_ROPE_CPU
                 else:
@@ -1383,8 +1384,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        assert self.q_lora_rank is not None and getattr(
-            self, "use_intel_amx_backend", False
+        assert self.q_lora_rank is not None and use_intel_amx_backend(
+            self
         ), "forward_absorb_fused_mla_rope_cpu_prepare requires q_lora_rank is not None and use_intel_amx_backend"
 
         q_input, k_input, v_input = (
@@ -1503,8 +1504,8 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward_absorb_fused_mla_rope_cpu_core(
         self, q_input, k_input, v_input, forward_batch, zero_allocator
     ):
-        assert self.q_lora_rank is not None and getattr(
-            self, "use_intel_amx_backend", False
+        assert self.q_lora_rank is not None and use_intel_amx_backend(
+            self
         ), "forward_absorb_fused_mla_rope_cpu_core requires q_lora_rank is not None and use_intel_amx_backend"
 
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)

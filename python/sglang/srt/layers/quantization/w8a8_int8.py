@@ -17,6 +17,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     set_weight_attrs,
+    use_intel_amx_backend,
 )
 
 _is_cuda = is_cuda()
@@ -127,7 +128,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
-        if getattr(layer, "use_intel_amx_backend", False):
+        if use_intel_amx_backend(layer):
             return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
                 x,
                 layer.weight,
@@ -284,7 +285,7 @@ class W8A8Int8MoEMethod:
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        if getattr(layer, "use_intel_amx_backend", False):
+        if use_intel_amx_backend(layer):
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,

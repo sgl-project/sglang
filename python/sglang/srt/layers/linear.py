@@ -35,6 +35,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     set_weight_attrs,
+    use_intel_amx_backend,
 )
 
 logger = logging.getLogger(__name__)
@@ -184,7 +185,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
-        if getattr(layer, "use_intel_amx_backend", False):
+        if use_intel_amx_backend(layer):
             return torch.ops.sgl_kernel.weight_packed_linear(
                 x, layer.weight, bias, True  # is_vnni
             )
