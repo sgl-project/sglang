@@ -152,7 +152,7 @@ class BaseMultimodalProcessor(ABC):
             "input_features": Modality.AUDIO,
             "input_features_mask": Modality.AUDIO,
             # Video-related attributes
-            "video_grid_thws": Modality.VIDEO,
+            "video_grid_thw": Modality.VIDEO,
             # Generic attributes that could apply to multiple modalities
             # "precomputed_features" - handled specially as it can be any modality
         }
@@ -263,7 +263,6 @@ class BaseMultimodalProcessor(ABC):
         for text_part in text_parts:
             modality = token_to_modality.get(text_part)
             if modality is not None:
-                print(f"{modality=}")
                 data_iterator = data_iterators.get(modality)
                 if data_iterator is None:
                     raise ValueError(f"No data iterator found for token: {text_part}")
@@ -356,7 +355,6 @@ class BaseMultimodalProcessor(ABC):
             data_iterators[Modality.VIDEO] = iter(video_data)
         if multimodal_tokens.audio_token and audio_data:
             data_iterators[Modality.AUDIO] = iter(audio_data)
-        print(f"{data_iterators=}")
         futures, task_info = self.submit_data_loading_tasks(
             text_parts=text_parts,
             multimodal_tokens=multimodal_tokens,
@@ -496,15 +494,14 @@ class BaseMultimodalProcessor(ABC):
                     )
                 except ValueError:
                     modality = Modality.IMAGE
-
+            print(f"{modality=}, {attr_name=}, {value=}")
             if modality:
                 # Create item if needed
                 if modality not in items:
                     items[modality] = MultimodalDataItem(modality=modality)
 
                 # Set attribute
-                if hasattr(items[modality], attr_name):
-                    setattr(items[modality], attr_name, value)
+                setattr(items[modality], attr_name, value)
 
         return list(items.values())
 
@@ -560,7 +557,6 @@ class BaseMultimodalProcessor(ABC):
             else:
                 raise ValueError(f"Unknown multimodal item type: {type(item)}")
         print(f"{all_items=}")
-        print(f"{raw_videos=}")
         # Process items and get input_ids
         all_collected_items = []
         input_ids = None
@@ -600,12 +596,12 @@ class BaseMultimodalProcessor(ABC):
                     mm_token_id=self.IM_TOKEN_ID,
                 )
             elif mm_item.modality == Modality.AUDIO:
-                mm_item.audio_offsets = self.get_mm_items_offset(
+                mm_item.offsets = self.get_mm_items_offset(
                     input_ids=input_ids,
                     mm_token_id=self.AUDIO_TOKEN_ID,
                 )
             elif mm_item.modality == Modality.VIDEO:
-                mm_item.video_offsets = self.get_mm_items_offset(
+                mm_item.offsets = self.get_mm_items_offset(
                     input_ids=input_ids,
                     mm_token_id=self.VIDEO_TOKEN_ID,
                 )

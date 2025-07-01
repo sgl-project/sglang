@@ -257,8 +257,10 @@ class MultimodalDataItem:
                     self.hash = hash_feature(self.audio_features)
                 elif self.input_features is not None:
                     self.hash = hash_feature(self.input_features)
-            else:
-                self.hash = hash_feature(self.pixel_values)
+            elif self.is_video():
+            self.hash = hash_feature(self.pixel_values_videos)
+        else:
+            self.hash = hash_feature(self.pixel_values)
 
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
@@ -284,7 +286,7 @@ class MultimodalDataItem:
     def is_video(self):
         return (self.modality == Modality.VIDEO) and (
             self.precomputed_features is not None
-            or not MultimodalDataItem.is_empty_list(self.pixel_values)
+            or not MultimodalDataItem.is_empty_list(self.pixel_values_videos)
         )
 
     def is_audio(self):

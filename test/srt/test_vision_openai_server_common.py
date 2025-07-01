@@ -229,7 +229,7 @@ class TestOpenAIVisionServer(CustomTestCase):
         frame_format = {
             "type": "image_url",
             "image_url": {"url": "data:image/jpeg;base64,{}"},
-            "modalities": "video",
+            "modalities": "image",
         }
 
         for base64_frame in base64_frames:
