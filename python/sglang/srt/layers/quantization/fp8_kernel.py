@@ -337,7 +337,8 @@ def per_token_group_quant_8bit(
             assert masked_m is None
             masked_m = torch.tensor([num_tokens], device=x.device, dtype=torch.int32)
 
-        output = torch.empty(
+        # NOTE use `zeros` for easier testing
+        output = torch.zeros(
             (*x.shape[:-1], x.shape[-1] // 2),
             device=x.device,
             dtype=dst_dtype,
