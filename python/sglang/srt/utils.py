@@ -1739,6 +1739,7 @@ def direct_register_custom_op(
 
 
 def set_gpu_proc_affinity(
+    pp_size: int,
     tp_size: int,
     nnodes: int,
     gpu_id: int,
@@ -1747,7 +1748,8 @@ def set_gpu_proc_affinity(
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    tp_size_per_node = tp_size // nnodes
+    nnodes_per_tp_group = max(nnodes // pp_size, 1)
+    tp_size_per_node = tp_size // nnodes_per_tp_group
 
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)
