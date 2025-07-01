@@ -21,6 +21,7 @@ from sglang.srt.utils import is_hip
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
+mode_concentrated = os.environ.get("SGLANG_BENCH_MODE", "") == "concentrated"
 
 if int(os.environ.get("SGLANG_NSYS_PROFILING", "0")):
     # configs = [[
@@ -55,6 +56,63 @@ if int(os.environ.get("SGLANG_NSYS_PROFILING", "0")):
             ),
         ]
     ]
+elif mode_concentrated:
+    configs = list(
+        itertools.product(
+            [768],
+            [1536, 7168, 16384],
+            [128],
+            [None],
+            [fp8_type_],
+            [
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=True,
+                    fuse_silu_and_mul=False,
+                    masked_layout_mode=None,
+                ),
+            ],
+        )
+    ) + list(
+        itertools.product(
+            [768 * 8],
+            [2048],
+            [128],
+            [48],
+            [fp8_type_],
+            [
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=True,
+                    fuse_silu_and_mul=True,
+                    masked_layout_mode=None,
+                ),
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=True,
+                    fuse_silu_and_mul=True,
+                    masked_layout_mode="balanced",
+                ),
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=True,
+                    fuse_silu_and_mul=True,
+                    masked_layout_mode="imbalanced",
+                ),
+                dict(
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=True,
+                    fuse_silu_and_mul=True,
+                    masked_layout_mode="extreme",
+                ),
+            ],
+        )
+    )
 else:
     configs = list(
         itertools.product(
@@ -183,7 +241,7 @@ def benchmark(
         **{k: v for k, v in flags.items() if k not in ["masked_layout_mode"]},
     )
 
-    time_s = bench_kineto(bench_fn, kernel_names=kernel_names)
+    time_s = bench_kineto(bench_fn, kernel_names=kernel_names, num_tests=300 if mode_concentrated else 30)
     return time_s * 1e6
 
 
