@@ -66,28 +66,29 @@ def adjust_config_with_unaligned_cpu_tp(
     # Support the case where the num_attention_heads is not divisible by the TP size.
     weight_block_size = may_get_weight_block_size(model_config, load_config)
 
+    model_config.hf_config.original_num_attention_heads = (
+        model_config.num_attention_heads
+    )
+    model_config.hf_text_config.original_num_attention_heads = (
+        model_config.num_attention_heads
+    )
+
+    model_config.hf_config.original_total_num_kv_heads = (
+        model_config.get_total_num_kv_heads()
+    )
+    model_config.hf_text_config.original_total_num_kv_heads = (
+        model_config.get_total_num_kv_heads()
+    )
+
     if (
         model_config.num_attention_heads % tp_size != 0
         or model_config.get_total_num_kv_heads() % tp_size != 0
     ):
         # Compute the head_dim using the model_config.num_attention_heads before padding
-        model_config.hf_config.original_head_dim = (
-            model_config.hidden_size // model_config.num_attention_heads
-        )
-
-        model_config.hf_config.original_num_attention_heads = (
-            model_config.num_attention_heads
-        )
-        model_config.hf_text_config.original_num_attention_heads = (
-            model_config.num_attention_heads
-        )
-
-        model_config.hf_config.original_total_num_kv_heads = (
-            model_config.get_total_num_kv_heads()
-        )
-        model_config.hf_text_config.original_total_num_kv_heads = (
-            model_config.get_total_num_kv_heads()
-        )
+        if not hasattr(model_config.hf_config, "head_dim"):
+            model_config.hf_config.head_dim = (
+                model_config.hidden_size // model_config.num_attention_heads
+            )
 
         query_heads_per_kv = (
             model_config.num_attention_heads // model_config.get_total_num_kv_heads()

@@ -113,21 +113,13 @@ class Llama4ForConditionalGeneration(nn.Module):
         # rotary embeds should be sliced
         if ("wk" in modules or "k_proj" in modules) and modules[-1] == "weight":
             if _is_cpu:
-                dim = getattr(
-                    self.language_model.config,
-                    "original_total_num_kv_heads",
-                    self.language_model.config.num_key_value_heads,
-                )
+                dim = self.language_model.config.original_total_num_kv_heads
             else:
                 dim = self.language_model.config.num_key_value_heads
             loaded_weight = permute(loaded_weight, dim)
         elif ("wq" in modules or "q_proj" in modules) and modules[-1] == "weight":
             if _is_cpu:
-                dim = getattr(
-                    self.language_model.config,
-                    "original_num_attention_heads",
-                    self.language_model.config.num_attention_heads,
-                )
+                dim = self.language_model.config.original_num_attention_heads
             else:
                 dim = self.language_model.config.num_attention_heads
             loaded_weight = permute(loaded_weight, dim)
