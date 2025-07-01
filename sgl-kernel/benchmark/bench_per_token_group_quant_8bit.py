@@ -159,6 +159,8 @@ else:
 def benchmark(
     num_tokens, hidden_dim, group_size, num_ranks, dst_dtype, flags, provider
 ):
+    print(f"Testing: {num_tokens=} {hidden_dim=} {group_size=} {num_ranks=} {dst_dtype=} {flags=} {provider=}")
+
     x, masked_m = create_per_token_group_quant_test_data(
         num_tokens=num_tokens, hidden_dim=hidden_dim, num_ranks=num_ranks, flags=flags
     )
