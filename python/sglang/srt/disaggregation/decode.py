@@ -21,13 +21,11 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
-import os
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 from torch.distributed import ProcessGroup
 
@@ -47,12 +45,9 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import (
-    KVCache,
-    ReqToTokenPool,
-    TokenToKVPoolAllocator,
-)
+from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import require_mlp_sync
@@ -141,7 +136,7 @@ class DecodePreallocQueue:
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         draft_token_to_kv_pool: Optional[KVCache],
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
@@ -438,9 +433,7 @@ class DecodePreallocQueue:
             else 0
         )
 
-        available_size = self.token_to_kv_pool_allocator.available_size()
-
-        allocatable_tokens = available_size - max(
+        allocatable_tokens = self.token_to_kv_pool_allocator.available_size() - max(
             # preserve some space for future decode
             self.num_reserved_decode_tokens
             * (
@@ -584,11 +577,11 @@ class DecodeTransferQueue:
                 idx = decode_req.metadata_buffer_index
                 (
                     output_id,
-                    output_hidden_states,
                     output_token_logprobs_val,
                     output_token_logprobs_idx,
                     output_top_logprobs_val,
                     output_top_logprobs_idx,
+                    output_hidden_states,
                 ) = self.metadata_buffers.get_buf(idx)
 
                 decode_req.req.output_ids.append(output_id[0].item())
@@ -611,9 +604,21 @@ class DecodeTransferQueue:
                             : decode_req.req.top_logprobs_num
                         ].tolist()
                     )
+
                 if hasattr(decode_req.kv_receiver, "clear"):
                     decode_req.kv_receiver.clear()
-                transferred_reqs.append(decode_req.req)
+
+                # special handling for sampling_params.max_new_tokens == 1
+                if decode_req.req.sampling_params.max_new_tokens == 1:
+                    # finish immediately
+                    decode_req.req.check_finished()
+                    self.scheduler.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    self.tree_cache.cache_finished_req(decode_req.req)
+                else:
+                    transferred_reqs.append(decode_req.req)
+
                 indices_to_remove.add(i)
             elif poll in [
                 KVPoll.Bootstrapping,
@@ -766,7 +771,7 @@ class SchedulerDisaggregationDecodeMixin:
         if batch:
             result = self.run_batch(batch)
             if not delay_process:
-                self.prepare_mlp_sync_batch(batch, result)
+                self.process_batch_result(batch, result)
         return batch, result
 
     def get_next_disagg_decode_batch_to_run(

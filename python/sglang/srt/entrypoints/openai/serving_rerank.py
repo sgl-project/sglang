@@ -2,6 +2,7 @@ import logging
 from typing import Any, Dict, List, Optional, Union
 
 from fastapi import Request
+from fastapi.responses import ORJSONResponse
 
 from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
@@ -15,7 +16,10 @@ logger = logging.getLogger(__name__)
 
 
 class OpenAIServingRerank(OpenAIServingBase):
-    """Handler for rerank requests"""
+    """Handler for /v1/rerank requests"""
+
+    # NOTE: /v1/rerank is not an official OpenAI endpoint. This module may be moved
+    # to another module in the future.
 
     def _request_id_prefix(self) -> str:
         return "rerank-"
@@ -61,7 +65,7 @@ class OpenAIServingRerank(OpenAIServingBase):
         adapted_request: EmbeddingReqInput,
         request: V1RerankReqInput,
         raw_request: Request,
-    ) -> Union[RerankResponse, ErrorResponse]:
+    ) -> Union[List[RerankResponse], ErrorResponse, ORJSONResponse]:
         """Handle the rerank request"""
         try:
             ret = await self.tokenizer_manager.generate_request(
@@ -74,16 +78,16 @@ class OpenAIServingRerank(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
-        response = self._build_rerank_response(ret, request)
-        return response
+        responses = self._build_rerank_response(ret, request)
+        return responses
 
     def _build_rerank_response(
         self, ret: List[Dict[str, Any]], request: V1RerankReqInput
     ) -> List[RerankResponse]:
         """Build the rerank response from generation results"""
-        response = []
+        responses = []
         for idx, ret_item in enumerate(ret):
-            response.append(
+            responses.append(
                 RerankResponse(
                     score=ret_item["embedding"],
                     document=request.documents[idx],
@@ -93,6 +97,6 @@ class OpenAIServingRerank(OpenAIServingBase):
             )
 
         # Sort by score in descending order (highest relevance first)
-        response.sort(key=lambda x: x.score, reverse=True)
+        responses.sort(key=lambda x: x.score, reverse=True)
 
-        return response
+        return responses
