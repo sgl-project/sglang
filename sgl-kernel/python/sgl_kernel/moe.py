@@ -12,6 +12,7 @@ def moe_align_block_size(
     num_tokens_post_pad,
     token_cnts_buffer,
     cumsum_buffer,
+    pad_sorted_token_ids=False,
 ):
     torch.ops.sgl_kernel.moe_align_block_size.default(
         topk_ids,
@@ -22,6 +23,7 @@ def moe_align_block_size(
         num_tokens_post_pad,
         token_cnts_buffer,
         cumsum_buffer,
+        pad_sorted_token_ids,
     )
 
 
@@ -85,6 +87,24 @@ def ep_moe_pre_reorder(
         end_expert_id,
         topk,
         use_per_token_if_dynamic,
+    )
+
+
+def ep_moe_silu_and_mul(
+    gateup_output,
+    down_input,
+    reorder_topk_ids,
+    scales,
+    start_expert_id,
+    end_expert_id,
+):
+    return torch.ops.sgl_kernel.ep_moe_silu_and_mul.default(
+        gateup_output,
+        down_input,
+        reorder_topk_ids,
+        scales,
+        start_expert_id,
+        end_expert_id,
     )
 
 

@@ -33,6 +33,8 @@ from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
     cutlass_scaled_fp4_mm,
+    dsv3_fused_a_gemm,
+    dsv3_router_gemm,
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
     int8_scaled_mm,
@@ -47,11 +49,18 @@ from sgl_kernel.gemm import (
     shuffle_rows,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
+from sgl_kernel.kvcacheio import (
+    transfer_kv_all_layer,
+    transfer_kv_all_layer_mla,
+    transfer_kv_per_layer,
+    transfer_kv_per_layer_mla,
+)
 from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     cutlass_fp4_group_mm,
     ep_moe_post_reorder,
     ep_moe_pre_reorder,
+    ep_moe_silu_and_mul,
     fp8_blockwise_scaled_grouped_mm,
     moe_align_block_size,
     moe_fused_gate,
@@ -71,6 +80,7 @@ from sgl_kernel.speculative import (
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
 )
+from sgl_kernel.top_k import fast_topk
 from sgl_kernel.version import __version__
 
 build_tree_kernel = (
