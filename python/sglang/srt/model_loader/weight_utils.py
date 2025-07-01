@@ -209,6 +209,17 @@ def get_quant_config(
             config["adapter_name_or_path"] = model_name_or_path
         elif model_config.quantization == "modelopt":
             if config["producer"]["name"] == "modelopt":
+                # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
+                if config["quantization"]["quant_algo"] is None:
+                    if (
+                        model_config.hf_config.architectures[0]
+                        != "LlamaForCausalLMEagle3"
+                    ):
+                        raise ValueError(
+                            f"Invalid quant_config, quantization method: {model_config.quantization},"
+                            f"hf architectures: {model_config.hf_config.architectures[0]}. "
+                        )
+                    return None
                 if "FP4" in config["quantization"]["quant_algo"]:
                     return ModelOptFp4Config.from_config(config)
                 else:
