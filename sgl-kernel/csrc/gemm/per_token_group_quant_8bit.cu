@@ -22,7 +22,6 @@ __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
 }
 
 __device__ __forceinline__ float silu(const float& val) {
-//   return val / (1.0f + __expf(-val));
     float half = 0.5f * val;
     float t = __tanhf(half);
     return half * (1.0f + t);
