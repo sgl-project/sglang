@@ -206,13 +206,14 @@ struct MaskedLayoutScheduler {
 //     const int curr_expert_token_num = masked_m[expert_idx];
     const int curr_expert_token_num = 1024;
 
-    for (int token_idx = token_idx_start; token_idx < curr_expert_token_num;
-         token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
+//     for (int token_idx = token_idx_start; token_idx < curr_expert_token_num;
+//          token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
+    const int token_idx = token_idx_start;
       const int hidden_size = hidden_dim_num_groups * group_size;
       const int input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
           expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, group_size);
       fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
-    }
+//     }
   }
 };
 
