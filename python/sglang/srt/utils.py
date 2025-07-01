@@ -74,7 +74,6 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
-from decord import VideoReader, cpu, gpu
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
@@ -729,33 +728,6 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
     return audio
 
 
-def encode_video(video_path, frame_count_limit=None):
-    # Lazy import because decord is not available on some arm platforms.
-    from decord import VideoReader, cpu
-
-    if not os.path.exists(video_path):
-        logger.error(f"Video {video_path} does not exist")
-        return []
-
-    if frame_count_limit == 0:
-        return []
-
-    def uniform_sample(l, n):
-        gap = len(l) / n
-        idxs = [int(i * gap + gap / 2) for i in range(n)]
-        return [l[i] for i in idxs]
-
-    vr = VideoReader(video_path, ctx=cpu(0))
-    sample_fps = round(vr.get_avg_fps() / 1)  # FPS
-    frame_indices = [i for i in range(0, len(vr), sample_fps)]
-    if frame_count_limit is not None and len(frame_indices) > frame_count_limit:
-        frame_indices = uniform_sample(frame_indices, frame_count_limit)
-
-    frames = vr.get_batch(frame_indices).asnumpy()
-    frames = [Image.fromarray(v.astype("uint8")) for v in frames]
-    return frames
-
-
 def load_image(
     image_file: Union[Image.Image, str, bytes],
 ) -> tuple[Image.Image, tuple[int, int]]:
@@ -783,7 +755,10 @@ def load_image(
     return image, image_size
 
 
-def load_video(video_file: Union[str, bytes], use_gpu: bool = True) -> VideoReader:
+def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
+    # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
+    from decord import VideoReader, cpu, gpu
+
     try:
         from decord.bridge import decord_bridge
 

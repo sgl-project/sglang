@@ -8,6 +8,7 @@ from PIL import Image
 from torchvision.transforms import InterpolationMode
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
@@ -196,7 +197,9 @@ def smart_nframes(
 
 # process video, qwen-specific
 async def preprocess_video(
-    vr: VideoReader, image_factor: int = IMAGE_FACTOR
+    vr,
+    image_factor: int = IMAGE_FACTOR,
+    # vr: VideoReader, image_factor: int = IMAGE_FACTOR
 ) -> torch.Tensor:
     ele = {}
     total_frames, video_fps = len(vr), vr.get_avg_fps()

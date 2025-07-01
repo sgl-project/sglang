@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import flatten_nested_list
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -64,8 +63,6 @@ class GenerateReqInput:
     image_data: Optional[
         Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]
     ] = None
-    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
-    video_data: Optional[Union[List[List[str]], List[str], str]] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[Union[List[AudioDataItem], AudioDataItem]] = None
     # The video input. Like image data, it can be a file name, a url, or base64 encoded string.

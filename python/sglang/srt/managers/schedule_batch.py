@@ -252,7 +252,7 @@ class MultimodalDataItem:
         if self.hash is None:
             if self.precomputed_features is not None:
                 self.hash = hash_feature(self.precomputed_features)
-            elif self.is_modality(Modality.AUDIO):
+            elif self.is_audio():
                 if self.audio_features is not None:
                     self.hash = hash_feature(self.audio_features)
                 elif self.input_features is not None:
