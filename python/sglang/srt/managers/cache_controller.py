@@ -169,6 +169,7 @@ class HiCacheController:
         page_size: int,
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through_selective",
+        io_backend: str = "",
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -176,8 +177,10 @@ class HiCacheController:
         self.write_policy = write_policy
         self.page_size = page_size
         # using kernel for small page KV cache transfer and DMA for large pages
-        # todo: hardware aware config, server parameter
-        self.io_backend = "direct" if self.page_size >= 64 else "kernel"
+        if not io_backend:
+            self.io_backend = "direct" if self.page_size >= 64 else "kernel"
+        else:
+            self.io_backend = io_backend
 
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
@@ -275,6 +278,7 @@ class HiCacheController:
         return device_indices
 
     def move_indices(self, host_indices, device_indices):
+        # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             return host_indices.to(self.mem_pool_device.device), device_indices
         elif self.io_backend == "direct":
