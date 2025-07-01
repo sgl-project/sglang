@@ -203,7 +203,8 @@ struct MaskedLayoutScheduler {
 
     const int hidden_dim_group_idx = blockIdx.x * SUBWARPS_PER_BLOCK + subwarp_id;
 
-    const int curr_expert_token_num = masked_m[expert_idx];
+//     const int curr_expert_token_num = masked_m[expert_idx];
+    const int curr_expert_token_num = 1024;
 
     for (int token_idx = token_idx_start; token_idx < curr_expert_token_num;
          token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
