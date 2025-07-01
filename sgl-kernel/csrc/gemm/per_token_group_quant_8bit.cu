@@ -222,7 +222,6 @@ template <
     bool IS_COLUMN_MAJOR = false,
     bool SCALE_UE8M0 = false,
     bool FUSE_SILU_AND_MUL = false,
-    bool MASKED_LAYOUT = false,
     typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>>
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
@@ -426,7 +425,7 @@ void sgl_per_token_group_quant_8bit(
       if (scale_ue8m0) {                                                                                \
         if (fuse_silu_and_mul) {                                                                        \
           if (masked_layout) {                                                                          \
-            LAUNCH_KERNEL_INNER(MaskedLayoutScheduler, T, DST_DTYPE, uint32_t, true, true, true, true); \
+            LAUNCH_KERNEL_INNER(MaskedLayoutScheduler, T, DST_DTYPE, uint32_t, true, true, true);       \
           } else {                                                                                      \
             LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true, true);              \
           }                                                                                             \
