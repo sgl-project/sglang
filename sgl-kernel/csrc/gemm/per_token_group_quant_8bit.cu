@@ -101,7 +101,7 @@ int compute_input_group_start_offset(
     int hidden_size,
     int num_tokens_per_expert,
     int group_size) {
-  return expert_idx * num_tokens_per_expert * hidden_size+
+  return expert_idx * num_tokens_per_expert * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
          token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) +
          hidden_dim_group_idx * group_size;
 }
