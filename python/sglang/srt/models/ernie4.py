@@ -195,9 +195,9 @@ class MoEGate(nn.Module):
         self.weight = nn.Parameter(
             torch.empty((config.moe_num_experts, config.hidden_size))
         )
-        # self.e_score_correction_bias = nn.Parameter(
-        #     torch.empty((config.moe_num_experts))
-        # )
+        self.e_score_correction_bias = nn.Parameter(
+            torch.empty((1, config.moe_num_experts))
+        )
 
     def forward(self, hidden_states):
         logits = F.linear(hidden_states, self.weight, None)
@@ -240,6 +240,7 @@ class Ernie4Moe(nn.Module):
             renormalize=True,
             quant_config=quant_config,
             use_grouped_topk=False,
+            correction_bias=self.gate.e_score_correction_bias,
             prefix=add_prefix("experts", prefix),
         )
 
@@ -301,6 +302,7 @@ class Ernie4DecoderLayer(nn.Module):
         if (
             hasattr(config, "moe_layer_start_index")
             and layer_id >= config.moe_layer_start_index
+            and (layer_id + 1) % config.moe_layer_interval == 0
         ):
             self.mlp = Ernie4Moe(
                 config=config,
@@ -484,8 +486,8 @@ class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
             # MTP will be supported soon
             if "mtp" in name:
                 continue
-            if "e_score_correction_bias" in name:
-                continue
+            if "moe_statics.e_score_correction_bias" in name:
+                name = name.replace("moe_statics", "gate")
             for param_name, weight_name, shard_id in self.stacked_params_mapping:
                 if weight_name not in name:
                     continue
