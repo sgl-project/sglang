@@ -143,7 +143,10 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages \
     icdiff \
     scikit_build_core \
     uv \
-    pre-commit
+    pre-commit \
+    pandas \
+    matplotlib \
+    tabulate
 
 # Install diff-so-fancy
 RUN curl -LSso /usr/local/bin/diff-so-fancy https://github.com/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \

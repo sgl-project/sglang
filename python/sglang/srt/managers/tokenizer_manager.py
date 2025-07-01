@@ -111,11 +111,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.managers.multimodal_processor import (
-    get_dummy_processor,
-    get_mm_processor,
-    import_processors,
-)
+from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -187,6 +183,8 @@ class TokenizerManager:
             if server_args.preferred_sampling_params
             else None
         )
+        self.crash_dump_folder = server_args.crash_dump_folder
+        self.crash_dump_performed = False  # Flag to ensure dump is only called once
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
@@ -251,10 +249,11 @@ class TokenizerManager:
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
         self.dump_request_list: List[Tuple] = []
+        self.crash_dump_request_list: deque[Tuple] = deque()
         self.log_request_metadata = self.get_log_request_metadata()
-        self.asyncio_tasks = set()
         self.session_futures = {}  # session_id -> asyncio event
         self.max_req_input_len = None
+        self.asyncio_tasks = set()
 
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
@@ -266,14 +265,14 @@ class TokenizerManager:
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
-        self.transfer_backend = TransferBackend(
+        self.disaggregation_transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
         # Start kv boostrap server on prefill
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # only start bootstrap server on prefill tm
             kv_bootstrap_server_class = get_kv_class(
-                self.transfer_backend, KVClassType.BOOTSTRAP_SERVER
+                self.disaggregation_transfer_backend, KVClassType.BOOTSTRAP_SERVER
             )
             self.bootstrap_server = kv_bootstrap_server_class(
                 self.server_args.disaggregation_bootstrap_port
@@ -324,7 +323,6 @@ class TokenizerManager:
         self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.health_check_communitcator = _Communicator(self.send_to_scheduler, 1)
         self.get_internal_state_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -484,7 +482,7 @@ class TokenizerManager:
                 token_type_ids = encoded.get("token_type_ids", [None])[0]
 
         if self.mm_processor and obj.contains_mm_input():
-            image_inputs = await self.mm_processor.process_mm_data_async(
+            image_inputs: Dict = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
                 input_text=input_text or input_ids,
                 request_obj=obj,
@@ -546,6 +544,14 @@ class TokenizerManager:
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logits-processor` to enable this feature."
                 )
+
+    def _validate_input_ids_in_vocab(
+        self, input_ids: List[int], vocab_size: int
+    ) -> None:
+        if any(id >= vocab_size for id in input_ids):
+            raise ValueError(
+                f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
+            )
 
     def _create_tokenized_object(
         self,
@@ -1096,12 +1102,36 @@ class TokenizerManager:
                         "image_data",
                         "audio_data",
                         "lora_path",
+                        "sampling_params",
                     ]
                 )
-                out_skip_names = set(["text", "output_ids", "embedding"])
+                out_skip_names = set(
+                    [
+                        "text",
+                        "output_ids",
+                    ]
+                )
             elif self.log_requests_level == 1:
-                max_length = 2048
+                max_length = 1 << 30
+                skip_names = set(
+                    [
+                        "text",
+                        "input_ids",
+                        "input_embeds",
+                        "image_data",
+                        "audio_data",
+                        "lora_path",
+                    ]
+                )
+                out_skip_names = set(
+                    [
+                        "text",
+                        "output_ids",
+                    ]
+                )
             elif self.log_requests_level == 2:
+                max_length = 2048
+            elif self.log_requests_level == 3:
                 max_length = 1 << 30
             else:
                 raise ValueError(
@@ -1118,6 +1148,8 @@ class TokenizerManager:
             self.dump_requests_folder = obj.dump_requests_folder
         if obj.dump_requests_threshold is not None:
             self.dump_requests_threshold = obj.dump_requests_threshold
+        if obj.crash_dump_folder is not None:
+            self.crash_dump_folder = obj.crash_dump_folder
         logging.info(f"Config logging: {obj=}")
         self.log_request_metadata = self.get_log_request_metadata()
 
@@ -1166,6 +1198,52 @@ class TokenizerManager:
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
 
+    def dump_requests_before_crash(self):
+        if self.crash_dump_performed:
+            logger.info(
+                "SIGTERM/SIGQUIT/Exception triggered, but crash dump already performed, skipping."
+            )
+            return
+        logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
+        self.crash_dump_performed = True
+        if not self.crash_dump_folder:
+            return
+
+        data_to_dump = []
+        if self.crash_dump_request_list:
+            data_to_dump.extend(self.crash_dump_request_list)
+
+        # Add unfinished requests from rid_to_state
+        unfinished_requests = []
+        for rid, state in self.rid_to_state.items():
+            if not state.finished:
+                unfinished_requests.append(
+                    (state.obj, {}, state.created_time, time.time())
+                )
+        if unfinished_requests:
+            data_to_dump.extend(unfinished_requests)
+
+        if not data_to_dump:
+            return
+
+        filename = os.path.join(
+            self.crash_dump_folder,
+            os.getenv("HOSTNAME", None),
+            f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
+        )
+
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        # Include server_args in the dump
+        data_to_dump_with_server_args = {
+            "server_args": self.server_args,
+            "requests": data_to_dump,
+        }
+        with open(filename, "wb") as f:
+            pickle.dump(data_to_dump_with_server_args, f)
+        logger.error(
+            f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
+        )
+
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
             await asyncio.sleep(5)
@@ -1175,11 +1253,12 @@ class TokenizerManager:
             remain_num_req = len(self.rid_to_state)
 
             if self.health_check_failed:
-                # if health check failed, exit immediately
+                # if health check failed, we should exit immediately
                 logger.error(
                     "Signal SIGTERM received while health check failed. Exiting... remaining number of requests: %d",
                     remain_num_req,
                 )
+                self.dump_requests_before_crash()
                 break
 
             elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
@@ -1196,6 +1275,7 @@ class TokenizerManager:
             if remain_num_req > 0:
                 await asyncio.sleep(5)
             else:
+                self.dump_requests_before_crash()
                 break
 
         kill_process_tree(os.getpid(), include_parent=True)
@@ -1273,16 +1353,7 @@ class TokenizerManager:
                     "meta_info": meta_info,
                 }
             elif isinstance(recv_obj, BatchMultimodalOut):
-                if isinstance(recv_obj.outputs[i], str):
-                    out_dict = {
-                        "text": recv_obj.outputs[i],
-                        "meta_info": meta_info,
-                    }
-                else:
-                    out_dict = {
-                        "outputs": json.dumps(recv_obj.outputs[i]),
-                        "meta_info": meta_info,
-                    }
+                raise NotImplementedError("BatchMultimodalOut not implemented")
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOut)
                 out_dict = {
@@ -1306,6 +1377,8 @@ class TokenizerManager:
                 self.collect_metrics(state, recv_obj, i)
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
+            if self.crash_dump_folder and state.finished and state.obj.log_metrics:
+                self.record_request_for_crash_dump(state, out_dict)
 
     def convert_logprob_style(
         self,
@@ -1317,6 +1390,9 @@ class TokenizerManager:
         recv_obj: BatchStrOut,
         recv_obj_index: int,
     ):
+        if recv_obj.input_token_logprobs_val is None:
+            return
+
         if len(recv_obj.input_token_logprobs_val) > 0:
             state.input_token_logprobs_val.extend(
                 recv_obj.input_token_logprobs_val[recv_obj_index]
@@ -1436,7 +1512,10 @@ class TokenizerManager:
             else 0
         )
 
-        if state.first_token_time == 0.0:
+        if (
+            state.first_token_time == 0.0
+            and self.disaggregation_mode != DisaggregationMode.PREFILL
+        ):
             state.first_token_time = state.last_time = time.time()
             state.last_completion_tokens = completion_tokens
             self.metrics_collector.observe_time_to_first_token(
@@ -1484,13 +1563,30 @@ class TokenizerManager:
             to_dump = self.dump_request_list
             self.dump_request_list = []
 
+            to_dump_with_server_args = {
+                "server_args": self.server_args,
+                "requests": to_dump,
+            }
+
             def background_task():
                 os.makedirs(self.dump_requests_folder, exist_ok=True)
                 with open(filename, "wb") as f:
-                    pickle.dump(to_dump, f)
+                    pickle.dump(to_dump_with_server_args, f)
 
             # Schedule the task to run in the background without awaiting it
             asyncio.create_task(asyncio.to_thread(background_task))
+
+    def record_request_for_crash_dump(self, state: ReqState, out_dict: dict):
+        current_time = time.time()
+        self.crash_dump_request_list.append(
+            (state.obj, out_dict, state.created_time, current_time)
+        )
+        # Remove requests older than 5 minutes based on finish time
+        while (
+            self.crash_dump_request_list
+            and current_time - self.crash_dump_request_list[0][3] >= 300
+        ):
+            self.crash_dump_request_list.popleft()
 
     def _handle_abort_req(self, recv_obj):
         self.rid_to_state.pop(recv_obj.rid, None)
@@ -1614,6 +1710,8 @@ async def print_exception_wrapper(func):
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"TokenizerManager hit an exception: {traceback}")
+        if hasattr(func, "__self__") and isinstance(func.__self__, TokenizerManager):
+            func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
 
@@ -1632,6 +1730,7 @@ class SignalHandler:
         logger.error(
             "Received sigquit from a child process. It usually means the child failed."
         )
+        self.tokenizer_manager.dump_requests_before_crash()
         kill_process_tree(os.getpid())
 
 
