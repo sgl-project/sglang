@@ -58,6 +58,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -65,9 +66,6 @@ from sglang.srt.hf_transformers_utils import (
 )
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.expert_distribution import (
-    get_global_expert_distribution_recorder,
-)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     CloseSessionReqInput,
@@ -82,6 +80,8 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    LoadLoRAAdapterReqInput,
+    LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     ProfileReq,
@@ -99,6 +99,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    UnloadLoRAAdapterReqInput,
+    UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -126,7 +128,8 @@ from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import validate_input_length
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
+from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
@@ -415,13 +418,15 @@ class Scheduler(
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
         self.return_health_check_ct = 0
+        self.num_retracted_reqs: int = 0
+        self.num_paused_reqs: int = 0
+        self.kv_transfer_speed_gb_s: float = 0.0
+        self.kv_transfer_latency_ms: float = 0.0
+        self.sessions: Dict[str, Session] = {}
         self.current_stream = torch.get_device_module(self.device).current_stream()
         if self.device == "cpu":
             self.current_stream.synchronize = lambda: None  # No-op for CPU
         self.forward_sleep_time = None
-
-        # Init session info
-        self.sessions: Dict[str, Session] = {}
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
@@ -470,26 +475,12 @@ class Scheduler(
         t = threading.Thread(target=self.watchdog_thread, daemon=True)
         t.start()
         self.parent_process = psutil.Process().parent()
+
+        # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
-
-        # Init profiler
-        self.torch_profiler = None
-        self.torch_profiler_output_dir: Optional[str] = None
-        self.profiler_activities: Optional[List[str]] = None
-        self.profile_id: Optional[str] = None
-        self.profiler_target_forward_ct: Optional[int] = None
-        self.profiler_target_prefill_ct: Optional[int] = None
-        self.profiler_target_decode_ct: Optional[int] = None
-        self.profiler_prefill_ct: Optional[int] = None
-        self.profiler_decode_ct: Optional[int] = None
-        self.profile_by_stage: bool = False
-        self.profile_steps: Optional[int] = None
-        self.profile_in_progress: bool = False
-        self.rpd_profiler = None
-
-        # Init metrics stats
+        self.init_profier()
         self.init_metrics()
         self.init_kv_events(server_args.kv_events_config)
 
@@ -518,9 +509,12 @@ class Scheduler(
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
+                (LoadLoRAAdapterReqInput, self.load_lora_adapter),
+                (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
             ]
         )
 
+        # Init disaggregation
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
@@ -570,7 +564,11 @@ class Scheduler(
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
         ):
-            self.tree_cache = ChunkCache(
+            if self.model_config.is_hybrid:
+                ChunkCacheClass = SWAChunkCache
+            else:
+                ChunkCacheClass = ChunkCache
+            self.tree_cache = ChunkCacheClass(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 page_size=self.page_size,
@@ -614,6 +612,21 @@ class Scheduler(
                 )
             )
         )
+
+    def init_profier(self):
+        self.torch_profiler = None
+        self.torch_profiler_output_dir: Optional[str] = None
+        self.profiler_activities: Optional[List[str]] = None
+        self.profile_id: Optional[str] = None
+        self.profiler_target_forward_ct: Optional[int] = None
+        self.profiler_target_prefill_ct: Optional[int] = None
+        self.profiler_target_decode_ct: Optional[int] = None
+        self.profiler_prefill_ct: Optional[int] = None
+        self.profiler_decode_ct: Optional[int] = None
+        self.profile_by_stage: bool = False
+        self.profile_steps: Optional[int] = None
+        self.profile_in_progress: bool = False
+        self.rpd_profiler = None
 
     def init_metrics(self):
         self.last_gen_throughput: float = 0.0
@@ -1283,9 +1296,8 @@ class Scheduler(
         self.last_input_throughput = self.last_prefill_tokens / gap_latency
         self.last_prefill_tokens = adder.log_input_tokens
 
-        num_used = self.max_total_num_tokens - (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
+        usage_msg, num_used = self.token_to_kv_pool_allocator.log_usage(
+            self.tree_cache.evictable_size()
         )
 
         num_new_seq = len(can_run_list)
@@ -1294,7 +1306,7 @@ class Scheduler(
             f"#new-seq: {num_new_seq}, "
             f"#new-token: {adder.log_input_tokens}, "
             f"#cached-token: {adder.log_hit_tokens}, "
-            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
+            f"{usage_msg}"
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1337,9 +1349,8 @@ class Scheduler(
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
-        num_used = self.max_total_num_tokens - (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
+        usage_msg, num_used = self.token_to_kv_pool_allocator.log_usage(
+            self.tree_cache.evictable_size()
         )
 
         if RECORD_STEP_TIME:
@@ -1347,12 +1358,7 @@ class Scheduler(
                 gap_latency / self.server_args.decode_log_interval
             )
 
-        msg = (
-            f"Decode batch. "
-            f"#running-req: {num_running_reqs}, "
-            f"#token: {num_used}, "
-            f"token usage: {num_used / self.max_total_num_tokens:.2f}, "
-        )
+        msg = f"Decode batch. " f"#running-req: {num_running_reqs}, " f"{usage_msg}"
 
         if self.spec_algorithm.is_none():
             spec_accept_length = 0
@@ -1390,10 +1396,11 @@ class Scheduler(
         self._publish_kv_events()
 
     def check_memory(self):
-        available_size = (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
-        )
+        if isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+            available_token_size = self.token_to_kv_pool_allocator.full_available_size()
+        else:
+            available_token_size = self.token_to_kv_pool_allocator.available_size()
+        available_size = available_token_size + self.tree_cache.evictable_size()
         protected_size = self.tree_cache.protected_size()
         memory_leak = available_size != (
             self.max_total_num_tokens
@@ -1404,7 +1411,7 @@ class Scheduler(
             msg = (
                 "token_to_kv_pool_allocator memory leak detected! "
                 f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
-                f"{self.token_to_kv_pool_allocator.available_size()=}\n"
+                f"{available_token_size=}\n"
                 f"{self.tree_cache.evictable_size()=}\n"
             )
             raise ValueError(msg)
@@ -2104,6 +2111,18 @@ class Scheduler(
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
         ret["last_gen_throughput"] = self.last_gen_throughput
+        ret["memory_usage"] = {
+            "weight": round(
+                self.tp_worker.worker.model_runner.weight_load_mem_usage, 2
+            ),
+            "kvcache": round(
+                self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
+            ),
+            "cuda_graph": round(
+                self.tp_worker.worker.model_runner.cuda_graph_mem_usage, 2
+            ),
+            "token_capacity": int(self.max_total_num_tokens),
+        }
         if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
             ret["avg_spec_accept_length"] = (
                 self.cum_spec_accept_length / self.cum_spec_accept_count
@@ -2241,6 +2260,36 @@ class Scheduler(
         else:
             logger.error(message)
         return UpdateWeightFromDiskReqOutput(success, message, 0)
+
+    def load_lora_adapter(
+        self, recv_req: LoadLoRAAdapterReqInput
+    ) -> LoadLoRAAdapterReqOutput:
+        """In-place loading a new lora adapter from disk or huggingface."""
+
+        result = self.tp_worker.load_lora_adapter(recv_req)
+
+        if result.success:
+            flush_cache_success = self.flush_cache()
+            assert flush_cache_success, "Cache flush failed after loading lora adapter."
+        else:
+            logger.error(result.error_message)
+        return result
+
+    def unload_lora_adapter(
+        self, recv_req: UnloadLoRAAdapterReqInput
+    ) -> UnloadLoRAAdapterReqOutput:
+        """Unload the lora adapter."""
+
+        result = self.tp_worker.unload_lora_adapter(recv_req)
+
+        if result.success:
+            flush_cache_success = self.flush_cache()
+            assert (
+                flush_cache_success
+            ), "Cache flush failed after unloading LoRA weights"
+        else:
+            logger.error(result.error_message)
+        return result
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""

@@ -72,6 +72,7 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
     ProfileReqInput,
@@ -80,6 +81,7 @@ from sglang.srt.managers.io_struct import (
     SeparateReasoningReqInput,
     SetInternalStateReq,
     SlowDownReqInput,
+    UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -124,8 +126,6 @@ def set_global_state(global_state: _GlobalState):
 
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
-    server_args: ServerArgs = fast_api_app.server_args
-
     # Initialize OpenAI serving handlers
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
         _global_state.tokenizer_manager, _global_state.template_manager
@@ -143,9 +143,12 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager
     )
 
+    server_args: ServerArgs = fast_api_app.server_args
     if server_args.warmups is not None:
         await execute_warmups(
-            server_args.warmups.split(","), _global_state.tokenizer_manager
+            server_args.disaggregation_mode,
+            server_args.warmups.split(","),
+            _global_state.tokenizer_manager,
         )
         logger.info("Warmup ended")
 
@@ -278,13 +281,17 @@ async def get_model_info():
         "model_path": _global_state.tokenizer_manager.model_path,
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
+        "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
     }
     return result
 
 
 @app.get("/get_server_info")
 async def get_server_info():
-    internal_states = await _global_state.tokenizer_manager.get_internal_state()
+    # Returns interna states per DP.
+    internal_states: List[Dict[Any, Any]] = (
+        await _global_state.tokenizer_manager.get_internal_state()
+    )
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
@@ -298,6 +305,8 @@ async def get_load():
     return await _global_state.tokenizer_manager.get_load()
 
 
+# example usage:
+# curl -s -X POST http://localhost:30000/set_internal_state -H "Content-Type: application/json" -d '{"server_args": {"max_micro_batch_size": 8}}'
 @app.api_route("/set_internal_state", methods=["POST", "PUT"])
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
@@ -351,8 +360,7 @@ async def generate_from_file_request(file: UploadFile, request: Request):
     obj = GenerateReqInput(
         input_embeds=input_embeds,
         sampling_params={
-            "repetition_penalty": 1.2,
-            "temperature": 0.2,
+            "temperature": 0.0,
             "max_new_tokens": 512,
         },
     )
@@ -389,16 +397,6 @@ async def classify_request(obj: EmbeddingReqInput, request: Request):
         return ret
     except ValueError as e:
         return _create_error_response(e)
-
-
-@app.api_route(
-    "/v1/rerank", methods=["POST", "PUT"], dependencies=[Depends(validate_json_request)]
-)
-async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
-    """Endpoint for reranking documents based on query relevance."""
-    return await raw_request.app.state.openai_serving_rerank.handle_request(
-        request, raw_request
-    )
 
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
@@ -593,6 +591,40 @@ async def slow_down(obj: SlowDownReqInput, request: Request):
         await _global_state.tokenizer_manager.slow_down(obj, request)
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.api_route("/load_lora_adapter", methods=["POST"])
+async def load_lora_adapter(obj: LoadLoRAAdapterReqInput, request: Request):
+    """Load a new LoRA adapter without re-launching the server."""
+    result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
+
+    if result.success:
+        return ORJSONResponse(
+            result,
+            status_code=HTTPStatus.OK,
+        )
+    else:
+        return ORJSONResponse(
+            result,
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+@app.api_route("/unload_lora_adapter", methods=["POST"])
+async def unload_lora_adapter(obj: UnloadLoRAAdapterReqInput, request: Request):
+    """Load a new LoRA adapter without re-launching the server."""
+    result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
+
+    if result.success:
+        return ORJSONResponse(
+            result,
+            status_code=HTTPStatus.OK,
+        )
+    else:
+        return ORJSONResponse(
+            result,
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
 
 @app.api_route("/open_session", methods=["GET", "POST"])
@@ -805,6 +837,16 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
     )
 
 
+@app.api_route(
+    "/v1/rerank", methods=["POST", "PUT"], dependencies=[Depends(validate_json_request)]
+)
+async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
+    """Endpoint for reranking documents based on query relevance."""
+    return await raw_request.app.state.openai_serving_rerank.handle_request(
+        request, raw_request
+    )
+
+
 def _create_error_response(e):
     return ORJSONResponse(
         {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
@@ -851,6 +893,15 @@ def launch_server(
         add_prometheus_middleware(app)
         enable_func_timer()
 
+    image_token_text = None
+    if (
+        tokenizer_manager.image_token_id is not None
+        and not server_args.skip_tokenizer_init
+    ):
+        image_token_text = tokenizer_manager.tokenizer.decode(
+            [tokenizer_manager.image_token_id]
+        )
+
     # Send a warmup request - we will create the thread launch it
     # in the lifespan after all other warmups have fired.
     warmup_thread = threading.Thread(
@@ -858,7 +909,7 @@ def launch_server(
         args=(
             server_args,
             pipe_finish_writer,
-            _global_state.tokenizer_manager.image_token_id,
+            image_token_text,
             launch_callback,
         ),
     )
@@ -987,9 +1038,10 @@ def _wait_and_warmup(
         return
 
     # Debug print
-    # logger.info(f"{res.json()=}")
+    # logger.info(f"warmup request returns: {res.json()=}")
 
     logger.info("The server is fired up and ready to roll!")
+
     if pipe_finish_writer is not None:
         pipe_finish_writer.send("ready")
 
