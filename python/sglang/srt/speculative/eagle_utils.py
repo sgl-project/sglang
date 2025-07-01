@@ -21,19 +21,22 @@ from sglang.srt.managers.schedule_batch import (
     get_last_loc,
     global_server_args_dict,
 )
-from sglang.srt.mem_cache.memory_pool import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sglang.srt.utils import fast_topk, is_cuda, is_hip, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
+
+logger = logging.getLogger(__name__)
 
 if is_cuda():
     from sgl_kernel import (
+        fast_topk,
         top_k_renorm_prob,
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
         verify_tree_greedy,
     )
 elif is_hip():
-    from sgl_kernel import verify_tree_greedy
+    from sgl_kernel import fast_topk, verify_tree_greedy
 
 
 logger = logging.getLogger(__name__)
@@ -68,6 +71,8 @@ class EagleDraftInput:
     kv_indices: torch.Tensor = None
 
     def prepare_for_extend(self, batch: ScheduleBatch):
+        if batch.forward_mode.is_idle():
+            return
         # Prefill only generate 1 token.
         assert len(self.verified_id) == len(batch.seq_lens)
 
@@ -78,6 +83,25 @@ class EagleDraftInput:
                 (input_ids[1:], self.verified_id[i].reshape(1))
             )
             pt += extend_len
+
+    @classmethod
+    def create_idle_input(
+        cls,
+        device: torch.device,
+        hidden_size: int,
+        dtype: torch.dtype,
+        topk: int,
+        capture_hidden_mode: CaptureHiddenMode,
+    ):
+        return cls(
+            verified_id=None,
+            hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
+            topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
+            topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
+            capture_hidden_mode=capture_hidden_mode,
+            accept_length=torch.empty((0,), device=device, dtype=torch.int32),
+            accept_length_cpu=[],
+        )
 
     def prepare_extend_after_decode(
         self,
@@ -192,7 +216,35 @@ class EagleVerifyInput:
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
 
+    @classmethod
+    def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
+        return cls(
+            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
+            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
+            retrive_index=torch.full(
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+            ),
+            retrive_next_token=torch.full(
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+            ),
+            retrive_next_sibling=torch.full(
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+            ),
+            retrive_cum_len=None,
+            topk=topk,
+            draft_token_num=num_verify_tokens,
+            spec_steps=spec_steps,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            seq_lens_sum=0,
+            seq_lens_cpu=torch.empty((0,), dtype=torch.int32),
+        )
+
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
+
+        if batch.forward_mode.is_idle():
+            return
+
         batch.input_ids = self.draft_token
 
         if page_size == 1:
@@ -264,7 +316,7 @@ class EagleVerifyInput:
         self,
         batch: ScheduleBatch,
         logits_output: torch.Tensor,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
     ) -> torch.Tensor:
@@ -278,6 +330,26 @@ class EagleVerifyInput:
         tokens. I.e., logits_output.next_token_logits only contains
         accepted token logits.
         """
+        if batch.forward_mode.is_idle():
+            return EagleVerifyOutput(
+                draft_input=EagleDraftInput.create_idle_input(
+                    device=batch.device,
+                    hidden_size=batch.model_config.hidden_size,
+                    dtype=batch.model_config.dtype,
+                    topk=self.topk,
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                ),
+                logits_output=logits_output,
+                verified_id=torch.empty(0, dtype=torch.long, device=batch.device),
+                accept_length_per_req_cpu=[],
+                accepted_indices=torch.full(
+                    (0, self.spec_steps + 1),
+                    -1,
+                    dtype=torch.int32,
+                    device=batch.device,
+                ),
+            )
+
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
@@ -327,11 +399,11 @@ class EagleVerifyInput:
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=accept_length,  # mutable
-                candidates=candidates.to(torch.int32),
-                retrive_index=self.retrive_index.to(torch.int32),
-                retrive_next_token=self.retrive_next_token.to(torch.int32),
-                retrive_next_sibling=self.retrive_next_sibling.to(torch.int32),
-                target_predict=target_predict.to(torch.int32),
+                candidates=candidates,
+                retrive_index=self.retrive_index,
+                retrive_next_token=self.retrive_next_token,
+                retrive_next_sibling=self.retrive_next_sibling,
+                target_predict=target_predict,
             )
         else:
             # apply temperature and get target probs
@@ -370,12 +442,12 @@ class EagleVerifyInput:
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=accept_length,  # mutable
-                candidates=candidates.to(torch.int32),
-                retrive_index=self.retrive_index.to(torch.int32),
-                retrive_next_token=self.retrive_next_token.to(torch.int32),
-                retrive_next_sibling=self.retrive_next_sibling.to(torch.int32),
+                candidates=candidates,
+                retrive_index=self.retrive_index,
+                retrive_next_token=self.retrive_next_token,
+                retrive_next_sibling=self.retrive_next_sibling,
                 uniform_samples=coins,
-                # uniform_samples_for_final_sampling=coins_for_final_sampling,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
                 target_probs=target_probs,
                 draft_probs=draft_probs,
                 threshold_single=global_server_args_dict[
@@ -991,10 +1063,11 @@ def select_top_k_tokens(
         topk_index = topk_index.reshape(-1, topk**2)
         input_ids = torch.gather(topk_index, index=topk_cs_index, dim=1).flatten()
 
-        selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
-            0, hidden_states.shape[0], step=topk, device="cuda"
-        ).repeat_interleave(topk)
-        hidden_states = hidden_states[selected_input_index, :]
+        if hidden_states.shape[0] > 0:
+            selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
+                0, hidden_states.shape[0], step=topk, device="cuda"
+            ).repeat_interleave(topk)
+            hidden_states = hidden_states[selected_input_index, :]
 
         tree_info = (
             expand_scores,  # shape: (b, topk, topk)
@@ -1003,16 +1076,6 @@ def select_top_k_tokens(
         )
 
     return input_ids, hidden_states, scores, tree_info
-
-
-def fast_topk_torch(values, topk, dim):
-    if topk == 1:
-        # Use max along the specified dimension to get both value and index
-        max_value, max_index = torch.max(values, dim=dim)
-        return max_value.unsqueeze(1), max_index.unsqueeze(1)
-    else:
-        # Use topk for efficiency with larger k values
-        return torch.topk(values, topk, dim=dim)
 
 
 def _generate_simulated_accept_index(
