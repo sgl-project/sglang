@@ -640,7 +640,7 @@ void fp8_blockwise_scaled_grouped_mm(
 #endif
 #endif
 
-#if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED) && defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
+#if defined(CUTLASS_ARCH_MMA_SM90_SUPPORTED) &&  defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
   if (sm_version == 90 && a.size(1) > 256) {
     if (output.scalar_type() == torch::kBFloat16) {
       sm90_fp8_blockwise_group_mm_dispatch_shape<cutlass::bfloat16_t>(
