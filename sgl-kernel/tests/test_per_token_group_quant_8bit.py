@@ -152,7 +152,7 @@ def test_per_token_group_quant_with_column_major(
             msg=lambda message: message + f" {x_s_triton=} {x_s_sglang=}",
         )
     except AssertionError:
-        if d := os.environ.get("SGLANG_DUMP_TEST_ERROR_DIR"):
+        if (d := os.environ.get("SGLANG_DUMP_TEST_ERROR_DIR", "")) != "":
             import matplotlib.pyplot as plt
             base_stem = time.time()
             for name, value in [
