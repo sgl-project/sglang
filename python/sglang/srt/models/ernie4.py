@@ -472,6 +472,9 @@ class Ernie4_5_ForCausalLM(nn.Module):
                 else:
                     raise KeyError(f"Parameter '{name}' not found in model.")
 
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
 
 class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
