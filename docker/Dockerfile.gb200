@@ -99,6 +99,9 @@ RUN cd /sgl-workspace/DeepEP && DEEPEP_NVCC_LINEINFO=1 CUDA_HOME=/usr/local/cuda
 # --- Misc Python tools ---
 RUN uv pip install typer httpx openai netifaces
 
+# -- Install VIM ---
+RUN apt update && apt install vim
+
 # --- Entrypoint ---
 WORKDIR /sgl-workspace
 CMD ["/bin/bash"]
