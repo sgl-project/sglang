@@ -342,7 +342,8 @@ def per_token_group_quant_8bit(
             device=x.device,
             dtype=dst_dtype,
         )
-        output_scale_for_kernel = torch.empty(
+        # NOTE use `zeros` for easier testing
+        output_scale_for_kernel = torch.zeros(
             (*x.shape[:-1], x.shape[-1] // 2 // group_size),
             device=x.device,
             dtype=torch.float32,
