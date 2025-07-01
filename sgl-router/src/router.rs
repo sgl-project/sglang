@@ -755,7 +755,7 @@ impl Router {
             let first_worker_url = {
                 let worker_urls_guard = worker_urls
                     .read()
-                    .expect("Failed to lock worker urls, worker urls Mutex is poisoned");
+                    .expect("Failed to read worker urls: RwLock poisoned");
                 if worker_urls_guard.is_empty() {
                     return Err("No workers available for CacheAware routing".to_string());
                 }
@@ -768,9 +768,8 @@ impl Router {
             {
                 let running_queue_read_guard = running_queue
                     .read()
-                    .expect("Failed to read running_queue: RwLock poisoned");
+                    .expect("Failed to read running queue: RwLock poisoned");
 
-                // Efficiently get min and max load in one pass, handling empty map.
                 let (mut min_load, mut max_load) = running_queue_read_guard
                     .values()
                     .fold((usize::MAX, 0), |(min, max), &load| {
@@ -829,14 +828,12 @@ impl Router {
             // --- 3. Update Queues and Tree (Write Operations) ---
             let mut running_queue_locked = running_queue
                 .write()
-                .expect("Failed to lock running queue, running queue Mutex is poisoned");
+                .expect("Failed to lock running queue: RwLock poisoned");
             if let Some(count) = running_queue_locked.get_mut(&selected_url) {
                 *count += 1;
                 gauge!("sgl_router_running_requests", "worker" => selected_url.to_string())
                     .set(*count as f64);
             } else {
-                // This indicates a critical state inconsistency: a selected_url
-                // that was not among the initially known workers.
                 error!(
                     "Selected worker URL '{}' not found in pre-initialized running queue. This indicates a logic error.",
                     selected_url
@@ -850,17 +847,12 @@ impl Router {
 
             let mut processed_queue_locked = processed_queue
                 .lock()
-                .expect("Failed to lock processed queue, processed queue Mutex is poisoned");
+                .expect("Failed to lock processed queue: Mutex poisoned");
             if let Some(count) = processed_queue_locked.get_mut(&selected_url) {
                 *count += 1;
-                // Using counter for total processed requests.
                 counter!("sgl_router_processed_requests_total", "worker" => selected_url.to_string())
                     .increment(1);
-                // Optional: if you need a gauge for total processed too.
-                gauge!("sgl_router_processed_requests_gauge", "worker" => selected_url.to_string())
-                    .set(*count as f64);
             } else {
-                // This also indicates a critical state inconsistency.
                 error!(
                     "Selected worker URL '{}' not found in pre-initialized processed queue. This indicates a logic error.",
                     selected_url
@@ -873,7 +865,7 @@ impl Router {
             drop(processed_queue_locked);
 
             tree.write()
-                .expect("Failed to lock tree, tree Mutex is poisoned")
+                .expect("Failed to write tree: RwLock poisoned")
                 .insert(&text, &selected_url);
 
             Ok(selected_url)
