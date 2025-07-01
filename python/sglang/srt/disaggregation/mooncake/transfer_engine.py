@@ -128,9 +128,12 @@ class MooncakeTransferEngine:
         peer_buffer_addresses: List[int],
         lengths: List[int],
     ) -> int:
-        """Synchronously transfer data to the specified addresses in batches."""
+        """
+        Submits a batch of transfer tasks as micro-batches without immediate result queries. 
+        Results for all micro-batches are queried collectively after submission.
+        """
         try:
-            micro_batch_size = get_int_env_var('SGLANG_DISAGGREGATION_MICRO_BATCH_SIZE', 256)
+            micro_batch_size = get_int_env_var('SGLANG_DISAGGREGATION_ASYNC_TRANSFER_MICRO_BATCH_SIZE', 256)
             batch_ids = []
             for i in range(0, len(lengths), micro_batch_size):
                 batch_id = self.engine.batch_transfer_async_write(

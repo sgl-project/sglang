@@ -300,7 +300,7 @@ class MooncakeKVManager(BaseKVManager):
             for i in range (0, num_small_chunks, micro_batch_size)
         ]
 
-        futures = list(zip(async_futures, sync_futures))
+        futures = async_futures + sync_futures
         for future in concurrent.futures.as_completed(futures):
             status = future.result()
             if status != 0:
@@ -417,12 +417,11 @@ class MooncakeKVManager(BaseKVManager):
         if slice_lens_per_page > get_int_env_var('SGLANG_DISAGGREGATION_LARGE_CHUNK', 20480):
             futures = [
                 executor.submit(
-                    self.engine.batch_transfer_async(
-                        mooncake_session_id,
-                        src_addr_list,
-                        dst_addr_list,
-                        length_list,
-                    )
+                    self.engine.batch_transfer_async,
+                    mooncake_session_id,
+                    src_addr_list,
+                    dst_addr_list,
+                    length_list,
                 )
             ]
         else:
