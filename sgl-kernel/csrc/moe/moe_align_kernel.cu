@@ -27,8 +27,6 @@ class alignas(Alignment) AlignedArray {
   T data[N];
 };
 
-#define WARP_SIZE 32
-
 #define VEC_SIZE 4
 using Vec = AlignedArray<int32_t, VEC_SIZE>;
 
