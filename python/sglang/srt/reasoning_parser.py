@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple, Type
 
 
 class StreamingParseResult:
@@ -32,17 +32,26 @@ class BaseReasoningFormatDetector:
         One-time parsing: Detects and parses reasoning sections in the provided text.
         Returns both reasoning content and normal text separately.
         """
-        text = text.replace(self.think_start_token, "").strip()
-        if self.think_end_token not in text:
+        in_reasoning = self._in_reasoning or text.startswith(self.think_start_token)
+
+        if not in_reasoning:
+            return StreamingParseResult(normal_text=text)
+
+        # The text is considered to be in a reasoning block.
+        processed_text = text.replace(self.think_start_token, "").strip()
+
+        if self.think_end_token not in processed_text:
             # Assume reasoning was truncated before `</think>` token
-            return StreamingParseResult(reasoning_text=text)
+            return StreamingParseResult(reasoning_text=processed_text)
 
         # Extract reasoning content
-        splits = text.split(self.think_end_token, maxsplit=1)
+        splits = processed_text.split(self.think_end_token, maxsplit=1)
         reasoning_text = splits[0]
-        text = splits[1].strip()
+        normal_text = splits[1].strip()
 
-        return StreamingParseResult(normal_text=text, reasoning_text=reasoning_text)
+        return StreamingParseResult(
+            normal_text=normal_text, reasoning_text=reasoning_text
+        )
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         """
@@ -57,10 +66,18 @@ class BaseReasoningFormatDetector:
         self._buffer += new_text
         current_text = self._buffer
 
+        # If the current text is a prefix of the think token, keep buffering
+        if any(
+            token.startswith(current_text) and token != current_text
+            for token in [self.think_start_token, self.think_end_token]
+        ):
+            return StreamingParseResult()
+
         # Strip `<think>` token if present
         if not self.stripped_think_start and self.think_start_token in current_text:
             current_text = current_text.replace(self.think_start_token, "")
             self.stripped_think_start = True
+            self._in_reasoning = True
 
         # Handle end of reasoning block
         if self._in_reasoning and self.think_end_token in current_text:
@@ -131,11 +148,29 @@ class Qwen3Detector(BaseReasoningFormatDetector):
     """
 
     def __init__(self, stream_reasoning: bool = True):
-        # Qwen3 is assumed to be reasoning until `</think>` token
+        # Qwen3 won't be in reasoning mode when user passes `enable_thinking=False`
         super().__init__(
             "<think>",
             "</think>",
-            force_reasoning=True,
+            force_reasoning=False,
+            stream_reasoning=stream_reasoning,
+        )
+
+
+class KimiDetector(BaseReasoningFormatDetector):
+    """
+    Detector for Kimi Thinking model.
+    Assumes reasoning format:
+      ◁think▷*(.*)◁/think▷
+    Returns all the text before the ◁/think▷ tag as `reasoning_text`
+    and the rest of the text as `normal_text`.
+    """
+
+    def __init__(self, stream_reasoning: bool = True):
+        super().__init__(
+            "◁think▷",
+            "◁/think▷",
+            force_reasoning=False,
             stream_reasoning=stream_reasoning,
         )
 
@@ -151,12 +186,13 @@ class ReasoningParser:
             If True, streams reasoning content as it arrives.
     """
 
-    DetectorMap: Dict[str, BaseReasoningFormatDetector] = {
+    DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
         "qwen3": Qwen3Detector,
+        "kimi": KimiDetector,
     }
 
-    def __init__(self, model_type: str = None, stream_reasoning: bool = True):
+    def __init__(self, model_type: Optional[str] = None, stream_reasoning: bool = True):
         if not model_type:
             raise ValueError("Model type must be specified")
 

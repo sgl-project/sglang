@@ -64,6 +64,7 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.utils import (
+    _process_weight_after_loading,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
@@ -330,6 +331,12 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
                 layer.input_scale = None
+            elif _is_cpu:
+                assert (
+                    _is_cpu_amx_available
+                ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
+                _process_weight_after_loading(layer, ["weight"])
+                return
             else:
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
             layer.weight = torch.nn.Parameter(weight, requires_grad=False)
@@ -426,6 +433,17 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.block_quant:
+            if getattr(layer, "use_intel_amx_backend", False):
+                return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
+                    x,
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    self.quant_config.weight_block_size,
+                    bias,
+                    x.dtype,
+                    True,  # is_vnni
+                )
+
             return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
@@ -746,6 +764,13 @@ class Fp8MoEMethod:
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
+
+            if _is_cpu:
+                assert (
+                    _is_cpu_amx_available
+                ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
+                _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+
             return
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
@@ -971,6 +996,24 @@ class Fp8MoEMethod:
             routed_scaling_factor=routed_scaling_factor,
         )
 
+        if getattr(layer, "use_intel_amx_backend", False):
+            return torch.ops.sgl_kernel.fused_experts_cpu(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                False,  # inplace See [Note] inplace should be False in fused_experts.
+                False,  # use_int8_w8a8
+                True,  # use_fp8_w8a16
+                layer.w13_weight_scale_inv,  # w1_scale
+                layer.w2_weight_scale_inv,  # w2_scale
+                self.quant_config.weight_block_size,  # block_size
+                None,  # a1_scale
+                None,  # a2_scale
+                True,  # is_vnni
+            )
+
         if _is_hip:
             ret = self.maybe_apply_hip_fused_experts(
                 layer,
@@ -1052,15 +1095,15 @@ class Fp8MoEMethod:
         if _use_hip_int4:
             # TODO: add triton kernel and add check _use_aiter
             assert not no_combine, f"{no_combine=} is not supported."
-            return ck_moe_2stages(
+            return fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                QuantType.per_Token,
-                layer.w13_weight_scale1,
-                layer.w2_weight_scale1,
+                quant_type=QuantType.per_Token,
+                w1_scale=layer.w13_weight_scale1,
+                w2_scale=layer.w2_weight_scale1,
                 activation=(
                     ActivationType.Silu if activation == "silu" else ActivationType.Gelu
                 ),
@@ -1086,15 +1129,15 @@ class Fp8MoEMethod:
                     expert_mask=None,
                 )
             else:
-                return ck_moe_2stages(
+                return fused_moe(
                     x,
                     layer.w13_weight,
                     layer.w2_weight,
                     topk_weights,
                     topk_ids,
-                    QuantType.per_Token,
-                    layer.w13_weight_scale1,
-                    layer.w2_weight_scale1,
+                    quant_type=QuantType.per_Token,
+                    w1_scale=layer.w13_weight_scale1,
+                    w2_scale=layer.w2_weight_scale1,
                     activation=(
                         ActivationType.Silu
                         if activation == "silu"
