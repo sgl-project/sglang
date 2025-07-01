@@ -584,20 +584,14 @@ class DefaultModelLoader(BaseModelLoader):
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
-                model = _initialize_model(model_config, self.load_config)
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                )
 
-            model.load_weights(self._get_all_weights(model_config, model))
-
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    # When quant methods need to process weights after loading
-                    # (for repacking, quantizing, etc), they expect parameters
-                    # to be on the global target device. This scope is for the
-                    # case where cpu offloading is used, where we will move the
-                    # parameters onto device for processing and back off after.
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
+            self.load_weights_and_postprocess(
+                model, self._get_all_weights(model_config, model), target_device
+            )
 
         return model.eval()
 
