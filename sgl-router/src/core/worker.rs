@@ -287,3 +287,244 @@ pub fn urls_to_workers(urls: Vec<String>) -> Vec<Box<dyn Worker>> {
 pub fn workers_to_urls(workers: &[Box<dyn Worker>]) -> Vec<String> {
     workers.iter().map(|w| w.url().to_string()).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_basic_worker_creation_and_metadata() {
+        let worker = BasicWorker::new(
+            "http://localhost:8000".to_string(),
+            WorkerType::Prefill { bootstrap_port: Some(9000) }
+        );
+        
+        assert_eq!(worker.url(), "http://localhost:8000");
+        assert_eq!(worker.worker_type(), WorkerType::Prefill { bootstrap_port: Some(9000) });
+        assert!(worker.is_healthy());
+        assert_eq!(worker.load(), 0);
+        assert_eq!(worker.processed_requests(), 0);
+    }
+
+    #[test]
+    fn test_worker_load_tracking() {
+        let worker = BasicWorker::new("http://test".to_string(), WorkerType::Regular);
+        
+        // Test multiple increments and decrements
+        worker.increment_load();
+        worker.increment_load();
+        worker.increment_load();
+        assert_eq!(worker.load(), 3);
+        
+        worker.decrement_load();
+        assert_eq!(worker.load(), 2);
+        
+        // Test processed requests counter
+        worker.increment_processed();
+        worker.increment_processed();
+        assert_eq!(worker.processed_requests(), 2);
+    }
+
+    #[test]
+    fn test_worker_health_management() {
+        let worker = BasicWorker::new("http://test".to_string(), WorkerType::Decode);
+        
+        // Initially healthy
+        assert!(worker.is_healthy());
+        assert!(worker.check_health().is_ok());
+        
+        // Set unhealthy and verify behavior
+        worker.set_healthy(false);
+        assert!(!worker.is_healthy());
+        
+        let health_result = worker.check_health();
+        assert!(health_result.is_err());
+        if let Err(WorkerError::HealthCheckFailed { url, reason: _ }) = health_result {
+            assert_eq!(url, "http://test");
+        }
+        
+        // Restore health
+        worker.set_healthy(true);
+        assert!(worker.is_healthy());
+        assert!(worker.check_health().is_ok());
+    }
+
+    #[test]
+    fn test_worker_factory_different_types() {
+        let regular = WorkerFactory::create_regular("http://regular".to_string());
+        let prefill = WorkerFactory::create_prefill("http://prefill".to_string(), Some(8080));
+        let decode = WorkerFactory::create_decode("http://decode".to_string());
+        
+        assert_eq!(regular.worker_type(), WorkerType::Regular);
+        assert_eq!(prefill.worker_type(), WorkerType::Prefill { bootstrap_port: Some(8080) });
+        assert_eq!(decode.worker_type(), WorkerType::Decode);
+        
+        assert_eq!(regular.url(), "http://regular");
+        assert_eq!(prefill.url(), "http://prefill");
+        assert_eq!(decode.url(), "http://decode");
+    }
+
+    #[test]
+    fn test_worker_factory_batch_creation() {
+        let regular_urls = vec!["http://r1".to_string(), "http://r2".to_string()];
+        let prefill_urls = vec![
+            ("http://p1".to_string(), Some(8080)),
+            ("http://p2".to_string(), None)
+        ];
+        let decode_urls = vec!["http://d1".to_string()];
+        
+        let (regular_workers, prefill_workers, decode_workers) = 
+            WorkerFactory::create_from_urls(regular_urls, prefill_urls, decode_urls);
+        
+        assert_eq!(regular_workers.len(), 2);
+        assert_eq!(prefill_workers.len(), 2);
+        assert_eq!(decode_workers.len(), 1);
+        
+        assert_eq!(regular_workers[0].url(), "http://r1");
+        assert_eq!(prefill_workers[1].worker_type(), WorkerType::Prefill { bootstrap_port: None });
+        assert_eq!(decode_workers[0].worker_type(), WorkerType::Decode);
+    }
+
+    #[test]
+    fn test_worker_collection_operations() {
+        let mut workers: Vec<Box<dyn Worker>> = vec![
+            WorkerFactory::create_regular("http://healthy1".to_string()),
+            WorkerFactory::create_regular("http://unhealthy".to_string()),
+            WorkerFactory::create_regular("http://healthy2".to_string()),
+        ];
+        
+        // Set different health states
+        workers[1].set_healthy(false);
+        
+        // Add some load
+        workers[0].increment_load();
+        workers[0].increment_load();
+        workers[2].increment_load();
+        
+        // Test healthy_workers
+        let healthy = workers.healthy_workers();
+        assert_eq!(healthy.len(), 2);
+        assert_eq!(healthy[0].url(), "http://healthy1");
+        assert_eq!(healthy[1].url(), "http://healthy2");
+        
+        // Test total_load
+        assert_eq!(workers.total_load(), 3);
+        
+        // Test find_worker
+        let found = workers.find_worker("http://unhealthy");
+        assert!(found.is_some());
+        assert!(!found.unwrap().is_healthy());
+        
+        let not_found = workers.find_worker("http://nonexistent");
+        assert!(not_found.is_none());
+        
+        // Test find_worker_mut
+        let found_mut = workers.find_worker_mut("http://healthy1");
+        assert!(found_mut.is_some());
+    }
+
+    #[test]
+    fn test_worker_type_display() {
+        assert_eq!(format!("{}", WorkerType::Regular), "Regular");
+        assert_eq!(format!("{}", WorkerType::Decode), "Decode");
+        assert_eq!(format!("{}", WorkerType::Prefill { bootstrap_port: Some(8080) }), "Prefill(bootstrap:8080)");
+        assert_eq!(format!("{}", WorkerType::Prefill { bootstrap_port: None }), "Prefill");
+    }
+
+    #[test]
+    fn test_worker_with_custom_configuration() {
+        let mut labels = HashMap::new();
+        labels.insert("env".to_string(), "production".to_string());
+        labels.insert("region".to_string(), "us-west".to_string());
+        
+        let health_config = HealthConfig {
+            timeout_secs: 10,
+            check_interval_secs: 60,
+            endpoint: "/custom-health".to_string(),
+        };
+        
+        let worker = BasicWorker::new("http://configured".to_string(), WorkerType::Regular)
+            .with_labels(labels.clone())
+            .with_health_config(health_config.clone());
+        
+        let metadata = worker.metadata();
+        assert_eq!(metadata.labels.get("env").unwrap(), "production");
+        assert_eq!(metadata.labels.get("region").unwrap(), "us-west");
+        assert_eq!(metadata.health_config.timeout_secs, 10);
+        assert_eq!(metadata.health_config.endpoint, "/custom-health");
+    }
+
+    #[test]
+    fn test_worker_concurrent_access() {
+        use std::sync::Arc;
+        use std::thread;
+        
+        let worker = Arc::new(BasicWorker::new("http://concurrent".to_string(), WorkerType::Regular));
+        let num_threads = 10;
+        let operations_per_thread = 100;
+        
+        let mut handles = vec![];
+        
+        // Spawn threads that concurrently increment load and processed counters
+        for thread_id in 0..num_threads {
+            let worker_clone = Arc::clone(&worker);
+            let handle = thread::spawn(move || {
+                for _ in 0..operations_per_thread {
+                    worker_clone.increment_load();
+                    worker_clone.increment_processed();
+                    
+                    // Occasionally toggle health status to test concurrent health management
+                    if thread_id % 3 == 0 {
+                        worker_clone.set_healthy(false);
+                        worker_clone.set_healthy(true);
+                    }
+                }
+                
+                // Decrement some load at the end
+                for _ in 0..(operations_per_thread / 2) {
+                    worker_clone.decrement_load();
+                }
+            });
+            handles.push(handle);
+        }
+        
+        // Wait for all threads to complete
+        for handle in handles {
+            handle.join().expect("Thread panicked");
+        }
+        
+        // Verify final state
+        let expected_load = num_threads * operations_per_thread - num_threads * (operations_per_thread / 2);
+        let expected_processed = num_threads * operations_per_thread;
+        
+        assert_eq!(worker.load(), expected_load);
+        assert_eq!(worker.processed_requests(), expected_processed);
+        assert!(worker.is_healthy()); // Should end up healthy
+        
+        // Verify basic functionality still works after concurrent access
+        assert_eq!(worker.url(), "http://concurrent");
+        assert_eq!(worker.worker_type(), WorkerType::Regular);
+        assert!(worker.check_health().is_ok());
+    }
+
+    #[test]
+    fn test_urls_conversion_functions() {
+        let urls = vec![
+            "http://worker1".to_string(),
+            "http://worker2".to_string(),
+            "http://worker3".to_string(),
+        ];
+        
+        let workers = urls_to_workers(urls.clone());
+        assert_eq!(workers.len(), 3);
+        
+        let converted_urls = workers_to_urls(&workers);
+        assert_eq!(converted_urls, urls);
+        
+        // Verify all workers are Regular type
+        for worker in &workers {
+            assert_eq!(worker.worker_type(), WorkerType::Regular);
+        }
+    }
+}
