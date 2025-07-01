@@ -170,7 +170,7 @@ struct NaiveScheduler {
 };
 
 struct MaskedLayoutScheduler {
-  // TODO not good
+  // TODO can be dynamically determined (which may be good when num rank is small)
   static constexpr int TOKEN_DIM_BLOCK_NUM_PER_EXPERT = 1024;
   static constexpr int SUBWARPS_PER_BLOCK = 16;
 
