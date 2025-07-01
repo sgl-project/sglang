@@ -105,7 +105,7 @@ def fused_moe_sglang_api(
         w2,
         input_gating,
         topk,
-        renormalize=True,
+        renormalize=False,
         inplace=True,
         use_fp8_w8a8=use_fp8_w8a8,
         w1_scale=w1_scale,
@@ -119,7 +119,7 @@ def fused_moe_sglang_api(
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["batch_size"],
-        x_vals=list([128, 256, 512, 1024, 2048, 4096]),
+        x_vals=list([128, 256, 512, 1024, 2048, 4096, 8192]),
         line_arg="provider",
         line_vals=[
             "sglang_fused_moe_triton_v340",
@@ -138,7 +138,13 @@ def fused_moe_sglang_api(
         args={},
     )
 )
-def benchmark(batch_size, provider, model_config, use_fp8_w8a8=False):
+def benchmark(
+    batch_size,
+    provider,
+    model_config,
+    use_fp8_w8a8=False,
+    use_cuda_graph: bool = False,
+):
     print(f"benchmark {provider} with batch_size={batch_size}")
     torch.set_default_device("cuda")
     torch.cuda.manual_seed_all(0)
@@ -159,6 +165,11 @@ def benchmark(batch_size, provider, model_config, use_fp8_w8a8=False):
         num_experts, hidden_size, shard_intermediate_size // 2, dtype=dtype
     )
 
+    w1_tri = w1.clone()
+    w2_tri = w2.clone()
+    w1_tri = w1_tri.transpose(-2, -1).contiguous()
+    w2_tri = w2_tri.transpose(-2, -1).contiguous()
+
     input_gating = torch.randn(num_tokens, num_experts, dtype=torch.float32)
 
     # Warmup
@@ -171,8 +182,8 @@ def benchmark(batch_size, provider, model_config, use_fp8_w8a8=False):
         if provider == "sglang_fused_moe_triton_v340":
             y = fused_moe_triton_api(
                 x,
-                w1,
-                w2,
+                w1_tri,
+                w2_tri,
                 input_gating,
                 topk,
             )
@@ -192,38 +203,46 @@ def benchmark(batch_size, provider, model_config, use_fp8_w8a8=False):
             )
     torch.cuda.synchronize()
 
-    quantiles = [0.5, 0.2, 0.8]
+    if use_cuda_graph:
+        stream = torch.cuda.Stream()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            (
+                fused_moe_triton_api(x, w1_tri, w2_tri, input_gating, topk)
+                if provider == "sglang_fused_moe_triton_v340"
+                else fused_moe_sglang_api(
+                    x,
+                    w1,
+                    w2,
+                    input_gating,
+                    topk,
+                    use_fp8_w8a8=use_fp8_w8a8,
+                    block_shape=block_shape,
+                )
+            )
+        torch.cuda.synchronize()
 
-    if provider == "sglang_fused_moe_triton_v340":
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: api_func(
-                x,
-                w1,
-                w2,
-                input_gating,
-                topk,
-            )[0],
-            quantiles=quantiles,
-        )
-        return ms, min_ms, max_ms
+        bench_lambda = lambda: graph.replay()
     else:
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: api_func(
+        if provider == "sglang_fused_moe_triton_v340":
+            bench_lambda = lambda: fused_moe_triton_api(
+                x, w1_tri, w2_tri, input_gating, topk
+            )[0]
+        else:
+            bench_lambda = lambda: fused_moe_sglang_api(
                 x,
                 w1,
                 w2,
                 input_gating,
                 topk,
                 use_fp8_w8a8=use_fp8_w8a8,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                a1_scale=a1_scale,
-                a2_scale=a2_scale,
                 block_shape=block_shape,
-            )[0],
-            quantiles=quantiles,
-        )
-        return ms, min_ms, max_ms
+            )[0]
+
+    quantiles = [0.5, 0.2, 0.8]
+
+    ms, min_ms, max_ms = triton.testing.do_bench(bench_lambda, quantiles=quantiles)
+    return ms, min_ms, max_ms
 
 
 def main():
@@ -234,10 +253,14 @@ def main():
     parser.add_argument("--tp-size", type=int, default=2)
     parser.add_argument("--use-fp8-w8a8", action="store_true")
     parser.add_argument(
+        "--use-cuda-graph", action="store_true", help="Enable CUDA Graph capture/replay"
+    )
+    parser.add_argument(
         "--save-path",
         type=str,
         default="./configs/benchmark_ops/sglang_fused_moe/",
     )
+    parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
 
     try:
@@ -269,6 +292,7 @@ def main():
             save_path=args.save_path,
             model_config=model_config,
             use_fp8_w8a8=args.use_fp8_w8a8,
+            use_cuda_graph=args.use_cuda_graph,
         )
     finally:
         destroy_model_parallel()

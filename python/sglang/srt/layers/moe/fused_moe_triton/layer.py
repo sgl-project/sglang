@@ -21,6 +21,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -501,8 +502,10 @@ class FusedMoE(torch.nn.Module):
         self.inplace = inplace
         self.no_combine = no_combine
 
-        # TODO(yuan-luo): Use server_args.
-        self.use_triton_kernels = True
+        if global_server_args_dict["use_triton_kernels"]:
+            self.use_triton_kernels = True
+        else:
+            self.use_triton_kernels = False
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
