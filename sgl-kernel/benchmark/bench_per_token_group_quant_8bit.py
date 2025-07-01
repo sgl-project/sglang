@@ -23,23 +23,19 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 
 if int(os.environ.get("SGLANG_NSYS_PROFILING", "0")):
-    configs = list(
-        itertools.product(
-            [768],
-            [16384],
-            [128],
-            [fp8_type_],
-            [
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                    fuse_silu_and_mul=False,
-                    masked_layout_mode=None,
-                ),
-            ],
-        )
-    )
+    configs = [[
+        768,
+        16384,
+        128,
+        fp8_type_,
+        dict(
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+            fuse_silu_and_mul=False,
+            masked_layout_mode=None,
+        ),
+    ]]
 else:
     configs = list(
         itertools.product(
