@@ -751,19 +751,37 @@ impl Router {
             ..
         } = self
         {
+            // --- 1. Validate Worker URLs & Get Fallback ---
             let first_worker_url = {
-            if worker_urls.read().unwrap().is_empty() {
-                return Err("No workers available for CacheAware routing".to_string());
-            }
-            worker_urls.read().unwrap()[0].clone()
-        };
+                let worker_urls_guard = worker_urls
+                    .read()
+                    .expect("Failed to lock worker urls, worker urls Mutex is poisoned");
+                if worker_urls_guard.is_empty() {
+                    return Err("No workers available for CacheAware routing".to_string());
+                }
+                worker_urls_guard[0].clone()
+            };
 
-            // TODO: delay scheduling if cache hit rate is high because it may cause imbalance. prioritize low hit rate ones
-            let mut selected_url = None;
+            let selected_url: String;
+
+            // --- 2. Determine Load Balancing or Cache-Aware Routing ---
             {
-                let running_queue_snapshot = running_queue.read().unwrap();
-                let max_load = *running_queue_snapshot.values().max().unwrap_or(&0);
-                let min_load = *running_queue_snapshot.values().min().unwrap_or(&0);
+                let running_queue_read_guard = running_queue
+                    .read()
+                    .expect("Failed to read running_queue: RwLock poisoned");
+
+                // Efficiently get min and max load in one pass, handling empty map.
+                let (mut min_load, mut max_load) = running_queue_read_guard
+                    .values()
+                    .fold((usize::MAX, 0), |(min, max), &load| {
+                        (min.min(load), max.max(load))
+                    });
+
+                // Adjust for empty queue case (where min_load remains usize::MAX)
+                if running_queue_read_guard.is_empty() {
+                    min_load = 0;
+                    max_load = 0;
+                }
 
                 // Load is considered imbalanced if:
                 // 1. (max - min) > abs_threshold AND
@@ -772,96 +790,87 @@ impl Router {
                     && (max_load as f32) > (min_load as f32 * balance_rel_threshold);
 
                 if is_imbalanced {
-                    // Log load balancing trigger and current queue state
                     info!(
                         "Load balancing triggered due to workload imbalance:\n\
-                                Max load: {}, Min load: {}",
-                        max_load, min_load
+                        Max load: {}, Min load: {}\n\
+                        Current running queue: {:?}",
+                        max_load, min_load, running_queue_read_guard
                     );
 
                     counter!("sgl_router_load_balancing_events_total").increment(1);
                     gauge!("sgl_router_max_load").set(max_load as f64);
                     gauge!("sgl_router_min_load").set(min_load as f64);
 
-                    // Use shortest queue routing when load is imbalanced
-                    // NOTE: The selected url is always `Some(url)` in case of imbalanced load,
-                    // and `None` in case of balanced load.
-                    selected_url = Some(
-                        running_queue_snapshot
-                            .iter()
-                            .min_by_key(|(_url, &count)| count)
-                            .map(|(url, _)| url.clone())
-                            .unwrap_or_else(|| first_worker_url.clone()),
-                    );
-                }
-            };
-
-            if selected_url.is_none() {
-                // Use cache-aware routing when load is balanced
-                let (matched_text, matched_worker) = {
-                    let tree = tree.read().expect("Failed to lock tree, tree Mutex is poisoned");
-                    tree.prefix_match(&text)
-                };
-
-                let matched_rate =
-                    matched_text.chars().count() as f32 / text.chars().count() as f32;
-
-                if matched_rate > *cache_threshold {
-                    counter!("sgl_router_cache_hits_total").increment(1);
-                    selected_url = Some(matched_worker.to_string());
+                    // Find the worker with the shortest queue.
+                    selected_url = running_queue_read_guard
+                        .iter()
+                        .min_by_key(|(_url, &count)| count)
+                        .map(|(url, _)| url.clone())
+                        .unwrap_or_else(|| first_worker_url.clone());
                 } else {
-                    counter!("sgl_router_cache_misses_total").increment(1);
-                    selected_url = Some(
-                        tree.read()
-                            .expect("Failed to lock tree, tree Mutex is poisoned")
-                            .get_smallest_tenant(),
-                    );
-                }
-            };
+                    let tree_read_guard = tree
+                        .read()
+                        .expect("Failed to read lock tree: RwLock poisoned");
 
-            let selected_url =
-                selected_url.unwrap_or_else(|| first_worker_url.clone());
+                    let (matched_text, matched_worker) = tree_read_guard.prefix_match(text);
+                    let matched_rate =
+                        matched_text.chars().count() as f32 / text.chars().count() as f32;
 
-            // Update queues and tree
-            {
-                let mut running_queue_locked = running_queue
-                    .write()
-                    .expect("Failed to lock running queue, running queue Mutex is poisoned");
-                if let Some(count) = running_queue_locked.get_mut(&selected_url) {
-                    *count += 1;
-                    gauge!("sgl_router_running_requests", "worker" => selected_url.to_string())
-                        .set(*count as f64);
-                } else {
-                    error!(
-                        "Selected worker URL not found in running queue: {}",
-                        selected_url
-                    );
-                    return Err(format!(
-                        "Selected worker URL not found in running queue: {}",
-                        selected_url
-                    ));
+                    if matched_rate > *cache_threshold {
+                        counter!("sgl_router_cache_hits_total").increment(1);
+                        selected_url = matched_worker;
+                    } else {
+                        counter!("sgl_router_cache_misses_total").increment(1);
+                        selected_url = tree_read_guard.get_smallest_tenant();
+                    }
                 }
-            };
+            }
 
-            {
-                let mut processed_queue_locked = processed_queue
-                    .lock()
-                    .expect("Failed to lock processed queue, processed queue Mutex is poisoned");
-                if let Some(count) = processed_queue_locked.get_mut(&selected_url) {
-                    *count += 1;
-                    gauge!("sgl_router_processed_requests", "worker" => selected_url.to_string())
-                        .set(*count as f64);
-                } else {
-                    error!(
-                        "Selected worker URL not found in processed queue: {}",
-                        selected_url
-                    );
-                    return Err(format!(
-                        "Selected worker URL not found in processed queue: {}",
-                        selected_url
-                    ));
-                }
-            };
+            // --- 3. Update Queues and Tree (Write Operations) ---
+            let mut running_queue_locked = running_queue
+                .write()
+                .expect("Failed to lock running queue, running queue Mutex is poisoned");
+            if let Some(count) = running_queue_locked.get_mut(&selected_url) {
+                *count += 1;
+                gauge!("sgl_router_running_requests", "worker" => selected_url.to_string())
+                    .set(*count as f64);
+            } else {
+                // This indicates a critical state inconsistency: a selected_url
+                // that was not among the initially known workers.
+                error!(
+                    "Selected worker URL '{}' not found in pre-initialized running queue. This indicates a logic error.",
+                    selected_url
+                );
+                return Err(format!(
+                    "Internal error: Selected worker URL '{}' not found in running queue.",
+                    selected_url
+                ));
+            }
+            drop(running_queue_locked);
+
+            let mut processed_queue_locked = processed_queue
+                .lock()
+                .expect("Failed to lock processed queue, processed queue Mutex is poisoned");
+            if let Some(count) = processed_queue_locked.get_mut(&selected_url) {
+                *count += 1;
+                // Using counter for total processed requests.
+                counter!("sgl_router_processed_requests_total", "worker" => selected_url.to_string())
+                    .increment(1);
+                // Optional: if you need a gauge for total processed too.
+                gauge!("sgl_router_processed_requests_gauge", "worker" => selected_url.to_string())
+                    .set(*count as f64);
+            } else {
+                // This also indicates a critical state inconsistency.
+                error!(
+                    "Selected worker URL '{}' not found in pre-initialized processed queue. This indicates a logic error.",
+                    selected_url
+                );
+                return Err(format!(
+                    "Internal error: Selected worker URL '{}' not found in processed queue.",
+                    selected_url
+                ));
+            }
+            drop(processed_queue_locked);
 
             tree.write()
                 .expect("Failed to lock tree, tree Mutex is poisoned")
