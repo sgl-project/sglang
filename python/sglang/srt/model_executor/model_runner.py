@@ -471,10 +471,6 @@ class ModelRunner:
             if self.model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
 
-        if self.is_hybrid and not server_args.disable_radix_cache:
-            logger.info("Automatically disable radix cache for hybrid cache.")
-            server_args.disable_radix_cache = True
-
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
 
