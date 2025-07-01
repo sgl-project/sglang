@@ -58,7 +58,11 @@ __global__ void ep_moe_act_and_mul_cuda_kernel(
   if (expert_id < start_expert_id || expert_id > end_expert_id) return;
 
   if (thread_idx == 0) { 
-    float scale_f = scales ? (1.f / scales[expert_id - start_expert_id]) : 1.f;
+    float scale_f = 1.f;
+    if (scales) { 
+      const float s = scales[expert_id - start_expert_id];
+      scale_f = (s != 0.f) ? (1.f / s) : 1.f;
+    }
     shared_scale = static_cast<scalar_t>(scale_f);
   }
   __syncthreads();
