@@ -231,7 +231,9 @@ class MoEGate(nn.Module):
             and self.weight.shape[0] == 256
             and get_device_sm() >= 90
         ):
-            logits = dsv3_router_gemm(hidden_states, self.weight)
+            logits = dsv3_router_gemm(hidden_states, self.weight).to(
+                hidden_states.dtype
+            )
         else:
             logits = F.linear(hidden_states, self.weight, None)
 
