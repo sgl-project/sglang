@@ -140,6 +140,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "                 Tensor! output_scale, Tensor! input_scale) -> ()");
   m.impl("scaled_fp4_quant", torch::kCUDA, &scaled_fp4_quant);
 
+  m.def("dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
+  m.impl("dsv3_fused_a_gemm", torch::kCUDA, &dsv3_fused_a_gemm);
+
   // Compute NVFP4 experts quantization.
   m.def(
       "scaled_fp4_experts_quant(Tensor! output, Tensor! output_scale,"
@@ -159,7 +162,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
   m.def(
       "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
-      "experts_ids, Tensor! num_tokens_post_pad, Tensor! token_cnts_buffer, Tensor! cumsum_buffer) -> ()");
+      "experts_ids, Tensor! num_tokens_post_pad, Tensor! token_cnts_buffer, Tensor! cumsum_buffer, bool "
+      "pad_sorted_token_ids) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
   m.def(
