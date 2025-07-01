@@ -1,9 +1,11 @@
 import logging
+
 import torch
 
 from sglang.srt.utils import cpu_has_amx_support
 
 logger = logging.getLogger(__name__)
+
 
 def amx_process_weight_after_loading(weight):
     if weight.device != torch.device("cpu"):
@@ -26,7 +28,9 @@ def dim_is_supported(weight):
     return OC % TILE_N == 0 and IC % TILE_K == 0
 
 
-def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
+def _amx_process_weight_after_loading(
+    module, weight_names, transpose_dims=None
+) -> None:
     # Pack weight for get better performance on CPU
     devices = {getattr(module, weight_name).device for weight_name in weight_names}
     assert len(devices) == 1, f"Expects all weights to be on the same device"
@@ -77,4 +81,6 @@ class PackWeightMethod:
         self.transpose_dims = transpose_dims
 
     def process_weights_after_loading(self, module) -> None:
-        _process_weight_after_loading(module, self.weight_names, self.transpose_dims)
+        _amx_process_weight_after_loading(
+            module, self.weight_names, self.transpose_dims
+        )

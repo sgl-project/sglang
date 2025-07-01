@@ -27,7 +27,7 @@ except ImportError:
 
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.amx_utils import _process_weight_after_loading
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -336,7 +336,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 assert (
                     _is_cpu_amx_available
                 ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
-                _process_weight_after_loading(layer, ["weight"])
+                _amx_process_weight_after_loading(layer, ["weight"])
                 return
             else:
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
@@ -770,7 +770,7 @@ class Fp8MoEMethod:
                 assert (
                     _is_cpu_amx_available
                 ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
-                _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+                _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 
             return
 

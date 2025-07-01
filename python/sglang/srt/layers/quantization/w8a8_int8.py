@@ -4,7 +4,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.amx_utils import _process_weight_after_loading
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.linear import LinearMethodBase
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -85,7 +85,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             assert (
                 _is_cpu_amx_available
             ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
-            _process_weight_after_loading(layer, ["weight"])
+            _amx_process_weight_after_loading(layer, ["weight"])
             return
 
         layer.weight = Parameter(layer.weight.t(), requires_grad=False)
@@ -236,7 +236,7 @@ class W8A8Int8MoEMethod:
             assert (
                 _is_cpu_amx_available
             ), "W8A8Int8MoEMethod on CPU requires that CPU has AMX support"
-            _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             return
 
         layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
