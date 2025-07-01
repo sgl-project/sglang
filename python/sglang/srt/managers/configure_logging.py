@@ -28,7 +28,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", type=str, default="http://localhost:30000")
     parser.add_argument("--log-requests", action="store_true")
-    parser.add_argument("--log-requests-level", type=int, default=2)
+    parser.add_argument("--log-requests-level", type=int, default=3)
     parser.add_argument(
         "--dump-requests-folder", type=str, default="/tmp/sglang_request_dump"
     )

@@ -306,7 +306,26 @@ class ModelRunner:
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
-            self.model.set_eagle3_layers_to_capture()
+            # load draft config
+            draft_model_config = ModelConfig.from_server_args(
+                server_args,
+                model_path=(server_args.speculative_draft_model_path),
+                is_draft_model=True,
+            )
+
+            try:
+                # get the aux layer from draft model config
+                eagle_config = getattr(
+                    draft_model_config.hf_config, "eagle_config", None
+                )
+                eagle_aux_hidden_state_layer_ids = eagle_config[
+                    "eagle_aux_hidden_state_layer_ids"
+                ]
+            except:
+                # if there is no aux layer, set to None
+                eagle_aux_hidden_state_layer_ids = None
+
+            self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -604,12 +623,13 @@ class ModelRunner:
         self.dtype = self.model_config.dtype
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+        self.weight_load_mem_usage = before_avail_memory - after_avail_memory
         logger.info(
             f"Load weight end. "
             f"type={type(self.model).__name__}, "
             f"dtype={self.dtype}, "
             f"avail mem={after_avail_memory:.2f} GB, "
-            f"mem usage={(before_avail_memory - after_avail_memory):.2f} GB."
+            f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
 
         # Handle the case where some ranks do not finish loading.
@@ -1250,6 +1270,7 @@ class ModelRunner:
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None
+        self.cuda_graph_mem_usage = 0
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
@@ -1265,9 +1286,10 @@ class ModelRunner:
         )
         self.cuda_graph_runner = CudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        self.cuda_graph_mem_usage = before_mem - after_mem
         logger.info(
             f"Capture cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
-            f"mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            f"mem usage={self.cuda_graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
     def apply_torch_tp(self):
