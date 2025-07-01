@@ -375,10 +375,6 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        if self.model_config.is_hybrid:
-            self.full_tokens_per_layer, self.swa_tokens_per_layer = (
-                self.tp_worker.get_tokens_per_layer_info()
-            )
         if global_server_args_dict["max_micro_batch_size"] is None:
             global_server_args_dict["max_micro_batch_size"] = max(
                 self.max_running_requests // server_args.pp_size, 1
@@ -394,6 +390,13 @@ class Scheduler(
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         global_server_args_dict.update(worker_global_server_args_dict)
         set_random_seed(self.random_seed)
+
+        # Hybrid
+        if self.model_config.is_hybrid:
+            self.sliding_window_size = self.tp_worker.sliding_window_size
+            self.full_tokens_per_layer, self.swa_tokens_per_layer = (
+                self.tp_worker.get_tokens_per_layer_info()
+            )
 
         # Print debug info
         if tp_rank == 0:
@@ -610,14 +613,10 @@ class Scheduler(
                 )
             elif self.model_config.is_hybrid:
                 assert self.server_args.disaggregation_mode == "null", "Hybrid mode does not support disaggregation yet"
-                if isinstance(self.tp_worker, TpModelWorkerClient):
-                    worker = self.tp_worker.worker
-                else:
-                    worker = self.tp_worker
                 self.tree_cache = SWARadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    sliding_window_size=worker.model_runner.sliding_window_size,
+                    sliding_window_size=self.sliding_window_size,
                     page_size=self.page_size,
                     disable=server_args.disable_radix_cache,
                 )

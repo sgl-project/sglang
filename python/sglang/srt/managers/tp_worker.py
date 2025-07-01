@@ -173,7 +173,11 @@ class TpModelWorker:
             self.model_runner.req_to_token_pool.max_context_len,
             self.model_runner.token_to_kv_pool.size,
         )
-    
+
+    @property
+    def sliding_window_size(self) -> Optional[int]:
+        return self.model_runner.sliding_window_size
+
     def get_tokens_per_layer_info(self):
         return (
             self.model_runner.full_tokens_per_layer,

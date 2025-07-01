@@ -529,6 +529,8 @@ class Req:
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.host_hit_length = 0
+        # The node to lock until for swa radix tree lock ref
+        self.is_hybrid_uuid_for_lock: Optional[int] = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -747,6 +749,7 @@ class Req:
     def reset_for_retract(self):
         self.prefix_indices = []
         self.last_node = None
+        self.is_hybrid_uuid_for_lock = None
         self.extend_input_len = 0
         self.is_retracted = True
         self.input_token_logprobs = None
@@ -1449,20 +1452,39 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return (
                 num_reqs * global_config.retract_decode_steps + headroom_for_spec_decode
             )
+        
+        def _get_available_size():
+            if self.is_hybrid:
+                return min(
+                    self.token_to_kv_pool_allocator.full_available_size(),
+                    self.token_to_kv_pool_allocator.swa_available_size(),
+                )
+            else:
+                return self.token_to_kv_pool_allocator.available_size()
 
         retracted_reqs = []
         seq_lens_cpu = self.seq_lens.cpu().numpy()
         first_iter = True
         while (
-            self.token_to_kv_pool_allocator.available_size()
-            < get_required_tokens(len(sorted_indices))
+            _get_available_size() < get_required_tokens(len(sorted_indices))
             or first_iter
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
-                assert (
-                    self.token_to_kv_pool_allocator.available_size() > 0
-                ), "No space left for only one request"
+                if self.is_hybrid:
+                    full_available_size = (
+                        self.token_to_kv_pool_allocator.full_available_size()
+                    )
+                    swa_available_size = (
+                        self.token_to_kv_pool_allocator.swa_available_size()
+                    )
+                    assert (
+                        full_available_size > 0 and swa_available_size > 0
+                    ), f"No space left for only one request in SWA mode {full_available_size=}, {swa_available_size=}"
+                else:
+                    assert (
+                        self.token_to_kv_pool_allocator.available_size() > 0
+                    ), f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
                 break
 
             first_iter = False
@@ -1494,7 +1516,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_to_token_pool.free(req.req_pool_idx)
 
                 # release the last node
-                self.tree_cache.dec_lock_ref(req.last_node)
+                if self.is_hybrid:
+                    self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+                else:
+                    self.tree_cache.dec_lock_ref(req.last_node)
 
                 # NOTE(lsyin): we should use the newly evictable memory instantly.
                 num_tokens = len(sorted_indices) * global_config.retract_decode_steps
