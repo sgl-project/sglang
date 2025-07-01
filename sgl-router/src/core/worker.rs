@@ -2,6 +2,7 @@ use super::{WorkerError, WorkerResult};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use tracing::warn;
 
 /// Core worker abstraction that represents a backend service
 pub trait Worker: Send + Sync + fmt::Debug {
@@ -175,11 +176,29 @@ impl Worker for BasicWorker {
     }
 
     fn increment_load(&self) {
-        self.load_counter.fetch_add(1, Ordering::Relaxed);
+        // Use fetch_update to safely increment with overflow protection
+        if self
+            .load_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .is_err()
+        {
+            panic!("Load counter overflowed");
+        }
     }
 
     fn decrement_load(&self) {
-        self.load_counter.fetch_sub(1, Ordering::Relaxed);
+        // Use fetch_update to safely decrement with underflow protection
+        if self
+            .load_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(1)
+            })
+            .is_err()
+        {
+            warn!("Load counter underflowed for worker {}", self.url());
+        }
     }
 
     fn processed_requests(&self) -> usize {
@@ -562,5 +581,16 @@ mod tests {
         for worker in &workers {
             assert_eq!(worker.worker_type(), WorkerType::Regular);
         }
+    }
+
+    #[test]
+    fn test_worker_load_overflow() {
+        let worker = BasicWorker::new("http://test".to_string(), WorkerType::Regular);
+        worker.increment_load();
+        assert_eq!(worker.load(), 1);
+        worker.decrement_load();
+        assert_eq!(worker.load(), 0);
+        worker.decrement_load();
+        assert_eq!(worker.load(), 0);
     }
 }
