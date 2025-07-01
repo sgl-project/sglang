@@ -36,21 +36,6 @@ if int(os.environ.get("SGLANG_NSYS_PROFILING", "0")):
     #         masked_layout_mode=None,
     #     ),
     # ]]
-    # configs = [
-    #     [
-    #         768 * 8,
-    #         2048,
-    #         128,
-    #         fp8_type_,
-    #         dict(
-    #             column_major_scales=True,
-    #             scale_tma_aligned=True,
-    #             scale_ue8m0=True,
-    #             fuse_silu_and_mul=True,
-    #             masked_layout_mode=None,
-    #         ),
-    #     ]
-    # ]
     configs = [
         [
             768 * 8,
@@ -62,7 +47,9 @@ if int(os.environ.get("SGLANG_NSYS_PROFILING", "0")):
                 scale_tma_aligned=True,
                 scale_ue8m0=True,
                 fuse_silu_and_mul=True,
-                masked_layout_mode="balanced",
+                # masked_layout_mode=None,
+                # masked_layout_mode="balanced",
+                masked_layout_mode="extreme",
             ),
         ]
     ]
