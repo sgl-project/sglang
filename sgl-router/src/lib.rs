@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 pub mod config;
+pub mod core;
 pub mod logging;
 use std::collections::HashMap;
 pub mod openai_api_types;
