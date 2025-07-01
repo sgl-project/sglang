@@ -253,6 +253,7 @@ def _get_chunked_prefill_embedding(
             continue
         embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
         items_offset = items_offset_list[i]
+        assert items_offset is not None, items_offset
         embedding_items_hash = get_embedding_hash(embedding_items_per_req)
         # if all items has been prefixed, we do not need to calculate embedding
         if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
@@ -482,7 +483,7 @@ def general_mm_embed_routine(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
     language_model: nn.Module,
-    multimodal_model: nn.Module,
+    multimodal_model: Optional[nn.Module] = None,
     data_embedding_funcs: Dict[
         Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
     ] = None,

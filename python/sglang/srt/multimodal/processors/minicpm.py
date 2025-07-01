@@ -137,11 +137,10 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
             item = MultimodalDataItem(
                 audio_features=[res["audio_features"]],
                 audio_feature_lens=res["audio_feature_lens"],
-                audio_offsets=audio_offsets,
+                offsets=audio_offsets,
                 modality=Modality.AUDIO,
             )
             items += [item]
-
         return {
             "mm_items": items,
             "input_ids": input_ids.tolist(),
