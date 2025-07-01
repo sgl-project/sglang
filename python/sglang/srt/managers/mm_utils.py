@@ -409,12 +409,11 @@ def embed_mm_inputs(
         item_flatten_list += [item for item in mm_inputs.mm_items if item is not None]
 
     embeddings, masks = [], []
-
     # 2. Get multimodal embedding separately
     # Try get mm embedding if any
     for modality in Modality.all():
         items = [
-            item for item in mm_inputs.mm_items if item.is_modality(modality=modality)
+            item for item in item_flatten_list if item.is_modality(modality=modality)
         ]
         embedder = (
             None
@@ -432,7 +431,6 @@ def embed_mm_inputs(
             )
             # calculate per request items length offset
             items_size = torch.zeros(len(mm_inputs_list) + 1, dtype=int)
-            print(f"{mm_inputs_list=}")
             items_offsets = []
             for i, mm_inputs in enumerate(mm_inputs_list):
                 mm_items = [
