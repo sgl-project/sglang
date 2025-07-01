@@ -225,7 +225,7 @@ class GroupCoordinator:
         self.device_group = None
         self.cpu_group = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
-  
+
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
                 ranks, backend=torch_distributed_backend
