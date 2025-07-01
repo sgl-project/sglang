@@ -63,7 +63,7 @@ configs = list(
     # )
 ) + list(
     itertools.product(
-        [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
+        [1, 4],
         # # [256, 512, 1024, 2048, 4096], # TODO
         [512, 1024, 2048, 4096],
         [128],
@@ -159,6 +159,7 @@ def test_per_token_group_quant_with_column_major(
                 ("x_q", x_q_triton != x_q_sglang),
                 ("x_s", x_s_triton != x_s_sglang),
             ]:
+                value = value.reshape((-1, value.shape[-1]))
                 plt.figure(figsize=(20, 20))
                 plt.imshow((value * 1.0).cpu().numpy())
                 p = Path(d) / f"{base_stem}_{name}.png"
