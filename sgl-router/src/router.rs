@@ -1,3 +1,4 @@
+use crate::core::{Worker, WorkerFactory};
 use crate::pd_router::PDRouter;
 use crate::pd_types::PDSelectionPolicy;
 use crate::tree::Tree;
@@ -30,13 +31,13 @@ pub fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
 #[derive(Debug)]
 pub enum Router {
     RoundRobin {
-        worker_urls: Arc<RwLock<Vec<String>>>,
+        workers: Arc<RwLock<Vec<Box<dyn Worker>>>>,
         current_index: AtomicUsize,
         timeout_secs: u64,
         interval_secs: u64,
     },
     Random {
-        worker_urls: Arc<RwLock<Vec<String>>>,
+        workers: Arc<RwLock<Vec<Box<dyn Worker>>>>,
         timeout_secs: u64,
         interval_secs: u64,
     },
@@ -104,7 +105,7 @@ pub enum Router {
             Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
             during the next eviction cycle.
         */
-        worker_urls: Arc<RwLock<Vec<String>>>,
+        workers: Arc<RwLock<Vec<Box<dyn Worker>>>>,
         tree: Arc<Mutex<Tree>>,
         running_queue: Arc<Mutex<HashMap<String, usize>>>,
         processed_queue: Arc<Mutex<HashMap<String, usize>>>,
@@ -192,13 +193,19 @@ impl Router {
             }
         }
 
+        // Create Worker trait objects from URLs
+        let workers: Vec<Box<dyn Worker>> = worker_urls
+            .iter()
+            .map(|url| WorkerFactory::create_regular(url.clone()))
+            .collect();
+
         // Create router based on policy...
         Ok(match policy_config {
             PolicyConfig::RandomConfig {
                 timeout_secs,
                 interval_secs,
             } => Router::Random {
-                worker_urls: Arc::new(RwLock::new(worker_urls)),
+                workers: Arc::new(RwLock::new(workers)),
                 timeout_secs,
                 interval_secs,
             },
@@ -206,7 +213,7 @@ impl Router {
                 timeout_secs,
                 interval_secs,
             } => Router::RoundRobin {
-                worker_urls: Arc::new(RwLock::new(worker_urls)),
+                workers: Arc::new(RwLock::new(workers)),
                 current_index: std::sync::atomic::AtomicUsize::new(0),
                 timeout_secs,
                 interval_secs,
@@ -221,13 +228,13 @@ impl Router {
                 interval_secs,
             } => {
                 let mut running_queue = HashMap::new();
-                for url in &worker_urls {
-                    running_queue.insert(url.clone(), 0);
+                for worker in &workers {
+                    running_queue.insert(worker.url().to_string(), 0);
                 }
 
                 let mut processed_queue = HashMap::new();
-                for url in &worker_urls {
-                    processed_queue.insert(url.clone(), 0);
+                for worker in &workers {
+                    processed_queue.insert(worker.url().to_string(), 0);
                 }
 
                 let tree = Arc::new(Mutex::new(Tree::new()));
@@ -257,12 +264,12 @@ impl Router {
                     }
                 });
 
-                for url in &worker_urls {
-                    tree.lock().unwrap().insert("", url);
+                for worker in &workers {
+                    tree.lock().unwrap().insert("", worker.url());
                 }
 
                 Router::CacheAware {
-                    worker_urls: Arc::new(RwLock::new(worker_urls)),
+                    workers: Arc::new(RwLock::new(workers)),
                     tree,
                     running_queue,
                     processed_queue,
@@ -300,9 +307,33 @@ impl Router {
     /// Get a reference to the worker URLs shared across threads
     pub fn get_worker_urls(&self) -> Arc<RwLock<Vec<String>>> {
         match self {
-            Router::RoundRobin { worker_urls, .. } => Arc::clone(worker_urls),
-            Router::Random { worker_urls, .. } => Arc::clone(worker_urls),
-            Router::CacheAware { worker_urls, .. } => Arc::clone(worker_urls),
+            Router::RoundRobin { workers, .. } => {
+                let urls = workers
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|w| w.url().to_string())
+                    .collect();
+                Arc::new(RwLock::new(urls))
+            }
+            Router::Random { workers, .. } => {
+                let urls = workers
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|w| w.url().to_string())
+                    .collect();
+                Arc::new(RwLock::new(urls))
+            }
+            Router::CacheAware { workers, .. } => {
+                let urls = workers
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|w| w.url().to_string())
+                    .collect();
+                Arc::new(RwLock::new(urls))
+            }
             Router::PrefillDecode { .. } => {
                 // For PD mode, return empty list since we manage workers differently
                 Arc::new(RwLock::new(Vec::new()))
@@ -373,13 +404,14 @@ impl Router {
 
     fn select_first_worker(&self) -> Result<String, String> {
         match self {
-            Router::RoundRobin { worker_urls, .. }
-            | Router::Random { worker_urls, .. }
-            | Router::CacheAware { worker_urls, .. } => {
-                if worker_urls.read().unwrap().is_empty() {
+            Router::RoundRobin { workers, .. }
+            | Router::Random { workers, .. }
+            | Router::CacheAware { workers, .. } => {
+                let workers_guard = workers.read().unwrap();
+                if workers_guard.is_empty() {
                     Err("No workers are available".to_string())
                 } else {
-                    Ok(worker_urls.read().unwrap()[0].clone())
+                    Ok(workers_guard[0].url().to_string())
                 }
             }
             Router::PrefillDecode { .. } => {
@@ -688,26 +720,30 @@ impl Router {
     fn select_generate_worker_from_text(&self, text: &str) -> String {
         match self {
             Router::RoundRobin {
-                worker_urls,
+                workers,
                 current_index,
                 ..
             } => {
+                let workers_guard = workers.read().unwrap();
                 let idx = current_index
                     .fetch_update(
                         std::sync::atomic::Ordering::SeqCst,
                         std::sync::atomic::Ordering::SeqCst,
-                        |x| Some((x + 1) % worker_urls.read().unwrap().len()),
+                        |x| Some((x + 1) % workers_guard.len()),
                     )
                     .unwrap();
-                worker_urls.read().unwrap()[idx].clone()
+                workers_guard[idx].url().to_string()
             }
 
-            Router::Random { worker_urls, .. } => worker_urls.read().unwrap()
-                [rand::random::<usize>() % worker_urls.read().unwrap().len()]
-            .clone(),
+            Router::Random { workers, .. } => {
+                let workers_guard = workers.read().unwrap();
+                workers_guard[rand::random::<usize>() % workers_guard.len()]
+                    .url()
+                    .to_string()
+            }
 
             Router::CacheAware {
-                worker_urls,
+                workers,
                 tree,
                 running_queue,
                 processed_queue,
@@ -747,7 +783,7 @@ impl Router {
                         .iter()
                         .min_by_key(|(_url, &count)| count)
                         .map(|(url, _)| url.clone())
-                        .unwrap_or_else(|| worker_urls.read().unwrap()[0].clone())
+                        .unwrap_or_else(|| workers.read().unwrap()[0].url().to_string())
                 } else {
                     // Use cache-aware routing when load is balanced
                     let (matched_text, matched_worker) = tree.prefix_match(&text);
@@ -932,17 +968,19 @@ impl Router {
                 Ok(res) => {
                     if res.status().is_success() {
                         match self {
-                            Router::RoundRobin { worker_urls, .. }
-                            | Router::Random { worker_urls, .. }
-                            | Router::CacheAware { worker_urls, .. } => {
+                            Router::RoundRobin { workers, .. }
+                            | Router::Random { workers, .. }
+                            | Router::CacheAware { workers, .. } => {
                                 info!("Worker {} health check passed", worker_url);
-                                let mut urls = worker_urls.write().unwrap();
-                                if urls.contains(&worker_url.to_string()) {
+                                let mut workers_guard = workers.write().unwrap();
+                                if workers_guard.iter().any(|w| w.url() == worker_url) {
                                     return Err(format!("Worker {} already exists", worker_url));
                                 }
                                 info!("Added worker: {}", worker_url);
-                                urls.push(worker_url.to_string());
-                                gauge!("sgl_router_active_workers").set(urls.len() as f64);
+                                let new_worker =
+                                    WorkerFactory::create_regular(worker_url.to_string());
+                                workers_guard.push(new_worker);
+                                gauge!("sgl_router_active_workers").set(workers_guard.len() as f64);
                             }
                             Router::PrefillDecode { .. } => {
                                 return Err("Adding workers to PrefillDecode router not supported via add_worker. Use dedicated PD management methods.".to_string());
@@ -1010,14 +1048,14 @@ impl Router {
 
     pub fn remove_worker(&self, worker_url: &str) {
         match self {
-            Router::RoundRobin { worker_urls, .. }
-            | Router::Random { worker_urls, .. }
-            | Router::CacheAware { worker_urls, .. } => {
-                let mut urls = worker_urls.write().unwrap();
-                if let Some(index) = urls.iter().position(|url| url == &worker_url) {
-                    urls.remove(index);
+            Router::RoundRobin { workers, .. }
+            | Router::Random { workers, .. }
+            | Router::CacheAware { workers, .. } => {
+                let mut workers_guard = workers.write().unwrap();
+                if let Some(index) = workers_guard.iter().position(|w| w.url() == worker_url) {
+                    workers_guard.remove(index);
                     info!("Removed worker: {}", worker_url);
-                    gauge!("sgl_router_active_workers").set(urls.len() as f64);
+                    gauge!("sgl_router_active_workers").set(workers_guard.len() as f64);
                 } else {
                     warn!("Worker {} not found, skipping removal", worker_url);
                     return;
@@ -1238,11 +1276,12 @@ mod tests {
     use crate::service_discovery::PodType;
 
     fn create_test_regular_router() -> Router {
+        let workers = vec![
+            WorkerFactory::create_regular("http://worker1:8080".to_string()),
+            WorkerFactory::create_regular("http://worker2:8080".to_string()),
+        ];
         Router::Random {
-            worker_urls: Arc::new(RwLock::new(vec![
-                "http://worker1:8080".to_string(),
-                "http://worker2:8080".to_string(),
-            ])),
+            workers: Arc::new(RwLock::new(workers)),
             timeout_secs: 5,
             interval_secs: 1,
         }
