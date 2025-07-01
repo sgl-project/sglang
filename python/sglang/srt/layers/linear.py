@@ -34,7 +34,6 @@ from sglang.srt.utils import (
     _process_weight_after_loading,
     cpu_has_amx_support,
     is_cpu,
-    narrow_padded_param_and_loaded_weight,
     set_weight_attrs,
 )
 
@@ -428,6 +427,10 @@ class ColumnParallelLinear(LinearBase):
             start_idx = self.tp_rank * shard_size
 
             if _is_cpu:
+                from sglang.srt.model_loader.weight_utils import (
+                    narrow_padded_param_and_loaded_weight,
+                )
+
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     param_data,
                     loaded_weight,
@@ -660,6 +663,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             start_idx = self.tp_rank * shard_size
 
             if _is_cpu:
+                from sglang.srt.model_loader.weight_utils import (
+                    narrow_padded_param_and_loaded_weight,
+                )
+
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     param_data,
                     loaded_weight,
@@ -1142,6 +1149,10 @@ class QKVParallelLinear(ColumnParallelLinear):
             start_idx = shard_id * shard_size
 
             if _is_cpu:
+                from sglang.srt.model_loader.weight_utils import (
+                    narrow_padded_param_and_loaded_weight,
+                )
+
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     param_data,
                     loaded_weight,
@@ -1301,6 +1312,10 @@ class RowParallelLinear(LinearBase):
             start_idx = self.tp_rank * shard_size
 
             if _is_cpu:
+                from sglang.srt.model_loader.weight_utils import (
+                    narrow_padded_param_and_loaded_weight,
+                )
+
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     param_data,
                     loaded_weight,
