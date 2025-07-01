@@ -65,8 +65,7 @@ configs = list(
     itertools.product(
         [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
         # # [256, 512, 1024, 2048, 4096], # TODO
-        # [512, 1024, 2048, 4096], # TODO
-        [512],
+        [512, 1024, 2048, 4096],
         [128],
         [fp8_type_],
         [
@@ -163,7 +162,7 @@ def test_per_token_group_quant_with_column_major(
                 plt.figure(figsize=(20, 20))
                 plt.imshow((value * 1.0).cpu().numpy())
                 p = Path(d) / f"{base_stem}_{name}.png"
-                print(f"Write diff to {p}")
+                print(f"Write diff to {p}", flush=True)
                 plt.savefig(p)
 
         raise
