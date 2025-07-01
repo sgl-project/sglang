@@ -400,7 +400,7 @@ def create_per_token_group_quant_fp8_output_scale(
         aligned_mn = align(x_s_mn, 4)
         aligned_k = align(x_s_k, 4)
         # TODO(FIXME): Fix cuda kernel and recover here to empty.
-        return torch.zeros(
+        return torch.empty(
             (*x_batch, aligned_k // 4, aligned_mn),
             device=device,
             dtype=torch.int,
