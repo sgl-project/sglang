@@ -372,6 +372,7 @@ void sgl_per_token_group_quant_8bit(
     const std::optional<torch::Tensor>& masked_m) {
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
+  TORCH_CHECK(input.numel() > 0);
 
   TORCH_CHECK(std::abs(LOCAL_ABSMAX_ABS - eps) < 1e-13);
 
