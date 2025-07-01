@@ -105,8 +105,8 @@ pub enum Router {
             during the next eviction cycle.
         */
         worker_urls: Arc<RwLock<Vec<String>>>,
-        tree: Arc<Mutex<Tree>>,
-        running_queue: Arc<Mutex<HashMap<String, usize>>>,
+        tree: Arc<RwLock<Tree>>,
+        running_queue: Arc<RwLock<HashMap<String, usize>>>,
         processed_queue: Arc<Mutex<HashMap<String, usize>>>,
         cache_threshold: f32,
         balance_abs_threshold: usize,
@@ -230,8 +230,8 @@ impl Router {
                     processed_queue.insert(url.clone(), 0);
                 }
 
-                let tree = Arc::new(Mutex::new(Tree::new()));
-                let running_queue = Arc::new(Mutex::new(running_queue));
+                let tree = Arc::new(RwLock::new(Tree::new()));
+                let running_queue = Arc::new(RwLock::new(running_queue));
                 let processed_queue = Arc::new(Mutex::new(processed_queue));
 
                 // Create background eviction thread
@@ -243,7 +243,7 @@ impl Router {
                         // Sleep for the specified interval
                         thread::sleep(Duration::from_secs(eviction_interval_secs));
 
-                        let locked_tree_clone = tree_clone.lock().unwrap();
+                        let locked_tree_clone = tree_clone.read().unwrap();
                         // Run eviction
                         locked_tree_clone.evict_tenant_by_size(max_tree_size);
 
@@ -252,13 +252,13 @@ impl Router {
                         info!("Processed Queue: {:?}", locked_processed_queue);
 
                         // Print the running queue
-                        let locked_running_queue = running_queue_clone.lock().unwrap();
+                        let locked_running_queue = running_queue_clone.read().unwrap();
                         info!("Running Queue: {:?}", locked_running_queue);
                     }
                 });
 
                 for url in &worker_urls {
-                    tree.lock().unwrap().insert("", url);
+                    tree.write().unwrap().insert("", url);
                 }
 
                 Router::CacheAware {
@@ -756,41 +756,41 @@ impl Router {
             }
 
             // TODO: delay scheduling if cache hit rate is high because it may cause imbalance. prioritize low hit rate ones
-            let running_queue_snapshot = running_queue.lock().unwrap().clone();
+            let mut selected_url = None;
+            {
+                let running_queue_snapshot = running_queue.read().unwrap();
+                let max_load = *running_queue_snapshot.values().max().unwrap_or(&0);
+                let min_load = *running_queue_snapshot.values().min().unwrap_or(&0);
 
-            // Get current load statistics
-            let max_load = *running_queue_snapshot.values().max().unwrap_or(&0);
-            let min_load = *running_queue_snapshot.values().min().unwrap_or(&0);
+                // Load is considered imbalanced if:
+                // 1. (max - min) > abs_threshold AND
+                // 2. max > rel_threshold * min
+                let is_imbalanced = max_load.saturating_sub(min_load) > *balance_abs_threshold
+                    && (max_load as f32) > (min_load as f32 * balance_rel_threshold);
 
-            // Load is considered imbalanced if:
-            // 1. (max - min) > abs_threshold AND
-            // 2. max > rel_threshold * min
-            let is_imbalanced = max_load.saturating_sub(min_load) > *balance_abs_threshold
-                && (max_load as f32) > (min_load as f32 * balance_rel_threshold);
+                if is_imbalanced {
+                    // Log load balancing trigger and current queue state
+                    info!(
+                        "Load balancing triggered due to workload imbalance:\n\
+                                Max load: {}, Min load: {}",
+                        max_load, min_load
+                    );
 
-            let selected_url = if is_imbalanced {
-                // Log load balancing trigger and current queue state
-                info!(
-                    "Load balancing triggered due to workload imbalance:\n\
-                        Max load: {}, Min load: {}\n\
-                        Current running queue: {:?}",
-                    max_load, min_load, running_queue_snapshot
-                );
+                    counter!("sgl_router_load_balancing_events_total").increment(1);
+                    gauge!("sgl_router_max_load").set(max_load as f64);
+                    gauge!("sgl_router_min_load").set(min_load as f64);
 
-                counter!("sgl_router_load_balancing_events_total").increment(1);
-                gauge!("sgl_router_max_load").set(max_load as f64);
-                gauge!("sgl_router_min_load").set(min_load as f64);
-
-                // Use shortest queue routing when load is imbalanced
-                running_queue_snapshot
-                    .iter()
-                    .min_by_key(|(_url, &count)| count)
-                    .map(|(url, _)| url.clone())
-                    .unwrap_or_else(|| worker_urls.read().unwrap()[0].clone())
-            } else {
+                    // Use shortest queue routing when load is imbalanced
+                    selected_url = running_queue_snapshot
+                        .iter()
+                        .min_by_key(|(_url, &count)| count)
+                        .map(|(url, _)| url.clone());
+                }
+            };
+            if selected_url.is_none() {
                 // Use cache-aware routing when load is balanced
                 let (matched_text, matched_worker) = {
-                    let tree = tree.lock().unwrap();
+                    let tree = tree.read().unwrap();
                     tree.prefix_match(&text)
                 };
 
@@ -799,19 +799,25 @@ impl Router {
 
                 if matched_rate > *cache_threshold {
                     counter!("sgl_router_cache_hits_total").increment(1);
-                    matched_worker.to_string()
+                    selected_url = Some(matched_worker.to_string());
                 } else {
                     counter!("sgl_router_cache_misses_total").increment(1);
-                    tree.lock()
-                        .expect("Failed to lock tree, tree Mutex is poisoned")
-                        .get_smallest_tenant()
+                    selected_url = Some(
+                        tree.read()
+                            .expect("Failed to lock tree, tree Mutex is poisoned")
+                            .get_smallest_tenant(),
+                    );
                 }
             };
+
+            let selected_url = selected_url.unwrap_or_else(|| {
+                worker_urls.read().unwrap()[0].clone()
+            });
 
             // Update queues and tree
             {
                 let mut running_queue_locked = running_queue
-                    .lock()
+                    .write()
                     .expect("Failed to lock running queue, running queue Mutex is poisoned");
                 if let Some(count) = running_queue_locked.get_mut(&selected_url) {
                     *count += 1;
@@ -841,7 +847,7 @@ impl Router {
                 }
             };
 
-            tree.lock()
+            tree.write()
                 .expect("Failed to lock tree, tree Mutex is poisoned")
                 .insert(&text, &selected_url);
 
@@ -903,7 +909,7 @@ impl Router {
 
             // Then decrement running queue counter if using CacheAware
             if let Router::CacheAware { running_queue, .. } = self {
-                if let Ok(mut queue) = running_queue.lock() {
+                if let Ok(mut queue) = running_queue.write() {
                     if let Some(count) = queue.get_mut(worker_url) {
                         *count = count.saturating_sub(1);
                     }
@@ -935,7 +941,7 @@ impl Router {
                                 .windows(12)
                                 .any(|window| window == b"data: [DONE]")
                             {
-                                let mut locked_queue = running_queue.lock().unwrap();
+                                let mut locked_queue = running_queue.write().unwrap();
                                 let count = locked_queue.get_mut(&worker_url).unwrap();
                                 *count = count.saturating_sub(1);
                                 debug!("Streaming is done!!")
@@ -1023,7 +1029,7 @@ impl Router {
                         {
                             // Add worker to running queue with initial count of 0
                             running_queue
-                                .lock()
+                                .write()
                                 .unwrap()
                                 .insert(worker_url.to_string(), 0);
 
@@ -1034,7 +1040,7 @@ impl Router {
                                 .insert(worker_url.to_string(), 0);
 
                             // Add worker to tree
-                            tree.lock().unwrap().insert("", worker_url);
+                            tree.write().unwrap().insert("", worker_url);
                         }
 
                         return Ok(format!("Successfully added worker: {}", worker_url));
@@ -1101,9 +1107,9 @@ impl Router {
             ..
         } = self
         {
-            tree.lock().unwrap().remove_tenant(&worker_url);
+            tree.write().unwrap().remove_tenant(&worker_url);
             running_queue
-                .lock()
+                .write()
                 .unwrap()
                 .remove(&worker_url.to_string());
             processed_queue
