@@ -27,6 +27,7 @@ if int(os.environ.get("SGLANG_NSYS_PROFILING", "0")):
     #     768,
     #     16384,
     #     128,
+    #     None,
     #     fp8_type_,
     #     dict(
     #         column_major_scales=True,
@@ -41,6 +42,7 @@ if int(os.environ.get("SGLANG_NSYS_PROFILING", "0")):
             768 * 8,
             2048,
             128,
+            None,
             fp8_type_,
             dict(
                 column_major_scales=True,
@@ -59,6 +61,7 @@ else:
             [1, 4, 16, 64, 256, 768, 2048, 8192, 16384],
             [1536, 7168, 16384],
             [128],
+            [None],
             [fp8_type_],
             [
                 dict(
@@ -96,6 +99,7 @@ else:
             [1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
             [2048],
             [128],
+            [8, 16, 32, 48],
             [fp8_type_],
             [
                 dict(
@@ -133,7 +137,7 @@ else:
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["num_tokens", "hidden_dim", "group_size", "dst_dtype", "flags"],
+        x_names=["num_tokens", "hidden_dim", "group_size", "num_ranks", "dst_dtype", "flags"],
         x_vals=configs,
         line_arg="provider",
         line_vals=["triton", "sglang"],
@@ -145,9 +149,9 @@ else:
         args={},
     )
 )
-def benchmark(num_tokens, hidden_dim, group_size, dst_dtype, flags, provider):
+def benchmark(num_tokens, hidden_dim, group_size, num_ranks, dst_dtype, flags, provider):
     x, masked_m = create_per_token_group_quant_test_data(
-        num_tokens=num_tokens, hidden_dim=hidden_dim, flags=flags
+        num_tokens=num_tokens, hidden_dim=hidden_dim, num_ranks=num_ranks, flags=flags
     )
 
     fn, kernel_names = {

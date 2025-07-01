@@ -28,6 +28,7 @@ configs = list(
         # TODO support group size != 128
         # [8, 16, 32, 64, 128],  # group_size
         [128],  # group_size
+        [None],  # num_ranks
         [fp8_type_, torch.int8],  # dtype
         [
             dict(
@@ -66,6 +67,7 @@ configs = list(
         # TODO support more
         [2048],
         [128],
+        [8, 16, 32, 48],
         [fp8_type_],
         [
             dict(
@@ -102,12 +104,13 @@ configs = list(
 
 
 @pytest.mark.parametrize(
-    "num_tokens, hidden_dim, group_size, dst_dtype, flags", configs
+    "num_tokens, hidden_dim, group_size, num_ranks, dst_dtype, flags", configs
 )
 def test_per_token_group_quant_with_column_major(
     num_tokens,
     hidden_dim,
     group_size,
+    num_ranks,
     dst_dtype,
     flags,
 ):
@@ -118,7 +121,7 @@ def test_per_token_group_quant_with_column_major(
         return
 
     x, masked_m = create_per_token_group_quant_test_data(
-        num_tokens=num_tokens, hidden_dim=hidden_dim, flags=flags
+        num_tokens=num_tokens, hidden_dim=hidden_dim, num_ranks=num_ranks, flags=flags
     )
 
     # print("hack data!!!")

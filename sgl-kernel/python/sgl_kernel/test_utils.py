@@ -1,7 +1,7 @@
 import torch
 
 
-def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
+def create_per_token_group_quant_test_data(num_tokens, hidden_dim, num_ranks, flags):
     device = torch.device("cuda")
     dtype = torch.bfloat16
 
@@ -18,11 +18,10 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
     del hidden_dim
 
     if (masked_layout_mode := flags["masked_layout_mode"]) is not None:
-        num_local_experts = 6
         num_max_dispatch_tokens_per_rank = 768
-        num_ranks = 48
         num_global_experts = 288
-        assert num_local_experts * num_ranks == num_global_experts
+        num_local_experts, remainder = divmod(num_global_experts, num_ranks)
+        assert remainder == 0
 
         # mimic DeepEP low_latency_dispatch output
         x = torch.randn(
