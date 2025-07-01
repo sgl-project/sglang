@@ -137,7 +137,14 @@ else:
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["num_tokens", "hidden_dim", "group_size", "num_ranks", "dst_dtype", "flags"],
+        x_names=[
+            "num_tokens",
+            "hidden_dim",
+            "group_size",
+            "num_ranks",
+            "dst_dtype",
+            "flags",
+        ],
         x_vals=configs,
         line_arg="provider",
         line_vals=["triton", "sglang"],
@@ -149,7 +156,9 @@ else:
         args={},
     )
 )
-def benchmark(num_tokens, hidden_dim, group_size, num_ranks, dst_dtype, flags, provider):
+def benchmark(
+    num_tokens, hidden_dim, group_size, num_ranks, dst_dtype, flags, provider
+):
     x, masked_m = create_per_token_group_quant_test_data(
         num_tokens=num_tokens, hidden_dim=hidden_dim, num_ranks=num_ranks, flags=flags
     )

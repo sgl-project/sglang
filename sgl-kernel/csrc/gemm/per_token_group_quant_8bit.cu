@@ -299,7 +299,8 @@ __global__ void per_token_group_quant_8bit_kernel(
         // can speed up if too slow
         if constexpr (IS_COLUMN_MAJOR and SCALE_UE8M0) {
           const int remainder_num_groups = hidden_dim_num_groups % num_elems_per_pack;
-          if ((remainder_num_groups != 0) and (hidden_dim_group_idx == hidden_dim_num_groups - 1) and (lane_id < num_elems_per_pack - remainder_num_groups)) {
+          if ((remainder_num_groups != 0) and (hidden_dim_group_idx == hidden_dim_num_groups - 1) and
+              (lane_id < num_elems_per_pack - remainder_num_groups)) {
             const int shift = 1 + lane_id;
             *(scale_output + shift) = 0;
           }
