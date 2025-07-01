@@ -42,10 +42,10 @@ __forceinline__ __device__ int fast_log2_ceil(float x) {
 
 // Copied and modified from DeepEP
 template <bool ROUND_SCALE, typename dtype_info>
-__forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, float& scale_inv, int& exp_scale_inv) {
+__forceinline__ __device__ void calculate_fp8_scales(float amax, float& scale, float& scale_inv) {
   constexpr float MAX_8BIT_INV = 1.0f / dtype_info::MAX;
   if constexpr (ROUND_SCALE) {
-    exp_scale_inv = fast_log2_ceil(amax * MAX_8BIT_INV);
+    auto exp_scale_inv = fast_log2_ceil(amax * MAX_8BIT_INV);
     scale = fast_pow2(-exp_scale_inv);
     scale_inv = fast_pow2(exp_scale_inv);
   } else {
@@ -312,10 +312,8 @@ __global__ void per_token_group_quant_8bit_kernel(
         local_absmax = GroupReduceMax<THREADS_PER_SUBWARP>(local_absmax, lane_id);
 
         float y_scale, y_scale_inv;
-        int y_exp_scale_inv;
-        calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv, y_exp_scale_inv);
-        // TODO wrong for neg
-        uint32_t adder_for_scaling = (y_exp_scale_inv << (16 + 7)) | (y_exp_scale_inv << 7);
+        calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
+        float2 y_scale_repeated = {y_scale, y_scale};
 
         if (lane_id == 0) {
           *scale_output = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
@@ -331,10 +329,9 @@ __global__ void per_token_group_quant_8bit_kernel(
 
 #pragma unroll
           for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
-            uint32_t inputx2 = *reinterpret_cast<uint32_t*>(input_primary_vec + j);
-            uint32_t scaledx2 = inputx2 + adder_for_scaling;
-            __nv_bfloat162_raw outputx2 = *reinterpret_cast<__nv_bfloat162_raw*>(scaledx2);
-            output_buf_ptr[j / 2] = __nv_cvt_bfloat16raw2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+            float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
+            float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
+            output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
           }
         } else {
           const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
