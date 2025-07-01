@@ -122,6 +122,7 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
   hw_info.device_id = c10::cuda::current_device();
   hw_info.sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
+  
   typename GemmKernel::EpilogueArguments epilogue_args{
       {},
       nullptr,
