@@ -52,13 +52,13 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.1.9",
+    "sgl-kernel==0.2.1",
     "torch==2.7.1",
     "torchaudio==2.7.1",
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.6.post1",
+    "flashinfer_python==0.2.7",
 ]
 
 blackwell = [
@@ -69,7 +69,7 @@ blackwell = [
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.6.post1",
+    "flashinfer_python==0.2.7",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
@@ -88,9 +88,7 @@ srt_xpu = ["sglang[runtime_common]"]
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
 srt_hpu = ["sglang[runtime_common]"]
 
-# CPU: currently, there are no pre-built vllm wheels for CPU.
-# To install vllm for CPU, please follow the instruction here:
-# https://docs.vllm.ai/en/latest/getting_started/installation/cpu/index.html
+# CPU: torch wheel for CPU needs to be installed from https://download.pytorch.org/whl/cpu
 srt_cpu = ["sglang[runtime_common]", "einops"]
 # https://vllm-ascend.readthedocs.io/en/latest/installation.html
 srt_npu = ["sglang[runtime_common]"]
