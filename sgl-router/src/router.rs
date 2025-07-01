@@ -751,9 +751,12 @@ impl Router {
             ..
         } = self
         {
+            let first_worker_url = {
             if worker_urls.read().unwrap().is_empty() {
                 return Err("No workers available for CacheAware routing".to_string());
             }
+            worker_urls.read().unwrap()[0].clone()
+        };
 
             // TODO: delay scheduling if cache hit rate is high because it may cause imbalance. prioritize low hit rate ones
             let mut selected_url = None;
@@ -781,16 +784,22 @@ impl Router {
                     gauge!("sgl_router_min_load").set(min_load as f64);
 
                     // Use shortest queue routing when load is imbalanced
-                    selected_url = running_queue_snapshot
-                        .iter()
-                        .min_by_key(|(_url, &count)| count)
-                        .map(|(url, _)| url.clone());
+                    // NOTE: The selected url is always `Some(url)` in case of imbalanced load,
+                    // and `None` in case of balanced load.
+                    selected_url = Some(
+                        running_queue_snapshot
+                            .iter()
+                            .min_by_key(|(_url, &count)| count)
+                            .map(|(url, _)| url.clone())
+                            .unwrap_or_else(|| first_worker_url.clone()),
+                    );
                 }
             };
+
             if selected_url.is_none() {
                 // Use cache-aware routing when load is balanced
                 let (matched_text, matched_worker) = {
-                    let tree = tree.read().unwrap();
+                    let tree = tree.read().expect("Failed to lock tree, tree Mutex is poisoned");
                     tree.prefix_match(&text)
                 };
 
@@ -810,9 +819,8 @@ impl Router {
                 }
             };
 
-            let selected_url = selected_url.unwrap_or_else(|| {
-                worker_urls.read().unwrap()[0].clone()
-            });
+            let selected_url =
+                selected_url.unwrap_or_else(|| first_worker_url.clone());
 
             // Update queues and tree
             {
@@ -828,6 +836,10 @@ impl Router {
                         "Selected worker URL not found in running queue: {}",
                         selected_url
                     );
+                    return Err(format!(
+                        "Selected worker URL not found in running queue: {}",
+                        selected_url
+                    ));
                 }
             };
 
@@ -844,6 +856,10 @@ impl Router {
                         "Selected worker URL not found in processed queue: {}",
                         selected_url
                     );
+                    return Err(format!(
+                        "Selected worker URL not found in processed queue: {}",
+                        selected_url
+                    ));
                 }
             };
 
@@ -853,7 +869,7 @@ impl Router {
 
             Ok(selected_url)
         } else {
-            unreachable!("Called select_worker_cache_aware on a non-CacheAware router");
+            unreachable!("Called `select_worker_cache_aware` on a non-CacheAware router");
         }
     }
 
