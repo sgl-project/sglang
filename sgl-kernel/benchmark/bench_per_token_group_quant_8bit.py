@@ -104,7 +104,6 @@ else:
                     scale_tma_aligned=True,
                     scale_ue8m0=True,
                     fuse_silu_and_mul=True,
-                    masked_layout=True,
                     masked_layout_mode="imbalanced",
                 ),
             ],
