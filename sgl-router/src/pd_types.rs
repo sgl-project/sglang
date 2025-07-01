@@ -1,8 +1,8 @@
 // Essential PDLB types extracted for PD routing
 
+use crate::core::worker::{Worker, WorkerType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::core::worker::{Worker, WorkerType};
 
 // Custom error type for PD router operations
 #[derive(Debug, thiserror::Error)]
@@ -39,10 +39,10 @@ pub fn get_api_path(worker: &dyn Worker, api_path: &str) -> String {
 
 pub fn get_hostname(worker: &dyn Worker) -> String {
     let url = worker
-            .url()
-            .trim_start_matches("http://")
-            .trim_start_matches("https://");
-        url.split(':').next().unwrap_or("localhost").to_string()
+        .url()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    url.split(':').next().unwrap_or("localhost").to_string()
 }
 
 pub fn get_bootstrap_port(worker: &dyn Worker) -> Option<u16> {

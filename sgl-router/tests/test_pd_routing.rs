@@ -12,9 +12,9 @@
 mod test_pd_routing {
     use rand::Rng;
     use serde_json::json;
-    use sglang_router_rs::pd_types::{get_hostname, get_bootstrap_port, get_api_path};
-    use sglang_router_rs::core::worker::{WorkerType, WorkerFactory};
-    use sglang_router_rs::pd_types::{PDSelectionPolicy};
+    use sglang_router_rs::core::worker::{WorkerFactory, WorkerType};
+    use sglang_router_rs::pd_types::PDSelectionPolicy;
+    use sglang_router_rs::pd_types::{get_api_path, get_bootstrap_port, get_hostname};
     use sglang_router_rs::router::{PolicyConfig, Router};
 
     // Test-only struct to help validate PD request parsing
@@ -55,7 +55,8 @@ mod test_pd_routing {
     #[test]
     fn test_worker_creation() {
         // Test worker creation for prefill servers
-        let prefill_worker = WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(9000));
+        let prefill_worker =
+            WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(9000));
         match prefill_worker.worker_type() {
             WorkerType::Prefill { bootstrap_port } => assert_eq!(bootstrap_port, Some(9000)),
             _ => panic!("Expected Prefill worker type"),
@@ -244,7 +245,8 @@ mod test_pd_routing {
         });
 
         // Simulate what inject_bootstrap_fields would do
-        let prefill_info = WorkerFactory::create_prefill("http://prefill1:8080".to_string(), Some(9000));
+        let prefill_info =
+            WorkerFactory::create_prefill("http://prefill1:8080".to_string(), Some(9000));
         single_json["bootstrap_host"] = json!(get_hostname(&*prefill_info));
         single_json["bootstrap_port"] = json!(get_bootstrap_port(&*prefill_info));
         single_json["bootstrap_room"] = json!(12345u64); // Random room ID
@@ -668,11 +670,13 @@ mod test_pd_routing {
         });
 
         // Simulate bootstrap injection
-        let prefill_info = WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(9000));
+        let prefill_info =
+            WorkerFactory::create_prefill("http://prefill:8080".to_string(), Some(9000));
         let batch_size = 16;
 
         benchmark_request["bootstrap_host"] = json!(vec![get_hostname(&*prefill_info); batch_size]);
-        benchmark_request["bootstrap_port"] = json!(vec![get_bootstrap_port(&*prefill_info); batch_size]);
+        benchmark_request["bootstrap_port"] =
+            json!(vec![get_bootstrap_port(&*prefill_info); batch_size]);
         benchmark_request["bootstrap_room"] =
             json!((0..batch_size).map(|_| 12345u64).collect::<Vec<_>>());
 

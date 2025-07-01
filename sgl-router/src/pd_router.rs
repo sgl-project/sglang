@@ -331,7 +331,9 @@ impl PDRouter {
         // Log routing decision
         info!(
             "PD routing: {} -> prefill={}, decode={}",
-            route, prefill.url(), decode.url()
+            route,
+            prefill.url(),
+            decode.url()
         );
 
         // Add bootstrap info using the trait method
@@ -398,7 +400,9 @@ impl PDRouter {
         // Log routing decision
         info!(
             "PD routing: {} -> prefill={}, decode={}",
-            route, prefill.url(), decode.url()
+            route,
+            prefill.url(),
+            decode.url()
         );
 
         // Add bootstrap info using the trait method
@@ -454,7 +458,9 @@ impl PDRouter {
         );
 
         // Build requests using .json() method
-        let mut prefill_request = client.post(get_api_path(prefill, route)).json(&json_request);
+        let mut prefill_request = client
+            .post(get_api_path(prefill, route))
+            .json(&json_request);
 
         let mut decode_request = client.post(get_api_path(decode, route)).json(&json_request);
 
@@ -490,7 +496,8 @@ impl PDRouter {
                     counter!("sgl_router_pd_decode_errors_total", "worker" => decode.url().to_string()).increment(1);
                     error!(
                         "Decode server {} returned error status: {}",
-                        decode.url(), status
+                        decode.url(),
+                        status
                     );
 
                     // Return the error response from decode server
@@ -509,7 +516,8 @@ impl PDRouter {
                 if let Err(e) = &prefill_result {
                     error!(
                         "Prefill server {} failed (non-critical): {}",
-                        prefill.url(), e
+                        prefill.url(),
+                        e
                     );
                     counter!("sgl_router_pd_prefill_errors_total", "worker" => prefill.url().to_string()).increment(1);
                 }

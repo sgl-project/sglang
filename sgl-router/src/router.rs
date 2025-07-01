@@ -300,17 +300,32 @@ impl Router {
     pub fn get_worker_urls(&self) -> Arc<RwLock<Vec<String>>> {
         match self {
             Router::RoundRobin { workers, .. } => {
-                let urls = workers.read().unwrap().iter().map(|w| w.url().to_string()).collect();
+                let urls = workers
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|w| w.url().to_string())
+                    .collect();
                 Arc::new(RwLock::new(urls))
-            },
+            }
             Router::Random { workers, .. } => {
-                let urls = workers.read().unwrap().iter().map(|w| w.url().to_string()).collect();
+                let urls = workers
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|w| w.url().to_string())
+                    .collect();
                 Arc::new(RwLock::new(urls))
-            },
+            }
             Router::CacheAware { workers, .. } => {
-                let urls = workers.read().unwrap().iter().map(|w| w.url().to_string()).collect();
+                let urls = workers
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .map(|w| w.url().to_string())
+                    .collect();
                 Arc::new(RwLock::new(urls))
-            },
+            }
             Router::PrefillDecode { .. } => {
                 // For PD mode, return empty list since we manage workers differently
                 Arc::new(RwLock::new(Vec::new()))
@@ -714,8 +729,10 @@ impl Router {
 
             Router::Random { workers, .. } => {
                 let workers_guard = workers.read().unwrap();
-                workers_guard[rand::random::<usize>() % workers_guard.len()].url().to_string()
-            },
+                workers_guard[rand::random::<usize>() % workers_guard.len()]
+                    .url()
+                    .to_string()
+            }
 
             Router::CacheAware {
                 workers,
@@ -952,7 +969,8 @@ impl Router {
                                     return Err(format!("Worker {} already exists", worker_url));
                                 }
                                 info!("Added worker: {}", worker_url);
-                                let new_worker = WorkerFactory::create_regular(worker_url.to_string());
+                                let new_worker =
+                                    WorkerFactory::create_regular(worker_url.to_string());
                                 workers_guard.push(new_worker);
                                 gauge!("sgl_router_active_workers").set(workers_guard.len() as f64);
                             }
