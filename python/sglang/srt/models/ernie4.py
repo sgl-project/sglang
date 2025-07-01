@@ -265,7 +265,11 @@ class Ernie4Moe(nn.Module):
         return self.forward_normal(hidden_states)
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        shared_output = self.shared_experts(hidden_states)
+        shared_output = (
+            self.shared_experts(hidden_states)
+            if self.moe_num_shared_experts > 0
+            else None
+        )
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
@@ -453,8 +457,6 @@ class Ernie4_5_ForCausalLM(nn.Module):
             for param_name, weight_name, shard_id in self.stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                if ("mlp.experts." in name) and name not in params_dict:
-                    continue
                 name = name.replace(weight_name, param_name)
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -491,6 +493,12 @@ class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
             for param_name, weight_name, shard_id in self.stacked_params_mapping:
                 if weight_name not in name:
                     continue
+                # We have mlp.experts[0].gate_proj in the checkpoint.
+                # Since we handle the experts below in expert_params_mapping,
+                # we need to skip here BEFORE we update the name, otherwise
+                # name will be updated to mlp.experts[0].gate_up_proj, which
+                # will then be updated below in expert_params_mapping
+                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 name = name.replace(weight_name, param_name)
@@ -504,15 +512,20 @@ class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
+                    if name in params_dict.keys():
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
+                    else:
+                        raise KeyError(
+                            f"Parameter '{name}'(replaced) not found in model."
+                        )
                     break
                 else:
                     if name in params_dict.keys():
