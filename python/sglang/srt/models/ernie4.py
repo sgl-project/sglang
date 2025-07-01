@@ -295,6 +295,7 @@ class Ernie4DecoderLayer(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        is_mtp: bool = False,
     ):
         super().__init__()
         # Self attention.
@@ -303,7 +304,7 @@ class Ernie4DecoderLayer(nn.Module):
         )
 
         # MLP
-        if (
+        if (is_mtp == False) and (
             hasattr(config, "moe_layer_start_index")
             and layer_id >= config.moe_layer_start_index
             and (layer_id + 1) % config.moe_layer_interval == 0
@@ -318,7 +319,7 @@ class Ernie4DecoderLayer(nn.Module):
             self.mlp = Ernie4MLP(
                 config=config,
                 quant_config=quant_config,
-                prefix=add_prefix("feed_forward", prefix),
+                prefix=add_prefix("mlp", prefix),
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -488,8 +489,7 @@ class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
         for name, loaded_weight in weights:
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
-            # MTP will be supported soon
-            if "mtp" in name:
+            if name.startswith("model.mtp_"):
                 continue
             if "moe_statics.e_score_correction_bias" in name:
                 name = name.replace("moe_statics", "gate")

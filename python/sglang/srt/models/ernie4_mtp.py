@@ -30,7 +30,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.ernie4 import Ernie4DecoderLayer
-from sglang.srt.utils import make_layers
+from sglang.srt.utils import add_prefix, make_layers
 
 
 class Ernie4MTPLayer(nn.Module):
@@ -45,6 +45,8 @@ class Ernie4MTPLayer(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.mtp_emb_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mtp_hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -54,7 +56,11 @@ class Ernie4MTPLayer(nn.Module):
         self.mtp_block = make_layers(
             1,
             lambda idx, prefix: Ernie4DecoderLayer(
-                config=config, layer_id=idx, quant_config=quant_config, prefix=prefix
+                config=config,
+                layer_id=idx,
+                quant_config=quant_config,
+                prefix=prefix,
+                is_mtp=True,
             ),
             prefix="model.mtp_block",
         )
@@ -149,7 +155,7 @@ class Ernie4_5_MoeMTP(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
+            if not name.startswith("model.mtp_"):
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -162,11 +168,10 @@ class Ernie4_5_MoeMTP(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                if "mtp_" not in name:
-                    continue
                 for sub_name in strip_layer_id_list:
                     if sub_name in name:
                         name = name.replace(".0", "")
+                        break
                 if name in params_dict.keys():
                     param = params_dict[name]
                     weight_loader = getattr(
