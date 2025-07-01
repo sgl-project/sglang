@@ -141,6 +141,7 @@ def test_per_token_group_quant_with_column_major(
             print(f"Mask tokens after {masked_m} to be zero")
             for i in range(len(masked_m)):
                 x_q[i, masked_m[i] :, :] = 0
+                x_s[i, masked_m[i] :, :] = 0
         return x_q, x_s
 
     x_q_triton, x_s_triton = _postprocess(
