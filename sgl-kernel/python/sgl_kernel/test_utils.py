@@ -37,9 +37,13 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
         if masked_layout_mode == "balanced":
             masked_m = _compute_balanced_split(num_tokens, num_local_experts)
         elif masked_layout_mode == "imbalanced":
-            masked_m = _compute_imbalanced_split(num_tokens, num_local_experts, gen_cpu=gen_cpu)
+            masked_m = _compute_imbalanced_split(
+                num_tokens, num_local_experts, gen_cpu=gen_cpu
+            )
         elif masked_layout_mode == "extreme":
-            masked_m = torch.tensor([num_tokens] + [0] * (num_local_experts - 1), dtype=torch.int)
+            masked_m = torch.tensor(
+                [num_tokens] + [0] * (num_local_experts - 1), dtype=torch.int
+            )
         else:
             raise NotImplementedError
         print(f"{masked_layout_mode=} {masked_m=} {x.shape=}")
@@ -49,7 +53,11 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, flags):
         return x, masked_m
     else:
         x = torch.randn(
-            num_tokens, effective_hidden_dim, device=device, dtype=dtype, generator=gen_cuda
+            num_tokens,
+            effective_hidden_dim,
+            device=device,
+            dtype=dtype,
+            generator=gen_cuda,
         )
         x[torch.randn(x.shape, device=device, generator=gen_cuda) < 0.001] *= 10
         return x, None
@@ -63,7 +71,9 @@ def _compute_balanced_split(total: int, arr_len: int):
     return torch.tensor(ans, dtype=torch.int)
 
 
-def _compute_imbalanced_split(total: int, arr_len: int, gen_cpu, dtype=torch.int) -> list[int]:
+def _compute_imbalanced_split(
+    total: int, arr_len: int, gen_cpu, dtype=torch.int
+) -> list[int]:
     # can use `rand ** 2`, `rand ** 3`, etc, to change how imbalanced it is
     noise_raw = torch.rand(arr_len, generator=gen_cpu) ** 3
 

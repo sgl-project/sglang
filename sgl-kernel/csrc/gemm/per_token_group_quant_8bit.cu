@@ -22,9 +22,9 @@ __device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
 }
 
 __device__ __forceinline__ float silu(const float& val) {
-    float half = 0.5f * val;
-    float t = __tanhf(half);
-    return half * (1.0f + t);
+  float half = 0.5f * val;
+  float t = __tanhf(half);
+  return half * (1.0f + t);
 }
 
 // Copied and modified from DeepEP
@@ -413,31 +413,31 @@ void sgl_per_token_group_quant_8bit(
         num_tokens_per_expert);                                                                          \
   } while (0)
 
-#define LAUNCH_KERNEL(T, DST_DTYPE)                                                                     \
-  do {                                                                                                  \
-    TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));            \
-                                                                                                        \
-    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                        \
-    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                            \
-    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                                                            \
-                                                                                                        \
-    if (is_column_major) {                                                                              \
-      if (scale_ue8m0) {                                                                                \
-        if (fuse_silu_and_mul) {                                                                        \
-          if (masked_layout) {                                                                          \
-            LAUNCH_KERNEL_INNER(MaskedLayoutScheduler, T, DST_DTYPE, uint32_t, true, true, true);       \
-          } else {                                                                                      \
-            LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true, true);              \
-          }                                                                                             \
-        } else {                                                                                        \
-          LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true);                      \
-        }                                                                                               \
-      } else {                                                                                          \
-        LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, true);                                 \
-      }                                                                                                 \
-    } else {                                                                                            \
-      LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, false);                                  \
-    }                                                                                                   \
+#define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
+  do {                                                                                            \
+    TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));      \
+                                                                                                  \
+    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                  \
+    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                      \
+    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                                                      \
+                                                                                                  \
+    if (is_column_major) {                                                                        \
+      if (scale_ue8m0) {                                                                          \
+        if (fuse_silu_and_mul) {                                                                  \
+          if (masked_layout) {                                                                    \
+            LAUNCH_KERNEL_INNER(MaskedLayoutScheduler, T, DST_DTYPE, uint32_t, true, true, true); \
+          } else {                                                                                \
+            LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true, true);        \
+          }                                                                                       \
+        } else {                                                                                  \
+          LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, uint32_t, true, true);                \
+        }                                                                                         \
+      } else {                                                                                    \
+        LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, true);                           \
+      }                                                                                           \
+    } else {                                                                                      \
+      LAUNCH_KERNEL_INNER(NaiveScheduler, T, DST_DTYPE, float, false);                            \
+    }                                                                                             \
   } while (0)
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), scalar_t, [&] {
