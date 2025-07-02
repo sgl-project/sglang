@@ -69,6 +69,7 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/sour
  && git apply /sgl-workspace/DeepEP/third-party/nvshmem.patch \
  && sed -i '1i#include <unistd.h>' examples/moe_shuffle.cu \
  && rm -f /sgl-workspace/nvshmem_src_3.2.5-1.txz \
+ && CUDA_ARCH=$([ "$BUILD_TYPE" = "blackwell" ] && echo 100 || echo 90) \
  && NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
@@ -77,7 +78,7 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/sour
     NVSHMEM_PMIX_SUPPORT=0 \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
     NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=$([ "$BUILD_TYPE" = "blackwell" ] && echo "100" || echo "90") \
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
  && cmake --build build --target install -j \
  && cd /sgl-workspace/DeepEP \
  && NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
