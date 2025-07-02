@@ -707,9 +707,6 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
-            # Metric for pre-allocation
-            self.num_tokens_pre_allocated = 0
-
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
