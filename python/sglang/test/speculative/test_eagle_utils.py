@@ -142,7 +142,6 @@ class TestEagleUtils(unittest.TestCase):
         req_to_token[2, :5] = torch.tensor([4, 5, 6, 7, 8], device=device)
         last_page_lens = torch.tensor([0, 3, 1], dtype=torch.int32, device=device)
         last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
-        print(f"{last_page_lens_cumsum=}")
         duplicate_cache_len = last_page_lens.sum() * (topk - 1)
         out_cache_loc = torch.arange(
             12, 12 + torch.sum(extend_lens), dtype=torch.int32, device=device
