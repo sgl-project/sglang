@@ -158,7 +158,6 @@ def benchmark(
     block_shape = model_config["block_shape"]
 
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
-    w1_scale = w2_scale = a1_scale = a2_scale = None
 
     w1 = torch.randn(num_experts, shard_intermediate_size, hidden_size, dtype=dtype)
     w2 = torch.randn(
@@ -172,75 +171,44 @@ def benchmark(
 
     input_gating = torch.randn(num_tokens, num_experts, dtype=torch.float32)
 
+    if provider == "sglang_fused_moe_triton_v340":
+        api_func = fused_moe_triton_api
+        api_kwargs = {
+            "x": x,
+            "w1": w1_tri,
+            "w2": w2_tri,
+            "input_gating": input_gating,
+            "topk": topk,
+        }
+    else:
+        api_func = fused_moe_sglang_api
+        api_kwargs = {
+            "x": x,
+            "w1": w1,
+            "w2": w2,
+            "input_gating": input_gating,
+            "topk": topk,
+            "use_fp8_w8a8": use_fp8_w8a8,
+            "block_shape": block_shape,
+        }
+
     # Warmup
-    api_func = (
-        fused_moe_triton_api
-        if provider == "sglang_fused_moe_triton_v340"
-        else fused_moe_sglang_api
-    )
     for _ in range(10):
-        if provider == "sglang_fused_moe_triton_v340":
-            y = fused_moe_triton_api(
-                x,
-                w1_tri,
-                w2_tri,
-                input_gating,
-                topk,
-            )
-        else:
-            y = fused_moe_sglang_api(
-                x,
-                w1,
-                w2,
-                input_gating,
-                topk,
-                use_fp8_w8a8=use_fp8_w8a8,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                a1_scale=a1_scale,
-                a2_scale=a2_scale,
-                block_shape=block_shape,
-            )
+        _ = api_func(**api_kwargs)
     torch.cuda.synchronize()
 
     if use_cuda_graph:
         stream = torch.cuda.Stream()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            (
-                fused_moe_triton_api(x, w1_tri, w2_tri, input_gating, topk)
-                if provider == "sglang_fused_moe_triton_v340"
-                else fused_moe_sglang_api(
-                    x,
-                    w1,
-                    w2,
-                    input_gating,
-                    topk,
-                    use_fp8_w8a8=use_fp8_w8a8,
-                    block_shape=block_shape,
-                )
-            )
+            api_func(**api_kwargs)
         torch.cuda.synchronize()
 
         bench_lambda = lambda: graph.replay()
     else:
-        if provider == "sglang_fused_moe_triton_v340":
-            bench_lambda = lambda: fused_moe_triton_api(
-                x, w1_tri, w2_tri, input_gating, topk
-            )[0]
-        else:
-            bench_lambda = lambda: fused_moe_sglang_api(
-                x,
-                w1,
-                w2,
-                input_gating,
-                topk,
-                use_fp8_w8a8=use_fp8_w8a8,
-                block_shape=block_shape,
-            )[0]
+        bench_lambda = lambda: api_func(**api_kwargs)
 
     quantiles = [0.5, 0.2, 0.8]
-
     ms, min_ms, max_ms = triton.testing.do_bench(bench_lambda, quantiles=quantiles)
     return ms, min_ms, max_ms
 

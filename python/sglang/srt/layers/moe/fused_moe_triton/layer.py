@@ -20,8 +20,8 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -96,7 +96,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     """MoE method without quantization."""
 
-    def __init__(self, use_triton_kernels: False):
+    def __init__(self, use_triton_kernels: bool = False):
         super().__init__()
         self.use_triton_kernels = use_triton_kernels
 
@@ -110,23 +110,27 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         **extra_weight_attrs,
     ):
         # Fused gate_up_proj (column parallel)
-        w13_weight_raw = torch.empty(
-            num_experts, 2 * intermediate_size, hidden_size, dtype=params_dtype
-        )
+        w13_weight_n, w13_weight_k = 2 * intermediate_size, hidden_size
         if self.use_triton_kernels:
-            w13_weight_raw = w13_weight_raw.transpose(-2, -1).contiguous()
-        w13_weight = torch.nn.Parameter(w13_weight_raw, requires_grad=False)
-
+            w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
+        w13_weight = torch.nn.Parameter(
+            torch.empty(num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype),
+            requires_grad=False,
+        )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         # down_proj (row parallel)
-        w2_weight_raw = torch.empty(
-            num_experts, hidden_size, intermediate_size, dtype=params_dtype
+        w2_weight_n, w2_weight_k = (
+            hidden_size,
+            intermediate_size,
         )
         if self.use_triton_kernels:
-            w2_weight_raw = w2_weight_raw.transpose(-2, -1).contiguous()
-        w2_weight = torch.nn.Parameter(w2_weight_raw, requires_grad=False)
+            w2_weight_n, w2_weight_k = w2_weight_k, w2_weight_n
+        w2_weight = torch.nn.Parameter(
+            torch.empty(num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype),
+            requires_grad=False,
+        )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
@@ -502,10 +506,9 @@ class FusedMoE(torch.nn.Module):
         self.inplace = inplace
         self.no_combine = no_combine
 
-        if global_server_args_dict["use_triton_kernels"]:
-            self.use_triton_kernels = True
-        else:
-            self.use_triton_kernels = False
+        self.use_triton_kernels = (
+            not _is_cpu and global_server_args_dict["enable_triton_kernel_moe"]
+        )
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedFusedMoEMethod(
@@ -630,7 +633,7 @@ class FusedMoE(torch.nn.Module):
         else:
             if not self.use_presharded_weights:
                 if self.use_triton_kernels:
-                    loaded_weight = loaded_weight.transpose(-2, -1).contiguous()
+                    loaded_weight = loaded_weight.transpose(-2, -1)
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )
@@ -665,7 +668,7 @@ class FusedMoE(torch.nn.Module):
         else:
             if not self.use_presharded_weights:
                 if self.use_triton_kernels:
-                    loaded_weight = loaded_weight.transpose(-2, -1).contiguous()
+                    loaded_weight = loaded_weight.transpose(-2, -1)
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )

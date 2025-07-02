@@ -1,13 +1,12 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import sys
-from typing import Callable, List, Optional, Tuple
+# Adapted from https://github.com/vllm-project/vllm/pull/18595/files#diff-f426a6de78c82ffec568eff6811bfbf0043dab5f87f1a8c0cffdbdcb8a81e035
+from typing import Optional
 
 import torch
+from sgl_kernel import gelu_and_mul, silu_and_mul
 from triton_kernels.matmul_ogs import matmul_ogs
 from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
 
-# from vllm.utils import direct_register_custom_op
+from sglang.srt.utils import direct_register_custom_op
 
 
 def triton_kernel_moe_forward(
@@ -79,6 +78,15 @@ def triton_kernel_fused_experts(
     block_shape: Optional[list[int]] = None,
 ) -> torch.Tensor:
 
+    assert use_fp8_w8a8 == False, "use_fp8_w8a8 is not supported"
+    assert per_channel_quant == False, "per_channel_quant is not supported"
+    assert expert_map == None, "expert_map is not supported"
+    assert w1_scale == None, "w1_scale is not supported"
+    assert w2_scale == None, "w2_scale is not supported"
+    assert a1_scale == None, "a1_scale is not supported"
+    assert a2_scale == None, "a2_scale is not supported"
+    assert block_shape == None, "block_shape is not supported"
+
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
     assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
@@ -94,7 +102,7 @@ def triton_kernel_fused_experts(
     ), f"w2 shape[-1] {w2.shape[-1]} must be equal to w1 shape[1] {w1.shape[1]}"
 
     # feature check
-    # assert inplace == False, "Inplace is not supported in new triton MoE kernel"
+    assert inplace == False, "Inplace is not supported in new triton MoE kernel"
 
     M, K = hidden_states.shape
     E, _, N = w1.shape
@@ -117,8 +125,6 @@ def triton_kernel_fused_experts(
         gather_indx=gather_indx,
         gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
     )
-
-    from sgl_kernel import gelu_and_mul, silu_and_mul
 
     if activation == "silu":
         silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
@@ -162,12 +168,9 @@ def triton_kernel_moe_forward_fake(
     return torch.empty_like(hidden_states)
 
 
-"""
 direct_register_custom_op(
     op_name="forward_cuda_triton",
     op_func=triton_kernel_moe_forward,
     mutates_args=[],
     fake_impl=triton_kernel_moe_forward_fake,
-    tags=(torch.Tag.needs_fixed_stride_order,),
 )
-"""
