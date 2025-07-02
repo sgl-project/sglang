@@ -20,7 +20,7 @@ import logging
 import os
 import random
 import tempfile
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Union
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -99,6 +99,7 @@ class ServerArgs:
     log_level_http: Optional[str] = None
     log_requests: bool = False
     log_requests_level: int = 0
+    crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
     bucket_time_to_first_token: Optional[List[float]] = None
@@ -130,7 +131,7 @@ class ServerArgs:
     preferred_sampling_params: Optional[str] = None
 
     # LoRA
-    lora_paths: Optional[List[str]] = None
+    lora_paths: Optional[Union[dict[str, str], List[str]]] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
 
@@ -485,12 +486,6 @@ class ServerArgs:
                     self.speculative_eagle_topk,
                     self.speculative_num_draft_tokens,
                 ) = auto_choose_speculative_params(self)
-
-            if self.page_size > 1 and self.speculative_eagle_topk > 1:
-                self.speculative_eagle_topk = 1
-                logger.warning(
-                    "speculative_eagle_topk is adjusted to 1 when page_size > 1"
-                )
 
             if (
                 self.speculative_eagle_topk == 1
@@ -933,8 +928,14 @@ class ServerArgs:
             "--log-requests-level",
             type=int,
             default=0,
-            help="0: Log metadata. 1. Log metadata and partial input/output. 2. Log every input/output.",
-            choices=[0, 1, 2],
+            help="0: Log metadata (no sampling parameters). 1: Log metadata and sampling parameters. 2: Log metadata, sampling parameters and partial input/output. 3: Log every input/output.",
+            choices=[0, 1, 2, 3],
+        )
+        parser.add_argument(
+            "--crash-dump-folder",
+            type=str,
+            default=ServerArgs.crash_dump_folder,
+            help="Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled.",
         )
         parser.add_argument(
             "--show-time-cost",
