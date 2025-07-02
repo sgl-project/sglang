@@ -832,7 +832,7 @@ class OpenAIMoeForCausalLM(nn.Module):
         '''
         ###########################################################################
         self.config.num_experts = self.config.num_local_experts
-        self.config.moe_intermediate_size = self.config.intermediate_size * 2
+        self.config.moe_intermediate_size = self.config.intermediate_size
         self.config.norm_topk_prob = True
         # Todo: remove this, currently use silu as a workaround because the swiglu activation is not supported in FusedMoE
         # self.config.hidden_act = "swiglu"
