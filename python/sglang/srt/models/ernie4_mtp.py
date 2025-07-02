@@ -29,14 +29,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.ernie4 import Ernie4DecoderLayer
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.models.ernie4 import Ernie4_5_ForCausalLM, Ernie4DecoderLayer
+from sglang.srt.utils import add_prefix
 
 
-class Ernie4MTPLayer(nn.Module):
+class Ernie4ModelMTP(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        layer_id: int,
         prefix: str,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
@@ -53,16 +54,12 @@ class Ernie4MTPLayer(nn.Module):
         self.mtp_linear_proj = nn.Linear(
             config.hidden_size * 2, config.hidden_size, bias=False
         )
-        self.mtp_block = make_layers(
-            1,
-            lambda idx, prefix: Ernie4DecoderLayer(
-                config=config,
-                layer_id=idx,
-                quant_config=quant_config,
-                prefix=prefix,
-                is_mtp=True,
-            ),
-            prefix="model.mtp_block",
+        self.mtp_block = Ernie4DecoderLayer(
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("mtp_block", prefix),
+            is_mtp=True,
         )
 
     def forward(
@@ -89,32 +86,35 @@ class Ernie4MTPLayer(nn.Module):
             )
         )
         residual = None
-        for layer in self.mtp_block:
-            hidden_states, residual = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                residual=residual,
-            )
+        hidden_states, residual = self.mtp_block(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            residual=residual,
+        )
         hidden_states = residual + hidden_states
         return hidden_states
 
 
-class Ernie4_5_MoeMTP(nn.Module):
+class Ernie4_5_MoeForCausalLMMTP(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        mtp_layer_id: int = 0,
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
+        self.mtp_layer_id = mtp_layer_id
 
-        self.model = Ernie4MTPLayer(
-            config,
-            prefix,
-            quant_config,
+        self.model = Ernie4ModelMTP(
+            config=config,
+            layer_id=self.mtp_layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
         )
+
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
@@ -139,39 +139,35 @@ class Ernie4_5_MoeMTP(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, weight_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
+        mtp_weight_patterns = [
+            f"mtp_block.{self.mtp_layer_id}",
+            f"mtp_emb_norm.{self.mtp_layer_id}",
+            f"mtp_hidden_norm.{self.mtp_layer_id}",
+            f"mtp_linear_proj.{self.mtp_layer_id}",
         ]
-        strip_layer_id_list = [
-            "mtp_emb_norm.0",
-            "mtp_hidden_norm.0",
-            "mtp_linear_proj.0",
-        ]
-
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if not name.startswith("model.mtp_"):
+            # Only name matched patterns should be loaded
+            for layer_pattern in mtp_weight_patterns:
+                if layer_pattern in name:
+                    break
+            else:
                 continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
+            # But strip mtp_layer_id before loading, because each MTP layer is a MTP model.
+            name = name.replace(f".{self.mtp_layer_id}", "")
+            for (
+                param_name,
+                weight_name,
+                shard_id,
+            ) in Ernie4_5_ForCausalLM.stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                if "mtp_block" not in name:
-                    break
                 name = name.replace(weight_name, param_name)
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for sub_name in strip_layer_id_list:
-                    if sub_name in name:
-                        name = name.replace(".0", "")
-                        break
                 if name in params_dict.keys():
                     param = params_dict[name]
                     weight_loader = getattr(
@@ -196,4 +192,4 @@ class Ernie4_5_MoeMTP(nn.Module):
         torch.cuda.synchronize()
 
 
-EntryClass = [Ernie4_5_MoeMTP]
+EntryClass = [Ernie4_5_MoeForCausalLMMTP]

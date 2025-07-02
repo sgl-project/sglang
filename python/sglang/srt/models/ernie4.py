@@ -25,18 +25,11 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.communicator import enable_moe_dense_fully_dp
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -44,59 +37,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4MLP
 from sglang.srt.models.llama import LlamaAttention as Ernie4Attention
 from sglang.srt.utils import add_prefix, make_layers
-
-
-class Ernie4MLP(nn.Module):
-    def __init__(
-        self,
-        config,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        intermediate_size=None,
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
-    ) -> None:
-        super().__init__()
-        self.tp_size = tp_size
-        if not intermediate_size:
-            intermediate_size = config.intermediate_size
-
-        self.gate_up_proj = MergedColumnParallelLinear(
-            config.hidden_size,
-            [intermediate_size] * 2,
-            bias=config.use_bias,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            config.hidden_size,
-            bias=config.use_bias,
-            quant_config=quant_config,
-            reduce_results=False,
-            prefix=add_prefix("down_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-        )
-        if config.hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {config.hidden_act}. "
-                "Only silu is supported for now."
-            )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x):
-        if (self.tp_size == 1) and x.shape[0] == 0:
-            return x
-
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
 
 
 class MoEGate(nn.Module):
@@ -164,10 +107,12 @@ class Ernie4Moe(nn.Module):
             )
             # disable tp for shared experts when enable deepep moe
             self.shared_experts = Ernie4MLP(
-                config=config,
-                quant_config=quant_config,
-                prefix=add_prefix("shared_experts", prefix),
+                hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+                prefix=add_prefix("shared_experts", prefix),
                 **(
                     {"tp_rank": 0, "tp_size": 1}
                     if global_server_args_dict["enable_deepep_moe"]
@@ -232,7 +177,8 @@ class Ernie4DecoderLayer(nn.Module):
         )
         self.moe_layer_start_index = config.num_hidden_layers
         if hasattr(config, "moe_layer_start_index"):
-            # config.moe_layer_start_index is a list in the VL models, the value of idx 0 is for the text moe
+            # config.moe_layer_start_index is a list in the VL models,
+            # the value of idx 0 is for the text moe
             if isinstance(config.moe_layer_start_index, int):
                 self.moe_layer_start_index = config.moe_layer_start_index
             else:
@@ -245,9 +191,8 @@ class Ernie4DecoderLayer(nn.Module):
             else:
                 self.moe_layer_end_index = config.moe_layer_end_index[0]
         # MLP
-        if (is_mtp == False) and (
-            layer_id >= self.moe_layer_start_index
-            and layer_id <= self.moe_layer_end_index
+        if (not is_mtp) and (
+            self.moe_layer_start_index <= layer_id <= self.moe_layer_end_index
             and (layer_id - self.moe_layer_start_index) % config.moe_layer_interval == 0
         ):
             self.mlp = Ernie4Moe(
@@ -257,10 +202,18 @@ class Ernie4DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
+            if enable_moe_dense_fully_dp():
+                mlp_tp_rank, mlp_tp_size = 0, 1
+            else:
+                mlp_tp_rank, mlp_tp_size = None, None
             self.mlp = Ernie4MLP(
-                config=config,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                tp_rank=mlp_tp_rank,
+                tp_size=mlp_tp_size,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

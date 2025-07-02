@@ -125,7 +125,7 @@ class ModelConfig:
             is_draft_model
             and self.hf_config.architectures[0] == "Ernie4_5_MoeForCausalLM"
         ):
-            self.hf_config.architectures[0] = "Ernie4_5_MoeMTP"
+            self.hf_config.architectures[0] = "Ernie4_5_MoeForCausalLMMTP"
         # Check model type
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
