@@ -22,7 +22,7 @@ class DPBalanceMeta:
         self.onfly_info_size = (
             512 * num_workers * 8
         )  # max_onfly_req_per_worker * num_workers * dByte
-        self.local_tokens_size = num_workers * 8
+        self.local_tokens_size = num_workers * 8 + 512
         self.num_workers = num_workers
 
         if do_init:
