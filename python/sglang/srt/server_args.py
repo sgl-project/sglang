@@ -325,8 +325,52 @@ class ServerArgs:
 
             # Multimodal models need more memory for the image processor
             model_config = ModelConfig.from_server_args(self)
-            if model_config.is_multimodal:
-                self.mem_fraction_static *= 0.90
+
+            vision_config = getattr(model_config.hf_config, "vision_config", None)
+
+            if model_config.is_multimodal and vision_config:
+                # roughly reduce the mem_fraction_static base on params of Vit
+                original_server_arg_mem_fraction = self.mem_fraction_static
+                # a base mem_fraction_static factor for regular Vit
+                base_mem_fraction_reduction_ratio = 0.95
+
+                vit_num_layers = getattr(vision_config, "num_hidden_layers", 24)
+                vit_hidden_size = getattr(vision_config, "hidden_size", 1024)
+
+                # baseline ViT params (ViT-L/14)
+                baseline_vit_layers = 24
+                baseline_vit_hidden_size = 1024
+
+                # weight params count
+                current_complexity_score = vit_num_layers * (vit_hidden_size ** 2)
+                baseline_complexity_score = baseline_vit_layers * (
+                    baseline_vit_hidden_size ** 2
+                )
+                complexity_ratio = (
+                    current_complexity_score / baseline_complexity_score
+                    if baseline_complexity_score > 0
+                    else 1.0
+                )
+
+                # every time the complexity grows 100%, adjust final factor for 10%
+                sensitivity_scale = 0.1
+                dynamic_adjustment_factor = 1.0 - sensitivity_scale * (
+                    complexity_ratio - 1.0
+                )
+                dynamic_adjustment_factor = max(
+                    0.8, min(1.05, dynamic_adjustment_factor)
+                )
+
+                final_overall_factor = (
+                    base_mem_fraction_reduction_ratio * dynamic_adjustment_factor
+                )
+                self.mem_fraction_static = (
+                    original_server_arg_mem_fraction * final_overall_factor
+                )
+                logger.warning(
+                    f"Multimodal model: Dynamically adjusted --mem-fraction-static "
+                    f"from: {original_server_arg_mem_fraction:.3f} to: {self.mem_fraction_static:.3f}."
+                )
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
@@ -608,8 +652,8 @@ class ServerArgs:
             default=ServerArgs.tokenizer_mode,
             choices=["auto", "slow"],
             help="Tokenizer mode. 'auto' will use the fast "
-            "tokenizer if available, and 'slow' will "
-            "always use the slow tokenizer.",
+                 "tokenizer if available, and 'slow' will "
+                 "always use the slow tokenizer.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",
@@ -638,27 +682,27 @@ class ServerArgs:
                 "remote",
             ],
             help="The format of the model weights to load. "
-            '"auto" will try to load the weights in the safetensors format '
-            "and fall back to the pytorch bin format if safetensors format "
-            "is not available. "
-            '"pt" will load the weights in the pytorch bin format. '
-            '"safetensors" will load the weights in the safetensors format. '
-            '"npcache" will load the weights in pytorch format and store '
-            "a numpy cache to speed up the loading. "
-            '"dummy" will initialize the weights with random values, '
-            "which is mainly for profiling."
-            '"gguf" will load the weights in the gguf format. '
-            '"bitsandbytes" will load the weights using bitsandbytes '
-            "quantization."
-            '"layered" loads weights layer by layer so that one can quantize a '
-            "layer before loading another to make the peak memory envelope "
-            "smaller.",
+                 '"auto" will try to load the weights in the safetensors format '
+                 "and fall back to the pytorch bin format if safetensors format "
+                 "is not available. "
+                 '"pt" will load the weights in the pytorch bin format. '
+                 '"safetensors" will load the weights in the safetensors format. '
+                 '"npcache" will load the weights in pytorch format and store '
+                 "a numpy cache to speed up the loading. "
+                 '"dummy" will initialize the weights with random values, '
+                 "which is mainly for profiling."
+                 '"gguf" will load the weights in the gguf format. '
+                 '"bitsandbytes" will load the weights using bitsandbytes '
+                 "quantization."
+                 '"layered" loads weights layer by layer so that one can quantize a '
+                 "layer before loading another to make the peak memory envelope "
+                 "smaller.",
         )
         parser.add_argument(
             "--model-loader-extra-config",
             type=str,
             help="Extra config for model loader. "
-            "This will be passed to the model loader corresponding to the chosen load_format.",
+                 "This will be passed to the model loader corresponding to the chosen load_format.",
             default=ServerArgs.model_loader_extra_config,
         )
         parser.add_argument(
@@ -672,13 +716,13 @@ class ServerArgs:
             default=ServerArgs.dtype,
             choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
             help="Data type for model weights and activations.\n\n"
-            '* "auto" will use FP16 precision for FP32 and FP16 models, and '
-            "BF16 precision for BF16 models.\n"
-            '* "half" for FP16. Recommended for AWQ quantization.\n'
-            '* "float16" is the same as "half".\n'
-            '* "bfloat16" for a balance between precision and range.\n'
-            '* "float" is shorthand for FP32 precision.\n'
-            '* "float32" for FP32 precision.',
+                 '* "auto" will use FP16 precision for FP32 and FP16 models, and '
+                 "BF16 precision for BF16 models.\n"
+                 '* "half" for FP16. Recommended for AWQ quantization.\n'
+                 '* "float16" is the same as "half".\n'
+                 '* "bfloat16" for a balance between precision and range.\n'
+                 '* "float" is shorthand for FP32 precision.\n'
+                 '* "float32" for FP32 precision.',
         )
         parser.add_argument(
             "--kv-cache-dtype",
@@ -714,9 +758,9 @@ class ServerArgs:
             type=nullable_str,
             default=None,
             help="Path to the JSON file containing the KV cache "
-            "scaling factors. This should generally be supplied, when "
-            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
-            "default to 1.0, which may cause accuracy issues. ",
+                 "scaling factors. This should generally be supplied, when "
+                 "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
+                 "default to 1.0, which may cause accuracy issues. ",
         )
         parser.add_argument(
             "--context-length",
@@ -764,20 +808,20 @@ class ServerArgs:
             type=str,
             default=None,
             help="The specific model version to use. It can be a branch "
-            "name, a tag name, or a commit id. If unspecified, will use "
-            "the default version.",
+                 "name, a tag name, or a commit id. If unspecified, will use "
+                 "the default version.",
         )
         parser.add_argument(
             "--impl",
             type=str,
             default=ServerArgs.impl,
             help="Which implementation of the model to use.\n\n"
-            '* "auto" will try to use the SGLang implementation if it exists '
-            "and fall back to the Transformers implementation if no SGLang "
-            "implementation is available.\n"
-            '* "sglang" will use the SGLang model implementation.\n'
-            '* "transformers" will use the Transformers model '
-            "implementation.\n",
+                 '* "auto" will try to use the SGLang implementation if it exists '
+                 "and fall back to the Transformers implementation if no SGLang "
+                 "implementation is available.\n"
+                 '* "sglang" will use the SGLang model implementation.\n'
+                 '* "transformers" will use the Transformers model '
+                 "implementation.\n",
         )
 
         # Memory and scheduling
@@ -798,7 +842,7 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_total_tokens,
             help="The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. "
-            "This option is typically used for development and debugging purposes.",
+                 "This option is typically used for development and debugging purposes.",
         )
         parser.add_argument(
             "--chunked-prefill-size",
@@ -1469,7 +1513,7 @@ class ServerArgs:
             "--triton-attention-reduce-in-fp32",
             action="store_true",
             help="Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."
-            "This only affects Triton attention kernels.",
+                 "This only affects Triton attention kernels.",
         )
         parser.add_argument(
             "--triton-attention-num-kv-splits",
@@ -1482,8 +1526,8 @@ class ServerArgs:
             type=int,
             default=ServerArgs.num_continuous_decode_steps,
             help="Run multiple continuous decoding steps to reduce scheduling overhead. "
-            "This can potentially increase throughput but may also increase time-to-first-token latency. "
-            "The default value is 1, meaning only run one decoding step at a time.",
+                 "This can potentially increase throughput but may also increase time-to-first-token latency. "
+                 "The default value is 1, meaning only run one decoding step at a time.",
         )
         parser.add_argument(
             "--delete-ckpt-after-loading",
@@ -1559,7 +1603,7 @@ class ServerArgs:
             type=str,
             required=False,
             help="Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 "
-            "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
+                 "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
         )
 
         # Debug tensor dumps
@@ -1631,8 +1675,8 @@ class ServerArgs:
             type=str,
             default=ServerArgs.disaggregation_ib_device,
             help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
-            "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
-            "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+                 "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
+                 "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
         )
         parser.add_argument(
             "--num-reserved-decode-tokens",
@@ -1676,8 +1720,8 @@ class ServerArgs:
 
     def check_server_args(self):
         assert (
-            self.tp_size * self.pp_size
-        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+                   self.tp_size * self.pp_size
+               ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
         # FIXME pp constraints
         if self.pp_size > 1:
