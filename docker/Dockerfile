@@ -7,7 +7,8 @@ ARG CMAKE_BUILD_PARALLEL_LEVEL=2
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
-    NVSHMEM_DIR=/sgl-workspace/nvshmem/install
+    NVSHMEM_DIR=/sgl-workspace/nvshmem/install \
+    BUILD_TYPE=${BUILD_TYPE}
 
 # Set timezone and install all packages
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
@@ -71,6 +72,8 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
  && cd nvshmem \
  && rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
  && CUDA_ARCH=$([ "$BUILD_TYPE" = "blackwell" ] && echo 100 || echo 90) \
+ && if [ "$BUILD_TYPE" = "blackwell" ]; then CUDA_ARCH=100; else CUDA_ARCH=90; fi \
+ && echo "BUILD_TYPE: $BUILD_TYPE, CUDA_ARCH: $CUDA_ARCH" \
  && NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
