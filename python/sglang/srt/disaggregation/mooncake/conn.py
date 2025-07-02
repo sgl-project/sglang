@@ -277,7 +277,7 @@ class MooncakeKVManager(BaseKVManager):
                     dst_addr_list_small_chunk.append(dst_addr)
                     length_list_small_chunk.append(length)
         
-        async_futures = [
+        large_chunks_transfer_futures = [
             executor.submit(
                 self.engine.batch_transfer_async,
                 mooncake_session_id,
@@ -289,9 +289,9 @@ class MooncakeKVManager(BaseKVManager):
 
         num_small_chunks = len(length_list_small_chunk)
         micro_batch_size = max(num_small_chunks // self.thread_pool_size, self.thread_pool_size)
-        sync_futures = [
+        small_chunks_transfer_futures = [
             executor.submit(
-                self.engine.batch_transfer_sync,
+                self.engine.batch_transfer_async,
                 mooncake_session_id,
                 src_addr_list_small_chunk[i : i + micro_batch_size],
                 dst_addr_list_small_chunk[i : i + micro_batch_size],
@@ -300,7 +300,7 @@ class MooncakeKVManager(BaseKVManager):
             for i in range (0, num_small_chunks, micro_batch_size)
         ]
 
-        futures = async_futures + sync_futures
+        futures = large_chunks_transfer_futures + small_chunks_transfer_futures
         for future in concurrent.futures.as_completed(futures):
             status = future.result()
             if status != 0:
@@ -425,10 +425,10 @@ class MooncakeKVManager(BaseKVManager):
                 )
             ]
         else:
-            micro_batch_size = min(len(length_list), 256)
+            micro_batch_size = max(len(length_list) // self.thread_pool_size, self.thread_pool_size)
             futures = [
                 executor.submit(
-                    self.engine.batch_transfer_sync,
+                    self.engine.batch_transfer_async,
                     mooncake_session_id,
                     src_addr_list[i : i + micro_batch_size],
                     dst_addr_list[i : i + micro_batch_size],
