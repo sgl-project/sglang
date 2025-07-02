@@ -20,12 +20,14 @@ Page-aligned memory pool.
 """
 
 import abc
+import weakref
 from typing import TYPE_CHECKING
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var, next_power_of_2
 
 if TYPE_CHECKING:
@@ -54,6 +56,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def debug_print(self) -> str:
         return ""
+
+    def log_usage(self, evictable_size: int = 0):
+        num_used = self.size - (self.available_size() + evictable_size)
+        msg = f"#token: {num_used}, token usage: {num_used / self.size:.2f}, "
+        return msg, num_used
 
     def available_size(self):
         return len(self.free_pages) * self.page_size
@@ -144,6 +151,128 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+
+class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    """Allocator for SWA hybrid KV cache."""
+
+    def __init__(
+        self,
+        size: int,
+        size_swa: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: SWAKVPool,
+    ):
+        super().__init__(size, 1, dtype, device, kvcache)
+        assert isinstance(kvcache, SWAKVPool)
+        self._size_full = size
+        self._size_swa = size_swa
+        self.full_attn_allocator = TokenToKVPoolAllocator(
+            size,
+            dtype,
+            device,
+            kvcache.full_kv_pool,
+        )
+        self.swa_attn_allocator = TokenToKVPoolAllocator(
+            size_swa,
+            dtype,
+            device,
+            kvcache.swa_kv_pool,
+        )
+        self.full_to_swa_index_mapping = torch.empty(
+            size + size_swa + 1,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.clear()
+
+        self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
+
+    def available_size(self):
+        return min(self.full_available_size(), self.swa_available_size())
+
+    def full_available_size(self):
+        return self.full_attn_allocator.available_size()
+
+    def swa_available_size(self):
+        return self.swa_attn_allocator.available_size()
+
+    @property
+    def size_full(self):
+        return self._size_full
+
+    @property
+    def size_swa(self):
+        return self._size_swa
+
+    def debug_print(self) -> str:
+        msg = ""
+        msg += f"#swa-available-size: {self.swa_attn_allocator.available_size()}, "
+        msg += (
+            f"#full-attn-available-size: {self.full_attn_allocator.available_size()}, "
+        )
+        return msg
+
+    def log_usage(self, swa_evictable_size: int = 0, full_evictable_size: int = 0):
+        used_full = self.size_full - (self.full_available_size() + full_evictable_size)
+        used_swa = self.size_swa - (self.swa_available_size() + swa_evictable_size)
+        msg = (
+            f"#token: full={used_full}, swa={used_swa}, "
+            f"token usage: full={used_full / self.size_full:.2f}, "
+            f"swa={used_swa / self.size_swa:.2f}, "
+        )
+        return msg, used_full
+
+    def get_kvcache(self):
+        return self._kvcache
+
+    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
+        assert self.full_to_swa_index_mapping is not None
+        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
+
+    def alloc(self, need_size: int):
+        if need_size > self.full_attn_allocator.available_size():
+            return None
+        if need_size > self.swa_attn_allocator.available_size():
+            return None
+
+        alloc_full_indices = self.full_attn_allocator.alloc(need_size)
+        alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
+        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        return alloc_full_indices
+
+    def free(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+        if self.is_not_in_free_group:
+            self.full_attn_allocator.free(free_index)
+            self.free_swa(free_index)
+        else:
+            self.free_group.append(free_index)
+        assert (
+            self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
+        )
+        assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+
+    def free_swa(self, free_index: torch.Tensor):
+        swa_indices = self.full_to_swa_index_mapping[free_index]
+        swa_indices = swa_indices[swa_indices > 0]
+        self.swa_attn_allocator.free(swa_indices)
+        self.full_to_swa_index_mapping[free_index] = 0
+
+    def backup_state(self):
+        raise NotImplementedError
+
+    def restore_state(self, state):
+        raise NotImplementedError
+
+    def clear(self):
+        self.swa_attn_allocator.clear()
+        self.full_attn_allocator.clear()
+        self.full_to_swa_index_mapping.fill_(0)
+        self.is_in_free_group = False
+        self.free_group = []
 
 
 @triton.jit
