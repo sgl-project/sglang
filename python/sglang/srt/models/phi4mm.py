@@ -444,7 +444,7 @@ class Phi4MMForCausalLM(nn.Module):
             forward_batch=forward_batch,
             language_model=self.language_model,
             data_embedding_funcs={
-                Modality.IMAGE: self.get_image_feature,
+                Modality.IMAGE: self.get_image_feature(),
             },
             positions=positions,
         )

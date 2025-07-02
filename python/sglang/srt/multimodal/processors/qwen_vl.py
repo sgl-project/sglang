@@ -2,13 +2,15 @@ import asyncio
 import math
 import os
 import re
-from typing import Dict, List, Union
+from typing import List, Union
 
+import torch
+import torchvision
+from decord import VideoReader
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
@@ -31,53 +33,6 @@ FRAME_FACTOR = 2
 FPS = 2.0
 FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
-
-
-# Compatible with Qwen2VL and Qwen2_5VL
-class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
-    models = [Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration]
-
-    def __init__(self, hf_config, server_args, _processor):
-        super().__init__(hf_config, server_args, _processor)
-        # The single, pre-expanded image token.
-        self.IMAGE_TOKEN = "<|vision_start|><|image_pad|><|vision_end|>"
-        # The regex that matches expanded image tokens.
-        self.IMAGE_TOKEN_REGEX = re.compile(
-            r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
-        )
-        self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
-        self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
-        self.IM_TOKEN_ID = hf_config.image_token_id
-        self.VIDEO_TOKEN_ID = hf_config.video_token_id
-        self.vision_start_token_id = hf_config.vision_start_token_id
-        self.vision_end_token_id = hf_config.vision_end_token_id
-        self.NUM_TOKEN_PER_FRAME = 770
-        self.IMAGE_FACTOR = 28
-        self.MIN_PIXELS = 4 * 28 * 28
-        self.MAX_PIXELS = 16384 * 28 * 28
-        self.MAX_RATIO = 200
-
-    async def process_mm_data_async(
-        self,
-        image_data: List[Union[str, bytes, Dict]],
-        input_text,
-        request_obj,
-        max_req_input_len,
-        *args,
-        **kwargs,
-    ):
-        if isinstance(image_data, str):
-            image_data = [image_data]
-
-        base_output = self.load_mm_data(
-            prompt=input_text,
-            image_data=image_data,
-            multimodal_tokens=MultimodalSpecialTokens(
-                image_token=self.IMAGE_TOKEN,
-                image_token_regex=self.IMAGE_TOKEN_REGEX,
-            ),
-            max_req_input_len=max_req_input_len,
-        )
 
 
 def smart_resize(
@@ -282,8 +237,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        if isinstance(image_data, str):
-            image_data = [image_data]
 
         base_output = self.load_mm_data(
             prompt=input_text,
