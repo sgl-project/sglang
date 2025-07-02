@@ -122,7 +122,6 @@ def decode_attention_intermediate_arrays_shapes(num_seqs, head_size_kv, num_quer
         head_size_kv=head_size_kv,
         block_size=0,
         num_seqs=num_seqs,
-        kv_lens=0,
     )
     return get_paged_decode_intermediate_arrays_shapes(shape, max_kv_splits)
 
@@ -142,9 +141,8 @@ def decode_attention_wave(
     logit_cap,
 ):
     num_seqs, num_query_heads, head_size = q.shape
-    total_tokens, num_kv_heads, _ = k_buffer.shape
+    _, num_kv_heads, _ = k_buffer.shape
     _, _, head_size_kv = v_buffer.shape
-    seq_len = total_tokens // num_seqs
     block_size = 32
     shape = paged_decode_attention_shape(
         num_query_heads,
@@ -153,7 +151,6 @@ def decode_attention_wave(
         head_size_kv,
         block_size,
         num_seqs,
-        seq_len,
     )
 
     phase_0, phase_1 = get_wave_kernel(
