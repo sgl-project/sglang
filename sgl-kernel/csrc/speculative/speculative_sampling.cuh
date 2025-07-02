@@ -190,7 +190,7 @@ cudaError_t TreeSpeculativeSamplingTargetOnly(
   const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
-  // float capped_threshold_acc = fmaxf(threshold_acc, 1e-9f);
+
   void* args[] = {
       &predicts,
       &output_token_ids,

@@ -481,13 +481,9 @@ class Req:
             for i in range(len(self.origin_input_ids_unpadded) - 1, -1, -1):
                 if self.origin_input_ids_unpadded[i] == think_start_token_id:
                     self.is_thinking = True
-                    logger.warning("Thinking started during prefill!")
-                elif self.origin_input_ids_unpadded[i] == think_end_token_id:
-                    logger.warning("Thinking ended during prefill!")
-                    pass
-                else:
-                    continue
-                break
+                    break
+                if self.origin_input_ids_unpadded[i] == think_end_token_id:
+                    break
 
         self.origin_input_ids = origin_input_ids
         # Each decode stage's output ids

@@ -104,9 +104,6 @@ def test_tree_speculative_sampling_target_only(
     coins = torch.rand(bs, num_draft_tokens, device=device, dtype=torch.float32)
     coins_for_final_sampling = torch.rand(bs, device=device).to(torch.float32)
 
-    # threshold_singles = torch.ones(bs, device=device).to(torch.float32) * threshold_single
-    # threshold_accs = torch.ones(bs, device=device).to(torch.float32) * threshold_acc
-
     threshold_singles = torch.tensor(
         threshold_singles, dtype=torch.float32, device=device
     )

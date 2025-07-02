@@ -70,8 +70,6 @@ class EagleDraftInput:
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
 
-    is_thinking = None
-
     def prepare_for_extend(self, batch: ScheduleBatch):
         if batch.forward_mode.is_idle():
             return
@@ -509,15 +507,11 @@ class EagleVerifyInput:
                 id = predict_cpu[idx]
                 req.output_ids.append(id)
 
-                # think_start_token = 128798
-                # think_end_token = 128799
                 if relaxed_thinking and thinking_states:
                     if id == req.think_start_token_id:
                         thinking_states[i] = True
-                        logger.warning("thinking is started in spec!")
                     if id == req.think_end_token_id:
                         thinking_states[i] = False
-                        logger.warning("thinking is ended in spec!")
 
                 req.check_finished()
                 if req.finished():

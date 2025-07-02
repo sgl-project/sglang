@@ -10,7 +10,7 @@ check-deps: ## Check and install required Python formatting dependencies
 	@command -v black >/dev/null 2>&1 || (echo "Installing black..." && pip install black)
 
 install-deps: ## Install Python formatting tools (isort and black)
-	pip install scikit-build-core isort black nvtx --break-system-packages
+	pip install scikit-build-core isort black --break-system-packages
 
 tree: ## Show project directory structure
 	@tree --prune -I "__pycache__|*.egg-info|*.so|build|3rdparty|dist"
