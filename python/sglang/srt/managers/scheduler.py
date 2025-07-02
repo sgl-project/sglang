@@ -1372,7 +1372,7 @@ class Scheduler(
             msg += f"accept len: {spec_accept_length:.2f}, "
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
-            msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
+            msg += f"pre-allocated usage: {self.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         msg += (
