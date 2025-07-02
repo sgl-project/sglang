@@ -79,14 +79,12 @@ def initialize_dp_attention(
     )
 
     if enable_dp_attention:
-        local_rank = tp_rank % (tp_size // dp_size)
         _ATTN_DP_SIZE = dp_size
         if moe_dense_tp_size is None:
             _LOCAL_ATTN_DP_SIZE = _ATTN_DP_SIZE
         else:
             _LOCAL_ATTN_DP_SIZE = max(1, dp_size // (tp_size // moe_dense_tp_size))
     else:
-        local_rank = tp_rank
         _ATTN_DP_SIZE = 1
         _LOCAL_ATTN_DP_SIZE = 1
 
@@ -96,7 +94,7 @@ def initialize_dp_attention(
             list(range(head, head + _ATTN_TP_SIZE))
             for head in range(0, pp_size * tp_size, _ATTN_TP_SIZE)
         ],
-        local_rank,
+        tp_group.local_rank,
         torch.distributed.get_backend(tp_group.device_group),
         use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
         use_pymscclpp=False,
@@ -165,7 +163,8 @@ def disable_dp_size():
 
 
 def get_dp_local_info(forward_batch: ForwardBatch):
-    dp_rank = get_local_attention_dp_rank()
+    # `get_dp_local_info` is only called in global DP gather and scatter. We use global DP rank here.
+    dp_rank = get_attention_dp_rank()
 
     if forward_batch.dp_local_start_pos is None:
         cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
@@ -309,4 +308,4 @@ def attn_tp_reduce_scatter(
 
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input_: torch.Tensor):
-    return get_attention_tp_group().all_gather(input_, tensor_list=output_list)
+    return get_attention_tp_group().all_gather(input_, output_tensor_list=output_list)
