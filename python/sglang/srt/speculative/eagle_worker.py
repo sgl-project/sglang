@@ -75,7 +75,8 @@ class EAGLEWorker(TpModelWorker):
         dp_rank: Optional[int],
         nccl_port: int,
         target_worker: TpModelWorker,
-        **kwargs,
+        think_start_token: Optional[int],
+        think_end_token: Optional[int],
     ):
         # Parse arguments
         self.server_args = server_args
@@ -174,8 +175,8 @@ class EAGLEWorker(TpModelWorker):
             "speculative_relaxed_thinking", False
         )
         if self.relaxed_thinking:
-            self.think_start_token = kwargs["think_start_id"]
-            self.think_end_token = kwargs["think_end_id"]
+            self.think_start_token = think_start_token
+            self.think_end_token = think_end_token
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
