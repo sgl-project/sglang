@@ -45,6 +45,7 @@ ENABLE_TRTLMM_GEN_MOE = get_bool_env_var("SGLANG_ENABLE_TRTLLM_GEN_MOE", "false"
 if ENABLE_TRTLMM_GEN_MOE:
     try:
         import tensorrt_llm
+        from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
         from tensorrt_llm.quantization.utils.fp4_utils import (
             float4_sf_dtype,
             get_reorder_rows_for_gated_act_gemm_row_indices,
@@ -517,6 +518,7 @@ class ModelOptNvFp4FusedMoEMethod:
     Args:
         quant_config: NVFP4 Quant Config
     """
+
     _cache_permute_indices = {}
     weight_dtype = torch.uint8
     weight_scale_dtype = torch.float8_e4m3fn
@@ -688,6 +690,7 @@ class ModelOptNvFp4FusedMoEMethod:
             else swizzled_scale.reshape(B, M, K)
         )
 
+    # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc0/tensorrt_llm/_torch/modules/fused_moe/quantization.py#L1094
     def trtllm_gen_maybe_get_cached_w3_w1_permute_indices(
         self,
         dst_w3_w1_weight: torch.Tensor,
@@ -714,6 +717,7 @@ class ModelOptNvFp4FusedMoEMethod:
         permute_indices = self._cache_permute_indices[dst_w3_w1_weight.shape]
         return permute_indices
 
+    # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc0/tensorrt_llm/_torch/modules/fused_moe/quantization.py#L1094
     def trtllm_gen_maybe_get_cached_w2_permute_indices(
         self,
         dst_w2_weight: torch.Tensor,
@@ -736,6 +740,7 @@ class ModelOptNvFp4FusedMoEMethod:
         permute_indices = self._cache_permute_indices[dst_w2_weight.shape]
         return permute_indices
 
+    # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc0/tensorrt_llm/_torch/modules/fused_moe/quantization.py#L1094
     def trtllm_gen_process_expert_w3_w1_weight(self, layer: torch.nn.Module):
         for expert_idx in range(layer.local_num_experts):
             dst_w3_w1_weight = layer.w13_weight.data[expert_idx]  # (E, imm * 2, hidden)
@@ -758,6 +763,7 @@ class ModelOptNvFp4FusedMoEMethod:
                 processed_w31_weight_shard.view(dst_w3_w1_weight.dtype)
             )
 
+    # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc0/tensorrt_llm/_torch/modules/fused_moe/quantization.py#L1094
     def trtllm_gen_process_expert_w2_weight(self, layer: torch.nn.Module):
         for expert_idx in range(layer.local_num_experts):
             dst_w2_weight = layer.w2_weight.data[expert_idx]  # (E, hidden, imm)
@@ -988,6 +994,16 @@ class ModelOptNvFp4FusedMoEMethod:
 
         if ENABLE_TRTLMM_GEN_MOE:
             assert self.enable_flashinfer_moe
+            assert use_grouped_topk, "must be true for deepseek_v3"
+            assert correction_bias is not None, "must appear for deepseek_v3"
+            assert topk_group is not None, "must appear for deepseek_v3"
+            assert routed_scaling_factor is not None, "must appear for deepseek_v3"
+            assert num_expert_group is not None, "must appear for deepseek_v3"
+            assert not apply_router_weight_on_input, "unsupported"
+            assert custom_routing_function is None, "unsupported"
+            assert (
+                num_fused_shared_experts is None or num_fused_shared_experts == 0
+            ), "unsupported"
             do_finalize = True
             scale_factor_use_ue8m0 = False
             is_scale_factor_swizzled = False  # use linear layout here
@@ -1004,23 +1020,22 @@ class ModelOptNvFp4FusedMoEMethod:
             # FIXME: tile_tokens_dim is hardcoded for now
             tile_tokens_dim = 8
 
+            # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc1/tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py#L195
             outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
-                router_logits,
+                # NOTE: router out_dtype should be float32!
+                # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc1/tensorrt_llm/_torch/models/modeling_deepseekv3.py#L378
+                router_logits.to(torch.float),
                 correction_bias,
                 hidden_states_fp4,
                 hidden_states_scale_linear_fp4.view(torch.float8_e4m3fn),
-                layer.w13_weight,  # self.w3_w1_weight, # uint8
-                layer.w13_weight_scale.view(
-                    torch.float8_e4m3fn
-                ),  # self.w3_w1_weight_scale.view(torch.float8_e4m3fn),
-                layer.w2_weight,  # self.w2_weight, # uint8
-                layer.w2_weight_scale.view(
-                    torch.float8_e4m3fn
-                ),  # self.w2_weight_scale.view(torch.float8_e4m3fn),
-                layer.g1_scale_c.data,  # fc31_scale_c.data,
-                layer.g1_alphas.data,  # fc31_alpha.data,
-                layer.g2_alphas.data,  # fc2_alpha.data,
-                layer.local_num_experts * ep_size,  # num_slots,
+                layer.w13_weight,
+                layer.w13_weight_scale.view(torch.float8_e4m3fn),
+                layer.w2_weight,
+                layer.w2_weight_scale.view(torch.float8_e4m3fn),
+                layer.g1_scale_c.data,
+                layer.g1_alphas.data,
+                layer.g2_alphas.data,
+                layer.local_num_experts * ep_size,
                 top_k,
                 num_expert_group,
                 topk_group,
@@ -1030,7 +1045,7 @@ class ModelOptNvFp4FusedMoEMethod:
                 layer.local_num_experts,  # local_expert_size
                 routed_scaling_factor,
                 tile_tokens_dim,
-                2,  # self.routing_method.routing_method_type = DeepSeekV3 = 2,
+                RoutingMethodType.DeepSeekV3,
                 do_finalize=do_finalize,
             )
             return outputs[0]
