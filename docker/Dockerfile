@@ -57,7 +57,7 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
  && cd / && rm -rf /tmp/gdrcopy
 
 # Fix DeepEP IBGDA symlink
-RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
+RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
 
 FROM scratch AS local_src
 COPY . /src
@@ -85,23 +85,29 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
  && python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.6 --force-reinstall --no-deps \
  && python3 -m flashinfer --download-cubin \
  && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.8/sgl_kernel-0.3.8+cu128-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.8/sgl_kernel-0.3.8+cu128-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
     fi \
  && if [ "$CUDA_VERSION" = "12.9.1" ]; then \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.8/sgl_kernel-0.3.8+cu129-cp310-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.3.8/sgl_kernel-0.3.8+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
     fi
 
 # Download source files
 RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/source/nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
-    git clone https://github.com/deepseek-ai/DeepEP.git && \
-    cd DeepEP && git checkout ${DEEPEP_COMMIT} && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-    cd .. && \
+    if [ "$BUILD_TYPE" = "blackwell" ] && [ "$(uname -m)" = "aarch64" ]; then \
+      git clone https://github.com/fzyzcjy/DeepEP.git \
+      && cd DeepEP && git checkout 1b14ad661c7640137fcfe93cccb2694ede1220b0 && cd .. ; \
+    else \
+      git clone https://github.com/deepseek-ai/DeepEP.git \
+      && cd DeepEP && git checkout ${DEEPEP_COMMIT} && sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && cd .. ; \
+    fi \
     tar -xf nvshmem_src_cuda12-all-all-3.3.9.tar.gz && \
     mv nvshmem_src nvshmem && \
     rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz
 
+
 # Build and install NVSHMEM
 RUN cd /sgl-workspace/nvshmem && \
+    if [ "$BUILD_TYPE" = "blackwell" ]; then CUDA_ARCH="100;120"; else CUDA_ARCH=90; fi && \
     NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
@@ -110,7 +116,7 @@ RUN cd /sgl-workspace/nvshmem && \
     NVSHMEM_PMIX_SUPPORT=0 \
     NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
     NVSHMEM_USE_GDRCOPY=1 \
-    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES="90" && \
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} && \
     cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL}
 
 # Install DeepEP
@@ -127,6 +133,7 @@ RUN cd /sgl-workspace/DeepEP && \
         ;; \
     esac && \
     NVSHMEM_DIR=${NVSHMEM_DIR} TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install .
+
 
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
@@ -172,16 +179,16 @@ RUN apt-get update && apt-get install -y \
 
 RUN apt update -y \
     && apt install -y --no-install-recommends gnupg \
-    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/amd64 /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
-    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub \
+    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
+    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
     && apt update -y \
     && apt install nsight-systems-cli -y
 
 # Set up locale
 RUN locale-gen en_US.UTF-8
-ENV LANG en_US.UTF-8
-ENV LANGUAGE en_US:en
-ENV LC_ALL en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+ENV LC_ALL=en_US.UTF-8
 
 # Install minimal Python packages
 RUN python3 -m pip install --no-cache-dir --break-system-packages \
@@ -212,11 +219,14 @@ RUN curl -L https://github.com/clangd/clangd/releases/download/18.1.3/clangd-lin
     && rm -rf clangd_18.1.3 clangd.zip
 
 # Install CMake
-RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1-linux-x86_64.tar.gz \
-    && tar -xzf cmake-3.31.1-linux-x86_64.tar.gz \
-    && cp -r cmake-3.31.1-linux-x86_64/bin/* /usr/local/bin/ \
-    && cp -r cmake-3.31.1-linux-x86_64/share/* /usr/local/share/ \
-    && rm -rf cmake-3.31.1-linux-x86_64 cmake-3.31.1-linux-x86_64.tar.gz
+RUN CMAKE_VERSION=3.31.1 \
+    && ARCH=$(uname -m) \
+    && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
+    && wget "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
+    && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
+    && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
+    && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
+    && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
 # Install Rust toolchain for sgl-router
 ENV PATH="/root/.cargo/bin:${PATH}"
