@@ -460,7 +460,10 @@ class LayeredModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-        from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+        from sglang.srt.layers.torchao_utils import (
+            apply_torchao_config_to_model,
+            proj_filter,
+        )
         from sglang.srt.managers.schedule_batch import global_server_args_dict
 
         torchao_config = global_server_args_dict.get("torchao_config")
@@ -503,7 +506,7 @@ class LayeredModelLoader(DefaultModelLoader):
                     weights,
                 )
                 # Quantize weights if applicable
-                if torchao_config and "proj" in fqn_path:
+                if torchao_config and proj_filter(module, fqn_path):
                     # Note: `None` here is needed to indicate no filter, see
                     # `apply_torchao_config_to_model` for details.
                     apply_torchao_config_to_model(module, torchao_config, None)
