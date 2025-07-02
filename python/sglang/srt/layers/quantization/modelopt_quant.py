@@ -517,6 +517,9 @@ class ModelOptNvFp4FusedMoEMethod:
     Args:
         quant_config: NVFP4 Quant Config
     """
+    _cache_permute_indices = {}
+    weight_dtype = torch.uint8
+    weight_scale_dtype = torch.float8_e4m3fn
 
     def __new__(cls, *args, **kwargs):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
@@ -545,9 +548,6 @@ class ModelOptNvFp4FusedMoEMethod:
                 " above."
             )
         self.enable_flashinfer_moe = False
-        self._cache_permute_indices = {}
-        self.weight_dtype = torch.uint8
-        self.weight_scale_dtype = torch.float8_e4m3fn
 
     def create_weights(
         self,
@@ -738,7 +738,7 @@ class ModelOptNvFp4FusedMoEMethod:
 
     def trtllm_gen_process_expert_w3_w1_weight(self, layer: torch.nn.Module):
         for expert_idx in range(layer.local_num_experts):
-            dst_w3_w1_weight = layer.w13_weight[expert_idx]  # (E, imm * 2, hidden)
+            dst_w3_w1_weight = layer.w13_weight.data[expert_idx]  # (E, imm * 2, hidden)
 
             # FIXME: this depends on the kernel internals
             epilogue_tile_m = 128
@@ -760,7 +760,7 @@ class ModelOptNvFp4FusedMoEMethod:
 
     def trtllm_gen_process_expert_w2_weight(self, layer: torch.nn.Module):
         for expert_idx in range(layer.local_num_experts):
-            dst_w2_weight = layer.w2_weight[expert_idx]  # (E, hidden, imm)
+            dst_w2_weight = layer.w2_weight.data[expert_idx]  # (E, hidden, imm)
 
             # FIXME: this depends on the kernel internals
             epilogue_tile_m = 128
@@ -782,7 +782,7 @@ class ModelOptNvFp4FusedMoEMethod:
         self, layer: torch.nn.Module
     ):
         for expert_idx in range(layer.local_num_experts):
-            dst_w3_w1_weight_scale = layer.w13_weight_scale[expert_idx]  # (E, ...)
+            dst_w3_w1_weight_scale = layer.w13_weight_scale.data[expert_idx]  # (E, ...)
             orig_shape = dst_w3_w1_weight_scale.shape
 
             # trtllm-gen specific block scales preprocessing logics
@@ -823,7 +823,7 @@ class ModelOptNvFp4FusedMoEMethod:
         layer: torch.nn.Module,
     ):
         for expert_idx in range(layer.local_num_experts):
-            dst_w2_weight_scale = layer.w2_weight_scale[expert_idx]  # (E, ...)
+            dst_w2_weight_scale = layer.w2_weight_scale.data[expert_idx]  # (E, ...)
 
             orig_shape = dst_w2_weight_scale.shape
 
@@ -940,7 +940,6 @@ class ModelOptNvFp4FusedMoEMethod:
 
         # trtllm gen moe param
         if ENABLE_TRTLMM_GEN_MOE:
-            self._cache_permute_indices = {}  # release buffers
             layer.g1_scale_c = Parameter(
                 (w2_input_scale * layer.g1_alphas).to(torch.float32),
                 requires_grad=False,
