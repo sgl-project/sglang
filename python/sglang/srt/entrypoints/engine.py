@@ -419,7 +419,12 @@ class Engine(EngineBase):
         )
 
     def update_weights_from_distributed(
-        self, names: list[str], dtypes, shapes, group_name: str = "weight_update_group"
+        self,
+        names: list[str],
+        dtypes: list[str],
+        shapes: list[list[int]],
+        group_name: str = "weight_update_group",
+        flush_cache: bool = True,
     ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
@@ -427,6 +432,7 @@ class Engine(EngineBase):
             dtypes=dtypes,
             shapes=shapes,
             group_name=group_name,
+            flush_cache=flush_cache,
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(

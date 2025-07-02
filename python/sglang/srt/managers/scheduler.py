@@ -2304,8 +2304,8 @@ class Scheduler(
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
             if recv_req.flush_cache:
-                flash_cache_success = self.flush_cache()
-                assert flash_cache_success, "Cache flush failed after updating weights"
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
         return UpdateWeightsFromDistributedReqOutput(success, message)
