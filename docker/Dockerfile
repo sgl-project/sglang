@@ -43,7 +43,7 @@ RUN mkdir -p /tmp/gdrcopy && cd /tmp \
  && cd / && rm -rf /tmp/gdrcopy
 
 # Fix DeepEP IBGDA symlink
-RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
+RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
 
 # Clone and install SGLang
 WORKDIR /sgl-workspace
@@ -58,7 +58,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel html5li
  && python3 -m pip install --no-cache-dir -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
  && if [ "$CUDA_VERSION" = "12.8.1" ]; then \
       python3 -m pip install --no-cache-dir nvidia-nccl-cu12==2.27.3 --force-reinstall --no-deps ; \
-      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.2.1/sgl_kernel-0.2.1+cu128-cp39-abi3-manylinux2014_x86_64.whl --force-reinstall --no-deps ; \
+      python3 -m pip install --no-cache-dir https://github.com/sgl-project/whl/releases/download/v0.2.1/sgl_kernel-0.2.1+cu128-cp39-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps ; \
     fi
 
 # Build and install NVSHMEM + DeepEP
@@ -124,8 +124,8 @@ RUN apt-get update && apt-get install -y \
 
 RUN apt update -y \
     && apt install -y --no-install-recommends gnupg \
-    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/amd64 /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
-    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/7fa2af80.pub \
+    && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
+    && apt-key adv --fetch-keys http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "x86_64"; fi)/7fa2af80.pub \
     && apt update -y \
     && apt install nsight-systems-cli -y
 
@@ -164,11 +164,11 @@ RUN curl -L https://github.com/clangd/clangd/releases/download/18.1.3/clangd-lin
     && rm -rf clangd_18.1.3 clangd.zip
 
 # Install CMake
-RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1-linux-x86_64.tar.gz \
-    && tar -xzf cmake-3.31.1-linux-x86_64.tar.gz \
-    && cp -r cmake-3.31.1-linux-x86_64/bin/* /usr/local/bin/ \
-    && cp -r cmake-3.31.1-linux-x86_64/share/* /usr/local/share/ \
-    && rm -rf cmake-3.31.1-linux-x86_64 cmake-3.31.1-linux-x86_64.tar.gz
+RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1-linux-$(uname -m).tar.gz \
+    && tar -xzf cmake-3.31.1-linux-$(uname -m).tar.gz \
+    && cp -r cmake-3.31.1-linux-$(uname -m)/bin/* /usr/local/bin/ \
+    && cp -r cmake-3.31.1-linux-$(uname -m)/share/* /usr/local/share/ \
+    && rm -rf cmake-3.31.1-linux-$(uname -m) cmake-3.31.1-linux-$(uname -m).tar.gz
 
 # Add yank script
 COPY --chown=root:root <<-"EOF" /usr/local/bin/yank
