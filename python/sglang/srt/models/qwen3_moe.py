@@ -99,6 +99,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 f"Tensor parallel size {self.tp_size} is greater than "
                 f"the number of experts {config.num_experts}."
             )
+        self.activation = config.hidden_act
 
         self.experts = get_moe_impl_class()(
             num_experts=config.num_experts
@@ -110,6 +111,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
+            activation=self.activation
             **(
                 dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
                 if global_server_args_dict["enable_deepep_moe"]
