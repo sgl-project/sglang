@@ -57,7 +57,7 @@ class BenchArgs:
     extra_request_body: Optional[str] = None
     apply_chat_template: bool = False
     profile: bool = False
-    skip_warmup: bool = False
+    skip_bench_warmup: bool = False
     do_not_exit: bool = False
     prompt_suffix: str = ""
 
@@ -172,7 +172,7 @@ class BenchArgs:
             "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
         )
         parser.add_argument(
-            "--skip-warmup",
+            "--skip-bench-warmup",
             action="store_true",
             help="Skip the warmup batches.",
         )
@@ -346,7 +346,7 @@ def throughput_test(
     )
 
     # Warm up
-    if not bench_args.skip_warmup:
+    if not bench_args.skip_bench_warmup:
         logging.info("\nWarmup...")
         throughput_test_once(
             backend_name=bench_args.backend,
