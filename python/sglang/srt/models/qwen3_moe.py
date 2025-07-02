@@ -112,7 +112,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
             activation=self.activation
-            **(
+            ** (
                 dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
                 if global_server_args_dict["enable_deepep_moe"]
                 else {}
