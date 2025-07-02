@@ -299,7 +299,12 @@ def init_process_sgl(
     shapes = [state_dict_key_to_shape[parameter_name] for parameter_name in names]
 
     if backend == "Engine":
-        engine.update_weights_from_distributed(names, dtypes=dtypes, shapes=shapes)
+        engine.update_weights_from_distributed(
+            names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name="test_parameter_update_group",
+        )
     else:
         requests.post(
             f"{url}/update_weights_from_distributed",
@@ -307,6 +312,7 @@ def init_process_sgl(
                 "names": names,
                 "dtypes": dtypes,
                 "shapes": shapes,
+                "group_name": "test_parameter_update_group",
             },
         )
     torch.cuda.synchronize()
