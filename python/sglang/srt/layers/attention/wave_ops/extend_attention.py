@@ -68,7 +68,6 @@ def get_wave_kernel(
         extend_attention,
         hyperparams,
         dynamic_symbols,
-        dynamic_symbols_map,
     ) = get_extend_attention_kernel(
         shape,
         mfma_variant,
@@ -94,7 +93,6 @@ def get_wave_kernel(
         schedule=SchedulingType.NONE,
         use_scheduling_barriers=False,
         dynamic_symbols=dynamic_symbols,
-        dynamic_symbols_map=dynamic_symbols_map,
         use_buffer_load_ops=True,
         use_buffer_store_ops=True,
         waves_per_eu=2,

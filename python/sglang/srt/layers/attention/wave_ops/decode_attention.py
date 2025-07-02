@@ -70,8 +70,8 @@ def get_wave_kernel(
         phase_1,
         hyperparams_0,
         hyperparams_1,
-        dynamic_symbols,
-        dynamic_symbols_map,
+        dynamic_symbols_0,
+        dynamic_symbols_1,
     ) = get_paged_decode_attention_kernels(
         shape,
         mfma_variant,
@@ -91,8 +91,7 @@ def get_wave_kernel(
         use_buffer_load_ops=True,
         use_buffer_store_ops=True,
         waves_per_eu=2,
-        dynamic_symbols=dynamic_symbols,
-        dynamic_symbols_map=dynamic_symbols_map,
+        dynamic_symbols=dynamic_symbols_0,
         wave_runtime=True,
     )
     options = set_default_run_config(options)
@@ -105,8 +104,7 @@ def get_wave_kernel(
         use_buffer_load_ops=False,
         use_buffer_store_ops=False,
         waves_per_eu=4,
-        dynamic_symbols=dynamic_symbols,
-        dynamic_symbols_map=dynamic_symbols_map,
+        dynamic_symbols=dynamic_symbols_1,
         wave_runtime=True,
     )
     options = set_default_run_config(options)
