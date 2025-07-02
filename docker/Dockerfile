@@ -164,11 +164,14 @@ RUN curl -L https://github.com/clangd/clangd/releases/download/18.1.3/clangd-lin
     && rm -rf clangd_18.1.3 clangd.zip
 
 # Install CMake
-RUN wget https://github.com/Kitware/CMake/releases/download/v3.31.1/cmake-3.31.1-linux-$(uname -m).tar.gz \
-    && tar -xzf cmake-3.31.1-linux-$(uname -m).tar.gz \
-    && cp -r cmake-3.31.1-linux-$(uname -m)/bin/* /usr/local/bin/ \
-    && cp -r cmake-3.31.1-linux-$(uname -m)/share/* /usr/local/share/ \
-    && rm -rf cmake-3.31.1-linux-$(uname -m) cmake-3.31.1-linux-$(uname -m).tar.gz
+RUN CMAKE_VERSION=3.31.1 \
+    && ARCH=$(uname -m) \
+    && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
+    && wget "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
+    && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
+    && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
+    && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
+    && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
 # Add yank script
 COPY --chown=root:root <<-"EOF" /usr/local/bin/yank
