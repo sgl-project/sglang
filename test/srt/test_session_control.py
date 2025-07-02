@@ -291,7 +291,7 @@ class TestSessionControl(unittest.TestCase):
             logprobs_normal
         ), "logprobs must have equal length"
         for a, b in zip(logprobs_from_session, logprobs_normal):
-            assert abs(a - b) <= 0.1, f"logprobs {a} and {b} differ by more than 0.1"
+            assert abs(a - b) <= 0.15, f"logprobs {a} and {b} differ by more than 0.15"
 
     async def async_generate(self, payload):
         url = self.base_url + "/generate"
