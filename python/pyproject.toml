@@ -52,13 +52,13 @@ runtime_common = [
 
 srt = [
     "sglang[runtime_common]",
-    "sgl-kernel==0.1.9",
+    "sgl-kernel==0.2.1",
     "torch==2.7.1",
     "torchaudio==2.7.1",
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.6.post1",
+    "flashinfer_python==0.2.7.post1",
 ]
 
 blackwell = [
@@ -69,7 +69,7 @@ blackwell = [
     "torchvision==0.22.1",
     "cuda-python",
     "einops",
-    "flashinfer_python==0.2.6.post1",
+    "flashinfer_python==0.2.7.post1",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
