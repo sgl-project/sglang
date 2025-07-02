@@ -426,7 +426,7 @@ class EAGLEWorker(TpModelWorker):
                 #  "-" means prefix tokens
                 #  "x" means speculative draft tokens
                 #  "." means padded tokens
-            
+
                 (
                     prefix_lens,
                     seq_lens,
@@ -455,11 +455,15 @@ class EAGLEWorker(TpModelWorker):
                 )
             )
         if self.page_size > 1 and self.topk > 1:
-            # cum sum of last_page_lens
             last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
             duplicate_cache_len = torch.sum(last_page_lens) * (self.topk - 1)
-            target_cache_loc = torch.zeros(duplicate_cache_len, dtype=torch.int32, device=self.device)
-            source_cache_loc = torch.zeros(duplicate_cache_len, dtype=torch.int32, device=self.device)
+            # TODO: Remove device sync here
+            target_cache_loc = torch.zeros(
+                duplicate_cache_len, dtype=torch.int32, device=self.device
+            )
+            source_cache_loc = torch.zeros(
+                duplicate_cache_len, dtype=torch.int32, device=self.device
+            )
         else:
             # When source_cache_loc is not needed, simply skip
             duplicate_cache_len = 0
@@ -486,7 +490,10 @@ class EAGLEWorker(TpModelWorker):
 
         if self.page_size > 1 and self.topk > 1:
             if duplicate_cache_len > 0:
-                self.draft_model_runner.token_to_kv_pool.move_kv_cache(target_cache_loc, source_cache_loc)
+                self.draft_model_runner.token_to_kv_pool.move_kv_cache(
+                    target_cache_loc, source_cache_loc
+                )
+            # Remove padded slots
             out_cache_loc = out_cache_loc[
                 : num_seqs * self.topk * self.speculative_num_steps
             ]
@@ -966,4 +973,11 @@ def get_last_loc_large_page_size_large_top_k(
         prefix_lens,
     )
 
-    return prefix_lens, seq_lens, last_loc, num_new_pages_per_topk, extend_lens, last_page_lens
+    return (
+        prefix_lens,
+        seq_lens,
+        last_loc,
+        num_new_pages_per_topk,
+        extend_lens,
+        last_page_lens,
+    )

@@ -792,9 +792,10 @@ def assign_draft_cache_locs(
     # Skip the first one since no copy is needed
     for topk_id in range(1, topk):
         tl.store(
-            source_cache_loc 
+            source_cache_loc
             + (topk - 1) * (last_page_lens_cumsum_ - last_page_len)
-            + (topk_id - 1) * last_page_len + offsets,
+            + (topk_id - 1) * last_page_len
+            + offsets,
             src_indices,
             mask=mask,
         )
@@ -803,9 +804,10 @@ def assign_draft_cache_locs(
             mask=mask,
         )
         tl.store(
-            target_cache_loc 
+            target_cache_loc
             + (topk - 1) * (last_page_lens_cumsum_ - last_page_len)
-            + (topk_id - 1) * last_page_len + offsets,
+            + (topk_id - 1) * last_page_len
+            + offsets,
             tgt_indices,
             mask=mask,
         )
@@ -823,10 +825,8 @@ def assign_draft_cache_locs(
         mask_lower = iter_offset >= last_page_len
         combined_mask = mask_upper & mask_lower
         indices = tl.load(
-            prefix_base
-            + topk_id * num_new_pages_per_topk_ * page_size
-            + iter_offset,
-            mask=combined_mask, 
+            prefix_base + topk_id * num_new_pages_per_topk_ * page_size + iter_offset,
+            mask=combined_mask,
             other=0,
         )
         padding_len = (iter_upper - speculative_num_steps) * pid * topk
