@@ -18,6 +18,8 @@ if _is_cuda:
         apply_shuffle_mul_sum,
         cutlass_fp4_group_mm,
         fp8_blockwise_scaled_grouped_mm,
+        gelu_and_mul,
+        gelu_tanh_and_mul,
         prepare_moe_input,
         scaled_fp4_experts_quant,
         shuffle_rows,
@@ -229,6 +231,7 @@ def cutlass_moe_fp4(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     params: CutlassMoEParams,
+    activation: str,
     apply_router_weight_on_input: bool = False,
 ):
     """
@@ -273,6 +276,10 @@ def cutlass_moe_fp4(
     m, n, k: Unquantized weight shapes, dtype: int
     e: number of experts for the current rank, dtype: int
     assumes that topk < k < n to satisfy - up/down projection expectations.
+
+    activation: str
+        The activation function to apply after the first GEMM.
+        Supported values: "silu", "gelu", "gelu_tanh".
     """
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert w1_fp4.dtype == torch.uint8, "weight 1 must be uint8"
@@ -343,7 +350,17 @@ def cutlass_moe_fp4(
     intermediate = torch.empty(
         (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
     )
-    silu_and_mul(c1, intermediate)
+    if activation == "gelu":
+        gelu_and_mul(c1, intermediate)
+    elif activation == "gelu_tanh":
+        gelu_tanh_and_mul(c1, intermediate)
+    elif activation == "silu":
+        silu_and_mul(c1, intermediate)
+    else:
+        raise ValueError(
+            f"Unsupported activation function: {activation}. "
+            "Supported values are 'silu', 'gelu', 'gelu_tanh'."
+        )
 
     int_fp4, int_blockscale = scaled_fp4_experts_quant(
         intermediate,

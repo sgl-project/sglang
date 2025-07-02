@@ -779,7 +779,6 @@ class ModelOptNvFp4FusedMoEMethod:
         tp_size: Optional[int] = None,
     ) -> torch.Tensor:
 
-        assert activation == "silu", "Only SiLU activation is supported."
         from sglang.srt.layers.moe.topk import select_experts
 
         topk_weights, topk_ids = select_experts(
@@ -802,6 +801,10 @@ class ModelOptNvFp4FusedMoEMethod:
             ), "apply_router_weight_on_input is not supported for Flashinfer"
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
+            assert (
+                activation == "silu"
+            ), "Only SiLU activation is supported for flashinfer MOE."
+
             output = flashinfer_cutlass_fused_moe(
                 x,
                 topk_ids.to(torch.int),
@@ -840,5 +843,6 @@ class ModelOptNvFp4FusedMoEMethod:
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             params=layer.cutlass_moe_params,
+            activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
         ).to(x.dtype)
