@@ -100,7 +100,17 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
-        self.experts = get_moe_impl_class()(
+        extra_args = {}
+
+        expert_type = get_moe_impl_class()
+        if expert_type is FusedMoE:
+            extra_args = {
+                "enable_flashinfer_moe": global_server_args_dict[
+                    "enable_flashinfer_moe"
+                ],
+            }
+
+        self.experts = expert_type(
             num_experts=config.num_experts
             + global_server_args_dict["ep_num_redundant_experts"],
             top_k=config.num_experts_per_tok,
@@ -115,6 +125,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 if global_server_args_dict["enable_deepep_moe"]
                 else {}
             ),
+            **extra_args,
         )
 
         self.gate = ReplicatedLinear(

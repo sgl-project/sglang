@@ -134,7 +134,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
-        self.experts = get_moe_impl_class()(
+        extra_args = {}
+        expert_type = get_moe_impl_class()
+        if expert_type is FusedMoE:
+            extra_args = {
+                "enable_deepep_moe": global_server_args_dict["enable_deepep_moe"],
+            }
+
+        self.experts = expert_type(
             layer_id=self.layer_id,
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
@@ -143,6 +150,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
+            **extra_args,
         )
 
         self.gate = ReplicatedLinear(
