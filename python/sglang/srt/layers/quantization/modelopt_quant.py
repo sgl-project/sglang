@@ -43,17 +43,14 @@ except ImportError:
 ENABLE_TRTLMM_GEN_MOE = get_bool_env_var("SGLANG_ENABLE_TRTLLM_GEN_MOE", "false")
 
 if ENABLE_TRTLMM_GEN_MOE:
-    try:
-        import tensorrt_llm
-        from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
-        from tensorrt_llm.quantization.utils.fp4_utils import (
-            float4_sf_dtype,
-            get_reorder_rows_for_gated_act_gemm_row_indices,
-            get_shuffle_matrix_a_row_indices,
-            get_shuffle_matrix_sf_a_row_indices,
-        )
-    except ImportError:
-        ENABLE_TRTLMM_GEN_MOE = False
+    import tensorrt_llm
+    from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
+    from tensorrt_llm.quantization.utils.fp4_utils import (
+        float4_sf_dtype,
+        get_reorder_rows_for_gated_act_gemm_row_indices,
+        get_shuffle_matrix_a_row_indices,
+        get_shuffle_matrix_sf_a_row_indices,
+    )
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
@@ -947,7 +944,7 @@ class ModelOptNvFp4FusedMoEMethod:
         # trtllm gen moe param
         if ENABLE_TRTLMM_GEN_MOE:
             layer.g1_scale_c = Parameter(
-                (w2_input_scale * layer.g1_alphas).to(torch.float32),
+                (layer.w2_input_scale_quant * layer.g1_alphas).to(torch.float32),
                 requires_grad=False,
             )
 
