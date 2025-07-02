@@ -115,7 +115,7 @@ class TestEAGLEServer(CustomTestCase):
 
         args = SimpleNamespace(
             num_shots=5,
-            data_path="/shared/public/data/gsm8k/test.jsonl",
+            data_path=None,
             num_questions=200,
             max_new_tokens=1,
             parallel=128,
@@ -132,7 +132,7 @@ class TestEAGLEServer(CustomTestCase):
 
         args = SimpleNamespace(
             num_shots=5,
-            data_path="/shared/public/data/gsm8k/test.jsonl",
+            data_path=None,
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
@@ -479,14 +479,14 @@ class TestEAGLEServerPageSizeTopk(TestEAGLEServer):
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693",
+            DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
                 "--speculative-algorithm",
-                "EAGLE3",
+                "EAGLE",
                 "--speculative-draft-model-path",
-                "/shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B/e5ed08d66f528a95ce89f5d4fd136a28f6def714",
+                DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
                 "--speculative-num-steps",
                 5,
                 "--speculative-eagle-topk",
@@ -503,8 +503,6 @@ class TestEAGLEServerPageSizeTopk(TestEAGLEServer):
                 4,
                 "--attention-backend",
                 "flashinfer",
-                "--dtype",
-                "bfloat16",
             ],
         )
 
