@@ -816,9 +816,6 @@ def assign_draft_cache_locs(
     #  "x" means speculative draft tokens
     #  "." means padded tokens
     # we only want to copy the "x" part.
-    # so copy num_new_pages_per_topk_ * page_size - last_page_len elements
-    # max_copy = num_new_pages_per_topk_ * page_size - last_page_len
-
     iter_offset = tl.arange(0, iter_upper)
     for topk_id in range(topk):
         mask_upper = iter_offset < (speculative_num_steps + last_page_len)
@@ -831,7 +828,6 @@ def assign_draft_cache_locs(
             mask=combined_mask, 
             other=0,
         )
-        # duplicate_len = (last_page_lens_cumsum_ - last_page_len) * (topk - 1)
         padding_len = (iter_upper - speculative_num_steps) * pid * topk
         all_len = pid * num_new_pages_per_topk_ * page_size * topk
         ptr_offset = all_len - padding_len
