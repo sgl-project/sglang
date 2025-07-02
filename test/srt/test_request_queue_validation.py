@@ -73,12 +73,14 @@ class TestMaxQueuedRequests(CustomTestCase):
         """Verify running request and queued request numbers based on server logs."""
         rr_pattern = re.compile(r"#running-req:\s*(\d+)")
         qr_pattern = re.compile(r"#queue-req:\s*(\d+)")
-        for line in open(STDERR_FILENAME).readlines():
-            rr_match, qr_match = rr_pattern.search(line), qr_pattern.search(line)
-            if rr_match:
-                assert int(rr_match.group(1)) <= 1
-            if qr_match:
-                assert int(qr_match.group(1)) <= 1
+
+        with open(STDERR_FILENAME) as lines:
+            for line in lines:
+                rr_match, qr_match = rr_pattern.search(line), qr_pattern.search(line)
+                if rr_match:
+                    assert int(rr_match.group(1)) <= 1
+                if qr_match:
+                    assert int(qr_match.group(1)) <= 1
 
 
 if __name__ == "__main__":
