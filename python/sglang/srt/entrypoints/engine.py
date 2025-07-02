@@ -48,10 +48,12 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     ImageDataItem,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
+    UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -478,6 +480,29 @@ class Engine(EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
+    def load_lora_adapter(self, lora_name: str, lora_path: str):
+        """Load a new LoRA adapter without re-launching the engine."""
+
+        obj = LoadLoRAAdapterReqInput(
+            lora_name=lora_name,
+            lora_path=lora_path,
+        )
+
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.load_lora_adapter(obj, None)
+        )
+
+    def unload_lora_adapter(self, lora_name: str):
+        """Unload a LoRA adapter without re-launching the engine."""
+
+        obj = UnloadLoRAAdapterReqInput(lora_name=lora_name)
+
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.unload_lora_adapter(obj, None)
+        )
+
     def release_memory_occupation(self, tags: Optional[List[str]] = None):
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
@@ -608,7 +633,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.6.post1",
+            "0.2.7.post1",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -616,7 +641,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda:
         assert_pkg_version(
             "sgl-kernel",
-            "0.1.9",
+            "0.2.1",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 

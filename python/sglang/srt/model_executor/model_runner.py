@@ -26,7 +26,6 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from sglang.srt import debug_utils
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
@@ -40,6 +39,19 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.eplb.eplb_manager import EPLBManager
+from sglang.srt.eplb.expert_distribution import (
+    ExpertDistributionRecorder,
+    get_global_expert_distribution_recorder,
+    set_global_expert_distribution_recorder,
+)
+from sglang.srt.eplb.expert_location import (
+    ExpertLocationMetadata,
+    compute_initial_expert_location_metadata,
+    get_global_expert_location_metadata,
+    set_global_expert_location_metadata,
+)
+from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
@@ -55,18 +67,6 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.managers.eplb_manager import EPLBManager
-from sglang.srt.managers.expert_distribution import (
-    ExpertDistributionRecorder,
-    get_global_expert_distribution_recorder,
-    set_global_expert_distribution_recorder,
-)
-from sglang.srt.managers.expert_location import (
-    ExpertLocationMetadata,
-    compute_initial_expert_location_metadata,
-    get_global_expert_location_metadata,
-    set_global_expert_location_metadata,
-)
 from sglang.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
@@ -74,6 +74,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import (
@@ -81,9 +82,9 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
+    SWAKVPool,
 )
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.model_executor.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
@@ -185,6 +186,7 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.is_hybrid = model_config.is_hybrid
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
 
@@ -304,7 +306,26 @@ class ModelRunner:
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
-            self.model.set_eagle3_layers_to_capture()
+            # load draft config
+            draft_model_config = ModelConfig.from_server_args(
+                server_args,
+                model_path=(server_args.speculative_draft_model_path),
+                is_draft_model=True,
+            )
+
+            try:
+                # get the aux layer from draft model config
+                eagle_config = getattr(
+                    draft_model_config.hf_config, "eagle_config", None
+                )
+                eagle_aux_hidden_state_layer_ids = eagle_config[
+                    "eagle_aux_hidden_state_layer_ids"
+                ]
+            except:
+                # if there is no aux layer, set to None
+                eagle_aux_hidden_state_layer_ids = None
+
+            self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -436,6 +457,10 @@ class ModelRunner:
         if server_args.attention_backend == "aiter":
             if self.model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
+
+        if self.is_hybrid and not server_args.disable_radix_cache:
+            logger.info("Automatically disable radix cache for hybrid cache.")
+            server_args.disable_radix_cache = True
 
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
@@ -598,12 +623,13 @@ class ModelRunner:
         self.dtype = self.model_config.dtype
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+        self.weight_load_mem_usage = before_avail_memory - after_avail_memory
         logger.info(
             f"Load weight end. "
             f"type={type(self.model).__name__}, "
             f"dtype={self.dtype}, "
             f"avail mem={after_avail_memory:.2f} GB, "
-            f"mem usage={(before_avail_memory - after_avail_memory):.2f} GB."
+            f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
 
         # Handle the case where some ranks do not finish loading.
@@ -812,8 +838,47 @@ class ModelRunner:
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
         )
-        self.lora_manager.load_lora_adapters(self.server_args.lora_paths)
-        logger.info("LoRA manager ready.")
+        result = self.lora_manager.load_lora_adapters(self.server_args.lora_paths)
+        if result.success:
+            logger.info(
+                f"LoRA manager ready. Loaded LoRA adapters: {', '.join(result.loaded_adapters)}"
+            )
+        else:
+            raise RuntimeError(f"Failed to load LoRA adapters: {result.error_message}")
+
+    def load_lora_adapter(self, lora_name: str, lora_path: str):
+        """Load a new lora adapter from disk or huggingface."""
+
+        logger.info(
+            f"LoRA adapter loading starts: name={lora_name}, path={lora_path}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        result = self.lora_manager.load_lora_adapter(lora_name, lora_path)
+
+        logger.info(
+            f"LoRA adapter loading completes: name={lora_name}, path={lora_path}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        return result
+
+    def unload_lora_adapter(self, lora_name: str):
+        """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
+
+        logger.info(
+            f"LoRA adapter unloading starts: name={lora_name}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        result = self.lora_manager.unload_lora_adapter(lora_name)
+
+        logger.info(
+            f"LoRA adapter unloading completes: name={lora_name}. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        return result
 
     def profile_max_num_token(self, total_gpu_memory: int):
         available_gpu_memory = get_available_gpu_memory(
@@ -851,6 +916,40 @@ class ModelRunner:
         )
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
+
+    def set_num_token_hybrid(self):
+        if (
+            "Llama4ForConditionalGeneration"
+            in self.model_config.hf_config.architectures
+        ):
+            temp_ratio = (
+                (1 - self.is_hybrid)
+                + self.is_hybrid
+                * self.attention_chunk_size
+                / self.model_config.context_len
+            )
+            self.swa_max_total_num_tokens = (
+                4 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
+            )
+            self.full_max_total_num_tokens = (
+                4 * self.max_total_num_tokens
+                - 12 * self.max_total_num_tokens * temp_ratio // (3 * temp_ratio + 1)
+            )
+            self.swa_max_total_num_tokens = int(
+                self.swa_max_total_num_tokens
+                // self.server_args.page_size
+                * self.server_args.page_size
+            )
+            self.full_max_total_num_tokens = int(
+                self.full_max_total_num_tokens
+                // self.server_args.page_size
+                * self.server_args.page_size
+            )
+            self.max_total_num_tokens = self.full_max_total_num_tokens
+        else:
+            raise ValueError(
+                f"Unsupported model for hybrid cache: {self.model_config.hf_config.architectures}."
+            )
 
     def init_memory_pool(
         self,
@@ -929,6 +1028,10 @@ class ModelRunner:
             * self.server_args.page_size
         )
 
+        # create token size for hybrid cache
+        if self.is_hybrid:
+            self.set_num_token_hybrid()
+
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
                 "Not enough memory. Please try to increase --mem-fraction-static."
@@ -991,27 +1094,53 @@ class ModelRunner:
                 end_layer=self.end_layer,
             )
         else:
-            self.token_to_kv_pool = MHATokenToKVPool(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
-                head_dim=self.model_config.head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-            )
+            if self.is_hybrid:
+                self.token_to_kv_pool = SWAKVPool(
+                    size=self.full_max_total_num_tokens,
+                    size_swa=self.swa_max_total_num_tokens,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
+                    full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+                    enable_kvcache_transpose=False,
+                    device=self.device,
+                )
+            else:
+                self.token_to_kv_pool = MHATokenToKVPool(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
 
         if self.token_to_kv_pool_allocator is None:
             if self.page_size == 1:
-                self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                    self.max_total_num_tokens,
-                    dtype=self.kv_cache_dtype,
-                    device=self.device,
-                    kvcache=self.token_to_kv_pool,
-                )
+                if self.is_hybrid:
+                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                        self.full_max_total_num_tokens,
+                        self.swa_max_total_num_tokens,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                    )
+                else:
+                    self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
+                        self.max_total_num_tokens,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                    )
             else:
                 self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                     self.max_total_num_tokens,
@@ -1039,7 +1168,7 @@ class ModelRunner:
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
-        if self.server_args.enable_two_batch_overlap:
+        if self.server_args.enable_two_batch_overlap and not self.is_draft_worker:
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
         else:
             self.attn_backend = self._get_attention_backend()
@@ -1141,6 +1270,7 @@ class ModelRunner:
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None
+        self.cuda_graph_mem_usage = 0
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
@@ -1156,9 +1286,10 @@ class ModelRunner:
         )
         self.cuda_graph_runner = CudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        self.cuda_graph_mem_usage = before_mem - after_mem
         logger.info(
             f"Capture cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
-            f"mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            f"mem usage={self.cuda_graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
     def apply_torch_tp(self):
