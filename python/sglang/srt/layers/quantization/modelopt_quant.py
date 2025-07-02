@@ -40,6 +40,12 @@ try:
 except ImportError:
     flashinfer_cutlass_fused_moe = None
 
+try:
+    import tensorrt_llm
+    HAS_TRTLLM = True
+except ImportError:
+    HAS_TRTLLM = False
+
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
 
@@ -671,6 +677,7 @@ class ModelOptNvFp4FusedMoEMethod:
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        enable_trtllm_moe = self.enable_flashinfer_moe
 
         # GEMM 1
         if not torch.allclose(
@@ -684,7 +691,7 @@ class ModelOptNvFp4FusedMoEMethod:
         w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
         layer.w13_weight_scale_2 = Parameter(w13_weight_scale_2, requires_grad=False)
 
-        if self.enable_flashinfer_moe:
+        if self.enable_flashinfer_moe and not enable_trtllm_moe:
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
         else:
             w13_input_scale = layer.w13_input_scale.max(dim=1).values.to(torch.float32)
@@ -713,7 +720,7 @@ class ModelOptNvFp4FusedMoEMethod:
         layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
 
         # GEMM 2
-        if self.enable_flashinfer_moe:
+        if self.enable_flashinfer_moe and not enable_trtllm_moe:
             w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
         else:
             w2_input_scale = layer.w2_input_scale
@@ -722,6 +729,12 @@ class ModelOptNvFp4FusedMoEMethod:
             (w2_input_scale * layer.w2_weight_scale_2).to(torch.float32),
             requires_grad=False,
         )
+
+        if enable_trtllm_moe:
+            layer.g1c_alphas = Parameter(
+                (w2_input_scale * layer.g1_alphas).to(torch.float32),
+                requires_grad=False,
+            )
 
         # This is for quantization, so we need to invert it.
         layer.w2_input_scale_quant = Parameter(
@@ -780,6 +793,54 @@ class ModelOptNvFp4FusedMoEMethod:
     ) -> torch.Tensor:
 
         assert activation == "silu", "Only SiLU activation is supported."
+        enable_trtllm_moe = self.enable_flashinfer_moe
+
+        if enable_trtllm_moe:
+            assert self.enable_flashinfer_moe
+            assert HAS_TRTLLM
+            do_finalize = True
+            scale_factor_use_ue8m0 = False
+            is_scale_factor_swizzled = False  # use linear layout here
+            hidden_states_fp4, hidden_states_scale_linear_fp4 = torch.ops.trtllm.fp4_quantize(
+                x, layer.w13_input_scale_quant, 16, scale_factor_use_ue8m0,
+                is_scale_factor_swizzled)
+
+            # FIXME: tile_tokens_dim is hardcoded for now
+            tile_tokens_dim = 8
+
+            num_experts = 256 # DeepSeekV3
+            intermediate_size = 2048 # DeepSeekV3
+            expert_size_per_partition = num_experts // ep_size
+            slot_start = ep_rank * expert_size_per_partition
+            intermediate_size_per_partition = intermediate_size // tp_size
+            num_slots = num_experts
+
+            outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
+                router_logits,
+                correction_bias,
+                hidden_states_fp4,
+                hidden_states_scale_linear_fp4.view(torch.float8_e4m3fn),
+                layer.w13_weight, # self.w3_w1_weight,
+                layer.w13_blockscale_swizzled.view(torch.float8_e4m3fn), # self.w3_w1_weight_scale.view(torch.float8_e4m3fn),
+                layer.w2_weight, # self.w2_weight,
+                layer.w2_blockscale_swizzled.view(torch.float8_e4m3fn), # self.w2_weight_scale.view(torch.float8_e4m3fn),
+                layer.g1c_alphas.data, # fc31_scale_c.data,
+                layer.g1_alphas.data, # fc31_alpha.data,
+                layer.g2_alphas.data, # fc2_alpha.data,
+                num_slots,
+                top_k,
+                num_expert_group,
+                topk_group,
+                intermediate_size_per_partition,
+                slot_start,  # local_expert_start;  use ep_rank if stride!=1
+                expert_size_per_partition,  # local_expert_size
+                routed_scaling_factor,
+                tile_tokens_dim,
+                2, # self.routing_method.routing_method_type = DeepSeekV3 = 2,
+                do_finalize=do_finalize,
+            )
+            return outputs[0]
+
         from sglang.srt.layers.moe.topk import select_experts
 
         topk_weights, topk_ids = select_experts(
