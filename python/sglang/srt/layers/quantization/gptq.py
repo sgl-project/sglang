@@ -344,7 +344,9 @@ class GPTQMarlinConfig(QuantizationConfig):
         if (num_bits, sym) not in cls.TYPE_MAP:
             return False
 
-        assert VLLM_AVAILABLE, "vllm is not installed, to use gptq_marlin, please install vllm"
+        assert (
+            VLLM_AVAILABLE
+        ), "vllm is not installed, to use gptq_marlin, please install vllm"
 
         return check_marlin_supported(
             quant_type=cls.TYPE_MAP[(num_bits, sym)], group_size=group_size
