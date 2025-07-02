@@ -1,0 +1,56 @@
+name: PR Test (Ascend NPU)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "python/**"
+      - "scripts/**"
+      - "test/**"
+      - ".github/workflows/pr-test-npu.yml"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "python/**"
+      - "scripts/**"
+      - "test/**"
+      - ".github/workflows/pr-test-npu.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: pr-test-npu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-test-backend-1-npu-ascend:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') &&
+      github.event.pull_request.draft == false  && contains(github.event.pull_request.labels.*.name, 'npu')
+    strategy:
+      fail-fast: false
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run test
+        timeout-minutes: 40
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite per-commit-npu
+
+  finish:
+    if: always()
+    needs: [ unit-test-backend-1-npu-ascend ]
+    runs-on: self-hosted
+    steps:
+      - name: Check all dependent job statuses
+        run: |
+          results=(${{ join(needs.*.result, ' ') }})
+          for result in "${results[@]}"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "Job failed with result: $result"
+              exit 1
+            fi
+          done
+          echo "All jobs completed successfully"
+          exit 0

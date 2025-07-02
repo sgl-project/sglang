@@ -403,7 +403,6 @@ class ModelRunner:
                     "triton",
                     "flashmla",
                     "cutlass_mla",
-                    "ascend",
                 ]:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
