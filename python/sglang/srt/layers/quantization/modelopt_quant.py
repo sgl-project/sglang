@@ -1024,7 +1024,7 @@ class ModelOptNvFp4FusedMoEMethod:
             outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 # NOTE: router out_dtype should be float32!
                 # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc1/tensorrt_llm/_torch/models/modeling_deepseekv3.py#L378
-                router_logits.to(torch.float),
+                router_logits.to(torch.float32),
                 correction_bias,
                 hidden_states_fp4,
                 hidden_states_scale_linear_fp4.view(torch.float8_e4m3fn),
