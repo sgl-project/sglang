@@ -197,7 +197,7 @@ class EagleVerifyOutput:
     accept_length_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
     accepted_indices: torch.Tensor
-
+    # Tracking the contents if they are in thinking mode.
     thinking_states: Optional[List[bool]]
 
 

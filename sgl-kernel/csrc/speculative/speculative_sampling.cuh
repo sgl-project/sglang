@@ -70,6 +70,12 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   IdType2 cur_index = 0;
   DType threshold_single = threshold_singles[bx];
   DType threshold_acc = threshold_accs[bx];
+
+  CHECK_GE(threshold_single, 0);
+  CHECK_GE(1, threshold_single);
+  CHECK_GE(threshold_acc, 0);
+  CHECK_GE(1, threshold_acc);
+
   float capped_threshold_acc = fmaxf(threshold_acc, 1e-9f);
   for (uint32_t j = 1; j < num_speculative_tokens; ++j) {
     cur_index = retrive_next_token[bx * num_draft_tokens + cur_index];
