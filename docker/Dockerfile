@@ -5,7 +5,8 @@ ARG BUILD_TYPE=all
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
-    NVSHMEM_DIR=/sgl-workspace/nvshmem/install
+    NVSHMEM_DIR=/sgl-workspace/nvshmem/install \
+    BUILD_TYPE=${BUILD_TYPE}
 
 # Set timezone and install all packages
 RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
@@ -69,7 +70,8 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/sour
  && git apply /sgl-workspace/DeepEP/third-party/nvshmem.patch \
  && sed -i '1i#include <unistd.h>' examples/moe_shuffle.cu \
  && rm -f /sgl-workspace/nvshmem_src_3.2.5-1.txz \
- && CUDA_ARCH=$([ "$BUILD_TYPE" = "blackwell" ] && echo 100 || echo 90) \
+ && if [ "$BUILD_TYPE" = "blackwell" ]; then CUDA_ARCH=100; else CUDA_ARCH=90; fi \
+ && echo "BUILD_TYPE: $BUILD_TYPE, CUDA_ARCH: $CUDA_ARCH" \
  && NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
