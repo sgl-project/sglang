@@ -445,24 +445,22 @@ class EagleVerifyInput:
             )
 
             threshold_singles = torch.ones_like(
-                coins_for_final_sampling, dtype=torch.float32, device="cpu"
+                coins_for_final_sampling, dtype=torch.float32, device="cuda"
             )
             threshold_accs = torch.ones_like(
-                coins_for_final_sampling, dtype=torch.float32, device="cpu"
+                coins_for_final_sampling, dtype=torch.float32, device="cuda"
             )
             if relaxed_thinking:
                 thinking_states = batch.thinking_states()
-                thinking_states_ts = torch.tensor(thinking_states, device="cpu")
+                thinking_states_ts = torch.tensor(thinking_states, device="cuda")
             else:
-                thinking_states_ts = torch.ones(bs, dtype=torch.bool, device="cpu")
+                thinking_states_ts = torch.ones(bs, dtype=torch.bool, device="cuda")
             threshold_singles[thinking_states_ts] = global_server_args_dict[
                 "speculative_accept_threshold_single"
             ]
             threshold_accs[thinking_states_ts] = global_server_args_dict[
                 "speculative_accept_threshold_acc"
             ]
-            threshold_accs = threshold_accs.to(device="cuda")
-            threshold_singles = threshold_singles.to(device="cuda")
 
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
@@ -510,7 +508,7 @@ class EagleVerifyInput:
                 if relaxed_thinking and thinking_states:
                     if id == req.think_start_token_id:
                         thinking_states[i] = True
-                    if id == req.think_end_token_id:
+                    elif id == req.think_end_token_id:
                         thinking_states[i] = False
 
                 req.check_finished()
