@@ -1046,7 +1046,7 @@ def _wait_and_warmup(
     image_token_text: str,
     launch_callback: Optional[Callable[[], None]] = None,
 ):
-    if not server_args.skip_warmup:
+    if not server_args.skip_server_warmup:
         if not _execute_server_warmup(
             server_args,
             pipe_finish_writer,

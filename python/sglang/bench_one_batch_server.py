@@ -42,7 +42,7 @@ class BenchArgs:
     input_len_step_percentage: float = 0.0
     result_filename: str = "result.jsonl"
     base_url: str = ""
-    skip_bench_warmup: bool = False
+    skip_warmup: bool = False
     show_report: bool = False
     profile: bool = False
     profile_by_stage: bool = False
@@ -75,7 +75,7 @@ class BenchArgs:
             "--result-filename", type=str, default=BenchArgs.result_filename
         )
         parser.add_argument("--base-url", type=str, default=BenchArgs.base_url)
-        parser.add_argument("--skip-bench-warmup", action="store_true")
+        parser.add_argument("--skip-warmup", action="store_true")
         parser.add_argument("--show-report", action="store_true")
         parser.add_argument("--profile", action="store_true")
         parser.add_argument("--profile-by-stage", action="store_true")
@@ -258,7 +258,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     tokenizer = get_tokenizer(tokenizer_path)
 
     # warmup
-    if not bench_args.skip_bench_warmup:
+    if not bench_args.skip_warmup:
         print("=" * 8 + " Warmup Begin " + "=" * 8)
         run_one_case(
             base_url,

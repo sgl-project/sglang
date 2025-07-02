@@ -46,7 +46,7 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
-    skip_warmup: bool = False
+    skip_server_warmup: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
@@ -599,7 +599,7 @@ class ServerArgs:
             help="If set, skip init tokenizer and pass input_ids in generate request.",
         )
         parser.add_argument(
-            "--skip-warmup",
+            "--skip-server-warmup",
             action="store_true",
             help="If set, skip warmup.",
         )
