@@ -129,7 +129,7 @@ impl Router {
             discovery,
             metrics,
             log_dir: self.log_dir.clone(),
-            verbose: self.verbose,
+            log_level: self.log_level.clone(),
         })
     }
 }
