@@ -47,5 +47,5 @@ jobs:
       - name: Check npu and CANN info
         run: |
           npu-smi info
-          python3 -m unittest test_ascend_attention_backend.TestAscendAttnBackend.test_mmlu
+          python3 -m unittest test_ascend_attention_backend.TestAscendAttnBackend.test_gsm8k
           python3 -m unittest test_ascend_attention_backend.TestAscendAttnBackend.test_latency
