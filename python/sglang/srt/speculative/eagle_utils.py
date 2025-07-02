@@ -779,7 +779,8 @@ def assign_draft_cache_locs(
     if page_size == 1 or topk == 1:
         return
 
-    # Part 2: Copy the indices for the last partial page
+    # Part 2: Copy indices into source_cache_loc and target_cache_loc
+    # Expected output: src:[8,9,10,8,9,10...] tgt:[16,17,18,24,25,26...]
     prefix_len = tl.load(seq_lens + pid)
     last_page_len = prefix_len % page_size
     offsets = tl.arange(0, page_size)
@@ -787,8 +788,8 @@ def assign_draft_cache_locs(
     num_new_pages_per_topk_ = tl.load(num_new_pages_per_topk + pid)
     prefix_base = token_pool + prefix_len - last_page_len
     src_indices = tl.load(prefix_base + offsets, mask=mask)
-    # Skip the first one since no copy is needed
     last_page_lens_cumsum_ = tl.load(last_page_lens_cumsum + pid)
+    # Skip the first one since no copy is needed
     for topk_id in range(1, topk):
         tl.store(
             source_cache_loc 
