@@ -37,6 +37,9 @@ from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_flashinfer_available
 
+_is_flashinfer_available = is_flashinfer_available()
+_is_sm100_supported = is_sm100_supported()
+
 
 class ScatterMode(Enum):
     """
@@ -400,8 +403,8 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 hidden_states = layernorm(hidden_states)
         else:
             if (
-                is_sm100_supported()
-                and is_flashinfer_available()
+                _is_sm100_supported
+                and _is_flashinfer_available
                 and hasattr(layernorm, "forward_with_allreduce_fusion")
                 and global_server_args_dict["enable_flashinfer_allreduce_fusion"]
                 and hidden_states.shape[0] <= 1024
