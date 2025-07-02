@@ -138,7 +138,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         expert_type = get_moe_impl_class()
         if expert_type is FusedMoE:
             extra_args = {
-                "enable_deepep_moe": global_server_args_dict["enable_deepep_moe"],
+                "enable_flashinfer_moe": global_server_args_dict["enable_flashinfer_moe"],
             }
 
         self.experts = expert_type(
