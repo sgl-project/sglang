@@ -44,94 +44,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.llama import LlamaAttention as Ernie4Attention
 from sglang.srt.utils import add_prefix, make_layers
-
-
-class Ernie4Attention(nn.Module):
-    def __init__(
-        self,
-        config: ErnieConfig,
-        layer_id: int = 0,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
-        self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.head_dim = getattr(
-            config, "head_dim", config.hidden_size // self.total_num_heads
-        )
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.rope_theta = getattr(config, "rope_theta", 500000)
-        self.rope_scaling = getattr(config, "rope_scaling", None)
-
-        self.qkv_proj = QKVParallelLinear(
-            self.hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=config.use_bias,
-            quant_config=quant_config,
-            prefix=add_prefix("qkv_proj", prefix),
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            self.hidden_size,
-            bias=config.use_bias,
-            quant_config=quant_config,
-            prefix=add_prefix("o_proj", prefix),
-        )
-
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=config.max_position_embeddings,
-            base=self.rope_theta,
-            rope_scaling=self.rope_scaling,
-            is_neox_style=False,
-        )
-        self.attn = RadixAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=add_prefix("attn", prefix),
-        )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        context_layer = self.attn(
-            q,
-            k,
-            v,
-            forward_batch,
-        )
-        attn_output, _ = self.o_proj(context_layer)
-        return attn_output
 
 
 class Ernie4MLP(nn.Module):
@@ -298,9 +212,23 @@ class Ernie4DecoderLayer(nn.Module):
         is_mtp: bool = False,
     ):
         super().__init__()
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_is_neox_style = getattr(config, "rope_is_neox_style", False)
         # Self attention.
         self.self_attn = Ernie4Attention(
-            config, layer_id, quant_config, prefix=add_prefix("self_attn", prefix)
+            config=config,
+            hidden_size=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            layer_id=layer_id,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            rope_is_neox_style=rope_is_neox_style,
+            max_position_embeddings=config.max_position_embeddings,
+            quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
+            bias=config.use_bias,
         )
         self.moe_layer_start_index = config.num_hidden_layers
         if hasattr(config, "moe_layer_start_index"):
