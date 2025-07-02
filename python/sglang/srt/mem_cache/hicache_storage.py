@@ -28,7 +28,9 @@ class HiCacheStorage(ABC):
     """
 
     @abstractmethod
-    def get(self, key: str) -> Tensor | None:
+    def get(
+        self, key: str, target_location: Optional[torch.Tensor] = None
+    ) -> torch.Tensor | None:
         """
         Retrieve the value associated with the given key.
         Returns None if the key does not exist.
@@ -74,10 +76,18 @@ class HiCacheFile(HiCacheStorage):
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
-    def get(self, key: str) -> Tensor | None:
+    def get(
+        self, key: str, target_location: Optional[torch.Tensor] = None
+    ) -> Tensor | None:
         tensor_path = f"{self.file_path}/{key}.bin"
         try:
-            return torch.load(tensor_path)
+            # todo: fixing the target_location logic
+            loaded_tensor = torch.load(tensor_path, map_location=target_location)
+            if isinstance(loaded_tensor, Tensor):
+                return loaded_tensor
+            else:
+                logger.error(f"Loaded data for key {key} is not a tensor.")
+                return None
         except FileNotFoundError:
             return None
 

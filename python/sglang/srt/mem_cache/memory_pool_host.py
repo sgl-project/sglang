@@ -109,10 +109,6 @@ class HostKVCache(abc.ABC):
     def available_size(self):
         return len(self.free_slots)
 
-    @abc.abstractmethod
-    def assign(self, indices: torch.Tensor, value: torch.Tensor):
-        raise NotImplementedError()
-
     @synchronized()
     def alloc(self, need_size: int) -> torch.Tensor:
         if need_size > self.available_size():

@@ -56,8 +56,8 @@ class TreeNode:
         # indicating the node is loading KV cache from host
         self.loading = False
         # indicating the node is locked to protect from eviction
-        # used when the node is being used by a request undergoing prefetching from storage
-        self.protected = False
+        # incremented when the node is referenced by a storage operation
+        self.host_ref_counter = 0
         # store the host indices of KV cache
         self.host_value: Optional[torch.Tensor] = None
         # store hash values of each pages

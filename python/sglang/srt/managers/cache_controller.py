@@ -162,19 +162,24 @@ class TransferBuffer:
         self.buffers.queue.clear()
 
 
-class PrefetchOperation:
+class StorageOperation:
     counter = 0
 
-    def __init__(self, new_input_tokens: List[int], last_hash: Optional[str] = None):
-        self.new_input_tokens = new_input_tokens
+    def __init__(
+        self,
+        host_indices: torch.Tensor,
+        token_ids: List[int],
+        last_hash: Optional[str] = None,
+    ):
+        self.host_indices = host_indices
+        self.token_ids = token_ids
         self.last_hash = last_hash
-        self.data = None
-        self.completed_pages = 0
+        self.completed_tokens = 0
 
-        self.id = PrefetchOperation.counter
-        PrefetchOperation.counter += 1
+        self.id = StorageOperation.counter
+        StorageOperation.counter += 1
 
-    def __lt__(self, other: "PrefetchOperation"):
+    def __lt__(self, other: "StorageOperation"):
         return self.id < other.id
 
 
@@ -250,10 +255,14 @@ class HiCacheController:
         self.prefetch_thread = threading.Thread(
             target=self.prefetch_thread_func, daemon=True
         )
+        self.backup_thread = threading.Thread(
+            target=self.backup_thread_func, daemon=True
+        )
 
         self.write_thread.start()
         self.load_thread.start()
         self.prefetch_thread.start()
+        self.backup_thread.start()
 
     def reset(self):
         self.stop_event.set()
@@ -418,20 +427,29 @@ class HiCacheController:
                 f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
             )
 
-    def prefetch_from_storage(
-        self, new_input_tokens: List[int], last_hash: Optional[str] = None
+    def prefetch(
+        self,
+        host_indices: torch.Tensor,
+        new_input_tokens: List[int],
+        last_hash: Optional[str] = None,
     ) -> int:
         """
         Prefetch KV caches from storage backend to host memory.
         """
-        operation = PrefetchOperation(new_input_tokens, last_hash)
+        operation = StorageOperation(host_indices, new_input_tokens, last_hash)
         self.prefetch_queue.put(operation)
         self.ongoing_prefetch[operation.id] = operation
         return operation.id
 
     def terminate_prefetch(self, operation_id: int):
+        # todo: fix concurrency issues
         operation = self.ongoing_prefetch.pop(operation_id)
-        return (operation.data, operation.completed_pages)
+        assert operation is not None, f"Operation {operation_id} not found"
+        self.mem_pool_host.free(operation.host_indices[operation.completed_tokens :])
+        return (
+            operation.token_ids[: operation.completed_tokens],
+            operation.host_indices[: operation.completed_tokens],
+        )
 
     def prefetch_thread_func(self):
         while (not self.stop_event.is_set()) or not self.prefetch_queue.empty():
@@ -440,24 +458,30 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                new_input_tokens = operation.new_input_tokens
+                tokens_to_fetch = operation.token_ids
+                host_indices = operation.host_indices
                 hash_value = get_hash_str(
-                    new_input_tokens[: self.page_size], operation.last_hash
+                    tokens_to_fetch[: self.page_size], operation.last_hash
                 )
                 if not self.storage_backend.exists(hash_value):
+                    # todo: release the host memory asap after figuring out exact amount of tokens to prefetch
                     continue
 
-                while len(new_input_tokens) >= self.page_size:
-                    data = self.storage_backend.get(hash_value)
-                    if data is None:
+                while len(tokens_to_fetch) >= self.page_size:
+                    if operation.id not in self.ongoing_prefetch:
+                        # operation was terminated
                         break
-                    else:
-                        operation.data = torch.cat(operation.data, data)
-                    operation.completed_pages += 1
-
-                    new_input_tokens = new_input_tokens[self.page_size :]
+                    target_indices = host_indices[: self.page_size]
+                    loaded_tensor = self.storage_backend.get(
+                        hash_value, self.mem_pool_host[target_indices]
+                    )
+                    if loaded_tensor is None:
+                        break
+                    operation.completed_tokens += self.page_size
+                    tokens_to_fetch = tokens_to_fetch[self.page_size :]
+                    host_indices = host_indices[self.page_size :]
                     hash_value = get_hash_str(
-                        new_input_tokens[: self.page_size], hash_value
+                        tokens_to_fetch[: self.page_size], hash_value
                     )
             except Empty:
                 continue

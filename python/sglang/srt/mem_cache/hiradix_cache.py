@@ -228,7 +228,7 @@ class HiRadixCache(RadixCache):
             if not x.evicted:
                 continue
 
-            if x.protected:
+            if x.host_ref_counter > 0:
                 continue
 
             num_evicted += self.cache_controller.evict_host(x.host_value)
@@ -325,6 +325,12 @@ class HiRadixCache(RadixCache):
         self.writing_check()
         self.loading_check()
 
+    def check_prefetch_progress(self):
+        # for finished prefetch operations, update the radix tree
+        # for ongoing prefetch operations, determine whether to continue
+        # if continue, move the associated requests into a staging area
+        pass
+
     def match_prefix(self, key: List[int], **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         if self.disable or len(key) == 0:
@@ -371,25 +377,60 @@ class HiRadixCache(RadixCache):
         ):
             return
 
-        last_host_node.protected = True
-        operation_id = self.cache_controller.prefetch_from_storage(
-            new_input_tokens=new_input_tokens,
-            last_hash=last_hash,
+        last_host_node.host_ref_counter += 1
+        host_indices = self.cache_controller.mem_pool_host.alloc(len(new_input_tokens))
+        if host_indices is None:
+            self.evict_host(len(new_input_tokens))
+            host_indices = self.cache_controller.mem_pool_host.alloc(
+                len(new_input_tokens)
+            )
+        if host_indices is None:
+            last_host_node.host_ref_counter -= 1
+            # no sufficient host memory to prefetch
+            return
+        operation_id = self.cache_controller.prefetch(
+            host_indices, new_input_tokens, last_hash
         )
         self.ongoing_prefetch[req_id] = (operation_id, last_host_node)
 
-    def finish_prefetch(self, req_id: str):
+    def terminate_prefetch(self, req_id: str):
+        # todo: sync with TP workers
         operation_id, last_host_node = self.ongoing_prefetch[req_id]
-        data, completed_pages = self.cache_controller.terminate_prefetch(operation_id)
-        host_indices = self.cache_controller.mem_pool_host.alloc(
-            completed_pages * self.page_size
+        fetched_token_ids, host_indices = self.cache_controller.terminate_prefetch(
+            operation_id
         )
-
-        # todo: this extra data movement should be eliminated
-        self.cache_controller.mem_pool_host.assign(host_indices, data)
-        last_host_node.protected = False
         # insert a new node of prefetched data into the radix tree
-        self.insert(host_indices)
+        self._insert_helper_host(last_host_node, fetched_token_ids, host_indices)
+        last_host_node.host_ref_counter -= 1
+
+    def _insert_helper_host(self, node: TreeNode, key: List, host_value):
+        node.last_access_time = time.monotonic()
+        if len(key) == 0:
+            return 0
+
+        child_key = self.get_child_key_fn(key)
+
+        while len(key) > 0 and child_key in node.children.keys():
+            node = node.children[child_key]
+            node.last_access_time = time.monotonic()
+            prefix_len = self.key_match_fn(node.key, key)
+            key = key[prefix_len:]
+            host_value = host_value[prefix_len:]
+
+            if prefix_len < len(node.key):
+                new_node = self._split_node(node.key, node, prefix_len)
+                node = new_node
+
+            if len(key):
+                child_key = self.get_child_key_fn(key)
+
+        if len(key):
+            new_node = TreeNode()
+            new_node.parent = node
+            new_node.key = key
+            new_node.value = None
+            new_node.host_value = host_value
+            node.children[child_key] = new_node
 
     def _match_prefix_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.monotonic()
