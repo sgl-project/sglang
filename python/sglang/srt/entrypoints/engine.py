@@ -419,7 +419,7 @@ class Engine(EngineBase):
         )
 
     def update_weights_from_distributed(
-        self, names: str, dtypes, shapes, group_name: str
+        self, names: list[str], dtypes, shapes, group_name: str = "weight_update_group"
     ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
