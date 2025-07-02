@@ -402,7 +402,7 @@ class EAGLEWorker(TpModelWorker):
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
         if self.page_size == 1:
-            out_cache_loc, self.token_to_kv_pool_state_backup = batch.alloc_token_slots(
+            out_cache_loc, token_to_kv_pool_state_backup = batch.alloc_token_slots(
                 num_seqs * self.speculative_num_steps * self.topk, backup_state=True
             )
         else:
@@ -440,11 +440,10 @@ class EAGLEWorker(TpModelWorker):
                     self.topk,
                     self.page_size,
                 )
-
                 # TODO(lmzheng): remove this device sync
                 extend_num_tokens = torch.sum(self.extend_lens).item()
 
-            out_cache_loc, self.token_to_kv_pool_state_backup = (
+            out_cache_loc, token_to_kv_pool_state_backup = (
                 batch.alloc_paged_token_slots_extend(
                     prefix_lens,
                     seq_lens,
@@ -453,11 +452,18 @@ class EAGLEWorker(TpModelWorker):
                     backup_state=True,
                 )
             )
+        if self.page_size > 1 and self.topk > 1:
+            # cum sum of last_page_lens
+            last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
+            duplicate_cache_len = torch.sum(last_page_lens) * (self.topk - 1)
+            target_cache_loc = torch.zeros(duplicate_cache_len, dtype=torch.int32, device=self.device)
+            source_cache_loc = torch.zeros(duplicate_cache_len, dtype=torch.int32, device=self.device)
+        else:
+            # When source_cache_loc is not needed, simply skip
+            duplicate_cache_len = 0
+            source_cache_loc = torch.zeros(0, dtype=torch.int32, device=self.device)
+            target_cache_loc = torch.zeros(0, dtype=torch.int32, device=self.device)
 
-        # TODO: remove this device sync
-        duplicate_cache_len = last_page_lens.sum() * (self.topk - 1)
-        target_cache_loc = torch.zeros(duplicate_cache_len, dtype=torch.int32, device=self.device)
-        source_cache_loc = torch.zeros(duplicate_cache_len, dtype=torch.int32, device=self.device)
         assign_draft_cache_locs[(num_seqs,)](
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
@@ -467,6 +473,7 @@ class EAGLEWorker(TpModelWorker):
             out_cache_loc,
             source_cache_loc,
             target_cache_loc,
+            last_page_lens_cumsum,
             batch.req_to_token_pool.req_to_token.shape[1],
             self.topk,
             self.speculative_num_steps,
@@ -474,10 +481,10 @@ class EAGLEWorker(TpModelWorker):
             next_power_of_2(num_seqs),
             next_power_of_2(self.speculative_num_steps),
         )
-        if duplicate_cache_len > 0:
-            self.draft_model_runner.token_to_kv_pool.move_kv_cache(target_cache_loc, source_cache_loc)
 
         if self.page_size > 1 and self.topk > 1:
+            if duplicate_cache_len > 0:
+                self.draft_model_runner.token_to_kv_pool.move_kv_cache(target_cache_loc, source_cache_loc)
             out_cache_loc = out_cache_loc[
                 : num_seqs * self.topk * self.speculative_num_steps
             ]
@@ -486,7 +493,7 @@ class EAGLEWorker(TpModelWorker):
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         batch.return_hidden_states = False
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
-        # self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
+        self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
         batch.spec_info = EagleDraftInput.create_idle_input(
@@ -531,7 +538,7 @@ class EAGLEWorker(TpModelWorker):
             score_list, token_list, parents_list = self.draft_forward(forward_batch)
 
         # Should this line be here?
-        self.token_to_kv_pool_allocator.restore_state(self.token_to_kv_pool_state_backup)
+        # self.token_to_kv_pool_allocator.restore_state(self.token_to_kv_pool_state_backup)
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
