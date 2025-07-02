@@ -30,7 +30,7 @@ class TestQwen2VLServer(TestOpenAIVisionServer):
             api_key=cls.api_key,
             other_args=[
                 "--mem-fraction-static",
-                "0.5",
+                "0.4",
             ],
         )
         cls.base_url += "/v1"
@@ -49,7 +49,7 @@ class TestQwen2_5_VLServer(TestOpenAIVisionServer):
             api_key=cls.api_key,
             other_args=[
                 "--mem-fraction-static",
-                "0.5",
+                "0.4",
             ],
         )
         cls.base_url += "/v1"
@@ -141,7 +141,7 @@ class TestMinicpmvServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.7",
+                "0.4",
             ],
         )
         cls.base_url += "/v1"
