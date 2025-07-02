@@ -82,6 +82,5 @@ def test_verify_tree_greedy():
     ]
     assert accept_token_num.tolist() == [3, 2]
 
-
 if __name__ == "__main__":
     pytest.main([__file__])
