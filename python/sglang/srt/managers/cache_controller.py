@@ -13,7 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import concurrent.futures
 import logging
 import math
 import threading
@@ -25,6 +24,9 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+    from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+
+from sglang.srt.mem_cache.hicache_storage import get_hash_str
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +162,22 @@ class TransferBuffer:
         self.buffers.queue.clear()
 
 
+class PrefetchOperation:
+    counter = 0
+
+    def __init__(self, new_input_tokens: List[int], last_hash: Optional[str] = None):
+        self.new_input_tokens = new_input_tokens
+        self.last_hash = last_hash
+        self.data = None
+        self.completed_pages = 0
+
+        self.id = PrefetchOperation.counter
+        PrefetchOperation.counter += 1
+
+    def __lt__(self, other: "PrefetchOperation"):
+        return self.id < other.id
+
+
 class HiCacheController:
 
     def __init__(
@@ -170,6 +188,7 @@ class HiCacheController:
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through_selective",
         io_backend: str = "",
+        storage_backend: Optional[str] = None,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -181,6 +200,17 @@ class HiCacheController:
             self.io_backend = "direct" if self.page_size >= 64 else "kernel"
         else:
             self.io_backend = io_backend
+
+        # todo: move backend initialization to storage backend module
+        if storage_backend is "file":
+            self.storage_backend = HiCacheFile()
+            # tracking prefetch operation progress
+            # todo: thread safe data structure
+            self.ongoing_prefetch = {}
+        else:
+            raise NotImplementedError(
+                f"Unsupported storage backend: {self.storage_backend}"
+            )
 
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
@@ -199,6 +229,9 @@ class HiCacheController:
         self.ack_write_queue = Queue()
         self.ack_load_queue = Queue()
 
+        self.prefetch_queue = Queue()
+        self.backup_queue = Queue()
+
         self.stop_event = threading.Event()
         self.write_buffer = TransferBuffer(self.stop_event)
         self.load_buffer = TransferBuffer(
@@ -214,8 +247,13 @@ class HiCacheController:
         self.load_thread = threading.Thread(
             target=self.load_thread_func_layer_by_layer, daemon=True
         )
+        self.prefetch_thread = threading.Thread(
+            target=self.prefetch_thread_func, daemon=True
+        )
+
         self.write_thread.start()
         self.load_thread.start()
+        self.prefetch_thread.start()
 
     def reset(self):
         self.stop_event.set()
@@ -379,3 +417,47 @@ class HiCacheController:
             raise ValueError(
                 f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
             )
+
+    def prefetch_from_storage(
+        self, new_input_tokens: List[int], last_hash: Optional[str] = None
+    ) -> int:
+        """
+        Prefetch KV caches from storage backend to host memory.
+        """
+        operation = PrefetchOperation(new_input_tokens, last_hash)
+        self.prefetch_queue.put(operation)
+        self.ongoing_prefetch[operation.id] = operation
+        return operation.id
+
+    def terminate_prefetch(self, operation_id: int):
+        operation = self.ongoing_prefetch.pop(operation_id)
+        return (operation.data, operation.completed_pages)
+
+    def prefetch_thread_func(self):
+        while (not self.stop_event.is_set()) or not self.prefetch_queue.empty():
+            try:
+                operation = self.prefetch_queue.get(block=True, timeout=1)
+                if operation is None:
+                    continue
+
+                new_input_tokens = operation.new_input_tokens
+                hash_value = get_hash_str(
+                    new_input_tokens[: self.page_size], operation.last_hash
+                )
+                if not self.storage_backend.exists(hash_value):
+                    continue
+
+                while len(new_input_tokens) >= self.page_size:
+                    data = self.storage_backend.get(hash_value)
+                    if data is None:
+                        break
+                    else:
+                        operation.data = torch.cat(operation.data, data)
+                    operation.completed_pages += 1
+
+                    new_input_tokens = new_input_tokens[self.page_size :]
+                    hash_value = get_hash_str(
+                        new_input_tokens[: self.page_size], hash_value
+                    )
+            except Empty:
+                continue

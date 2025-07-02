@@ -55,8 +55,13 @@ class TreeNode:
         self.hit_count = 0
         # indicating the node is loading KV cache from host
         self.loading = False
+        # indicating the node is locked to protect from eviction
+        # used when the node is being used by a request undergoing prefetching from storage
+        self.protected = False
         # store the host indices of KV cache
         self.host_value: Optional[torch.Tensor] = None
+        # store hash values of each pages
+        self.hash_values: Optional[List[int]] = None
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -68,6 +73,12 @@ class TreeNode:
     @property
     def backuped(self):
         return self.host_value is not None
+
+    def last_hash_value(self) -> Optional[int]:
+        """Returns the hash value of the last page in this node."""
+        if self.hash_values is None or len(self.hash_values) == 0:
+            return None
+        return self.hash_values[-1]
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
