@@ -436,7 +436,7 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             forward_batch=forward_batch,
             language_model=self.language_model,
             data_embedding_funcs={
-                Modality.IMAGE: self.get_image_feature,
+                Modality.IMAGE: self.get_image_feature(),
                 Modality.AUDIO: self.get_audio_feature(),
             },
             positions=positions,

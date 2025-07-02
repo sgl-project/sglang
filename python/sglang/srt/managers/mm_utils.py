@@ -162,7 +162,7 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 embedding_cache: Optional[MultiModalCache] = None
 
 
-def init_embedding_cache(max_size: int):
+def init_embedding_cache(max_size: int = 0):
     global embedding_cache
     embedding_cache = MultiModalCache(max_size)
 
@@ -379,7 +379,7 @@ def embed_mm_inputs(
     extend_seq_lens: List[int],
     input_ids: torch.Tensor,
     input_embedding: nn.Embedding,
-    multimodal_model: nn.Module,
+    multimodal_model: nn.Module = None,
     data_embedding_func_mapping: Dict[
         Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
     ] = None,
