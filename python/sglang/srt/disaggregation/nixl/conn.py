@@ -149,6 +149,7 @@ class NixlKVManager(CommonKVManager):
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.request_status = {}
                 self.transfer_infos: Dict[int, TransferInfo] = {}
+                self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
                 self.peer_names: Dict[str, str] = {}
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
@@ -514,6 +515,7 @@ class NixlKVReceiver(CommonKVReceiver):
     ):
         self.started_transfer = False
         self.is_remote_prefill = mgr.is_remote_prefill
+        self.conclude_state = None
         if self.is_remote_prefill:
             # if remote prefill, don't get boostrap info from prefill server
 
@@ -536,7 +538,7 @@ class NixlKVReceiver(CommonKVReceiver):
 
         threading.Thread(target=start_async_loop, args=(event_loop,)).start()
 
-    def _send_to_queue(self, req: Req, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+    def _send_to_queue(self, req: Req, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
         # only send the request to the queue if the engine rank per dp rank is 0
         per_dp_tp_rank = self.kv_mgr.tp_size // self.kv_mgr.dp_size
         if self.kv_mgr.engine_rank % per_dp_tp_rank != 0:
@@ -590,7 +592,7 @@ class NixlKVReceiver(CommonKVReceiver):
         asyncio.run_coroutine_threadsafe(send_to_nats(), self.send_to_queue_loop)
         logger.debug(f"Send request to queue succeed!")
 
-    def init(self, req: Req, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+    def init(self, req: Req, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
         if self.is_remote_prefill:
             self._send_to_queue(req, kv_indices, aux_index)
             return

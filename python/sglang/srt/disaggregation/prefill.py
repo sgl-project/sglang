@@ -625,7 +625,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def handle_remote_prefill_req(self: Scheduler, remote_prefill_req: RemotePrefillReq):
         import numpy as np
-        from .nixl.conn import NixlKVSender, TransferInfo
+        from .nixl.conn import NixlKVSender, TransferInfo, KVArgsRegisterInfo
         import json
 
         req = Req(rid = remote_prefill_req.rid,
@@ -639,7 +639,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         bootstrap_room = req.bootstrap_room
         engine_id = remote_prefill_req.engine_id
-        self.disagg_prefill_bootstrap_queue.add(req)
+        self.disagg_prefill_bootstrap_queue.add(req, self.model_config.num_key_value_heads)
         kv_sender = REQ_KV_SENDR_MAP[req.rid]
         kv_indices = base64.b64decode(remote_prefill_req.kv_indices)
 
@@ -676,19 +676,27 @@ class SchedulerDisaggregationPrefillMixin:
 
             logger.debug(f"rank {self.tp_rank} with agent name: {agent_name}")
             kv_mgr = kv_sender.kv_mgr
+            if bootstrap_room not in kv_mgr.decode_kv_args_table:
+                    kv_mgr.decode_kv_args_table[bootstrap_room] = {}
+            kv_mgr._add_remote_peer(decode_kv_args=KVArgsRegisterInfo(
+                room=remote_prefill_req.bootstrap_room,
+                endpoint=remote_prefill_req.rank_ip,
+                dst_port=remote_prefill_req.rank_port,
+                agent_metadata=agent_info["agent_metadata"],
+                dst_kv_ptrs=agent_info["kv_data_ptrs"],
+                dst_aux_ptrs=agent_info["aux_data_ptrs"],
+                gpu_id=agent_info["gpu_id"],
+            ))
+                
             if bootstrap_room not in kv_mgr.transfer_infos:
                 kv_mgr.transfer_infos[bootstrap_room] = {}
-            kv_mgr.transfer_infos[bootstrap_room][agent_name] = TransferInfo(
+            kv_mgr.transfer_infos[bootstrap_room][agent_key] = TransferInfo(
                 room =remote_prefill_req.bootstrap_room,
                 endpoint=remote_prefill_req.rank_ip,
                 dst_port=remote_prefill_req.rank_port,
-                agent_metadata= agent_info["agent_metadata"],
                 agent_name=agent_name,
-                dst_kv_ptrs=agent_info["kv_data_ptrs"],
-                dst_kv_indices= np.frombuffer(kv_indices, dtype=np.int64),
-                dst_aux_ptrs=agent_info["aux_data_ptrs"],
+                dst_kv_indices=dst_kv_indices,
                 dst_aux_index=remote_prefill_req.aux_index,
-                dst_gpu_id=agent_info["gpu_id"],
                 required_dst_info_num=0,
             )
             kv_mgr.update_status(bootstrap_room, KVPoll.WaitingForInput)
@@ -712,28 +720,39 @@ class SchedulerDisaggregationPrefillMixin:
                 assert isinstance(kv_sender, NixlKVSender), \
                     f"Expect NixlKVSender but got {type(kv_sender)} for remote prefill request {remote_prefill_req.rid}"
 
-                dst_kv_indices = np.frombuffer(kv_indices, dtype=np.int64) \
-                    if self.attn_tp_rank == 0 else np.array([], dtype=np.int64)
+                dst_kv_indices = np.frombuffer(kv_indices, dtype=np.int32) \
+                    if self.attn_tp_rank == 0 else np.array([], dtype=np.int32)
 
                 agent_name = agent_info["agent_name"]
                 agent_key = f"{agent_name}_{target_tp_rank}"
                 logger.debug(f"rank {self.tp_rank} with agent name: {agent_name}")
                 kv_mgr = kv_sender.kv_mgr
+                
+                if bootstrap_room not in kv_mgr.decode_kv_args_table:
+                    kv_mgr.decode_kv_args_table[bootstrap_room] = {}
+                kv_mgr._add_remote_peer(decode_kv_args=KVArgsRegisterInfo(
+                    room=remote_prefill_req.bootstrap_room,
+                    endpoint=remote_prefill_req.rank_ip,
+                    dst_port=remote_prefill_req.rank_port,
+                    agent_name=agent_name,
+                    agent_metadata=agent_info["agent_metadata"],
+                    dst_kv_ptrs=agent_info["kv_data_ptrs"],
+                    dst_aux_ptrs=agent_info["aux_data_ptrs"],
+                    gpu_id=agent_info["gpu_id"],
+                ))
+                
                 if bootstrap_room not in kv_mgr.transfer_infos:
                     kv_mgr.transfer_infos[bootstrap_room] = {}
                 kv_mgr.transfer_infos[bootstrap_room][agent_key] = TransferInfo(
                     room =remote_prefill_req.bootstrap_room,
                     endpoint=remote_prefill_req.rank_ip,
                     dst_port=remote_prefill_req.rank_port,
-                    agent_metadata=agent_info["agent_metadata"],
                     agent_name=agent_name,
-                    dst_kv_ptrs=agent_info["kv_data_ptrs"],
                     dst_kv_indices=dst_kv_indices,
-                    dst_aux_ptrs=agent_info["aux_data_ptrs"],
                     dst_aux_index=remote_prefill_req.aux_index,
-                    dst_gpu_id=agent_info["gpu_id"],
                     required_dst_info_num=0,
                 )
+                
                 kv_mgr.update_status(bootstrap_room, KVPoll.WaitingForInput)
 
     def _start_queue_thread(self: Scheduler):
