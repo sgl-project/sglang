@@ -43,7 +43,8 @@ except ImportError:
 ENABLE_TRTLMM_GEN_MOE = get_bool_env_var("SGLANG_ENABLE_TRTLLM_GEN_MOE", "false")
 
 if ENABLE_TRTLMM_GEN_MOE:
-    import tensorrt_llm
+    # import tensorrt_llm to register ops
+    import tensorrt_llm # noqa
     from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
     from tensorrt_llm.quantization.utils.fp4_utils import (
         float4_sf_dtype,
