@@ -744,6 +744,8 @@ def assign_draft_cache_locs(
     extend_lens,
     num_new_pages_per_topk,
     out_cache_loc,
+    source_cache_loc,
+    target_cache_loc,
     pool_len: tl.constexpr,
     topk: tl.constexpr,
     speculative_num_steps: tl.constexpr,
@@ -783,16 +785,32 @@ def assign_draft_cache_locs(
     mask = offsets < last_page_len
     num_new_pages_per_topk_ = tl.load(num_new_pages_per_topk + pid)
     prefix_base = token_pool + prefix_len - last_page_len
-
-    for topk_id in range(topk):
-        value = tl.load(prefix_base + offsets, mask=mask)
+    src_indices = tl.load(prefix_base + offsets, mask=mask)
+    # Skip the first one since no copy is needed
+    for topk_id in range(1, topk):
+        # Copy the last partial page topk times
         tl.store(
-            prefix_base + topk_id * num_new_pages_per_topk_ * page_size + offsets,
-            value,
+            source_cache_loc 
+            + pid * topk * page_size
+            + (topk_id - 1) * last_page_len + offsets,
+            src_indices,
             mask=mask,
         )
-
+        tgt_indices = tl.load(
+            prefix_base + topk_id * num_new_pages_per_topk_ * page_size + offsets,
+            mask=mask,
+        )
+        tl.store(
+            target_cache_loc 
+            + pid * topk * page_size
+            + (topk_id - 1) * last_page_len + offsets,
+            tgt_indices,
+            mask=mask,
+        )
     # Part 3: Remove the padding in out_cache_loc
+    # so copy num_new_pages_per_topk_ * page_size - last_page_pen elements
+    max_copy = num_new_pages_per_topk_ * page_size - last_page_len
+    # Each iteration copies at most min(speculative_num_steps, max_copy)
     iter_offest = tl.arange(0, iter_upper)
     for topk_id in range(topk):
         indices = tl.load(
@@ -800,15 +818,15 @@ def assign_draft_cache_locs(
             + topk_id * num_new_pages_per_topk_ * page_size
             + last_page_len
             + iter_offest,
-            mask=iter_offest < speculative_num_steps,
+            mask=iter_offest < max_copy,
         )
         tl.store(
             out_cache_loc
-            + pid * topk * speculative_num_steps
-            + topk_id * speculative_num_steps
+            + pid * topk * max_copy
+            + topk_id * max_copy
             + iter_offest,
             indices,
-            mask=iter_offest < speculative_num_steps,
+            mask=iter_offest < max_copy,
         )
 
 

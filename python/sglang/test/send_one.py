@@ -15,7 +15,7 @@ import requests
 @dataclasses.dataclass
 class BenchArgs:
     host: str = "localhost"
-    port: int = 30000
+    port: int = 8000
     batch_size: int = 1
     temperature: float = 0.0
     max_new_tokens: int = 512
