@@ -209,6 +209,17 @@ def get_quant_config(
             config["adapter_name_or_path"] = model_name_or_path
         elif model_config.quantization == "modelopt":
             if config["producer"]["name"] == "modelopt":
+                # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
+                if config["quantization"]["quant_algo"] is None:
+                    if (
+                        model_config.hf_config.architectures[0]
+                        != "LlamaForCausalLMEagle3"
+                    ):
+                        raise ValueError(
+                            f"Invalid quant_config, quantization method: {model_config.quantization},"
+                            f"hf architectures: {model_config.hf_config.architectures[0]}. "
+                        )
+                    return None
                 if "FP4" in config["quantization"]["quant_algo"]:
                     return ModelOptFp4Config.from_config(config)
                 else:
@@ -449,10 +460,12 @@ def safetensors_weights_iterator(
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
+                for name, param in result.items():
+                    yield name, param
         else:
-            result = safetensors.torch.load_file(st_file, device="cpu")
-        for name, param in result.items():
-            yield name, param
+            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                for name in f.keys():
+                    yield name, f.get_tensor(name)
 
 
 def multi_thread_safetensors_weights_iterator(
@@ -485,7 +498,8 @@ def multi_thread_safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
         else:
-            result = safetensors.torch.load_file(st_file, device="cpu")
+            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                result = {k: f.get_tensor(k) for k in f.keys()}
 
         return result
 
