@@ -87,6 +87,8 @@ from triton.runtime.cache import (
     default_override_dir,
 )
 
+from sglang.srt.metrics.func_timer import enable_func_timer
+
 logger = logging.getLogger(__name__)
 
 show_time_cost = False
@@ -1930,7 +1932,7 @@ def get_cuda_version():
     return (0, 0)
 
 
-def launch_dummy_health_check_server(host, port):
+def launch_dummy_health_check_server(host, port, enable_metrics):
     import asyncio
 
     import uvicorn
@@ -1947,6 +1949,11 @@ def launch_dummy_health_check_server(host, port):
     async def health_generate():
         """Check the health of the http server."""
         return Response(status_code=200)
+
+    # Add prometheus middleware
+    if enable_metrics:
+        add_prometheus_middleware(app)
+        enable_func_timer()
 
     config = uvicorn.Config(
         app,
