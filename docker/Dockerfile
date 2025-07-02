@@ -83,6 +83,7 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/sour
     cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
  && cmake --build build --target install -j \
  && cd /sgl-workspace/DeepEP \
+ && if [ "$BUILD_TYPE" = "blackwell" ]; then export TORCH_CUDA_ARCH_LIST="10.0"; echo "Setting TORCH_CUDA_ARCH_LIST=10.0 for Blackwell build"; fi \
  && NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
 
 # Python tools
