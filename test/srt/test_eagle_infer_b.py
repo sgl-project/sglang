@@ -115,7 +115,7 @@ class TestEAGLEServer(CustomTestCase):
 
         args = SimpleNamespace(
             num_shots=5,
-            data_path="/shared/public/sharing/sglang_test/test.jsonl",
+            data_path="/shared/public/data/gsm8k/test.jsonl",
             num_questions=200,
             max_new_tokens=1,
             parallel=128,
@@ -132,7 +132,7 @@ class TestEAGLEServer(CustomTestCase):
 
         args = SimpleNamespace(
             num_shots=5,
-            data_path="/shared/public/sharing/sglang_test/test.jsonl",
+            data_path="/shared/public/data/gsm8k/test.jsonl",
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
