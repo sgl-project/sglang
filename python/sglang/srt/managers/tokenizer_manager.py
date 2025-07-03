@@ -846,10 +846,10 @@ class TokenizerManager:
     async def flush_cache(self) -> FlushCacheReqOutput:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
 
-    def abort_request(self, rid: str):
-        if rid not in self.rid_to_state:
+    def abort_request(self, rid: str = "", abort_all: bool = False):
+        if not abort_all and rid not in self.rid_to_state:
             return
-        req = AbortReq(rid)
+        req = AbortReq(rid, abort_all)
         self.send_to_scheduler.send_pyobj(req)
 
         if self.enable_metrics:
@@ -914,6 +914,9 @@ class TokenizerManager:
             obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
         if True:  # Keep this redundant check to simplify some internal code sync
             # Hold the lock if it is not async. This means that weight sync
             # cannot run while requests are in progress.
@@ -969,6 +972,9 @@ class TokenizerManager:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
         # This means that weight sync
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
@@ -984,6 +990,9 @@ class TokenizerManager:
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
+
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
 
         # This means that weight sync
         # cannot run while requests are in progress.
@@ -1619,7 +1628,23 @@ class TokenizerManager:
             self.crash_dump_request_list.popleft()
 
     def _handle_abort_req(self, recv_obj):
-        self.rid_to_state.pop(recv_obj.rid, None)
+        state = self.rid_to_state[recv_obj.rid]
+        state.finished = True
+        state.out_list.append(
+            {
+                "text": "",
+                "meta_info": {
+                    "id": recv_obj.rid,
+                    "finish_reason": {
+                        "type": "abort",
+                        "message": "Abort before prefill",
+                    },
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                },
+            }
+        )
+        state.event.set()
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(
