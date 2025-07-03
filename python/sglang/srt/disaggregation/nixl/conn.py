@@ -34,6 +34,17 @@ from sglang.srt.utils import broadcast_pyobj, get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
 
+try:
+    import os
+
+    import etcd3
+    import nats
+
+    IS_REMOTE_PREFILL_SUPPORT = True
+except ImportError:
+    logger.info("etcd3 or nats is not installed, remote prefill will not be available.")
+    IS_REMOTE_PREFILL_SUPPORT = False
+
 GUARD = "NixlMsgGuard".encode("ascii")
 
 
@@ -119,7 +130,11 @@ class NixlKVManager(CommonKVManager):
         is_remote_prefill: Optional[bool] = False,
     ):
         super().__init__(
-            args, disaggregation_mode, server_args, is_mla_backend, is_remote_prefill
+            args,
+            disaggregation_mode,
+            server_args,
+            is_mla_backend,
+            is_remote_prefill and IS_REMOTE_PREFILL_SUPPORT,
         )
         try:
             from nixl._api import nixl_agent
@@ -137,11 +152,8 @@ class NixlKVManager(CommonKVManager):
             import base64
             import hashlib
             import json
-            from os import environ
 
-            import etcd3
-
-            etcd_endpoint = environ.get("ETCD_ENDPOINT", "127.0.0.1:2379")
+            etcd_endpoint = os.environ.get("ETCD_ENDPOINT", "127.0.0.1:2379")
             self.model_name_hash = hashlib.sha256(
                 server_args.served_model_name.encode("utf-8")
             ).hexdigest()[:8]

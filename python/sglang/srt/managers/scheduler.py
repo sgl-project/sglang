@@ -165,6 +165,15 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
+try:
+    import etcd3
+    import nats
+
+    IS_REMOTE_PREFILL_SUPPORT = True
+except ImportError:
+    logger.info("etcd3 or nats is not installed, remote prefill will not be available.")
+    IS_REMOTE_PREFILL_SUPPORT = False
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
@@ -660,7 +669,9 @@ class Scheduler(
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
-        self.is_remote_prefill = self.server_args.enable_remote_prefill
+        self.is_remote_prefill = (
+            self.server_args.enable_remote_prefill and IS_REMOTE_PREFILL_SUPPORT
+        )
         self.model_name_hash = hashlib.sha256(
             self.server_args.served_model_name.encode("utf-8")
         ).hexdigest()[:8]
@@ -761,19 +772,16 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
 
         if self.is_remote_prefill:
-            from os import environ
-
-            import etcd3
-            import nats
-
             # connect to etcd
-            etcd_endpoint = environ.get("ETCD_ENDPOINT", "127.0.0.1:2379")
+            etcd_endpoint = os.environ.get("ETCD_ENDPOINT", "127.0.0.1:2379")
             self.etcd_client = etcd3.client(
                 host=etcd_endpoint.split(":")[0], port=int(etcd_endpoint.split(":")[1])
             )
             self.remote_agent_map = {}
             self.remote_engine_configs = {}
-            self.nats_endpoint = environ.get("NATS_ENDPOINT", "nats://127.0.0.1:4222")
+            self.nats_endpoint = os.environ.get(
+                "NATS_ENDPOINT", "nats://127.0.0.1:4222"
+            )
 
     @DynamicGradMode()
     def event_loop_normal(self):
