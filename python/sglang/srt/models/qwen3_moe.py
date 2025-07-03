@@ -117,6 +117,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 if global_server_args_dict["enable_deepep_moe"]
                 else {}
             ),
+            # Additional args for FusedMoE
+            **(
+                dict(
+                    enable_flashinfer_moe=True,
+                    enable_ep_moe=global_server_args_dict["enable_ep_moe"],
+                )
+                if global_server_args_dict["enable_flashinfer_moe"]
+                else {}
+            ),
         )
 
         self.gate = ReplicatedLinear(
