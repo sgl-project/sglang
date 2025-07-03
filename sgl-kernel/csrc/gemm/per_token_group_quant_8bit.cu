@@ -106,12 +106,12 @@ __device__ __forceinline__ int compute_input_group_start_offset(
          token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) + hidden_dim_group_idx * group_size;
 }
 
-__device__ __host__ __forceinline__ int4 operator+(const int4& a, const int4& b) {
+__device__ __host__ __forceinline__ int4 operator^(const int4& a, const int4& b) {
     int4 result;
-    result.x = a.x + b.x;
-    result.y = a.y + b.y;
-    result.z = a.z + b.z;
-    result.w = a.w + b.w;
+    result.x = a.x ^ b.x;
+    result.y = a.y ^ b.y;
+    result.z = a.z ^ b.z;
+    result.w = a.w ^ b.w;
     return result;
 }
 
@@ -271,7 +271,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 
   constexpr int NUM_INPUT_DATA = 6;
 
-  int output_data = 0;
+  int4 output_data = {0,0,0,0};
 
 // #pragma unroll
 //   for (int access_base_idx = flat_thread_idx; access_base_idx < num_items_overall; access_base_idx += num_items_per_iteration * NUM_INPUT_DATA) {
@@ -288,11 +288,11 @@ __global__ void per_token_group_quant_8bit_kernel(
 
 #pragma unroll
     for (int i = 0; i < NUM_INPUT_DATA; ++i) {
-      output_data ^= input_data[i].x ^ input_data[i].y ^ input_data[i].z ^ input_data[i].w;
+      output_data = output_data ^ input_data[i];
     }
 //   }
 
-  *(reinterpret_cast<int*>(output_q) + flat_thread_idx) = output_data;
+  *(reinterpret_cast<int4*>(output_q) + flat_thread_idx) = output_data;
 
 //   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
 //   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
