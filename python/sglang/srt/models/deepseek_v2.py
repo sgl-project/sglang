@@ -325,7 +325,9 @@ class DeepseekV2MoE(nn.Module):
                 dict(
                     enable_flashinfer_moe=True,
                     enable_ep_moe=global_server_args_dict["enable_ep_moe"],
-                    enable_flashinfer_fp4_allgather=global_server_args_dict["enable_flashinfer_fp4_allgather"],
+                    enable_flashinfer_fp4_allgather=global_server_args_dict[
+                        "enable_flashinfer_fp4_allgather"
+                    ],
                 )
                 if global_server_args_dict["enable_flashinfer_moe"]
                 else {}
