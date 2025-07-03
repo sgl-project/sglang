@@ -167,6 +167,7 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
             config.num_experts,
             bias=config.mlp_bias,
             quant_config=None,
+            #Todo: to replace gate with router
             prefix=add_prefix("gate", prefix),
         )
 
