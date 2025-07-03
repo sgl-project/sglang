@@ -21,10 +21,10 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from collections import deque
 from dataclasses import dataclass
-import hashlib
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
@@ -49,7 +49,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, KVCache
+from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import require_mlp_sync
@@ -412,7 +412,9 @@ class DecodePreallocQueue:
             page_indices = kv_to_page_indices(
                 kv_indices, self.token_to_kv_pool_allocator.page_size
             )
-            decode_req.kv_receiver.init(decode_req.req, page_indices, decode_req.metadata_buffer_index)
+            decode_req.kv_receiver.init(
+                decode_req.req, page_indices, decode_req.metadata_buffer_index
+            )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
 
@@ -533,7 +535,7 @@ class DecodeTransferQueue:
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
-        is_remote_prefill: bool = False
+        is_remote_prefill: bool = False,
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group

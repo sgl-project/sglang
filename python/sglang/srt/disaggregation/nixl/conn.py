@@ -28,10 +28,9 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.utils import DisaggregationMode, RemotePrefillReq
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_local_ip_by_remote, broadcast_pyobj
-
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import broadcast_pyobj, get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
 
@@ -119,8 +118,9 @@ class NixlKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
         is_remote_prefill: Optional[bool] = False,
     ):
-        super().__init__(args, disaggregation_mode, server_args,
-                         is_mla_backend, is_remote_prefill)
+        super().__init__(
+            args, disaggregation_mode, server_args, is_mla_backend, is_remote_prefill
+        )
         try:
             from nixl._api import nixl_agent
         except ImportError as e:
@@ -134,17 +134,20 @@ class NixlKVManager(CommonKVManager):
         self.register_buffer_to_engine()
 
         if self.is_remote_prefill:
-            from os import environ
-            import etcd3
-            import json
             import base64
             import hashlib
+            import json
+            from os import environ
+
+            import etcd3
 
             etcd_endpoint = environ.get("ETCD_ENDPOINT", "127.0.0.1:2379")
-            self.model_name_hash = hashlib.sha256(server_args.served_model_name.encode('utf-8')) \
-                .hexdigest()[:8]
-            self.etcd_client = etcd3.client(host=etcd_endpoint.split(":")[0],
-                                            port=int(etcd_endpoint.split(":")[1]))
+            self.model_name_hash = hashlib.sha256(
+                server_args.served_model_name.encode("utf-8")
+            ).hexdigest()[:8]
+            self.etcd_client = etcd3.client(
+                host=etcd_endpoint.split(":")[0], port=int(etcd_endpoint.split(":")[1])
+            )
             # register to etcd
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.request_status = {}
@@ -160,34 +163,46 @@ class NixlKVManager(CommonKVManager):
                 if self.engine_rank == 0:
                     engine_id = hashlib.sha256(uuid.uuid4().bytes).hexdigest()[:8]
                     broadcast_pyobj([engine_id], self.engine_rank, None, 0, False)
-                    logger.debug(f"Rank {self.engine_rank} broadcasted engine_id: {engine_id}")
+                    logger.debug(
+                        f"Rank {self.engine_rank} broadcasted engine_id: {engine_id}"
+                    )
                 else:
                     engine_id = broadcast_pyobj([], self.engine_rank, None, 0, False)[0]
-                    logger.debug(f"Rank {self.engine_rank} received engine_id: {engine_id}")
+                    logger.debug(
+                        f"Rank {self.engine_rank} received engine_id: {engine_id}"
+                    )
                 self.engine_id = engine_id
 
-                agent_metadata = base64.b64encode(self.agent.get_agent_metadata()).decode('ascii')
+                agent_metadata = base64.b64encode(
+                    self.agent.get_agent_metadata()
+                ).decode("ascii")
                 if self.engine_rank == 0:
                     self.etcd_client.put(
                         f"/decode/{self.model_name_hash}/{self.engine_id}",
-                        json.dumps({
-                            "tp_size": self.tp_size,
-                            "dp_size": self.dp_size,
-                        })
+                        json.dumps(
+                            {
+                                "tp_size": self.tp_size,
+                                "dp_size": self.dp_size,
+                            }
+                        ),
                     )
                 self.etcd_client.put(
                     f"/decode/{self.model_name_hash}/{self.engine_id}/{self.engine_rank}",
-                    json.dumps({
-                        "agent_metadata": agent_metadata,
-                        "agent_name": self.agent.name,
-                        "kv_data_ptrs": self.kv_args.kv_data_ptrs,
-                        "aux_data_ptrs": self.kv_args.aux_data_ptrs,
-                        "gpu_id": self.kv_args.gpu_id,
-                        "tp_size": self.tp_size,
-                        "dp_size": self.dp_size,
-                    })
+                    json.dumps(
+                        {
+                            "agent_metadata": agent_metadata,
+                            "agent_name": self.agent.name,
+                            "kv_data_ptrs": self.kv_args.kv_data_ptrs,
+                            "aux_data_ptrs": self.kv_args.aux_data_ptrs,
+                            "gpu_id": self.kv_args.gpu_id,
+                            "tp_size": self.tp_size,
+                            "dp_size": self.dp_size,
+                        }
+                    ),
                 )
-                logger.debug(f"Register key: /decode/{self.model_name_hash}/{self.engine_id}/{self.engine_rank} to ETCD")
+                logger.debug(
+                    f"Register key: /decode/{self.model_name_hash}/{self.engine_id}/{self.engine_rank} to ETCD"
+                )
             else:
                 raise ValueError(
                     f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -538,7 +553,12 @@ class NixlKVReceiver(CommonKVReceiver):
 
         threading.Thread(target=start_async_loop, args=(event_loop,)).start()
 
-    def _send_to_queue(self, req: Req, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
+    def _send_to_queue(
+        self,
+        req: Req,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int] = None,
+    ):
         # only send the request to the queue if the engine rank per dp rank is 0
         per_dp_tp_rank = self.kv_mgr.tp_size // self.kv_mgr.dp_size
         if self.kv_mgr.engine_rank % per_dp_tp_rank != 0:
@@ -560,16 +580,19 @@ class NixlKVReceiver(CommonKVReceiver):
             engine_rank=self.kv_mgr.engine_rank,
             aux_index=aux_index,
             bootstrap_room=self.bootstrap_room,
-            engine_id=self.kv_mgr.engine_id
+            engine_id=self.kv_mgr.engine_id,
         )
 
         remote_prefill_req_data = pickle.dumps(remote_prefill_req)
 
         async def send_to_nats():
-            import nats
             from os import environ
 
-            logger.debug(f"Send request and kv indices to queue: {queue_name} with len: {len(remote_prefill_req_data)} and boostrap room: {req.bootstrap_room}")
+            import nats
+
+            logger.debug(
+                f"Send request and kv indices to queue: {queue_name} with len: {len(remote_prefill_req_data)} and boostrap room: {req.bootstrap_room}"
+            )
             nats_endpoint = environ.get("NATS_ENDPOINT", "nats://127.0.0.1:4222")
             nats_client = await nats.connect(nats_endpoint)
             js = nats_client.jetstream()
@@ -581,10 +604,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 max_msgs=1000000,  # 1 million messages
             )
 
-            ark = await js.publish(
-                queue_name,
-                remote_prefill_req_data
-            )
+            ark = await js.publish(queue_name, remote_prefill_req_data)
 
             self.started_transfer = True
             logger.debug(f"Published request to NATS with ark: {ark}")
@@ -592,7 +612,12 @@ class NixlKVReceiver(CommonKVReceiver):
         asyncio.run_coroutine_threadsafe(send_to_nats(), self.send_to_queue_loop)
         logger.debug(f"Send request to queue succeed!")
 
-    def init(self, req: Req, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
+    def init(
+        self,
+        req: Req,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int] = None,
+    ):
         if self.is_remote_prefill:
             self._send_to_queue(req, kv_indices, aux_index)
             return

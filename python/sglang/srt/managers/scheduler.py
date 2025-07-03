@@ -14,6 +14,7 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import faulthandler
+import hashlib
 import logging
 import os
 import random
@@ -25,7 +26,6 @@ from collections import defaultdict, deque
 from concurrent import futures
 from dataclasses import dataclass
 from pathlib import Path
-import hashlib
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -55,9 +55,9 @@ from sglang.srt.disaggregation.prefill import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     MetadataBuffers,
+    RemotePrefillReq,
     ReqToMetadataIdxAllocator,
     TransferBackend,
-    RemotePrefillReq,
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -661,8 +661,9 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
         self.is_remote_prefill = self.server_args.enable_remote_prefill
-        self.model_name_hash = hashlib.sha256(self.server_args.served_model_name.encode('utf-8')) \
-                .hexdigest()[:8]
+        self.model_name_hash = hashlib.sha256(
+            self.server_args.served_model_name.encode("utf-8")
+        ).hexdigest()[:8]
         self.remote_prefill_reqs = []
 
         if (
@@ -720,9 +721,7 @@ class Scheduler(
             # Metric for pre-allocation
             self.num_tokens_pre_allocated = 0
 
-        elif (
-            self.disaggregation_mode == DisaggregationMode.PREFILL
-        ):
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
@@ -763,13 +762,15 @@ class Scheduler(
 
         if self.is_remote_prefill:
             from os import environ
+
             import etcd3
             import nats
 
             # connect to etcd
             etcd_endpoint = environ.get("ETCD_ENDPOINT", "127.0.0.1:2379")
-            self.etcd_client = etcd3.client(host=etcd_endpoint.split(":")[0],
-                                        port=int(etcd_endpoint.split(":")[1]))
+            self.etcd_client = etcd3.client(
+                host=etcd_endpoint.split(":")[0], port=int(etcd_endpoint.split(":")[1])
+            )
             self.remote_agent_map = {}
             self.remote_engine_configs = {}
             self.nats_endpoint = environ.get("NATS_ENDPOINT", "nats://127.0.0.1:4222")
@@ -1017,14 +1018,24 @@ class Scheduler(
                     req
                     for req in recv_reqs
                     if isinstance(
-                        req, (TokenizedGenerateReqInput, RemotePrefillReq, TokenizedEmbeddingReqInput)
+                        req,
+                        (
+                            TokenizedGenerateReqInput,
+                            RemotePrefillReq,
+                            TokenizedEmbeddingReqInput,
+                        ),
                     )
                 ]
                 control_reqs = [
                     req
                     for req in recv_reqs
                     if not isinstance(
-                        req, (TokenizedGenerateReqInput, RemotePrefillReq, TokenizedEmbeddingReqInput)
+                        req,
+                        (
+                            TokenizedGenerateReqInput,
+                            RemotePrefillReq,
+                            TokenizedEmbeddingReqInput,
+                        ),
                     )
                 ]
             else:

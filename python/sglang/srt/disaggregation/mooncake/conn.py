@@ -143,7 +143,9 @@ class MooncakeKVManager(BaseKVManager):
             ib_device=self.kv_args.ib_device,
         )
         self.is_mla_backend = is_mla_backend
-        self.is_remote_prefill = False # TODO: remote prefill doesn't support mooncake for now
+        self.is_remote_prefill = (
+            False  # TODO: remote prefill doesn't support mooncake for now
+        )
         self.disaggregation_mode = disaggregation_mode
         # for p/d multi node infer
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -1208,7 +1210,12 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
-    def init(self, req: Req, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+    def init(
+        self,
+        req: Req,
+        kv_indices: npt.NDArray[np.int64],
+        aux_index: Optional[int] = None,
+    ):
         for bootstrap_info in self.bootstrap_infos:
             self.prefill_server_url = (
                 f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"

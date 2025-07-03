@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 from sglang.srt.managers.schedule_batch import Req
 
+
 class KVArgs:
     engine_rank: int
     kv_data_ptrs: List[int]
@@ -106,7 +107,12 @@ class BaseKVReceiver(ABC):
     ): ...
 
     @abstractmethod
-    def init(self, req: Req, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None):
+    def init(
+        self,
+        req: Req,
+        kv_indices: npt.NDArray[np.int64],
+        aux_index: Optional[int] = None,
+    ):
         """
         Notify the prefill server about the kv indices and aux index
         """
