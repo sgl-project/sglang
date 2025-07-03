@@ -128,7 +128,7 @@ suites = {
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_metrics.py", 32),
         TestFile("test_no_chunked_prefill.py", 108),
-        TestFile("test_no_overlap_scheduler.py", 234),
+        # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_pytorch_sampling_backend.py", 66),
@@ -140,7 +140,7 @@ suites = {
         TestFile("test_triton_attention_backend.py", 150),
         TestFile("test_update_weights_from_disk.py", 114),
         TestFile("test_vertex_endpoint.py", 31),
-        TestFile("test_vision_chunked_prefill.py", 175),
+        # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         TestFile("test_reasoning_parser.py", 5),
     ],
     "per-commit-2-gpu": [

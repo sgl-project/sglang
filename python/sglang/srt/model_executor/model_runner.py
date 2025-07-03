@@ -225,6 +225,7 @@ class ModelRunner:
         self.support_pp = (
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
         )
+        self._model_update_group = {}
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -744,7 +745,7 @@ class ModelRunner:
         )
 
         try:
-            self._model_update_group = init_custom_process_group(
+            self._model_update_group[group_name] = init_custom_process_group(
                 backend=backend,
                 init_method=f"tcp://{master_address}:{master_port}",
                 world_size=world_size,
@@ -757,7 +758,7 @@ class ModelRunner:
             logger.error(message)
             return False, message
 
-    def update_weights_from_distributed(self, name, dtype, shape):
+    def update_weights_from_distributed(self, names, dtypes, shapes, group_name):
         """
         Update specific parameter in the model weights online
         through `_model_update_group` process group.
@@ -767,19 +768,34 @@ class ModelRunner:
             dtype: the data type of the parameter to be updated.
             shape: the shape of the parameter to be updated.
         """
-        target_dtype = (
-            dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
         )
 
-        assert (
-            self._model_update_group is not None
-        ), "model update group must be initialized"
-
         try:
-            weights = torch.empty(shape, dtype=target_dtype, device=self.device)
-            torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
-            self.model.load_weights([(name, weights)])
-            return True, f"Succeeded to update parameter {name} online."
+            weights = []
+            handles = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+                handles.append(
+                    torch.distributed.broadcast(
+                        weight,
+                        src=0,
+                        group=self._model_update_group[group_name],
+                        async_op=True,
+                    )
+                )
+                weights.append((name, weight))
+            for handle in handles:
+                handle.wait()
+
+            self.model.load_weights(weights)
+            return True, f"Succeeded to update parameter online."
 
         except Exception as e:
             error_msg = (
