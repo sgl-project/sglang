@@ -73,10 +73,37 @@ class Llama4ForConditionalGeneration(nn.Module):
         if not model_path:
             return False
 
-        index_file = os.path.join(model_path, "model.safetensors.index.json")
-        if not os.path.exists(index_file):
-            return False
+        # Check if this is a local path first
+        if os.path.isdir(model_path):
+            index_file = os.path.join(model_path, "model.safetensors.index.json")
+            if os.path.exists(index_file):
+                return self._check_vision_weights_in_index(index_file)
 
+        # For HuggingFace models, we need to check the actual checkpoint
+        # The config might say it's multimodal, but the checkpoint might be text-only
+        try:
+            # Try to access the HuggingFace cache directory
+            from huggingface_hub import try_to_load_from_cache
+
+            # Check if index file exists in cache
+            index_file_path = try_to_load_from_cache(
+                repo_id=model_path,
+                filename="model.safetensors.index.json",
+                cache_dir=None,
+            )
+
+            if index_file_path and os.path.exists(index_file_path):
+                return self._check_vision_weights_in_index(index_file_path)
+
+        except Exception:
+            # If we can't access the cache, fall back to config-based detection
+            pass
+
+        # Fallback， assume text-only
+        return False
+
+    def _check_vision_weights_in_index(self, index_file: str) -> bool:
+        """Check if the model.safetensors.index.json contains vision weights."""
         try:
             with open(index_file, "r") as f:
                 index_data = json_lib.load(f)
