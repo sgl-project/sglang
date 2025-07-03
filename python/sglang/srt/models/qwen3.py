@@ -225,7 +225,7 @@ class Qwen3Model(Qwen2Model):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> torch.Tensor:
+) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
