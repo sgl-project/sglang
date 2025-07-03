@@ -467,8 +467,9 @@ class EAGLEWorker(TpModelWorker):
         else:
             # When source_cache_loc is not needed, simply skip
             duplicate_cache_len = 0
-            source_cache_loc = torch.zeros(0, dtype=torch.int32, device=self.device)
-            target_cache_loc = torch.zeros(0, dtype=torch.int32, device=self.device)
+            last_page_lens_cumsum = torch.empty(0, dtype=torch.int32, device=self.device)
+            source_cache_loc = torch.empty(0, dtype=torch.int32, device=self.device)
+            target_cache_loc = torch.empty(0, dtype=torch.int32, device=self.device)
 
         assign_draft_cache_locs[(num_seqs,)](
             batch.req_pool_indices,
