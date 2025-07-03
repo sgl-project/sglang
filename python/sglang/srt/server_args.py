@@ -319,9 +319,12 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
+            # Lazy init to avoid circular import
+            from sglang.srt.configs.model_config import ModelConfig
+
+            # Multimodal models need more memory for the image processor
             model_config = ModelConfig.from_server_args(self)
             if model_config.is_multimodal:
-                # Multimodal models need more memory for the image processor
                 self.mem_fraction_static *= 0.90
 
         # Set chunked prefill size, which depends on the gpu memory capacity
