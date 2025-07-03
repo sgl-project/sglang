@@ -707,9 +707,6 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
-            # Metric for pre-allocation
-            self.num_tokens_pre_allocated = 0
-
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
@@ -1372,7 +1369,7 @@ class Scheduler(
             msg += f"accept len: {spec_accept_length:.2f}, "
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
-            msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
+            msg += f"pre-allocated usage: {self.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         msg += (
