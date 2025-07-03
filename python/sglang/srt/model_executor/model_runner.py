@@ -225,6 +225,7 @@ class ModelRunner:
         self.support_pp = (
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
         )
+        self._model_update_group = {}
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -306,7 +307,26 @@ class ModelRunner:
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
-            self.model.set_eagle3_layers_to_capture()
+            # load draft config
+            draft_model_config = ModelConfig.from_server_args(
+                server_args,
+                model_path=(server_args.speculative_draft_model_path),
+                is_draft_model=True,
+            )
+
+            try:
+                # get the aux layer from draft model config
+                eagle_config = getattr(
+                    draft_model_config.hf_config, "eagle_config", None
+                )
+                eagle_aux_hidden_state_layer_ids = eagle_config[
+                    "eagle_aux_hidden_state_layer_ids"
+                ]
+            except:
+                # if there is no aux layer, set to None
+                eagle_aux_hidden_state_layer_ids = None
+
+            self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -604,12 +624,13 @@ class ModelRunner:
         self.dtype = self.model_config.dtype
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
+        self.weight_load_mem_usage = before_avail_memory - after_avail_memory
         logger.info(
             f"Load weight end. "
             f"type={type(self.model).__name__}, "
             f"dtype={self.dtype}, "
             f"avail mem={after_avail_memory:.2f} GB, "
-            f"mem usage={(before_avail_memory - after_avail_memory):.2f} GB."
+            f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
 
         # Handle the case where some ranks do not finish loading.
@@ -724,7 +745,7 @@ class ModelRunner:
         )
 
         try:
-            self._model_update_group = init_custom_process_group(
+            self._model_update_group[group_name] = init_custom_process_group(
                 backend=backend,
                 init_method=f"tcp://{master_address}:{master_port}",
                 world_size=world_size,
@@ -737,7 +758,7 @@ class ModelRunner:
             logger.error(message)
             return False, message
 
-    def update_weights_from_distributed(self, name, dtype, shape):
+    def update_weights_from_distributed(self, names, dtypes, shapes, group_name):
         """
         Update specific parameter in the model weights online
         through `_model_update_group` process group.
@@ -747,19 +768,34 @@ class ModelRunner:
             dtype: the data type of the parameter to be updated.
             shape: the shape of the parameter to be updated.
         """
-        target_dtype = (
-            dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
         )
 
-        assert (
-            self._model_update_group is not None
-        ), "model update group must be initialized"
-
         try:
-            weights = torch.empty(shape, dtype=target_dtype, device=self.device)
-            torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
-            self.model.load_weights([(name, weights)])
-            return True, f"Succeeded to update parameter {name} online."
+            weights = []
+            handles = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+                handles.append(
+                    torch.distributed.broadcast(
+                        weight,
+                        src=0,
+                        group=self._model_update_group[group_name],
+                        async_op=True,
+                    )
+                )
+                weights.append((name, weight))
+            for handle in handles:
+                handle.wait()
+
+            self.model.load_weights(weights)
+            return True, f"Succeeded to update parameter online."
 
         except Exception as e:
             error_msg = (
@@ -1250,6 +1286,7 @@ class ModelRunner:
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
         self.cuda_graph_runner = None
+        self.cuda_graph_mem_usage = 0
 
         if not self.is_generation:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
@@ -1265,9 +1302,10 @@ class ModelRunner:
         )
         self.cuda_graph_runner = CudaGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        self.cuda_graph_mem_usage = before_mem - after_mem
         logger.info(
             f"Capture cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
-            f"mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            f"mem usage={self.cuda_graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
     def apply_torch_tp(self):
