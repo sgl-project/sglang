@@ -73,7 +73,6 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
  && rm -f /sgl-workspace/nvshmem_src_cuda12-all-all-3.3.9.tar.gz \
  && CUDA_ARCH=$([ "$BUILD_TYPE" = "blackwell" ] && echo 100 || echo 90) \
  && if [ "$BUILD_TYPE" = "blackwell" ]; then CUDA_ARCH=100; else CUDA_ARCH=90; fi \
- && echo "BUILD_TYPE: $BUILD_TYPE, CUDA_ARCH: $CUDA_ARCH" \
  && NVSHMEM_SHMEM_SUPPORT=0 \
     NVSHMEM_UCX_SUPPORT=0 \
     NVSHMEM_USE_NCCL=0 \
@@ -85,7 +84,7 @@ RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.3.9/sour
     cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
  && cmake --build build --target install -j${CMAKE_BUILD_PARALLEL_LEVEL} \
  && cd /sgl-workspace/DeepEP \
- && if [ "$BUILD_TYPE" = "blackwell" ]; then export TORCH_CUDA_ARCH_LIST="10.0"; echo "Setting TORCH_CUDA_ARCH_LIST=10.0 for Blackwell build"; fi \
+ && if [ "$BUILD_TYPE" = "blackwell" ]; then export TORCH_CUDA_ARCH_LIST="10.0"; fi \
  && NVSHMEM_DIR=${NVSHMEM_DIR} pip install .
 
 # Python tools
