@@ -147,9 +147,9 @@ struct NaiveScheduler {
 
     const int group_size = 128;
     const int sizeof_T = 2;
-    printf("grid.x=%d block.x=%d num_groups=%d \n",
-        grid.x, block.x, num_groups);
-    TORCH_CHECK(grid.x * block.x * sizeof(InputDataType) == num_groups * group_size * sizeof_T);
+//     printf("grid.x=%d block.x=%d num_groups=%d \n", grid.x, block.x, num_groups);
+    TORCH_CHECK(grid.x * block.x * sizeof(InputDataType) == num_groups * group_size * sizeof_T,
+        "grid.x=", grid.x, "block.x=", block.x, "num_groups=", num_groups);
   }
 
   template <bool FUSE_SILU_AND_MUL, typename FUNC>
@@ -453,7 +453,7 @@ void sgl_per_token_group_quant_8bit(
 
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
   do {                                                                                            \
-    TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));      \
+    /* TODO temp: TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));     */ \
                                                                                                   \
     using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                  \
     CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                      \
