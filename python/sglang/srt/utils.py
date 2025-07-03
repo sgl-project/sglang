@@ -1000,36 +1000,48 @@ def point_to_point_pyobj(
     src: int = 0,
     dst: int = 1,
 ):
-    """Send data from src to dst in group."""
+    """Send data from src to dst in group using DeviceToDevice communication."""
 
     if rank == src:
         if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long)
+            tensor_size = torch.tensor(
+                [0], dtype=torch.long, device=torch.cuda.current_device()
+            )
             dist.send(tensor_size, dst=dst, group=group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
+            ).cuda(
+                device=torch.cuda.current_device()
+            )  # Move to GPU
+            tensor_size = torch.tensor(
+                [size], dtype=torch.long, device=torch.cuda.current_device()
             )
-            tensor_size = torch.tensor([size], dtype=torch.long)
 
             dist.send(tensor_size, dst=dst, group=group)
             dist.send(tensor_data, dst=dst, group=group)
         return data
 
     elif rank == dst:
-        tensor_size = torch.tensor([0], dtype=torch.long)
+        tensor_size = torch.tensor(
+            [0], dtype=torch.long, device=torch.cuda.current_device()
+        )
         dist.recv(tensor_size, src=src, group=group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
-        tensor_data = torch.empty(size, dtype=torch.uint8)
+        tensor_data = torch.empty(
+            size, dtype=torch.uint8, device=torch.cuda.current_device()
+        )
         dist.recv(tensor_data, src=src, group=group)
 
-        serialized_data = bytes(tensor_data.cpu().numpy())
+        serialized_data = bytes(
+            tensor_data.cpu().numpy()
+        )  # Move back to host for deserialization
         data = pickle.loads(serialized_data)
         return data
 
@@ -1431,6 +1443,15 @@ def is_habana_available() -> bool:
 
 @lru_cache(maxsize=8)
 def get_device(device_id: Optional[int] = None) -> str:
+    if is_cpu():
+        if cpu_has_amx_support():
+            logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
+        else:
+            logger.warning(
+                "CPU device enabled, using torch native backend, low performance expected."
+            )
+        return "cpu"
+
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if device_id is None:
             return "cuda"
@@ -1458,15 +1479,6 @@ def get_device(device_id: Optional[int] = None) -> str:
             raise ImportError(
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
-
-    if is_cpu():
-        if cpu_has_amx_support():
-            logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
-        else:
-            logger.warning(
-                "CPU device enabled, using torch native backend, low performance expected."
-            )
-        return "cpu"
 
     raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
 
