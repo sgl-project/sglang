@@ -272,11 +272,15 @@ __global__ void per_token_group_quant_8bit_kernel(
   int output_data = 0;
 
 #pragma unroll
-  for (int access_idx = flat_thread_idx; access_idx < num_items_overall; access_idx += num_items_per_iteration * NUM_INPUT_DATA) {
-    InputDataType[NUM_INPUT_DATA] input_data;
+  for (int access_base_idx = flat_thread_idx; access_base_idx < num_items_overall; access_base_idx += num_items_per_iteration * NUM_INPUT_DATA) {
+    InputDataType input_data[NUM_INPUT_DATA] = {{0,0,0,0}, {0,0,0,0}};
+
 #pragma unroll
     for (int i = 0; i < NUM_INPUT_DATA; ++i) {
-        input_data[i] = ld_global_nc(reinterpret_cast<const int4*>(input) + access_idx + num_items_per_iteration * i);
+        const int access_idx = access_base_idx + num_items_per_iteration * i;
+        if (access_idx < num_items_overall) {
+          input_data[i] = ld_global_nc(reinterpret_cast<const int4*>(input) + access_idx);
+        }
     }
 
 #pragma unroll
