@@ -360,7 +360,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 //         }
 
         static_assert(INPUT_PRIMARY_INT4_SIZE == 2);
-        int4 output_buf = input_primary_vec[0] + input_primary_vec[1];
+        int4 output_buf = input_primary_int4[0] + input_primary_int4[1];
 
         st_global(
             reinterpret_cast<int4*>(output_q + offset_num_groups * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE),
