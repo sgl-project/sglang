@@ -2694,7 +2694,7 @@ def is_shm_available(dtype, world_size, local_size):
     )
 
 
-def lru_cache_str(maxsize=128):
+def lru_cache_frozenset(maxsize=128):
     def _to_hashable(o):
         try:
             hash(o)
