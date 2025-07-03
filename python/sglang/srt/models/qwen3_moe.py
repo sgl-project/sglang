@@ -18,7 +18,7 @@
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -28,54 +28,43 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     parallel_state,
-    split_tensor_along_last_dim,
-    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
-    attn_tp_all_gather,
-    attn_tp_reduce_scatter,
-    dp_gather_partial,
-    dp_scatter,
     get_attention_tp_rank,
     get_attention_tp_size,
     get_local_attention_dp_size,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.managers.expert_distribution import (
+    get_global_expert_distribution_recorder,
 )
+from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
+from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
-from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
+from sglang.srt.two_batch_overlap import (
+    MaybeTboDeepEPDispatcher,
+    ScatterMode,
+    model_forward_maybe_tbo,
+)
 from sglang.srt.utils import DeepEPMode, add_prefix, is_non_idle_and_non_empty
 
 Qwen3MoeConfig = None
@@ -664,6 +653,71 @@ class Qwen3MoeModel(Qwen2MoeModel):
             decoder_layer_type=Qwen3MoeDecoderLayer,
         )
 
+        # For EAGLE3 support
+        self.layers_to_capture = []
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
+
+        # For EAGLE3 support - collect auxiliary hidden states
+        aux_hidden_states = []
+
+        if forward_batch.can_run_tbo:
+            hidden_states, residual = model_forward_maybe_tbo(
+                layers=self.layers,
+                enable_tbo=True,
+                input_data_scatter_mode=ScatterMode.model_input_output(),
+                positions=positions,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        else:
+            for i in range(self.start_layer, self.end_layer):
+                # EAGLE3 support: capture hidden states from specified layers
+                if i in self.layers_to_capture:
+                    aux_hidden_states.append(hidden_states + residual)
+
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    layer = self.layers[i]
+                    hidden_states, residual = layer(
+                        positions, hidden_states, forward_batch, residual
+                    )
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
+        else:
+            if hidden_states.shape[0] != 0:
+                if residual is None:
+                    hidden_states = self.norm(hidden_states)
+                else:
+                    hidden_states, _ = self.norm(hidden_states, residual)
+
+        # Return aux_hidden_states if available for EAGLE3
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
+
 
 class Qwen3MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
@@ -690,6 +744,9 @@ class Qwen3MoeForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
 
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
+
     @torch.no_grad()
     def forward(
         self,
@@ -707,9 +764,13 @@ class Qwen3MoeForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         if self.pp_group.is_last_rank:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
         else:
             return hidden_states
@@ -721,6 +782,17 @@ class Qwen3MoeForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_eagle3_layers_to_capture(self):
+        if not self.pp_group.is_last_rank:
+            return
+
+        self.capture_aux_hidden_states = True
+        num_layers = self.config.num_hidden_layers
+        self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
