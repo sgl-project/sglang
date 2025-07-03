@@ -42,7 +42,7 @@ import threading
 import time
 import traceback
 import warnings
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from enum import Enum
 from functools import lru_cache
@@ -2692,3 +2692,48 @@ def is_shm_available(dtype, world_size, local_size):
         and world_size >= 1
         and world_size == local_size
     )
+
+
+def lru_cache_str(maxsize=128):
+    def _to_hashable(o):
+        try:
+            hash(o)
+            return o
+        except TypeError:
+            # Not hashable; convert based on type
+            if isinstance(o, (dict)):
+                return frozenset(
+                    (_to_hashable(k), _to_hashable(v)) for k, v in o.items()
+                )
+            elif isinstance(o, set):
+                return frozenset(_to_hashable(v) for v in o)
+            elif isinstance(o, (list, tuple)) or (
+                isinstance(o, Sequence) and not isinstance(o, (str, bytes))
+            ):
+                return tuple(_to_hashable(v) for v in o)
+            else:
+                raise TypeError(f"Cannot make hashable: {type(o)}")
+
+    def decorator(func):
+        cache = OrderedDict()
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            h_args = tuple(_to_hashable(a) for a in args)
+            h_kwargs = frozenset(
+                (_to_hashable(k), _to_hashable(v)) for k, v in kwargs.items()
+            )
+            key = (h_args, h_kwargs)
+            if key in cache:
+                cache.move_to_end(key)
+                return cache[key]
+            result = func(*args, **kwargs)
+            cache[key] = result
+            if maxsize is not None and len(cache) > maxsize:
+                cache.popitem(last=False)
+            return result
+
+        wrapper.cache_clear = cache.clear  # For manual cache clearing
+        return wrapper
+
+    return decorator

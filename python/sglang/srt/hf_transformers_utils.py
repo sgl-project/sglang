@@ -14,7 +14,6 @@
 """Utilities for Huggingface Transformers."""
 
 import contextlib
-import functools
 import os
 import warnings
 from pathlib import Path
@@ -43,7 +42,7 @@ from sglang.srt.configs import (
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
-from sglang.srt.utils import is_remote_url
+from sglang.srt.utils import is_remote_url, lru_cache_str
 
 _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ChatGLMConfig.model_type: ChatGLMConfig,
@@ -104,7 +103,7 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
-@functools.lru_cache(maxsize=100)
+@lru_cache_str(maxsize=32)
 def get_config(
     model: str,
     trust_remote_code: bool,
