@@ -238,6 +238,7 @@ async def get_server_info():
             "internal_states": all_internal_states,
             "prefill": prefill_infos,
             "decode": decode_infos,
+            "tokenizer_path": prefill_infos[0]["tokenizer_path"],
         }
     else:
         # Fallback with dummy data if no internal states found
@@ -250,6 +251,7 @@ async def get_server_info():
             ],
             "prefill": prefill_infos,
             "decode": decode_infos,
+            "tokenizer_path": prefill_infos[0]["tokenizer_path"],
         }
 
 
