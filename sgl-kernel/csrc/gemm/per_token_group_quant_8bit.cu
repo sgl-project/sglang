@@ -149,10 +149,13 @@ struct NaiveScheduler {
       }
       return 1;
     })();
-    const int block_dim = subwarps_per_block * THREADS_PER_SUBWARP;
-    constexpr int NUM_THREADS_PER_SM = 2048;
-    grid = dim3(NUM_SMS * (NUM_THREADS_PER_SM / block_dim));
-    block = dim3(block_dim);
+//     const int block_dim = subwarps_per_block * THREADS_PER_SUBWARP;
+//     constexpr int NUM_THREADS_PER_SM = 2048;
+//     grid = dim3(NUM_SMS * (NUM_THREADS_PER_SM / block_dim));
+//     block = dim3(block_dim);
+
+    grid = dim3(NUM_SMS);
+    block = dim3(1024);
 
 //     const int group_size = 128;
 //     const int sizeof_T = 2;
@@ -251,7 +254,7 @@ template <
     bool FUSE_SILU_AND_MUL = false,
     typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>>
 // NOTE HACK
-__maxnreg__(32)
+__maxnreg__(64)
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
     DST_DTYPE* __restrict__ output_q,
@@ -269,7 +272,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int num_items_per_iteration = gridDim.x * blockDim.x;
   const int num_items_overall = num_tokens_per_expert * hidden_dim_num_groups * group_size * sizeof(T) / sizeof(InputDataType);
 
-  constexpr int NUM_INPUT_DATA = 6;
+  constexpr int NUM_INPUT_DATA = 12;
 
   int output_data = 0;
 
