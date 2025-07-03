@@ -58,7 +58,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-REQ_KV_SENDR_MAP: Dict[str:BaseKVSender] = defaultdict()
+try:
+    import nats
+
+    IS_REMOTE_PREFILL_SUPPORT = True
+except ImportError:
+    logger.info("etcd3 or nats is not installed, remote prefill will not be available.")
+    IS_REMOTE_PREFILL_SUPPORT = False
+
+REQ_KV_SENDR_MAP: Dict[str, BaseKVSender] = defaultdict()
 
 
 class PrefillBootstrapQueue:
@@ -281,7 +289,11 @@ class SchedulerDisaggregationPrefillMixin:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
 
         # only start the queue thread on rank 0
-        if self.is_remote_prefill and self.attn_tp_rank == 0:
+        if (
+            self.is_remote_prefill
+            and IS_REMOTE_PREFILL_SUPPORT
+            and self.attn_tp_rank == 0
+        ):
             self._start_queue_thread()
 
         while True:
@@ -796,8 +808,6 @@ class SchedulerDisaggregationPrefillMixin:
         queue_name = f"{self.model_name_hash}"
 
         async def recv_from_nats():
-            import nats
-
             nats_client = await nats.connect(self.nats_endpoint)
             js = nats_client.jetstream()
 

@@ -110,7 +110,7 @@ class BaseKVReceiver(ABC):
     def init(
         self,
         req: Req,
-        kv_indices: npt.NDArray[np.int64],
+        kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
     ):
         """

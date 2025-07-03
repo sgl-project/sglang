@@ -76,7 +76,12 @@ class FakeKVReceiver(BaseKVReceiver):
             logger.debug("FakeKVReceiver poll success")
             return KVPoll.Success
 
-    def init(self, req: Req, kv_indices: list[int], aux_index: Optional[int] = None):
+    def init(
+        self,
+        req: Req,
+        kv_indices: npt.NDArray[np.int32],
+        aux_index: Optional[int] = None,
+    ):
         self.has_init = True
         logger.debug(
             f"FakeKVReceiver init with kv_indices: {kv_indices}, aux_index: {aux_index}"
