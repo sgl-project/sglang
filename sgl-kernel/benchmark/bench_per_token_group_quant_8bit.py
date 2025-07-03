@@ -24,38 +24,38 @@ fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 mode_concentrated = os.environ.get("SGLANG_BENCH_MODE", "") == "concentrated"
 
 if int(os.environ.get("SGLANG_NSYS_PROFILING", "0")):
-    # configs = [[
-    #     768,
-    #     16384,
-    #     128,
-    #     None,
-    #     fp8_type_,
-    #     dict(
-    #         column_major_scales=True,
-    #         scale_tma_aligned=True,
-    #         scale_ue8m0=True,
-    #         fuse_silu_and_mul=False,
-    #         masked_layout_mode=None,
-    #     ),
-    # ]]
-    configs = [
-        [
-            768 * 8,
-            2048,
-            128,
-            48,
-            fp8_type_,
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=True,
-                fuse_silu_and_mul=True,
-                # masked_layout_mode=None,
-                masked_layout_mode="balanced",
-                # masked_layout_mode="extreme",
-            ),
-        ]
-    ]
+    configs = [[
+        768,
+        16384,
+        128,
+        None,
+        fp8_type_,
+        dict(
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+            fuse_silu_and_mul=False,
+            masked_layout_mode=None,
+        ),
+    ]]
+    # configs = [
+    #     [
+    #         768 * 8,
+    #         2048,
+    #         128,
+    #         48,
+    #         fp8_type_,
+    #         dict(
+    #             column_major_scales=True,
+    #             scale_tma_aligned=True,
+    #             scale_ue8m0=True,
+    #             fuse_silu_and_mul=True,
+    #             # masked_layout_mode=None,
+    #             masked_layout_mode="balanced",
+    #             # masked_layout_mode="extreme",
+    #         ),
+    #     ]
+    # ]
 elif mode_concentrated:
     configs = list(
         itertools.product(
@@ -75,43 +75,43 @@ elif mode_concentrated:
             ],
         )
     ) + list(
-        itertools.product(
-            [768 * 8],
-            [2048],
-            [128],
-            [48],
-            [fp8_type_],
-            [
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                    fuse_silu_and_mul=True,
-                    masked_layout_mode=None,
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                    fuse_silu_and_mul=True,
-                    masked_layout_mode="balanced",
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                    fuse_silu_and_mul=True,
-                    masked_layout_mode="imbalanced",
-                ),
-                dict(
-                    column_major_scales=True,
-                    scale_tma_aligned=True,
-                    scale_ue8m0=True,
-                    fuse_silu_and_mul=True,
-                    masked_layout_mode="extreme",
-                ),
-            ],
-        )
+        # itertools.product(
+        #     [768 * 8],
+        #     [2048],
+        #     [128],
+        #     [48],
+        #     [fp8_type_],
+        #     [
+        #         dict(
+        #             column_major_scales=True,
+        #             scale_tma_aligned=True,
+        #             scale_ue8m0=True,
+        #             fuse_silu_and_mul=True,
+        #             masked_layout_mode=None,
+        #         ),
+        #         dict(
+        #             column_major_scales=True,
+        #             scale_tma_aligned=True,
+        #             scale_ue8m0=True,
+        #             fuse_silu_and_mul=True,
+        #             masked_layout_mode="balanced",
+        #         ),
+        #         dict(
+        #             column_major_scales=True,
+        #             scale_tma_aligned=True,
+        #             scale_ue8m0=True,
+        #             fuse_silu_and_mul=True,
+        #             masked_layout_mode="imbalanced",
+        #         ),
+        #         dict(
+        #             column_major_scales=True,
+        #             scale_tma_aligned=True,
+        #             scale_ue8m0=True,
+        #             fuse_silu_and_mul=True,
+        #             masked_layout_mode="extreme",
+        #         ),
+        #     ],
+        # )
     )
 else:
     configs = list(

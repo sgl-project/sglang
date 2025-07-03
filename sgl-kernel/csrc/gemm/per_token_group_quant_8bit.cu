@@ -147,7 +147,9 @@ struct NaiveScheduler {
 
     const int group_size = 128;
     const int sizeof_T = 2;
-    TORCH_CHECK(grid.x * block.x * 32 * sizeof(InputDataType) == num_groups * group_size * sizeof_T);
+    printf("grid.x=%d block.x=%d num_groups=%d \n",
+        grid.x, block.x, num_groups);
+    TORCH_CHECK(grid.x * block.x * sizeof(InputDataType) == num_groups * group_size * sizeof_T);
   }
 
   template <bool FUSE_SILU_AND_MUL, typename FUNC>
