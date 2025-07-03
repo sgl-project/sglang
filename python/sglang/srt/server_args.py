@@ -325,7 +325,7 @@ class ServerArgs:
             # Multimodal models need more memory for the image processor
             model_config = ModelConfig.from_server_args(self)
             if model_config.is_multimodal:
-                self.mem_fraction_static *= 0.90
+                self.mem_fraction_static *= 0.93
 
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
