@@ -272,7 +272,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int num_items_per_iteration = gridDim.x * blockDim.x;
   const int num_items_overall = num_tokens_per_expert * hidden_dim_num_groups * group_size * sizeof(T) / sizeof(InputDataType);
 
-  constexpr int NUM_INPUT_DATA = 12;
+  constexpr int NUM_INPUT_DATA = 11;
 
   int output_data = 0;
 
