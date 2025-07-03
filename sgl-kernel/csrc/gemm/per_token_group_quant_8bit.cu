@@ -267,12 +267,25 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int num_items_per_iteration = gridDim.x * blockDim.x;
   const int num_items_overall = num_tokens_per_expert * hidden_dim_num_groups * group_size * sizeof(T) / sizeof(InputDataType);
 
+  constexpr int NUM_INPUT_DATA = 2;
+
+  int output_data = 0;
+
 #pragma unroll
-  for (int access_idx = flat_thread_idx; access_idx < num_items_overall; access_idx += num_items_per_iteration) {
-    InputDataType input_data = ld_global_nc(reinterpret_cast<const int4*>(input) + access_idx);
-    int output_data = input_data.x + input_data.y + input_data.z + input_data.w;
-    *(reinterpret_cast<int*>(output_q) + access_idx) = output_data;
+  for (int access_idx = flat_thread_idx; access_idx < num_items_overall; access_idx += num_items_per_iteration * NUM_INPUT_DATA) {
+    InputDataType[NUM_INPUT_DATA] input_data;
+#pragma unroll
+    for (int i = 0; i < NUM_INPUT_DATA; ++i) {
+        input_data[i] = ld_global_nc(reinterpret_cast<const int4*>(input) + access_idx + num_items_per_iteration * i);
+    }
+
+#pragma unroll
+    for (int i = 0; i < NUM_INPUT_DATA; ++i) {
+      output_data ^= input_data[i].x ^ input_data[i].y ^ input_data[i].z ^ input_data[i].w;
+    }
   }
+
+  *(reinterpret_cast<int*>(output_q) + flat_thread_idx) = output_data;
 
 //   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
 //   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
