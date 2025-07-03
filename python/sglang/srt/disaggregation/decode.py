@@ -416,6 +416,12 @@ class DecodePreallocQueue:
 
         return preallocated_reqs
 
+    @property
+    def num_tokens_pre_allocated(self):
+        return sum(
+            len(decode_req.req.fill_ids) for decode_req in self.transfer_queue.queue
+        )
+
     def _allocatable_tokens(
         self, retractable_tokens: Optional[int] = None, count_retracted: bool = True
     ) -> int:

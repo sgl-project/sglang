@@ -35,6 +35,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_npu,
 )
 
 _is_cuda = is_cuda()
@@ -42,6 +43,7 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -159,6 +161,9 @@ def grouped_topk_gpu(
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     scores = torch.softmax(gating_output, dim=-1)
+    # NPU compiler limitation
+    if _is_npu and scores.dtype == torch.bfloat16:
+        scores = scores.to(torch.float16)
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
     group_scores = (
