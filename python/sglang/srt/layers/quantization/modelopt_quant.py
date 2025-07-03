@@ -779,7 +779,7 @@ class ModelOptNvFp4FusedMoEMethod:
         ep_size: Optional[int] = None,
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
-        dp_size: Optional[int] = None,
+        enable_flashinfer_fp4_allgather: Optional[bool] = None,
         global_num_tokens_cpu: Optional[List[int]] = None,
     ) -> torch.Tensor:
 
@@ -812,7 +812,7 @@ class ModelOptNvFp4FusedMoEMethod:
             # and fp4 quantized weights loaded from the checkpoint
             output_dtype = x.dtype
             x_sf = None
-            if dp_size > 1:
+            if enable_flashinfer_fp4_allgather:
                 # Quantize before comm, swizzle after.
                 x_col = x.shape[1]
                 if x.shape[0] > 0:
@@ -857,7 +857,7 @@ class ModelOptNvFp4FusedMoEMethod:
             )
             output = output[0]
 
-            if dp_size > 1:
+            if enable_flashinfer_fp4_allgather:
                 output = parallel_state.get_tp_group().reduce_scatterv(
                     output, sizes=global_num_tokens_cpu
                 )
