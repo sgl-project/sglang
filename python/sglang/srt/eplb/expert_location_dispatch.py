@@ -87,10 +87,8 @@ def topk_ids_logical_to_physical(
     if info.ep_dispatch_algorithm == "probability" and logical_expert_probabilities is not None:
         return _topk_ids_logical_to_physical_probability(topk_ids, info, logical_expert_probabilities)
     if info.ep_dispatch_algorithm == "test":
-        print("test ep dispatch algorithm probability")
         # Generate random probabilities with same shape as logical_to_all_physical_map
         logical_expert_probabilities = torch.rand_like(info.partial_logical_to_all_physical_map, dtype=torch.float32, device=topk_ids.device)
-        print("Generated random probabilities")
         # Set probability to 0 where physical expert ID is -1
         logical_expert_probabilities[info.partial_logical_to_all_physical_map == -1] = 0
         
@@ -115,7 +113,6 @@ def _topk_ids_logical_to_physical_dynamic(
         torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device)
         % info.partial_logical_to_all_physical_map_num_valid[topk_ids]
     )
-    print(f"Chosen dispatch index, topk_ids shape: {topk_ids.shape}, chosen_dispatch_index shape: {chosen_dispatch_index.shape}, partial_logical_to_all_physical_map shape: {info.partial_logical_to_all_physical_map.shape}")
     topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
@@ -141,7 +138,6 @@ def _topk_ids_logical_to_physical_probability(
     Returns:
         Physical expert IDs with same shape as topk_ids
     """
-    print("Starting _topk_ids_logical_to_physical_probability")
     topk_ids_original_shape = topk_ids.shape
     device = topk_ids.device
     topk_ids = topk_ids.flatten()
@@ -157,7 +153,6 @@ def _topk_ids_logical_to_physical_probability(
             f"Probability tensor shape {logical_expert_probabilities.shape} "
             f"does not match expected shape {expected_shape}"
         )
-    print("Start masking probabilities")
     # Create mask for valid physical experts (-1 indicates invalid)
     valid_mask = logical_to_all_physical_map != -1
     
@@ -165,52 +160,9 @@ def _topk_ids_logical_to_physical_probability(
     masked_probabilities = logical_expert_probabilities * valid_mask
 
     topk_probs = masked_probabilities[topk_ids]
-    print("Masked probabilities")
     chosen_dispatch_index = torch.multinomial(topk_probs, 1).flatten()
 
-    print(f"Chosen dispatch index, topk_ids shape: {topk_ids.shape}, chosen_dispatch_index shape: {chosen_dispatch_index.shape}, logical_to_all_physical_map shape: {logical_to_all_physical_map.shape}")
     topk_ids = logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
-    print("Converted to physical experts, topk_ids shape: ", topk_ids.shape)
     return topk_ids
-
-    # # Create new physical expert selection
-    # new_physical_ids = torch.zeros_like(topk_ids)
-    
-    # for i, logical_expert_id in enumerate(topk_ids):
-    #     if logical_expert_id == -1:
-    #         new_physical_ids[i] = -1
-    #         continue
-            
-    #     # Get available physical experts and their probabilities for this logical expert
-    #     available_physical = logical_to_all_physical_map[logical_expert_id]
-    #     available_probabilities = logical_expert_probabilities[logical_expert_id]
-    #     num_available = num_valid_physical[logical_expert_id]
-        
-    #     if num_available == 0:
-    #         new_physical_ids[i] = -1
-    #         continue
-        
-    #     # Filter valid physical experts and their probabilities
-    #     valid_mask = available_physical != -1
-    #     valid_physical = available_physical[valid_mask]
-    #     valid_probabilities = available_probabilities[valid_mask]
-        
-    #     if len(valid_physical) == 0:
-    #         new_physical_ids[i] = -1
-    #         continue
-        
-    #     # Select physical expert based on probability
-    #     if len(valid_physical) == 1:
-    #         # Only one physical expert available
-    #         selected_physical = valid_physical[0]
-    #     else:
-    #         # Multiple physical experts available - use weighted selection
-    #         # Sample from multinomial distribution
-    #         selected_idx = torch.multinomial(valid_probabilities, 1).item()
-    #         selected_physical = valid_physical[selected_idx]
-        
-    #     new_physical_ids[i] = selected_physical
-    
-    # return new_physical_ids.view(topk_ids_original_shape)
