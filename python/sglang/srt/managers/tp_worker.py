@@ -259,7 +259,7 @@ class TpModelWorker:
         self, recv_req: UpdateWeightsFromDistributedReqInput
     ):
         success, message = self.model_runner.update_weights_from_distributed(
-            recv_req.name, recv_req.dtype, recv_req.shape
+            recv_req.names, recv_req.dtypes, recv_req.shapes, recv_req.group_name
         )
         return success, message
 
