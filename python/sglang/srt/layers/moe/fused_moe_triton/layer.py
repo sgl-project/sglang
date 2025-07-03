@@ -12,6 +12,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
@@ -19,12 +20,12 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.utils import (
-    _process_weight_after_loading,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
     is_hip,
     set_weight_attrs,
+    use_intel_amx_backend,
 )
 
 if torch.cuda.is_available():
@@ -129,7 +130,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
-            _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 
         return
 
@@ -264,10 +265,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     ) -> torch.Tensor:
         assert activation == "silu", f"activation = {activation} is not supported."
 
-        if (
-            getattr(layer, "use_intel_amx_backend", False)
-            and not apply_router_weight_on_input
-        ):
+        if use_intel_amx_backend(layer) and not apply_router_weight_on_input:
             topk_weights, topk_ids = select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
