@@ -2,7 +2,7 @@
 
 import logging
 from functools import partial
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -260,62 +260,6 @@ class Qwen3Model(Qwen2Model):
             alt_stream=alt_stream,
         )
 
-        # For EAGLE3 support
-        self.layers_to_capture = []
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
-        if self.pp_group.is_first_rank:
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = input_embeds
-            residual = None
-        else:
-            assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
-
-        # For EAGLE3 support - collect auxiliary hidden states
-        aux_hidden_states = []
-
-        for i in range(self.start_layer, self.end_layer):
-            # EAGLE3 support: capture hidden states from specified layers
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
-
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
-            )
-
-        if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-        else:
-            if hidden_states.shape[0] != 0:
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
-
-        # Return aux_hidden_states if available for EAGLE3
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-        return hidden_states, aux_hidden_states
-
 
 class Qwen3ForCausalLM(nn.Module):
     # BitandBytes specific attributes
@@ -516,13 +460,20 @@ class Qwen3ForCausalLM(nn.Module):
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)
 
-    def set_eagle3_layers_to_capture(self):
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if not self.pp_group.is_last_rank:
             return
 
         self.capture_aux_hidden_states = True
-        num_layers = self.config.num_hidden_layers
-        self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]  # Specific layers for EAGLE3 support
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]  # Specific layers for EAGLE3 support
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = Qwen3ForCausalLM
