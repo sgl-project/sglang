@@ -157,6 +157,7 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     enable_flashinfer_moe: bool = False
+    enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -1205,6 +1206,11 @@ class ServerArgs:
             "--enable-flashinfer-moe",
             action="store_true",
             help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP with --enable-ep-moe",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-allreduce-fusion",
+            action="store_true",
+            help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
         )
         parser.add_argument(
             "--enable-deepep-moe",
