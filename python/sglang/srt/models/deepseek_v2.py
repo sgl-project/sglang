@@ -32,6 +32,9 @@ from sglang.srt.distributed import (
     parallel_state,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -77,11 +80,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.expert_distribution import (
-    get_global_expert_distribution_recorder,
-)
-from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
-from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -93,10 +91,12 @@ from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
     LazyValue,
+    PackWeightMethod,
     add_prefix,
     bind_or_assign,
     cpu_has_amx_support,
     get_bool_env_var,
+    get_device_sm,
     get_int_env_var,
     is_cpu,
     is_cuda,
@@ -111,9 +111,16 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_device_sm = get_device_sm()
 
 if _is_cuda:
-    from sgl_kernel import awq_dequantize, bmm_fp8, merge_state_v2
+    from sgl_kernel import (
+        awq_dequantize,
+        bmm_fp8,
+        dsv3_fused_a_gemm,
+        dsv3_router_gemm,
+        merge_state_v2,
+    )
 elif _is_cpu and _is_cpu_amx_available:
     pass
 else:
@@ -124,8 +131,6 @@ if _is_hip:
         decode_attention_fwd_grouped_rope,
     )
 
-if _use_aiter:
-    from aiter.rotary_embedding import get_rope
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +148,9 @@ class AttnForwardMethod(IntEnum):
 
     # Use MLA but with fused RoPE
     MLA_FUSED_ROPE = auto()
+
+    # Use MLA with fused RoPE kernel for CPU
+    MLA_FUSED_ROPE_CPU = auto()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -212,9 +220,30 @@ class MoEGate(nn.Module):
             )
         else:
             self.e_score_correction_bias = None
+        if _is_cpu and _is_cpu_amx_available:
+            self.quant_method = PackWeightMethod(weight_names=["weight"])
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states, self.weight, None)
+        if getattr(self, "use_intel_amx_backend", False):
+            return torch.ops.sgl_kernel.weight_packed_linear(
+                hidden_states,
+                self.weight,
+                None,  # bias
+                True,  # is_vnni
+            )
+
+        if (
+            hidden_states.shape[0] < 4
+            and hidden_states.shape[1] == 7168
+            and self.weight.shape[0] == 256
+            and _device_sm >= 90
+        ):
+            logits = dsv3_router_gemm(hidden_states, self.weight).to(
+                hidden_states.dtype
+            )
+        else:
+            logits = F.linear(hidden_states, self.weight, None)
+
         return logits
 
 
@@ -288,6 +317,9 @@ class DeepseekV2MoE(nn.Module):
             ),
         )
 
+        self.shared_experts_is_int8 = False
+        self.shared_experts_is_fp8 = False
+        self.shared_experts_weight_block_size = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
@@ -304,6 +336,20 @@ class DeepseekV2MoE(nn.Module):
                     else {}
                 ),
             )
+            self.shared_experts_is_int8 = (
+                self.shared_experts.gate_up_proj.weight.dtype == torch.int8
+            )
+            self.shared_experts_is_fp8 = (
+                self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+            )
+            if self.shared_experts_is_fp8:
+                assert (
+                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                    == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
+                )
+                self.shared_experts_weight_block_size = (
+                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                )
 
         self.top_k = config.num_experts_per_tok
 
@@ -382,16 +428,75 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hasattr(self, "shared_experts") and getattr(
+            self.shared_experts.gate_up_proj, "use_intel_amx_backend", False
+        ):
+            return self.forward_cpu(hidden_states)
+
         shared_output = self._forward_shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
-        if not _is_cuda:
+        if not _is_cuda and not _use_aiter:
+            # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
+        if self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        return final_hidden_states
+
+    def forward_cpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # router_logits: (num_tokens, n_experts)
+        router_logits = self.gate(hidden_states)
+        fused_experts_out = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits
+        )
+
+        assert getattr(
+            self.shared_experts.gate_up_proj, "use_intel_amx_backend", False
+        ) == getattr(self.shared_experts.down_proj, "use_intel_amx_backend", False)
+        # [Note] inplace should be False in fused_experts.
+        # If inplace is True in fused_experts (self.experts), hidden_states will be changed after fused_experts
+        # While hidden_states is still needed in shared_expert.
+        final_hidden_states = torch.ops.sgl_kernel.shared_expert_cpu(
+            hidden_states,
+            self.shared_experts.gate_up_proj.weight,
+            self.shared_experts.down_proj.weight,
+            fused_experts_out,
+            self.routed_scaling_factor,
+            True,  # inplace
+            self.shared_experts_is_int8,  # use_int8_w8a8
+            self.shared_experts_is_fp8,  # use_fp8_w8a16
+            (
+                self.shared_experts.gate_up_proj.weight_scale
+                if self.shared_experts_is_int8
+                else (
+                    self.shared_experts.gate_up_proj.weight_scale_inv
+                    if self.shared_experts_is_fp8
+                    else None
+                )
+            ),  # w1_scale
+            (
+                self.shared_experts.down_proj.weight_scale
+                if self.shared_experts_is_int8
+                else (
+                    self.shared_experts.down_proj.weight_scale_inv
+                    if self.shared_experts_is_fp8
+                    else None
+                )
+            ),  # w2_scale
+            (
+                self.shared_experts_weight_block_size
+                if self.shared_experts_is_fp8
+                else None
+            ),  # block_size
+            None,  # a1_scale
+            None,  # a2_scale
+            True,  # is_vnni
+        )
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -777,6 +882,46 @@ class DeepseekV2AttentionMLA(nn.Module):
             "SGL_CHUNKED_PREFIX_CACHE_THRESHOLD", 8192
         )
 
+        # If we have self.fused_qkv_a_proj_with_mqa and we're running on CPU, we will choose the torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight kernel
+        # which requires self.w_kc and self.w_vc to be packed.
+        # If not, we will use torch.bmm and weight shouldn't be packed in this case
+        if (
+            hasattr(self, "fused_qkv_a_proj_with_mqa")
+            and _is_cpu
+            and _is_cpu_amx_available
+        ):
+            self.quant_method = PackWeightMethod(
+                weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
+            )
+
+        self.use_min_latency_fused_a_gemm = (
+            hasattr(self, "fused_qkv_a_proj_with_mqa")
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
+            and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
+            and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
+            and is_cuda
+            and _device_sm >= 90
+        )
+
+        self.qkv_proj_with_rope_is_int8 = (
+            hasattr(self, "fused_qkv_a_proj_with_mqa")
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.int8
+        )
+        self.qkv_proj_with_rope_is_fp8 = (
+            hasattr(self, "fused_qkv_a_proj_with_mqa")
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.float8_e4m3fn
+        )
+
+        self.weight_block_size = None
+        if self.qkv_proj_with_rope_is_fp8:
+            assert (
+                self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
+                == self.q_b_proj.quant_method.quant_config.weight_block_size
+            )
+            self.weight_block_size = (
+                self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
+            )
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
@@ -790,7 +935,12 @@ class DeepseekV2AttentionMLA(nn.Module):
                 else:
                     return AttnForwardMethod.MLA
             else:
-                return AttnForwardMethod.MLA
+                if hasattr(self, "fused_qkv_a_proj_with_mqa") and getattr(
+                    self, "use_intel_amx_backend", False
+                ):
+                    return AttnForwardMethod.MLA_FUSED_ROPE_CPU
+                else:
+                    return AttnForwardMethod.MLA
 
         if self.attention_backend == "flashinfer":
             # Flashinfer MLA: Do not absorb when enabling ragged prefill
@@ -904,6 +1054,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             inner_state = self.forward_absorb_fused_mla_rope_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
             )
+        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_CPU:
+            inner_state = self.forward_absorb_fused_mla_rope_cpu_prepare(
+                positions, hidden_states, forward_batch, zero_allocator
+            )
         else:
             raise NotImplementedError
         return None, attn_forward_method, forward_batch, inner_state
@@ -923,6 +1077,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             return self.forward_absorb_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
             return self.forward_absorb_fused_mla_rope_core(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_CPU:
+            return self.forward_absorb_fused_mla_rope_cpu_core(*inner_state)
         else:
             raise NotImplementedError
 
@@ -986,7 +1142,13 @@ class DeepseekV2AttentionMLA(nn.Module):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         if self.q_lora_rank is not None:
-            q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
+            if hidden_states.shape[0] <= 16 and self.use_min_latency_fused_a_gemm:
+                fused_qkv_a_proj_out = dsv3_fused_a_gemm(
+                    hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
+                )
+            else:
+                fused_qkv_a_proj_out = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+            q, latent_cache = fused_qkv_a_proj_out.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
@@ -1240,6 +1402,57 @@ class DeepseekV2AttentionMLA(nn.Module):
             zero_allocator,
         )
 
+    def forward_absorb_fused_mla_rope_cpu_prepare(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ):
+        assert self.q_lora_rank is not None and getattr(
+            self, "use_intel_amx_backend", False
+        ), "forward_absorb_fused_mla_rope_cpu_prepare requires q_lora_rank is not None and use_intel_amx_backend"
+
+        q_input, k_input, v_input = (
+            torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight(
+                hidden_states,
+                self.fused_qkv_a_proj_with_mqa.weight,
+                self.q_b_proj.weight,
+                self.w_kc,
+                self.q_a_layernorm.weight,
+                self.kv_a_layernorm.weight,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.kv_a_layernorm.variance_epsilon,
+                self.qkv_proj_with_rope_is_int8,
+                self.qkv_proj_with_rope_is_fp8,
+                (
+                    self.fused_qkv_a_proj_with_mqa.weight_scale
+                    if self.qkv_proj_with_rope_is_int8
+                    else (
+                        self.fused_qkv_a_proj_with_mqa.weight_scale_inv
+                        if self.qkv_proj_with_rope_is_fp8
+                        else None
+                    )
+                ),
+                (
+                    self.q_b_proj.weight_scale
+                    if self.qkv_proj_with_rope_is_int8
+                    else (
+                        self.q_b_proj.weight_scale_inv
+                        if self.qkv_proj_with_rope_is_fp8
+                        else None
+                    )
+                ),
+                True,  # is_vnni
+                self.weight_block_size,
+                self.q_lora_rank,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+            )
+        )
+        return (q_input, k_input, v_input, forward_batch, zero_allocator)
+
     def forward_absorb_fused_mla_rope_core(
         self,
         q_input,
@@ -1309,6 +1522,43 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        output, _ = self.o_proj(attn_output)
+
+        return output
+
+    def forward_absorb_fused_mla_rope_cpu_core(
+        self, q_input, k_input, v_input, forward_batch, zero_allocator
+    ):
+        assert self.q_lora_rank is not None and getattr(
+            self, "use_intel_amx_backend", False
+        ), "forward_absorb_fused_mla_rope_cpu_core requires q_lora_rank is not None and use_intel_amx_backend"
+
+        attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
+        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+
+        # [Note] Align shapes of bmm inputs.
+        # Shapes of inputs:
+        #   q_nope: [M, B, K]
+        #   original self.w_kc: [B, K, N]
+        #   current self.w_kc (which has been converted in PackWeightMethod): [B, N, K]
+
+        # Shapes of inputs to sgl_kernel.cpu.bmm:
+        #   out: [B, M, N]
+        #   mat1: [B, M, K]
+        #   mat2: [B, N, K]
+        B = self.w_vc.size(0)
+        N = self.w_vc.size(1)
+        M = attn_output.size(0)
+        output = torch.empty([M, int(B * N)], dtype=attn_output.dtype)
+        attn_bmm_output = output.view([M, B, N]).transpose_(0, 1)
+        torch.ops.sgl_kernel.bmm_cpu(
+            attn_bmm_output,
+            attn_output.transpose(0, 1),
+            self.w_vc,
+            True,  # is_vnni
+            None,  # scale
+        )
+        attn_output = output
         output, _ = self.o_proj(attn_output)
 
         return output
@@ -1964,6 +2214,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                     )
                     if _is_hip:
                         self_attn.w_scale *= 2.0
+                # TODO: remove this after adding FP8 support in bmm cpu kernel
+                if _is_cpu and _is_cpu_amx_available and w.dtype == torch.float8_e4m3fn:
+                    self_attn.w_kc = (
+                        self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
+                    )
+                    self_attn.w_vc = (
+                        self_attn.w_vc.to(torch.bfloat16) * self_attn.w_scale
+                    )
             else:
                 num_tiles_k = self_attn.qk_nope_head_dim // weight_block_size[1]
                 num_tiles_n = self_attn.v_head_dim // weight_block_size[0]
@@ -2201,7 +2459,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                             q_a_proj_weight = cached_a_proj[q_a_proj_name]
                             kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
                             cat_dim = 0
-                            if (
+                            if self.quant_config is not None and (
                                 self.quant_config.get_name() == "awq"
                                 or self.quant_config.get_name() == "moe_wna16"
                             ):
@@ -2232,6 +2490,13 @@ class DeepseekV2ForCausalLM(nn.Module):
                             for scale in ["k_scale", "v_scale"]:
                                 if scale in name:
                                     name = name.replace(f"{scale[0]}_proj", "attn_mqa")
+                                    break
+                        if name not in params_dict:
+                            # modelopt ckpt contains not needed weights for MTP module:
+                            # model.decoder.self_attn.attn_mqa.v_scale and
+                            # model.decoder.self_attn.attn_mqa.k_scale
+                            logger.warning(f"{name} not found in params_dict.")
+                            continue
                         param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader

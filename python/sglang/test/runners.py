@@ -503,6 +503,8 @@ class SRTRunner:
         disable_overlap_schedule: bool = False,
         disable_custom_all_reduce: bool = False,
         torchao_config: Optional[str] = None,
+        cuda_graph_max_bs: int = 4,
+        sleep_on_idle=False,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -538,8 +540,9 @@ class SRTRunner:
             tokenizer_path=tokenizer_path,
             enable_ep_moe=enable_ep_moe,
             disable_overlap_schedule=disable_overlap_schedule,
-            cuda_graph_max_bs=4,
+            cuda_graph_max_bs=cuda_graph_max_bs,
             disable_custom_all_reduce=disable_custom_all_reduce,
+            sleep_on_idle=sleep_on_idle,
             **spec_kwargs,
         )
 
@@ -549,6 +552,12 @@ class SRTRunner:
             )
         else:
             self.tokenizer = None
+
+    def load_lora_adapter(self, lora_name: str, lora_path: str):
+        return self.engine.load_lora_adapter(lora_name, lora_path)
+
+    def unload_lora_adapter(self, lora_name: str):
+        return self.engine.unload_lora_adapter(lora_name)
 
     def forward(
         self,
