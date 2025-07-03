@@ -649,6 +649,27 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.tensor,
         tp_rank: int,
     ):
+        """Load w2 weights for down projection.
+
+        Args:
+            expert_data: The expert data tensor to load into
+            shard_dim: The dimension to shard along
+            shard_id: The shard ID (must be "w2")
+            loaded_weight: The weight tensor to load from
+            tp_rank: The tensor parallel rank
+        """
+        if not isinstance(expert_data, torch.Tensor) or not isinstance(
+            loaded_weight, torch.Tensor
+        ):
+            raise ValueError("expert_data and loaded_weight must be torch.Tensor")
+
+        if expert_data.dim() != 2 or loaded_weight.dim() != 2:
+            raise ValueError(
+                f"Expected 2D tensors, got expert_data shape {expert_data.shape} and loaded_weight shape {loaded_weight.shape}"
+            )
+
+        if shard_id != "w2":
+            raise ValueError(f"shard_id must be 'w2', got {shard_id}")
 
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
@@ -664,6 +685,14 @@ class FusedMoE(torch.nn.Module):
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
+            )
+        if not self.use_presharded_weights:
+            if shard_size * tp_rank + shard_size > loaded_weight.shape[shard_dim]:
+                raise ValueError(
+                    f"Shard size {shard_size} at rank {tp_rank} exceeds loaded_weight dimension {loaded_weight.shape[shard_dim]}"
+                )
+            loaded_weight = loaded_weight.narrow(
+                shard_dim, shard_size * tp_rank, shard_size
             )
         else:
             if not self.use_presharded_weights:

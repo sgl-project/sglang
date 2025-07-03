@@ -303,6 +303,35 @@ class Llama4ForConditionalGeneration(nn.Module):
                 return True
         return False
 
+    def _transform_expert_name(
+        self, name: str, is_weight: bool = False
+    ) -> Tuple[str, str, List[str]]:
+        """Transform expert parameter name and get shard information.
+
+        Args:
+            name: The original parameter name
+            is_weight: Whether this is a weight parameter (adds _weight suffix)
+
+        Returns:
+            Tuple of (transformed_name, shard_id, shard_id_list)
+        """
+        suffix = "_weight" if is_weight else ""
+
+        if ".gate_up_proj" in name:
+            transformed_name = name.replace(
+                ".experts.gate_up_proj", f".experts.w13{suffix}"
+            )
+            shard_id = "w13"
+            shard_id_list = ["w1", "w3"]
+        else:  # down_proj
+            transformed_name = name.replace(
+                ".experts.down_proj", f".experts.w2{suffix}"
+            )
+            shard_id = "w2"
+            shard_id_list = ["w2"]
+
+        return transformed_name, shard_id, shard_id_list
+
     def _handle_expert_scale_params(
         self,
         name: str,
@@ -311,20 +340,38 @@ class Llama4ForConditionalGeneration(nn.Module):
         num_experts: int,
     ) -> bool:
         """Handle expert scale parameters."""
-        # Transform name based on projection type
-        if ".gate_up_proj" in name:
-            transformed_name = name.replace(".experts.gate_up_proj", ".experts.w13")
-        else:  # down_proj
-            transformed_name = name.replace(".experts.down_proj", ".experts.w2")
+        import re
+
+        # Check if this matches the expert parameter pattern: experts.{expert_id}.{param_name}
+        expert_match = re.search(r"experts\.(\d+)\.", name)
+
+        # Transform name
+        transformed_name, _, _ = self._transform_expert_name(name)
 
         if transformed_name not in params_dict:
-            return True  # Skip if parameter not found
+            return True
 
         param = params_dict[transformed_name]
         weight_loader = param.weight_loader
 
-        # Load scale for all experts
-        for expert_id in range(num_experts):
+        # For scale parameters, we need to handle them differently
+        if "scale" in name:
+            if expert_match:
+                # If we have a specific expert ID, only load for that expert
+                expert_id = int(expert_match.group(1))
+                # For scale parameters, we can directly set the value
+                param.data[expert_id] = loaded_weight
+            else:
+                # No expert ID found - this is a single scale for all experts
+                # Load the same scale for all experts
+                for expert_id in range(num_experts):
+                    param.data[expert_id] = loaded_weight
+            return True
+
+        # For non-scale parameters, use the weight loader
+        if expert_match:
+            # If we have a specific expert ID, only load for that expert
+            expert_id = int(expert_match.group(1))
             if ".gate_up_proj" in name:
                 # Load for both w1 and w3 shards
                 weight_loader(param, loaded_weight, transformed_name, "w1", expert_id)
@@ -332,6 +379,23 @@ class Llama4ForConditionalGeneration(nn.Module):
             else:
                 # Load for w2 shard
                 weight_loader(param, loaded_weight, transformed_name, "w2", expert_id)
+        else:
+            # No expert ID found - this is a single scale for all experts
+            # Load the same scale for all experts
+            for expert_id in range(num_experts):
+                if ".gate_up_proj" in name:
+                    # Load for both w1 and w3 shards
+                    weight_loader(
+                        param, loaded_weight, transformed_name, "w1", expert_id
+                    )
+                    weight_loader(
+                        param, loaded_weight, transformed_name, "w3", expert_id
+                    )
+                else:
+                    # Load for w2 shard
+                    weight_loader(
+                        param, loaded_weight, transformed_name, "w2", expert_id
+                    )
 
         return True
 
@@ -343,30 +407,46 @@ class Llama4ForConditionalGeneration(nn.Module):
         num_experts: int,
     ) -> bool:
         """Handle expert weight parameters."""
+        # Transform name and get shard info
+        transformed_name, _, shard_id_list = self._transform_expert_name(
+            name, is_weight=True
+        )
+
         if ".gate_up_proj" in name:
-            name_list = [
-                name.replace(".experts.gate_up_proj", ".experts.w13_weight")
-            ] * 2
             loaded_weight_list = loaded_weight.chunk(2, dim=-1)
-            shard_id_list = ["w1", "w3"]
-        else:
-            name_list = [name.replace(".experts.down_proj", ".experts.w2_weight")]
-            shard_id_list = ["w2"]
+        else:  # down_proj
             loaded_weight_list = [loaded_weight]
 
         for param_name, weight_chunk, shard_id in zip(
-            name_list, loaded_weight_list, shard_id_list
+            [transformed_name] * len(shard_id_list), loaded_weight_list, shard_id_list
         ):
+            if param_name not in params_dict:
+                continue
+
             param = params_dict[param_name]
             weight_loader = param.weight_loader
-            for expert_id in range(num_experts):
-                weight_loader(
-                    param,
-                    weight_chunk[expert_id].T,
-                    param_name,
-                    shard_id=shard_id,
-                    expert_id=expert_id,
-                )
+
+            # Handle the case where loaded_weight might be a single tensor for all experts
+            if weight_chunk.dim() == 2:
+                # Single tensor case - load for all experts
+                for expert_id in range(num_experts):
+                    weight_loader(
+                        param,
+                        weight_chunk.T,
+                        param_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+            else:
+                # Multiple experts case - load each expert's weights
+                for expert_id in range(num_experts):
+                    weight_loader(
+                        param,
+                        weight_chunk[expert_id].T,
+                        param_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
 
         return True
 
