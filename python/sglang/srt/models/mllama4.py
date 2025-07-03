@@ -16,7 +16,9 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_cpu
+
+_is_cpu = is_cpu()
 
 
 class Llama4ForConditionalGeneration(nn.Module):
@@ -107,13 +109,17 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         # rotary embeds should be sliced
         if ("wk" in modules or "k_proj" in modules) and modules[-1] == "weight":
-            loaded_weight = permute(
-                loaded_weight, self.language_model.config.num_key_value_heads
-            )
+            if _is_cpu:
+                dim = self.language_model.config.original_total_num_kv_heads
+            else:
+                dim = self.language_model.config.num_key_value_heads
+            loaded_weight = permute(loaded_weight, dim)
         elif ("wq" in modules or "q_proj" in modules) and modules[-1] == "weight":
-            loaded_weight = permute(
-                loaded_weight, self.language_model.config.num_attention_heads
-            )
+            if _is_cpu:
+                dim = self.language_model.config.original_num_attention_heads
+            else:
+                dim = self.language_model.config.num_attention_heads
+            loaded_weight = permute(loaded_weight, dim)
 
         return name, loaded_weight
 
