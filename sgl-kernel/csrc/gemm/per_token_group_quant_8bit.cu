@@ -137,19 +137,18 @@ struct NaiveScheduler {
       int& subwarps_per_block,
       dim3& grid,
       dim3& block) {
-//     subwarps_per_block = ([=]() -> int {
-//       if (num_groups % 16 == 0) {
-//         return 16;
-//       } else if (num_groups % 8 == 0) {
-//         return 8;
-//       } else if (num_groups % 4 == 0) {
-//         return 4;
-//       } else if (num_groups % 2 == 0) {
-//         return 2;
-//       }
-//       return 1;
-//     })();
-    subwarps_per_block = 32;
+    subwarps_per_block = ([=]() -> int {
+      if (num_groups % 16 == 0) {
+        return 16;
+      } else if (num_groups % 8 == 0) {
+        return 8;
+      } else if (num_groups % 4 == 0) {
+        return 4;
+      } else if (num_groups % 2 == 0) {
+        return 2;
+      }
+      return 1;
+    })();
     const int block_dim = subwarps_per_block * THREADS_PER_SUBWARP;
     constexpr int NUM_THREADS_PER_SM = 2048;
     grid = dim3(NUM_SMS * (NUM_THREADS_PER_SM / block_dim));
