@@ -14,7 +14,6 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.dp_attention import get_local_attention_dp_size
 from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
@@ -446,6 +445,7 @@ class FusedMoE(torch.nn.Module):
         routed_scaling_factor: Optional[float] = None,
         enable_flashinfer_moe: Optional[bool] = False,
         enable_ep_moe: Optional[bool] = False,
+        enable_flashinfer_fp4_allgather: Optional[bool] = False,
     ):
         super().__init__()
 
@@ -456,7 +456,6 @@ class FusedMoE(torch.nn.Module):
         self.tp_size = (
             tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
         )
-        self.local_dp_size = get_local_attention_dp_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.num_experts = num_experts
         self.expert_map = None
@@ -465,8 +464,10 @@ class FusedMoE(torch.nn.Module):
             logger.warning("Disable flashinfer MoE when quantization config is None.")
             enable_flashinfer_moe = False
             enable_ep_moe = False
+            enable_flashinfer_fp4_allgather = False
 
         self.enable_flashinfer_moe = enable_flashinfer_moe
+        self.enable_flashinfer_fp4_allgather = enable_flashinfer_fp4_allgather
         if enable_ep_moe:
             assert (
                 self.enable_flashinfer_moe
@@ -913,7 +914,7 @@ class FusedMoE(torch.nn.Module):
                     tp_size=self.tp_size,
                     ep_rank=self.ep_rank,
                     ep_size=self.ep_size,
-                    dp_size=self.local_dp_size,
+                    enable_flashinfer_fp4_allgather=self.enable_flashinfer_fp4_allgather,
                     global_num_tokens_cpu=forward_batch.global_num_tokens_cpu,
                 )
                 if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod"

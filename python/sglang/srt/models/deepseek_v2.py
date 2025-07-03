@@ -266,12 +266,6 @@ class DeepseekV2MoE(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.local_dp_size = get_local_attention_dp_size()
-        self.using_flashinfer_ep_moe_comm = (
-            self.local_dp_size > 1
-            and global_server_args_dict["enable_flashinfer_moe"]
-            and global_server_args_dict["enable_ep_moe"]
-        )
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
@@ -326,6 +320,7 @@ class DeepseekV2MoE(nn.Module):
                 dict(
                     enable_flashinfer_moe=True,
                     enable_ep_moe=global_server_args_dict["enable_ep_moe"],
+                    enable_flashinfer_fp4_allgather=global_server_args_dict["enable_flashinfer_fp4_allgather"],
                 )
                 if global_server_args_dict["enable_flashinfer_moe"]
                 else {}
@@ -337,7 +332,7 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_weight_block_size = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            # disable tp for shared experts when enable deepep moe, or with DP + flashinfer MoE
+            # disable tp for shared experts when enable deepep moe, or with fp4 allgather
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -348,7 +343,7 @@ class DeepseekV2MoE(nn.Module):
                 **(
                     dict(tp_rank=0, tp_size=1)
                     if global_server_args_dict["enable_deepep_moe"]
-                    or self.using_flashinfer_ep_moe_comm
+                    or global_server_args_dict["enable_flashinfer_fp4_allgather"]
                     else {}
                 ),
             )
@@ -452,7 +447,7 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1 and not self.using_flashinfer_ep_moe_comm:
+        if self.tp_size > 1 and not global_server_args_dict["enable_flashinfer_fp4_allgather"]:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
@@ -480,7 +475,7 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1 and not self.using_flashinfer_ep_moe_comm:
+        if self.tp_size > 1 and not global_server_args_dict["enable_flashinfer_fp4_allgather"]:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 

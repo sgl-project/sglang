@@ -159,6 +159,7 @@ class ServerArgs:
     enable_deepep_moe: bool = False
     enable_flashinfer_moe: bool = False
     enable_flashinfer_allreduce_fusion: bool = False
+    enable_flashinfer_fp4_allgather: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -263,6 +264,12 @@ class ServerArgs:
             logger.warning(
                 f"Flashinfer MoE is enabled. Shared expert fusion is disabled."
             )
+        if self.enable_flashinfer_fp4_allgather:
+            assert (
+                self.enable_flashinfer_moe
+                and self.enable_ep_moe
+                and self.dp_size > 1
+            ), "FP4 all-gather requires --enable-flashinfer-moe, --enable-ep-moe, and dp_size > 1"
         # Set missing default values
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
@@ -1231,6 +1238,11 @@ class ServerArgs:
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-fp4-allgather",
+            action="store_true",
+            help="Quantize before all-gather when using DP with flashinfer MOE EP",
         )
         parser.add_argument(
             "--enable-deepep-moe",

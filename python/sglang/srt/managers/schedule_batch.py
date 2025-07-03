@@ -86,6 +86,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_ep_moe",
     "enable_flashinfer_moe",
     "enable_flashinfer_allreduce_fusion",
+    "enable_flashinfer_fp4_allgather",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
     "deepep_config",

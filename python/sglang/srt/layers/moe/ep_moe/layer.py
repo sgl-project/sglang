@@ -253,7 +253,7 @@ class EPMoE(torch.nn.Module):
             self.w2_weight_scale_inv if self.use_block_quant else self.w2_weight_scale,
         )
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor, forward_batch: ForwardBatch):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
             return self.forward_deepgemm(hidden_states, router_logits)
         else:
