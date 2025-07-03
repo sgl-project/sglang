@@ -102,6 +102,7 @@ from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
     get_bool_env_var,
+    get_cpu_ids_by_node,
     init_custom_process_group,
     is_cuda,
     is_fa3_default_architecture,
@@ -211,6 +212,10 @@ class ModelRunner:
         # CPU offload
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
 
+        # Init OpenMP threads binding for CPU
+        if self.device == "cpu":
+            self.init_threads_binding()
+
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
@@ -225,6 +230,7 @@ class ModelRunner:
         self.support_pp = (
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
         )
+        self._model_update_group = {}
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
@@ -496,6 +502,15 @@ class ModelRunner:
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
 
         if not self.is_draft_worker:
+            if self.device == "cpu":
+                if _is_cpu_amx_available:
+                    # Bind OpenMP threads to CPU cores
+                    torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
+                else:
+                    logger.warning(
+                        "init_cpu_threads_env is skipped since intel amx backend is not available"
+                    )
+
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
                 backend=backend,
@@ -744,7 +759,7 @@ class ModelRunner:
         )
 
         try:
-            self._model_update_group = init_custom_process_group(
+            self._model_update_group[group_name] = init_custom_process_group(
                 backend=backend,
                 init_method=f"tcp://{master_address}:{master_port}",
                 world_size=world_size,
@@ -757,7 +772,7 @@ class ModelRunner:
             logger.error(message)
             return False, message
 
-    def update_weights_from_distributed(self, name, dtype, shape):
+    def update_weights_from_distributed(self, names, dtypes, shapes, group_name):
         """
         Update specific parameter in the model weights online
         through `_model_update_group` process group.
@@ -767,19 +782,34 @@ class ModelRunner:
             dtype: the data type of the parameter to be updated.
             shape: the shape of the parameter to be updated.
         """
-        target_dtype = (
-            dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
         )
 
-        assert (
-            self._model_update_group is not None
-        ), "model update group must be initialized"
-
         try:
-            weights = torch.empty(shape, dtype=target_dtype, device=self.device)
-            torch.distributed.broadcast(weights, src=0, group=self._model_update_group)
-            self.model.load_weights([(name, weights)])
-            return True, f"Succeeded to update parameter {name} online."
+            weights = []
+            handles = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+                handles.append(
+                    torch.distributed.broadcast(
+                        weight,
+                        src=0,
+                        group=self._model_update_group[group_name],
+                        async_op=True,
+                    )
+                )
+                weights.append((name, weight))
+            for handle in handles:
+                handle.wait()
+
+            self.model.load_weights(weights)
+            return True, f"Succeeded to update parameter online."
 
         except Exception as e:
             error_msg = (
@@ -1291,6 +1321,30 @@ class ModelRunner:
             f"Capture cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.cuda_graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
+
+    def init_threads_binding(self):
+        omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
+        if omp_cpuids == "all":
+            cpu_ids_by_node = get_cpu_ids_by_node()
+            n_numa_node = len(cpu_ids_by_node)
+
+            assert self.tp_size <= n_numa_node, (
+                f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
+                f"tp_size {self.tp_size} should be smaller than or equal to number of numa node on the machine {n_numa_node}. "
+                f"If you need tp_size to be larger than number of numa node, please set the CPU cores for each tp rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
+                f"For example, on a machine with 2 numa nodes, where core 0-31 are on numa node 0 and core 32-63 are on numa node 1, "
+                f"it is suggested to use -tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
+                f"This is the default behavior if SGLANG_CPU_OMP_THREADS_BIND is not set and it is the same as setting SGLANG_CPU_OMP_THREADS_BIND=0-31|32-63. "
+                f"If you do need tp_size to be larger than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with -tp 4. "
+                f"If you don't want each tp rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with -tp 2."
+            )
+            if self.tp_size < n_numa_node:
+                logger.warning(
+                    f"Detected the current machine has {n_numa_node} numa nodes available, but tp_size is set to {self.tp_size}, so only {self.tp_size} numa nodes are used."
+                )
+            self.local_omp_cpuid = cpu_ids_by_node[self.tp_rank]
+        else:
+            self.local_omp_cpuid = omp_cpuids.split("|")[self.tp_rank]
 
     def apply_torch_tp(self):
         logger.info(f"Enabling torch tensor parallelism on {self.tp_size} devices.")
