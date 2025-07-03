@@ -692,7 +692,7 @@ class Qwen3MoeModel(Qwen2MoeModel):
             for i in range(self.start_layer, self.end_layer):
                 # EAGLE3 support: capture hidden states from specified layers
                 if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states + residual)
+                    aux_hidden_states.append(hidden_states + residual if residual is not None else hidden_states)
 
                 with get_global_expert_distribution_recorder().with_current_layer(i):
                     layer = self.layers[i]
