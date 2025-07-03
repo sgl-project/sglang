@@ -131,7 +131,6 @@ __host__ __device__ __forceinline__ dtype_t ceil_div(dtype_t a, dtype_t b) {
 constexpr float LOCAL_ABSMAX_ABS = 1e-10;
 // constexpr int THREADS_PER_SUBWARP = 8;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
-constexpr int NUM_WAVES = 6;
 
 constexpr int THREADS_PER_SUBWARP = 16;
 // using InputDataType = int4;
@@ -292,7 +291,7 @@ __global__ void per_token_group_quant_8bit_kernel(
     for (int i = 0; i < NUM_INPUT_DATA; ++i) {
         const int access_idx = access_base_idx + num_items_per_iteration * i;
         if (access_idx < num_items_overall) {
-          input_data[i] = ld_global_nc(reinterpret_cast<const int4*>(input) + access_idx);
+          input_data[i] = ld_global_nc(reinterpret_cast<const InputDataType*>(input) + access_idx);
         }
     }
 
