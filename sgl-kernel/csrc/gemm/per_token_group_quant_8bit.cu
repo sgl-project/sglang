@@ -368,19 +368,12 @@ __global__ void per_token_group_quant_8bit_kernel(
 //           }
 //         }
 
-//         static_assert(INPUT_PRIMARY_INT4_SIZE == 2);
-//         int4 output_buf = input_primary_int4[0] + input_primary_int4[1];
-//
-//         st_global(
-//             reinterpret_cast<int4*>(output_q + offset_num_groups * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE),
-//             output_buf);
-
         static_assert(INPUT_PRIMARY_INT4_SIZE == 2);
-        int output = input_primary_int4[0].x + input_primary_int4[0].y + input_primary_int4[0].z + input_primary_int4[0].w
-            + input_primary_int4[1].x + input_primary_int4[1].y + input_primary_int4[1].z + input_primary_int4[1].w;
+        int4 output_buf = input_primary_int4[0] + input_primary_int4[1];
+
         st_global(
-            reinterpret_cast<int*>(output_q + offset_num_groups * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE),
-            output);
+            reinterpret_cast<int4*>(output_q + offset_num_groups * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE),
+            output_buf);
       });
 }
 
