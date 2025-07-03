@@ -125,6 +125,8 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-Xcompiler"
     "-fPIC"
     # "-gencode=arch=compute_90,code=sm_90"
+    # NOTE HACK
+    "--keep"
     "-std=c++17"
     "-DFLASHINFER_ENABLE_F16"
     "-DCUTE_USE_PACKED_TUPLE=1"
