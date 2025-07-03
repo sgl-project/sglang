@@ -910,7 +910,7 @@ class TokenizerManager:
     async def pause_generation(self):
         async with self._cond:
             self._updating = True
-            self.abort_request("")
+            self.abort_request(abort_all=True)
 
     async def continue_generation(self):
         async with self._cond:
