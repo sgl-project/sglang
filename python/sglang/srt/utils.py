@@ -1544,11 +1544,13 @@ def get_compiler_backend() -> str:
             import torchair
             import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
             from torchair.configs.compiler_config import CompilerConfig
+            from torchair import patch_for_hcom
+            patch_for_hcom()
         except ImportError as e:
             raise ImportError(
                 "NPU detected, but torchair package is not installed. "
                 "Please install torchair for torch.compile support on NPU."
-            )
+            ) from e
         compiler_config = CompilerConfig()
         predefined_config = get_npu_compiler_config()
         for k, v in predefined_config.items():
