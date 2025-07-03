@@ -14,6 +14,7 @@
 """Utilities for Huggingface Transformers."""
 
 import contextlib
+import functools
 import os
 import warnings
 from pathlib import Path
@@ -103,6 +104,7 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
 
+@functools.lru_cache(maxsize=100)
 def get_config(
     model: str,
     trust_remote_code: bool,
