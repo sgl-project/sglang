@@ -219,7 +219,6 @@ def cpu_has_amx_support():
     return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
 
 
-
 def use_intel_amx_backend(layer):
     return getattr(layer, "use_intel_amx_backend", False)
 
