@@ -36,11 +36,6 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        if not image_data:
-            return None
-        if isinstance(image_data, str):
-            image_data = [image_data]
-
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
@@ -51,11 +46,11 @@ class Gemma3SGLangImageProcessor(SGLangBaseProcessor):
             discard_alpha_channel=True,
         )
 
-        combined_mm_item, input_ids = self.process_and_combine_mm_data(base_output)
+        mm_items, input_ids = self.process_and_combine_mm_data(base_output)
 
         return {
             "input_ids": input_ids.tolist(),
-            "mm_items": [combined_mm_item] if combined_mm_item is not None else [],
+            "mm_items": mm_items,
             "im_start_id": self.IM_START_TOKEN_ID,
             "im_end_id": self.IM_END_TOKEN_ID,
         }

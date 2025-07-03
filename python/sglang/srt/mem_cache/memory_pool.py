@@ -568,6 +568,76 @@ class SWAKVPool(KVCache):
             )
 
 
+class AscendTokenToKVPool(MHATokenToKVPool):
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            # [size, head_num, head_dim] for each layer
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
+            self.k_buffer = [
+                torch.zeros(
+                    (
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        self.head_num,
+                        self.head_dim,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.v_buffer = [
+                torch.zeros(
+                    (
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        self.head_num,
+                        self.head_dim,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+    ):
+        layer_id = layer.layer_id
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+
+        import torch_npu
+
+        torch_npu._npu_reshape_and_cache(
+            key=cache_k,
+            value=cache_v,
+            key_cache=self.k_buffer[layer_id].view(
+                -1, self.page_size, self.head_num, self.head_dim
+            ),
+            value_cache=self.v_buffer[layer_id].view(
+                -1, self.page_size, self.head_num, self.head_dim
+            ),
+            slot_indices=loc,
+        )
+
+
 @triton.jit
 def set_mla_kv_buffer_kernel(
     kv_buffer_ptr,
@@ -818,6 +888,84 @@ class MLATokenToKVPool(KVCache):
                 kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
         torch.cuda.synchronize()
+
+
+class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        super(MLATokenToKVPool, self).__init__(
+            size,
+            page_size,
+            dtype,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+        )
+
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+
+        self.custom_mem_pool = None
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
+            self.kv_buffer = [
+                torch.zeros(
+                    (
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(layer_num)
+            ]
+
+        self.layer_transfer_counter = None
+
+        kv_size = self.get_kv_size_bytes()
+        logger.info(
+            f"KV Cache is allocated. #tokens: {size}, KV size: {kv_size / GB:.2f} GB"
+        )
+        self.mem_usage = kv_size / GB
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        layer_id = layer.layer_id
+        if cache_k.dtype != self.dtype:
+            cache_k = cache_k.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(store_dtype)
+
+        import torch_npu
+
+        torch_npu._npu_reshape_and_cache_siso(
+            key=cache_k.view(-1, 1, self.kv_lora_rank + self.qk_rope_head_dim),
+            key_cache=self.kv_buffer[layer_id - self.start_layer].view(
+                -1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim
+            ),
+            slot_indices=loc,
+        )
 
 
 class DoubleSparseTokenToKVPool(KVCache):

@@ -114,7 +114,7 @@ jobs:
       run: |
         echo "Installing SGLang with all extras..."
         python3 -m pip --no-cache-dir install -e "python[all]" --break-system-packages
-        python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.4.post1
+        python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.4.post2
 
     - name: Build and install sgl-router
       run: |

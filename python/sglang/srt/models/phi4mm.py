@@ -446,9 +446,7 @@ class Phi4MMForCausalLM(nn.Module):
         return hidden_states
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        # Get all special token IDs
-        im_token_id: int = mm_inputs.im_token_id
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens([im_token_id])
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def should_apply_lora(self, module_name: str) -> bool:

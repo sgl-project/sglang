@@ -21,7 +21,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
+    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -244,26 +244,11 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
     def pad_input_ids(
         self,
         input_ids: List[int],
-        mm_inputs: Optional[MultimodalInputs] = None,
+        mm_inputs: MultimodalInputs,
     ) -> List[int]:
         """Pad input IDs with image and audio tokens."""
-        if mm_inputs is None:
-            return input_ids
-
-        # Collect available media token pairs
-        media_token_pairs = []
-        for attr_name in ["im_start_id", "audio_start_id"]:
-            if hasattr(mm_inputs, attr_name):
-                start_id = getattr(mm_inputs, attr_name)
-                end_id = getattr(mm_inputs, attr_name.replace("start", "end"))
-                media_token_pairs.append((start_id, end_id))
-
-        # Apply padding pattern if we have media tokens
-        if media_token_pairs:
-            pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
-            return pattern.pad_input_tokens(input_ids, mm_inputs)
-
-        return input_ids
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
@@ -431,7 +416,6 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             )
 
         positions += 1
-
         if input_ids is not None:
             # Prepare per-layer inputs from inputs_ids
             per_layer_inputs_mask = torch.logical_and(

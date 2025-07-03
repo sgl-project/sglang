@@ -13,6 +13,8 @@
 # ==============================================================================
 """Common utilities."""
 
+from __future__ import annotations
+
 import base64
 import builtins
 import ctypes
@@ -40,6 +42,7 @@ import threading
 import time
 import traceback
 import warnings
+from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum
 from functools import lru_cache
@@ -997,36 +1000,48 @@ def point_to_point_pyobj(
     src: int = 0,
     dst: int = 1,
 ):
-    """Send data from src to dst in group."""
+    """Send data from src to dst in group using DeviceToDevice communication."""
 
     if rank == src:
         if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long)
+            tensor_size = torch.tensor(
+                [0], dtype=torch.long, device=torch.cuda.current_device()
+            )
             dist.send(tensor_size, dst=dst, group=group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
+            ).cuda(
+                device=torch.cuda.current_device()
+            )  # Move to GPU
+            tensor_size = torch.tensor(
+                [size], dtype=torch.long, device=torch.cuda.current_device()
             )
-            tensor_size = torch.tensor([size], dtype=torch.long)
 
             dist.send(tensor_size, dst=dst, group=group)
             dist.send(tensor_data, dst=dst, group=group)
         return data
 
     elif rank == dst:
-        tensor_size = torch.tensor([0], dtype=torch.long)
+        tensor_size = torch.tensor(
+            [0], dtype=torch.long, device=torch.cuda.current_device()
+        )
         dist.recv(tensor_size, src=src, group=group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
-        tensor_data = torch.empty(size, dtype=torch.uint8)
+        tensor_data = torch.empty(
+            size, dtype=torch.uint8, device=torch.cuda.current_device()
+        )
         dist.recv(tensor_data, src=src, group=group)
 
-        serialized_data = bytes(tensor_data.cpu().numpy())
+        serialized_data = bytes(
+            tensor_data.cpu().numpy()
+        )  # Move back to host for deserialization
         data = pickle.loads(serialized_data)
         return data
 
@@ -1428,6 +1443,15 @@ def is_habana_available() -> bool:
 
 @lru_cache(maxsize=8)
 def get_device(device_id: Optional[int] = None) -> str:
+    if is_cpu():
+        if cpu_has_amx_support():
+            logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
+        else:
+            logger.warning(
+                "CPU device enabled, using torch native backend, low performance expected."
+            )
+        return "cpu"
+
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if device_id is None:
             return "cuda"
@@ -1455,15 +1479,6 @@ def get_device(device_id: Optional[int] = None) -> str:
             raise ImportError(
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
-
-    if is_cpu():
-        if cpu_has_amx_support():
-            logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
-        else:
-            logger.warning(
-                "CPU device enabled, using torch native backend, low performance expected."
-            )
-        return "cpu"
 
     raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
 
@@ -2398,7 +2413,7 @@ def bind_or_assign(target, source):
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return backend not in ["torch_native", "intel_amx", "ascend"]
 
 
 try:
@@ -2415,75 +2430,8 @@ def cpu_has_amx_support():
     return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
 
 
-def prepack_weight_if_needed(weight):
-    if weight.device != torch.device("cpu"):
-        return weight
-    if not cpu_has_amx_support():
-        return weight
-
-    return torch.ops.sgl_kernel.convert_weight_packed(weight)
-
-
-# TODO: currently gemm kernel has the below requirements:
-# OC % TILE_N == 0, where TILE_N = 16
-# IC % TILE_K == 0, where TILE_K = 32
-def dim_is_supported(weight):
-    return weight.size(0) % 16 == 0 and weight.size(1) % 32 == 0
-
-
-def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
-    # Pack weight for get better performance on CPU
-    devices = {getattr(module, weight_name).device for weight_name in weight_names}
-    assert len(devices) == 1, f"Expects all weights to be on the same device"
-    device = devices.pop()
-
-    if transpose_dims:
-        assert len(weight_names) == len(
-            transpose_dims
-        ), "len(weight_names) should be equal to len(transpose_dims)"
-
-    for i, weight_name in enumerate(weight_names):
-        weight_tensor = getattr(module, weight_name)
-
-        # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
-        if not dim_is_supported(weight_tensor):
-            logger.warning(
-                f"Expects weight.size(0) % 16 == 0 and weight.size(1) % 32 == 0 "
-                f"but {weight_tensor.size(0)=} and {weight_tensor.size(1)=} in {module}. "
-                f"{module} won't use intel amx backend."
-            )
-            module.use_intel_amx_backend = False
-            return
-
-        if transpose_dims and transpose_dims[i]:
-            weight_tensor = weight_tensor.transpose(*transpose_dims[i])
-
-        packed_weight = torch.nn.Parameter(
-            prepack_weight_if_needed(weight_tensor),
-            requires_grad=False,
-        )
-        packed_weight.__dict__ = weight_tensor.__dict__
-        setattr(module, weight_name, packed_weight)
-
-    module.use_intel_amx_backend = (
-        device == torch.device("cpu") and cpu_has_amx_support()
-    )
-
-    if (
-        module.use_intel_amx_backend
-        and hasattr(module, "bias")
-        and module.bias is not None
-    ):
-        module.bias = torch.nn.Parameter(module.bias.data.float(), requires_grad=False)
-
-
-class PackWeightMethod:
-    def __init__(self, weight_names, transpose_dims=None):
-        self.weight_names = weight_names
-        self.transpose_dims = transpose_dims
-
-    def process_weights_after_loading(self, module) -> None:
-        _process_weight_after_loading(module, self.weight_names, self.transpose_dims)
+def use_intel_amx_backend(layer):
+    return getattr(layer, "use_intel_amx_backend", False)
 
 
 class LazyValue:
@@ -2545,3 +2493,78 @@ def align(x: int, y: int) -> int:
 # COPIED FROM DeepGEMM
 def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
+
+
+def parse_lscpu_topology():
+    try:
+        # Get CPU topology: CPU,Core,Socket,Node
+        output = subprocess.check_output(
+            ["lscpu", "-p=CPU,Core,Socket,Node"], text=True
+        )
+    except Exception as e:
+        raise RuntimeError(f"Unexpected error running 'lscpu': {e}")
+
+    # Parse only data lines (skip comments)
+    cpu_info = []
+    for line in output.splitlines():
+        if not line.startswith("#"):
+            cpu, core, socket, node = map(int, line.strip().split(","))
+            cpu_info.append((cpu, core, socket, node))
+
+    # [(0,0,0,0),(1,1,0,0),...,(43,43,0,1),...,(256,0,0,0),...]
+    return cpu_info
+
+
+def get_physical_cpus_by_numa():
+    cpu_info = parse_lscpu_topology()
+
+    # Map NUMA node -> set of (core_id, socket) to avoid duplicates
+    # 0: {(0,0): 0, (1, 0): 1,...}
+    # ...
+    # 5: {(214,1): 214, (215,1): 215}
+    physical_by_node = defaultdict(dict)  # node -> core_id -> cpu_id
+
+    for cpu, core, socket, node in cpu_info:
+        key = (core, socket)
+        if key not in physical_by_node[node]:
+            physical_by_node[node][
+                key
+            ] = cpu  # pick first CPU seen for that physical core
+
+    # Retrieves CPUs that the current process is allowed to run on
+    cpus_allowed_list = psutil.Process().cpu_affinity()
+
+    # Convert to list of physical CPUs per node
+    # 0: [0,1,2,...,42]
+    # ...
+    # 2: [86,87,...,127]
+    # ...
+    # 5: [214,215,...,255]
+    node_to_cpus = {}
+    for node, core_to_cpu in physical_by_node.items():
+        cpus = sorted(core_to_cpu.values())
+        allowed_cpus = set(cpus).intersection(cpus_allowed_list)
+        node_to_cpus[node] = allowed_cpus
+
+    return node_to_cpus
+
+
+# Only physical cores are used. Logical cores are excluded.
+def get_cpu_ids_by_node():
+    node_to_cpus = get_physical_cpus_by_numa()
+    # Sort by NUMA node index
+    cpu_ids = [
+        ",".join(map(str, sorted(node_to_cpus[node]))) for node in sorted(node_to_cpus)
+    ]
+
+    # ['0,1,2,3', '4,5,6,7', '8,9,10,11', '12,13,14,15', '16,17,18,19', '20,21,22,23']
+    return cpu_ids
+
+
+def is_shm_available(dtype, world_size, local_size):
+    return (
+        cpu_has_amx_support()
+        and dtype in [torch.bfloat16, torch.float]
+        and world_size >= 1
+        and world_size == local_size
+    )

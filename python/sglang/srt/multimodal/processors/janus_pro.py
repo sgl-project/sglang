@@ -22,12 +22,6 @@ class JanusProImageProcessor(BaseMultimodalProcessor):
         max_req_input_len,
         **kwargs,
     ):
-        if not image_data:
-            return None
-
-        if not isinstance(image_data, list):
-            image_data = [image_data]
-
         processor = self._processor
 
         base_out = self.load_mm_data(

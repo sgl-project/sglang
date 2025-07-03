@@ -124,6 +124,9 @@ def _get_quantization_config(
         quant_config = get_quant_config(
             model_config, load_config, packed_modules_mapping
         )
+        # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
+        if quant_config is None:
+            return None
         major, minor = get_device_capability()
 
         if major is not None and minor is not None:

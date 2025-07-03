@@ -27,8 +27,8 @@ pub struct RouterConfig {
     pub metrics: Option<MetricsConfig>,
     /// Log directory (None = stdout only)
     pub log_dir: Option<String>,
-    /// Verbose logging
-    pub verbose: bool,
+    /// Log level (None = info)
+    pub log_level: Option<String>,
 }
 
 /// Routing mode configuration
@@ -177,7 +177,7 @@ impl Default for RouterConfig {
             discovery: None,
             metrics: None,
             log_dir: None,
-            verbose: false,
+            log_level: None,
         }
     }
 }
