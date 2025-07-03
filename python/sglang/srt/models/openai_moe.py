@@ -422,7 +422,10 @@ class OpenAIMoeAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.sinks = nn.Parameter(torch.empty(self.num_heads))
+
+        # default sink dtype is bfloat16
+        self.sinks = nn.Parameter(torch.empty(self.num_heads, dtype=torch.bfloat16))
+
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.tp_rank = get_tensor_model_parallel_rank()
