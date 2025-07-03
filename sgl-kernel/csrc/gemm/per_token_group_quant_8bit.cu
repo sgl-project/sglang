@@ -275,6 +275,7 @@ __global__ void per_token_group_quant_8bit_kernel(
 
 // #pragma unroll
 //   for (int access_base_idx = flat_thread_idx; access_base_idx < num_items_overall; access_base_idx += num_items_per_iteration * NUM_INPUT_DATA) {
+  const int access_base_idx = flat_thread_idx;
     InputDataType input_data[NUM_INPUT_DATA] = {{0,0,0,0}, {0,0,0,0}};
 
 #pragma unroll
