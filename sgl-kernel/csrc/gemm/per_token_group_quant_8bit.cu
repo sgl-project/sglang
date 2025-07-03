@@ -79,8 +79,12 @@ __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
   return ret;
 }
 
-__device__ __forceinline__ longlong4 ld_global_nc(const longlong4* ptr) {
-  longlong4 ret;
+struct __align__(32) MyLongLong4 {
+    long long x,y,z,w;
+};
+
+__device__ __forceinline__ MyLongLong4 ld_global_nc(const MyLongLong4* ptr) {
+  MyLongLong4 ret;
   asm volatile("ld.global.nc.v4.s64 {%0, %1, %2, %3}, [%4];"
                : "=l"(ret.x), "=l"(ret.y), "=l"(ret.z), "=l"(ret.w)
                : "l"(ptr));
@@ -134,7 +138,7 @@ constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 
 constexpr int THREADS_PER_SUBWARP = 16;
 // using InputDataType = int4;
-using InputDataType = longlong4;
+using InputDataType = MyLongLong4;
 constexpr int NUM_SMS = 152;
 
 struct NaiveScheduler {
