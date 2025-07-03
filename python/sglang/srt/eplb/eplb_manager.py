@@ -4,10 +4,8 @@ from typing import TYPE_CHECKING, List
 
 import torch.cuda
 
-from sglang.srt.managers.expert_distribution import (
-    get_global_expert_distribution_recorder,
-)
-from sglang.srt.managers.expert_location import ExpertLocationMetadata
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner

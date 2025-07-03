@@ -516,9 +516,6 @@ class EmbeddingReqInput:
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
 
-    def contains_mm_input(self) -> bool:
-        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
-
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
         if self.text is None and self.input_ids is None and self.image_data is None:
@@ -571,6 +568,9 @@ class EmbeddingReqInput:
     def regenerate_rid(self):
         self.rid = uuid.uuid4().hex
         return self.rid
+
+    def contains_mm_input(self) -> bool:
+        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
 
     def __getitem__(self, i):
         if self.is_cross_encoder_request:
@@ -752,9 +752,13 @@ class UpdateWeightFromDiskReqOutput:
 
 @dataclass
 class UpdateWeightsFromDistributedReqInput:
-    name: str
-    dtype: str
-    shape: List[int]
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
+    # The group name
+    group_name: str = "weight_update_group"
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
 
 
 @dataclass
