@@ -18,7 +18,7 @@
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, Optional, Tuple, List
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -754,7 +754,7 @@ class Qwen3MoeForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
-    
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
@@ -765,7 +765,11 @@ class Qwen3MoeForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
-            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]  # Specific layers for EAGLE3 support
+            self.model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]  # Specific layers for EAGLE3 support
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
