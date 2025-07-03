@@ -38,6 +38,7 @@ runtime_common = [
     "psutil",
     "pydantic",
     "pynvml",
+    "pybase64",
     "python-multipart",
     "pyzmq>=25.1.2",
     "soundfile==0.13.1",
