@@ -268,12 +268,7 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int num_items_overall = num_tokens_per_expert * hidden_dim_num_groups * group_size * sizeof(T) / sizeof(InputDataType);
 
 #pragma unroll
-  for (int iter_idx = 0; iter_idx < NUM_WAVES; ++iter_idx) {
-    const int access_idx = iter_idx * num_items_per_iteration + flat_thread_idx;
-    if (access_idx >= num_items_overall) {
-      break;
-    }
-
+  for (int access_idx = flat_thread_idx; access_idx < num_items_overall; access_idx += num_items_per_iteration) {
     InputDataType input_data = ld_global_nc(reinterpret_cast<const int4*>(input) + access_idx);
     int output_data = input_data.x + input_data.y + input_data.z + input_data.w;
     *(reinterpret_cast<int*>(output_q) + access_idx) = output_data;
