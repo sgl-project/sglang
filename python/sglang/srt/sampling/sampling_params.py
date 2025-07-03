@@ -135,7 +135,7 @@ class SamplingParams:
             for token_id in self.logit_bias:
                 if not 0 <= int(token_id) < vocab_size:
                     raise ValueError(
-                        f"logits_bias must has keys in [0, {vocab_size - 1}], got "
+                        f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
                     )
         grammars = [
