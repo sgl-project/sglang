@@ -79,6 +79,7 @@ from sglang.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    AscendMLAPagedTokenToKVPool,
     AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
@@ -395,6 +396,8 @@ class ModelRunner:
                         server_args.attention_backend = "aiter"
                     else:
                         server_args.attention_backend = "triton"
+                elif _is_npu:
+                    server_args.attention_backend = "ascend"
                 else:
                     server_args.attention_backend = "triton"
             logger.info(
@@ -409,6 +412,7 @@ class ModelRunner:
                     "triton",
                     "flashmla",
                     "cutlass_mla",
+                    "ascend",
                 ]:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
@@ -1109,6 +1113,23 @@ class ModelRunner:
                 layer_num=self.model_config.num_hidden_layers,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
+            )
+        elif self.server_args.attention_backend == "ascend" and self.use_mla_backend:
+            self.token_to_kv_pool = AscendMLAPagedTokenToKVPool(
+                self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                layer_num=(
+                    self.model_config.num_hidden_layers
+                    if not self.is_draft_worker
+                    else self.model_config.hf_config.num_nextn_predict_layers
+                ),  # PP is not compatible with mla backend
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
             )
         elif self.use_mla_backend:
             self.token_to_kv_pool = MLATokenToKVPool(
