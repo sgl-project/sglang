@@ -49,9 +49,6 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        if isinstance(image_data, str):
-            image_data = [image_data]
-
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
@@ -130,12 +127,13 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
         video_grid_thw = None  # TODO
 
-        combined_mm_item, input_ids = self.process_and_combine_mm_data(base_output)
+        mm_items, input_ids = self.process_and_combine_mm_data(base_output)
 
-        if combined_mm_item is None:
+        if not mm_items:
             # Note(Xinyuan): This is the case where image loading fails.
             return None
 
+        combined_mm_item = mm_items[0]  # only image is supported for now
         video_grid_thw = None  # TODO
         second_per_grid_ts = getattr(combined_mm_item, "second_per_grid_ts", None)
 
@@ -157,7 +155,7 @@ class Qwen2_5VLImageProcessor(SGLangBaseProcessor):
 
         return {
             "input_ids": input_ids.tolist(),
-            "mm_items": [combined_mm_item],
+            "mm_items": mm_items,
             "im_start_id": self.IM_START_TOKEN_ID,
             "im_end_id": self.IM_END_TOKEN_ID,
             "im_token_id": self.IM_TOKEN_ID,

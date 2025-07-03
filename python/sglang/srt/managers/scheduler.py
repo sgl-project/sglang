@@ -2211,7 +2211,7 @@ class Scheduler(
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
-            if req.rid.startswith(recv_req.rid):
+            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 to_del.append(i)
 
         # Sort in reverse order to avoid index issues when deleting
@@ -2228,7 +2228,7 @@ class Scheduler(
             # Abort method 2: call `set_finish_with_abort`
             # The request will still run one prefill forward pass.
             # In this case, we change the input_ids to be only one token to make this prefill cheap.
-            if req.rid.startswith(recv_req.rid):
+            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
                 if req.grammar:
                     req.grammar.cancel()
@@ -2241,7 +2241,9 @@ class Scheduler(
             reqs = self.running_batch.reqs + self.cur_batch.reqs
 
         for req in reqs:
-            if req.rid.startswith(recv_req.rid) and not req.finished():
+            if not req.finished() and (
+                recv_req.abort_all or req.rid.startswith(recv_req.rid)
+            ):
                 # Abort method 3: set `to_abort=True`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
@@ -2303,8 +2305,9 @@ class Scheduler(
         """Update the online model parameter."""
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
-            flush_cache_success = self.flush_cache()
-            assert flush_cache_success, "Cache flush failed after updating weights"
+            if recv_req.flush_cache:
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
         return UpdateWeightsFromDistributedReqOutput(success, message)
