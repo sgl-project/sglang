@@ -266,9 +266,7 @@ class ServerArgs:
             )
         if self.enable_flashinfer_fp4_allgather:
             assert (
-                self.enable_flashinfer_moe
-                and self.enable_ep_moe
-                and self.dp_size > 1
+                self.enable_flashinfer_moe and self.enable_ep_moe and self.dp_size > 1
             ), "FP4 all-gather requires --enable-flashinfer-moe, --enable-ep-moe, and dp_size > 1"
         # Set missing default values
         if self.tokenizer_path is None:

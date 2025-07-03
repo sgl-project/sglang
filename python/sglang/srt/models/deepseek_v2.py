@@ -320,7 +320,9 @@ class DeepseekV2MoE(nn.Module):
                 dict(
                     enable_flashinfer_moe=True,
                     enable_ep_moe=global_server_args_dict["enable_ep_moe"],
-                    enable_flashinfer_fp4_allgather=global_server_args_dict["enable_flashinfer_fp4_allgather"],
+                    enable_flashinfer_fp4_allgather=global_server_args_dict[
+                        "enable_flashinfer_fp4_allgather"
+                    ],
                 )
                 if global_server_args_dict["enable_flashinfer_moe"]
                 else {}
@@ -447,11 +449,16 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1 and not global_server_args_dict["enable_flashinfer_fp4_allgather"]:
+        if (
+            self.tp_size > 1
+            and not global_server_args_dict["enable_flashinfer_fp4_allgather"]
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
-    def forward_normal(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+    def forward_normal(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
@@ -475,7 +482,10 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-        if self.tp_size > 1 and not global_server_args_dict["enable_flashinfer_fp4_allgather"]:
+        if (
+            self.tp_size > 1
+            and not global_server_args_dict["enable_flashinfer_fp4_allgather"]
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
