@@ -106,28 +106,9 @@ __device__ __forceinline__ int compute_input_group_start_offset(
          token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) + hidden_dim_group_idx * group_size;
 }
 
-__device__ __host__ __forceinline__ int4 operator+(const int4& a, const int4& b) {
-    int4 result;
-    result.x = a.x + b.x;
-    result.y = a.y + b.y;
-    result.z = a.z + b.z;
-    result.w = a.w + b.w;
-    return result;
-}
-
-template <typename dtype_t>
-__host__ __device__ __forceinline__ dtype_t ceil_div(dtype_t a, dtype_t b) {
-    return (a + b - 1) / b;
-}
-
 constexpr float LOCAL_ABSMAX_ABS = 1e-10;
-// constexpr int THREADS_PER_SUBWARP = 8;
+constexpr int THREADS_PER_SUBWARP = 8;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
-constexpr int NUM_WAVES = 6;
-
-constexpr int THREADS_PER_SUBWARP = 16;
-using InputDataType = int4;
-constexpr int NUM_SMS = 152;
 
 struct NaiveScheduler {
   static void compute_exec_config(
@@ -149,19 +130,8 @@ struct NaiveScheduler {
       }
       return 1;
     })();
-//     const int block_dim = subwarps_per_block * THREADS_PER_SUBWARP;
-//     constexpr int NUM_THREADS_PER_SM = 2048;
-//     grid = dim3(NUM_SMS * (NUM_THREADS_PER_SM / block_dim));
-//     block = dim3(block_dim);
-
-    grid = dim3(NUM_SMS);
-    block = dim3(1024);
-
-//     const int group_size = 128;
-//     const int sizeof_T = 2;
-    printf("grid.x=%d block.x=%d num_groups=%d \n", grid.x, block.x, num_groups);
-//     TORCH_CHECK(grid.x * block.x * sizeof(InputDataType) == num_groups * group_size * sizeof_T,
-//         "grid.x=", grid.x, "block.x=", block.x, "num_groups=", num_groups);
+    grid = dim3(num_groups / subwarps_per_block);
+    block = dim3(subwarps_per_block * THREADS_PER_SUBWARP);
   }
 
   template <bool FUSE_SILU_AND_MUL, typename FUNC>
@@ -253,8 +223,6 @@ template <
     bool SCALE_UE8M0 = false,
     bool FUSE_SILU_AND_MUL = false,
     typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>>
-// NOTE HACK
-__maxnreg__(64)
 __global__ void per_token_group_quant_8bit_kernel(
     const T* __restrict__ input,
     DST_DTYPE* __restrict__ output_q,
@@ -267,167 +235,134 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int scale_expert_stride,
     const int scale_hidden_stride,
     const int num_tokens_per_expert) {
+  using dst_dtype_info = DtypeInfo<DST_DTYPE>;
+  using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
+  static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
 
-  const int flat_thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int num_items_per_iteration = gridDim.x * blockDim.x;
-  const int num_items_overall = num_tokens_per_expert * hidden_dim_num_groups * group_size * sizeof(T) / sizeof(InputDataType);
+  SCHEDULER::execute<FUSE_SILU_AND_MUL>(
+      subwarps_per_block,
+      hidden_dim_num_groups,
+      group_size,
+      masked_m,
+      num_tokens_per_expert,
+      [&](const int expert_idx,
+          const int token_idx,
+          const int hidden_dim_group_idx,
+          const int lane_id,
+          const int input_group_start_offset) {
+        constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
+        constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
-  constexpr int NUM_INPUT_DATA = 11;
+        const int offset_num_groups = expert_idx * num_tokens_per_expert * hidden_dim_num_groups +
+                                      token_idx * hidden_dim_num_groups + hidden_dim_group_idx;
 
-  int output_data = 0;
+        int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
+        T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
+        static_assert(sizeof(input_primary_vec[0]) * INPUT_PRIMARY_VEC_SIZE == sizeof(input_primary_int4));
 
-// #pragma unroll
-//   for (int access_base_idx = flat_thread_idx; access_base_idx < num_items_overall; access_base_idx += num_items_per_iteration * NUM_INPUT_DATA) {
-  const int access_base_idx = flat_thread_idx;
-    InputDataType input_data[NUM_INPUT_DATA] = {{0,0,0,0}, {0,0,0,0}};
+        int4 input_secondary_int4[INPUT_PRIMARY_INT4_SIZE];
+        T* input_secondary_vec = reinterpret_cast<T*>(input_secondary_int4);
+        static_assert(sizeof(input_secondary_vec[0]) * INPUT_PRIMARY_VEC_SIZE == sizeof(input_secondary_int4));
 
 #pragma unroll
-    for (int i = 0; i < NUM_INPUT_DATA; ++i) {
-        const int access_idx = access_base_idx + num_items_per_iteration * i;
-        if (access_idx < num_items_overall) {
-          input_data[i] = ld_global_nc(reinterpret_cast<const int4*>(input) + access_idx);
+        for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
+          input_primary_int4[j] = ld_global_nc(
+              reinterpret_cast<const int4*>(input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
         }
-    }
+        if constexpr (FUSE_SILU_AND_MUL) {
+          const int secondary_offset = hidden_dim_num_groups * group_size;
+#pragma unroll
+          for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
+            input_secondary_int4[j] = ld_global_nc(
+                reinterpret_cast<const int4*>(
+                    input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE + secondary_offset) +
+                j);
+          }
+        }
+
+        constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
+        scale_element_t* scale_output;
+        if constexpr (IS_COLUMN_MAJOR) {
+          constexpr int scale_token_stride = 1;
+
+          const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
+          const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
+          scale_output = reinterpret_cast<scale_element_t*>(output_s) +
+                         (expert_idx * scale_expert_stride * num_elems_per_pack +
+                          hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
+                          token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
+        } else {
+          static_assert(!SCALE_UE8M0);
+          scale_output = output_s + offset_num_groups;
+        }
+
+        // can speed up if too slow
+        if constexpr (IS_COLUMN_MAJOR and SCALE_UE8M0) {
+          const int remainder_num_groups = hidden_dim_num_groups % num_elems_per_pack;
+          if ((remainder_num_groups != 0) and (hidden_dim_group_idx == hidden_dim_num_groups - 1) and
+              (lane_id < num_elems_per_pack - remainder_num_groups)) {
+            const int shift = 1 + lane_id;
+            *(scale_output + shift) = 0;
+          }
+        }
+
+        float local_absmax = LOCAL_ABSMAX_ABS;
 
 #pragma unroll
-    for (int i = 0; i < NUM_INPUT_DATA; ++i) {
-      output_data ^= input_data[i].x ^ input_data[i].y ^ input_data[i].z ^ input_data[i].w;
-    }
-//   }
+        for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
+          float val;
+          if constexpr (FUSE_SILU_AND_MUL) {
+            // TODO maybe vectorize
+            T val_lowprec = static_cast<T>(silu(static_cast<float>(input_primary_vec[j]))) * input_secondary_vec[j];
+            val = static_cast<float>(val_lowprec);
+            input_primary_vec[j] = val_lowprec;
+          } else {
+            val = static_cast<float>(input_primary_vec[j]);
+          }
 
-  *(reinterpret_cast<int*>(output_q) + flat_thread_idx) = output_data;
+          float abs_val = fabsf(val);
+          local_absmax = fmaxf(local_absmax, abs_val);
+        }
 
-//   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
-//   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
-//   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
-//
-//   SCHEDULER::execute<FUSE_SILU_AND_MUL>(
-//       subwarps_per_block,
-//       hidden_dim_num_groups,
-//       group_size,
-//       masked_m,
-//       num_tokens_per_expert,
-//       [&](const int expert_idx,
-//           const int token_idx,
-//           const int hidden_dim_group_idx,
-//           const int lane_id,
-//           const int input_group_start_offset) {
-//         constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
-//         constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
-//
-//         const int offset_num_groups = expert_idx * num_tokens_per_expert * hidden_dim_num_groups +
-//                                       token_idx * hidden_dim_num_groups + hidden_dim_group_idx;
-//
-//         int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
-//         T* input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
-//         static_assert(sizeof(input_primary_vec[0]) * INPUT_PRIMARY_VEC_SIZE == sizeof(input_primary_int4));
-//
-//         int4 input_secondary_int4[INPUT_PRIMARY_INT4_SIZE];
-//         T* input_secondary_vec = reinterpret_cast<T*>(input_secondary_int4);
-//         static_assert(sizeof(input_secondary_vec[0]) * INPUT_PRIMARY_VEC_SIZE == sizeof(input_secondary_int4));
-//
-// #pragma unroll
-//         for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
-//           input_primary_int4[j] = ld_global_nc(
-//               reinterpret_cast<const int4*>(input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE) + j);
-//         }
-//         if constexpr (FUSE_SILU_AND_MUL) {
-//           const int secondary_offset = hidden_dim_num_groups * group_size;
-// #pragma unroll
-//           for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
-//             input_secondary_int4[j] = ld_global_nc(
-//                 reinterpret_cast<const int4*>(
-//                     input + input_group_start_offset + lane_id * INPUT_PRIMARY_VEC_SIZE + secondary_offset) +
-//                 j);
-//           }
-//         }
-//
-// //         constexpr int num_elems_per_pack = static_cast<int>(sizeof(scale_packed_t) / sizeof(scale_element_t));
-// //         scale_element_t* scale_output;
-// //         if constexpr (IS_COLUMN_MAJOR) {
-// //           constexpr int scale_token_stride = 1;
-// //
-// //           const int hidden_idx_packed = hidden_dim_group_idx / num_elems_per_pack;
-// //           const int pack_idx = hidden_dim_group_idx % num_elems_per_pack;
-// //           scale_output = reinterpret_cast<scale_element_t*>(output_s) +
-// //                          (expert_idx * scale_expert_stride * num_elems_per_pack +
-// //                           hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
-// //                           token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
-// //         } else {
-// //           static_assert(!SCALE_UE8M0);
-// //           scale_output = output_s + offset_num_groups;
-// //         }
-// //
-// //         // can speed up if too slow
-// //         if constexpr (IS_COLUMN_MAJOR and SCALE_UE8M0) {
-// //           const int remainder_num_groups = hidden_dim_num_groups % num_elems_per_pack;
-// //           if ((remainder_num_groups != 0) and (hidden_dim_group_idx == hidden_dim_num_groups - 1) and
-// //               (lane_id < num_elems_per_pack - remainder_num_groups)) {
-// //             const int shift = 1 + lane_id;
-// //             *(scale_output + shift) = 0;
-// //           }
-// //         }
-// //
-// //         float local_absmax = LOCAL_ABSMAX_ABS;
-// //
-// // #pragma unroll
-// //         for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
-// //           float val;
-// //           if constexpr (FUSE_SILU_AND_MUL) {
-// //             // TODO maybe vectorize
-// //             T val_lowprec = static_cast<T>(silu(static_cast<float>(input_primary_vec[j]))) * input_secondary_vec[j];
-// //             val = static_cast<float>(val_lowprec);
-// //             input_primary_vec[j] = val_lowprec;
-// //           } else {
-// //             val = static_cast<float>(input_primary_vec[j]);
-// //           }
-// //
-// //           float abs_val = fabsf(val);
-// //           local_absmax = fmaxf(local_absmax, abs_val);
-// //         }
-// //
-// //         local_absmax = GroupReduceMax<THREADS_PER_SUBWARP>(local_absmax, lane_id);
-// //
-// //         float y_scale, y_scale_inv;
-// //         calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
-// //         float2 y_scale_repeated = {y_scale, y_scale};
-// //
-// //         if (lane_id == 0) {
-// //           *scale_output = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
-// //         }
-// //
-// //         int4 output_buf;
-// //         static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE * sizeof(DST_DTYPE));
-// //
-// //         if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
-// //           const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
-// //           static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
-// //           static_assert(INPUT_PRIMARY_VEC_SIZE % 2 == 0);
-// //
-// // #pragma unroll
-// //           for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
-// //             float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
-// //             float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
-// //             output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
-// //           }
-// //         } else {
-// //           const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
-// //
-// // #pragma unroll
-// //           for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
-// //             float val = static_cast<float>(input_primary_vec[j]);
-// //             float q_val = fminf(fmaxf(val * y_scale, dst_dtype_info::MIN), dst_dtype_info::MAX);
-// //             output_buf_ptr[j] = DST_DTYPE(q_val);
-// //           }
-// //         }
-//
-//         static_assert(INPUT_PRIMARY_INT4_SIZE == 2);
-//         int4 output_buf = input_primary_int4[0] + input_primary_int4[1];
-//
-//         st_global(
-//             reinterpret_cast<int4*>(output_q + offset_num_groups * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE),
-//             output_buf);
-//       });
+        local_absmax = GroupReduceMax<THREADS_PER_SUBWARP>(local_absmax, lane_id);
+
+        float y_scale, y_scale_inv;
+        calculate_fp8_scales<SCALE_UE8M0, dst_dtype_info>(local_absmax, y_scale, y_scale_inv);
+        float2 y_scale_repeated = {y_scale, y_scale};
+
+        if (lane_id == 0) {
+          *scale_output = extract_required_scale_format<SCALE_UE8M0>(y_scale_inv);
+        }
+
+        int4 output_buf;
+        static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE * sizeof(DST_DTYPE));
+
+        if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
+          const auto output_buf_ptr = reinterpret_cast<__nv_fp8x2_storage_t*>(&output_buf);
+          static_assert(sizeof(output_buf) == INPUT_PRIMARY_VEC_SIZE / 2 * sizeof(__nv_fp8x2_storage_t));
+          static_assert(INPUT_PRIMARY_VEC_SIZE % 2 == 0);
+
+#pragma unroll
+          for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 2) {
+            float2 inputx2 = {static_cast<float>(input_primary_vec[j]), static_cast<float>(input_primary_vec[j + 1])};
+            float2 outputx2 = __fmul2_rn(inputx2, y_scale_repeated);
+            output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+          }
+        } else {
+          const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);
+
+#pragma unroll
+          for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; ++j) {
+            float val = static_cast<float>(input_primary_vec[j]);
+            float q_val = fminf(fmaxf(val * y_scale, dst_dtype_info::MIN), dst_dtype_info::MAX);
+            output_buf_ptr[j] = DST_DTYPE(q_val);
+          }
+        }
+
+        st_global(
+            reinterpret_cast<int4*>(output_q + offset_num_groups * group_size + lane_id * INPUT_PRIMARY_VEC_SIZE),
+            output_buf);
+      });
 }
 
 void sgl_per_token_group_quant_8bit(
@@ -490,7 +425,7 @@ void sgl_per_token_group_quant_8bit(
 
 #define LAUNCH_KERNEL(T, DST_DTYPE)                                                               \
   do {                                                                                            \
-    /* TODO temp: TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));     */ \
+    TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));      \
                                                                                                   \
     using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                  \
     CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                      \
