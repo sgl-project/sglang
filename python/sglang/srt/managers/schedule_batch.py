@@ -85,6 +85,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "deepep_mode",
     "enable_ep_moe",
     "enable_flashinfer_moe",
+    "enable_flashinfer_allreduce_fusion",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
     "deepep_config",

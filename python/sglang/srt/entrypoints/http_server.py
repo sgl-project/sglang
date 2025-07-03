@@ -932,11 +932,9 @@ def launch_server(
         warmup_thread.join()
 
 
-def _wait_and_warmup(
+def _execute_server_warmup(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
-    image_token_text: str,
-    launch_callback: Optional[Callable[[], None]] = None,
 ):
     headers = {}
     url = server_args.url()
@@ -961,7 +959,7 @@ def _wait_and_warmup(
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_process_tree(os.getpid())
-        return
+        return success
 
     model_info = res.json()
 
@@ -1035,10 +1033,25 @@ def _wait_and_warmup(
             pipe_finish_writer.send(last_traceback)
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_process_tree(os.getpid())
-        return
+        return False
 
     # Debug print
     # logger.info(f"warmup request returns: {res.json()=}")
+    return success
+
+
+def _wait_and_warmup(
+    server_args: ServerArgs,
+    pipe_finish_writer: Optional[multiprocessing.connection.Connection],
+    image_token_text: str,
+    launch_callback: Optional[Callable[[], None]] = None,
+):
+    if not server_args.skip_server_warmup:
+        if not _execute_server_warmup(
+            server_args,
+            pipe_finish_writer,
+        ):
+            return
 
     logger.info("The server is fired up and ready to roll!")
 
