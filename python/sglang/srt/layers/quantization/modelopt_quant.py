@@ -811,14 +811,17 @@ class ModelOptNvFp4FusedMoEMethod:
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
             output_dtype = x.dtype
-            # Swizzle after communication for dp.
-            x_row = x.shape[0]
-            x_col = x.shape[1]
-            x, x_sf = fp4_quantize(
-                x, layer.w13_input_scale_quant, is_sf_swizzled_layout=dp_size == 1
-            )
-
+            x_sf = None
             if dp_size > 1:
+                # Quantize before comm, swizzle after.
+                x_col = x.shape[1]
+                if x.shape[0] > 0:
+                    x, x_sf = fp4_quantize(
+                        x, layer.w13_input_scale_quant, is_sf_swizzled_layout=False
+                    )
+                else:
+                    x = torch.zeros(0, x_col // 2, dtype=torch.uint8, device=x.device)
+                    x_sf = torch.zeros(0, x_col // 16, dtype=torch.uint8, device=x.device)
                 (
                     topk_weights,
                     topk_ids,
@@ -827,6 +830,7 @@ class ModelOptNvFp4FusedMoEMethod:
                 ) = parallel_state.get_tp_group().all_gatherv(
                     [topk_weights, topk_ids, x, x_sf], sizes=global_num_tokens_cpu
                 )
+                x_row = x.shape[0]
                 x_sf = fp4_swizzle_blockscale(x_sf, x_row, x_col)
 
             output = flashinfer_cutlass_fused_moe(

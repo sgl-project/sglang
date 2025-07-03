@@ -513,7 +513,7 @@ class GroupCoordinator:
         input_: torch.Tensor,
         output: Optional[torch.Tensor] = None,
         sizes: Optional[List[int]] = None,
-    ) -> None:
+    ) -> torch.Tensor:
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
 
