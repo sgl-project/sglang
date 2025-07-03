@@ -52,9 +52,12 @@ class MoEGate(nn.Module):
         self.weight = nn.Parameter(
             torch.empty((config.moe_num_experts, config.hidden_size))
         )
-        self.e_score_correction_bias = nn.Parameter(
-            torch.empty((1, config.moe_num_experts))
-        )
+        if getattr(config, "moe_use_aux_free", False):
+            self.e_score_correction_bias = nn.Parameter(
+                torch.empty((1, config.moe_num_experts))
+            )
+        else:
+            self.e_score_correction_bias = None
 
     def forward(self, hidden_states):
         logits = F.linear(hidden_states, self.weight, None)

@@ -52,7 +52,7 @@ class Ernie4ModelMTP(nn.Module):
         self.mtp_emb_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mtp_hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mtp_linear_proj = nn.Linear(
-            config.hidden_size * 2, config.hidden_size, bias=False
+            config.hidden_size * 2, config.hidden_size, bias=config.use_bias
         )
         self.mtp_block = Ernie4DecoderLayer(
             config=config,
@@ -139,6 +139,7 @@ class Ernie4_5_MoeForCausalLMMTP(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        mtp_layer_found = False
         mtp_weight_patterns = [
             f"mtp_block.{self.mtp_layer_id}",
             f"mtp_emb_norm.{self.mtp_layer_id}",
@@ -150,11 +151,12 @@ class Ernie4_5_MoeForCausalLMMTP(nn.Module):
             # Only name matched patterns should be loaded
             for layer_pattern in mtp_weight_patterns:
                 if layer_pattern in name:
+                    mtp_layer_found = True
                     break
             else:
                 continue
             # But strip mtp_layer_id before loading, because each MTP layer is a MTP model.
-            name = name.replace(f".{self.mtp_layer_id}", "")
+            name = name.replace(f".{self.mtp_layer_id}.", ".")
             for (
                 param_name,
                 weight_name,
@@ -176,6 +178,8 @@ class Ernie4_5_MoeForCausalLMMTP(nn.Module):
                     weight_loader(param, loaded_weight)
                 else:
                     raise KeyError(f"Parameter '{name}' not found in MTP model.")
+        if not mtp_layer_found:
+            raise KeyError(f"MTP layers 'mtp_*.{self.mtp_layer_id}.*' not found in weights.")
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
