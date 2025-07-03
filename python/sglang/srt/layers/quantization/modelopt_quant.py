@@ -821,7 +821,9 @@ class ModelOptNvFp4FusedMoEMethod:
                     )
                 else:
                     x = torch.zeros(0, x_col // 2, dtype=torch.uint8, device=x.device)
-                    x_sf = torch.zeros(0, x_col // 16, dtype=torch.uint8, device=x.device)
+                    x_sf = torch.zeros(
+                        0, x_col // 16, dtype=torch.uint8, device=x.device
+                    )
                 (
                     topk_weights,
                     topk_ids,
