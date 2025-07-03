@@ -79,6 +79,14 @@ __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
   return ret;
 }
 
+__device__ __forceinline__ longlong4 ld_global_nc(const longlong4* ptr) {
+  longlong4 ret;
+  asm volatile("ld.global.nc.v4.s64 {%0, %1, %2, %3}, [%4];"
+               : "=l"(ret.x), "=l"(ret.y), "=l"(ret.z), "=l"(ret.w)
+               : "l"(ptr));
+  return ret;
+}
+
 template <typename T>
 struct DtypeInfo;
 
@@ -126,7 +134,8 @@ constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 constexpr int NUM_WAVES = 6;
 
 constexpr int THREADS_PER_SUBWARP = 16;
-using InputDataType = int4;
+// using InputDataType = int4;
+using InputDataType = longlong4;
 constexpr int NUM_SMS = 152;
 
 struct NaiveScheduler {
@@ -269,7 +278,8 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int num_items_per_iteration = gridDim.x * blockDim.x;
   const int num_items_overall = num_tokens_per_expert * hidden_dim_num_groups * group_size * sizeof(T) / sizeof(InputDataType);
 
-  constexpr int NUM_INPUT_DATA = 6;
+//   constexpr int NUM_INPUT_DATA = 6;
+  constexpr int NUM_INPUT_DATA = 3;
 
   int output_data = 0;
 
