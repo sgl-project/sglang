@@ -85,6 +85,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "deepep_mode",
     "enable_ep_moe",
     "enable_flashinfer_moe",
+    "enable_flashinfer_allreduce_fusion",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
     "deepep_config",
@@ -1672,6 +1673,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             or global_server_args_dict["attention_backend"] == "flashmla"
             or global_server_args_dict["attention_backend"] == "cutlass_mla"
+            or global_server_args_dict["attention_backend"] == "ascend"
             or global_server_args_dict["enable_two_batch_overlap"]
         ):
             seq_lens_cpu = (
@@ -1874,7 +1876,10 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    if global_server_args_dict["attention_backend"] != "torch_native":
+    if (
+        global_server_args_dict["attention_backend"] != "ascend"
+        and global_server_args_dict["attention_backend"] != "torch_native"
+    ):
         impl = get_last_loc_triton
     else:
         impl = get_last_loc_torch

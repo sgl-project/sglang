@@ -253,8 +253,11 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
     else:
         proc, base_url = launch_server_process(server_args)
 
-    server_info = requests.get(base_url + "/get_server_info")
-    tokenizer_path = server_info.json()["tokenizer_path"]
+    server_info = requests.get(base_url + "/get_server_info").json()
+    if "tokenizer_path" in server_info:
+        tokenizer_path = server_info["tokenizer_path"]
+    elif "prefill" in server_info:
+        tokenizer_path = server_info["prefill"][0]["tokenizer_path"]
     tokenizer = get_tokenizer(tokenizer_path)
 
     # warmup

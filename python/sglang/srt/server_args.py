@@ -157,6 +157,7 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     enable_flashinfer_moe: bool = False
+    enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -378,6 +379,12 @@ class ServerArgs:
                 "Cuda graph is disabled because of using torch native attention backend"
             )
             self.disable_cuda_graph = True
+
+        if self.attention_backend == "ascend":
+            logger.warning(
+                "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
+            )
+            self.page_size = 128
 
         # Choose grammar backend
         if self.grammar_backend is None:
@@ -1112,6 +1119,7 @@ class ServerArgs:
                 "flashmla",
                 "intel_amx",
                 "torch_native",
+                "ascend",
                 "triton",
             ],
             default=ServerArgs.attention_backend,
@@ -1205,6 +1213,11 @@ class ServerArgs:
             "--enable-flashinfer-moe",
             action="store_true",
             help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP with --enable-ep-moe",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-allreduce-fusion",
+            action="store_true",
+            help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
         )
         parser.add_argument(
             "--enable-deepep-moe",

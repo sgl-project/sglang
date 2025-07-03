@@ -27,6 +27,7 @@ except ImportError:
 
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -64,7 +65,6 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.utils import (
-    _process_weight_after_loading,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
@@ -74,6 +74,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     print_warning_once,
     set_weight_attrs,
+    use_intel_amx_backend,
 )
 
 _is_hip = is_hip()
@@ -335,7 +336,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 assert (
                     _is_cpu_amx_available
                 ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
-                _process_weight_after_loading(layer, ["weight"])
+                _amx_process_weight_after_loading(layer, ["weight"])
                 return
             else:
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
@@ -433,7 +434,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.block_quant:
-            if getattr(layer, "use_intel_amx_backend", False):
+            if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
                     x,
                     layer.weight,
@@ -769,7 +770,7 @@ class Fp8MoEMethod:
                 assert (
                     _is_cpu_amx_available
                 ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
-                _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+                _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 
             return
 
@@ -996,7 +997,7 @@ class Fp8MoEMethod:
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        if getattr(layer, "use_intel_amx_backend", False):
+        if use_intel_amx_backend(layer):
             return torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,
