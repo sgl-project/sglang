@@ -79,7 +79,7 @@ router = Router(
 )
 ```
 
-Use the `--verbose` flag with the CLI for more detailed logs.
+Use the `--log-level` flag with the CLI to set [log level](https://docs.sglang.ai/backend/server_arguments.html#logging).
 
 ### Metrics
 
