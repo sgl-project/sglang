@@ -505,6 +505,8 @@ class SRTRunner:
         torchao_config: Optional[str] = None,
         cuda_graph_max_bs: int = 4,
         sleep_on_idle=False,
+        max_lora_rank: Optional[int] = None,
+        enable_lora: Optional[bool] = None,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -543,6 +545,8 @@ class SRTRunner:
             cuda_graph_max_bs=cuda_graph_max_bs,
             disable_custom_all_reduce=disable_custom_all_reduce,
             sleep_on_idle=sleep_on_idle,
+            max_lora_rank=max_lora_rank,
+            enable_lora=enable_lora,
             **spec_kwargs,
         )
 

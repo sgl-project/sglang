@@ -133,6 +133,8 @@ class ServerArgs:
     preferred_sampling_params: Optional[str] = None
 
     # LoRA
+    enable_lora: bool = False
+    max_lora_rank: Optional[int] = None
     lora_paths: Optional[Union[dict[str, str], List[str]]] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
@@ -1098,6 +1100,18 @@ class ServerArgs:
 
         # LoRA
         parser.add_argument(
+            "--enable-lora",
+            default=ServerArgs.enable_lora,
+            action="store_true",
+            help="Enable LoRA support for the model. This argument is automatically set to True if --lora-paths is provided.",
+        )
+        parser.add_argument(
+            "--max-lora-rank",
+            default=ServerArgs.max_lora_rank,
+            type=int,
+            help="The maximum rank of LoRA adapters. If not specified, it will be automatically inferred from the adapters provided in --lora-paths.",
+        )
+        parser.add_argument(
             "--lora-paths",
             type=str,
             nargs="*",
@@ -1698,15 +1712,27 @@ class ServerArgs:
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
-        if isinstance(self.lora_paths, list):
-            lora_paths = self.lora_paths
-            self.lora_paths = {}
-            for lora_path in lora_paths:
-                if "=" in lora_path:
-                    name, path = lora_path.split("=", 1)
-                    self.lora_paths[name] = path
-                else:
-                    self.lora_paths[lora_path] = lora_path
+        # Enable LoRA if any LoRA paths are provided for backward compatibility.
+        if self.lora_paths:
+            self.enable_lora = True
+            logger.info(
+                "Automatically enabling LoRA support due to provided LoRA paths."
+            )
+
+        if self.enable_lora:
+            if isinstance(self.lora_paths, list):
+                lora_paths = self.lora_paths
+                self.lora_paths = {}
+                for lora_path in lora_paths:
+                    if "=" in lora_path:
+                        name, path = lora_path.split("=", 1)
+                        self.lora_paths[name] = path
+                    else:
+                        self.lora_paths[lora_path] = lora_path
+
+            assert (
+                self.lora_paths or self.max_lora_rank
+            ), "either lora_paths or max_lora_rank must be set when LoRA support is enabled."
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:

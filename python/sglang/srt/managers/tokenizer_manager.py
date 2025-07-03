@@ -560,7 +560,7 @@ class TokenizerManager:
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logits-processor` to enable this feature."
                 )
-            if self.server_args.lora_paths and obj.lora_path:
+            if obj.lora_path:
                 self._validate_lora_adapters(obj)
 
     def _validate_input_ids_in_vocab(
@@ -677,6 +677,12 @@ class TokenizerManager:
 
     def _validate_lora_adapters(self, obj: GenerateReqInput):
         """Validate that the requested LoRA adapters are loaded."""
+
+        if not self.server_args.enable_lora:
+            raise ValueError(
+                "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+            )
+
         requested_adapters = (
             set(obj.lora_path) if isinstance(obj.lora_path, list) else {obj.lora_path}
         )
@@ -686,8 +692,8 @@ class TokenizerManager:
         unloaded_adapters = requested_adapters - loaded_adapters
         if unloaded_adapters:
             raise ValueError(
-                f"The following requested LoRA adapters are not loaded: {unloaded_adapters}\n"
-                f"Loaded adapters: {loaded_adapters}."
+                f"The following requested LoRA adapters are not loaded: {list(unloaded_adapters)}\n"
+                f"Loaded adapters: {list(loaded_adapters)}."
             )
 
     def _send_one_request(
@@ -1021,6 +1027,10 @@ class TokenizerManager:
         _: Optional[fastapi.Request] = None,
     ) -> LoadLoRAAdapterReqOutput:
         self.auto_create_handle_loop()
+        if not self.server_args.enable_lora:
+            raise ValueError(
+                "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+            )
 
         # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
         # with dp_size > 1.
@@ -1044,6 +1054,10 @@ class TokenizerManager:
         _: Optional[fastapi.Request] = None,
     ) -> UnloadLoRAAdapterReqOutput:
         self.auto_create_handle_loop()
+        if not self.server_args.enable_lora:
+            raise ValueError(
+                "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+            )
 
         # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
         # with dp_size > 1.
