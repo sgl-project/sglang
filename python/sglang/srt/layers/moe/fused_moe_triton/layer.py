@@ -20,10 +20,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
-if torch.cuda.is_available():
-    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-else:
-    fused_experts = None  # type: ignore
+# fused_experts will be imported at runtime to avoid circular imports
 
 import logging
 
@@ -95,6 +92,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
+        # Add bias for gate_up_proj
+        w13_bias = torch.nn.Parameter(
+            torch.empty(
+                num_experts, 2 * intermediate_size, dtype=params_dtype
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_bias", w13_bias)
+        set_weight_attrs(w13_bias, extra_weight_attrs)
+
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
             torch.empty(
@@ -104,6 +111,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # Add bias for down_proj
+        w2_bias = torch.nn.Parameter(
+            torch.empty(
+                num_experts, hidden_size, dtype=params_dtype
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_bias", w2_bias)
+        set_weight_attrs(w2_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _use_aiter:
@@ -216,6 +233,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 ),
             )
         else:
+            # Import at runtime to avoid circular dependency
+            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+            
             return fused_experts(
                 hidden_states=x,
                 w1=layer.w13_weight,
@@ -227,6 +247,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 no_combine=no_combine,
                 routed_scaling_factor=routed_scaling_factor,
+                w1_bias=getattr(layer, 'w13_bias', None),
+                w2_bias=getattr(layer, 'w2_bias', None),
             )
 
     def forward_cpu(
@@ -544,7 +566,7 @@ class FusedMoE(torch.nn.Module):
                 tp_rank=tp_rank,
             )
         else:
-            assert shard_id in ("w1", "w3")
+            assert shard_id in ("w1", "w3", "w13")
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
@@ -579,16 +601,16 @@ class FusedMoE(torch.nn.Module):
             else loaded_weight
         )
 
-        if shard_id not in ("w1", "w2", "w3"):
+        if shard_id not in ("w1", "w2", "w3", "w13"):
             raise ValueError(
-                f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
+                f"shard_id must be ['w1','w2','w3','w13'] but " f"got {shard_id}."
             )
 
         WEIGHT_SCALE_SUPPORTED = [e.value for e in FusedMoeWeightScaleSupported]
         # Fetch the dim to shard the parameter/loaded weight
         # based on the shard id. This will be whatever
         # dimension intermediate_size is used.
-        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
+        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0, "w13": 0}
 
         expert_data = param.data[expert_id]
 
@@ -711,13 +733,86 @@ class FusedMoE(torch.nn.Module):
 
         # Case model weights
         if "weight" in weight_name:
-            self._load_model_weight_or_group_weight_scale(
-                shard_id=shard_id,
-                shard_dim=shard_dim,
-                loaded_weight=loaded_weight,
-                expert_data=expert_data,
-                tp_rank=tp_rank,
-            )
+            if shard_id == "w13":
+                # Handle full gate_up_proj weight (w13)
+                weight_param = getattr(self, "w13_weight", None)
+                if weight_param is not None:
+                    # Apply TP sharding to the full weight based on shard_dim
+                    tp_size = get_tensor_model_parallel_world_size()
+                    if tp_size > 1 and not self.use_presharded_weights:
+                        # Use shard_dim instead of hardcoded dim 0
+                        weight_per_partition = loaded_weight.shape[shard_dim] // tp_size
+                        start_idx = tp_rank * weight_per_partition
+                        end_idx = start_idx + weight_per_partition
+                        if shard_dim == 0:
+                            loaded_weight = loaded_weight[start_idx:end_idx, :]
+                        else:  # shard_dim == 1
+                            loaded_weight = loaded_weight[:, start_idx:end_idx]
+                    
+                    # Now split into gate and up parts
+                    gate_weight = loaded_weight[:loaded_weight.shape[0]//2, :]
+                    up_weight = loaded_weight[loaded_weight.shape[0]//2:, :]
+                    
+                    # Load into w13_weight
+                    weight_param.data[expert_id][:weight_param.data[expert_id].shape[0]//2, :] = gate_weight
+                    weight_param.data[expert_id][weight_param.data[expert_id].shape[0]//2:, :] = up_weight
+            else:
+                self._load_model_weight_or_group_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=tp_rank,
+                )
+            return
+
+        # Handle bias loading
+        if "bias" in weight_name:
+            if shard_id == "w13":
+                # Handle full gate_up_proj bias (w13)
+                bias_param = getattr(self, "w13_bias", None)
+                if bias_param is not None:
+                    # Apply TP sharding to the full bias (bias is 1D, always shard along dim 0)
+                    tp_size = get_tensor_model_parallel_world_size()
+                    if tp_size > 1 and not self.use_presharded_weights:
+                        # For w13 bias, we shard along dim 0 (output dimension)
+                        bias_per_partition = loaded_weight.shape[0] // tp_size
+                        start_idx = tp_rank * bias_per_partition
+                        end_idx = start_idx + bias_per_partition
+                        loaded_weight = loaded_weight[start_idx:end_idx]
+                    
+                    # Now split into gate and up parts
+                    gate_bias = loaded_weight[:loaded_weight.shape[0]//2]
+                    up_bias = loaded_weight[loaded_weight.shape[0]//2:]
+                    
+                    # Load into w13_bias
+                    bias_param.data[expert_id][:bias_param.data[expert_id].shape[0]//2] = gate_bias
+                    bias_param.data[expert_id][bias_param.data[expert_id].shape[0]//2:] = up_bias
+            elif shard_id in ("w1", "w3"):
+                # For w1 and w3, we need to load bias into w13_bias
+                bias_param = getattr(self, "w13_bias", None)
+                if bias_param is not None:
+                    # Apply TP sharding to individual w1/w3 bias
+                    tp_size = get_tensor_model_parallel_world_size()
+                    if tp_size > 1 and not self.use_presharded_weights:
+                        # w1/w3 bias needs to be sharded along output dimension
+                        bias_per_partition = loaded_weight.shape[0] // tp_size
+                        start_idx = tp_rank * bias_per_partition
+                        end_idx = start_idx + bias_per_partition
+                        loaded_weight = loaded_weight[start_idx:end_idx]
+                    
+                    if shard_id == "w1":
+                        # Load into first half of w13_bias
+                        bias_param.data[expert_id][:bias_param.data[expert_id].shape[0]//2] = loaded_weight
+                    else:  # w3
+                        # Load into second half of w13_bias
+                        bias_param.data[expert_id][bias_param.data[expert_id].shape[0]//2:] = loaded_weight
+            elif shard_id == "w2":
+                # For w2, load bias into w2_bias (no TP sharding needed for w2 bias)
+                bias_param = getattr(self, "w2_bias", None)
+                if bias_param is not None:
+                    # w2 bias is not sharded in TP (it's the output bias)
+                    bias_param.data[expert_id] = loaded_weight
             return
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
@@ -765,25 +860,39 @@ class FusedMoE(torch.nn.Module):
         num_experts: int,
     ) -> List[Tuple[str, str, int, str]]:
 
-        return [
-            # (param_name, weight_name, expert_id, shard_id)
-            (
-                (
-                    "experts.w13_"
-                    if weight_name in [ckpt_gate_proj_name, ckpt_up_proj_name]
-                    else "experts.w2_"
-                ),
-                f"experts.{expert_id}.{weight_name}.",
-                expert_id,
-                shard_id,
-            )
-            for expert_id in range(num_experts)
+        mappings = []
+        for expert_id in range(num_experts):
             for shard_id, weight_name in [
                 ("w1", ckpt_gate_proj_name),
                 ("w2", ckpt_down_proj_name),
                 ("w3", ckpt_up_proj_name),
-            ]
-        ]
+            ]:
+                # Add weight mapping
+                param_name = (
+                    "experts.w13_"
+                    if weight_name in [ckpt_gate_proj_name, ckpt_up_proj_name]
+                    else "experts.w2_"
+                )
+                mappings.append((
+                    param_name,
+                    f"experts.{expert_id}.{weight_name}.",
+                    expert_id,
+                    shard_id,
+                ))
+                
+                # Add bias mapping
+                bias_param_name = (
+                    "experts.w13_bias"
+                    if weight_name in [ckpt_gate_proj_name, ckpt_up_proj_name]
+                    else "experts.w2_bias"
+                )
+                mappings.append((
+                    bias_param_name,
+                    f"experts.{expert_id}.{weight_name}_bias.",
+                    expert_id,
+                    shard_id,
+                ))
+        return mappings
 
     def _load_fp8_scale(
         self,

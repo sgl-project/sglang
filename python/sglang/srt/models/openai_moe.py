@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_pp_group,
@@ -834,8 +835,8 @@ class OpenAIMoeForCausalLM(nn.Module):
         self.config.num_experts = self.config.num_local_experts
         self.config.moe_intermediate_size = self.config.intermediate_size
         self.config.norm_topk_prob = True
-        # Todo: remove this, currently use silu as a workaround because the swiglu activation is not supported in FusedMoE
-        # self.config.hidden_act = "swiglu"
+        # Enable swiglu activation for the new model
+        self.config.hidden_act = "swiglu"
         # Todo: remove this, currently set as True (Gate and up/down bias are True)
         self.config.mlp_bias = True
         ###########################################################################
@@ -891,8 +892,7 @@ class OpenAIMoeForCausalLM(nn.Module):
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
+            # Note: gate_up_proj for experts is handled separately below
         ]
 
         expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
@@ -902,6 +902,7 @@ class OpenAIMoeForCausalLM(nn.Module):
             num_experts=self.config.num_experts,
         )
 
+        
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
@@ -953,36 +954,73 @@ class OpenAIMoeForCausalLM(nn.Module):
                         default_weight_loader(param, loaded_weight)
                     continue
 
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    if name not in params_dict:
-                        continue
-
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
+                # Handle batch expert weights (simplified approach)
+                if ".experts.gate_up_proj" in name:
+                    # Handle batched gate_up_proj weights and bias
+                    if name.endswith("_bias"):
+                        param_name = name.replace(".experts.gate_up_proj_bias", ".experts.w13_bias")
                     else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+                        param_name = name.replace(".experts.gate_up_proj", ".experts.w13_weight") 
+                    
+                    if param_name in params_dict:
+                        param = params_dict[param_name]
+                        weight_loader = param.weight_loader
+                        for expert_id in range(self.config.num_experts):
+                            if name.endswith("_bias"):
+                                # Bias case - pass the full bias and let weight_loader handle TP sharding
+                                expert_bias = loaded_weight[expert_id]  # Shape: (2*moe_intermediate_size,)
+                                # Pass the full bias to weight_loader, it will handle TP sharding internally
+                                weight_loader(param, expert_bias, name, shard_id="w13", expert_id=expert_id)
+                            else:
+                                # Weight case - pass the full weight and let weight_loader handle TP sharding
+                                expert_weight = loaded_weight[expert_id]  # Shape: (2*moe_intermediate_size, hidden_size)
+                                # Pass the full weight to weight_loader, it will handle TP sharding internally
+                                weight_loader(param, expert_weight, name, shard_id="w13", expert_id=expert_id)
+                elif ".experts.down_proj" in name:
+                    # Handle batched down_proj weights and bias
+                    if name.endswith("_bias"):
+                        param_name = name.replace(".experts.down_proj_bias", ".experts.w2_bias")
+                    else:
+                        param_name = name.replace(".experts.down_proj", ".experts.w2_weight")
+                    
+                    if param_name in params_dict:
+                        param = params_dict[param_name]
+                        weight_loader = param.weight_loader
+                        for expert_id in range(self.config.num_experts):
+                            expert_data = loaded_weight[expert_id]
+                            weight_loader(param, expert_data, name, shard_id="w2", expert_id=expert_id)
+                else:
+                    # Handle individual expert weights (traditional format)
+                    for mapping in expert_params_mapping:
+                        param_name, weight_name, expert_id, shard_id = mapping
+                        if weight_name not in name:
+                            continue
+                        name = name.replace(weight_name, param_name)
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
+                        break
+                    else:
+                        # Skip loading extra bias for GPTQ models.
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        if name not in params_dict:
+                            continue
+
+                        if name in params_dict.keys():
+                            param = params_dict[name]
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            weight_loader(param, loaded_weight)
+                        else:
+                            logger.warning(f"Parameter {name} not found in params_dict")
 
         # TODO mimic deepseek
         self.routed_experts_weights_of_layer = {
