@@ -44,7 +44,7 @@ ENABLE_TRTLMM_GEN_MOE = get_bool_env_var("SGLANG_ENABLE_TRTLLM_GEN_MOE", "false"
 
 if ENABLE_TRTLMM_GEN_MOE:
     # import tensorrt_llm to register ops
-    import tensorrt_llm # noqa
+    import tensorrt_llm  # noqa
     from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
     from tensorrt_llm.quantization.utils.fp4_utils import (
         float4_sf_dtype,
@@ -599,7 +599,9 @@ class ModelOptNvFp4FusedMoEMethod:
         )
         layer.register_parameter("w2_weight", w2_weight)
 
-        assert self.quant_config.group_size == 16
+        assert (
+            self.quant_config.group_size == 16
+        ), f"NVFP4 MoE only supports group_size=16, but got {self.quant_config.group_size}"
 
         w13_weight_scale = ModelWeightParameter(
             data=torch.empty(
@@ -782,6 +784,7 @@ class ModelOptNvFp4FusedMoEMethod:
             # Copy the result into device buffer
             dst_w2_weight.copy_(processed_w2_weight.view(dst_w2_weight.dtype))
 
+    # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc0/tensorrt_llm/_torch/modules/fused_moe/quantization.py#L1094
     def trtllm_gen_process_expert_w3_w1_weight_scale_nvfp4(
         self, layer: torch.nn.Module
     ):
@@ -822,6 +825,7 @@ class ModelOptNvFp4FusedMoEMethod:
                 )
             )
 
+    # https://github.com/NVIDIA/TensorRT-LLM/blob/v1.0.0rc0/tensorrt_llm/_torch/modules/fused_moe/quantization.py#L1094
     def trtllm_gen_process_expert_w2_weight_scale_nvfp4(
         self,
         layer: torch.nn.Module,
@@ -991,7 +995,9 @@ class ModelOptNvFp4FusedMoEMethod:
         assert activation == "silu", "Only SiLU activation is supported."
 
         if ENABLE_TRTLMM_GEN_MOE:
-            assert self.enable_flashinfer_moe
+            assert (
+                self.enable_flashinfer_moe
+            ), "must enable flashinfer moe for POC convenience"
             assert use_grouped_topk, "must be true for deepseek_v3"
             assert correction_bias is not None, "must appear for deepseek_v3"
             assert topk_group is not None, "must appear for deepseek_v3"

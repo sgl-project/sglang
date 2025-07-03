@@ -114,6 +114,7 @@ _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 
 ENABLE_TRTLMM_GEN_MOE = get_bool_env_var("SGLANG_ENABLE_TRTLLM_GEN_MOE", "false")
+GATE_TOKENS_THRESHOLD = (16 + 1) if ENABLE_TRTLMM_GEN_MOE else 4
 
 if _is_cuda:
     from sgl_kernel import (
@@ -234,7 +235,8 @@ class MoEGate(nn.Module):
                 True,  # is_vnni
             )
 
-        if (hidden_states.shape[0] <= 16
+        if (
+            hidden_states.shape[0] < GATE_TOKENS_THRESHOLD
             and hidden_states.shape[1] == 7168
             and self.weight.shape[0] == 256
             and _device_sm >= 90
@@ -408,13 +410,17 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal_dual_stream(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not ENABLE_TRTLMM_GEN_MOE:
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
+
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states)
 
         with torch.cuda.stream(self.alt_stream):
-            # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states)
+            if ENABLE_TRTLMM_GEN_MOE:
+                router_logits = self.gate(hidden_states)
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
