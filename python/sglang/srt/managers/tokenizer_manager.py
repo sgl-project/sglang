@@ -737,6 +737,15 @@ class TokenizerManager:
                     ):
                         raise ValueError(finish_reason["message"])
 
+                    if (
+                        finish_reason.get("type") == "abort"
+                        and finish_reason.get("status_code")
+                        == HTTPStatus.TOO_MANY_REQUESTS
+                    ):
+                        raise fastapi.HTTPException(
+                            status_code=finish_reason["status_code"],
+                            detail=finish_reason["message"],
+                        )
                 yield out
                 break
 
@@ -1619,6 +1628,18 @@ class TokenizerManager:
             self.crash_dump_request_list.popleft()
 
     def _handle_abort_req(self, recv_obj):
+        if recv_obj.finished_reason:
+            state = self.rid_to_state[recv_obj.rid]
+            state.finished = True
+            state.out_list.append(
+                {
+                    "meta_info": {
+                        "id": recv_obj.rid,
+                        "finish_reason": recv_obj.finished_reason,
+                    },
+                }
+            )
+            state.event.set()
         self.rid_to_state.pop(recv_obj.rid, None)
 
     def _handle_open_session_req_output(self, recv_obj):
@@ -1810,8 +1831,10 @@ class _Communicator(Generic[T]):
 #
 # | entrypoint | is_streaming | status          | abort engine    | cancel asyncio task   | rid_to_state                |
 # | ---------- | ------------ | --------------- | --------------- | --------------------- | --------------------------- |
+# | http       | yes          | validation      | background task | fast api              | del in _handle_abort_req    |
 # | http       | yes          | waiting queue   | background task | fast api              | del in _handle_abort_req    |
 # | http       | yes          | running         | background task | fast api              | del in _handle_batch_output |
+# | http       | no           | validation      | http exception  | http exception        | del in _handle_abort_req    |
 # | http       | no           | waiting queue   | type 1          | type 1 exception      | del in _handle_abort_req    |
 # | http       | no           | running         | type 3          | type 3 exception      | del in _handle_batch_output |
 #

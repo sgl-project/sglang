@@ -5,7 +5,7 @@ import time
 import uuid
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.conversation import generate_chat_conv
@@ -563,6 +563,11 @@ class OpenAIServingChat(OpenAIServingBase):
         except ValueError as e:
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+        except HTTPException as e:
+            error = self.create_streaming_error_response(
+                e.detail, err_type=str(e.status_code), status_code=e.status_code
+            )
+            yield f"data: {error}\n\n"
 
         yield "data: [DONE]\n\n"
 
@@ -579,6 +584,10 @@ class OpenAIServingChat(OpenAIServingBase):
             ).__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
+        except HTTPException as e:
+            return self.create_error_response(
+                e.detail, err_type=str(e.status_code), status_code=e.status_code
+            )
 
         if not isinstance(ret, list):
             ret = [ret]
