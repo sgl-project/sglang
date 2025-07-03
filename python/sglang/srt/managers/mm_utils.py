@@ -211,7 +211,7 @@ def get_embedding_chunk(
             end_index += extend_end_index - start + 1
         elif extend_end_index > end:
             end_index += end - start + 1
-    # some models embedding is 3-dim, reshape it to 2-dim
+    # some models' embedding is 3-dim, reshape it to 2-dim
     embedding = embedding.reshape(-1, embedding.shape[-1])
     embedding_chunk = embedding[start_index:end_index]
     return embedding_chunk, start_index, end_index
@@ -636,7 +636,7 @@ def tensor_hash(tensor_list) -> int:
         tensor = tensor.float()
 
     assert isinstance(tensor, torch.Tensor)
-    tensor_cpu = tensor
+    tensor_cpu = tensor.cpu()
 
     mv = memoryview(tensor_cpu.numpy())
     return data_hash(mv.tobytes())
