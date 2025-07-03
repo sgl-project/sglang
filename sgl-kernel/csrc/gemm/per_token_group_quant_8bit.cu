@@ -269,7 +269,8 @@ __global__ void per_token_group_quant_8bit_kernel(
   const int num_items_per_iteration = gridDim.x * blockDim.x;
   const int num_items_overall = num_tokens_per_expert * hidden_dim_num_groups * group_size * sizeof(T) / sizeof(InputDataType);
 
-  constexpr int NUM_INPUT_DATA = 6;
+//   constexpr int NUM_INPUT_DATA = 6;
+  constexpr int NUM_INPUT_DATA = 5; // TODO temp wrong!
 
   int output_data = 0;
 
@@ -281,9 +282,9 @@ __global__ void per_token_group_quant_8bit_kernel(
 #pragma unroll
     for (int i = 0; i < NUM_INPUT_DATA; ++i) {
         const int access_idx = access_base_idx + num_items_per_iteration * i;
-        if (access_idx < num_items_overall) {
+//         if (access_idx < num_items_overall) { // TODO wrong!
           input_data[i] = ld_global_nc(reinterpret_cast<const int4*>(input) + access_idx);
-        }
+//         }
     }
 
 #pragma unroll
