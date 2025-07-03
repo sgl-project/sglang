@@ -42,8 +42,10 @@ from torch.distributed import Backend, ProcessGroup
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
+    get_int_env_var,
     is_cuda_alike,
     is_npu,
+    is_shm_available,
     supports_custom_op,
 )
 
@@ -222,6 +224,7 @@ class GroupCoordinator:
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
+        self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
         for ranks in group_ranks:
             device_group = torch.distributed.new_group(
@@ -440,9 +443,12 @@ class GroupCoordinator:
             return input_
 
         if input_.is_cpu:
-            import intel_extension_for_pytorch as ipex
-
-            ipex.distributed.all_reduce(input_, group=self.device_group)
+            if is_shm_available(input_.dtype, self.world_size, self.local_size):
+                torch.ops.sgl_kernel.shm_allreduce(
+                    input_, torch.distributed.ReduceOp.SUM
+                )
+            else:
+                torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
 
         if not supports_custom_op():
@@ -570,6 +576,16 @@ class GroupCoordinator:
         output_tensor = torch.empty(
             output_size, dtype=input_.dtype, device=input_.device
         )
+
+        if input_.is_cpu:
+            if is_shm_available(input_.dtype, self.world_size, self.local_size):
+                return torch.ops.sgl_kernel.shm_allgather(input_, dim)
+            else:
+                torch.distributed.all_gather_into_tensor(
+                    output_tensor, input_, group=self.device_group
+                )
+                return output_tensor
+
         # All-gather.
         self.all_gather_into_tensor(output_tensor, input_)
         # Reshape

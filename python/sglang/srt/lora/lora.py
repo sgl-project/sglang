@@ -65,7 +65,7 @@ class LoRAAdapter(nn.Module):
         self.layers: List[LoRALayer] = nn.ModuleList(
             [
                 LoRALayer(config, base_hf_config)
-                for i in range(base_hf_config.num_hidden_layers)
+                for _ in range(base_hf_config.num_hidden_layers)
             ]
         )
 
@@ -88,10 +88,9 @@ class LoRAAdapter(nn.Module):
             else:
                 self.weights[name] = loaded_weight.cpu()
 
-        # stack kv_proj and gate_up_proj
-        for i in range(self.base_hf_config.num_hidden_layers):
-            layer = self.layers[i]
-            weight_names = [name for name, _ in layer.weights.items()]
+        # normalize kv_proj and gate_up_proj
+        for layer in self.layers:
+            weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
             self.normalize_gate_up_proj(weight_names, layer.weights)
 
