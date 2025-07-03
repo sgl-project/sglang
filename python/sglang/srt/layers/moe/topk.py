@@ -22,6 +22,7 @@ from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import (
     ExpertDistributionRecorder,
     get_global_expert_distribution_recorder,
+    count_logical_expert_tokens,
 )
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
@@ -155,6 +156,7 @@ def grouped_topk_gpu(
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    lp_dispatch: bool = False,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -195,6 +197,13 @@ def grouped_topk_gpu(
         topk_weights = topk_weights / topk_weights_sum
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+    # Count logical expert tokens before logical-to-physical mapping if requested
+    logical_counts = None
+    if lp_dispatch:
+        num_logical_experts = gating_output.shape[1]  # Number of experts in gating output
+        logical_counts = count_logical_expert_tokens(topk_ids, num_logical_experts)
+
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
@@ -238,6 +247,7 @@ def biased_grouped_topk_impl(
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    lp_dispatch: bool = False,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -285,6 +295,13 @@ def biased_grouped_topk_impl(
         topk_weights = topk_weights / topk_weights_sum
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+    # Count logical expert tokens before logical-to-physical mapping if requested
+    logical_counts = None
+    if lp_dispatch:
+        num_logical_experts = gating_output.shape[1]  # Number of experts in gating output
+        logical_counts = count_logical_expert_tokens(topk_ids, num_logical_experts)
+
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
@@ -326,6 +343,7 @@ def biased_grouped_topk_gpu(
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    lp_dispatch: bool = False,
 ):
     assert (
         routed_scaling_factor is not None
@@ -346,6 +364,12 @@ def biased_grouped_topk_gpu(
             num_fused_shared_experts,
             routed_scaling_factor,
         )
+        # Count logical expert tokens before logical-to-physical mapping if requested
+        logical_counts = None
+        if lp_dispatch:
+            num_logical_experts = gating_output.shape[1]  # Number of experts in gating output
+            logical_counts = count_logical_expert_tokens(topk_ids, num_logical_experts)
+
         # TODO merge into kernel
         if (expert_location_dispatch_info is not None) or (
             num_token_non_padded is not None
@@ -450,6 +474,7 @@ def select_experts(
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    lp_dispatch: bool = False,
 ):
     router_logits, correction_bias = (
         expert_location_dispatch.transform_select_experts_inputs(
@@ -475,6 +500,7 @@ def select_experts(
                 routed_scaling_factor=routed_scaling_factor,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
+                lp_dispatch=lp_dispatch,
             )
         else:
             topk_weights, topk_ids = biased_grouped_topk(
@@ -489,6 +515,7 @@ def select_experts(
                 routed_scaling_factor=routed_scaling_factor,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
+                lp_dispatch=lp_dispatch,
             )
     elif torch_native and custom_routing_function is None:
         assert (

@@ -918,3 +918,38 @@ def compute_utilization_rate(
         "mean",
     )
     return (avg_gpu_physical_count + 1e-5) / (max_gpu_physical_count + 1e-5)
+
+
+# --------------------------------------- Logical Expert Token Count Function -----------------------------------------
+
+def count_logical_expert_tokens(
+    logical_expert_ids: torch.Tensor, 
+    num_logical_experts: int
+) -> torch.Tensor:
+    """Count logical expert token occurrences from topk selection
+    
+    Args:
+        logical_expert_ids: Tensor of shape (num_tokens, topk) containing logical expert IDs
+        num_logical_experts: Number of logical experts
+        
+    Returns:
+        Tensor of shape (num_logical_experts,) containing token counts for each expert
+    """
+    device = logical_expert_ids.device
+    logical_counts = torch.zeros(num_logical_experts, dtype=torch.int32, device=device)
+    
+    # Flatten the expert IDs and count occurrences
+    flat_ids = logical_expert_ids.flatten()
+    # Filter out invalid IDs (like -1 for padding)
+    valid_mask = flat_ids >= 0
+    valid_ids = flat_ids[valid_mask]
+    
+    if valid_ids.numel() > 0:
+        # Use scatter_add to count occurrences
+        logical_counts.scatter_add_(
+            dim=0, 
+            index=valid_ids.long(), 
+            src=torch.ones_like(valid_ids, dtype=torch.int32)
+        )
+    
+    return logical_counts

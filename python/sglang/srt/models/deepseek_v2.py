@@ -364,6 +364,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
         self._enable_deepep_moe = global_server_args_dict["enable_deepep_moe"]
+        self._lp_dispatch = global_server_args_dict["lp_dispatch"]
 
     def get_moe_weights(self):
         return [
@@ -506,6 +507,7 @@ class DeepseekV2MoE(nn.Module):
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
+                lp_dispatch=self._lp_dispatch,
             )
         else:
             topk_idx = torch.full(
