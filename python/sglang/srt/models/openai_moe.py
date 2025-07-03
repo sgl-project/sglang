@@ -80,7 +80,7 @@ OpenAIMoeConfig = None
 
 logger = logging.getLogger(__name__)
 
-# todo: to make sure sliding window size for flashinfer is correct
+# Todo: to make sure sliding window size for flashinfer is correct
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
@@ -464,6 +464,7 @@ class OpenAIMoeAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
+            #Todo: to make sure if it is set to be true.
             reduce_results=True, # False,
             prefix=add_prefix("o_proj", prefix),
         )
