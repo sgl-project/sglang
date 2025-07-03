@@ -266,33 +266,37 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int num_tokens_per_expert) {
 
   const int flat_thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int num_items_per_iteration = gridDim.x * blockDim.x;
-  const int num_items_overall = num_tokens_per_expert * hidden_dim_num_groups * group_size * sizeof(T) / sizeof(InputDataType);
 
-  constexpr int NUM_INPUT_DATA = 6;
+  const int value = reinterpret_cast<const int*>(input)[flat_thread_idx];
+  *(reinterpret_cast<int*>(output_q) + flat_thread_idx) = value;
 
-  int output_data = 0;
-
+//   const int num_items_per_iteration = gridDim.x * blockDim.x;
+//   const int num_items_overall = num_tokens_per_expert * hidden_dim_num_groups * group_size * sizeof(T) / sizeof(InputDataType);
+//
+//   constexpr int NUM_INPUT_DATA = 6;
+//
+//   int output_data = 0;
+//
+// // #pragma unroll
+// //   for (int access_base_idx = flat_thread_idx; access_base_idx < num_items_overall; access_base_idx += num_items_per_iteration * NUM_INPUT_DATA) {
+//   const int access_base_idx = flat_thread_idx;
+//     InputDataType input_data[NUM_INPUT_DATA] = {{0,0,0,0}, {0,0,0,0}};
+//
 // #pragma unroll
-//   for (int access_base_idx = flat_thread_idx; access_base_idx < num_items_overall; access_base_idx += num_items_per_iteration * NUM_INPUT_DATA) {
-  const int access_base_idx = flat_thread_idx;
-    InputDataType input_data[NUM_INPUT_DATA] = {{0,0,0,0}, {0,0,0,0}};
-
-#pragma unroll
-    for (int i = 0; i < NUM_INPUT_DATA; ++i) {
-        const int access_idx = access_base_idx + num_items_per_iteration * i;
-        if (access_idx < num_items_overall) {
-          input_data[i] = ld_global_nc(reinterpret_cast<const int4*>(input) + access_idx);
-        }
-    }
-
-#pragma unroll
-    for (int i = 0; i < NUM_INPUT_DATA; ++i) {
-      output_data ^= input_data[i].x ^ input_data[i].y ^ input_data[i].z ^ input_data[i].w;
-    }
-//   }
-
-  *(reinterpret_cast<int*>(output_q) + flat_thread_idx) = output_data;
+//     for (int i = 0; i < NUM_INPUT_DATA; ++i) {
+//         const int access_idx = access_base_idx + num_items_per_iteration * i;
+//         if (access_idx < num_items_overall) {
+//           input_data[i] = ld_global_nc(reinterpret_cast<const int4*>(input) + access_idx);
+//         }
+//     }
+//
+// #pragma unroll
+//     for (int i = 0; i < NUM_INPUT_DATA; ++i) {
+//       output_data ^= input_data[i].x ^ input_data[i].y ^ input_data[i].z ^ input_data[i].w;
+//     }
+// //   }
+//
+//   *(reinterpret_cast<int*>(output_q) + flat_thread_idx) = output_data;
 
 //   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
 //   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
