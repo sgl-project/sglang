@@ -6,36 +6,17 @@ import pytest
 import torch
 
 from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
-from sglang.srt.layers.moe.ep_moe.kernels import (
-    pre_reorder_triton_kernel,
-    pre_reorder_triton_kernel_for_cutlass_moe,
-    run_cutlass_moe_ep_preproess,
-    run_moe_ep_preproess,
-)
 from sglang.srt.layers.moe.topk import select_experts
-
-debug = False
-# debug = False
-print_info = False
-
-
-def print_tensor_info(name, tensor):
-    if not print_info:
-        return
-    print(f"\n{name}:")
-    print(f"  shape: {tensor.shape}")
-    print(f"  values: {tensor.flatten()[:10]}")  # Print first 10 values
 
 
 def pack_int4_values_to_int8(int4_values_interleaved: torch.Tensor) -> torch.Tensor:
     if int4_values_interleaved.shape[-1] % 2 != 0:
-        raise ValueError("int4_values_interleaved 的最后一个维度的大小必须是偶数。")
+        raise ValueError(
+            "the last dim size of int4_values_interleaved tensor must be even."
+        )
 
     input_tensor_int8 = int4_values_interleaved.to(torch.int8)
 
-    # 分离低位和高位半字节的值
-    # a[..., 0::2] 取最后一个维度上索引为偶数的元素
-    # a[..., 1::2] 取最后一个维度上索引为奇数的元素
     low_nibbles = input_tensor_int8[..., 0::2]
     high_nibbles = input_tensor_int8[..., 1::2]
 
@@ -46,54 +27,45 @@ def pack_int4_values_to_int8(int4_values_interleaved: torch.Tensor) -> torch.Ten
 
 def pack_interleave(num_experts, ref_weight, ref_scale):
     n, k = ref_weight.shape[1], ref_weight.shape[2]
-    # packer = torch.ops.trtllm.pack_int8_tensor_to_packed_int4
 
-    # weight = packer(ref_weight.cpu()).cuda()
     weight = pack_int4_values_to_int8(ref_weight.cpu()).cuda()
     w_q = weight.view((num_experts, n, k // 2)).view(torch.int8)
-    # w_q = w_q.contiguous().transpose(1, 2)
     w_q = w_q.contiguous()
 
-    ###############################################################
-    # scale interleave, [E, K, N]
-    scale = ref_scale.permute(0, 2, 1)  # [E, N, K]
-    # scale = ref_scale
-    scale_interleaved = scale.reshape(
-        scale.shape[0], scale.shape[1], (scale.shape[2] // 4), 4
+    scale_interleaved = ref_scale.reshape(
+        ref_scale.shape[0], ref_scale.shape[1], (ref_scale.shape[2] // 4), 4
     )  # [E, N, K/4, 4]
     scale_interleaved = scale_interleaved.permute(0, 2, 1, 3)  # [E, K/4, N, 4]
     scale_interleaved = scale_interleaved.reshape(
-        scale.shape[0], scale.shape[2] // 4, scale.shape[1] * 4
+        ref_scale.shape[0], ref_scale.shape[2] // 4, ref_scale.shape[1] * 4
     )  # [E, K/4, N*4]
     w_scale = scale_interleaved.contiguous()
 
     return w_q, w_scale
 
 
+@pytest.mark.parametrize("M", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("N", [2048])
+@pytest.mark.parametrize("K", [7168])
+@pytest.mark.parametrize("E", [256])
+@pytest.mark.parametrize("ep_size", [8])
+@pytest.mark.parametrize("topk", [8])
+@pytest.mark.parametrize("group_size", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_fused_moe_w4afp8(dtype):
+def test_cutlass_w4a8_moe(M, N, K, E, ep_size, topk, group_size, dtype):
+    local_e = E // ep_size
 
-    M = 5
-    K = 7168
-    N = 2048
-    group_size = 128
-    E = 256
-    local_e = 32
-    # local_e = 32
-    topk = 8
-    dtype = torch.bfloat16
-
+    debug = False
     if debug:
-        a = torch.ones((M, k), dtype=dtype, device="cuda") * 0.001
-        # a[1:] = 0.02
+        a = torch.ones((M, K), dtype=dtype, device="cuda") * 0.001
         ref_weight_1 = torch.ones((local_e, N * 2, K), dtype=torch.int8, device="cuda")
         ref_weight_2 = torch.ones((local_e, K, N), dtype=torch.int8, device="cuda")
         a1_scale = torch.ones(1, dtype=torch.float32, device="cuda")
         a2_scale = torch.ones(1, dtype=torch.float32, device="cuda")
         scale_1 = torch.ones(
-            (local_e, K // group_size, N * 2), dtype=dtype, device="cuda"
+            (local_e, N * 2, K // group_size), dtype=dtype, device="cuda"
         )
-        scale_2 = torch.ones((local_e, N // group_size, K), dtype=dtype, device="cuda")
+        scale_2 = torch.ones((local_e, K, N // group_size), dtype=dtype, device="cuda")
     else:
         a = torch.randn(M, K, dtype=dtype, device="cuda")
         ref_weight_1 = torch.randint(
@@ -105,21 +77,17 @@ def test_fused_moe_w4afp8(dtype):
         affine_coeff = 0.005
         a1_scale = torch.randn(1, dtype=torch.float32, device="cuda")
         a2_scale = torch.randn(1, dtype=torch.float32, device="cuda")
-        # a1_scale = torch.ones(1, dtype=torch.float32, device="cuda")
-        # a2_scale = torch.ones(1, dtype=torch.float32, device="cuda")
         scale_1 = (
-            torch.randn(local_e, K // group_size, N * 2, dtype=dtype, device="cuda")
+            torch.randn(local_e, N * 2, K // group_size, dtype=dtype, device="cuda")
             * affine_coeff
         )
         scale_2 = (
-            torch.randn(local_e, N // group_size, K, dtype=dtype, device="cuda")
+            torch.randn(local_e, K, N // group_size, dtype=dtype, device="cuda")
             * affine_coeff
         )
 
     w1_q, w1_scale = pack_interleave(local_e, ref_weight_1, scale_1)
     w2_q, w2_scale = pack_interleave(local_e, ref_weight_2, scale_2)
-    print("w1_q.shape", w1_q.shape)
-    print("w1_scale.shape", w1_scale.shape)
 
     device = "cuda"
     a_strides1 = torch.full((local_e, 3), K, device=device, dtype=torch.int64)
@@ -131,7 +99,7 @@ def test_fused_moe_w4afp8(dtype):
     b_strides2 = a_strides2
     s_strides2 = c_strides2
 
-    score = torch.randn((M, E), device="cuda", dtype=dtype)
+    score = torch.randn((M, E), dtype=dtype, device=device)
     topk_weights, topk_ids = select_experts(
         hidden_states=a,
         router_logits=score,
@@ -139,7 +107,7 @@ def test_fused_moe_w4afp8(dtype):
         use_grouped_topk=False,
         renormalize=False,
     )
-    expert_map = torch.arange(E, dtype=torch.int32, device="cuda")
+    expert_map = torch.arange(E, dtype=torch.int32, device=device)
     expert_map[local_e:] = E
 
     output = cutlass_moe(
@@ -166,7 +134,7 @@ def test_fused_moe_w4afp8(dtype):
         expert_map,
     )
 
-    ref_output, ref_tensors = ref(
+    ref_output = ref(
         a,
         local_e,
         topk_weights,
@@ -186,14 +154,8 @@ def test_fused_moe_w4afp8(dtype):
     # compare
     torch.cuda.synchronize()
 
-    # compare_intermediate_val(cutlass_tensors, ref_tensors)
-
     # compare final output
-    print("\nComparing final output tensors...")
-    print("output", output)
-    print("ref_output", ref_output)
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
-    # woq_assert_near_eq(ref_output, output, 2)
     print("SUCCESS: Final output tensors are close.")
 
 
@@ -282,21 +244,7 @@ def ref(
 ):
     results = torch.zeros_like(x)
     dtype = x.dtype
-    m = x.shape[0]
-    k = x.shape[1]
-    n = ref_weight_2.shape[1]
-    # selected_experts, final_scales = routing_method.apply(router_logits)
-    # unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
-    tensors_collector = []
-    aggregated_tensors_lists = {
-        "c1": [],
-        "silu_intermediate": [],
-        "intermediate_q": [],
-        "c2": [],
-        "delta_results": [],  # Stores the contribution of each expert to the results
-    }
     for e_idx in range(num_experts):
-        print(f"==================expert {e_idx}======================")
         mask = topk_ids == e_idx
         activated_tokens = mask.sum(1).bool()
         act = x[activated_tokens, :]
@@ -309,147 +257,25 @@ def ref(
             .to(torch.float8_e4m3fn)
             .to(dtype)
         )
-        print_tensor_info("act", act)
         w3_w1 = ref_weight_1[e_idx]
         ref_w_scale_repeat = (
-            ref_weight_scale_1[e_idx].t().repeat_interleave(128, dim=1).to(float)
+            ref_weight_scale_1[e_idx].repeat_interleave(128, dim=1).to(float)
         )
-        print_tensor_info("ref_w_scale_repeat1", ref_w_scale_repeat)
         w3_w1 = (w3_w1.to(float) * ref_w_scale_repeat).to(dtype)
         fc1 = ((torch.matmul(act, w3_w1.T)) * alpha_1).to(torch.float16)
-        print_tensor_info("fc1", fc1)
-        aggregated_tensors_lists["c1"].append(fc1.clone().detach())
-        # tensors_collector.append({
-        #     "name": "c1",
-        #     "tensor": fc1.clone().detach()
-        # })
 
         gate, fc1 = fc1.chunk(2, dim=-1)
-        print_tensor_info("gate", gate)
-        print_tensor_info("fc1", fc1)
         fc1 = fc1 * torch.nn.functional.silu(gate)
-        print_tensor_info("fc1 after silu", fc1)
-        # tensors_collector.append({
-        #     "name": "silu_intermediate",
-        #     "tensor": fc1.clone().detach()
-        # })
-        aggregated_tensors_lists["silu_intermediate"].append(fc1.clone().detach())
-
-        # act = torch.clamp((fc1 / pre_quant_scale_2[e_idx].float()), -448.0,
-        #                   448.0).to(torch.float8_e4m3fn).to(dtype)
-        print_tensor_info("pre_quant_scale_2", pre_quant_scale_2)
         act = (fc1 / pre_quant_scale_2.float()).to(torch.float8_e4m3fn)
-        # torch.save(act, "ref_intermediate_q_fp8")
         act = act.to(dtype)
-        print_tensor_info("act2", act)
-        # tensors_collector.append({
-        #     "name": "intermediate_q",
-        #     "tensor": act.clone().detach()
-        # })
-        aggregated_tensors_lists["intermediate_q"].append(act.clone().detach())
-
-        # act = torch.load("ref_intermediate_q_fp8").to(dtype)
-        # tensors_collector.append({
-        #     "name": "intermediate_q",
-        #     "tensor": act.clone().detach()
-        # })
 
         w2 = ref_weight_2[e_idx]
         ref_w_scale_repeat = (
-            ref_weight_scale_2[e_idx].t().repeat_interleave(128, dim=1).to(float)
+            ref_weight_scale_2[e_idx].repeat_interleave(128, dim=1).to(float)
         )
-        print_tensor_info("ref_w_scale_repeat2", ref_w_scale_repeat)
         w2 = (w2.to(float) * ref_w_scale_repeat).to(dtype)
         fc2 = (torch.matmul(act, w2.T) * alpha_2).to(torch.float16)
-        print_tensor_info("fc2", fc2)
-        # tensors_collector.append({
-        #     "name": "c2",
-        #     "tensor": fc2.clone().detach()
-        # })
-        aggregated_tensors_lists["c2"].append(fc2.clone().detach())
 
         results[activated_tokens, :] += (fc2 * final_scale).to(results.dtype)
-        print_tensor_info("results", results)
-        # tensors_collector.append({
-        #     "name": "results",
-        #     "tensor": results.clone().detach()
-        # })
 
-    for name, tensor_list in aggregated_tensors_lists.items():
-        non_empty_tensors = [t for t in tensor_list if t.numel() > 0]
-        if non_empty_tensors:
-            aggregated_tensor = torch.cat(non_empty_tensors, dim=0)
-            tensors_collector.append({"name": name, "tensor": aggregated_tensor})
-        elif name in [
-            "c1",
-            "silu_intermediate",
-            "intermediate_q",
-            "c2",
-            "delta_results",
-        ]:
-            print(
-                f"Warning: All tensors for step '{name}' were empty or skipped. Appending an empty tensor."
-            )
-            # Determine a representative dtype and device
-            ref_dtype = x.dtype
-            ref_device = x.device
-            expected_k_dim = 0
-            if name == "c1":
-                expected_k_dim = n * 2
-            elif name == "silu_intermediate" or name == "intermediate_q":
-                expected_k_dim = n
-            elif name == "c2" or name == "delta_results":
-                expected_k_dim = k
-
-            tensors_collector.append(
-                {
-                    "name": name,
-                    "tensor": torch.empty(
-                        (0, expected_k_dim), dtype=ref_dtype, device=ref_device
-                    ),
-                }
-            )
-    return results, tensors_collector
-
-
-def compare_intermediate_val(cutlass_tensors, ref_tensors):
-    cutlass_tensors_map = {}
-    if cutlass_tensors:  # Check if cutlass_tensors is not None and not empty
-        cutlass_tensors_map = {item["name"]: item["tensor"] for item in cutlass_tensors}
-
-    for ref_item in ref_tensors:
-        ref_name = ref_item["name"]
-        ref_tensor_val = ref_item["tensor"]
-
-        print(f"\nComparing tensor: '{ref_name}'")
-
-        if ref_name in cutlass_tensors_map:
-            cutlass_tensor_val = cutlass_tensors_map[ref_name]
-            try:
-                if cutlass_tensor_val.device != ref_tensor_val.device:
-                    print(
-                        f"  WARNING: Tensor '{ref_name}' devices differ. Ref: {ref_tensor_val.device}, Cutlass: {cutlass_tensor_val.device}. Moving Cutlass tensor to Ref tensor's device."
-                    )
-                    cutlass_tensor_val = cutlass_tensor_val.to(ref_tensor_val.device)
-
-                torch.testing.assert_close(
-                    cutlass_tensor_val, ref_tensor_val, rtol=1e-2, atol=0.1
-                )
-                print(f"  SUCCESS: '{ref_name}' tensors are close.")
-            except AssertionError as e:
-                # torch.set_printoptions(threshold=10_000)
-                print(f"  FAILURE: '{ref_name}' tensors are NOT close.")
-                print(f"    Ref tensor: {ref_tensor_val.flatten()}")
-                print(f"    Cutlass tensor: {cutlass_tensor_val.flatten()}")
-                print(
-                    f"    Max absolute difference: {torch.max(torch.abs(cutlass_tensor_val.to(ref_tensor_val.dtype) - ref_tensor_val))}"
-                )
-                print(
-                    f"    Mean absolute difference: {torch.mean(torch.abs(cutlass_tensor_val.to(ref_tensor_val.dtype) - ref_tensor_val))}"
-                )
-                print(f"    AssertionError: {e}")
-                raise
-        else:
-            print(
-                f"  WARNING: Tensor '{ref_name}' not found in cutlass_tensors output."
-            )
+    return results
