@@ -85,6 +85,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "deepep_mode",
     "enable_ep_moe",
     "enable_flashinfer_moe",
+    "enable_flashinfer_allreduce_fusion",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
     "deepep_config",
@@ -173,6 +174,15 @@ class Modality(Enum):
     MULTI_IMAGES = auto()
     VIDEO = auto()
     AUDIO = auto()
+
+    @staticmethod
+    def from_str(modality_str: str):
+        try:
+            return Modality[modality_str.upper()]
+        except KeyError:
+            raise ValueError(
+                f"Invalid modality string: {modality_str}. Valid modalities are: {[m.name for m in Modality]}"
+            )
 
 
 @dataclasses.dataclass
