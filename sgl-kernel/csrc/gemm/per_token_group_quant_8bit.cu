@@ -116,8 +116,11 @@ __device__ __host__ __forceinline__ int4 operator+(const int4& a, const int4& b)
 }
 
 constexpr float LOCAL_ABSMAX_ABS = 1e-10;
-constexpr int THREADS_PER_SUBWARP = 8;
+// constexpr int THREADS_PER_SUBWARP = 8;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
+
+constexpr int THREADS_PER_SUBWARP = 16;
+using InputDataType = int4;
 
 struct NaiveScheduler {
   static void compute_exec_config(
@@ -141,6 +144,10 @@ struct NaiveScheduler {
     })();
     grid = dim3(num_groups / subwarps_per_block);
     block = dim3(subwarps_per_block * THREADS_PER_SUBWARP);
+
+    const int group_size = 128;
+    const int sizeof_T = 2;
+    TORCH_CHECK(grid.x * block.x * 32 * sizeof(InputDataType) == num_groups * group_size * sizeof_T);
   }
 
   template <bool FUSE_SILU_AND_MUL, typename FUNC>
@@ -244,8 +251,12 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int scale_expert_stride,
     const int scale_hidden_stride,
     const int num_tokens_per_expert) {
-    
-  TODO;
+
+  const int flat_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  InputDataType input_data = ld_global_nc(reinterpret_cast<const int4*>(input) + flat_idx);
+  int output_data = input_data.x + input_data.y + input_data.z + input_data.w;
+  *(reinterpret_cast<int*>(output_q) + flat_idx) = output_data;
 
 //   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
 //   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
