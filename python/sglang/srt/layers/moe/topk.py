@@ -108,38 +108,14 @@ def fused_topk(
         M, topk, dtype=torch.float32, device=hidden_states.device
     )
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
-    token_expert_indicies = torch.empty(
-        M, topk, dtype=torch.int32, device=hidden_states.device
-    )
 
     topk_softmax(
         topk_weights,
         topk_ids,
-        token_expert_indicies,
         gating_output.float(),
-    )
-    del token_expert_indicies
-
-    return _fused_topk_postprocess(
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        renormalize=renormalize,
-        expert_location_dispatch_info=expert_location_dispatch_info,
-        num_token_non_padded=num_token_non_padded,
+        renormalize,
     )
 
-
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def _fused_topk_postprocess(
-    topk_weights,
-    topk_ids,
-    renormalize,
-    expert_location_dispatch_info,
-    num_token_non_padded,
-):
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
 
