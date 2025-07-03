@@ -314,7 +314,12 @@ class EPMoE(torch.nn.Module):
             )
         return (local_num_experts, expert_map)
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor, forward_batch: ForwardBatch):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
             return self.forward_deepgemm(hidden_states, router_logits)
         else:
