@@ -185,6 +185,7 @@ class Qwen2DecoderLayer(nn.Module):
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -246,6 +247,7 @@ class Qwen2Model(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         decoder_layer_type: type[nn.Module] = Qwen2DecoderLayer,
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -272,6 +274,7 @@ class Qwen2Model(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
+                alt_stream=alt_stream,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,

@@ -51,6 +51,7 @@ class Qwen3Attention(nn.Module):
         rms_norm_eps: float = None,
         attention_bias: bool = False,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -111,8 +112,7 @@ class Qwen3Attention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
         )
-
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.alt_stream = alt_stream
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -158,6 +158,7 @@ class Qwen3DecoderLayer(nn.Module):
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -178,6 +179,7 @@ class Qwen3DecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=config.attention_bias,
             prefix=add_prefix("self_attn", prefix),
+            alt_stream=alt_stream,
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -223,11 +225,13 @@ class Qwen3Model(Qwen2Model):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        alt_stream = torch.cuda.Stream() if _is_cuda else None
         super().__init__(
             config=config,
             quant_config=quant_config,
             prefix=prefix,
             decoder_layer_type=Qwen3DecoderLayer,
+            alt_stream=alt_stream,
         )
 
 

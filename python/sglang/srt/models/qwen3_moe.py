@@ -354,6 +354,7 @@ class Qwen3MoeAttention(nn.Module):
         attention_bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -423,7 +424,7 @@ class Qwen3MoeAttention(nn.Module):
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.alt_stream = alt_stream
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -503,6 +504,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -528,6 +530,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             attention_bias=attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
+            alt_stream=alt_stream,
         )
 
         self.layer_id = layer_id
@@ -671,11 +674,13 @@ class Qwen3MoeModel(Qwen2MoeModel):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        alt_stream = torch.cuda.Stream() if _is_cuda else None
         super().__init__(
             config=config,
             quant_config=quant_config,
             prefix=prefix,
             decoder_layer_type=Qwen3MoeDecoderLayer,
+            alt_stream=alt_stream,
         )
 
 
