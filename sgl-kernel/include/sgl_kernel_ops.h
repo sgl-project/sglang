@@ -222,10 +222,7 @@ void moe_align_block_size(
     bool pad_sorted_token_ids);
 
 void topk_softmax(
-    torch::Tensor& topk_weights,
-    torch::Tensor& topk_indices,
-    torch::Tensor& token_expert_indices,
-    torch::Tensor& gating_output);
+    torch::Tensor& topk_weights, torch::Tensor& topk_indices, torch::Tensor& gating_output, bool renormalize);
 
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
