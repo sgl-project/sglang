@@ -668,6 +668,12 @@ class Gemma3ForCausalLM(PreTrainedModel):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+
+                if "language_model" in name and name not in params_dict.keys():
+                    name = name.replace("language_model.", "")
+                if "multi_modal_projector" in name or "vision_tower" in name:
+                    continue
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -683,6 +689,11 @@ class Gemma3ForCausalLM(PreTrainedModel):
                 # Remapping the name of FP8 kv-scale.
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
+                    continue
+
+                if "language_model" in name and name not in params_dict.keys():
+                    name = name.replace("language_model.", "")
+                if "multi_modal_projector" in name or "vision_tower" in name:
                     continue
 
                 param = params_dict[name]
