@@ -374,7 +374,8 @@ void build_tree_kernel_efficient(
     at::Tensor retrive_next_sibling,
     int64_t topk,
     int64_t depth,
-    int64_t draft_token_num);
+    int64_t draft_token_num,
+    int64_t tree_mask_mode);
 
 void segment_packbits(
     at::Tensor x,
