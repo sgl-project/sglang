@@ -228,7 +228,7 @@ class VILAForConditionalGeneration(nn.Module):
             forward_batch=forward_batch,
             language_model=self.llm,
             data_embedding_funcs={
-                Modality.IMAGE: self.get_image_feature(),
+                Modality.IMAGE: self.get_image_feature,
             },
             get_embedding=get_embedding,
             positions=positions,
