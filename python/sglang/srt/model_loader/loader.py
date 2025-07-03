@@ -124,6 +124,9 @@ def _get_quantization_config(
         quant_config = get_quant_config(
             model_config, load_config, packed_modules_mapping
         )
+        # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
+        if quant_config is None:
+            return None
         major, minor = get_device_capability()
 
         if major is not None and minor is not None:
@@ -534,6 +537,12 @@ class DummyModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
+
+        if get_bool_env_var("SGL_CPU_QUANTIZATION"):
+            return load_model_with_cpu_quantization(
+                self, model_config=model_config, device_config=device_config
+            )
+
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(
@@ -1462,6 +1471,38 @@ class RemoteModelLoader(BaseModelLoader):
         end = time.perf_counter()
         logger.info("Loaded weights from remote storage in %.2f seconds.", end - start)
         return model.eval()
+
+
+def load_model_with_cpu_quantization(
+    self,
+    *,
+    model_config: ModelConfig,
+    device_config: DeviceConfig,
+) -> nn.Module:
+    target_device = torch.device(device_config.device)
+    with set_default_torch_dtype(model_config.dtype):
+        model = _initialize_model(
+            model_config,
+            self.load_config,
+        )
+
+        if not isinstance(self, DummyModelLoader):
+            model.load_weights(self._get_all_weights(model_config, model))
+
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                # When quant methods need to process weights after loading
+                # (for repacking, quantizing, etc), they expect parameters
+                # to be on the global target device. This scope is for the
+                # case where cpu offloading is used, where we will move the
+                # parameters onto device for processing and back off after.
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+
+        model.to(target_device)
+
+    return model.eval()
 
 
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:

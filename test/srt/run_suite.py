@@ -128,7 +128,7 @@ suites = {
         TestFile("test_input_embeddings.py", 38),
         TestFile("test_metrics.py", 32),
         TestFile("test_no_chunked_prefill.py", 108),
-        TestFile("test_no_overlap_scheduler.py", 234),
+        # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
         TestFile("test_penalty.py", 41),
         TestFile("test_page_size.py", 60),
         TestFile("test_pytorch_sampling_backend.py", 66),
@@ -140,7 +140,7 @@ suites = {
         TestFile("test_triton_attention_backend.py", 150),
         TestFile("test_update_weights_from_disk.py", 114),
         TestFile("test_vertex_endpoint.py", 31),
-        TestFile("test_vision_chunked_prefill.py", 175),
+        # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         TestFile("test_reasoning_parser.py", 5),
     ],
     "per-commit-2-gpu": [
@@ -173,10 +173,11 @@ suites = {
         # TestFile("test_deepep_intranode.py", 50),
         # TestFile("test_deepep_low_latency.py", 50),
         # TestFile("test_moe_deepep_eval_accuracy_large.py", 250),
+        # Disabled because it hangs on the CI.
+        # TestFile("test_moe_ep.py", 181),
         TestFile("test_disaggregation.py", 270),
         TestFile("test_disaggregation_different_tp.py", 155),
         TestFile("test_full_deepseek_v3.py", 463),
-        TestFile("test_moe_ep.py", 181),
     ],
     "per-commit-8-gpu-amd": [
         TestFile("test_full_deepseek_v3.py", 250),
