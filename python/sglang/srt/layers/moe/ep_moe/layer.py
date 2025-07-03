@@ -257,7 +257,7 @@ class EPMoE(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
-        forward_batch: ForwardBatch,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
             return self.forward_deepgemm(hidden_states, router_logits)

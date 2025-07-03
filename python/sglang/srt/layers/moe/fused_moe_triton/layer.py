@@ -888,7 +888,7 @@ class FusedMoE(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
-        forward_batch: ForwardBatch,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         assert self.quant_method is not None
 
