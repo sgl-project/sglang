@@ -106,6 +106,15 @@ __device__ __forceinline__ int compute_input_group_start_offset(
          token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) + hidden_dim_group_idx * group_size;
 }
 
+__device__ __host__ __forceinline__ int4 operator+(const int4& a, const int4& b) {
+    int4 result;
+    result.x = a.x + b.x;
+    result.y = a.y + b.y;
+    result.z = a.z + b.z;
+    result.w = a.w + b.w;
+    return result;
+}
+
 constexpr float LOCAL_ABSMAX_ABS = 1e-10;
 constexpr int THREADS_PER_SUBWARP = 8;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
