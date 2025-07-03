@@ -53,6 +53,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         hidden_size: int,
         intermediate_size: int,
         params_dtype: torch.dtype,
+        bias: bool = False,
         **extra_weight_attrs,
     ):
         raise NotImplementedError
@@ -80,6 +81,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         hidden_size: int,
         intermediate_size: int,
         params_dtype: torch.dtype,
+        bias: bool = False,
         **extra_weight_attrs,
     ):
         # Fused gate_up_proj (column parallel)
@@ -92,16 +94,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
-        # Add bias for gate_up_proj
-        w13_bias = torch.nn.Parameter(
-            torch.empty(
-                num_experts, 2 * intermediate_size, dtype=params_dtype
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_bias", w13_bias)
-        set_weight_attrs(w13_bias, extra_weight_attrs)
-
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
             torch.empty(
@@ -112,15 +104,31 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
-        # Add bias for down_proj
-        w2_bias = torch.nn.Parameter(
-            torch.empty(
-                num_experts, hidden_size, dtype=params_dtype
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_bias", w2_bias)
-        set_weight_attrs(w2_bias, extra_weight_attrs)
+        # Create bias parameters only if bias=True
+        if bias:
+            # Add bias for gate_up_proj
+            w13_bias = torch.nn.Parameter(
+                torch.empty(
+                    num_experts, 2 * intermediate_size, dtype=params_dtype
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_bias", w13_bias)
+            set_weight_attrs(w13_bias, extra_weight_attrs)
+
+            # Add bias for down_proj
+            w2_bias = torch.nn.Parameter(
+                torch.empty(
+                    num_experts, hidden_size, dtype=params_dtype
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_bias", w2_bias)
+            set_weight_attrs(w2_bias, extra_weight_attrs)
+        else:
+            # Register as None when bias is disabled
+            layer.register_parameter("w13_bias", None)
+            layer.register_parameter("w2_bias", None)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _use_aiter:
@@ -339,6 +347,7 @@ class FusedMoE(torch.nn.Module):
         routed_scaling_factor: Optional[float] = None,
         enable_flashinfer_moe: Optional[bool] = False,
         enable_ep_moe: Optional[bool] = False,
+        bias: bool = False,
     ):
         super().__init__()
 
@@ -400,6 +409,7 @@ class FusedMoE(torch.nn.Module):
         self.use_presharded_weights = use_presharded_weights
         self.inplace = inplace
         self.no_combine = no_combine
+        self.bias = bias
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = (
@@ -420,6 +430,7 @@ class FusedMoE(torch.nn.Module):
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
+            bias=self.bias,
         )
 
     def _load_per_tensor_weight_scale(

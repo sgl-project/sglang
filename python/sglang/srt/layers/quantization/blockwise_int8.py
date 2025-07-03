@@ -272,6 +272,7 @@ class BlockInt8MoEMethod:
         hidden_size: int,
         intermediate_size: int,
         params_dtype: torch.dtype,
+        bias: bool = False,
         **extra_weight_attrs,
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported

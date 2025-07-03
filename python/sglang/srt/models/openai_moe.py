@@ -151,7 +151,7 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             renormalize=config.norm_topk_prob,
-            # bias=config.mlp_bias, # Todo: add bias support in MoE impl class
+            bias=config.mlp_bias, # Todo: add bias support in MoE impl class
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
             **(
