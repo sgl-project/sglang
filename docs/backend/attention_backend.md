@@ -9,6 +9,7 @@
 | **Triton**               | ❌                | ✅                 | ✅      | ✅                 | ❌              |
 | **Torch Native**         | ❌                | ❌                 | ❌      | ❌                 | ❌              |
 | **FlashMLA**             | ✅                | ✅                 | ✅      | ❌                 | ❌              |
+| **Ascend**               | ✅                | ❌                 | ❌      | ❌                 | ❌              |
 
 Note: Every kernel backend is compatible with a page size > 1 by specifying an argument such as `--page-size 16`.
 This is because a page size of 16 can be converted to a page size of 1 in the kernel backend.
@@ -45,4 +46,9 @@ python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --
 ```bash
 python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-R1 --attention-backend flashmla --trust-remote-code
 python3 -m sglang.launch_server --tp 8 --model deepseek-ai/DeepSeek-R1 --attention-backend flashmla --kv-cache-dtype fp8_e4m3 --trust-remote-code
+```
+
+- Ascend
+```bash
+python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3.1-8B-Instruct --attention-backend ascend
 ```
