@@ -336,10 +336,12 @@ class DeepseekV2MoE(nn.Module):
                     else {}
                 ),
             )
-            is_packed_weight = (
-                self.shared_experts.gate_up_proj.quant_method.quant_config.get_name()
-                in {"awq", "moe_wna16"}
-            )
+            is_packed_weight = hasattr(
+                self.shared_experts.gate_up_proj.quant_method, "quant_config"
+            ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
+                "awq",
+                "moe_wna16",
+            }
             self.shared_experts_is_int8 = (
                 not is_packed_weight
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
@@ -899,6 +901,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         is_packed_weight = (
             has_fused_proj
+            and hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config")
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
             in {"awq", "moe_wna16"}
         )
