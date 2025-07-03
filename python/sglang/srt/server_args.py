@@ -46,6 +46,7 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
+    skip_server_warmup: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
@@ -156,6 +157,7 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     enable_flashinfer_moe: bool = False
+    enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -596,6 +598,11 @@ class ServerArgs:
             "--skip-tokenizer-init",
             action="store_true",
             help="If set, skip init tokenizer and pass input_ids in generate request.",
+        )
+        parser.add_argument(
+            "--skip-server-warmup",
+            action="store_true",
+            help="If set, skip warmup.",
         )
         parser.add_argument(
             "--load-format",
@@ -1199,6 +1206,11 @@ class ServerArgs:
             "--enable-flashinfer-moe",
             action="store_true",
             help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP with --enable-ep-moe",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-allreduce-fusion",
+            action="store_true",
+            help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
         )
         parser.add_argument(
             "--enable-deepep-moe",

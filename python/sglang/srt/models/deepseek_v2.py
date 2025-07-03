@@ -111,9 +111,16 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_device_sm = get_device_sm()
 
 if _is_cuda:
-    from sgl_kernel import awq_dequantize, bmm_fp8, dsv3_fused_a_gemm, merge_state_v2
+    from sgl_kernel import (
+        awq_dequantize,
+        bmm_fp8,
+        dsv3_fused_a_gemm,
+        dsv3_router_gemm,
+        merge_state_v2,
+    )
 elif _is_cpu and _is_cpu_amx_available:
     pass
 else:
@@ -225,7 +232,18 @@ class MoEGate(nn.Module):
                 True,  # is_vnni
             )
 
-        logits = F.linear(hidden_states, self.weight, None)
+        if (
+            hidden_states.shape[0] < 4
+            and hidden_states.shape[1] == 7168
+            and self.weight.shape[0] == 256
+            and _device_sm >= 90
+        ):
+            logits = dsv3_router_gemm(hidden_states, self.weight).to(
+                hidden_states.dtype
+            )
+        else:
+            logits = F.linear(hidden_states, self.weight, None)
+
         return logits
 
 
@@ -318,11 +336,17 @@ class DeepseekV2MoE(nn.Module):
                     else {}
                 ),
             )
+            is_packed_weight = (
+                self.shared_experts.gate_up_proj.quant_method.quant_config.get_name()
+                in ["awq", "moe_wna16"]
+            )
             self.shared_experts_is_int8 = (
-                self.shared_experts.gate_up_proj.weight.dtype == torch.int8
+                not is_packed_weight
+                and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
             )
             self.shared_experts_is_fp8 = (
-                self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+                not is_packed_weight
+                and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
             )
             if self.shared_experts_is_fp8:
                 assert (
@@ -876,21 +900,28 @@ class DeepseekV2AttentionMLA(nn.Module):
                 weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
             )
 
+        is_packed_weight = (
+            self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
+            in ["awq", "moe_wna16"]
+        )
         self.use_min_latency_fused_a_gemm = (
             hasattr(self, "fused_qkv_a_proj_with_mqa")
+            and not is_packed_weight
             and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
             and self.fused_qkv_a_proj_with_mqa.weight.shape[0] == 2112
             and self.fused_qkv_a_proj_with_mqa.weight.shape[1] == 7168
             and is_cuda
-            and get_device_sm() >= 90
+            and _device_sm >= 90
         )
 
         self.qkv_proj_with_rope_is_int8 = (
             hasattr(self, "fused_qkv_a_proj_with_mqa")
+            and not is_packed_weight
             and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.int8
         )
         self.qkv_proj_with_rope_is_fp8 = (
             hasattr(self, "fused_qkv_a_proj_with_mqa")
+            and not is_packed_weight
             and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.float8_e4m3fn
         )
 
