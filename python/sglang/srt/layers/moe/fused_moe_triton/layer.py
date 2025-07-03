@@ -321,6 +321,44 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 routed_scaling_factor,
             )
 
+    def forward_npu(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
+    ) -> torch.Tensor:
+        return moe_forward_native(
+            layer,
+            x,
+            use_grouped_topk,
+            top_k,
+            router_logits,
+            renormalize,
+            topk_group,
+            num_expert_group,
+            num_fused_shared_experts,
+            custom_routing_function,
+            correction_bias,
+            activation,
+            apply_router_weight_on_input,
+            inplace,
+            no_combine,
+            routed_scaling_factor,
+        )
+
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
 
