@@ -277,6 +277,34 @@ class TestAWQMethods(unittest.TestCase):
             torch.allclose(output_fused, output_orig, atol=1e-2, rtol=1e-2)
         )  # Tighter for consistency
 
+    def test_fused_awq_method_unaligned_output(self):
+        """Tests the fused AWQ method where the output dim is not divisible by 128."""
+        # Override setup for this specific test
+        self.output_size = 200  # Not divisible by 128, but divisible by pack_factor (8)
+        self.output_partition_sizes = [self.output_size]
+
+        (
+            layer,
+            method,
+            x,
+            _,
+            qweight,
+            qzeros,
+            scales,
+        ) = self._setup_linear_layer(FusedAWQLinearMethod)
+        output = method.apply(layer, x, bias=None)
+
+        ref_dequant_weight = sgl_kernel.awq_dequantize(qweight, scales, qzeros)
+        expected_output = torch.matmul(
+            x.reshape(-1, self.input_size), ref_dequant_weight
+        )
+
+        self.assertEqual(output.shape, expected_output.shape)
+        self.assertEqual(output.shape, (self.batch_size, self.output_size))
+        self.assertTrue(
+            torch.allclose(output, expected_output, atol=1e-1, rtol=1e-1)
+        )
+
 
 if __name__ == "__main__":
     loader = unittest.TestLoader()
