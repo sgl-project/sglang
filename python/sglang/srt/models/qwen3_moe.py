@@ -792,7 +792,7 @@ class Qwen3MoeForCausalLM(nn.Module):
 
         self.capture_aux_hidden_states = True
         num_layers = self.config.num_hidden_layers
-        self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]  # Specific layers for EAGLE3 support
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
