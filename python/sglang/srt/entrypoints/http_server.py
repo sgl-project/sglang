@@ -939,7 +939,7 @@ def _execute_server_warmup(
     pipe_finish_writer: Optional[multiprocessing.connection.Connection],
 ):
     headers = {}
-    url = server_args.url()
+    url = server_args.url_or_local()
     if server_args.api_key:
         headers["Authorization"] = f"Bearer {server_args.api_key}"
 
