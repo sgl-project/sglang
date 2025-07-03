@@ -80,7 +80,7 @@ OpenAIMoeConfig = None
 
 logger = logging.getLogger(__name__)
 
-
+# todo: to make sure sliding window size for flashinfer is correct
 def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
