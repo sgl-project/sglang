@@ -115,12 +115,19 @@ __device__ __host__ __forceinline__ int4 operator+(const int4& a, const int4& b)
     return result;
 }
 
+template <typename dtype_t>
+__host__ __device__ __forceinline__ dtype_t ceil_div(dtype_t a, dtype_t b) {
+    return (a + b - 1) / b;
+}
+
 constexpr float LOCAL_ABSMAX_ABS = 1e-10;
 // constexpr int THREADS_PER_SUBWARP = 8;
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
+constexpr int NUM_WAVES = 6;
 
 constexpr int THREADS_PER_SUBWARP = 16;
 using InputDataType = int4;
+constexpr int NUM_SMS = 152;
 
 struct NaiveScheduler {
   static void compute_exec_config(
@@ -142,14 +149,16 @@ struct NaiveScheduler {
       }
       return 1;
     })();
-    grid = dim3(num_groups / subwarps_per_block);
-    block = dim3(subwarps_per_block * THREADS_PER_SUBWARP);
+    const int block_dim = subwarps_per_block * THREADS_PER_SUBWARP;
+    constexpr int NUM_THREADS_PER_SM = 2048;
+    grid = dim3(NUM_SMS * (NUM_THREADS_PER_SM / block_dim));
+    block = dim3(block_dim);
 
-    const int group_size = 128;
-    const int sizeof_T = 2;
-//     printf("grid.x=%d block.x=%d num_groups=%d \n", grid.x, block.x, num_groups);
-    TORCH_CHECK(grid.x * block.x * sizeof(InputDataType) == num_groups * group_size * sizeof_T,
-        "grid.x=", grid.x, "block.x=", block.x, "num_groups=", num_groups);
+//     const int group_size = 128;
+//     const int sizeof_T = 2;
+    printf("grid.x=%d block.x=%d num_groups=%d \n", grid.x, block.x, num_groups);
+//     TORCH_CHECK(grid.x * block.x * sizeof(InputDataType) == num_groups * group_size * sizeof_T,
+//         "grid.x=", grid.x, "block.x=", block.x, "num_groups=", num_groups);
   }
 
   template <bool FUSE_SILU_AND_MUL, typename FUNC>
@@ -254,11 +263,21 @@ __global__ void per_token_group_quant_8bit_kernel(
     const int scale_hidden_stride,
     const int num_tokens_per_expert) {
 
-  const int flat_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int flat_thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int num_items_per_iteration = gridDim.x * blockDim.x;
+  const int num_items_overall = num_tokens_per_expert * hidden_dim_num_groups * group_size * sizeof(T) / sizeof(InputDataType);
 
-  InputDataType input_data = ld_global_nc(reinterpret_cast<const int4*>(input) + flat_idx);
-  int output_data = input_data.x + input_data.y + input_data.z + input_data.w;
-  *(reinterpret_cast<int*>(output_q) + flat_idx) = output_data;
+#pragma unroll
+  for (int iter_idx = 0; iter_idx < NUM_WAVES; ++iter_idx) {
+    const int access_idx = iter_idx * num_items_per_iteration + flat_thread_idx;
+    if (access_idx >= num_items_overall) {
+      break;
+    }
+
+    InputDataType input_data = ld_global_nc(reinterpret_cast<const int4*>(input) + access_idx);
+    int output_data = input_data.x + input_data.y + input_data.z + input_data.w;
+    *(reinterpret_cast<int*>(output_q) + access_idx) = output_data;
+  }
 
 //   using dst_dtype_info = DtypeInfo<DST_DTYPE>;
 //   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;

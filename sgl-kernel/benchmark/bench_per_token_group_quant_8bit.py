@@ -60,7 +60,8 @@ elif mode_concentrated:
     configs = list(
         itertools.product(
             [768],
-            [1536, 7168, 16384],
+            # [1536, 7168, 16384],
+            [16384],
             [128],
             [None],
             [fp8_type_],
