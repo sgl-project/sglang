@@ -55,8 +55,8 @@ def cutlass_w4a8_moe_mm(
     b_strides: torch.tensor,
     d_strides: torch.tensor,
     s_strides: torch.tensor,
-    chunk_size: int = 0,
-    topk: int = 0,
+    chunk_size: int = 128,
+    topk: int = 8,
 ):
     """
     Perform grouped matrix multiplication between int4 weights and fp8 activations.
