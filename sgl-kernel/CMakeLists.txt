@@ -70,7 +70,7 @@ FetchContent_Populate(repo-deepgemm)
 FetchContent_Declare(
     repo-flashinfer
     GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        9220fb3443b5a5d274f00ca5552f798e225239b7
+    GIT_TAG        592b110a78725e034daf3a3c978053e7dae92e5c
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
