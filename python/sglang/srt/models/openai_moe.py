@@ -252,6 +252,13 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
+        if global_server_args_dict["enable_deepep_moe"]:
+            extra_args = dict(
+                deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]]
+            )
+        else:
+            extra_args = dict(is_openai_moe=True, swiglu_alpha=1.702, swiglu_beta=1.0)
+
         # Todo: add bias support in MoE impl class
         self.experts = get_moe_impl_class()(
             num_experts=config.num_experts
@@ -264,11 +271,7 @@ class OpenAIMoeSparseMoeBlock(nn.Module):
             bias=config.mlp_bias, # Todo: add bias support in MoE impl class
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
-            **(
-                dict(deepep_mode=DeepEPMode[global_server_args_dict["deepep_mode"]])
-                if global_server_args_dict["enable_deepep_moe"]
-                else {}
-            ),
+            **extra_args,
             activation=config.hidden_act,
         )
 

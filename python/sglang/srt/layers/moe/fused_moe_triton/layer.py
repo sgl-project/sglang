@@ -19,6 +19,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe_oai import fused_experts_oai
 
 # fused_experts will be imported at runtime to avoid circular imports
 
@@ -243,7 +244,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         else:
             # Import at runtime to avoid circular dependency
             from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-            
+
             return fused_experts(
                 hidden_states=x,
                 w1=layer.w13_weight,
@@ -297,6 +298,199 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
     forward_native = forward_cpu
 
+class UnquantizedFusedMoEMethodOpenAI(FusedMoEMethodBase, CustomOp):
+    def __init__(self, 
+        swiglu_alpha: Optional[float] = 1.702, 
+        swiglu_beta: Optional[float] = 1.0,
+        bias: bool = True,
+        shuffle_weight: bool = True,
+    ):
+        super().__init__()
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_beta = swiglu_beta
+        self.shuffle_weight = shuffle_weight
+        self.bias = bias
+
+        if not bias:
+            raise ValueError("bias is required for OpenAI MoE")
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        if not params_dtype == torch.bfloat16:
+            raise ValueError("OpenAI MoE only supports bfloat16")
+        
+        # Fused gate_up_proj (column parallel)
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts, 2 * intermediate_size, hidden_size, dtype=params_dtype
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        # down_proj (row parallel)
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts, hidden_size, intermediate_size, dtype=params_dtype
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        if self.bias:
+            # Add bias for gate_up_proj
+            w13_bias = torch.nn.Parameter(
+                torch.empty(
+                    num_experts, 2 * intermediate_size, dtype=params_dtype
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_bias", w13_bias)
+            set_weight_attrs(w13_bias, extra_weight_attrs)
+            # Add bias for down_proj
+            w2_bias = torch.nn.Parameter(
+                torch.empty(
+                    num_experts, hidden_size, dtype=params_dtype
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_bias", w2_bias)
+            set_weight_attrs(w2_bias, extra_weight_attrs)
+        else:
+            layer.register_parameter("w13_bias", None)
+            layer.register_parameter("w2_bias", None)
+    
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.shuffle_weight:
+            layer.w13_weight = torch.nn.Parameter(
+                self._shuffle_for_activation_kernel(torch.transpose(layer.w13_weight.data, 1, 2)),
+                requires_grad=False,
+            )
+            torch.cuda.empty_cache()
+            layer.w2_weight = torch.nn.Parameter(
+                torch.transpose(layer.w2_weight.data, 1, 2),
+                requires_grad=False,
+            )
+            torch.cuda.empty_cache()
+            if self.bias:
+                layer.w13_bias = torch.nn.Parameter(
+                    self._shuffle_for_activation_kernel(layer.w13_bias.data.to(torch.float32)),  # TODO: check if float32 is needed
+                    requires_grad=False,
+                )
+                torch.cuda.empty_cache()
+                layer.w2_bias = torch.nn.Parameter(
+                    layer.w2_bias.data.to(torch.float32),
+                    requires_grad=False,
+                )
+                torch.cuda.empty_cache()
+        return
+    
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "swiglu",
+        apply_router_weight_on_input: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
+    ) -> torch.Tensor:
+        return self.forward(
+            x=x,
+            layer=layer,
+            router_logits=router_logits,
+            top_k=top_k,
+            renormalize=renormalize,
+            use_grouped_topk=use_grouped_topk,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            num_fused_shared_experts=num_fused_shared_experts,
+            custom_routing_function=custom_routing_function,
+            correction_bias=correction_bias,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            inplace=inplace,
+            no_combine=no_combine,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+
+    def forward_cuda(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "swiglu",
+        apply_router_weight_on_input: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
+    ) -> torch.Tensor:
+        if _use_aiter:
+            raise NotImplementedError("Aiter is not supported for OpenAI MoE")
+        else:
+            return fused_experts_oai(
+                hidden_states=x,
+                w13=layer.w13_weight,
+                w2=layer.w2_weight,
+                expert_logits=router_logits,
+                top_k=top_k,
+                inplace=inplace and not no_combine,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                no_combine=no_combine,
+                routed_scaling_factor=routed_scaling_factor,
+                w1_bias=getattr(layer, 'w13_bias', None),
+                w2_bias=getattr(layer, 'w2_bias', None),
+                swiglu_alpha=self.swiglu_alpha,
+                swiglu_beta=self.swiglu_beta,
+                dtype=x.dtype,
+            )
+    
+    def forward_cpu(self, *args, **kwargs) -> torch.Tensor:
+        raise NotImplementedError("CPU is not supported for OpenAI MoE")
+    
+    def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
+        raise NotImplementedError("TPU is not supported for OpenAI MoE")
+    
+    forward_native = forward_cpu
+
+    def _shuffle_for_activation_kernel(
+        self, weight_or_bias: torch.Tensor) -> torch.Tensor:
+        temp_weight = weight_or_bias.clone()
+        last_dim = weight_or_bias.shape[-1]
+        if weight_or_bias.dim() == 3:
+            weight_or_bias[:, :, 1::2] = temp_weight[:, :, last_dim // 2:]
+            weight_or_bias[:, :, 0::2] = temp_weight[:, :, 0:last_dim // 2]
+        elif weight_or_bias.dim() == 2:
+            weight_or_bias[:, 1::2] = temp_weight[:, last_dim // 2:]
+            weight_or_bias[:, 0::2] = temp_weight[:, 0:last_dim // 2]
+        return weight_or_bias
 
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
@@ -348,6 +542,9 @@ class FusedMoE(torch.nn.Module):
         enable_flashinfer_moe: Optional[bool] = False,
         enable_ep_moe: Optional[bool] = False,
         bias: bool = False,
+        is_openai_moe: Optional[bool] = False,
+        swiglu_alpha: Optional[float] = None,
+        swiglu_beta: Optional[float] = None,
     ):
         super().__init__()
 
@@ -411,10 +608,21 @@ class FusedMoE(torch.nn.Module):
         self.no_combine = no_combine
         self.bias = bias
 
+        if is_openai_moe:
+            if self.ep_size > 1:
+                raise ValueError("OpenAI FusedMoE only supports ep_size=1")
+        
         if quant_config is None:
-            self.quant_method: Optional[QuantizeMethodBase] = (
-                UnquantizedFusedMoEMethod()
-            )
+            if not is_openai_moe:
+                self.quant_method: Optional[QuantizeMethodBase] = (
+                    UnquantizedFusedMoEMethod()
+                )
+            else:
+                self.quant_method = UnquantizedFusedMoEMethodOpenAI(
+                    swiglu_alpha=swiglu_alpha or 1.0,
+                    swiglu_beta=swiglu_beta or 0.0,
+                    bias=bias,
+                )
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod":
