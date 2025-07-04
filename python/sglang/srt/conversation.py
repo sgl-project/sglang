@@ -364,15 +364,15 @@ class Conversation:
         self.messages.append([role, message])
 
     def append_image(self, image: str):
-        """Append a new message."""
+        """Append a new image."""
         self.image_data.append(image)
 
     def append_video(self, video: str):
-        """Append a new message."""
+        """Append a new video."""
         self.video_data.append(video)
 
     def append_audio(self, audio: str):
-        """Append a new message."""
+        """Append a new audio."""
         self.audio_data.append(audio)
 
     def update_last_message(self, message: str):
