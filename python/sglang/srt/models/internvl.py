@@ -43,24 +43,13 @@ class InternAttention(nn.Module):
         self,
         config,
         quant_config: QuantizationConfig = None,
+        hf_version: bool = False
     ):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
-
-        self.hf_version = hf_version
-        if hf_version:
-            self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.attention_bias)
-            self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.attention_bias)
-            self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.attention_bias)
-            self.qk_normalization = config.use_qk_norm
-            self.projection_layer = nn.Linear(self.embed_dim, self.embed_dim)
-        else:
-            self.qkv = nn.Linear(self.embed_dim, 3 * self.embed_dim, bias=config.qkv_bias)
-            self.qk_normalization = config.qk_normalization
-            self.proj = nn.Linear(self.embed_dim, self.embed_dim)
 
         self.scale = self.head_dim**-0.5
 
@@ -77,7 +66,8 @@ class InternAttention(nn.Module):
         )
 
         self.proj_drop = nn.Dropout(config.dropout)
-        if self.qk_normalization:
+
+        if hasattr(config, 'qk_normalization') and config.qk_normalization:
             self.q_norm = InternRMSNorm(self.embed_dim, eps=config.layer_norm_eps)
             self.k_norm = InternRMSNorm(self.embed_dim, eps=config.layer_norm_eps)
 
@@ -298,7 +288,7 @@ class InternVisionEncoderLayer(nn.Module):
             ls2 = self.ls2
 
         hidden_states = hidden_states + self.drop_path1(
-            attn(norm1(hidden_states).to(hidden_states.dtype)) * ls1
+            attn(norm1(hidden_states).to(hidden_states.dtype), cu_seqlens=cu_seqlens) * ls1
         )
 
         hidden_states = hidden_states + self.drop_path2(
@@ -378,6 +368,8 @@ class InternVisionEncoder(nn.Module):
             layers = self.layer
         else:
             layers = self.layers
+
+        cu_seqlens = SingletonCache()
 
         for idx, encoder_layer in enumerate(layers):
             if output_hidden_states:
@@ -692,8 +684,8 @@ class InternVLChatModel(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                if self.hf_version and "vision_tower" in name:
-                    continue
+                if "vision_tower" in name:
+                    name = name.replace(r"attention.", r"attention.attn.")
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
@@ -707,6 +699,9 @@ class InternVLChatModel(nn.Module):
                     # adapt to VisionAttention
                     name = name.replace(r"attn.", r"attn.attn.")
                     name = name.replace(r"qkv.", r"qkv_proj.")
+                if "vision_tower" in name:
+                    name = name.replace(r"attention.", r"attention.attn.")
+                    name = name.replace(r"projection_layer.", r"proj.")
 
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
@@ -748,7 +743,6 @@ class InternVLForConditionalGeneration(InternVLChatModel):
         quant_config: Optional[QuantizationConfig] = None,
         use_flash_attn=True,
     ) -> None:
-        # import pdb; pdb.set_trace()
         super().__init__(config, quant_config, use_flash_attn, hf_version=True)
 
 
