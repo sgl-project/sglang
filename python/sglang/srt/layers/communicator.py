@@ -187,11 +187,17 @@ class LayerCommunicator:
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
-            if residual is None:
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
+            if residual is not None and hasattr(hidden_states, '_sglang_needs_allreduce_fusion') and hidden_states._sglang_needs_allreduce_fusion:
+                fused_result = self._try_allreduce_add_rmsnorm_fusion(hidden_states, residual)
+                assert fused_result is not None, "Fused result should not be None"
+                delattr(hidden_states, '_sglang_needs_allreduce_fusion')
+                hidden_states, residual = fused_result    
             else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+                if residual is None:
+                    residual = hidden_states
+                    hidden_states = self.input_layernorm(hidden_states)
+                else:
+                    hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,
@@ -200,6 +206,28 @@ class LayerCommunicator:
         )
 
         return hidden_states, residual
+
+    def _try_allreduce_add_rmsnorm_fusion(self, hidden_states: torch.Tensor, residual: torch.Tensor):
+        from sglang.srt.layers.flashinfer_comm_fusion import flashinfer_allreduce_add_rmsnorm
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+        
+        if get_tensor_model_parallel_world_size() <= 1:
+            return None
+            
+        if residual is None:
+            return None
+            
+        norm_out, residual_out = flashinfer_allreduce_add_rmsnorm(
+            input_tensor=hidden_states,
+            residual=residual,
+            weight=self.input_layernorm.weight,
+            eps=self.input_layernorm.variance_epsilon,
+        )
+        
+        if norm_out is not None:
+            return norm_out, residual_out
+        else:
+            return None
 
     def prepare_mlp(
         self,

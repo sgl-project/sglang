@@ -71,6 +71,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
 )
+from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
@@ -103,6 +104,7 @@ from sglang.srt.utils import (
     is_hip,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
+    is_flashinfer_available,
 )
 
 _is_hip = is_hip()
@@ -130,6 +132,9 @@ if _is_hip:
     from sglang.srt.layers.attention.triton_ops.rocm_mla_decode_rope import (
         decode_attention_fwd_grouped_rope,
     )
+
+_is_flashinfer_available = is_flashinfer_available()
+_is_sm100_supported = is_cuda() and is_sm100_supported()
 
 
 logger = logging.getLogger(__name__)
@@ -1798,6 +1803,24 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id % self.config.moe_layer_freq == 0
         )
 
+    def _should_fuse_mlp_allreduce_with_next_layer(self, forward_batch) -> bool:
+        """Check if MLP allreduce can be fused with next layer's add_rmsnorm"""
+
+        if self.layer_id == self.config.num_hidden_layers - 1 or get_tensor_model_parallel_world_size() <= 1:
+            return False
+
+        if not global_server_args_dict.get("enable_flashinfer_allreduce_fusion", False):
+            return False
+
+        if not _is_sm100_supported or not _is_flashinfer_available:
+            return False
+
+        if hasattr(forward_batch, 'input_ids') and forward_batch.input_ids.shape[0] > 1024:
+            return False
+
+        return True
+
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1824,14 +1847,22 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         hidden_states = self.mlp(hidden_states, forward_batch)
 
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
+        can_fuse_mlp_allreduce = (
+            self._should_fuse_mlp_allreduce_with_next_layer(forward_batch) and
+            not (self.enable_dp_attention and self.speculative_algorithm.is_eagle())
         )
+        
+        if can_fuse_mlp_allreduce:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
 
-        if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
-            # NOTE: this line resolves the degradation of MTP reception rate for non-zero DP ranks.
-            # See discussion here (https://github.com/sgl-project/sglang/pull/6081#discussion_r2147452251).
-            hidden_states = hidden_states.clone()
+            if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
+                # NOTE: this line resolves the degradation of MTP reception rate for non-zero DP ranks.
+                # See discussion here (https://github.com/sgl-project/sglang/pull/6081#discussion_r2147452251).
+                hidden_states = hidden_states.clone()
 
         return hidden_states, residual
 
@@ -1997,6 +2028,7 @@ class DeepseekV2Model(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+
 
 
 class DeepseekV2ForCausalLM(nn.Module):
