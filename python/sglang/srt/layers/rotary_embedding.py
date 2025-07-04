@@ -142,14 +142,20 @@ class RotaryEmbedding(CustomOp):
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
         query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
-        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+        if query_pass.shape[-1] != 0:
+            query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+        else:
+            query = query_rot.reshape(query_shape)
 
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
         key_pass = key[..., self.rotary_dim :]
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
-        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+        if key_pass.shape[-1] != 0:
+            key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+        else:
+            key = key_rot.reshape(key_shape)
         return query, key
 
     def forward_cpu(
@@ -354,13 +360,13 @@ def _yarn_find_correction_range(
     dim: int,
     base: float = 10000,
     max_position_embeddings: int = 2048,
+    truncate: bool = True,
 ) -> Tuple[int, int]:
-    low = math.floor(
-        _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
-    )
-    high = math.ceil(
-        _yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
-    )
+    low = _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
+    high = _yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
+    if truncate:
+        low = math.floor(low)
+        high = math.ceil(high)
     return max(low, 0), min(high, dim - 1)  # Clamp values just in case
 
 
@@ -396,6 +402,8 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         is_neox_style: bool,
         scaling_factor: float,
         dtype: torch.dtype,
+        truncate: bool = True,
+        apply_scale_to_max_pos: bool = True,
         *,
         extrapolation_factor: float = 1,
         attn_factor: float = 1,
@@ -407,6 +415,8 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         self.attn_factor = attn_factor
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
+        self.truncate = truncate
+        self.apply_scale_to_max_pos = apply_scale_to_max_pos
         # Get n-d magnitude scaling corrected for interpolation
         self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
         super().__init__(
@@ -426,7 +436,9 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
             self.rotary_dim,
             self.base,
             self.max_position_embeddings,
+            self.truncate,
         )
+
         # Get n-d rotational scaling corrected for extrapolation
         inv_freq_mask = (
             1
@@ -440,9 +452,11 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
+        initial_max_positions = self.max_position_embeddings * self.scaling_factor if self.apply_scale_to_max_pos else self.max_position_embeddings
         t = torch.arange(
-            self.max_position_embeddings * self.scaling_factor, dtype=torch.float32
+            initial_max_positions, dtype=torch.float32
         )
+
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos() * self.mscale
         sin = freqs.sin() * self.mscale
@@ -1104,6 +1118,8 @@ def get_rope(
     rope_scaling: Optional[Dict[str, Any]] = None,
     dtype: Optional[torch.dtype] = None,
     partial_rotary_factor: float = 1.0,
+    truncate: bool = True,
+    apply_scale_to_max_pos: bool = True,
 ) -> RotaryEmbedding:
     if dtype is None:
         dtype = torch.get_default_dtype()
@@ -1125,6 +1141,8 @@ def get_rope(
         is_neox_style,
         rope_scaling_args,
         dtype,
+        truncate,
+        apply_scale_to_max_pos,
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
@@ -1202,7 +1220,7 @@ def get_rope(
             )
         elif scaling_type == "yarn":
             scaling_factor = rope_scaling["factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"] if "original_max_position_embeddings" in rope_scaling else 4096
+            original_max_position = rope_scaling["original_max_position_embeddings"] if "original_max_position_embeddings" in rope_scaling else max_position
             extra_kwargs = {
                 k: v
                 for k, v in rope_scaling.items()
@@ -1217,6 +1235,8 @@ def get_rope(
                 is_neox_style,
                 scaling_factor,
                 dtype,
+                truncate,
+                apply_scale_to_max_pos,
                 **extra_kwargs,
             )
         elif scaling_type == "deepseek_yarn":
