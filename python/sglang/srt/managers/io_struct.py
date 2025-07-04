@@ -308,7 +308,7 @@ class GenerateReqInput:
                 self.modalities = ["image"] * num
 
     def _normalize_video_data(self, num):
-        """Normalize audio data for batch processing."""
+        """Normalize video data for batch processing."""
         if self.video_data is None:
             self.video_data = [None] * num
         elif not isinstance(self.video_data, list):

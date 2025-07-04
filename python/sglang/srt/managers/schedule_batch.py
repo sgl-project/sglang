@@ -289,11 +289,6 @@ class MultimodalDataItem:
             or not MultimodalDataItem.is_empty_list(self.pixel_values_videos)
         )
 
-    def is_audio(self):
-        return (
-            self.is_modality(Modality.AUDIO)
-        ) and not MultimodalDataItem.is_empty_list(self.audio_features)
-
     def is_valid(self) -> bool:
         return self.is_image() or self.is_video() or self.is_audio()
 

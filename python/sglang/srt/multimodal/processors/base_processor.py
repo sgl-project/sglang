@@ -95,7 +95,7 @@ class MultimodalSpecialTokens:
         combined = "(" + "|".join(f"(?:{p})" for p in patterns) + ")"
         return re.compile(combined, flags)
 
-    def collect(self) -> list[str]:
+    def get_token_strings(self) -> list[str]:
         return [
             token
             for token in [self.image_token, self.video_token, self.audio_token]
@@ -357,7 +357,7 @@ class BaseMultimodalProcessor(ABC):
         images, videos, audios = [], [], []
         new_text_parts = []
         task_ptr = 0
-        multimodal_token_list = multimodal_tokens.collect()
+        multimodal_token_list = multimodal_tokens.get_token_strings()
         for text_part in text_parts:
             try:
                 if text_part in multimodal_token_list:
