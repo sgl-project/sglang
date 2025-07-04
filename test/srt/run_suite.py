@@ -143,6 +143,9 @@ suites = {
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         TestFile("test_reasoning_parser.py", 5),
     ],
+    "per-commit-npu": [
+        TestFile("test_ascend_attention_backend.py", 400),
+    ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
         TestFile("test_data_parallelism.py", 73),
@@ -195,6 +198,7 @@ suites = {
         TestFile("cpu/test_rope.py"),
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
+        TestFile("test_intel_amx_attention_backend.py"),
     ],
     "nightly": [
         TestFile("test_nightly_gsm8k_eval.py"),
