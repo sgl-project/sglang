@@ -1039,6 +1039,16 @@ class OpenAIMoeForCausalLM(nn.Module):
 
             if "rotary_emb.inv_freq" in name:
                 continue
+            
+            # OpenAIMoe use router to name gate
+            if ".mlp.router." in name:
+                name = name.replace(".mlp.router.", ".mlp.gate.")
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
