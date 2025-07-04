@@ -540,6 +540,8 @@ class Test10(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
             ],
         )
 
@@ -593,6 +595,8 @@ class Test11(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
             ],
         )
 
@@ -646,6 +650,8 @@ class Test12(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
             ],
         )
 
@@ -698,6 +704,8 @@ class Test13(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
             ],
         )
 
@@ -753,6 +761,8 @@ class Test14(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
             ],
         )
 
@@ -808,6 +818,8 @@ class Test15(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
             ],
         )
 
@@ -862,6 +874,8 @@ class Test16(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
             ],
         )
 
@@ -916,6 +930,8 @@ class Test17(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
             ],
         )
 
@@ -972,6 +988,8 @@ class Test18(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
             ],
         )
 
@@ -1028,6 +1046,8 @@ class Test19(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
             ],
         )
 
@@ -2204,6 +2224,8 @@ class Test40(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2267,6 +2289,8 @@ class Test41(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2330,6 +2354,8 @@ class Test42(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2392,6 +2418,8 @@ class Test43(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2457,6 +2485,8 @@ class Test44(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2522,6 +2552,8 @@ class Test45(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2586,6 +2618,8 @@ class Test46(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2650,6 +2684,8 @@ class Test47(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2716,6 +2752,8 @@ class Test48(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2782,6 +2820,8 @@ class Test49(CustomTestCase):
                 "--enable-deepep-moe",
                 "--deepep-mode",
                 "auto",
+                "--cuda-graph-max-bs",
+                "128",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
