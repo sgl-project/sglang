@@ -92,17 +92,8 @@ class HiRadixCache(RadixCache):
         if enable_mooncake_store_l3_cache:
             # TODO(huangtingwei9988):L3 cache only support write_through_selective and write_through write policy
             assert hicache_write_policy in ["write_through_selective", "write_through"]
-            self.mooncake_l3_kv_pool = MooncakeStore(
-                self.token_to_kv_pool_host.get_flat_data(
-                    list(range(0, self.page_size))
-                ).shape,
-                self.token_to_kv_pool_host.dtype,
-                (
-                    1
-                    if isinstance(self.token_to_kv_pool_host, MLATokenToKVPoolHost)
-                    else 2
-                ),
-            )
+            self.mooncake_l3_kv_pool = MooncakeStore()
+            self.mooncake_l3_kv_pool.register_buffer(self.token_to_kv_pool_host.kv_buffer)
             self.mooncake_l3_load_cache_event = threading.Event()
             self.l3_ongoing_load_back = {}
 
@@ -253,6 +244,8 @@ class HiRadixCache(RadixCache):
 
                 # clear the reference
                 del self.l3_ongoing_load_back[ack_id]
+                req.last_node = req.last_l3_node
+                req.host_hit_length += req.l3_hit_length
             except Exception:
                 break
 
@@ -364,18 +357,27 @@ class HiRadixCache(RadixCache):
 
         self.inc_lock_ref(ancester_node)
 
+        l3_keys = [key for n in l3_nodes_to_load for key in n.l3_keys]
+        slots_required = len(l3_keys) * self.page_size
+        host_indices=self.cache_controller.mooncake_load(l3_keys, slots_required, node_id=last_hit_node.id)
+        if host_indices is None:
+            self.evict_host(slots_required)
+            host_indices = self.cache_controller.mooncake_load(l3_keys, slots_required, node_id=last_hit_node.id)
+        self.dec_lock_ref(ancester_node)
+        if host_indices is None:
+            req.waiting_status = WaitingStatus.READY
+            return
+
         self.l3_ongoing_load_back[last_hit_node.id] = (
             ancester_node,
             last_hit_node,
             req,
         )
-
-        if last_hit_node == ancester_node:
-            self.cache_controller.mooncake_l3_ack_load_queue.put(last_hit_node.id)
-            return
-
-        l3_keys = [key for n in l3_nodes_to_load for key in n.l3_keys]
-        self.cache_controller.mooncake_load(node_id=last_hit_node.id, l3_keys=l3_keys)
+        offset = 0
+        for node in l3_nodes_to_load:
+            node.host_value = host_indices[
+                offset : offset + len(node.l3_keys) * self.page_size
+            ]
         for node in l3_nodes_to_load:
             node.loading = True
 
@@ -386,16 +388,11 @@ class HiRadixCache(RadixCache):
 
         last_hit_node = node
         nodes_to_load = []
-        l3_nodes_to_load = []
         while node.evicted:
             assert (
-                node.l2_backuped or node.l3_backuped
+                node.l2_backuped
             ), "No backup available on evicted nodes, should not happen"
-            if node.l2_backuped:
-                nodes_to_load.insert(0, node)
-            if self.enable_mooncake_store_l3_cache:
-                if not node.l2_backuped and node.l3_backuped:
-                    l3_nodes_to_load.insert(0, node)
+            nodes_to_load.insert(0, node)
             node = node.parent
         else:
             ancester_node = node
@@ -403,37 +400,22 @@ class HiRadixCache(RadixCache):
         # protect the ancestor nodes from eviction
         delta = self.inc_lock_ref(ancester_node)
 
-        l3_keys = (
-            [key for n in l3_nodes_to_load for key in n.l3_keys]
-            if len(l3_nodes_to_load) > 0
-            else []
-        )
-        host_indices = (
-            torch.cat([n.host_value for n in nodes_to_load])
-            if len(nodes_to_load) > 0
-            else []
-        )
-
         # load it all or not at all
-        total_load_back_size = len(host_indices) + len(l3_keys) * self.page_size
-        if total_load_back_size < self.load_back_threshold or (
-            total_load_back_size > mem_quota + delta if mem_quota is not None else False
+        host_indices = torch.cat([n.host_value for n in nodes_to_load])
+        if len(host_indices) < self.load_back_threshold or (
+            len(host_indices) > mem_quota + delta if mem_quota is not None else False
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
             self.dec_lock_ref(ancester_node)
             return None
 
         device_indices = self.cache_controller.load(
-            host_indices=host_indices,
-            node_id=last_hit_node.id,
-            load_back_size=total_load_back_size,
+            host_indices=host_indices, node_id=last_hit_node.id
         )
         if device_indices is None:
-            self.evict(total_load_back_size)
+            self.evict(len(host_indices))
             device_indices = self.cache_controller.load(
-                host_indices=host_indices,
-                node_id=last_hit_node.id,
-                load_back_size=total_load_back_size,
+                host_indices=host_indices, node_id=last_hit_node.id
             )
         self.dec_lock_ref(ancester_node)
         if device_indices is None:
@@ -446,19 +428,8 @@ class HiRadixCache(RadixCache):
             node.value = device_indices[offset : offset + len(node.host_value)]
             offset += len(node.host_value)
             node.loading = True
-        for node in l3_nodes_to_load:
-            node.value = device_indices[
-                offset : offset + len(node.l3_keys) * self.page_size
-            ]
-            offset += len(node.l3_keys) * self.page_size
-            node.loading = True
-        self.evictable_size_ += total_load_back_size
-
-        if len(nodes_to_load) > 0:
-            self.inc_lock_ref(last_hit_node)
-        if len(l3_nodes_to_load) > 0:
-            self.inc_lock_ref(last_hit_node)
-
+        self.evictable_size_ += len(device_indices)
+        self.inc_lock_ref(last_hit_node)
         return device_indices
 
     def init_load_back(

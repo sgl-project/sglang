@@ -2024,6 +2024,7 @@ class Scheduler(
             batch.next_batch_sampling_info.sampling_info_done.set()
 
     def loading_l3_cache(self):
+        torch.cuda.set_stream(self.current_stream)
         while True:
             if len(self.waiting_queue) > 0:
                 for req in self.waiting_queue:

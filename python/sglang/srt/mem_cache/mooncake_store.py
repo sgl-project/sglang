@@ -13,51 +13,12 @@ import uuid
 from dataclasses import dataclass
 from typing import List, Optional
 
-import numpy as np
 import torch
-from safetensors.torch import load as safetensors_load
-from safetensors.torch import save as safetensors_save
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 0  # 3.125 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 8 * 1024 * 1024 * 1024  # 8.0 GiB
 
 logger = logging.getLogger(__name__)
-
-
-# TODO:(huangtingwei9988) Safetensors serialization performance is poor,
-#  this optimization is not completed
-def tensor_to_bytes(tensor):
-    length = int(np.prod(tensor.shape).item())
-    bytes_per_item = 2  # for bfloat16, other will change accordingly
-    total_bytes = length * bytes_per_item
-    ptr = tensor.data_ptr()
-    new_ptr = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ubyte))
-    data = np.ctypeslib.as_array(new_ptr, (total_bytes,))  # no internal copy
-    return data.tobytes()
-
-
-def bytes_to_tensor(data_bytes: bytes, tensor_shape: torch.Size, dtype: torch.dtype):
-    return torch.frombuffer(data_bytes, dtype=dtype).reshape(tensor_shape)
-
-
-def safetensors_bytes_to_tensor(data: bytes):
-    loaded_tensors = safetensors_load(data)
-    tensor = loaded_tensors["tensor"]
-    if "device_id" not in loaded_tensors.keys():
-        return tensor
-    device_id_tensor = loaded_tensors["device_id"]
-    device_id = int(device_id_tensor.item())
-    device = torch.device("cuda", device_id) if device_id >= 0 else torch.device("cpu")
-    return tensor.to(device)
-
-
-def safetensors_tensor_to_bytes(tensor_value: torch.Tensor):
-    tensors = {"tensor": tensor_value}
-    device_id = tensor_value.device.index if tensor_value.device.type == "cuda" else -1
-    if device_id != -1:
-        device_tensor = torch.tensor(device_id, dtype=torch.int32)
-        tensors["device_id"] = device_tensor
-    return safetensors_save(tensors)
 
 
 @dataclass
@@ -102,7 +63,7 @@ class MooncakeStoreConfig:
 
 class MooncakeStore:
 
-    def __init__(self, page_tensor_shape: torch.Size, dtype: torch.dtype, seq_dim: int):
+    def __init__(self):
         try:
             from mooncake.store import MooncakeDistributedStore
         except ImportError as e:
@@ -130,10 +91,6 @@ class MooncakeStore:
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
 
-            self.page_tensor_shape = page_tensor_shape
-            self.dtype = dtype
-            self.seq_dim = seq_dim
-
         except ValueError as e:
             logger.error("Configuration loading failed: %s", e)
             raise
@@ -150,117 +107,89 @@ class MooncakeStore:
         self.store.get(warmup_key)
         self.store.remove(warmup_key)
 
+    def register_buffer(
+        self,
+        buffer: torch.Tensor
+    ) -> None:
+        try:
+            buffer_ptr = buffer.data_ptr()
+            buffer_size = buffer.numel() * buffer.element_size()
+            self.store.register_buffer(buffer_ptr, buffer_size)
+        except TypeError as err:
+            logger.error("Failed to register buffer to Mooncake Store: %s", err)
+            raise TypeError("Mooncake Store Register Buffer Error.") from err
+
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
         # it is unnecessary to close it manually.
         pass
 
-    def remove(
+    def batch_put(
         self,
-        key: str,
+        key_strs: List[str],
+        buffer_ptrs: List[int],
+        buffer_sizes: List[int]
     ) -> None:
-        if key is not None:
-            if self.is_exist(key):
-                self.store.remove(key)
-
-    def put(self, key: str, value: Optional[torch.Tensor]) -> None:
-        # A message queue needs to be introduced before making it asynchronous.
-        if value is not None:
-            self._put_impl(key, value)
-
-    def batch_put(self, keys: List[str], values: List[torch.Tensor]) -> None:
-        if keys is None or values is None:
+        assert len(key_strs) == len(buffer_ptrs) == len(buffer_sizes)
+        if len(key_strs) == 0:
             return
 
-        if len(keys) != len(values):
-            return
-
-        for i in range(len(keys)):
-            if keys[i] is None or values[i] is None:
+        for i in range(len(key_strs)):
+            if (key_strs[i] is None
+                or buffer_ptrs[i] is None
+                or buffer_sizes[i] is None):
                 return
 
-        self._put_batch_impl(keys, values)
-
-    def get(
-        self,
-        key: str,
-    ) -> Optional[torch.Tensor]:
-        # A message queue needs to be introduced before making it asynchronous.
-        value = self._get_impl(key)
-        return value
+        self._put_batch_zero_copy_impl(key_strs, buffer_ptrs, buffer_sizes)
 
     def batch_get(
         self,
-        keys: List[str],
-    ) -> Optional[List[torch.Tensor]]:
-        if keys is None:
-            return None
+        key_strs: List[str],
+        buffer_ptrs: List[int],
+        buffer_sizes: List[int]
+    ) -> None:
+        assert len(key_strs) == len(buffer_ptrs) == len(buffer_sizes)
+        if len(key_strs) == 0:
+            return
 
-        for key in keys:
-            if key is None:
-                return None
+        for i in range(len(key_strs)):
+            if (key_strs[i] is None
+                or buffer_ptrs[i] is None
+                or buffer_sizes[i] is None):
+                return
 
-        return self._get_batch_impl(keys)
-
-    def is_exist(self, key: str) -> bool:
-        if key is not None:
-            return self.store.is_exist(key) == 1
-        return False
+        return self._get_batch_zero_copy_impl(key_strs, buffer_ptrs, buffer_sizes)
 
     def is_batch_exist(self, keys: List[str]):
+        _keys = []
         for key in keys:
             if key is None:
                 return None
-        return self.store.is_batch_exist(keys)
+            # Since mooncake store is stored in layer by layer,
+            # only the first layer is checked here.
+            _keys.append(f"{key}_0_k")
+        return {k: v for k, v in zip(keys, self.store.is_batch_exist(_keys).values())}
 
-    def _put_batch_impl(self, keys: List[str], values: List[torch.Tensor]) -> None:
-        value_bytes = [tensor_to_bytes(value) for value in values]
-        batches = {}
-        for i in range(len(keys)):
-            batches[keys[i]] = value_bytes[i]
-        try:
-            self.store.put_batch(batches)
-        except TypeError as err:
-            logger.error("Failed to put value into Mooncake Store: %s", err)
-            raise TypeError("Mooncake Store Put Type Error.") from err
-
-    def _put_impl(self, key: str, value: torch.Tensor) -> None:
-        """Put KVCache to Mooncake Store"""
-        value_bytes = tensor_to_bytes(value)
-        try:
-            self.store.put(key, value_bytes)
-        except TypeError as err:
-            logger.error("Failed to put value into Mooncake Store: %s", err)
-            raise TypeError("Mooncake Store Put Type Error.") from err
-
-    def _get_batch_impl(self, keys: List[str]) -> Optional[List[torch.Tensor]]:
-        try:
-            batch_data = self.store.get_batch(keys)
-        except TypeError as err:
-            logger.error("Failed to get value from Mooncake Store: %s", err)
-            raise TypeError("Mooncake Store Get Type Error.") from err
-
-        if batch_data:
-            if len(batch_data) > 0:
-                tensor_list = [
-                    bytes_to_tensor(data, self.page_tensor_shape, self.dtype)
-                    for data in batch_data
-                ]
-                return torch.concat(tensor_list, dim=self.seq_dim)
-        return None
-
-    def _get_impl(
+    def _put_batch_zero_copy_impl(
         self,
-        key: str,
-    ) -> Optional[torch.Tensor]:
-        """Get KVCache from Mooncake Store"""
+        key_strs: List[str],
+        buffer_ptrs: List[int],
+        buffer_sizes: List[int]
+    ) -> None:
         try:
-            data = self.store.get(key)
+            self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        except TypeError as err:
+            logger.error("Failed to put value to Mooncake Store: %s", err)
+            raise TypeError("Mooncake Store Put Type Error.") from err
+
+    def _get_batch_zero_copy_impl(
+        self,
+        key_strs: List[str],
+        buffer_ptrs: List[int],
+        buffer_sizes: List[int]
+    ) -> None:
+        try:
+            self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
         except TypeError as err:
             logger.error("Failed to get value from Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Get Type Error.") from err
-
-        if data:
-            return bytes_to_tensor(data, self.page_tensor_shape, self.dtype)
-
-        return None
