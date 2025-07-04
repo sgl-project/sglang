@@ -216,6 +216,7 @@ class MoeWNA16Method:
         hidden_size: int,
         intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
+        bias: bool = False,
         **extra_weight_attrs,
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
