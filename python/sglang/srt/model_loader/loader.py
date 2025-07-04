@@ -704,6 +704,13 @@ class ShardedStateLoader(BaseModelLoader):
                         state_dict.pop(key)
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+
+            # Model weight loading consists of two stages:
+            # 1. Initial weight loading.
+            # 2. Post-processing of weights, including assigning specific member variables.
+            if hasattr(model, "post_load_weights"):
+                model.post_load_weights()
+
         return model.eval()
 
     @staticmethod
@@ -1378,6 +1385,7 @@ class RemoteModelLoader(BaseModelLoader):
                         ".bin",
                         ".pt",
                         ".safetensors",
+                        ".jpg",  # ignore jpg file
                     ):
                         file_path = os.path.join(root, file_name)
                         with open(file_path, encoding="utf-8") as file:
@@ -1412,6 +1420,12 @@ class RemoteModelLoader(BaseModelLoader):
             state_dict.pop(key)
         if state_dict:
             raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+
+        # Model weight loading consists of two stages:
+        # 1. Initial weight loading.
+        # 2. Post-processing of weights, including assigning specific member variables.
+        if hasattr(model, "post_load_weights"):
+            model.post_load_weights()
 
     def _load_model_from_remote_fs(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
@@ -1459,7 +1473,9 @@ class RemoteModelLoader(BaseModelLoader):
                     if quant_method is not None:
                         quant_method.process_weights_after_loading(module)
 
-            with create_remote_connector(model_weights, device_config.device) as client:
+            with create_remote_connector(
+                model_weights, device=device_config.device
+            ) as client:
                 connector_type = get_connector_type(client)
                 if connector_type == ConnectorType.KV:
                     self._load_model_from_remote_kv(model, client)
