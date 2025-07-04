@@ -31,11 +31,6 @@ _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
-# TODO: Remove this when triton>=3.2.0. This issue will not affect performance and accuracy.
-logger.warning(
-    "The following error message 'operation scheduled before its operands' can be ignored."
-)
-
 
 _MIN_BLOCK_KV = 32
 
@@ -713,7 +708,7 @@ def decode_attention_fwd(
             num_kv_splits,
             max_kv_splits,
             sm_scale,
-            logit_cap,
+            logit_cap=logit_cap,
         )
     else:
         # GQA/MQA/MLA
@@ -729,5 +724,5 @@ def decode_attention_fwd(
             num_kv_splits,
             max_kv_splits,
             sm_scale,
-            logit_cap,
+            logit_cap=logit_cap,
         )
