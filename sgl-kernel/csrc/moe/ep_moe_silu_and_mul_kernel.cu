@@ -45,6 +45,9 @@ __global__ void ep_moe_act_and_mul_cuda_kernel(
   constexpr uint32_t vec_size = 16 / sizeof(scalar_t);
   using vec_t = flashinfer::vec_t<scalar_t, vec_size>;
 
+  // OPTIMIZATION: Shared memory for scales (computed once per block)
+  __shared__ scalar_t shared_scale;
+
   const int64_t token_idx = blockIdx.x;
   const int64_t thread_idx = threadIdx.x;
   const int64_t stride = blockDim.x;
@@ -53,10 +56,20 @@ __global__ void ep_moe_act_and_mul_cuda_kernel(
   const int expert_id = reorder_topk_ids[token_idx];
 
   if (expert_id < start_expert_id || expert_id > end_expert_id) return;
-  const scalar_t* gate_output_ptr = gateup_output + static_cast<int64_t>(token_idx) * hidden_size;
+
+  if (thread_idx == 0) { 
+    float scale_f = 1.f;
+    if (scales) { 
+      const float s = scales[expert_id - start_expert_id];
+      scale_f = (s != 0.f) ? (1.f / s) : 1.f;
+    }
+    shared_scale = static_cast<scalar_t>(scale_f);
+  }
+  __syncthreads();
+
+  const scalar_t* gate_output_ptr = gateup_output + token_idx * hidden_size;
   const scalar_t* up_output_ptr = gate_output_ptr + half_hidden_size;
-  scalar_t* dst_ptr = down_input + static_cast<int64_t>(token_idx) * half_hidden_size;
-  scalar_t scale_q = static_cast<scalar_t>(scales ? (1.f / scales[expert_id - start_expert_id]) : 1.f);
+  scalar_t* dst_ptr = down_input + token_idx * half_hidden_size;
 
   const uint32_t vec_elements = half_hidden_size / vec_size;
 #pragma unroll 1
@@ -69,7 +82,7 @@ __global__ void ep_moe_act_and_mul_cuda_kernel(
     for (uint32_t i = 0; i < vec_size; ++i) {
       float gate_f = static_cast<float>(gate_vec[i]);
       scalar_t gate_q = silu_quantize<scalar_t>(gate_f);
-      scalar_t prod = gate_q * up_vec[i] * scale_q;
+      scalar_t prod = gate_q * up_vec[i] * shared_scale;
       out_vec[i] = prod;
     }
     out_vec.store(dst_ptr + idx * vec_size);
@@ -80,7 +93,7 @@ __global__ void ep_moe_act_and_mul_cuda_kernel(
   for (int64_t idx = scalar_start; idx < half_hidden_size; idx += stride) {
     float gate_f = static_cast<float>(gate_output_ptr[idx]);
     scalar_t gate_q = silu_quantize<scalar_t>(gate_f);
-    dst_ptr[idx] = gate_q * up_output_ptr[idx] * scale_q;
+    dst_ptr[idx] = gate_q * up_output_ptr[idx] * shared_scale;
   }
 }
 
