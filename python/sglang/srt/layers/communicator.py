@@ -189,9 +189,10 @@ class LayerCommunicator:
             residual = hidden_states
         else:
             if residual is not None and hasattr(hidden_states, '_sglang_needs_allreduce_fusion') and hidden_states._sglang_needs_allreduce_fusion:
-                fused_result = self._allreduce_add_rmsnorm_fusion(hidden_states, residual)
+                hidden_states, residual = self.input_layernorm.forward_with_allreduce_fusion(
+                    hidden_states, residual
+                )
                 delattr(hidden_states, '_sglang_needs_allreduce_fusion')
-                hidden_states, residual = fused_result    
             else:
                 if residual is None:
                     residual = hidden_states
@@ -207,16 +208,6 @@ class LayerCommunicator:
 
         return hidden_states, residual
 
-    def _allreduce_add_rmsnorm_fusion(self, hidden_states: torch.Tensor, residual: torch.Tensor):
-
-        norm_out, residual_out = flashinfer_allreduce_add_rmsnorm(
-            input_tensor=hidden_states,
-            residual=residual,
-            weight=self.input_layernorm.weight,
-            eps=self.input_layernorm.variance_epsilon,
-        )
-        
-        return norm_out, residual_out
 
     def prepare_mlp(
         self,
