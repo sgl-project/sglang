@@ -486,12 +486,18 @@ class HiCacheController:
             try:
                 operation = self.mooncake_l3_write_queue.get(block=True, timeout=0.001)
                 keys = operation.mooncake_keys
-                mooncake_exist_keys = self.mooncake_l3_kv_pool.is_batch_exist(
-                    keys
-                )
-                key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(operation.mooncake_keys,
-                                                                                 operation.host_indices)
-                self.mooncake_l3_kv_pool.batch_put(key_strs, buffer_ptrs, buffer_sizes)
+                mooncake_exist_keys = self.mooncake_l3_kv_pool.is_batch_exist(keys)
+                indices = operation.host_indices.tolist()
+                non_exist_keys = []
+                non_exist_indices = []
+                for i in range(len(keys)):
+                    if not mooncake_exist_keys[keys[i]]:
+                        non_exist_keys.append(keys[i])
+                        non_exist_indices.extend(indices[i * self.page_size: (i + 1) * self.page_size])
+                if len(non_exist_keys) > 0:
+                    key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(non_exist_keys,
+                                                                                     non_exist_indices)
+                    self.mooncake_l3_kv_pool.batch_put(key_strs, buffer_ptrs, buffer_sizes)
 
             except Empty:
                 continue
@@ -504,7 +510,7 @@ class HiCacheController:
             try:
                 operation = self.mooncake_load_queue.get(block=True, timeout=0.001)
                 key_strs, buffer_ptrs, buffer_sizes = self.mem_pool_host.get_buffer_meta(operation.mooncake_keys,
-                                                                                 operation.host_indices)
+                                                                                 operation.host_indices.tolist())
                 self.mooncake_l3_kv_pool.batch_get(key_strs, buffer_ptrs, buffer_sizes)
 
                 for node_id in operation.node_ids:
