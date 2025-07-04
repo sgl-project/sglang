@@ -33,6 +33,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_janus_pro import DropPath
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.utils import logger
@@ -50,7 +51,6 @@ class InternAttention(nn.Module):
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
-
         self.scale = self.head_dim**-0.5
 
         self.attn = VisionAttention(
@@ -64,12 +64,7 @@ class InternAttention(nn.Module):
             proj_bias=getattr(config, "qkv_bias", True),
             flatten_batch=False,
         )
-
         self.proj_drop = nn.Dropout(config.dropout)
-
-        if hasattr(config, 'qk_normalization') and config.qk_normalization:
-            self.q_norm = InternRMSNorm(self.embed_dim, eps=config.layer_norm_eps)
-            self.k_norm = InternRMSNorm(self.embed_dim, eps=config.layer_norm_eps)
 
     def forward(
         self,
@@ -188,20 +183,6 @@ class InternVisionEmbeddings(nn.Module):
         )
         embeddings = embeddings + position_embedding.to(target_dtype)
         return embeddings
-
-
-class InternRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
     
 
 class InternMLP(nn.Module):
@@ -220,7 +201,7 @@ class InternMLP(nn.Module):
 
 
 NORM2FN = {
-    "rms_norm": InternRMSNorm,
+    "rms_norm": RMSNorm,
     "layer_norm": nn.LayerNorm,
 }
 
