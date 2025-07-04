@@ -178,25 +178,16 @@ class Ernie4DecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             bias=config.use_bias,
         )
-        self.moe_layer_start_index = config.num_hidden_layers
-        if hasattr(config, "moe_layer_start_index"):
-            # config.moe_layer_start_index is a list in the VL models,
-            # the value of idx 0 is for the text moe
-            if isinstance(config.moe_layer_start_index, int):
-                self.moe_layer_start_index = config.moe_layer_start_index
-            else:
-                self.moe_layer_start_index = config.moe_layer_start_index[0]
-
-        self.moe_layer_end_index = config.num_hidden_layers - 1
-        if hasattr(config, "moe_layer_end_index"):
-            if isinstance(config.moe_layer_end_index, int):
-                self.moe_layer_end_index = config.moe_layer_end_index
-            else:
-                self.moe_layer_end_index = config.moe_layer_end_index[0]
+        moe_layer_start_index = getattr(
+            config, "moe_layer_start_index", config.num_hidden_layers
+        )
+        moe_layer_end_index = getattr(
+            config, "moe_layer_end_index", config.num_hidden_layers - 1
+        )
         # MLP
         if (not is_mtp) and (
-            self.moe_layer_start_index <= layer_id <= self.moe_layer_end_index
-            and (layer_id - self.moe_layer_start_index) % config.moe_layer_interval == 0
+            moe_layer_start_index <= layer_id <= moe_layer_end_index
+            and (layer_id - moe_layer_start_index) % config.moe_layer_interval == 0
         ):
             self.mlp = Ernie4Moe(
                 config=config,
