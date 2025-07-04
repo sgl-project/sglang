@@ -6,13 +6,11 @@ from decord import VideoReader, cpu
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.models.internvl import InternVLChatModel
+from sglang.srt.models.internvl import InternVLChatModel, InternVLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.models.internvl import InternVLChatModel, InternVLForConditionalGeneration
 
 
 class InternVLImageProcessor(BaseMultimodalProcessor):

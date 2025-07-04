@@ -35,12 +35,13 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 if is_flashinfer_available():
-    from flashinfer.prefill import (
+    from flashinfer import (
+        BatchDecodeWithPagedKVCacheWrapper,
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
     )
     from flashinfer.cascade import merge_state
-    from flashinfer.decode import _get_range_buf, get_seq_lens, BatchDecodeWithPagedKVCacheWrapper
+    from flashinfer.decode import _get_range_buf, get_seq_lens
 
 
 class WrapperDispatch(Enum):
