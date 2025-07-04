@@ -13,6 +13,8 @@
 # ==============================================================================
 """Common utilities."""
 
+from __future__ import annotations
+
 import base64
 import builtins
 import ctypes
@@ -40,6 +42,7 @@ import threading
 import time
 import traceback
 import warnings
+from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum
 from functools import lru_cache
@@ -997,36 +1000,48 @@ def point_to_point_pyobj(
     src: int = 0,
     dst: int = 1,
 ):
-    """Send data from src to dst in group."""
+    """Send data from src to dst in group using DeviceToDevice communication."""
 
     if rank == src:
         if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long)
+            tensor_size = torch.tensor(
+                [0], dtype=torch.long, device=torch.cuda.current_device()
+            )
             dist.send(tensor_size, dst=dst, group=group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
+            ).cuda(
+                device=torch.cuda.current_device()
+            )  # Move to GPU
+            tensor_size = torch.tensor(
+                [size], dtype=torch.long, device=torch.cuda.current_device()
             )
-            tensor_size = torch.tensor([size], dtype=torch.long)
 
             dist.send(tensor_size, dst=dst, group=group)
             dist.send(tensor_data, dst=dst, group=group)
         return data
 
     elif rank == dst:
-        tensor_size = torch.tensor([0], dtype=torch.long)
+        tensor_size = torch.tensor(
+            [0], dtype=torch.long, device=torch.cuda.current_device()
+        )
         dist.recv(tensor_size, src=src, group=group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
-        tensor_data = torch.empty(size, dtype=torch.uint8)
+        tensor_data = torch.empty(
+            size, dtype=torch.uint8, device=torch.cuda.current_device()
+        )
         dist.recv(tensor_data, src=src, group=group)
 
-        serialized_data = bytes(tensor_data.cpu().numpy())
+        serialized_data = bytes(
+            tensor_data.cpu().numpy()
+        )  # Move back to host for deserialization
         data = pickle.loads(serialized_data)
         return data
 
@@ -1428,6 +1443,15 @@ def is_habana_available() -> bool:
 
 @lru_cache(maxsize=8)
 def get_device(device_id: Optional[int] = None) -> str:
+    if is_cpu():
+        if cpu_has_amx_support():
+            logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
+        else:
+            logger.warning(
+                "CPU device enabled, using torch native backend, low performance expected."
+            )
+        return "cpu"
+
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if device_id is None:
             return "cuda"
@@ -1455,15 +1479,6 @@ def get_device(device_id: Optional[int] = None) -> str:
             raise ImportError(
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
-
-    if is_cpu():
-        if cpu_has_amx_support():
-            logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
-        else:
-            logger.warning(
-                "CPU device enabled, using torch native backend, low performance expected."
-            )
-        return "cpu"
 
     raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
 
@@ -1924,13 +1939,6 @@ def rank0_log(msg: str):
         logger.info(msg)
 
 
-def rank0_print(msg: str):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
-
-    if get_tensor_model_parallel_rank() == 0:
-        print(msg, flush=True)
-
-
 def get_cuda_version():
     if torch.version.cuda:
         return tuple(map(int, torch.version.cuda.split(".")))
@@ -2348,45 +2356,6 @@ def require_mlp_sync(server_args):
     return server_args.enable_dp_attention or require_gathered_buffer(server_args)
 
 
-def merge_bias_tensor(
-    lhs: Optional[torch.Tensor],
-    rhs: Optional[torch.Tensor],
-    bs1: int,
-    bs2: int,
-    device: str,
-    default: float,
-):
-    """Merge two bias tensors for batch merging.
-
-    Args:
-        lhs: Left-hand side tensor
-        rhs: Right-hand side tensor
-        bs1: Batch size of left-hand side tensor
-        bs2: Batch size of right-hand side tensor
-        device: Device to place the merged tensor on
-        default: Default value for missing tensor elements
-
-    Returns:
-        Merged tensor or None if both inputs are None
-    """
-    if lhs is None and rhs is None:
-        return None
-
-    if lhs is not None and rhs is not None:
-        return torch.cat([lhs, rhs])
-    else:
-        if lhs is not None:
-            shape, dtype = lhs.shape[1:], lhs.dtype
-        else:
-            shape, dtype = rhs.shape[1:], rhs.dtype
-
-        if lhs is None:
-            lhs = torch.empty((bs1, *shape), device=device, dtype=dtype).fill_(default)
-        if rhs is None:
-            rhs = torch.empty((bs2, *shape), device=device, dtype=dtype).fill_(default)
-        return torch.cat([lhs, rhs])
-
-
 def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
     import huggingface_hub as hf
 
@@ -2444,7 +2413,7 @@ def bind_or_assign(target, source):
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return backend not in ["torch_native", "intel_amx", "ascend"]
 
 
 try:
@@ -2459,6 +2428,10 @@ except:
 
 def cpu_has_amx_support():
     return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
+
+
+def use_intel_amx_backend(layer):
+    return getattr(layer, "use_intel_amx_backend", False)
 
 
 class LazyValue:
@@ -2510,3 +2483,88 @@ def configure_gc_logger():
             )
 
     gc.callbacks.append(gc_callback)
+
+
+# COPIED FROM DeepGEMM
+def align(x: int, y: int) -> int:
+    return ceil_div(x, y) * y
+
+
+# COPIED FROM DeepGEMM
+def ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
+def parse_lscpu_topology():
+    try:
+        # Get CPU topology: CPU,Core,Socket,Node
+        output = subprocess.check_output(
+            ["lscpu", "-p=CPU,Core,Socket,Node"], text=True
+        )
+    except Exception as e:
+        raise RuntimeError(f"Unexpected error running 'lscpu': {e}")
+
+    # Parse only data lines (skip comments)
+    cpu_info = []
+    for line in output.splitlines():
+        if not line.startswith("#"):
+            cpu, core, socket, node = map(int, line.strip().split(","))
+            cpu_info.append((cpu, core, socket, node))
+
+    # [(0,0,0,0),(1,1,0,0),...,(43,43,0,1),...,(256,0,0,0),...]
+    return cpu_info
+
+
+def get_physical_cpus_by_numa():
+    cpu_info = parse_lscpu_topology()
+
+    # Map NUMA node -> set of (core_id, socket) to avoid duplicates
+    # 0: {(0,0): 0, (1, 0): 1,...}
+    # ...
+    # 5: {(214,1): 214, (215,1): 215}
+    physical_by_node = defaultdict(dict)  # node -> core_id -> cpu_id
+
+    for cpu, core, socket, node in cpu_info:
+        key = (core, socket)
+        if key not in physical_by_node[node]:
+            physical_by_node[node][
+                key
+            ] = cpu  # pick first CPU seen for that physical core
+
+    # Retrieves CPUs that the current process is allowed to run on
+    cpus_allowed_list = psutil.Process().cpu_affinity()
+
+    # Convert to list of physical CPUs per node
+    # 0: [0,1,2,...,42]
+    # ...
+    # 2: [86,87,...,127]
+    # ...
+    # 5: [214,215,...,255]
+    node_to_cpus = {}
+    for node, core_to_cpu in physical_by_node.items():
+        cpus = sorted(core_to_cpu.values())
+        allowed_cpus = set(cpus).intersection(cpus_allowed_list)
+        node_to_cpus[node] = allowed_cpus
+
+    return node_to_cpus
+
+
+# Only physical cores are used. Logical cores are excluded.
+def get_cpu_ids_by_node():
+    node_to_cpus = get_physical_cpus_by_numa()
+    # Sort by NUMA node index
+    cpu_ids = [
+        ",".join(map(str, sorted(node_to_cpus[node]))) for node in sorted(node_to_cpus)
+    ]
+
+    # ['0,1,2,3', '4,5,6,7', '8,9,10,11', '12,13,14,15', '16,17,18,19', '20,21,22,23']
+    return cpu_ids
+
+
+def is_shm_available(dtype, world_size, local_size):
+    return (
+        cpu_has_amx_support()
+        and dtype in [torch.bfloat16, torch.float]
+        and world_size >= 1
+        and world_size == local_size
+    )
