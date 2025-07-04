@@ -39,7 +39,12 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import flatten_nested_list, get_compiler_backend, support_triton
+from sglang.srt.utils import (
+    flatten_nested_list,
+    get_compiler_backend,
+    is_npu,
+    support_triton,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -49,6 +54,8 @@ if TYPE_CHECKING:
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+_is_npu = is_npu()
 
 
 class ForwardMode(IntEnum):
@@ -224,6 +231,9 @@ class ForwardBatch:
     # For input embeddings
     input_embeds: Optional[torch.tensor] = None
 
+    # For cross-encoder model
+    token_type_ids: Optional[torch.Tensor] = None
+
     # Sampling info
     sampling_info: SamplingBatchInfo = None
 
@@ -302,6 +312,7 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embeds=batch.input_embeds,
+            token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
         )
         device = model_runner.device
@@ -318,17 +329,30 @@ class ForwardBatch:
 
         # For DP attention
         if batch.global_num_tokens is not None:
-            ret.global_num_tokens_cpu = batch.global_num_tokens
+
+            spec_num_draft_tokens = (
+                batch.spec_num_draft_tokens
+                if batch.spec_num_draft_tokens is not None
+                else 1
+            )
+            global_num_tokens = [
+                x * spec_num_draft_tokens for x in batch.global_num_tokens
+            ]
+            global_num_tokens_for_logprob = [
+                x * spec_num_draft_tokens for x in batch.global_num_tokens_for_logprob
+            ]
+
+            ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
-                batch.global_num_tokens, dtype=torch.int64
+                global_num_tokens, dtype=torch.int64
             ).to(device, non_blocking=True)
 
-            ret.global_num_tokens_for_logprob_cpu = batch.global_num_tokens_for_logprob
+            ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                batch.global_num_tokens_for_logprob, dtype=torch.int64
+                global_num_tokens_for_logprob, dtype=torch.int64
             ).to(device, non_blocking=True)
 
-            sum_len = sum(batch.global_num_tokens)
+            sum_len = sum(global_num_tokens)
             ret.gathered_buffer = torch.zeros(
                 (sum_len, model_runner.model_config.hidden_size),
                 dtype=model_runner.dtype,
@@ -337,7 +361,9 @@ class ForwardBatch:
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
-            TboForwardBatchPreparer.prepare(ret)
+            TboForwardBatchPreparer.prepare(
+                ret, is_draft_worker=model_runner.is_draft_worker
+            )
             return ret
 
         # Override the positions with spec_info
@@ -358,8 +384,8 @@ class ForwardBatch:
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
+            ret.extend_num_tokens = batch.extend_num_tokens
             if support_triton(model_runner.server_args.attention_backend):
-                ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
                     ret.extend_prefix_lens,
                     ret.extend_seq_lens,
@@ -382,7 +408,9 @@ class ForwardBatch:
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
-        TboForwardBatchPreparer.prepare(ret)
+        TboForwardBatchPreparer.prepare(
+            ret, is_draft_worker=model_runner.is_draft_worker
+        )
 
         return ret
 
@@ -720,7 +748,7 @@ def compute_position_torch(
     return positions.to(torch.int64), extend_start_loc
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 

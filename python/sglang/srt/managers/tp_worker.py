@@ -30,12 +30,15 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterReqInput,
+    UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
@@ -57,7 +60,7 @@ class TpModelWorker:
         nccl_port: int,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
-        token_to_kv_pool_allocator: Optional[TokenToKVPoolAllocator] = None,
+        token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
@@ -146,6 +149,15 @@ class TpModelWorker:
 
         # A reference make this class has the same member as TpModelWorkerClient
         self.worker = self
+
+        self.hicache_layer_transfer_counter = None
+
+    def register_hicache_layer_transfer_counter(self, counter):
+        self.hicache_layer_transfer_counter = counter
+
+    def set_hicache_consumer(self, consumer_index):
+        if self.hicache_layer_transfer_counter is not None:
+            self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
     def get_worker_info(self):
         return (
@@ -247,7 +259,7 @@ class TpModelWorker:
         self, recv_req: UpdateWeightsFromDistributedReqInput
     ):
         success, message = self.model_runner.update_weights_from_distributed(
-            recv_req.name, recv_req.dtype, recv_req.shape
+            recv_req.names, recv_req.dtypes, recv_req.shapes, recv_req.group_name
         )
         return success, message
 
@@ -265,3 +277,13 @@ class TpModelWorker:
             recv_req.name, recv_req.truncate_size
         )
         return parameter
+
+    def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
+        result = self.model_runner.load_lora_adapter(
+            recv_req.lora_name, recv_req.lora_path
+        )
+        return result
+
+    def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
+        result = self.model_runner.unload_lora_adapter(recv_req.lora_name)
+        return result

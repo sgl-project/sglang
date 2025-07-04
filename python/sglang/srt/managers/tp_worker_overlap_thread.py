@@ -26,6 +26,8 @@ import torch
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterReqInput,
+    UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -88,6 +90,15 @@ class TpModelWorkerClient:
         if self.device == "cpu":
             self.scheduler_stream.synchronize = lambda: None  # No-op for CPU
 
+        self.hicache_layer_transfer_counter = None
+
+    def register_hicache_layer_transfer_counter(self, counter):
+        self.hicache_layer_transfer_counter = counter
+
+    def set_hicache_consumer(self, consumer_index):
+        if self.hicache_layer_transfer_counter is not None:
+            self.hicache_layer_transfer_counter.set_consumer(consumer_index)
+
     def get_worker_info(self):
         return self.worker.get_worker_info()
 
@@ -146,6 +157,8 @@ class TpModelWorkerClient:
             input_ids = model_worker_batch.input_ids
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
 
+            # update the consumer index of hicache to the running batch
+            self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
             # Run forward
             logits_output, next_token_ids, can_run_cuda_graph = (
                 self.worker.forward_batch_generation(
@@ -256,6 +269,12 @@ class TpModelWorkerClient:
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         return self.worker.get_weights_by_name(recv_req)
+
+    def load_lora_adapter(self, recv_req: LoadLoRAAdapterReqInput):
+        return self.worker.load_lora_adapter(recv_req)
+
+    def unload_lora_adapter(self, recv_req: UnloadLoRAAdapterReqInput):
+        return self.worker.unload_lora_adapter(recv_req)
 
     def __delete__(self):
         self.input_queue.put((None, None))
