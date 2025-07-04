@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 
 import torch
 import torch_npu
+import numpy as np
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -55,7 +56,7 @@ class NpuMLADecodeMetadata:
         self.num_splits = num_splits
         self.block_kv_indices = block_kv_indices
         self.seq_lens_list = seq_lens_list if seq_lens_list is not None else [1]
-
+        self.seq_lens_list_cussum = np.cumsum(self.seq_lens_list).tolist() 
 
 class NpuMLAIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
@@ -63,7 +64,7 @@ class NpuMLAIndicesUpdaterDecode:
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
-        if "depseek" in model_runner.model_config.hf_config.architectures[0].lower():
+        if "deepseek" in model_runner.model_config.hf_config.architectures[0].lower():
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
             self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -155,7 +156,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
-        if "depseek" in model_runner.model_config.hf_config.architectures[0].lower():
+        if "deepseek" in model_runner.model_config.hf_config.architectures[0].lower():
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
             self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -437,8 +438,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
                     q_len_offset += q_len
             else:  # MHA
                 if q_dim != v_dim:
-                    reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-                    q_nope, q_rope = reshape_q.split(
+                    q_nope, q_rope = q.split(
                         [self.v_head_dim, self.qk_rope_head_dim], dim=-1
                     )
                     k_nope, k_rope = k.split(
@@ -447,14 +447,16 @@ class NpuMLABackend(TorchNativeAttnBackend):
 
                     attn_ouput, _ = torch.ops.npu.npu_fused_infer_attention_score(
                         q_nope,
-                        k_nope.unsqueeze(0),
-                        v.unsqueeze(0),
+                        k_nope,
+                        v,
                         query_rope=q_rope,
-                        key_rope=k_rope.unsqueeze(0),
+                        key_rope=k_rope,
                         num_heads=q_heads,
-                        input_layout="BSND",
+                        input_layout="TND",
                         atten_mask=self.attn_mask,
                         sparse_mode=3,
+                        actual_seq_lengths=self.forward_metadata.seq_lens_list_cussum,
+                        actual_seq_lengths_kv=self.forward_metadata.seq_lens_list,
                         scale=layer.scaling,
                         next_tokens=0,
                     )

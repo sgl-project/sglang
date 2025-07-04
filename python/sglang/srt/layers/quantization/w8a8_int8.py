@@ -135,7 +135,6 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
-<<<<<<< HEAD
         if getattr(layer, "use_intel_amx_backend", False):
             return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
                 x,
@@ -145,17 +144,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 x.dtype,
                 True,  # is_vnni
             )
-<<<<<<< HEAD
         
-=======
-
-        x_q, x_scale = per_token_quant_int8(x)
-
-        return int8_scaled_mm(
-            x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
-        )
-=======
->>>>>>> e18352d7 (dsV3 can run on ascend npu, add npu_fused_infer_attention_score)
         if _is_npu:
             x_q, x_scale = torch_npu.npu_dynamic_quant(x)
             out = torch_npu.npu_quant_matmul(
@@ -177,10 +166,6 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
         return out
-<<<<<<< HEAD
-=======
->>>>>>> 38d3d6f2 (dsV3 can run on ascend npu, add npu_fused_infer_attention_score)
->>>>>>> e18352d7 (dsV3 can run on ascend npu, add npu_fused_infer_attention_score)
 
 
 class W8A8Int8MoEMethod:
