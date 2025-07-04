@@ -37,24 +37,6 @@ from sglang.srt.mem_cache.mooncake_store import MooncakeStore
 logger = logging.getLogger(__name__)
 
 
-class RLockCounter:
-    def __init__(self, initial=0):
-        self.value = initial
-        self._lock = threading.RLock()
-
-    def increment(self, amount=1):
-        with self._lock:
-            self.value += amount
-
-    def get_value(self):
-        with self._lock:
-            return self.value
-
-    def reset(self):
-        with self._lock:
-            self.value = 0
-
-
 class LayerDoneCounter:
     def __init__(self, num_layers):
         self.num_layers = num_layers
@@ -79,12 +61,6 @@ class LayerDoneCounter:
         with self.conditions[self.producer_index]:
             self.counters[self.producer_index] += 1
             self.conditions[self.producer_index].notify_all()
-
-    def compare_increment(self, value):
-        with self.conditions[self.producer_index]:
-            if value > self.counters[self.producer_index]:
-                self.counters[self.producer_index] = value
-                self.conditions[self.producer_index].notify_all()
 
     def wait_until(self, threshold):
         with self.conditions[self.consumer_index]:
@@ -205,7 +181,7 @@ class CacheOperation:
                     node_id=0,
                     l3_keys=(
                         self.l3_keys[
-                            i / self.page_size : (i + chunk_size) / self.page_size
+                            i // self.page_size : (i + chunk_size) // self.page_size
                         ]
                         if self.l3_keys
                         else None
@@ -563,8 +539,6 @@ class HiCacheController:
 
             # start layer-wise KV cache transfer from CPU to GPU
             self.layer_done_counter.reset()
-            if self.enable_mooncake_store_l3_cache:
-                self.l2_layer_counter.reset()
 
             host_indices, device_indices = self.move_indices(
                 batch_operation.host_indices, batch_operation.device_indices
@@ -578,15 +552,7 @@ class HiCacheController:
                     self.io_backend,
                 )
                 self.load_stream.synchronize()
-                if self.enable_mooncake_store_l3_cache:
-                    self.layer_done_counter.compare_increment(
-                        min(
-                            self.l3_layer_counter.get_value(),
-                            self.l2_layer_counter.get_value(),
-                        )
-                    )
-                else:
-                    self.layer_done_counter.increment()
+                self.layer_done_counter.increment()
 
             self.mem_pool_host.complete_io(batch_operation.host_indices)
             for node_id in batch_operation.node_ids:

@@ -143,11 +143,7 @@ class HiRadixCache(RadixCache):
         l3_keys = []
         if self.enable_mooncake_store_l3_cache:
             # The KV cache of each rank in the MLA model is the same, so only one copy needs to be stored
-            local_rank = (
-                0
-                if isinstance(self.kv_cache, MLATokenToKVPool)
-                else torch.cuda.current_device()
-            )
+            local_rank =  torch.cuda.current_device()
             prefix_block_key = (
                 ""
                 if node.parent is None or len(node.parent.l3_keys) == 0
@@ -545,11 +541,7 @@ class HiRadixCache(RadixCache):
         if self.enable_mooncake_store_l3_cache:
             # try to get the cross instance shared kv cache
             if len(key) and (not node.evicted or node.backuped):
-                local_rank = (
-                    0
-                    if isinstance(self.kv_cache, MLATokenToKVPool)
-                    else torch.cuda.current_device()
-                )
+                local_rank =  torch.cuda.current_device()
                 prefix_block_key = (
                     ""
                     if node.parent is None or len(node.parent.l3_keys) == 0
