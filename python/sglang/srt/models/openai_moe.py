@@ -1106,7 +1106,7 @@ class OpenAIMoeForCausalLM(nn.Module):
                                 # Weight case - pass the full weight and let weight_loader handle TP sharding
                                 expert_weight = loaded_weight[expert_id]  # Shape: (2*moe_intermediate_size, hidden_size)
                                 # Pass the full weight to weight_loader, it will handle TP sharding internally
-                                weight_loader(param, expert_weight, name, shard_id="w13", expert_id=expert_id)
+                                weight_loader(param, expert_weight, name, shard_id="w13", expert_id=expert_id, checkpoint_weights_transposed=True)
                 elif ".experts.down_proj" in name:
                     # Handle batched down_proj weights and bias
                     if name.endswith("_bias"):
