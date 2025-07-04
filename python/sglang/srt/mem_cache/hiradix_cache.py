@@ -240,7 +240,7 @@ class HiRadixCache(RadixCache):
 
                 # clear the reference
                 del self.l3_ongoing_load_back[ack_id]
-                req.last_node = req.last_l3_node
+                req.last_host_node = req.last_l3_node
                 req.host_hit_length += req.l3_hit_length
             except Exception:
                 break
