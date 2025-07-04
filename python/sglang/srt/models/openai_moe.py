@@ -1040,7 +1040,7 @@ class OpenAIMoeForCausalLM(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
             
-            # 处理gate/router命名不匹配
+            # OpenAIMoe use router to name gate
             if ".mlp.router." in name:
                 name = name.replace(".mlp.router.", ".mlp.gate.")
                 if name in params_dict:
