@@ -8,7 +8,7 @@ import sglang as sgl
 
 def main():
     image_path = "/mnt/petrelfs/shaojie/code/sglang/my_scripts/tmp.jpg"
-    model_path = "/mnt/petrelfs/shaojie/code/ckpts/OpenGVLab/InternVL3-8B-hf"
+    model_path = "/mnt/petrelfs/shaojie/code/ckpts/OpenGVLab/InternVL3-8B"
     chat = [
         {
             'content': "You are an AI assistant that rigorously follows this response protocol:\n\n1. First, conduct a detailed analysis of the question. Consider different angles, potential solutions, and reason through the problem step-by-step. Enclose this entire thinking process within <think> and </think> tags.\n\n2. After the thinking section, provide a clear, concise, and direct answer to the user's question. Separate the answer from the think section with a newline.\n\nEnsure that the thinking process is thorough but remains focused on the query. The final answer should be standalone and not reference the thinking section.",

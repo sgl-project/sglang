@@ -108,32 +108,43 @@ class FlashAttention(nn.Module):
 
 
 class InternAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, hf_version=False):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
 
+        self.hf_version = hf_version
+        if hf_version:
+            self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.attention_bias)
+            self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.attention_bias)
+            self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=config.attention_bias)
+            self.qk_normalization = config.use_qk_norm
+            self.projection_layer = nn.Linear(self.embed_dim, self.embed_dim)
+        else:
+            self.qkv = nn.Linear(self.embed_dim, 3 * self.embed_dim, bias=config.qkv_bias)
+            self.qk_normalization = config.qk_normalization
+            self.proj = nn.Linear(self.embed_dim, self.embed_dim)
+
         self.scale = self.head_dim**-0.5
-        self.qkv = nn.Linear(self.embed_dim, 3 * self.embed_dim, bias=config.qkv_bias)
         self.proj_drop = nn.Dropout(config.dropout)
-
-        self.qk_normalization = config.qk_normalization
-
         if self.qk_normalization:
             self.q_norm = InternRMSNorm(self.embed_dim, eps=config.layer_norm_eps)
             self.k_norm = InternRMSNorm(self.embed_dim, eps=config.layer_norm_eps)
-
         self.inner_attn = FlashAttention(softmax_scale=self.scale)
-
-        self.proj = nn.Linear(self.embed_dim, self.embed_dim)
 
     def _flash_attn(
         self,
         x,
     ):
-        qkv = self.qkv(x)
+        if self.hf_version:
+            q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = self.v_proj(x)
+            qkv = torch.cat([q, k, v], dim=2)
+        else:
+            qkv = self.qkv(x)
         qkv = rearrange(
             qkv, "b s (three h d) -> b s three h d", three=3, h=self.num_heads
         )
@@ -147,7 +158,10 @@ class InternAttention(nn.Module):
         context, _ = self.inner_attn(
             qkv,
         )
-        outs = self.proj(rearrange(context, "b s h d -> b s (h d)"))
+        if self.hf_version:
+            outs = self.projection_layer(rearrange(context, "b s h d -> b s (h d)"))
+        else:
+            outs = self.proj(rearrange(context, "b s h d -> b s (h d)"))
         outs = self.proj_drop(outs)
         return outs
 
@@ -156,31 +170,64 @@ class InternAttention(nn.Module):
         return x
 
 
+class InternVLVisionPatchEmbeddings(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride):
+        super().__init__()
+        self.projection = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride
+        )
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        embeddings = self.projection(pixel_values)
+        return embeddings
+
+
 class InternVisionEmbeddings(nn.Module):
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: PretrainedConfig, hf_version=False):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
-        self.image_size = config.image_size
-        self.patch_size = config.patch_size
 
-        self.class_embedding = nn.Parameter(
-            torch.randn(1, 1, self.embed_dim),
-        )
+        self.hf_version = hf_version
+        if hf_version:
+            self.image_size = config.image_size[0]
+            self.patch_size = config.patch_size[0]
+            self.num_patches = (self.image_size // self.patch_size) ** 2
+            self.num_positions = self.num_patches + 1
 
-        self.patch_embedding = nn.Conv2d(
-            in_channels=3,
-            out_channels=self.embed_dim,
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
-        )
+            self.cls_token = nn.Parameter(
+                torch.randn(1, 1, self.embed_dim),
+            )
+            self.patch_embeddings = InternVLVisionPatchEmbeddings(
+                in_channels=3,
+                out_channels=self.embed_dim,
+                kernel_size=self.patch_size,
+                stride=self.patch_size,
+            )
+            self.position_embeddings = nn.Parameter(
+                torch.randn(1, self.num_positions, self.embed_dim)
+            )
+        else:
+            self.image_size = config.image_size
+            self.patch_size = config.patch_size
+            self.num_patches = (self.image_size // self.patch_size) ** 2
+            self.num_positions = self.num_patches + 1
 
-        self.num_patches = (self.image_size // self.patch_size) ** 2
-        self.num_positions = self.num_patches + 1
-
-        self.position_embedding = nn.Parameter(
-            torch.randn(1, self.num_positions, self.embed_dim)
-        )
+            self.class_embedding = nn.Parameter(
+                torch.randn(1, 1, self.embed_dim),
+            )
+            self.patch_embedding = nn.Conv2d(
+                in_channels=3,
+                out_channels=self.embed_dim,
+                kernel_size=self.patch_size,
+                stride=self.patch_size,
+            )
+            self.position_embedding = nn.Parameter(
+                torch.randn(1, self.num_positions, self.embed_dim)
+            )
 
     def _get_pos_embed(self, pos_embed, H, W):
         target_dtype = pos_embed.dtype
@@ -203,18 +250,28 @@ class InternVisionEmbeddings(nn.Module):
         return pos_embed
 
     def forward(self, pixel_values: torch.FloatTensor) -> torch.Tensor:
-        target_dtype = self.patch_embedding.weight.dtype
-        patch_embeds = self.patch_embedding(
+        if self.hf_version:
+            patch_embedding = self.patch_embeddings
+            class_embedding = self.cls_token
+            position_embedding = self.position_embeddings
+            target_dtype = patch_embedding.projection.weight.dtype
+        else:
+            patch_embedding = self.patch_embedding
+            class_embedding = self.class_embedding
+            position_embedding = self.position_embedding
+            target_dtype = patch_embedding.weight.dtype
+
+        patch_embeds = patch_embedding(
             pixel_values
         )  # shape = [*, channel, width, height]
         batch_size, _, height, width = patch_embeds.shape
         patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
-        class_embeds = self.class_embedding.expand(batch_size, 1, -1).to(target_dtype)
+        class_embeds = class_embedding.expand(batch_size, 1, -1).to(target_dtype)
         embeddings = torch.cat([class_embeds, patch_embeds], dim=1)
         position_embedding = torch.cat(
             [
-                self.position_embedding[:, :1, :],
-                self._get_pos_embed(self.position_embedding[:, 1:, :], height, width),
+                position_embedding[:, :1, :],
+                self._get_pos_embed(position_embedding[:, 1:, :], height, width),
             ],
             dim=1,
         )
@@ -234,7 +291,7 @@ class InternRMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
-
+    
 
 class InternMLP(nn.Module):
     def __init__(self, config: PretrainedConfig):
@@ -264,24 +321,34 @@ class InternVisionEncoderLayer(nn.Module):
         config: PretrainedConfig,
         drop_path_rate: float,
         quant_config: QuantizationConfig = None,
+        hf_version: bool = False
     ):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.norm_type = config.norm_type
-        self.attn = InternAttention(config)
         self.mlp = InternMLP(config)
-        self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
-        self.norm2 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
 
-        self.ls1 = nn.Parameter(config.initializer_factor * torch.ones(self.embed_dim))
-        self.ls2 = nn.Parameter(config.initializer_factor * torch.ones(self.embed_dim))
         self.drop_path1 = (
             DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
         )
         self.drop_path2 = (
             DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
         )
+
+        self.hf_version = hf_version
+        if hf_version:
+            self.attention = InternAttention(config, hf_version=hf_version)
+            self.layernorm_before = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
+            self.layernorm_after = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
+            self.lambda_1 = nn.Parameter(config.initializer_factor * torch.ones(self.embed_dim))
+            self.lambda_2 = nn.Parameter(config.initializer_factor * torch.ones(self.embed_dim))
+        else:
+            self.attn = InternAttention(config, hf_version=hf_version)
+            self.norm1 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
+            self.norm2 = NORM2FN[self.norm_type](self.embed_dim, eps=config.layer_norm_eps)
+            self.ls1 = nn.Parameter(config.initializer_factor * torch.ones(self.embed_dim))
+            self.ls2 = nn.Parameter(config.initializer_factor * torch.ones(self.embed_dim))
 
     def forward(
         self,
@@ -295,12 +362,25 @@ class InternVisionEncoderLayer(nn.Module):
         Args:
             hidden_states (`Tuple[torch.FloatTensor, Optional[torch.FloatTensor]]`): input to the layer of shape `(batch, seq_len, embed_dim)`
         """
+        if self.hf_version:
+            attn = self.attention
+            norm1 = self.layernorm_before
+            ls1 = self.lambda_1
+            norm2 = self.layernorm_after
+            ls2 = self.lambda_2  
+        else:
+            attn = self.attn
+            norm1 = self.norm1
+            ls1 = self.ls1
+            norm2 = self.norm2
+            ls2 = self.ls2
+
         hidden_states = hidden_states + self.drop_path1(
-            self.attn(self.norm1(hidden_states).to(hidden_states.dtype)) * self.ls1
+            attn(norm1(hidden_states).to(hidden_states.dtype)) * ls1
         )
 
         hidden_states = hidden_states + self.drop_path2(
-            self.mlp(self.norm2(hidden_states).to(hidden_states.dtype)) * self.ls2
+            self.mlp(norm2(hidden_states).to(hidden_states.dtype)) * ls2
         )
 
         return hidden_states
@@ -320,20 +400,29 @@ class InternVisionEncoder(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        hf_version=False
     ):
         super().__init__()
         self.config = config
+        if not hasattr(config, 'drop_path_rate'):
+            config.drop_path_rate = 0
         # stochastic depth decay rule
         dpr = [
             x.item()
             for x in torch.linspace(0, config.drop_path_rate, config.num_hidden_layers)
         ]
-        self.layers = nn.ModuleList(
+        layers = nn.ModuleList(
             [
-                InternVisionEncoderLayer(config, dpr[idx], quant_config)
+                InternVisionEncoderLayer(config, dpr[idx], quant_config, hf_version=hf_version)
                 for idx in range(config.num_hidden_layers)
             ]
         )
+        
+        self.hf_version = hf_version
+        if hf_version:
+            self.layer = layers
+        else:
+            self.layers = layers
 
     def forward(
         self,
@@ -363,7 +452,12 @@ class InternVisionEncoder(nn.Module):
         encoder_states = () if output_hidden_states else None
         hidden_states = inputs_embeds
 
-        for idx, encoder_layer in enumerate(self.layers):
+        if self.hf_version:
+            layers = self.layer
+        else:
+            layers = self.layers
+
+        for idx, encoder_layer in enumerate(layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
             layer_outputs = encoder_layer(
@@ -391,17 +485,21 @@ class InternVisionModel(PreTrainedModel):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        hf_version: bool = False
     ):
         super().__init__(config)
         self.config = config
 
         self.embeddings = InternVisionEmbeddings(
-            config,
+            config, hf_version=hf_version
         )
-        self.encoder = InternVisionEncoder(config, quant_config)
+        self.encoder = InternVisionEncoder(config, quant_config, hf_version=hf_version)
 
     def resize_pos_embeddings(self, old_size, new_size, patch_size):
-        pos_emb = self.embeddings.position_embedding
+        if self.embeddings.hf_version:
+            pos_emb = self.embeddings.position_embeddings
+        else:
+            pos_emb = self.embeddings.position_embedding
         _, num_positions, embed_dim = pos_emb.shape
         cls_emb = pos_emb[:, :1, :]
         pos_emb = (
@@ -417,7 +515,10 @@ class InternVisionModel(PreTrainedModel):
         )
         pos_emb = pos_emb.to(cls_emb.dtype).reshape(1, embed_dim, -1).permute(0, 2, 1)
         pos_emb = torch.cat([cls_emb, pos_emb], dim=1)
-        self.embeddings.position_embedding = nn.Parameter(pos_emb)
+        if self.embeddings.hf_version:
+            self.embeddings.position_embeddings = nn.Parameter(pos_emb)
+        else:
+            self.embeddings.position_embedding = nn.Parameter(pos_emb)
         self.embeddings.image_size = new_size
         logger.info(
             "Resized position embeddings from {} to {}".format(old_size, new_size)
@@ -472,37 +573,63 @@ class InternVisionModel(PreTrainedModel):
         )
 
 
+class InternVLMultiModalProjector(nn.Module):
+    def __init__(self, config: PretrainedConfig):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(config.vision_config.hidden_size * int(1 / config.downsample_ratio) ** 2)
+        self.linear_1 = nn.Linear(
+            config.vision_config.hidden_size * int(1 / config.downsample_ratio) ** 2, config.text_config.hidden_size
+        )
+        self.act = ACT2FN[config.projector_hidden_act]
+        self.linear_2 = nn.Linear(config.text_config.hidden_size, config.text_config.hidden_size)
+
+    def forward(self, image_features):
+        hidden_states = self.layer_norm(image_features)
+        hidden_states = self.linear_1(hidden_states)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.linear_2(hidden_states)
+        return hidden_states
+    
+
 class InternVLChatModel(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         use_flash_attn=True,
+        hf_version=False
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
 
-        image_size = config.force_image_size or config.vision_config.image_size
-        patch_size = config.vision_config.patch_size
+        self.hf_version = hf_version
+        if hf_version:
+            image_size = config.vision_config.image_size[0]
+            patch_size = config.vision_config.patch_size[0]
+            config.llm_config = config.text_config
+            self.select_layer = config.vision_feature_layer
+            self.ps_version = None
+        else:
+            image_size = config.force_image_size or config.vision_config.image_size
+            patch_size = config.vision_config.patch_size
+            self.select_layer = config.select_layer
+            self.template = config.template
+            self.ps_version = config.ps_version
+            logger.info(f"ps_version: {self.ps_version}")
+
         self.patch_size = patch_size
-        self.select_layer = config.select_layer
-        self.template = config.template
         self.num_image_token = int(
             (image_size // patch_size) ** 2 * (config.downsample_ratio**2)
         )
         self.downsample_ratio = config.downsample_ratio
-        self.ps_version = config.ps_version
 
         config.vision_config.use_flash_attn = True if use_flash_attn else False
         config.llm_config._attn_implementation = (
             "flash_attention_2" if use_flash_attn else "eager"
         )
-
         logger.info(f"num_image_token: {self.num_image_token}")
-        logger.info(f"ps_version: {self.ps_version}")
 
-        self.vision_model = InternVisionModel(config.vision_config)
         if config.llm_config.architectures[0] == "Qwen2ForCausalLM":
             self.language_model = Qwen2ForCausalLM(
                 config=config.llm_config, quant_config=quant_config
@@ -518,15 +645,20 @@ class InternVLChatModel(nn.Module):
 
         vit_hidden_size = config.vision_config.hidden_size
         llm_hidden_size = config.llm_config.hidden_size
-
-        self.mlp1 = nn.Sequential(
-            nn.LayerNorm(vit_hidden_size * int(1 / self.downsample_ratio) ** 2),
-            nn.Linear(
-                vit_hidden_size * int(1 / self.downsample_ratio) ** 2, llm_hidden_size
-            ),
-            nn.GELU(),
-            nn.Linear(llm_hidden_size, llm_hidden_size),
-        )
+        
+        if hf_version:
+            self.multi_modal_projector = InternVLMultiModalProjector(config)
+            self.vision_tower = InternVisionModel(config.vision_config, hf_version=hf_version)
+        else:
+            self.vision_model = InternVisionModel(config.vision_config, hf_version=hf_version)
+            self.mlp1 = nn.Sequential(
+                nn.LayerNorm(vit_hidden_size * int(1 / self.downsample_ratio) ** 2),
+                nn.Linear(
+                    vit_hidden_size * int(1 / self.downsample_ratio) ** 2, llm_hidden_size
+                ),
+                nn.GELU(),
+                nn.Linear(llm_hidden_size, llm_hidden_size),
+            )
 
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
@@ -551,12 +683,19 @@ class InternVLChatModel(nn.Module):
         return x
 
     def extract_feature(self, pixel_values):
+        if self.hf_version:
+            vision_model = self.vision_tower
+            mlp1 = self.multi_modal_projector
+        else:
+            vision_model = self.vision_model
+            mlp1 = self.mlp1
+            
         if self.select_layer == -1:
-            vit_embeds = self.vision_model(
+            vit_embeds = vision_model(
                 pixel_values=pixel_values, output_hidden_states=False, return_dict=True
             ).last_hidden_state
         else:
-            vit_embeds = self.vision_model(
+            vit_embeds = vision_model(
                 pixel_values=pixel_values, output_hidden_states=True, return_dict=True
             ).hidden_states[self.select_layer]
         vit_embeds = vit_embeds[:, 1:, :]
@@ -565,7 +704,7 @@ class InternVLChatModel(nn.Module):
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
         vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
-        vit_embeds = self.mlp1(vit_embeds)
+        vit_embeds = mlp1(vit_embeds)
         return vit_embeds
 
     def get_image_feature(self, items: List[MultimodalDataItem]):
@@ -632,6 +771,8 @@ class InternVLChatModel(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
+                if self.hf_version and "vision_tower" in name:
+                    continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
@@ -667,4 +808,18 @@ class InternVLChatModel(nn.Module):
                     weight_loader(param, loaded_weight)
 
 
-EntryClass = InternVLChatModel
+class InternVLForConditionalGeneration(InternVLChatModel):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        use_flash_attn=True,
+    ) -> None:
+        # import pdb; pdb.set_trace()
+        super().__init__(config, quant_config, use_flash_attn, hf_version=True)
+
+
+EntryClass = [
+    InternVLChatModel, 
+    InternVLForConditionalGeneration
+]
