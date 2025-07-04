@@ -374,6 +374,7 @@ class HiRadixCache(RadixCache):
             node.host_value = host_indices[
                 offset : offset + len(node.l3_keys) * self.page_size
             ]
+            offset += len(node.l3_keys) * self.page_size
         for node in l3_nodes_to_load:
             node.loading = True
 
