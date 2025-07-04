@@ -1490,7 +1490,7 @@ class Scheduler(
         if need_dp_attn_preparation and not self.spec_algorithm.is_none():
             # In speculative decoding, prefill batches and decode batches cannot be processed in the same DP attention group.
             # We prepare idle batches in advance to skip preparing decode batches when there are prefill batches in the group.
-            new_batch, _ = self.prepare_mlp_sync_batch(new_batch)
+            new_batch = self.prepare_mlp_sync_batch(new_batch)
             need_dp_attn_preparation = new_batch is None
 
         if new_batch is not None:
