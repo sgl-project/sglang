@@ -24,11 +24,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from transformers import LlamaConfig
-# from vllm.config import VllmConfig
 
-# from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
-
 from .llama import LlamaDecoderLayer
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.model_loader.weight_utils import (
@@ -36,8 +33,6 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
-# from .utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper,
-#                     is_pp_missing_parameter)
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +41,7 @@ class TeleChat2Model(LlamaModel):
     def __init__(self, config: LlamaConfig, prefix: str = ""):
         # 1. Initialize the LlamaModel with bias
         config.attention_bias = True
-        config.mlp_bias = True
-        # aDDING FOR ERROR : AttributeError: 'Telechat2Config' object has no attribute 'intermediate_size'
-            
+        config.mlp_bias = True    
         super().__init__(config=config, prefix=prefix)
         # 2. Remove the bias from the qkv_proj and gate_up_proj based on config
         # Telechat2's gate_up_proj and qkv_proj don't have bias
@@ -62,18 +55,6 @@ class TeleChat2Model(LlamaModel):
 
 
 class TeleChat2ForCausalLM(LlamaForCausalLM):
-    # hf_to_vllm_mapper = WeightsMapper(
-    #     orig_to_new_prefix={
-    #         "transformer.": "model.",
-    #     },
-    #     orig_to_new_substr={
-    #         ".h.": ".layers.",
-    #         ".self_attention.": ".self_attn.",
-    #         ".word_embeddings.": ".embed_tokens.",
-    #         ".dense.": ".o_proj.",
-    #         ".ln_f.": ".norm.",
-    #     },
-    # )
     
     # Map to change the hf naming to sg lang style
     prefix_map = {
