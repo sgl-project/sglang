@@ -1,0 +1,183 @@
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
+
+ARG CUDA_VERSION=12.8.0
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    GDRCOPY_HOME=/usr/src/gdrdrv-2.4.4/ \
+    NVSHMEM_DIR=/sgl-workspace/nvshmem/install
+
+# --Install UV ---
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# --- System dependencies ---
+RUN echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
+ && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
+ && apt-get update && apt-get install -y --no-install-recommends \
+    tzdata \
+    software-properties-common netcat-openbsd kmod unzip openssh-server \
+    curl wget lsof zsh ccache tmux htop git-lfs tree \
+    python3 python3-pip python3-dev libpython3-dev \
+    build-essential cmake \
+    libopenmpi-dev libnuma1 libnuma-dev \
+    libibverbs-dev libibverbs1 libibumad3 \
+    librdmacm1 libnl-3-200 libnl-route-3-200 libnl-route-3-dev libnl-3-dev \
+    ibverbs-providers infiniband-diags perftest \
+    libgoogle-glog-dev libgtest-dev libjsoncpp-dev libunwind-dev \
+    libboost-all-dev libssl-dev \
+    libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+    pybind11-dev \
+    libhiredis-dev libcurl4-openssl-dev \
+    libczmq4 libczmq-dev \
+    libfabric-dev \
+    patchelf \
+    nvidia-dkms-550 \
+    devscripts debhelper fakeroot dkms check libsubunit0 libsubunit-dev \
+ && ln -sf /usr/bin/python3 /usr/bin/python \
+ && rm -rf /var/lib/apt/lists/* \
+ && apt-get clean
+
+# --- GDRCopy ---
+RUN mkdir -p /tmp/gdrcopy && cd /tmp \
+ && git clone https://github.com/NVIDIA/gdrcopy.git -b v2.4.4 \
+ && cd gdrcopy/packages \
+ && CUDA=/usr/local/cuda ./build-deb-packages.sh \
+ && dpkg -i gdrdrv-dkms_*.deb libgdrapi_*.deb gdrcopy-tests_*.deb gdrcopy_*.deb \
+ && cd / && rm -rf /tmp/gdrcopy
+
+# --- Fix DeepEp IGBDA symlink ---
+# Not sure what the alternative here is
+#RUN ln -sf /usr/lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so
+
+# --- Create workspace ---
+WORKDIR /sgl-workspace
+
+# --- Python venv ---
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+RUN mkdir /opt/dynamo && \
+    uv venv /sgl-workspace/venv --python 3.10
+# Activate virtual environment
+ENV VIRTUAL_ENV=/sgl-workspace/venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+# --- Clone & install sglang ---
+RUN git clone --depth 1 https://github.com/sgl-project/sglang.git && \
+    cd sglang && \
+    uv pip install -e "python[blackwell]"
+
+# --- Install nightly PyTorch ---
+RUN uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128 --force-reinstall
+
+# --- Install sgl_kernel ---
+RUN uv pip install https://github.com/sgl-project/whl/releases/download/v0.2.0/sgl_kernel-0.2.0+cu128-cp39-abi3-manylinux2014_aarch64.whl
+
+# --- torch sanity check ---
+RUN uv pip show torch
+
+# --- Download & build NVSHMEM (before DeepEP to enable cache reuse) ---
+RUN wget https://developer.download.nvidia.com/compute/redist/nvshmem/3.2.5/source/nvshmem_src_3.2.5-1.txz \
+ && git clone https://github.com/deepseek-ai/DeepEP.git \
+ && tar -xf nvshmem_src_3.2.5-1.txz && mv nvshmem_src nvshmem \
+ && cd nvshmem \
+ && git apply /sgl-workspace/DeepEP/third-party/nvshmem.patch \
+ && sed -i '1i#include <unistd.h>' examples/moe_shuffle.cu \
+ && rm -f /sgl-workspace/nvshmem_src_3.2.5-1.txz \
+ && NVSHMEM_SHMEM_SUPPORT=0 \
+    NVSHMEM_UCX_SUPPORT=0 \
+    NVSHMEM_USE_NCCL=0 \
+    NVSHMEM_MPI_SUPPORT=0 \
+    NVSHMEM_IBGDA_SUPPORT=1 \
+    NVSHMEM_PMIX_SUPPORT=0 \
+    NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
+    NVSHMEM_USE_GDRCOPY=1 \
+    cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=${NVSHMEM_DIR} -DCMAKE_CUDA_ARCHITECTURES=100 \
+ && cmake --build build --target install -j
+
+RUN uv pip show torch
+RUN cd /sgl-workspace/DeepEP && DEEPEP_NVCC_LINEINFO=1 CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=10.0 NVSHMEM_DIR=${NVSHMEM_DIR} python3 setup.py install
+
+# --- Misc Python tools ---
+RUN uv pip install typer httpx openai netifaces
+
+# -- Install VIM ---
+RUN apt update && apt install -y vim
+
+# --- NIXL ARM based install ---
+# For now we skip installing GDS (I hit an error during install and have not had time to debug)
+# These ARM installation steps come from https://github.com/ai-dynamo/dynamo/blob/main/container/Dockerfile.vllm_v1
+RUN apt-get update -y && \
+    apt-get install -y \
+    cmake \
+    meson \
+    ninja-build \
+    pybind11-dev \
+    clang \
+    libclang-dev \
+    git \
+    autoconf \
+    libtool \
+    build-essential
+
+# Install RDMA/UCX dependencies
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+    --reinstall libibverbs-dev rdma-core ibverbs-utils libibumad-dev \
+    libnuma-dev librdmacm-dev ibverbs-providers
+
+# Build UCX from source
+ARG NIXL_UCX_REF=v1.19.x
+RUN rm -rf /opt/hpcx/ucx || true && \
+    rm -rf /usr/local/ucx || true && \
+    cd /usr/local/src && \
+    git clone https://github.com/openucx/ucx.git && \
+    cd ucx && \
+    git checkout $NIXL_UCX_REF && \
+    ./autogen.sh && ./configure \
+    --prefix=/usr/local/ucx \
+    --enable-shared \
+    --disable-static \
+    --disable-doxygen-doc \
+    --enable-optimizations \
+    --enable-cma \
+    --enable-devel-headers \
+    --with-cuda=/usr/local/cuda \
+    --with-verbs \
+    --with-efa \
+    --with-dm \
+    --with-gdrcopy=/usr/local \
+    --enable-mt && \
+    make -j && \
+    make -j install-strip && \
+    ldconfig
+
+# Set UCX environment
+ENV LD_LIBRARY_PATH=/usr/lib:/usr/local/ucx/lib:$LD_LIBRARY_PATH
+
+# 0.3.1 release pinned commit
+RUN git clone https://github.com/ai-dynamo/nixl.git /opt/nixl && \
+    cd /opt/nixl && \
+    git checkout 16348080f5bdeb9fe6058a23be140cec020ef3f3
+
+RUN uv pip install meson
+RUN cd /opt/nixl && \
+    mkdir build && \
+    meson setup build/ --buildtype=release --prefix=/usr/local/nixl -Ddisable_gds_backend=true -Dgds_path=/usr/local/cuda/targets/sbsa-linux && \
+    cd build/ && \
+    ninja && \
+    ninja install
+
+# Install NIXL Python wheel
+RUN cd /opt/nixl && \
+    uv build . --out-dir /tmp/nixl-wheels && \
+    uv pip install /tmp/nixl-wheels/*.whl && \
+    rm -rf /tmp/nixl-wheels
+
+# Set NIXL environment
+ENV LD_LIBRARY_PATH=/usr/local/nixl/lib/aarch64-linux-gnu:/usr/local/nixl/lib/aarch64-linux-gnu/plugins:$LD_LIBRARY_PATH
+ENV NIXL_PLUGIN_DIR=/usr/local/nixl/lib/aarch64-linux-gnu/plugins
+
+# TODO: mooncake
+
+# --- Entrypoint ---
+WORKDIR /sgl-workspace
+CMD ["/bin/bash"]
