@@ -494,15 +494,20 @@ def select_experts(
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
     else:
-        assert (
-            num_token_non_padded is None
-        ), "num_token_non_padded is not yet supported in custom_routing_function"
-        assert expert_location_dispatch_info is None
+        ep_config = (
+            dict(
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+            )
+            if num_token_non_padded is not None
+            else dict()
+        )
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=top_k,
             renormalize=renormalize,
+            **ep_config,
         )
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)

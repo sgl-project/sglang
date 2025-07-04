@@ -173,6 +173,7 @@ class EPMoE(torch.nn.Module):
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
         use_per_token_if_dynamic: bool = True,
+        apply_router_weight_on_input: bool = False,
     ):
         super().__init__()
 
@@ -208,6 +209,7 @@ class EPMoE(torch.nn.Module):
         self.activation = activation
         self.routed_scaling_factor = routed_scaling_factor
         self.use_per_token_if_dynamic = use_per_token_if_dynamic
+        self.apply_router_weight_on_input = apply_router_weight_on_input
 
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedEPMoEMethod()
@@ -471,6 +473,7 @@ class EPMoE(torch.nn.Module):
             gateup_input,
             src2dst,
             topk_ids,
+            topk_weights,
             self.w13_input_scale,
             self.start_expert_id,
             self.end_expert_id,
@@ -478,6 +481,7 @@ class EPMoE(torch.nn.Module):
             hidden_states.shape[1],
             BLOCK_SIZE=512,
             use_per_token_if_dynamic=self.use_per_token_if_dynamic,
+            apply_router_weight_on_input=self.apply_router_weight_on_input,
         )
         dispose_tensor(hidden_states)
 
@@ -625,6 +629,7 @@ class EPMoE(torch.nn.Module):
             hidden_states_shape[1],
             0,
             BLOCK_SIZE=512,
+            apply_router_weight_on_input=self.apply_router_weight_on_input,
         )
         return output
 
