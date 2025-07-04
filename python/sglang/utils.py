@@ -289,21 +289,21 @@ class LazyImport:
     def __init__(self, module_name: str, class_name: str):
         self.module_name = module_name
         self.class_name = class_name
-        self._module = None
+        self._target_class = None
 
     def _load(self):
-        if self._module is None:
+        if self._target_class is None:
             module = importlib.import_module(self.module_name)
-            self._module = getattr(module, self.class_name)
-        return self._module
+            self._target_class = getattr(module, self.class_name)
+        return self._target_class
 
     def __getattr__(self, name: str):
-        module = self._load()
-        return getattr(module, name)
+        target_class = self._load()
+        return getattr(target_class, name)
 
     def __call__(self, *args, **kwargs):
-        module = self._load()
-        return module(*args, **kwargs)
+        target_class = self._load()
+        return target_class(*args, **kwargs)
 
 
 def download_and_cache_file(url: str, filename: Optional[str] = None):
