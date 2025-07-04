@@ -1183,7 +1183,9 @@ class DeepEPMoE(EPMoE):
         if _use_aiter:
             # in forward_aiter, we skip token permutation and unpermutation, which have been fused inside aiter kernel
             return self.forward_aiter(hidden_states, topk_idx, topk_weights)
-        resolved_deepep_mode = self.deepep_mode.resolve(forward_batch.is_extend_in_batch)
+        resolved_deepep_mode = self.deepep_mode.resolve(
+            forward_batch.is_extend_in_batch
+        )
         if resolved_deepep_mode == DeepEPMode.normal:
             if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
                 return self.forward_deepgemm_contiguous(

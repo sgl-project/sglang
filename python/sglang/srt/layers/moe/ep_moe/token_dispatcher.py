@@ -729,7 +729,9 @@ class DeepEPDispatcher:
         return self._get_impl(forward_batch).combine_b(*inner_state)
 
     def _get_impl(self, forward_batch: ForwardBatch) -> _DeepEPDispatcherImplBase:
-        resolved_deepep_mode = self.deepep_mode.resolve(forward_batch.is_extend_in_batch)
+        resolved_deepep_mode = self.deepep_mode.resolve(
+            forward_batch.is_extend_in_batch
+        )
         if resolved_deepep_mode == DeepEPMode.normal:
             return self._normal_dispatcher
         elif resolved_deepep_mode == DeepEPMode.low_latency:
