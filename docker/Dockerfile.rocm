@@ -6,13 +6,18 @@
 >>>>>>> aa0c914e7 (Add ROCm7.0 to support gfx950)
 
 # default base image
-ARG BASE_IMAGE="rocm/sgl-dev:rocm7.0_preview_ubuntu_22.04"
+#ARG BASE_IMAGE="rocm/sgl-dev:rocm7.0_preview_ubuntu_22.04"
+ARG BASE_IMAGE="rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_sglang_0.4.6.post4_mi35X_prealpha"
 
 FROM $BASE_IMAGE AS base
 USER root
 
 ARG ARG_PYTORCH_ROCM_ARCH
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
+
+ARG BUILD_VLLM="1"
+ARG BUILD_TRITON="1"
+ARG BUILD_AITER_ALL="1"
 
 # Install some basic utilities
 RUN rm -rf /etc/apt/sources.list.d/*
@@ -22,21 +27,23 @@ RUN apt-get update -q -y && apt-get install -q -y \
 RUN python3 -m pip install --upgrade pip && pip install setuptools_scm
 RUN apt-get purge -y sccache; python3 -m pip uninstall -y sccache; rm -f "$(which sccache)"
 
+RUN git config --global user.email "62472426+mqhc2020@users.noreply.github.com" \
+ && git config --global user.name "AMD User"
+
 WORKDIR /sgl-workspace
 
 # -----------------------
 # Build vLLM
 ARG VLLM_REPO="https://github.com/ROCm/vllm.git"
 ARG VLLM_BRANCH="9f6b92db47c3444b7a7d67451ba0c3a2d6af4c2c"
-RUN git clone ${VLLM_REPO} \
-	    && cd vllm \
-	    && git checkout ${VLLM_BRANCH}
-
-RUN cd vllm \
-    && python3 -m pip install -r requirements/rocm.txt \
-    && python3 setup.py clean --all  \
-    && python3 setup.py develop
-
+RUN if [ "$BUILD_VLLM" = "1" ]; then \
+        git clone ${VLLM_REPO} \
+     && cd vllm \
+     && git checkout ${VLLM_BRANCH} \
+     && python3 -m pip install -r requirements/rocm.txt \
+     && python3 setup.py clean --all \
+     && python3 setup.py develop; \
+    fi
 
 # -----------------------
 # Build SGLang
@@ -49,14 +56,19 @@ ENV SGL_DEFAULT="v0.4.7.post1-gfx950"
 ARG SGL_BRANCH=${SGL_DEFAULT}
 
 ARG TRITON_REPO="https://github.com/ROCm/triton.git"
-ARG TRITON_COMMIT="e2f87c4c681ce3611e82232ecb5856987651d88a"
+ARG TRITON_COMMIT="9dd57360b74ae60a05d81250113f4513010389aa"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
-ARG AITER_COMMIT="v0.1.2-gfx950"
+ARG AITER_COMMIT="v0.1.3"
+
+ARG CK_COMMIT="bb571a033019fd5a8ba6de31119395c3621a4235"
+ARG CK_REVERT="a4e1248dbaeb868bf5d95f90f844e3a9a58e85d5"
 
 ARG AMDGPU_TARGET=$PYTORCH_ROCM_ARCH
 
 WORKDIR /sgl-workspace/
+COPY patches/0001-fp8.patch .
+COPY patches/0002-amd-Opt-dsv3-moe-7160.patch .
 RUN git clone ${SGL_REPO} \
     && cd sglang \
     && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
@@ -66,6 +78,8 @@ RUN git clone ${SGL_REPO} \
          echo "Using ${SGL_BRANCH} branch."; \
          git checkout ${SGL_BRANCH}; \
        fi \
+    && git am -3 ../0001-fp8.patch \
+    && git am -3 ../0002-amd-Opt-dsv3-moe-7160.patch \
     && cd sgl-kernel \
     && rm -f pyproject.toml \
     && mv pyproject_rocm.toml pyproject.toml \
@@ -86,20 +100,35 @@ RUN pip install IPython \
     && pip install pybind11
 
 WORKDIR /sgl-workspace/
-RUN git clone ${TRITON_REPO} \
-    && cd triton \
-    && git checkout ${TRITON_COMMIT} \
-    && pip3 uninstall -y triton \
-    && python3 setup.py install
+COPY patches/0001-Add-functions-for-SGLang.patch .
+RUN if [ "$BUILD_TRITON" = "1" ]; then \
+        pip3 uninstall -y triton \
+     && git clone ${TRITON_REPO} \
+     && cd triton \
+     && git checkout ${TRITON_COMMIT} \
+     && git am -3 ../0001-Add-functions-for-SGLang.patch \
+     && python3 setup.py install; \
+    fi
 
 WORKDIR /sgl-workspace/
 RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO}
 WORKDIR /sgl-workspace/aiter
+COPY patches/0001-To-support-both-gfx942-and-gfx950.patch .
 RUN git checkout ${AITER_COMMIT} \
-    && git submodule update --init --recursive \
-    && PREBUILD_KERNELS=1 GPU_ARCHS=$AMDGPU_TARGET python3 setup.py develop
+ && git submodule update --init --recursive \
+ && git am -3 0001-To-support-both-gfx942-and-gfx950.patch \
+ && cd 3rdparty/composable_kernel \
+ && git checkout ${CK_COMMIT} \
+ && git revert --no-edit ${CK_REVERT} \
+ && cd ../../ \
+ && GPU_ARCHS=$AMDGPU_TARGET python3 setup.py develop
 
+RUN if [ "$BUILD_AITER_ALL" = "1" ]; then \
+    PREBUILD_KERNELS=1 GPU_ARCHS=$AMDGPU_TARGET python3 setup.py develop; \
+fi
+
+WORKDIR /sgl-workspace/
 
 # Copy config files to support MI300X in virtualized environments (MI300X_VF).  Symlinks will not be created in image build.
 RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \

@@ -1,0 +1,78 @@
+From c69b89446b39871f432d4ef43ad040ba67e5ca68 Mon Sep 17 00:00:00 2001
+From: Matthew Wong <Matthew.Wong2@amd.com>
+Date: Tue, 24 Jun 2025 06:28:33 +0000
+Subject: [PATCH 1/2] fp8
+
+---
+ .../srt/layers/moe/fused_moe_triton/layer.py     |  3 ++-
+ python/sglang/srt/layers/quantization/fp8.py     | 16 ++++++++--------
+ 2 files changed, 10 insertions(+), 9 deletions(-)
+
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index 96b89340..9f97d72b 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -32,6 +32,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+ 
+ if _use_aiter:
+     from aiter import ActivationType
++    from aiter.fused_moe import fused_moe
+     from aiter.fused_moe_bf16_asm import ck_moe_2stages
+     from aiter.ops.shuffle import shuffle_weight
+ 
+@@ -204,7 +205,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
+                     topk_weights, dtype=torch.float32
+                 )  # topk_weights must be FP32 (float32)
+ 
+-            return ck_moe_2stages(
++            return fused_moe(
+                 x,
+                 layer.w13_weight,
+                 layer.w2_weight,
+diff --git a/python/sglang/srt/layers/quantization/fp8.py b/python/sglang/srt/layers/quantization/fp8.py
+index c779f1f1..46c08578 100644
+--- a/python/sglang/srt/layers/quantization/fp8.py
++++ b/python/sglang/srt/layers/quantization/fp8.py
+@@ -1045,15 +1045,15 @@ class Fp8MoEMethod:
+         if _use_hip_int4:
+             # TODO: add triton kernel and add check _use_aiter
+             assert not no_combine, f"{no_combine=} is not supported."
+-            return ck_moe_2stages(
++            return fused_moe(
+                 x,
+                 layer.w13_weight,
+                 layer.w2_weight,
+                 topk_weights,
+                 topk_ids,
+-                QuantType.per_Token,
+-                layer.w13_weight_scale1,
+-                layer.w2_weight_scale1,
++                quant_type=QuantType.per_Token,
++                w1_scale=layer.w13_weight_scale1,
++                w2_scale=layer.w2_weight_scale1,
+                 activation=(
+                     ActivationType.Silu if activation == "silu" else ActivationType.Gelu
+                 ),
+@@ -1078,15 +1078,15 @@ class Fp8MoEMethod:
+                     expert_mask=None,
+                 )
+             else:
+-                return ck_moe_2stages(
++                return fused_moe(
+                     x,
+                     layer.w13_weight,
+                     layer.w2_weight,
+                     topk_weights,
+                     topk_ids,
+-                    QuantType.per_Token,
+-                    layer.w13_weight_scale1,
+-                    layer.w2_weight_scale1,
++                    quant_type=QuantType.per_Token,
++                    w1_scale=layer.w13_weight_scale1,
++                    w2_scale=layer.w2_weight_scale1,
+                     activation=(
+                         ActivationType.Silu
+                         if activation == "silu"
+-- 
+2.34.1
+
