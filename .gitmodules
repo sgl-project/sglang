@@ -1,0 +1,4 @@
+[submodule "3rdparty/triton"]
+	path = 3rdparty/triton
+	url = https://github.com/dongfengy/triton.git
+	branch = fused_moe_triton_0613
