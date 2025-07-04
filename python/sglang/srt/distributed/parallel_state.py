@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
     is_cuda_alike,
+    is_hip,
     is_npu,
     is_shm_available,
     supports_custom_op,
@@ -263,6 +264,9 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.pynccl import (
             PyNcclCommunicator,
         )
+        from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+            QuickAllReduce,
+        )
 
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
         if use_pynccl and self.world_size > 1:
@@ -283,6 +287,7 @@ class GroupCoordinator:
             )
 
         self.ca_comm: Optional[CustomAllreduce] = None
+        self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
@@ -295,6 +300,14 @@ class GroupCoordinator:
                     f"Setup Custom allreduce failed with {e}. To silence this "
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
+            if is_hip():
+                # TODO-lhy: check this comment.
+                # Initialize a custom quick all-reduce implementation for AMD.
+                # Quick reduce is designed as a complement to custom allreduce.
+                # Based on quickreduce (https://github.com/mk1-project/quickreduce).
+                # If it's a rocm, 'use_custom_allreduce==True' means it must
+                # currently be an MI300 series.
+                self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
 
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
             HpuCommunicator,
@@ -373,7 +386,8 @@ class GroupCoordinator:
             graph_capture_context = GraphCaptureContext(stream)
         else:
             stream = graph_capture_context.stream
-
+        # We don't need the context of custom quick allreduce because the ipc access
+        # is already collected in init() and we can capture the quick allreduce directly.
         ca_comm = self.ca_comm
         maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
 
@@ -388,6 +402,7 @@ class GroupCoordinator:
             # operations. The current status is:
             #     allreduce \ Mode   |  Eager  |  Graph  |
             # --------------------------------------------
+            # quick allreduce        | enabled | enabled |
             # custom allreduce       | enabled | enabled |
             # PyNccl                 | disabled| enabled |
             # PyMscclpp              | disabled| enabled |
