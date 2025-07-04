@@ -37,8 +37,8 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
-    set_weight_attrs,
     is_npu,
+    set_weight_attrs,
     use_intel_amx_backend,
 )
 
