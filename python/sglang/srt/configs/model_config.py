@@ -321,9 +321,19 @@ class ModelConfig:
             "num_key_value_heads",
             # For ChatGLM:
             "multi_query_group_num",
+            # For Llama-3_3-Nemotron-Super-49B-v1
+            "block_configs",
         ]
         for attr in attributes:
             num_kv_heads = getattr(self.hf_text_config, attr, None)
+            # lama-3_3-Nemotron-Super-49B-v1
+            if attr == "block_configs":
+                block_configs = getattr(self.hf_text_config, attr, None)
+                if block_configs is not None:
+                    return (
+                        self.hf_text_config.num_attention_heads
+                        // block_configs[0].attention.n_heads_in_group
+                    )
             if num_kv_heads is not None:
                 return num_kv_heads
 
