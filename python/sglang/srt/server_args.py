@@ -66,7 +66,6 @@ class ServerArgs:
     host: str = "127.0.0.1"
     port: int = 30000
     nccl_port: Optional[int] = None
-    other_ports: Optional[List[int]] = None
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -586,8 +585,12 @@ class ServerArgs:
             default=ServerArgs.port,
             help="The port of the HTTP server.",
         )
-        parser.add_argument("--nccl-port", type=int, default=None)
-        parser.add_argument("--other-ports", type=int, nargs="+", default=None)
+        parser.add_argument(
+            "--nccl-port",
+            type=int,
+            default=ServerArgs.nccl_port,
+            help="The port for NCCL distributed environment setup. Defaults to a random port.",
+        )
         parser.add_argument(
             "--tokenizer-mode",
             type=str,
@@ -1704,14 +1707,6 @@ class PortArgs:
         else:
             port = server_args.nccl_port
 
-        while True:
-            if is_port_available(port):
-                break
-            if port < 60000:
-                port += 42
-            else:
-                port -= 43
-
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
@@ -1736,27 +1731,6 @@ class PortArgs:
             ), "please provide --dist-init-addr as host:port of head node"
 
             dist_init_host, dist_init_port = dist_init_addr
-
-            if server_args.other_ports is not None:
-                assert port not in server_args.other_ports
-                tokenizer_port = server_args.other_ports[0]
-                detokenizer_port = server_args.other_ports[1]
-                rpc_ipc_port = server_args.other_ports[2]
-                if dp_rank is None:
-                    scheduler_input_port = server_args.other_ports[
-                        3
-                    ]  # TokenizerManager to DataParallelController
-                else:
-                    scheduler_input_port = server_args.other_ports[3 + 1 + dp_rank]
-
-                return PortArgs(
-                    tokenizer_ipc_name=f"tcp://{dist_init_host}:{tokenizer_port}",
-                    scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
-                    detokenizer_ipc_name=f"tcp://{dist_init_host}:{detokenizer_port}",
-                    nccl_port=port,
-                    rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_ipc_port}",
-                )
-
             port_base = int(dist_init_port) + 1
             if dp_rank is None:
                 scheduler_input_port = (
