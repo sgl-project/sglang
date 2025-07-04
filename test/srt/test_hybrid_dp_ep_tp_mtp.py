@@ -539,8 +539,7 @@ class Test10(CustomTestCase):
                 "8",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
             ],
         )
 
@@ -593,8 +592,7 @@ class Test11(CustomTestCase):
                 "4",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
             ],
         )
 
@@ -647,8 +645,7 @@ class Test12(CustomTestCase):
                 "8",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
             ],
         )
 
@@ -700,8 +697,7 @@ class Test13(CustomTestCase):
                 "1",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
             ],
         )
 
@@ -756,8 +752,7 @@ class Test14(CustomTestCase):
                 "1",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
             ],
         )
 
@@ -812,8 +807,7 @@ class Test15(CustomTestCase):
                 "1",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
             ],
         )
 
@@ -867,8 +861,7 @@ class Test16(CustomTestCase):
                 "--enable-dp-lm-head",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
             ],
         )
 
@@ -922,8 +915,7 @@ class Test17(CustomTestCase):
                 "--enable-dp-lm-head",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
             ],
         )
 
@@ -979,8 +971,7 @@ class Test18(CustomTestCase):
                 "--enable-dp-lm-head",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
             ],
         )
 
@@ -1036,8 +1027,7 @@ class Test19(CustomTestCase):
                 "--enable-dp-lm-head",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
             ],
         )
 
@@ -2213,8 +2203,7 @@ class Test40(CustomTestCase):
                 "8",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2277,8 +2266,7 @@ class Test41(CustomTestCase):
                 "4",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2341,8 +2329,7 @@ class Test42(CustomTestCase):
                 "8",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2404,8 +2391,7 @@ class Test43(CustomTestCase):
                 "1",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2470,8 +2456,7 @@ class Test44(CustomTestCase):
                 "1",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2536,8 +2521,7 @@ class Test45(CustomTestCase):
                 "1",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2601,8 +2585,7 @@ class Test46(CustomTestCase):
                 "--enable-dp-lm-head",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2666,8 +2649,7 @@ class Test47(CustomTestCase):
                 "--enable-dp-lm-head",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2733,8 +2715,7 @@ class Test48(CustomTestCase):
                 "--enable-dp-lm-head",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
@@ -2800,8 +2781,7 @@ class Test49(CustomTestCase):
                 "--enable-dp-lm-head",
                 "--enable-deepep-moe",
                 "--deepep-mode",
-                "normal",
-                "--disable-cuda-graph",
+                "auto",
                 "--speculative-algo",
                 "NEXTN",
                 "--speculative-draft",
