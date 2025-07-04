@@ -54,6 +54,25 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("get_meta_buffer_ipc_handle", &get_meta_buffer_ipc_handle);
   m.impl("get_meta_buffer_ipc_handle", torch::kCPU, &get_meta_buffer_ipc_handle);
 
+  // quick allreduce
+#ifdef USE_ROCM
+  custom_ar.def(
+      "qr_all_reduce(int fa, Tensor inp, Tensor out, int quant_level, bool "
+      "cast_bf2half) -> ()");
+  custom_ar.impl("qr_all_reduce", torch::kCUDA, &qr_all_reduce);
+
+  custom_ar.def("init_custom_qr", &init_custom_qr);
+  custom_ar.def("qr_destroy", &qr_destroy);
+
+  custom_ar.def("qr_get_handle", &qr_get_handle);
+
+  custom_ar.def("qr_open_handles(int _fa, Tensor[](b!) handles) -> ()");
+  custom_ar.impl("qr_open_handles", torch::kCPU, &qr_open_handles);
+
+  // Max input size in bytes
+  custom_ar.def("qr_max_size", &qr_max_size);
+#endif
+
   /*
    * From csrc/moe
    */
