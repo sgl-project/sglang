@@ -63,11 +63,10 @@ void launch_sm90_fp8_blockwise_scaled_group_mm(
   using OperatorClass = cutlass::arch::OpClassTensorOp;
   static constexpr auto RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
   using CustomEVTIdentity =  // acc
-    cutlass::epilogue::fusion::Sm90EVT<
-      cutlass::epilogue::fusion::Sm90Compute<
-        cutlass::epilogue::thread::Identity, ElementD, ElementAccumulator, RoundStyle>,
-      cutlass::epilogue::fusion::Sm90AccFetch
-    >;
+      cutlass::epilogue::fusion::Sm90EVT<
+          cutlass::epilogue::fusion::
+              Sm90Compute<cutlass::epilogue::thread::Identity, ElementD, ElementAccumulator, RoundStyle>,
+          cutlass::epilogue::fusion::Sm90AccFetch>;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag,
@@ -739,7 +738,5 @@ void fp8_blockwise_scaled_grouped_mm(
   }
 #endif
   TORCH_CHECK_NOT_IMPLEMENTED(
-      can_implement,
-      "No implemented fp8_blockwise_scaled_mm for current compute capability: ",
-      sm_version);
+      can_implement, "No implemented fp8_blockwise_scaled_mm for current compute capability: ", sm_version);
 }
