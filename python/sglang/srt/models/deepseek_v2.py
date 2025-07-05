@@ -1840,11 +1840,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        if self.enable_dp_attention and self.speculative_algorithm.is_eagle():
-            # NOTE: this line resolves the degradation of MTP reception rate for non-zero DP ranks.
-            # See discussion here (https://github.com/sgl-project/sglang/pull/6081#discussion_r2147452251).
-            hidden_states = hidden_states.clone()
-
         return hidden_states, residual
 
     def op_comm_prepare_attn(
@@ -1935,7 +1930,7 @@ class DeepseekV2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            use_attn_tp_group=True,
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
