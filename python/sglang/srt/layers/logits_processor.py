@@ -436,8 +436,8 @@ class LogitsProcessor(nn.Module):
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits_metadata.compute_dp_attention_metadata(hidden_states)
             hidden_states, local_hidden_states = (
-                logits_metadata.gathered_buffer,
-                hidden_states.clone(),
+                torch.empty_like(logits_metadata.gathered_buffer),
+                hidden_states,
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
