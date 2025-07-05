@@ -52,11 +52,10 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator, SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.metrics.collector import TimeStats
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -530,7 +529,7 @@ class Req:
         self.last_host_node: Any = None
         self.host_hit_length = 0
         # The node to lock until for swa radix tree lock ref
-        self.is_hybrid_uuid_for_lock: Optional[int] = None
+        self.swa_uuid_for_lock: Optional[int] = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -749,7 +748,7 @@ class Req:
     def reset_for_retract(self):
         self.prefix_indices = []
         self.last_node = None
-        self.is_hybrid_uuid_for_lock = None
+        self.swa_uuid_for_lock = None
         self.extend_input_len = 0
         self.is_retracted = True
         self.input_token_logprobs = None
