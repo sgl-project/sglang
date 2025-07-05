@@ -558,7 +558,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states=hidden_states,
                 topk_idx=topk_idx,
                 topk_weights=topk_weights,
-                forward_mode=forward_mode,
+                forward_batch=forward_batch,
             )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
@@ -569,14 +569,14 @@ class DeepseekV2MoE(nn.Module):
             masked_m=masked_m,
             expected_m=expected_m,
             num_recv_tokens_per_expert=num_recv_tokens_per_expert,
-            forward_mode=forward_mode,
+            forward_batch=forward_batch,
         )
         if self.ep_size > 1:
             final_hidden_states = self.deepep_dispatcher.combine(
                 hidden_states=final_hidden_states,
                 topk_idx=topk_idx,
                 topk_weights=topk_weights,
-                forward_mode=forward_mode,
+                forward_batch=forward_batch,
             )
 
         if shared_output is not None:
@@ -651,7 +651,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states=state.hidden_states_mlp_input,
                 topk_idx=state.pop("topk_idx_local"),
                 topk_weights=state.pop("topk_weights_local"),
-                forward_mode=state.forward_batch.forward_mode,
+                forward_batch=state.forward_batch,
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
@@ -683,7 +683,7 @@ class DeepseekV2MoE(nn.Module):
             masked_m=state.pop("masked_m"),
             expected_m=state.pop("expected_m"),
             num_recv_tokens_per_expert=state.pop("num_recv_tokens_per_expert"),
-            forward_mode=state.forward_batch.forward_mode,
+            forward_batch=state.forward_batch,
         )
 
     def op_combine_a(self, state):
@@ -692,7 +692,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states=state.pop("hidden_states_experts_output"),
                 topk_idx=state.pop("topk_idx_dispatched"),
                 topk_weights=state.pop("topk_weights_dispatched"),
-                forward_mode=state.forward_batch.forward_mode,
+                forward_batch=state.forward_batch,
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
@@ -1881,7 +1881,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             and hidden_states.shape[0] == 0
         ):
             state.hidden_states_mlp_output = self.mlp(
-                hidden_states, state.forward_batch.forward_mode
+                hidden_states, state.forward_batch
             )
         else:
             state.hidden_states_mlp_output = hidden_states
@@ -1930,7 +1930,7 @@ class DeepseekV2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            use_attn_tp_group=True,
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
         self.layers = nn.ModuleList(
