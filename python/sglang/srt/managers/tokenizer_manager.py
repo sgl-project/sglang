@@ -1148,6 +1148,7 @@ class TokenizerManager:
                     [
                         "text",
                         "output_ids",
+                        "embedding",
                     ]
                 )
             elif self.log_requests_level == 1:
@@ -1166,6 +1167,7 @@ class TokenizerManager:
                     [
                         "text",
                         "output_ids",
+                        "embedding",
                     ]
                 )
             elif self.log_requests_level == 2:
