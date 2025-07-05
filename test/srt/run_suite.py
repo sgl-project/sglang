@@ -142,6 +142,7 @@ suites = {
         TestFile("test_vertex_endpoint.py", 31),
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         TestFile("test_reasoning_parser.py", 5),
+        TestFile("test_awq_dequant.py", 2),
     ],
     "per-commit-npu": [
         TestFile("test_ascend_attention_backend.py", 400),
