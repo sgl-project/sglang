@@ -35,9 +35,21 @@ def _sgemm_lora_b_kernel(
     fuse_scaling_add,
     scalings,
 ):
-    # x: (s, K), s is the sum of sequence lengths
-    # weights: (num_lora, N, K)
-    # output: (s, N)
+    """
+    Computes a segmented batched matrix multiplication for the LoRA B matrix.
+
+    When a sequence's rank is 0, the kernel essentially initializes the output to 
+    all-zero, following the convention in pytorch where the product of two matrices 
+    of shape (m, 0) and (0, n) is an all-zero matrix of shape (m, n).
+
+    Args:
+        x (torch.Tensor): The intermediate tensor from the LoRA 'A' multiplication,
+            of shape `(s, K)`, where `s` is the total number of tokens.
+        weights (torch.Tensor): The LoRA 'B' weights for all available adapters,
+            with shape `(num_lora, N, K)`.
+        output (torch.Tensor): The output tensor of shape `(s, N)`. This can be
+            the base model's output for a fused add operation.
+    """
 
     # Current block computes sequence with batch_id,
     # which starts from row seg_start of x with length seg_len
@@ -74,8 +86,7 @@ def _sgemm_lora_b_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset[:, None] < seg_len)
-            and (k_offset[None, :] < K - k * BLOCK_K),
+            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
             other=0.0,
         )
         w_tile = tl.load(
