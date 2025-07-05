@@ -20,6 +20,8 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
 from collections import deque
 from dataclasses import dataclass
@@ -153,6 +155,7 @@ class DecodePreallocQueue:
         prefill_pp_size: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
+        is_remote_prefill: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -174,6 +177,8 @@ class DecodePreallocQueue:
         self.prefill_pp_size = prefill_pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
+        self.is_remote_prefill = is_remote_prefill
+
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
@@ -217,6 +222,7 @@ class DecodePreallocQueue:
             DisaggregationMode.DECODE,
             self.scheduler.server_args,
             self.is_mla_backend,
+            self.is_remote_prefill,
         )
         return kv_manager
 
@@ -406,7 +412,9 @@ class DecodePreallocQueue:
             page_indices = kv_to_page_indices(
                 kv_indices, self.token_to_kv_pool_allocator.page_size
             )
-            decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
+            decode_req.kv_receiver.init(
+                decode_req.req, page_indices, decode_req.metadata_buffer_index
+            )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
 
@@ -533,6 +541,7 @@ class DecodeTransferQueue:
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
+        is_remote_prefill: bool = False,
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
@@ -542,6 +551,7 @@ class DecodeTransferQueue:
         self.scheduler = scheduler
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
+        self.is_remote_prefill = is_remote_prefill
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)

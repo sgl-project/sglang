@@ -14,8 +14,10 @@
 """A scheduler that manages a tensor parallel GPU worker."""
 
 import faulthandler
+import hashlib
 import logging
 import os
+import random
 import signal
 import sys
 import threading
@@ -53,6 +55,7 @@ from sglang.srt.disaggregation.prefill import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     MetadataBuffers,
+    RemotePrefillReq,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     prepare_abort,
@@ -162,6 +165,15 @@ from sglang.srt.utils import (
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
+
+try:
+    import etcd3
+    import nats
+
+    IS_REMOTE_PREFILL_SUPPORT = True
+except ImportError:
+    logger.info("etcd3 or nats is not installed, remote prefill will not be available.")
+    IS_REMOTE_PREFILL_SUPPORT = False
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
@@ -492,6 +504,7 @@ class Scheduler(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
+                (RemotePrefillReq, self.handle_remote_prefill_req),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
@@ -659,6 +672,13 @@ class Scheduler(
         self.transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
+        self.is_remote_prefill = (
+            self.server_args.enable_remote_prefill and IS_REMOTE_PREFILL_SUPPORT
+        )
+        self.model_name_hash = hashlib.sha256(
+            self.server_args.served_model_name.encode("utf-8")
+        ).hexdigest()[:8]
+        self.remote_prefill_reqs = []
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
@@ -682,6 +702,7 @@ class Scheduler(
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 tree_cache=self.tree_cache,
+                is_remote_prefill=self.is_remote_prefill,
             )
 
             # The decode requests pending for pre-allocation
@@ -708,6 +729,7 @@ class Scheduler(
                 prefill_pp_size=self.server_args.disaggregation_prefill_pp,
                 num_reserved_decode_tokens=self.server_args.num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
+                is_remote_prefill=self.is_remote_prefill,
             )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -744,9 +766,22 @@ class Scheduler(
                 pp_rank=self.pp_rank,
                 pp_size=self.pp_size,
                 transfer_backend=self.transfer_backend,
+                is_remote_prefill=self.is_remote_prefill,
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+
+        if self.is_remote_prefill:
+            # connect to etcd
+            etcd_endpoint = os.environ.get("ETCD_ENDPOINT", "127.0.0.1:2379")
+            self.etcd_client = etcd3.client(
+                host=etcd_endpoint.split(":")[0], port=int(etcd_endpoint.split(":")[1])
+            )
+            self.remote_agent_map = {}
+            self.remote_engine_configs = {}
+            self.nats_endpoint = os.environ.get(
+                "NATS_ENDPOINT", "nats://127.0.0.1:4222"
+            )
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -967,6 +1002,9 @@ class Scheduler(
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
+
+                while len(self.remote_prefill_reqs) > 0:
+                    recv_reqs.append(self.remote_prefill_reqs.pop(-1))
             else:
                 recv_reqs = None
         else:
@@ -988,14 +1026,24 @@ class Scheduler(
                     req
                     for req in recv_reqs
                     if isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                        req,
+                        (
+                            TokenizedGenerateReqInput,
+                            RemotePrefillReq,
+                            TokenizedEmbeddingReqInput,
+                        ),
                     )
                 ]
                 control_reqs = [
                     req
                     for req in recv_reqs
                     if not isinstance(
-                        req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)
+                        req,
+                        (
+                            TokenizedGenerateReqInput,
+                            RemotePrefillReq,
+                            TokenizedEmbeddingReqInput,
+                        ),
                     )
                 ]
             else:
@@ -1062,6 +1110,9 @@ class Scheduler(
             if recv_req.bootstrap_port is None:
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
+
+            if recv_req.bootstrap_room is None and self.is_remote_prefill:
+                recv_req.bootstrap_room = random.randint(0, 2**63 - 1)
 
             req = Req(
                 recv_req.rid,
