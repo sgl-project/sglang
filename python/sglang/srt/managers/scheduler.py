@@ -2347,17 +2347,21 @@ class Scheduler(
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.worker.model_runner.model
             )
+            torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
         return ReleaseMemoryOccupationReqOutput()
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        import os
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
         tags = recv_req.tags
         if tags is None or len(tags) == 0:
             tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
+            torch.distributed.barrier(self.tp_cpu_group)
             _import_static_state(
                 self.tp_worker.worker.model_runner.model,
                 self.stashed_model_static_state,
