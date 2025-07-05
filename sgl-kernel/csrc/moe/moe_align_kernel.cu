@@ -141,8 +141,8 @@ __global__ void moe_align_block_size_kernel(
 
   // fill expert_ids
   const int32_t num_blocks = tpad / block_size;
-  for (int idx = tid; idx < num_blocks; idx += blockDim.x) {
-    int32_t block_start = idx * block_size;
+  for (int32_t i = tid; i < num_blocks; i += stride) {
+    int32_t block_start = i * block_size;
     int left = 0, right = num_experts;
     while (left < right) {
       int mid = (left + right) >> 1;
@@ -152,7 +152,7 @@ __global__ void moe_align_block_size_kernel(
         right = mid;
       }
     }
-    expert_ids[idx] = left - 1;
+    expert_ids[i] = left - 1;
   }
 
   if (pad_sorted_token_ids) {
@@ -160,7 +160,7 @@ __global__ void moe_align_block_size_kernel(
     fill_vec.x = fill_vec.y = fill_vec.z = fill_vec.w = numel;
     int32_t total_vecs = (tpad + VEC_SIZE - 1) / VEC_SIZE;
     Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
-    for (int i = tid; i < total_vecs; i += blockDim.x) {
+    for (int32_t i = tid; i < total_vecs; i += stride) {
       out_ptr[i] = fill_vec;
     }
   }
@@ -223,7 +223,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     fill_vec.x = fill_vec.y = fill_vec.z = fill_vec.w = numel;
     int32_t total_vecs = (*total_tokens_post_pad + VEC_SIZE - 1) / VEC_SIZE;
     Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
-    for (int i = tid; i < total_vecs; i += blockDim.x) {
+    for (int32_t i = tid; i < total_vecs; i += stride) {
       out_ptr[i] = fill_vec;
     }
   }
