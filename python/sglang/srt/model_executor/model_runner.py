@@ -295,11 +295,7 @@ class ModelRunner:
             self.apply_torch_tp()
 
         # Init lora
-        # TODO (lifuhuang): when we support dynamic LoRA loading / unloading, we should add
-        # a new server arg `enable_lora` to control whether to init LoRA manager to be more
-        # explicit, as it is perfectly valid to start a server with an empty lora_paths and
-        # load LoRA adapters dynamically later.
-        if server_args.lora_paths is not None:
+        if server_args.enable_lora:
             self.init_lora_manager()
 
         # Init memory pool and attention backends
@@ -882,14 +878,20 @@ class ModelRunner:
             lora_backend=self.server_args.lora_backend,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
+            max_lora_rank=self.server_args.max_lora_rank,
         )
-        result = self.lora_manager.load_lora_adapters(self.server_args.lora_paths)
-        if result.success:
-            logger.info(
-                f"LoRA manager ready. Loaded LoRA adapters: {', '.join(result.loaded_adapters)}"
-            )
+        if self.server_args.lora_paths:
+            result = self.lora_manager.load_lora_adapters(self.server_args.lora_paths)
+            if result.success:
+                logger.info(
+                    f"LoRA manager ready. Loaded LoRA adapters: {', '.join(result.loaded_adapters)}"
+                )
+            else:
+                raise RuntimeError(
+                    f"Failed to load LoRA adapters: {result.error_message}"
+                )
         else:
-            raise RuntimeError(f"Failed to load LoRA adapters: {result.error_message}")
+            logger.info("LoRA manager initialized without any adapters loaded.")
 
     def load_lora_adapter(self, lora_name: str, lora_path: str):
         """Load a new lora adapter from disk or huggingface."""

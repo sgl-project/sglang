@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 
@@ -48,7 +48,7 @@ def get_layer_id(name: str) -> int:
 
 
 def get_customized_names_from_hf_names(
-    hf_module_names: Set[str], base_model: torch.nn.Module
+    hf_module_names: Iterable[str], base_model: torch.nn.Module
 ) -> Set[str]:
     """
     This function takes in a set of huggingface style module names:
@@ -106,11 +106,12 @@ def get_hidden_dim(
             raise NotImplementedError()
 
 
-def get_normalized_lora_weight_names(name: str) -> Tuple[List[str], List[str]]:
+def get_normalized_lora_weight_names(module_name: str) -> Tuple[List[str], List[str]]:
     """
     Mapping a target module name to names of the normalized LoRA weights.
     Returned tuple contains (name for Lora A, name for Lora B)
     """
+    name = module_name.split(".")[-1]
     params_mapping = {
         "q_proj": (["qkv_proj"], ["q_proj"]),
         "k_proj": (["qkv_proj"], ["kv_proj"]),
