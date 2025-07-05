@@ -13,6 +13,8 @@
 # ==============================================================================
 """Common utilities."""
 
+from __future__ import annotations
+
 import base64
 import builtins
 import ctypes
@@ -40,7 +42,7 @@ import threading
 import time
 import traceback
 import warnings
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from enum import Enum
 from functools import lru_cache
@@ -95,35 +97,6 @@ time_infos = {}
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
-_warned_bool_env_var_keys = set()
-
-
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    value = value.lower()
-
-    truthy_values = ("true", "1")
-    falsy_values = ("false", "0")
-
-    if (value not in truthy_values) and (value not in falsy_values):
-        if value not in _warned_bool_env_var_keys:
-            logger.warning(
-                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
-            )
-        _warned_bool_env_var_keys.add(value)
-
-    return value in truthy_values
-
-
-def get_int_env_var(name: str, default: int = 0) -> int:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 def is_hip() -> bool:
@@ -172,6 +145,82 @@ def is_host_cpu_x86() -> bool:
 
 def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
+
+
+def get_cuda_version():
+    if torch.version.cuda:
+        return tuple(map(int, torch.version.cuda.split(".")))
+    return (0, 0)
+
+
+def _check(cc_major):
+    if not is_cuda():
+        return False
+    return torch.cuda.get_device_capability()[0] == cc_major and tuple(
+        map(int, torch.version.cuda.split(".")[:2])
+    ) >= (12, 3)
+
+
+is_ampere_with_cuda_12_3 = lambda: _check(8)
+is_hopper_with_cuda_12_3 = lambda: _check(9)
+
+
+def is_blackwell():
+    if not is_cuda():
+        return False
+    return torch.cuda.get_device_capability()[0] == 10
+
+
+_warned_bool_env_var_keys = set()
+
+
+def get_bool_env_var(name: str, default: str = "false") -> bool:
+    value = os.getenv(name, default)
+    value = value.lower()
+
+    truthy_values = ("true", "1")
+    falsy_values = ("false", "0")
+
+    if (value not in truthy_values) and (value not in falsy_values):
+        if value not in _warned_bool_env_var_keys:
+            logger.warning(
+                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+            )
+        _warned_bool_env_var_keys.add(value)
+
+    return value in truthy_values
+
+
+def get_int_env_var(name: str, default: int = 0) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def support_triton(backend: str) -> bool:
+    return backend not in ["torch_native", "intel_amx"]
+
+
+try:
+    import sgl_kernel
+
+    is_intel_amx_backend_available = hasattr(
+        torch.ops.sgl_kernel, "convert_weight_packed"
+    )
+except:
+    is_intel_amx_backend_available = False
+
+
+def cpu_has_amx_support():
+    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
+
+
+def use_intel_amx_backend(layer):
+    return getattr(layer, "use_intel_amx_backend", False)
 
 
 def is_flashinfer_available():
@@ -501,6 +550,46 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def find_process_using_port(port: int) -> Optional[psutil.Process]:
+    for conn in psutil.net_connections(kind="inet"):
+        if conn.laddr.port == port:
+            try:
+                return psutil.Process(conn.pid)
+            except psutil.NoSuchProcess:
+                # It could happen by race condition (the proc dies when psutil.Process is called).
+                pass
+
+    return None
+
+
+def wait_port_available(
+    port: int, port_name: str, timeout_s: int = 30, raise_exception: bool = True
+) -> bool:
+    for i in range(timeout_s):
+        if is_port_available(port):
+            return True
+
+        if i > 10 and i % 5 == 0:
+            process = find_process_using_port(port)
+            if process is None:
+                logger.warning(
+                    f"The port {port} is in use, but we could not find the process that uses it."
+                )
+
+            pid = process.pid
+            error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
+            logger.info(
+                f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
+            )
+        time.sleep(0.1)
+
+    if raise_exception:
+        raise ValueError(
+            f"{port_name} at {port} is not available in {timeout_s} seconds. {error_message}"
+        )
+    return False
+
+
 def is_port_available(port):
     """Return whether a port is available."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -513,6 +602,19 @@ def is_port_available(port):
             return False
         except OverflowError:
             return False
+
+
+def get_free_port():
+    # try ipv4
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+    except OSError:
+        # try ipv6
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
 
 
 def decode_video_base64(video_base64):
@@ -817,6 +919,7 @@ def maybe_set_triton_cache_manager() -> None:
 class CustomCacheManager(FileCacheManager):
     # Adapted from: https://github.com/tdoublep/vllm/blob/3307522289fdfefe323b6c00d0db696651989a2f/vllm/triton_utils/custom_cache_manager.py
     def __init__(self, key, override=False, dump=False):
+        from sglang.srt.distributed.parallel_state import get_tp_group
 
         self.key = key
         self.lock_path = None
@@ -834,7 +937,10 @@ class CustomCacheManager(FileCacheManager):
                 os.getenv("TRITON_CACHE_DIR", "").strip() or default_cache_dir()
             )
             if self.cache_dir:
-                self.cache_dir = f"{self.cache_dir}_{os.getpid()}"
+                try:
+                    self.cache_dir = f"{self.cache_dir}_{get_tp_group().local_rank}"
+                except:
+                    self.cache_dir = f"{self.cache_dir}_{os.getpid()}"
                 self.cache_dir = os.path.join(self.cache_dir, self.key)
                 self.lock_path = os.path.join(self.cache_dir, "lock")
                 os.makedirs(self.cache_dir, exist_ok=True)
@@ -998,36 +1104,48 @@ def point_to_point_pyobj(
     src: int = 0,
     dst: int = 1,
 ):
-    """Send data from src to dst in group."""
+    """Send data from src to dst in group using DeviceToDevice communication."""
 
     if rank == src:
         if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long)
+            tensor_size = torch.tensor(
+                [0], dtype=torch.long, device=torch.cuda.current_device()
+            )
             dist.send(tensor_size, dst=dst, group=group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
+            ).cuda(
+                device=torch.cuda.current_device()
+            )  # Move to GPU
+            tensor_size = torch.tensor(
+                [size], dtype=torch.long, device=torch.cuda.current_device()
             )
-            tensor_size = torch.tensor([size], dtype=torch.long)
 
             dist.send(tensor_size, dst=dst, group=group)
             dist.send(tensor_data, dst=dst, group=group)
         return data
 
     elif rank == dst:
-        tensor_size = torch.tensor([0], dtype=torch.long)
+        tensor_size = torch.tensor(
+            [0], dtype=torch.long, device=torch.cuda.current_device()
+        )
         dist.recv(tensor_size, src=src, group=group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
-        tensor_data = torch.empty(size, dtype=torch.uint8)
+        tensor_data = torch.empty(
+            size, dtype=torch.uint8, device=torch.cuda.current_device()
+        )
         dist.recv(tensor_data, src=src, group=group)
 
-        serialized_data = bytes(tensor_data.cpu().numpy())
+        serialized_data = bytes(
+            tensor_data.cpu().numpy()
+        )  # Move back to host for deserialization
         data = pickle.loads(serialized_data)
         return data
 
@@ -1429,6 +1547,15 @@ def is_habana_available() -> bool:
 
 @lru_cache(maxsize=8)
 def get_device(device_id: Optional[int] = None) -> str:
+    if is_cpu():
+        if cpu_has_amx_support():
+            logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
+        else:
+            logger.warning(
+                "CPU device enabled, using torch native backend, low performance expected."
+            )
+        return "cpu"
+
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if device_id is None:
             return "cuda"
@@ -1456,15 +1583,6 @@ def get_device(device_id: Optional[int] = None) -> str:
             raise ImportError(
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
-
-    if is_cpu():
-        if cpu_has_amx_support():
-            logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
-        else:
-            logger.warning(
-                "CPU device enabled, using torch native backend, low performance expected."
-            )
-        return "cpu"
 
     raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
 
@@ -1925,12 +2043,6 @@ def rank0_log(msg: str):
         logger.info(msg)
 
 
-def get_cuda_version():
-    if torch.version.cuda:
-        return tuple(map(int, torch.version.cuda.split(".")))
-    return (0, 0)
-
-
 def launch_dummy_health_check_server(host, port):
     import asyncio
 
@@ -2090,14 +2202,14 @@ class DeepEPMode(Enum):
     def enable_low_latency(self):
         return self in [DeepEPMode.low_latency, DeepEPMode.auto]
 
-    def resolve(self, forward_mode):
+    def resolve(self, is_extend_in_batch: bool):
         if self != DeepEPMode.auto:
             return self
 
-        if forward_mode.is_decode():
-            return DeepEPMode.low_latency
-        else:
+        if is_extend_in_batch:
             return DeepEPMode.normal
+        else:
+            return DeepEPMode.low_latency
 
 
 def is_non_idle_and_non_empty(forward_mode, hidden_states):
@@ -2117,35 +2229,12 @@ def fast_topk(values, topk, dim):
         return torch.topk(values, topk, dim=dim)
 
 
-def _check(cc_major):
-    if not is_cuda():
-        return False
-    return torch.cuda.get_device_capability()[0] == cc_major and tuple(
-        map(int, torch.version.cuda.split(".")[:2])
-    ) >= (12, 3)
-
-
-is_ampere_with_cuda_12_3 = lambda: _check(8)
-is_hopper_with_cuda_12_3 = lambda: _check(9)
-
-
-def is_blackwell():
-    if not is_cuda():
-        return False
-    return torch.cuda.get_device_capability()[0] == 10
-
-
-def get_free_port():
-    # try ipv4
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
-    except OSError:
-        # try ipv6
-        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
+def bind_or_assign(target, source):
+    if target is not None:
+        target.copy_(source)
+        return target
+    else:
+        return source
 
 
 def get_local_ip_auto() -> str:
@@ -2398,24 +2487,6 @@ def bind_or_assign(target, source):
         return source
 
 
-def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
-
-
-try:
-    import sgl_kernel
-
-    is_intel_amx_backend_available = hasattr(
-        torch.ops.sgl_kernel, "convert_weight_packed"
-    )
-except:
-    is_intel_amx_backend_available = False
-
-
-def cpu_has_amx_support():
-    return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
-
-
 def prepack_weight_if_needed(weight):
     if weight.device != torch.device("cpu"):
         return weight
@@ -2621,3 +2692,48 @@ def is_shm_available(dtype, world_size, local_size):
         and world_size >= 1
         and world_size == local_size
     )
+
+
+def lru_cache_frozenset(maxsize=128):
+    def _to_hashable(o):
+        try:
+            hash(o)
+            return o
+        except TypeError:
+            # Not hashable; convert based on type
+            if isinstance(o, (dict)):
+                return frozenset(
+                    (_to_hashable(k), _to_hashable(v)) for k, v in o.items()
+                )
+            elif isinstance(o, set):
+                return frozenset(_to_hashable(v) for v in o)
+            elif isinstance(o, (list, tuple)) or (
+                isinstance(o, Sequence) and not isinstance(o, (str, bytes))
+            ):
+                return tuple(_to_hashable(v) for v in o)
+            else:
+                raise TypeError(f"Cannot make hashable: {type(o)}")
+
+    def decorator(func):
+        cache = OrderedDict()
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            h_args = tuple(_to_hashable(a) for a in args)
+            h_kwargs = frozenset(
+                (_to_hashable(k), _to_hashable(v)) for k, v in kwargs.items()
+            )
+            key = (h_args, h_kwargs)
+            if key in cache:
+                cache.move_to_end(key)
+                return cache[key]
+            result = func(*args, **kwargs)
+            cache[key] = result
+            if maxsize is not None and len(cache) > maxsize:
+                cache.popitem(last=False)
+            return result
+
+        wrapper.cache_clear = cache.clear  # For manual cache clearing
+        return wrapper
+
+    return decorator
