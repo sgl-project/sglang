@@ -67,7 +67,11 @@ if _is_hip:
 if _use_aiter:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
-    from aiter.ops.shuffle import shuffle_weight
+
+    from sglang.srt.layers.moe.rocm_aiter_fused_moe import (
+        rocm_aiter_fused_experts,
+        shuffle_weights,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -1058,14 +1062,16 @@ class Fp8EPMoEMethod(Fp8MoEMethod):
                     )
                     layer.w2_input_scale = None
                 if _use_aiter:
+                    shuffled_w13, shuffled_w2 = shuffle_weights(
+                        layer.w13_weight.data, layer.w2_weight.data
+                    )
                     layer.w13_weight = torch.nn.Parameter(
-                        shuffle_weight(layer.w13_weight.data, (16, 16)),
-                        requires_grad=False,
+                        shuffled_w13, requires_grad=False
                     )
                     layer.w2_weight = torch.nn.Parameter(
-                        shuffle_weight(layer.w2_weight.data, (16, 16)),
-                        requires_grad=False,
+                        shuffled_w2, requires_grad=False
                     )
+                    torch.cuda.empty_cache()
             return
 
     def apply(
@@ -1328,9 +1334,12 @@ class DeepEPMoE(EPMoE):
         # in original deepep, idx == -1 meaning invalid and will not be processed.
         # aiter does not accept -1, we use a expert mask to make these idx invalid
         # (idx == num_experts_per_partition) meaning not used in aiter fused_moe
-        topk_idx_copy = topk_idx.to(torch.int32)
+        topk_idx_copy = topk_idx.to(
+            torch.int32
+        )  # TODO (Hubert): this will be done in "rocm_aiter_fused_experts"
         topk_idx_copy[topk_idx_copy == -1] = self.num_experts_per_partition
 
+        # TODO (Hubert): replace this with "rocm_aiter_fused_experts"
         return fused_moe(
             hidden_states,
             self.w13_weight,
