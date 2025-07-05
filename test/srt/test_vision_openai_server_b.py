@@ -140,7 +140,7 @@ class TestGemma3itServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.75",
+                "0.70",
                 "--enable-multimodal",
             ],
         )
@@ -220,6 +220,27 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
 
     def test_video_chat_completion(self):
         pass
+
+
+class TestVILAServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Efficient-Large-Model/NVILA-Lite-2B-hf-0626"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.revision = "6bde1de5964b40e61c802b375fff419edc867506"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--trust-remote-code",
+                "--context-length=65536",
+                f"--revision={cls.revision}",
+            ],
+        )
+        cls.base_url += "/v1"
 
 
 if __name__ == "__main__":
