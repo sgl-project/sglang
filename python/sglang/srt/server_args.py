@@ -20,7 +20,7 @@ import logging
 import os
 import random
 import tempfile
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Union
 
 from sglang.srt.hf_transformers_utils import check_gguf_file, get_config
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -46,6 +46,7 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
+    skip_server_warmup: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
@@ -131,7 +132,7 @@ class ServerArgs:
     preferred_sampling_params: Optional[str] = None
 
     # LoRA
-    lora_paths: Optional[List[str]] = None
+    lora_paths: Optional[Union[dict[str, str], List[str]]] = None
     max_loras_per_batch: int = 8
     lora_backend: str = "triton"
 
@@ -156,6 +157,7 @@ class ServerArgs:
     enable_ep_moe: bool = False
     enable_deepep_moe: bool = False
     enable_flashinfer_moe: bool = False
+    enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Optional[Literal["auto", "normal", "low_latency"]] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -319,6 +321,14 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
+            # Lazy init to avoid circular import
+            from sglang.srt.configs.model_config import ModelConfig
+
+            # Multimodal models need more memory for the image processor
+            model_config = ModelConfig.from_server_args(self)
+            if model_config.is_multimodal:
+                self.mem_fraction_static *= 0.90
+
         # Set chunked prefill size, which depends on the gpu memory capacity
         if self.chunked_prefill_size is None:
             if gpu_mem is not None:
@@ -379,6 +389,12 @@ class ServerArgs:
                 "Cuda graph is disabled because of using torch native attention backend"
             )
             self.disable_cuda_graph = True
+
+        if self.attention_backend == "ascend":
+            logger.warning(
+                "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
+            )
+            self.page_size = 128
 
         # Choose grammar backend
         if self.grammar_backend is None:
@@ -598,6 +614,11 @@ class ServerArgs:
             "--skip-tokenizer-init",
             action="store_true",
             help="If set, skip init tokenizer and pass input_ids in generate request.",
+        )
+        parser.add_argument(
+            "--skip-server-warmup",
+            action="store_true",
+            help="If set, skip warmup.",
         )
         parser.add_argument(
             "--load-format",
@@ -1108,6 +1129,7 @@ class ServerArgs:
                 "flashmla",
                 "intel_amx",
                 "torch_native",
+                "ascend",
                 "triton",
             ],
             default=ServerArgs.attention_backend,
@@ -1201,6 +1223,11 @@ class ServerArgs:
             "--enable-flashinfer-moe",
             action="store_true",
             help="Enable FlashInfer CUTLASS MoE backend for modelopt_fp4 quant on Blackwell. Supports MoE-EP with --enable-ep-moe",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-allreduce-fusion",
+            action="store_true",
+            help="Enable FlashInfer allreduce fusion for Add_RMSNorm.",
         )
         parser.add_argument(
             "--enable-deepep-moe",
