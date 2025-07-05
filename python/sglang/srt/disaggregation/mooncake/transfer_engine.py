@@ -100,39 +100,6 @@ class MooncakeTransferEngine:
     ) -> int:
         """Synchronously transfer data to the specified addresses in batches."""
         try:
-            ret = self.engine.batch_transfer_sync_write(
-                session_id, buffers, peer_buffer_addresses, lengths
-            )
-        except Exception:
-            ret = -1
-            # Inform user to upgrade mooncake-transfer-engine >= 0.3.4.post2
-            if not hasattr(self.engine, "batch_transfer_sync_write"):
-                raise RuntimeError(
-                    "Mooncake's batch transfer requires mooncake-transfer-engine >= 0.3.4.post2. "
-                    "Please upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'"
-                )
-
-        if ret < 0:
-            logger.debug(
-                "Failed to batch transfer data. Buffers: %s, Session: %s, Peer addresses: %s",
-                buffers,
-                session_id,
-                peer_buffer_addresses,
-            )
-        return ret
-
-    def batch_transfer_async(
-        self,
-        session_id: str,
-        buffers: List[int],
-        peer_buffer_addresses: List[int],
-        lengths: List[int],
-    ) -> int:
-        """
-        Submits a batch of transfer tasks as micro-batches without immediate result queries. 
-        Results for all micro-batches are queried collectively after submission.
-        """
-        try:
             micro_batch_size = get_int_env_var('SGLANG_DISAGGREGATION_ASYNC_TRANSFER_MICRO_BATCH_SIZE', 256)
             batch_ids = []
             for i in range(0, len(lengths), micro_batch_size):

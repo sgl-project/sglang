@@ -279,7 +279,7 @@ class MooncakeKVManager(BaseKVManager):
         
         large_chunks_transfer_futures = [
             executor.submit(
-                self.engine.batch_transfer_async,
+                self.engine.batch_transfer_sync,
                 mooncake_session_id,
                 src_addr_list_large_chunk,
                 dst_addr_list_large_chunk,
@@ -291,7 +291,7 @@ class MooncakeKVManager(BaseKVManager):
         micro_batch_size = max(num_small_chunks // self.thread_pool_size, self.thread_pool_size)
         small_chunks_transfer_futures = [
             executor.submit(
-                self.engine.batch_transfer_async,
+                self.engine.batch_transfer_sync,
                 mooncake_session_id,
                 src_addr_list_small_chunk[i : i + micro_batch_size],
                 dst_addr_list_small_chunk[i : i + micro_batch_size],
@@ -417,7 +417,7 @@ class MooncakeKVManager(BaseKVManager):
         if slice_lens_per_page > get_int_env_var('SGLANG_DISAGGREGATION_LARGE_CHUNK', 20480):
             futures = [
                 executor.submit(
-                    self.engine.batch_transfer_async,
+                    self.engine.batch_transfer_sync,
                     mooncake_session_id,
                     src_addr_list,
                     dst_addr_list,
@@ -428,7 +428,7 @@ class MooncakeKVManager(BaseKVManager):
             micro_batch_size = max(len(length_list) // self.thread_pool_size, self.thread_pool_size)
             futures = [
                 executor.submit(
-                    self.engine.batch_transfer_async,
+                    self.engine.batch_transfer_sync,
                     mooncake_session_id,
                     src_addr_list[i : i + micro_batch_size],
                     dst_addr_list[i : i + micro_batch_size],
