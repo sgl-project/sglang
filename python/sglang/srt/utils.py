@@ -951,15 +951,15 @@ def broadcast_pyobj(
     rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
-    force_cpu_device: bool = True,
+    device: Optional[str] = None,
 ):
     """Broadcast inputs from src rank to all other ranks with torch.dist backend.
     The `rank` here refer to the source rank on global process group (regardless
     of dist_group argument).
     """
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
-    )
+
+    if device is None:
+        device = get_device()
 
     if rank == src:
         if len(data) == 0:
@@ -999,9 +999,11 @@ def point_to_point_pyobj(
     group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
     dst: int = 1,
+    device: Optional[str] = None,
 ):
     """Send data from src to dst in group using DeviceToDevice communication."""
-    device = get_device()
+    if device is None:
+        device = get_device()
     if rank == src:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
