@@ -77,7 +77,6 @@ void RadixTree::Impl::debug_print(std::ostream& os) const {
   os << "Evictable size: " << evictable_size() << std::endl;
   os << "Protected size: " << protected_size() << std::endl;
   os << "Total size: " << const_cast<Impl*>(this)->total_size() << std::endl;
-  os << "Host pool size: " << m_host_pool.available_size() << "/" << m_host_pool.host_size << std::endl;
   std::vector<std::tuple<TreeNode*, TreeNode*, token_slice>> stack;
   auto root = const_cast<TreeNode*>(&m_root);
   os << root->node_id << " [root]" << std::endl;

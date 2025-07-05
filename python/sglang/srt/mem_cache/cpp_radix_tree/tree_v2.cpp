@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <memory>
 #include <queue>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -41,7 +42,7 @@ RadixTree::match_prefix(const token_vec_t& _key) {
 
   // walk up to the first non-evicted node
   std::size_t host_hit_length = 0;
-  const auto device_node = walk_to_device(host_node, [&](TreeNode* n) { host_hit_length += n->length(); });
+  const auto device_node = host_node;
 
   // collect all the device indices
   std::vector<at::Tensor> indices{};
@@ -66,71 +67,12 @@ std::vector<at::Tensor> RadixTree::evict(std::size_t num_tokens) {
     evicted_values.push_back(node->device_indices());
     num_evict += node->length();
     const auto parent = node->parent();
-    if (!node->on_cpu()) {
-      m_impl->remove_device_node(node);
-    } else {
-      m_impl->free_device_indices(node);
-    }
+    m_impl->remove_device_node(node);
     if (parent->is_leaf_device() && parent->ref_count == 0)
       heap.push(parent);  // push parent to the heap if it is now a free leaf
   }
 
   return evicted_values;
-}
-
-std::size_t RadixTree::Impl::try_write_through(const std::vector<TreeNode*>& nodes) {
-  // no write-through if hierarchical cache is not used or no nodes to write through
-  if (!use_hicache || nodes.empty()) return 0;
-
-  std::size_t remain_size = m_host_pool.available_size();
-  std::vector<std::size_t> sizes(nodes.size(), 0);
-
-  for (const auto i : c10::irange(nodes.size())) {
-    const auto node = nodes[i];
-    _assert(this->need_write_through(node), "Node does not need write-through");
-    if (const auto needed = node->length(); needed > remain_size) {
-      sizes[i] = needed - remain_size;
-      remain_size = 0;  // no more space left
-    } else {
-      remain_size -= needed;
-    }
-  }
-
-  const bool need_eviction = sizes.back() > 0;
-
-  // The following code, similar to `evict`, evicts nodes from the host memory in a batch manner.
-  auto heap = std::priority_queue{cmp, need_eviction ? this->collect_leaves() : std::vector<TreeNode*>{}};
-  std::size_t num_evict = 0;
-  for (const auto i : c10::irange(sizes.size())) {
-    const auto num_tokens = sizes[i];
-    while (num_evict < num_tokens && !heap.empty()) {
-      const auto node = heap.top();
-      heap.pop();
-      // skip nodes that are on the GPU or are undergoing IO (i.e. indices protected)
-      // the first condition is our policy, which can be changed in the future
-      // while the second one ensures the correctness of the eviction
-      // (in fact, io node are all protected, will will not be pushed to the heap
-      //  since their ref_count > 0, so we may skip this check in the future)
-      if (node->on_gpu() || !node->is_io_free()) continue;
-      num_evict += node->length();
-      const auto parent = node->parent();
-      this->remove_host_node(node);
-      if (parent->is_leaf() && parent->ref_count == 0)
-        heap.push(parent);  // push parent to the heap if it is now a free leaf
-    }
-
-    if (num_evict < num_tokens) return i;  // not enough host memory for writing through
-    num_evict -= num_tokens;
-    // set the node as being written through
-    const auto node = nodes[i];
-    node->_unsafe_host_indices() = m_host_pool.alloc(node->length());
-    const auto [ticket, iterator] = this->new_io_ticket();
-    node->start_device_to_host(ticket, /*locked=*/true);
-    this->register_io_ticket(node, iterator);
-    this->lock(node);
-  }
-
-  return sizes.size();  // all nodes were successfully allocated
 }
 
 std::tuple<std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>>, std::size_t>
@@ -141,98 +83,40 @@ RadixTree::writing_through(const token_vec_t& _key, at::Tensor value) {
   // just align the key to the page size, clip the unaligned tail
   const auto key = token_slice{_key.data(), m_impl->align(_key.size())};
 
-  // the nodes that are potentially written through to the host
-  std::vector<TreeNode*> potential_write_nodes;
-
   // walk the tree to find the right place to insert
   const auto [host_node, host_prefix_length] = m_impl->tree_walk(key);
 
   // insert and create a new node if the remaining part of the key is not empty
   if (host_prefix_length != key.size()) {
-    const auto new_node = m_impl->create_device_node(
+    m_impl->create_device_node(
         host_node,
         {key.begin() + host_prefix_length, key.end()},
         value.slice(/*dim=*/0, host_prefix_length, key.size()));
-    if (m_impl->need_write_through(new_node)) {
-      potential_write_nodes.push_back(new_node);
-    }
   }
 
-  // update the host node device indices with the newly-inserted device indices
-  std::size_t offset = host_prefix_length;
-  const auto device_node = walk_to_device(host_node, [&](TreeNode* n) {
-    m_impl->copy_device_indices(n, value.slice(/*dim=*/0, offset - n->length(), offset));
-    offset = offset - n->length();
-  });
-
   // add the hit count for the device node
-  std::size_t device_prefix_length = 0;
-  walk_to_root(device_node, [&](TreeNode* n) {
-    device_prefix_length += n->length();
-    n->hit_count++;
-    if (m_impl->need_write_through(n)) {
-      potential_write_nodes.push_back(n);
-    }
-  });
-  _assert(device_prefix_length == offset, "Something goes wrong...");
+  walk_to_root(host_node, [&](TreeNode* n) { n->hit_count++; });
 
   std::vector<std::tuple<IOTicket, at::Tensor, at::Tensor>> result;
 
   // don't write through if hicache is disabled (no host memory), fast path
-  if (!m_impl->use_hicache) return {std::move(result), device_prefix_length};
-
-  // reverse so that the nodes closer to the root are written back first
-  std::reverse(potential_write_nodes.begin(), potential_write_nodes.end());
-  const auto num_success = m_impl->try_write_through(potential_write_nodes);
-  _assert(num_success <= potential_write_nodes.size());
-
-  // fill the result with the tickets and indices
-  result.resize(num_success);
-  for (const auto i : c10::irange(num_success)) {
-    const auto node = potential_write_nodes[i];
-    const auto ticket = node->io_ticket();
-    _assert(ticket.has_value(), "Ticket should be valid for the node");
-    result[i] = {*ticket, node->device_indices(), node->host_indices()};
-  }
-
-  return {std::move(result), device_prefix_length};
+  if (!m_impl->use_hicache) return {std::move(result), host_prefix_length};
+  throw std::runtime_error("Not implemented yet");
 }
 
-std::tuple<IOTicket, std::vector<at::Tensor>> RadixTree::loading_onboard(NodeHandle host_id, at::Tensor value) {
+std::tuple<IOTicket, std::vector<at::Tensor>> RadixTree::loading_onboard(NodeHandle, at::Tensor) {
   if (m_impl->disabled) return {};
-  _assert(value.size(0) > 0, "Value must have at least one element");
-
-  const auto old_host_node = m_impl->id2node(host_id);
-  const auto [ticket, iterator] = m_impl->new_io_ticket();
-
-  std::vector<at::Tensor> indices;
-  std::size_t offset = value.size(0);
-  walk_to_device(old_host_node, [&](TreeNode* n) {
-    indices.push_back(n->host_indices());
-    m_impl->copy_device_indices(n, value.slice(/*dim=*/0, offset - n->length(), offset));
-    offset = offset - n->length();
-    // we only lock the furthermost host node, since it will automatically lock all the parent nodes
-    const bool locked = (n == old_host_node);
-    n->start_host_to_device(ticket, /*locked=*/locked);
-    m_impl->register_io_ticket(n, iterator);
-  });
-  // we can only lock node after it has device indices
-  m_impl->lock(old_host_node);
-
-  std::reverse(indices.begin(), indices.end());
-  _assert(offset == 0, "Offset should be zero after updating device indices");
-
-  return {ticket, std::move(indices)};
+  throw std::runtime_error("Not implemented yet");
 }
 
-void RadixTree::commit_writing_through(IOTicket ticket, bool success) {
+void RadixTree::commit_writing_through(IOTicket, bool) {
   if (m_impl->disabled) return;
-  m_impl->complete_io_writing_through(ticket, success);
+  throw std::runtime_error("Not implemented yet");
 }
 
-void RadixTree::commit_loading_onboard(IOTicket ticket, bool success) {
+void RadixTree::commit_loading_onboard(IOTicket, bool) {
   if (m_impl->disabled) return;
-  m_impl->complete_io_loading_onboard(ticket, success);
+  throw std::runtime_error("Not implemented yet");
 }
 
 void RadixTree::reset() {

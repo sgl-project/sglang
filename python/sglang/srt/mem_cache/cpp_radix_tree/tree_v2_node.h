@@ -194,52 +194,6 @@ struct TreeNode {
     return m_host_indices;
   }
 
-  void start_host_to_device(IOTicket ticket, bool locked) {
-    _assert(this->on_both(), "Node must be on both host and device before copying");
-    _assert(m_io_status == IOStatus::None, "IO operation already in progress");
-    m_io_locked = locked;  // whether ref_count will be locked during IO operation
-    m_io_status = IOStatus::HostToDevice;
-    m_io_ticket = ticket;
-  }
-
-  void start_device_to_host(IOTicket ticket, bool locked) {
-    _assert(this->on_both(), "Node must be on both host and device before copying");
-    _assert(m_io_status == IOStatus::None, "IO operation already in progress");
-    m_io_locked = locked;  // whether ref_count will be locked during IO operation
-    m_io_status = IOStatus::DeviceToHost;
-    m_io_ticket = ticket;
-  }
-
-  void complete_host_to_device(IOTicket ticket) {
-    _assert(this->on_both(), "Node must be on both device and host when host -> device");
-    _assert(m_io_status == IOStatus::HostToDevice, "Wrong IO operation status (should be host -> device)");
-    _assert(ticket == m_io_ticket, "IO ticket mismatch during host -> device completion");
-    m_io_status = IOStatus::None;
-    m_io_locked.reset();  // reset IO locked status after completion
-  }
-
-  void complete_device_to_host(IOTicket ticket) {
-    _assert(this->on_both(), "Node must be on both device and host when device -> host");
-    _assert(m_io_status == IOStatus::DeviceToHost, "Wrong IO operation status (should be device -> host)");
-    _assert(ticket == m_io_ticket, "IO ticket mismatch during device -> host completion");
-    m_io_status = IOStatus::None;
-    m_io_locked.reset();  // reset IO locked status after completion
-  }
-
-  bool is_io_locked() const {
-    _assert(m_io_locked.has_value(), "IO locked status is not set");
-    return m_io_locked.value();
-  }
-
-  std::optional<IOTicket> io_ticket() const {
-    if (m_io_status == IOStatus::None) {
-      _assert(!m_io_locked.has_value(), "IO lock in wrong status");
-      return std::nullopt;  // no IO operation in progress
-    }
-    _assert(m_io_locked.has_value(), "IO lock in wrong status");
-    return m_io_ticket;
-  }
-
   bool is_io_free() const {
     return m_io_status == IOStatus::None;
   }
@@ -298,15 +252,6 @@ inline TreeNode* walk_to_root(TreeNode* t, const F& f) {
     t = t->parent();
   }
   return t;  // return the root node
-}
-
-template <typename F>
-inline TreeNode* walk_to_device(TreeNode* t, const F& f) {
-  while (!t->is_root() && !t->on_gpu()) {
-    f(t);
-    t = t->parent();
-  }
-  return t;  // return the first non-evicted node or the root node
 }
 
 }  // namespace radix_tree_v2
