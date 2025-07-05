@@ -39,6 +39,7 @@ class SessionParams:
     rid: Optional[str] = None
     offset: Optional[int] = None
     replace: Optional[bool] = None
+    drop_previous_output: Optional[bool] = None
 
 
 AudioDataItem = Union[str, Dict]
