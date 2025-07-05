@@ -14,8 +14,8 @@ def tree_speculative_sampling_target_only(
     uniform_samples_for_final_sampling: torch.Tensor,
     target_probs: torch.Tensor,
     draft_probs: torch.Tensor,
-    threshold_single: float = 1.0,
-    threshold_acc: float = 1.0,
+    threshold_singles: torch.Tensor,
+    threshold_accs: torch.Tensor,
     deterministic: bool = True,
 ) -> None:
     torch.ops.sgl_kernel.tree_speculative_sampling_target_only.default(
@@ -30,8 +30,8 @@ def tree_speculative_sampling_target_only(
         uniform_samples_for_final_sampling,
         target_probs,
         draft_probs,
-        threshold_single,
-        threshold_acc,
+        threshold_singles,
+        threshold_accs,
         deterministic,
         get_cuda_stream(),
     )
