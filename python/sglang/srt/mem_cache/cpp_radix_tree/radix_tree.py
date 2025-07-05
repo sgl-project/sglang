@@ -1,7 +1,15 @@
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-from sgl_kernel import radix_tree_cpp  # type: ignore
+from torch.utils.cpp_extension import load
+
+radix_tree_cpp = load(
+    name="radix_tree_cpp",
+    sources=["tree_v2_binding.cpp", "tree_v2_debug.cpp", "tree_v2.cpp"],
+    extra_cflags=["-O3", "-std=c++20"],
+)
 
 if TYPE_CHECKING:
 
@@ -162,6 +170,7 @@ if TYPE_CHECKING:
             return self.tree.debug_print()
 
 else:
+    # Real implementation of the classes for runtime
     RadixTreeCpp = radix_tree_cpp.RadixTree
-    TreeNodeCpp = Any
-    IOHandle = Any
+    TreeNodeCpp = object
+    IOHandle = object

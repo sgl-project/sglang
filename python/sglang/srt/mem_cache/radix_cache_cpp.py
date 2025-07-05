@@ -1,15 +1,17 @@
+from __future__ import annotations
+
 from typing import TYPE_CHECKING, List, Set
 
 import torch
-from sgl_kernel.radix_tree import IOHandle, RadixTreeCpp, TreeNodeCpp
 
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+
+from .cpp_radix_tree.radix_tree import IOHandle, RadixTreeCpp, TreeNodeCpp
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-else:
-    Req = object
 
 import logging
 
@@ -31,7 +33,7 @@ def _make_cpp_tree(
     )
 
 
-class HiRadixCacheCpp(BasePrefixCache):
+class RadixCacheCpp(BasePrefixCache):
     def _merge_tensor(self, l: List[torch.Tensor]) -> torch.Tensor:
         """
         Merge a list of tensors into a single tensor.
@@ -52,7 +54,7 @@ class HiRadixCacheCpp(BasePrefixCache):
         disable: bool,
         use_hicache: bool,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool: TokenToKVPoolAllocator,
+        token_to_kv_pool: BaseTokenToKVPoolAllocator,
         tp_cache_group: torch.distributed.ProcessGroup,
         page_size: int,
         hicache_ratio: float,
@@ -60,7 +62,7 @@ class HiRadixCacheCpp(BasePrefixCache):
         hicache_write_policy: str,
         enable_kv_cache_events: bool = False,
         hicache_oracle: bool = False,
-        enable_write_cancel: bool = True,
+        enable_write_cancel: bool = False,
     ):
         self.disable = disable
         self.enable_write_cancel = enable_write_cancel
@@ -86,11 +88,10 @@ class HiRadixCacheCpp(BasePrefixCache):
         self.tp_group = tp_cache_group
 
         if not use_hicache:
-            self.tree = _make_cpp_tree(
-                disabled=disable,
-                use_hicache=use_hicache,
+            self.tree = RadixTreeCpp(
+                disabled=self.disable,
                 page_size=page_size,
-                host_size=0,  # no host cache, this should be removed in the future
+                host_size=None,  # no host cache, this should be removed in the future
                 write_through_threshold=self.write_through_threshold,
             )
             self.cache_controller = None
@@ -101,7 +102,7 @@ class HiRadixCacheCpp(BasePrefixCache):
     def reset(self):
         if self.cache_controller is not None:
             # need to clear the acks before resetting the cache controller
-            self.cache_controller.reset()
+            raise NotImplementedError("Host cache is not supported yet")
         self.tree.reset()
 
     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:

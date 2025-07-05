@@ -131,7 +131,6 @@ from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-from sglang.srt.mem_cache.hiradix_cache_cpp import HiRadixCacheCpp
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
@@ -578,8 +577,11 @@ class Scheduler(
                 page_size=self.page_size,
             )
         else:
-            if os.environ.get("SGLANG_EXPERIMENTAL_HIRADIX_CACHE") == "1":
-                self.tree_cache = HiRadixCacheCpp(
+            if os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE") == "1":
+                # lazy import to avoid JIT overhead
+                from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
+
+                self.tree_cache = RadixCacheCpp(
                     disable=False,
                     use_hicache=self.enable_hierarchical_cache,
                     req_to_token_pool=self.req_to_token_pool,
@@ -589,7 +591,7 @@ class Scheduler(
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
-                    enable_kv_cache_events=False,
+                    enable_kv_cache_events=self.enable_kv_cache_events,
                 )
             elif self.enable_hierarchical_cache:
                 self.tree_cache = HiRadixCache(

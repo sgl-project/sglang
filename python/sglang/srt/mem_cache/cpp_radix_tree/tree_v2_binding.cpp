@@ -1,4 +1,3 @@
-#undef Py_LIMITED_API
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
@@ -11,7 +10,6 @@
 PYBIND11_MODULE(radix_tree_cpp, m) {
   using namespace radix_tree_v2;
   namespace py = pybind11;
-  m.attr("__name__") = "sgl_kernel.radix_tree_cpp";
   py::class_<RadixTree>(m, "RadixTree")
       .def(
           py::init<bool, std::optional<std::size_t>, std::size_t, std::size_t>(),
