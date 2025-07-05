@@ -203,6 +203,8 @@ class TokenizerManager:
         self.is_image_gen = self.model_config.is_image_gen
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
+        self._updating = False
+        self._cond = asyncio.Condition()
 
         if self.model_config.is_multimodal:
             import_processors()
@@ -239,6 +241,12 @@ class TokenizerManager:
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
+
+        # Initialize loaded loRA adapters with the initial lora paths in the server_args.
+        # This list will be updated when new LoRA adapters are loaded or unloaded dynamically.
+        self.loaded_lora_adapters: Dict[str, str] = dict(
+            self.server_args.lora_paths or {}
+        )
 
         # Store states
         self.no_create_loop = False
@@ -415,6 +423,9 @@ class TokenizerManager:
         request: Optional[fastapi.Request] = None,
     ):
         created_time = time.time()
+        async with self._cond:
+            await self._cond.wait_for(lambda: not self._updating)
+
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
@@ -482,20 +493,25 @@ class TokenizerManager:
                 token_type_ids = encoded.get("token_type_ids", [None])[0]
 
         if self.mm_processor and obj.contains_mm_input():
-            image_inputs: Dict = await self.mm_processor.process_mm_data_async(
+            if not isinstance(obj.image_data, list):
+                obj.image_data = [obj.image_data]
+            if not isinstance(obj.audio_data, list):
+                obj.audio_data = [obj.audio_data]
+            mm_inputs: Dict = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
+                audio_data=obj.audio_data,
                 input_text=input_text or input_ids,
                 request_obj=obj,
                 max_req_input_len=self.max_req_input_len,
             )
-            if image_inputs and "input_ids" in image_inputs:
-                input_ids = image_inputs["input_ids"]
+            if mm_inputs and "input_ids" in mm_inputs:
+                input_ids = mm_inputs["input_ids"]
         else:
-            image_inputs: Optional[Dict] = None
+            mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
-            obj, input_text, input_ids, input_embeds, image_inputs, token_type_ids
+            obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
 
     def _validate_one_request(
@@ -544,6 +560,8 @@ class TokenizerManager:
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logits-processor` to enable this feature."
                 )
+            if self.server_args.lora_paths and obj.lora_path:
+                self._validate_lora_adapters(obj)
 
     def _validate_input_ids_in_vocab(
         self, input_ids: List[int], vocab_size: int
@@ -559,7 +577,7 @@ class TokenizerManager:
         input_text: str,
         input_ids: List[int],
         input_embeds: Optional[Union[List[float], None]] = None,
-        image_inputs: Optional[Dict] = None,
+        mm_inputs: Optional[Dict] = None,
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
@@ -584,7 +602,7 @@ class TokenizerManager:
                 obj.rid,
                 input_text,
                 input_ids,
-                image_inputs,
+                mm_inputs,
                 sampling_params,
                 obj.return_logprob,
                 obj.logprob_start_len,
@@ -606,7 +624,7 @@ class TokenizerManager:
                 obj.rid,
                 input_text,
                 input_ids,
-                image_inputs,
+                mm_inputs,
                 token_type_ids,
                 sampling_params,
             )
@@ -644,9 +662,9 @@ class TokenizerManager:
     ) -> None:
         """Validate constraints for batch tokenization processing."""
         for i in range(batch_size):
-            if self.is_generation and obj[i].image_data:
+            if self.is_generation and obj[i].contains_mm_input():
                 raise ValueError(
-                    "For image input processing do not set `enable_tokenizer_batch_encode`."
+                    "For multimodal input processing do not set `enable_tokenizer_batch_encode`."
                 )
             if obj[i].input_ids is not None:
                 raise ValueError(
@@ -656,6 +674,21 @@ class TokenizerManager:
                 raise ValueError(
                     "Batch tokenization is not needed for input_embeds. Do not set `enable_tokenizer_batch_encode`."
                 )
+
+    def _validate_lora_adapters(self, obj: GenerateReqInput):
+        """Validate that the requested LoRA adapters are loaded."""
+        requested_adapters = (
+            set(obj.lora_path) if isinstance(obj.lora_path, list) else {obj.lora_path}
+        )
+        loaded_adapters = (
+            self.loaded_lora_adapters.keys() if self.loaded_lora_adapters else set()
+        )
+        unloaded_adapters = requested_adapters - loaded_adapters
+        if unloaded_adapters:
+            raise ValueError(
+                f"The following requested LoRA adapters are not loaded: {unloaded_adapters}\n"
+                f"Loaded adapters: {loaded_adapters}."
+            )
 
     def _send_one_request(
         self,
@@ -818,10 +851,10 @@ class TokenizerManager:
     async def flush_cache(self) -> FlushCacheReqOutput:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
 
-    def abort_request(self, rid: str):
-        if rid not in self.rid_to_state:
+    def abort_request(self, rid: str = "", abort_all: bool = False):
+        if not abort_all and rid not in self.rid_to_state:
             return
-        req = AbortReq(rid)
+        req = AbortReq(rid, abort_all)
         self.send_to_scheduler.send_pyobj(req)
 
         if self.enable_metrics:
@@ -874,6 +907,16 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
 
+    async def pause_generation(self):
+        async with self._cond:
+            self._updating = True
+            self.abort_request(abort_all=True)
+
+    async def continue_generation(self):
+        async with self._cond:
+            self._updating = False
+            self._cond.notify_all()
+
     async def update_weights_from_disk(
         self,
         obj: UpdateWeightFromDiskReqInput,
@@ -885,6 +928,9 @@ class TokenizerManager:
         if obj.load_format is None:
             obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
+
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
 
         if True:  # Keep this redundant check to simplify some internal code sync
             # Hold the lock if it is not async. This means that weight sync
@@ -941,6 +987,9 @@ class TokenizerManager:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
         # This means that weight sync
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
@@ -956,6 +1005,9 @@ class TokenizerManager:
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
+
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
 
         # This means that weight sync
         # cannot run while requests are in progress.
@@ -983,6 +1035,7 @@ class TokenizerManager:
 
         async with self.model_update_lock.writer_lock:
             result = (await self.update_lora_adapter_communicator(obj))[0]
+            self.loaded_lora_adapters = result.loaded_adapters
             return result
 
     async def unload_lora_adapter(
@@ -1004,6 +1057,7 @@ class TokenizerManager:
 
         async with self.model_update_lock.writer_lock:
             result = (await self.update_lora_adapter_communicator(obj))[0]
+            self.loaded_lora_adapters = result.loaded_adapters
             return result
 
     async def get_weights_by_name(
@@ -1109,6 +1163,7 @@ class TokenizerManager:
                     [
                         "text",
                         "output_ids",
+                        "embedding",
                     ]
                 )
             elif self.log_requests_level == 1:
@@ -1127,6 +1182,7 @@ class TokenizerManager:
                     [
                         "text",
                         "output_ids",
+                        "embedding",
                     ]
                 )
             elif self.log_requests_level == 2:
@@ -1589,7 +1645,23 @@ class TokenizerManager:
             self.crash_dump_request_list.popleft()
 
     def _handle_abort_req(self, recv_obj):
-        self.rid_to_state.pop(recv_obj.rid, None)
+        state = self.rid_to_state[recv_obj.rid]
+        state.finished = True
+        state.out_list.append(
+            {
+                "text": "",
+                "meta_info": {
+                    "id": recv_obj.rid,
+                    "finish_reason": {
+                        "type": "abort",
+                        "message": "Abort before prefill",
+                    },
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                },
+            }
+        )
+        state.event.set()
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(
