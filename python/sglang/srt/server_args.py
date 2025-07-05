@@ -222,6 +222,7 @@ class ServerArgs:
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
     enable_return_hidden_states: bool = False
+    enable_triton_kernel_moe: bool = False
     warmups: Optional[str] = None
 
     # Debug tensor dumps
@@ -1553,6 +1554,11 @@ class ServerArgs:
             "--enable-return-hidden-states",
             action="store_true",
             help="Enable returning hidden states with responses.",
+        )
+        parser.add_argument(
+            "--enable-triton-kernel-moe",
+            action="store_true",
+            help="Use triton moe grouped gemm kernel.",
         )
         parser.add_argument(
             "--warmups",
