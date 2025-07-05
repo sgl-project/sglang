@@ -56,6 +56,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "ModelOptFp8LinearMethod",
     "ModelOptFp4LinearMethod",
     "IPEXAWQLinearMethod",
+    "PetitNvFp4LinearMethod",
 ]
 
 _is_cpu_amx_available = cpu_has_amx_support()
