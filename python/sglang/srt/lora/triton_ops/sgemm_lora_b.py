@@ -38,8 +38,8 @@ def _sgemm_lora_b_kernel(
     """
     Computes a segmented batched matrix multiplication for the LoRA B matrix.
 
-    When a sequence's rank is 0, the kernel essentially initializes the output to 
-    all-zero, following the convention in pytorch where the product of two matrices 
+    When a sequence's rank is 0, the kernel essentially initializes the output to
+    all-zero, following the convention in pytorch where the product of two matrices
     of shape (m, 0) and (0, n) is an all-zero matrix of shape (m, n).
 
     Args:

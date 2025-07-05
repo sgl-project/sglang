@@ -36,9 +36,9 @@ def _sgemm_lora_a_kernel(
     """
     Computes a segmented batched matrix multiplication for the LoRA A matrix.
 
-    The kernel ensures that output[seg_start:seg_start + seg_len, :rank * stack] 
-    stores the product of the input `x` and the LoRA weights for the corresponding 
-    sequence. This implies that when rank is 0, the kernel is essentially a no-op, 
+    The kernel ensures that output[seg_start:seg_start + seg_len, :rank * stack_num]
+    stores the product of the input `x` and the LoRA weights for the corresponding
+    sequence. This implies that when rank is 0, the kernel is essentially a no-op,
     as output[seg_start:seg_start + seg_len, :0] is trivially correct (empty).
 
     Args:
@@ -89,8 +89,7 @@ def _sgemm_lora_a_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(
             x_ptrs,
-            mask=(s_offset[:, None] < seg_len)
-            & (k_offset[None, :] < K - k * BLOCK_K),
+            mask=(s_offset[:, None] < seg_len) & (k_offset[None, :] < K - k * BLOCK_K),
             other=0.0,
         )
         w_tile = tl.load(

@@ -38,13 +38,13 @@ def _gate_up_lora_b_kernel(
     """
     This kernel packs 2 sgemms (gate/up) into a single kernel.
 
-    When a sequence's rank is 0, the kernel essentially initializes the output to 
-    all-zero, following the convention in pytorch where the product of two matrices 
+    When a sequence's rank is 0, the kernel essentially initializes the output to
+    all-zero, following the convention in pytorch where the product of two matrices
     of shape (m, 0) and (0, n) is an all-zero matrix of shape (m, n).
 
     Args:
         x (Tensor): The input tensor, which is the result of the LoRA A projection.
-            Shape: (s, 2 * K), where s is the sum of all sequence lengths in the 
+            Shape: (s, 2 * K), where s is the sum of all sequence lengths in the
             batch and K is the maximum LoRA rank.
         weights (Tensor): The LoRA B weights for all adapters.
             Shape: (num_lora, 2 * output_dim, K).
