@@ -237,8 +237,10 @@ class ServerArgs:
     disaggregation_decode_dp: Optional[int] = None
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
+    disaggregation_ascend_url: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
+    ascend_mooncake: bool = False
 
     # For model weight update
     custom_weight_loader: Optional[List[str]] = None
@@ -1588,7 +1590,7 @@ class ServerArgs:
             "--disaggregation-transfer-backend",
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
-            choices=["mooncake", "nixl"],
+            choices=["mooncake", "nixl", "ascend"],
             help="The backend for disaggregation transfer. Default is mooncake.",
         )
         parser.add_argument(
@@ -1622,6 +1624,17 @@ class ServerArgs:
             help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
             "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
             "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+        )
+        parser.add_argument(
+            "--disaggregation-ascend-url",
+            type=str,
+            default=ServerArgs.disaggregation_ascend_url,
+            help="(e.g., --disaggregation-ascend-url tcp://127.0.0.1:33233)",
+        )
+        parser.add_argument(
+            "--ascend-mooncake",
+            action="store_true",
+            help="Ascend Transfer mooncake",
         )
         parser.add_argument(
             "--num-reserved-decode-tokens",

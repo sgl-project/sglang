@@ -132,13 +132,9 @@ class MooncakeKVManager(BaseKVManager):
     ):
         self.kv_args = args
         self.local_ip = get_local_ip_auto()
-        self.engine = MooncakeTransferEngine(
-            hostname=self.local_ip,
-            gpu_id=self.kv_args.gpu_id,
-            ib_device=self.kv_args.ib_device,
-        )
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
+        self.init_engine()
         # for p/d multi node infer
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
@@ -217,6 +213,13 @@ class MooncakeKVManager(BaseKVManager):
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
+    def init_engine(self):
+        self.engine = MooncakeTransferEngine(
+            hostname=self.local_ip,
+            gpu_id=self.kv_args.gpu_id,
+            ib_device=self.kv_args.ib_device,
+        )
+
     def register_buffer_to_engine(self):
         for kv_data_ptr, kv_data_len in zip(
             self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
@@ -233,6 +236,13 @@ class MooncakeKVManager(BaseKVManager):
         socket = zmq.Context().socket(zmq.PUSH)
         socket.connect(endpoint)
         return socket
+
+    def caculate_kv_addr(self, src_ptr: int, dst_ptr: int, prefill_index: list[int], decode_index: list[int],
+                         item_len: int, data_len: int):
+        src_addr = src_ptr + int(prefill_index[0]) * item_len
+        dst_addr = dst_ptr + int(decode_index[0]) * item_len
+        length = item_len * len(prefill_index)
+        return src_addr, dst_addr, length
 
     def send_kvcache(
         self,
@@ -253,19 +263,19 @@ class MooncakeKVManager(BaseKVManager):
                 self.kv_args.kv_data_ptrs[layer_id],
                 dst_kv_ptrs[layer_id],
                 self.kv_args.kv_item_lens[layer_id],
+                self.kv_args.kv_data_lens[layer_id],
             )
             for layer_id in range(num_layers)
         ]
 
         # Worker function for processing a single layer
-        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+        def process_layer(src_ptr: int, dst_ptr: int, item_len: int, data_len: int) -> int:
             src_addr_list = []
             dst_addr_list = []
             length_list = []
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
+                src_addr, dst_addr, length = self.caculate_kv_addr(src_ptr, dst_ptr, prefill_index, decode_index,
+                                                                   item_len, data_len)
                 src_addr_list.append(src_addr)
                 dst_addr_list.append(dst_addr)
                 length_list.append(length)
@@ -279,8 +289,9 @@ class MooncakeKVManager(BaseKVManager):
                 src_ptr,
                 dst_ptr,
                 item_len,
+                data_len,
             )
-            for (src_ptr, dst_ptr, item_len) in layers_params
+            for (src_ptr, dst_ptr, item_len, data_len) in layers_params
         ]
 
         for future in concurrent.futures.as_completed(futures):
@@ -448,6 +459,12 @@ class MooncakeKVManager(BaseKVManager):
 
         return 0
 
+    def caculate_aux_addr(self, src_ptr: int, dst_ptr: int, prefill_aux_index: int, dst_aux_index: int,
+                          item_len: int, data_len: int):
+        src_addr = src_ptr + item_len * prefill_aux_index
+        dst_addr = dst_ptr + item_len * dst_aux_index
+        return src_addr, dst_addr, item_len
+
     def send_aux(
         self,
         mooncake_session_id: str,
@@ -460,10 +477,11 @@ class MooncakeKVManager(BaseKVManager):
         length_list = []
         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
         prefill_aux_item_lens = self.kv_args.aux_item_lens
+        prefill_aux_data_lens = self.kv_args.aux_data_lens
         for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
-            length = prefill_aux_item_lens[i]
-            src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
-            dst_addr = dst_aux_ptrs[i] + length * dst_aux_index
+            src_addr, dst_addr, length = self.caculate_aux_addr(prefill_aux_ptrs[i], dst_aux_ptrs[i],
+                                                                prefill_aux_index, dst_aux_index,
+                                                                prefill_aux_item_lens[i], prefill_aux_data_lens[i])
             src_addr_list.append(src_addr)
             dst_addr_list.append(dst_addr)
             length_list.append(length)

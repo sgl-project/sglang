@@ -120,6 +120,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_zmq_socket,
     kill_process_tree,
+    is_npu,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -283,6 +284,15 @@ class TokenizerManager:
             self.bootstrap_server = kv_bootstrap_server_class(
                 self.server_args.disaggregation_bootstrap_port
             )
+            is_create_store = (self.server_args.node_rank == 0
+                               and is_npu()
+                               and self.server_args.disaggregation_transfer_backend == "ascend"
+                               and not self.server_args.ascend_mooncake
+                               )
+            if is_create_store:
+                from mf_adapter import create_config_store
+                ascend_url = self.server_args.disaggregation_ascend_url
+                create_config_store(ascend_url)
 
         # For load balancing
         self.current_load = 0

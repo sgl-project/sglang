@@ -574,32 +574,18 @@ class AscendTokenToKVPool(MHATokenToKVPool):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # [size, head_num, head_dim] for each layer
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = [
-                torch.zeros(
-                    (
-                        self.size // self.page_size + 1,
-                        self.page_size,
-                        self.head_num,
-                        self.head_dim,
-                    ),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
-            self.v_buffer = [
-                torch.zeros(
-                    (
-                        self.size // self.page_size + 1,
-                        self.page_size,
-                        self.head_num,
-                        self.head_dim,
-                    ),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
+            self.kv_buffer = torch.zeros(
+                (2, self.layer_num,
+                 self.size // self.page_size + 1,
+                 self.page_size,
+                 self.head_num,
+                 self.head_dim,
+                 ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
+            self.k_buffer = self.kv_buffer[0]
+            self.v_buffer = self.kv_buffer[1]
 
     def set_kv_buffer(
         self,
@@ -922,18 +908,15 @@ class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.kv_buffer = [
-                torch.zeros(
-                    (
-                        self.size // self.page_size + 1,
-                        self.page_size,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                    ),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
-                for _ in range(layer_num)
-            ]
+            self.kv_buffer = torch.zeros(
+                (layer_num,
+                 self.size // self.page_size + 1,
+                 self.page_size,
+                 self.kv_lora_rank + self.qk_rope_head_dim,
+                 ),
+                dtype=self.store_dtype,
+                device=self.device,
+            )
 
         self.layer_transfer_counter = None
 
