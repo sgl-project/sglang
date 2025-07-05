@@ -185,5 +185,25 @@ class TestMinicpmoServer(TestOpenAIVisionServer):
         self._test_audio_ambient_completion()
 
 
+class TestMimoVLServer(TestOpenAIVisionServer):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "XiaomiMiMo/MiMo-VL-7B-RL"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--trust-remote-code",
+                "--mem-fraction-static",
+                "0.6",
+            ],
+        )
+        cls.base_url += "/v1"
+
+
 if __name__ == "__main__":
     unittest.main()
