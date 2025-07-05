@@ -1,8 +1,10 @@
 from types import MappingProxyType
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Union, Tuple
 
 import torch
 import torch_npu
+import sys
+import importlib
 
 try:
     from mindie_turbo import _ops as ops
@@ -49,6 +51,108 @@ if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 _is_npu = is_npu()
 
+# func refers to RMSNorm.__init__
+def wrapper_rmsnorm_init(func):
+
+    def init(self, hidden_size: int, **extra_args) -> None:
+        func(self, hidden_size, **extra_args)
+        self.ignore_anti = True
+        # The Ascend w8a8_int8 quantization requires adding a bias in rmsnorm
+        self.bias = torch.nn.Parameter(torch.zeros(hidden_size), requires_grad=False)
+
+    return init
+
+
+# func refers to RMSNorm.forward_oot
+def wrapper_rmsnorm_forward(func):
+
+    def _rmsnorm_forward_oot(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not x.is_contiguous():
+            x = x.contiguous()
+        original_dtype = x.dtype
+        x = x.to(torch.float32)
+        if residual is not None:
+            x = x + residual.to(torch.float32)
+            residual = x.to(original_dtype)
+
+        x = torch_npu.npu_rms_norm(x, self.weight.to(torch.float32), self.variance_epsilon)[0] + self.bias
+
+        if residual is None:
+            return x.to(original_dtype)
+        return x.to(original_dtype), residual
+
+    return _rmsnorm_forward_oot
+
+def ascend_fused_experts(hidden_states: torch.Tensor,
+                         w13: torch.Tensor,
+                         w13_scale: torch.Tensor,
+                         w2: torch.Tensor,
+                         w2_scale: torch.Tensor,
+                         topk_weights: torch.Tensor,
+                         topk_ids: torch.Tensor,
+                         top_k: int
+                         ):
+    original_shape = hidden_states.shape
+    original_dtype = hidden_states.dtype
+    scale_dtype = original_dtype if original_dtype == torch.bfloat16 else torch.float32
+    if len(original_shape) == 3:
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+    num_tokens = hidden_states.shape[0]
+    num_experts = w13.shape[0]
+    row_idx_len = num_tokens * top_k
+    row_idx = torch.arange(0,
+                           row_idx_len,
+                           dtype=torch.int32,
+                           device=topk_weights.device).view(top_k, -1).permute(1, 0).contiguous()
+    hidden_states, expanded_row_idx, expanded_expert_idx = torch_npu.npu_moe_init_routing(hidden_states,
+                                                                                          row_idx=row_idx,
+                                                                                          expert_idx=topk_ids,
+                                                                                          active_num=num_tokens)
+    expert_tokens = torch_npu.npu_moe_compute_expert_tokens(expanded_expert_idx, num_experts)
+    expert_tokens = expert_tokens.to(torch.int64)
+    #gmm1: gate_up_proj
+    hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
+    hidden_states = torch_npu.npu_grouped_matmul(
+        x=[hidden_states],
+        weight=[w13],
+        scale=[w13_scale.to(scale_dtype)],
+        per_token_scale=[pertoken_scale],
+        split_item=2,
+        group_list_type=0,
+        group_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype)[0]
+    # act_fn: swiglu
+    hidden_states = torch_npu.npu_swiglu(hidden_states)
+    hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
+    # gmm2: down_proj
+    hidden_states = torch_npu.npu_grouped_matmul(
+        x=[hidden_states],
+        weight=[w2],
+        scale=[w2_scale.to(scale_dtype)],
+        per_token_scale=[pertoken_scale],
+        split_item=2,
+        group_list_type=0,
+        group_type=0,
+        group_list=expert_tokens,
+        output_dtype=original_dtype)[0]
+
+    final_hidden_states = torch_npu.npu_moe_finalize_routing(
+        hidden_states,
+        skip1=None,
+        skip2=None,
+        bias=None,
+        scales=topk_weights,
+        expanded_src_to_dst_row=expanded_row_idx,
+        export_for_source_row=topk_ids
+    )
+    if len(original_shape) == 3:
+        final_hidden_states = final_hidden_states.view(original_shape)
+    return final_hidden_states
 
 class W8A8Int8Config(QuantizationConfig):
     """Config class for W8A8 Int8 Quantization.
@@ -61,12 +165,123 @@ class W8A8Int8Config(QuantizationConfig):
         super().__init__()
         self.quant_description = quant_config
         self.is_dynamic = quant_config.get("is_dynamic", False)
-        if is_npu:
+        if _is_npu:
             if (
                 "packed_modules_mapping" in quant_config
                 and quant_config["packed_modules_mapping"] is not None
             ):
                 self.packed_modules_mapping = quant_config["packed_modules_mapping"]
+
+            # Ascend w8a8_int8 quantization with bias, use wrappers to isolate the effects between models
+            for name in self.quant_description.keys():
+                if "norm.bias" in name:
+                    W8A8Int8Config.apply_patch(
+                        "sglang.srt.layers.layernorm.RMSNorm", "__init__",
+                        [wrapper_rmsnorm_init]
+                    )
+                    W8A8Int8Config.apply_patch(
+                        "sglang.srt.layers.layernorm.RMSNorm", "forward_npu",
+                        [wrapper_rmsnorm_forward]
+                    )
+
+    @staticmethod
+    def apply_patch(target_module, target_function, wrappers):
+
+        original_module, original_function = W8A8Int8Config.parse_path(
+            target_module, target_function, False)
+
+        original_function_id = id(original_function)
+
+        candidate = original_function
+        for wrapper in wrappers:
+            candidate = wrapper(candidate)
+        if target_function is not None:
+            setattr(original_module, target_function, candidate)
+
+        for key, value in sys.modules.copy().items():
+            if (target_function is not None
+                and hasattr(value, target_function)
+                and id(getattr(value,
+                               target_function)) == original_function_id):
+                setattr(value, target_function, candidate)
+
+    @staticmethod
+    def parse_path(module_path, function_name, create_dummy):
+        from importlib.machinery import ModuleSpec
+
+        def create_dummy_module(full_path, parent=None):
+            """Create and register a placeholder module"""
+            dummy = types.ModuleType(full_path)
+            dummy.__file__ = "vllm_ascend.dummy_module.py"
+            dummy.__spec__ = ModuleSpec(full_path, None)
+            sys.modules[full_path] = dummy
+            if parent:
+                setattr(parent, full_path.split(".")[-1], dummy)
+            return dummy
+
+        def create_placeholder_function(func_name):
+            """Create dummy function that raises when called"""
+
+            def placeholder(*args, **kwargs):
+                raise NotImplementedError(
+                    f"Function {func_name} is a placeholder")
+
+            placeholder.__name__ = func_name
+            return placeholder
+
+        modules = module_path.split(".")
+        current_module = None
+        processed_path = []
+
+        for idx, part in enumerate(modules):
+            current_path = ".".join(modules[:idx + 1])
+            parent_path = ".".join(modules[:idx]) if idx > 0 else None
+
+            try:
+                current_module = importlib.import_module(current_path)
+            except ModuleNotFoundError:
+                # Handle missing module
+                parent = importlib.import_module(
+                    parent_path) if parent_path else None
+                if parent and hasattr(parent, part):
+                    # Use existing attribute from parent
+                    current_module = getattr(parent, part)
+                    # Check for early function resolution
+                    if function_name and hasattr(current_module,
+                                                 function_name):
+                        return current_module, getattr(current_module,
+                                                       function_name)
+                    if function_name and create_dummy:
+                        ph_func = create_placeholder_function(function_name)
+                        setattr(current_module, function_name, ph_func)
+                        return current_module, ph_func
+                    if function_name:
+                        raise AttributeError(
+                            f"Function {function_name} missing in {current_path}"
+                        )
+                else:
+                    if not create_dummy:
+                        raise
+                    # Create and register dummy module
+                    current_module = create_dummy_module(
+                        current_path,
+                        parent=importlib.import_module(parent_path)
+                        if parent_path else None)
+
+            processed_path.append(part)
+
+        # Final function handling
+        final_module = sys.modules[module_path]
+        if function_name is not None:
+            if not hasattr(final_module, function_name):
+                if create_dummy:
+                    ph_func = create_placeholder_function(function_name)
+                    setattr(final_module, function_name, ph_func)
+                else:
+                    setattr(final_module, function_name, None)
+            return final_module, getattr(final_module, function_name)
+
+        return final_module, None
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -105,8 +320,13 @@ class W8A8Int8Config(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
-        if is_npu:
+        if _is_npu:
             if isinstance(layer, LinearBase):
+                prefix_in_quant_config = prefix
+                proj_name = prefix.split(".")[-1]
+                if proj_name in self.packed_modules_mapping:
+                    prefix_in_quant_config = prefix.replace(proj_name, self.packed_modules_mapping[proj_name][0])
+                self.is_dynamic = self.quant_description[prefix_in_quant_config + ".weight"] == "W8A8_DYNAMIC"
                 if self.is_layer_skipped(prefix, self.packed_modules_mapping):
                     return UnquantizedLinearMethod()
                 return (
@@ -114,6 +334,8 @@ class W8A8Int8Config(QuantizationConfig):
                     if self.is_dynamic
                     else NPU_W8A8LinearMethod(self)
                 )
+            elif isinstance(layer, FusedMoE):
+                return NPU_W8A8MoEMethod(self)
             return None
         else:
             if isinstance(layer, LinearBase):
@@ -742,3 +964,155 @@ class NPU_W8A8DynamicLinearMethod(LinearMethodBase):
             tp_rank = get_tensor_model_parallel_rank()
             return self.quant_method.apply(layer, x, bias, tp_rank)
         return self.quant_method.apply(layer, x, bias)
+
+
+class NPU_W8A8MoEMethod:
+    """MoE method for NPU quantization.
+
+    This class search for specific quantization
+    implementations supported on NPU hardware for moe methods.
+
+    Args:
+        quant_config: The NPU quantization config.
+    """
+
+    def __init__(self, quantization_config: W8A8Int8Config) -> None:
+        self.quantization_config = quantization_config
+        self.quant_method = self
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: List[int],
+        params_dtype: torch.dtype,
+        **extra_weight_attrs
+    ) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        self.num_experts = num_experts
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
+        )
+
+        # weight
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts, 2 * intermediate_size, hidden_size, dtype=torch.int8
+            ),
+            requires_grad=False
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts, hidden_size, intermediate_size, dtype=torch.int8
+            ),
+            requires_grad=False
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+        # scale
+        w13_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                num_experts, 2 * intermediate_size, 1, dtype=torch.float32
+            ),
+            requires_grad=False
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        w2_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                num_experts, hidden_size, 1, dtype=torch.float32
+            ),
+            requires_grad=False
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        # offset
+        w13_weight_offset = torch.nn.Parameter(
+            torch.empty(
+                num_experts, 2 * intermediate_size, 1, dtype=torch.float32
+            ),
+            requires_grad=False
+        )
+        layer.register_parameter("w13_weight_offset", w13_weight_offset)
+        set_weight_attrs(w13_weight_offset, extra_weight_attrs)
+        w2_weight_offset = torch.nn.Parameter(
+            torch.empty(
+                num_experts, hidden_size, 1, dtype=torch.float32
+            ),
+            requires_grad=False
+        )
+        layer.register_parameter("w2_weight_offset", w2_weight_offset)
+        set_weight_attrs(w2_weight_offset, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.w13_weight = Parameter(layer.w13_weight.data.transpose(1, 2).contiguous(), requires_grad=False)
+        layer.w2_weight = Parameter(layer.w2_weight.data.transpose(1, 2).contiguous(), requires_grad=False)
+        layer.w13_weight_scale = Parameter(layer.w13_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False)
+        layer.w2_weight_scale = Parameter(layer.w2_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False)
+        layer.w13_weight_offset = Parameter(layer.w13_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False)
+        layer.w2_weight_offset = Parameter(layer.w2_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False)
+
+    def apply(
+        self,
+        layer,
+        x,
+        router_logits,
+        top_k,
+        renormalize,
+        use_grouped_topk,
+        topk_group,
+        num_expert_group,
+        num_fused_shared_experts,
+        custom_routing_function,
+        correction_bias,
+        activation,
+        apply_router_weight_on_input,
+        routed_scaling_factor,
+        **kwargs
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.topk import select_experts
+        global_num_experts = router_logits.shape[-1]
+        # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
+        if global_num_experts == 256:
+            topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
+                router_logits,
+                k=top_k,
+                bias=correction_bias,
+                k_group=topk_group,
+                group_count=num_expert_group,
+                group_select_mode=1,
+                renorm=0,
+                norm_type=1,
+                routed_scaling_factor=1,
+                eps=float(1e-20)
+            )
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                num_fused_shared_experts=num_fused_shared_experts,
+                custom_routing_function=custom_routing_function,
+                correction_bias=correction_bias,
+                torch_native=True,
+                routed_scaling_factor=routed_scaling_factor
+            )
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = topk_weights.to(x.dtype)
+        return ascend_fused_experts(
+            hidden_states=x,
+            w13=layer.w13_weight,
+            w13_scale=layer.w13_weight_scale,
+            w2=layer.w2_weight,
+            w2_scale=layer.w2_weight_scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            top_k=top_k
+        )
