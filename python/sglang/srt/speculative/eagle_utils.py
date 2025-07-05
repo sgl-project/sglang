@@ -744,6 +744,9 @@ def assign_draft_cache_locs(
     extend_lens,
     num_new_pages_per_topk,
     out_cache_loc,
+    source_cache_loc,
+    target_cache_loc,
+    last_page_lens_cumsum,
     pool_len: tl.constexpr,
     topk: tl.constexpr,
     speculative_num_steps: tl.constexpr,
@@ -776,39 +779,67 @@ def assign_draft_cache_locs(
     if page_size == 1 or topk == 1:
         return
 
-    # Part 2: Copy the indices for the last partial page
+    # Part 2: Copy indices into source_cache_loc and target_cache_loc
+    # Expected output: src:[8,9,10,8,9,10...] tgt:[16,17,18,24,25,26...]
     prefix_len = tl.load(seq_lens + pid)
     last_page_len = prefix_len % page_size
     offsets = tl.arange(0, page_size)
     mask = offsets < last_page_len
     num_new_pages_per_topk_ = tl.load(num_new_pages_per_topk + pid)
     prefix_base = token_pool + prefix_len - last_page_len
-
-    for topk_id in range(topk):
-        value = tl.load(prefix_base + offsets, mask=mask)
+    src_indices = tl.load(prefix_base + offsets, mask=mask)
+    last_page_lens_cumsum_ = tl.load(last_page_lens_cumsum + pid)
+    # Skip the first one since no copy is needed
+    for topk_id in range(1, topk):
         tl.store(
-            prefix_base + topk_id * num_new_pages_per_topk_ * page_size + offsets,
-            value,
+            source_cache_loc
+            + (topk - 1) * (last_page_lens_cumsum_ - last_page_len)
+            + (topk_id - 1) * last_page_len
+            + offsets,
+            src_indices,
             mask=mask,
         )
-
-    # Part 3: Remove the padding in out_cache_loc
-    iter_offest = tl.arange(0, iter_upper)
-    for topk_id in range(topk):
-        indices = tl.load(
-            prefix_base
-            + topk_id * num_new_pages_per_topk_ * page_size
-            + last_page_len
-            + iter_offest,
-            mask=iter_offest < speculative_num_steps,
+        tgt_indices = tl.load(
+            prefix_base + topk_id * num_new_pages_per_topk_ * page_size + offsets,
+            mask=mask,
         )
         tl.store(
+            target_cache_loc
+            + (topk - 1) * (last_page_lens_cumsum_ - last_page_len)
+            + (topk_id - 1) * last_page_len
+            + offsets,
+            tgt_indices,
+            mask=mask,
+        )
+    # Part 3: Copy and remove the used indices for duplication
+    # speculative_num_steps=5, page_size=4, num_new_pages_per_topk_=2, last_page_len=1
+    #  - xxxxx .. | - xxxxx .. |
+    #   topk=0        topk=1
+    #  "-" means prefix tokens
+    #  "x" means speculative draft tokens
+    #  "." means padded tokens
+    # we only want to copy the "x" part.
+    iter_offset = tl.arange(0, iter_upper)
+    for topk_id in range(topk):
+        mask_upper = iter_offset < (speculative_num_steps + last_page_len)
+        mask_lower = iter_offset >= last_page_len
+        combined_mask = mask_upper & mask_lower
+        indices = tl.load(
+            prefix_base + topk_id * num_new_pages_per_topk_ * page_size + iter_offset,
+            mask=combined_mask,
+            other=0,
+        )
+        padding_len = (iter_upper - speculative_num_steps) * pid * topk
+        all_len = pid * num_new_pages_per_topk_ * page_size * topk
+        ptr_offset = all_len - padding_len
+        tl.store(
             out_cache_loc
-            + pid * topk * speculative_num_steps
+            - last_page_len
+            + ptr_offset
             + topk_id * speculative_num_steps
-            + iter_offest,
+            + iter_offset,
             indices,
-            mask=iter_offest < speculative_num_steps,
+            mask=combined_mask,
         )
 
 
