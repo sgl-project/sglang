@@ -276,7 +276,7 @@ class SchedulerDisaggregationPrefillMixin:
             batch = self.get_new_batch_prefill()
 
             if require_mlp_sync(self.server_args):
-                batch, _ = self.prepare_mlp_sync_batch(batch)
+                batch = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
 
             if batch:
@@ -310,7 +310,7 @@ class SchedulerDisaggregationPrefillMixin:
             batch = self.get_new_batch_prefill()
 
             if require_mlp_sync(self.server_args):
-                batch, _ = self.prepare_mlp_sync_batch(batch)
+                batch = self.prepare_mlp_sync_batch(batch)
             self.cur_batch = batch
             if batch:
                 result = self.run_batch(batch)

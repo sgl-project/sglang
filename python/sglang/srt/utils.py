@@ -2202,14 +2202,14 @@ class DeepEPMode(Enum):
     def enable_low_latency(self):
         return self in [DeepEPMode.low_latency, DeepEPMode.auto]
 
-    def resolve(self, forward_mode):
+    def resolve(self, is_extend_in_batch: bool):
         if self != DeepEPMode.auto:
             return self
 
-        if forward_mode.is_decode():
-            return DeepEPMode.low_latency
-        else:
+        if is_extend_in_batch:
             return DeepEPMode.normal
+        else:
+            return DeepEPMode.low_latency
 
 
 def is_non_idle_and_non_empty(forward_mode, hidden_states):
