@@ -283,7 +283,7 @@ void moe_align_block_size(
       auto align_kernel = moe_align_block_size_kernel<scalar_t>;
 
       const size_t scan_size = next_pow2(num_experts);
-      const size_t shared_mem_size = (num_experts + (num_experts + 1) + scan_size + 1) * sizeof(int32_t);
+      const size_t shared_mem_size = (num_experts + (num_experts + 1) + scan_size) * sizeof(int32_t);
 
       align_kernel<<<1, threads, shared_mem_size, stream>>>(
           topk_ids.data_ptr<scalar_t>(),
