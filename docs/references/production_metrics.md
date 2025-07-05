@@ -2,7 +2,7 @@
 
 SGLang exposes the following metrics via Prometheus. The metrics are namespaced by `$name` (the model name).
 
-An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](../examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
+An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
 Here is an example of the metrics:
 

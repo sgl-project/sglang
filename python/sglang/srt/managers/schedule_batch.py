@@ -203,7 +203,7 @@ class MultimodalDataItem:
 
     # the real data, pixel_values or audio_features
     # data: Union[List[torch.Tensor], List[np.ndarray]]
-    pixel_values: Union[torch.Tensor, np.ndarray] = None
+    pixel_values: Union[torch.Tensor, np.ndarray, "PIL.Image"] = None
     audio_features: Union[torch.Tensor, np.ndarray] = None
     audio_feature_lens: Optional[List[torch.Tensor]] = None
     audio_offsets: Optional[List[Tuple[int, int]]] = None
@@ -244,15 +244,16 @@ class MultimodalDataItem:
         """
         from sglang.srt.managers.mm_utils import hash_feature
 
-        if self.precomputed_features is not None:
-            self.hash = hash_feature(self.precomputed_features)
-        elif self.is_audio():
-            if self.audio_features is not None:
-                self.hash = hash_feature(self.audio_features)
-            elif self.input_features is not None:
-                self.hash = hash_feature(self.input_features)
-        else:
-            self.hash = hash_feature(self.pixel_values)
+        if self.hash is None:
+            if self.precomputed_features is not None:
+                self.hash = hash_feature(self.precomputed_features)
+            elif self.is_audio():
+                if self.audio_features is not None:
+                    self.hash = hash_feature(self.audio_features)
+                elif self.input_features is not None:
+                    self.hash = hash_feature(self.input_features)
+            else:
+                self.hash = hash_feature(self.pixel_values)
 
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
@@ -294,6 +295,13 @@ class MultimodalDataItem:
         ret = MultimodalDataItem(modality=modality, **kwargs)
         ret.validate()
         return ret
+
+    def merge(self, other):
+        self.pixel_values += other.pixel_values
+        self.image_sizes += other.image_sizes
+        self.image_offsets += other.image_offsets
+        self.hash = hash((self.hash, other.hash))
+        self.set_pad_value()
 
 
 @dataclasses.dataclass

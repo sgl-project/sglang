@@ -11,12 +11,14 @@ class TestPrepareServerArgs(CustomTestCase):
         server_args = prepare_server_args(
             [
                 "--model-path",
-                "model_path",
+                "meta-llama/Meta-Llama-3.1-8B-Instruct",
                 "--json-model-override-args",
                 '{"rope_scaling": {"factor": 2.0, "rope_type": "linear"}}',
             ]
         )
-        self.assertEqual(server_args.model_path, "model_path")
+        self.assertEqual(
+            server_args.model_path, "meta-llama/Meta-Llama-3.1-8B-Instruct"
+        )
         self.assertEqual(
             json.loads(server_args.json_model_override_args),
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
