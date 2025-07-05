@@ -29,12 +29,12 @@ class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.is_port_available")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_standard_case(self, mock_temp_file, mock_is_port_available):
-
         mock_is_port_available.return_value = True
         mock_temp_file.return_value.name = "temp_file"
 
         server_args = MagicMock()
         server_args.port = 30000
+        server_args.nccl_port = None
         server_args.enable_dp_attention = False
 
         port_args = PortArgs.init_new(server_args)
@@ -46,16 +46,17 @@ class TestPortArgs(unittest.TestCase):
 
     @patch("sglang.srt.server_args.is_port_available")
     def test_init_new_with_single_node_dp_attention(self, mock_is_port_available):
-
         mock_is_port_available.return_value = True
 
         server_args = MagicMock()
         server_args.port = 30000
+        server_args.nccl_port = None
         server_args.enable_dp_attention = True
         server_args.nnodes = 1
         server_args.dist_init_addr = None
 
         port_args = PortArgs.init_new(server_args)
+        print(f"{port_args=}")
 
         self.assertTrue(port_args.tokenizer_ipc_name.startswith("tcp://127.0.0.1:"))
         self.assertTrue(
@@ -66,11 +67,11 @@ class TestPortArgs(unittest.TestCase):
 
     @patch("sglang.srt.server_args.is_port_available")
     def test_init_new_with_dp_rank(self, mock_is_port_available):
-
         mock_is_port_available.return_value = True
 
         server_args = MagicMock()
         server_args.port = 30000
+        server_args.nccl_port = None
         server_args.enable_dp_attention = True
         server_args.nnodes = 1
         server_args.dist_init_addr = "192.168.1.1:25000"
@@ -86,11 +87,13 @@ class TestPortArgs(unittest.TestCase):
 
     @patch("sglang.srt.server_args.is_port_available")
     def test_init_new_with_ipv4_address(self, mock_is_port_available):
-
         mock_is_port_available.return_value = True
 
         server_args = MagicMock()
         server_args.port = 30000
+
+        server_args.nccl_port = None
+
         server_args.enable_dp_attention = True
         server_args.nnodes = 2
         server_args.dist_init_addr = "192.168.1.1:25000"
@@ -106,11 +109,12 @@ class TestPortArgs(unittest.TestCase):
 
     @patch("sglang.srt.server_args.is_port_available")
     def test_init_new_with_malformed_ipv4_address(self, mock_is_port_available):
-
         mock_is_port_available.return_value = True
 
         server_args = MagicMock()
         server_args.port = 30000
+        server_args.nccl_port = None
+
         server_args.enable_dp_attention = True
         server_args.nnodes = 2
         server_args.dist_init_addr = "192.168.1.1"
@@ -126,11 +130,12 @@ class TestPortArgs(unittest.TestCase):
     def test_init_new_with_malformed_ipv4_address_invalid_port(
         self, mock_is_port_available
     ):
-
         mock_is_port_available.return_value = True
 
         server_args = MagicMock()
         server_args.port = 30000
+        server_args.nccl_port = None
+
         server_args.enable_dp_attention = True
         server_args.nnodes = 2
         server_args.dist_init_addr = "192.168.1.1:abc"
@@ -143,11 +148,12 @@ class TestPortArgs(unittest.TestCase):
     def test_init_new_with_ipv6_address(
         self, mock_is_valid_ipv6, mock_is_port_available
     ):
-
         mock_is_port_available.return_value = True
 
         server_args = MagicMock()
         server_args.port = 30000
+        server_args.nccl_port = None
+
         server_args.enable_dp_attention = True
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1]:25000"
@@ -168,11 +174,12 @@ class TestPortArgs(unittest.TestCase):
     def test_init_new_with_invalid_ipv6_address(
         self, mock_is_valid_ipv6, mock_is_port_available
     ):
-
         mock_is_port_available.return_value = True
 
         server_args = MagicMock()
         server_args.port = 30000
+        server_args.nccl_port = None
+
         server_args.enable_dp_attention = True
         server_args.nnodes = 2
         server_args.dist_init_addr = "[invalid-ipv6]:25000"
@@ -186,11 +193,12 @@ class TestPortArgs(unittest.TestCase):
     def test_init_new_with_malformed_ipv6_address_missing_bracket(
         self, mock_is_port_available
     ):
-
         mock_is_port_available.return_value = True
 
         server_args = MagicMock()
         server_args.port = 30000
+        server_args.nccl_port = None
+
         server_args.enable_dp_attention = True
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1:25000"
@@ -205,11 +213,12 @@ class TestPortArgs(unittest.TestCase):
     def test_init_new_with_malformed_ipv6_address_missing_port(
         self, mock_is_valid_ipv6, mock_is_port_available
     ):
-
         mock_is_port_available.return_value = True
 
         server_args = MagicMock()
         server_args.port = 30000
+        server_args.nccl_port = None
+
         server_args.enable_dp_attention = True
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1]"
@@ -226,11 +235,12 @@ class TestPortArgs(unittest.TestCase):
     def test_init_new_with_malformed_ipv6_address_invalid_port(
         self, mock_is_valid_ipv6, mock_is_port_available
     ):
-
         mock_is_port_available.return_value = True
 
         server_args = MagicMock()
         server_args.port = 30000
+        server_args.nccl_port = None
+
         server_args.enable_dp_attention = True
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1]:abcde"
@@ -245,11 +255,12 @@ class TestPortArgs(unittest.TestCase):
     def test_init_new_with_malformed_ipv6_address_wrong_separator(
         self, mock_is_valid_ipv6, mock_is_port_available
     ):
-
         mock_is_port_available.return_value = True
 
         server_args = MagicMock()
         server_args.port = 30000
+        server_args.nccl_port = None
+
         server_args.enable_dp_attention = True
         server_args.nnodes = 2
         server_args.dist_init_addr = "[2001:db8::1]#25000"
