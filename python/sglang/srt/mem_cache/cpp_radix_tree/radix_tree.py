@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 from torch.utils.cpp_extension import load
 
+_abs_path = os.path.dirname(os.path.abspath(__file__))
 radix_tree_cpp = load(
     name="radix_tree_cpp",
-    sources=["tree_v2_binding.cpp", "tree_v2_debug.cpp", "tree_v2.cpp"],
+    sources=[
+        f"{_abs_path}/tree_v2_binding.cpp",
+        f"{_abs_path}/tree_v2_debug.cpp",
+        f"{_abs_path}/tree_v2.cpp",
+    ],
     extra_cflags=["-O3", "-std=c++20"],
 )
 
@@ -39,7 +45,7 @@ if TYPE_CHECKING:
                 page_size (int): Size of the page for the radix tree.
                 write_through_threshold (int): Threshold for writing through from GPU to CPU.
             """
-            self.tree = radix_tree_cpp.RadixTree(
+            self.tree = radix_tree_cpp.RadixTree(  # type: ignore
                 disabled, host_size, page_size, write_through_threshold
             )
 

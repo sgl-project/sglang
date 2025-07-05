@@ -18,21 +18,6 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _make_cpp_tree(
-    disabled: bool,
-    use_hicache: bool,
-    page_size: int,
-    host_size: int,
-    write_through_threshold: int,
-):
-    return RadixTreeCpp(
-        disabled=disabled,
-        host_size=(host_size if use_hicache else None),
-        page_size=page_size,
-        write_through_threshold=write_through_threshold,
-    )
-
-
 class RadixCacheCpp(BasePrefixCache):
     def _merge_tensor(self, l: List[torch.Tensor]) -> torch.Tensor:
         """
