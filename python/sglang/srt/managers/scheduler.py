@@ -40,6 +40,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
 )
+from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarBackend
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -1189,10 +1190,11 @@ class Scheduler(
                 key_type = "structural_tag"
                 key_string = req.sampling_params.structural_tag
 
-            if self.server_args.reasoning_parser and hasattr(
-                self.tokenizer, "think_end_id"
-            ):
-                key = (key_type, key_string, req.sampling_params.enable_thinking)
+            if isinstance(self.grammar_backend, ReasonerGrammarBackend):
+                enable_thinking = req.sampling_params.enable_thinking
+                if enable_thinking is None:
+                    enable_thinking = True
+                key = (key_type, key_string, enable_thinking)
             else:
                 key = (key_type, key_string)
 
