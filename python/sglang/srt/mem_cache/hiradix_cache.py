@@ -35,6 +35,7 @@ class HiRadixCache(RadixCache):
         hicache_size: int,
         hicache_write_policy: str,
         hicache_io_backend: str,
+        hicache_storage_backend: Optional[str] = None,
     ):
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
@@ -49,6 +50,9 @@ class HiRadixCache(RadixCache):
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
 
         self.tp_group = tp_cache_group
+        self.enable_storage = hicache_storage_backend is not None
+        # todo: customizable storage prefetch threshold
+        self.storage_prefetch_threshold = self.page_size * 10
 
         self.load_cache_event = threading.Event()
         self.cache_controller = HiCacheController(
@@ -58,12 +62,15 @@ class HiRadixCache(RadixCache):
             load_cache_event=self.load_cache_event,
             write_policy=hicache_write_policy,
             io_backend=hicache_io_backend,
+            storage_backend=hicache_storage_backend,
         )
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
         # record the node segments with ongoing load back
         self.ongoing_load_back = {}
+        # record the ongoing prefetch requests
+        self.ongoing_prefetch = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if hicache_write_policy == "write_through" else 3
@@ -221,6 +228,9 @@ class HiRadixCache(RadixCache):
             if not x.evicted:
                 continue
 
+            if x.host_ref_counter > 0:
+                continue
+
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
             for k, v in x.parent.children.items():
@@ -315,6 +325,12 @@ class HiRadixCache(RadixCache):
         self.writing_check()
         self.loading_check()
 
+    def check_prefetch_progress(self):
+        # for finished prefetch operations, update the radix tree
+        # for ongoing prefetch operations, determine whether to continue
+        # if continue, move the associated requests into a staging area
+        pass
+
     def match_prefix(self, key: List[int], **kwargs):
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
         if self.disable or len(key) == 0:
@@ -347,6 +363,74 @@ class HiRadixCache(RadixCache):
             last_host_node=last_host_node,
             host_hit_length=host_hit_length,
         )
+
+    def prefetch_from_storage(
+        self,
+        last_host_node: TreeNode,
+        new_input_tokens: List[int],
+        req_id: str,
+        last_hash: Optional[str] = None,
+    ):
+        if (
+            not self.enable_storage
+            or len(new_input_tokens) < self.storage_prefetch_threshold
+        ):
+            return
+
+        last_host_node.host_ref_counter += 1
+        host_indices = self.cache_controller.mem_pool_host.alloc(len(new_input_tokens))
+        if host_indices is None:
+            self.evict_host(len(new_input_tokens))
+            host_indices = self.cache_controller.mem_pool_host.alloc(
+                len(new_input_tokens)
+            )
+        if host_indices is None:
+            last_host_node.host_ref_counter -= 1
+            # no sufficient host memory to prefetch
+            return
+        operation_id = self.cache_controller.prefetch(
+            host_indices, new_input_tokens, last_hash
+        )
+        self.ongoing_prefetch[req_id] = (operation_id, last_host_node)
+
+    def terminate_prefetch(self, req_id: str):
+        # todo: sync with TP workers
+        operation_id, last_host_node = self.ongoing_prefetch[req_id]
+        fetched_token_ids, host_indices = self.cache_controller.terminate_prefetch(
+            operation_id
+        )
+        # insert a new node of prefetched data into the radix tree
+        self._insert_helper_host(last_host_node, fetched_token_ids, host_indices)
+        last_host_node.host_ref_counter -= 1
+
+    def _insert_helper_host(self, node: TreeNode, key: List, host_value):
+        node.last_access_time = time.monotonic()
+        if len(key) == 0:
+            return 0
+
+        child_key = self.get_child_key_fn(key)
+
+        while len(key) > 0 and child_key in node.children.keys():
+            node = node.children[child_key]
+            node.last_access_time = time.monotonic()
+            prefix_len = self.key_match_fn(node.key, key)
+            key = key[prefix_len:]
+            host_value = host_value[prefix_len:]
+
+            if prefix_len < len(node.key):
+                new_node = self._split_node(node.key, node, prefix_len)
+                node = new_node
+
+            if len(key):
+                child_key = self.get_child_key_fn(key)
+
+        if len(key):
+            new_node = TreeNode()
+            new_node.parent = node
+            new_node.key = key
+            new_node.value = None
+            new_node.host_value = host_value
+            node.children[child_key] = new_node
 
     def _match_prefix_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.monotonic()

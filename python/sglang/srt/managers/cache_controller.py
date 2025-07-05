@@ -24,6 +24,9 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+    from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+
+from sglang.srt.mem_cache.hicache_storage import get_hash_str
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +162,27 @@ class TransferBuffer:
         self.buffers.queue.clear()
 
 
+class StorageOperation:
+    counter = 0
+
+    def __init__(
+        self,
+        host_indices: torch.Tensor,
+        token_ids: List[int],
+        last_hash: Optional[str] = None,
+    ):
+        self.host_indices = host_indices
+        self.token_ids = token_ids
+        self.last_hash = last_hash
+        self.completed_tokens = 0
+
+        self.id = StorageOperation.counter
+        StorageOperation.counter += 1
+
+    def __lt__(self, other: "StorageOperation"):
+        return self.id < other.id
+
+
 class HiCacheController:
 
     def __init__(
@@ -169,6 +193,7 @@ class HiCacheController:
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through_selective",
         io_backend: str = "",
+        storage_backend: Optional[str] = None,
     ):
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
@@ -185,6 +210,17 @@ class HiCacheController:
             )
         else:
             self.io_backend = io_backend
+
+        # todo: move backend initialization to storage backend module
+        if storage_backend is "file":
+            self.storage_backend = HiCacheFile()
+            # tracking prefetch operation progress
+            # todo: thread safe data structure
+            self.ongoing_prefetch = {}
+        else:
+            raise NotImplementedError(
+                f"Unsupported storage backend: {self.storage_backend}"
+            )
 
         self.load_cache_event = load_cache_event
         self.layer_done_counter = LayerDoneCounter(self.mem_pool_device.layer_num)
@@ -203,6 +239,9 @@ class HiCacheController:
         self.ack_write_queue = Queue()
         self.ack_load_queue = Queue()
 
+        self.prefetch_queue = Queue()
+        self.backup_queue = Queue()
+
         self.stop_event = threading.Event()
         self.write_buffer = TransferBuffer(self.stop_event)
         self.load_buffer = TransferBuffer(
@@ -218,8 +257,17 @@ class HiCacheController:
         self.load_thread = threading.Thread(
             target=self.load_thread_func_layer_by_layer, daemon=True
         )
+        self.prefetch_thread = threading.Thread(
+            target=self.prefetch_thread_func, daemon=True
+        )
+        self.backup_thread = threading.Thread(
+            target=self.backup_thread_func, daemon=True
+        )
+
         self.write_thread.start()
         self.load_thread.start()
+        self.prefetch_thread.start()
+        self.backup_thread.start()
 
     def reset(self):
         self.stop_event.set()
@@ -383,3 +431,62 @@ class HiCacheController:
             raise ValueError(
                 f"Inconsistent states: {self.mem_pool_host.get_state(host_indices)}"
             )
+
+    def prefetch(
+        self,
+        host_indices: torch.Tensor,
+        new_input_tokens: List[int],
+        last_hash: Optional[str] = None,
+    ) -> int:
+        """
+        Prefetch KV caches from storage backend to host memory.
+        """
+        operation = StorageOperation(host_indices, new_input_tokens, last_hash)
+        self.prefetch_queue.put(operation)
+        self.ongoing_prefetch[operation.id] = operation
+        return operation.id
+
+    def terminate_prefetch(self, operation_id: int):
+        # todo: fix concurrency issues
+        operation = self.ongoing_prefetch.pop(operation_id)
+        assert operation is not None, f"Operation {operation_id} not found"
+        self.mem_pool_host.free(operation.host_indices[operation.completed_tokens :])
+        return (
+            operation.token_ids[: operation.completed_tokens],
+            operation.host_indices[: operation.completed_tokens],
+        )
+
+    def prefetch_thread_func(self):
+        while (not self.stop_event.is_set()) or not self.prefetch_queue.empty():
+            try:
+                operation = self.prefetch_queue.get(block=True, timeout=1)
+                if operation is None:
+                    continue
+
+                tokens_to_fetch = operation.token_ids
+                host_indices = operation.host_indices
+                hash_value = get_hash_str(
+                    tokens_to_fetch[: self.page_size], operation.last_hash
+                )
+                if not self.storage_backend.exists(hash_value):
+                    # todo: release the host memory asap after figuring out exact amount of tokens to prefetch
+                    continue
+
+                while len(tokens_to_fetch) >= self.page_size:
+                    if operation.id not in self.ongoing_prefetch:
+                        # operation was terminated
+                        break
+                    target_indices = host_indices[: self.page_size]
+                    loaded_tensor = self.storage_backend.get(
+                        hash_value, self.mem_pool_host[target_indices]
+                    )
+                    if loaded_tensor is None:
+                        break
+                    operation.completed_tokens += self.page_size
+                    tokens_to_fetch = tokens_to_fetch[self.page_size :]
+                    host_indices = host_indices[self.page_size :]
+                    hash_value = get_hash_str(
+                        tokens_to_fetch[: self.page_size], hash_value
+                    )
+            except Empty:
+                continue
