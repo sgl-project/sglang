@@ -247,7 +247,7 @@ class ExpertLocationMetadata:
                     [i in update_layer_ids for i in range(self.num_layers)]
                 )
                 mask_update = mask_update.view(*([-1] + [1] * (self_field.dim() - 1)))
-                mask_update = mask_update.to(self_field.device, non_blocking=True)
+                mask_update = mask_update.to(self_field.device)  # Must be blocking to avoid UB from premature GC of the source tensor
                 self_field[...] = torch.where(mask_update, other_field, self_field)
 
     # -------------------------------- usage ------------------------------------
