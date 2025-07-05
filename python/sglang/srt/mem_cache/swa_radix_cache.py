@@ -29,7 +29,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
