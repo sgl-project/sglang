@@ -175,6 +175,109 @@ class KimiDetector(BaseReasoningFormatDetector):
         )
 
 
+class HunyuanDetector(BaseReasoningFormatDetector):
+    """
+    Detector for Hunyuan model.
+
+    Handles format:
+      <think>reasoning</think><answer>response</answer>
+
+    Extracts reasoning from <think> tags and strips both <think> and <answer> tags,
+    leaving clean content for further processing.
+
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+
+    def __init__(self, stream_reasoning: bool = True):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=False,  # Reasoning triggered by /think suffix
+            stream_reasoning=stream_reasoning,
+        )
+        self.answer_start = "<answer>"
+        self.answer_end = "</answer>"
+        self._post_think_buffer = ""
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        """Non-streaming parsing for complete text."""
+        # Let base class handle think tags
+        result = super().detect_and_parse(text)
+
+        # Strip answer tags from normal_text
+        if result.normal_text:
+            result.normal_text = self._strip_answer_tags_complete(result.normal_text)
+
+        return result
+
+    def _strip_answer_tags_complete(self, text: str) -> str:
+        """Strip answer tags from complete text."""
+        if not text:
+            return text
+
+        # Find and remove answer tags while preserving content
+        if self.answer_start in text and self.answer_end in text:
+            start_idx = text.find(self.answer_start)
+            end_idx = text.find(self.answer_end)
+            if start_idx < end_idx:
+                before = text[:start_idx]
+                content = text[start_idx + len(self.answer_start) : end_idx]
+                after = text[end_idx + len(self.answer_end) :]
+                return (before + content + after).strip()
+
+        # Fallback: simple replacement
+        return text.replace(self.answer_start, "").replace(self.answer_end, "").strip()
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        """Streaming parsing with answer tag handling."""
+        # Let base class handle think tags
+        result = super().parse_streaming_increment(new_text)
+
+        # Handle answer tags only when not in reasoning mode
+        if not self._in_reasoning and result.normal_text:
+            self._post_think_buffer += result.normal_text
+            processed, self._post_think_buffer = self._process_answer_buffer_streaming()
+            result.normal_text = processed
+
+        return result
+
+    def _process_answer_buffer_streaming(self) -> tuple[str, str]:
+        """Process buffer to handle answer tags in streaming mode."""
+        buffer = self._post_think_buffer
+        output = ""
+
+        while buffer:
+            # Check for answer start tag
+            if self.answer_start in buffer:
+                idx = buffer.find(self.answer_start)
+                output += buffer[:idx]
+                buffer = buffer[idx + len(self.answer_start) :]
+                continue
+
+            # Check for answer end tag
+            if self.answer_end in buffer:
+                idx = buffer.find(self.answer_end)
+                output += buffer[:idx]
+                buffer = buffer[idx + len(self.answer_end) :]
+                continue
+
+            # Check for partial tags at end of buffer
+            partial_found = False
+            for tag in [self.answer_start, self.answer_end]:
+                for i in range(1, min(len(tag), len(buffer) + 1)):
+                    if buffer.endswith(tag[:i]):
+                        output += buffer[:-i]
+                        return output, buffer[-i:]
+
+            # No tags found, output everything
+            output += buffer
+            buffer = ""
+
+        return output, buffer
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -190,6 +293,7 @@ class ReasoningParser:
         "deepseek-r1": DeepSeekR1Detector,
         "qwen3": Qwen3Detector,
         "kimi": KimiDetector,
+        "hunyuan": HunyuanDetector,
     }
 
     def __init__(self, model_type: Optional[str] = None, stream_reasoning: bool = True):

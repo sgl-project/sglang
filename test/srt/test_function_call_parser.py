@@ -6,6 +6,7 @@ from xgrammar import GrammarCompiler, TokenizerInfo
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
+from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
@@ -506,6 +507,7 @@ class TestEBNFGeneration(unittest.TestCase):
         self.llama32_detector = Llama32Detector()
         self.mistral_detector = MistralDetector()
         self.qwen25_detector = Qwen25Detector()
+        self.hunyuan_detector = HunyuanDetector()
 
     def test_pythonic_detector_ebnf(self):
         """Test that the PythonicDetector generates valid EBNF."""
@@ -591,6 +593,24 @@ class TestEBNFGeneration(unittest.TestCase):
         except RuntimeError as e:
             self.fail(f"Failed to compile EBNF: {e}")
 
+    def test_hunyuan_detector_ebnf(self):
+        """Test that the HunyuanDetector generates valid EBNF."""
+        ebnf = self.hunyuan_detector.build_ebnf(self.tools)
+        self.assertIsNotNone(ebnf)
+
+        # Check that the EBNF contains expected patterns
+        self.assertIn("<tool_calls>", ebnf)
+        self.assertIn("</tool_calls>", ebnf)
+        self.assertIn('"name\\"" ":" "\\"get_weather\\"', ebnf)
+        self.assertIn('"\\"arguments\\"" ":"', ebnf)
+
+        # Validate that the EBNF can be compiled by GrammarCompiler
+        try:
+            ctx = self.grammar_compiler.compile_grammar(ebnf)
+            self.assertIsNotNone(ctx, "EBNF should be valid and compile successfully")
+        except RuntimeError as e:
+            self.fail(f"Failed to compile EBNF: {e}")
+
     def test_weather_function_optional_parameter_handling(self):
         """Test that weather function with optional unit parameter generates correct EBNF without trailing commas."""
         # Create a weather tool with required location and optional unit
@@ -620,6 +640,7 @@ class TestEBNFGeneration(unittest.TestCase):
             "llama32": self.llama32_detector,
             "mistral": self.mistral_detector,
             "qwen25": self.qwen25_detector,
+            "hunyuan": self.hunyuan_detector,
         }
 
         for name, detector in detectors.items():
@@ -676,6 +697,7 @@ class TestEBNFGeneration(unittest.TestCase):
             "llama32": self.llama32_detector,
             "mistral": self.mistral_detector,
             "qwen25": self.qwen25_detector,
+            "hunyuan": self.hunyuan_detector,
         }
 
         for name, detector in json_detectors.items():
@@ -764,6 +786,7 @@ class TestEBNFGeneration(unittest.TestCase):
             "llama32": self.llama32_detector,
             "mistral": self.mistral_detector,
             "qwen25": self.qwen25_detector,
+            "hunyuan": self.hunyuan_detector,
         }
 
         for name, detector in json_detectors.items():
@@ -1136,6 +1159,119 @@ class TestLlama32Detector(unittest.TestCase):
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 1)
         self.assertTrue(result.normal_text.strip().startswith("Some intro."))
+
+
+class TestHunyuanDetector(unittest.TestCase):
+    def setUp(self):
+        self.detector = HunyuanDetector()
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Search information",
+                    parameters={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                ),
+            ),
+        ]
+
+    def test_single_tool_call(self):
+        """Test basic single tool call parsing."""
+        text = '<tool_calls>[{"name": "get_weather", "arguments": {"city": "Tokyo"}}]</tool_calls>'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "Tokyo"})
+
+    def test_multiple_tool_calls(self):
+        """Test multiple tool calls in one block."""
+        text = '<tool_calls>[{"name": "get_weather", "arguments": {"city": "Tokyo"}}, {"name": "search", "arguments": {"query": "restaurants"}}]</tool_calls>'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[1].name, "search")
+
+    def test_mixed_content(self):
+        """Test tool calls with surrounding text."""
+        text = 'Let me check the weather. <tool_calls>[{"name": "get_weather", "arguments": {"city": "Paris"}}]</tool_calls> The weather data is above.'
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(
+            result.normal_text, "Let me check the weather.  The weather data is above."
+        )
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+
+    def test_no_tool_calls(self):
+        """Test text without tool calls."""
+        text = "Just regular text without any tool calls"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(len(result.calls), 0)
+
+    def test_streaming_basic(self):
+        """Test basic streaming functionality."""
+        chunks = [
+            "<tool_calls>[{",
+            '"name": "get_weather", ',
+            '"arguments": {"city": "Tokyo"}}]</tool_calls>',
+        ]
+
+        all_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            if result.calls:
+                all_calls.extend(result.calls)
+
+        # Should have detected the tool call
+        self.assertTrue(any(call.name == "get_weather" for call in all_calls))
+
+    def test_invalid_tool_handling(self):
+        """Test handling of malformed JSON and unknown tools."""
+        # Unknown tool
+        text1 = (
+            '<tool_calls>[{"name": "unknown_function", "arguments": {}}]</tool_calls>'
+        )
+        result1 = self.detector.detect_and_parse(text1, self.tools)
+        self.assertEqual(len(result1.calls), 0)
+
+        # Malformed JSON
+        text2 = (
+            '<tool_calls>[{"name": "get_weather", "arguments": {"city":</tool_calls>'
+        )
+        result2 = self.detector.detect_and_parse(text2, self.tools)
+        self.assertEqual(len(result2.calls), 0)
+
+    def test_has_tool_call(self):
+        """Test the has_tool_call method."""
+        self.assertTrue(self.detector.has_tool_call("text <tool_calls>"))
+        self.assertFalse(self.detector.has_tool_call("no tool calls here"))
 
 
 if __name__ == "__main__":
