@@ -6,7 +6,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip, rank0_log
+from sglang.srt.utils import is_cuda, is_hip
 
 if is_cuda() or is_hip():
     from sgl_kernel import (
@@ -58,9 +58,9 @@ def build_tree_kernel_efficient(
     topk: int,
     spec_steps: int,
     num_verify_tokens: int,
-    tree_mask_mode: TreeMaskMode,
-    tree_mask_buf: Optional[torch.Tensor],
-    position_buf: Optional[torch.Tensor],
+    tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
+    tree_mask_buf: Optional[torch.Tensor] = None,
+    position_buf: Optional[torch.Tensor] = None,
 ):
     parent_list, top_scores_index, draft_tokens = (
         build_tree_kernel_efficient_preprocess(
@@ -383,13 +383,13 @@ def test_build_tree_kernel_efficient():
         num_verify_tokens=num_draft_token,
     )
 
-    rank0_log("=========== build tree kernel efficient ==========")
-    # rank0_log(f"{tree_mask=}")
-    rank0_log(f"{position=}")
-    rank0_log(f"{retrive_index=}")
-    rank0_log(f"{retrive_next_token=}")
-    rank0_log(f"{retrive_next_sibling=}")
-    rank0_log(f"{draft_tokens=}")
+    print("=========== build tree kernel efficient ==========")
+    print(f"{tree_mask=}")
+    print(f"{position=}")
+    print(f"{retrive_index=}")
+    print(f"{retrive_next_token=}")
+    print(f"{retrive_next_sibling=}")
+    print(f"{draft_tokens=}")
     assert position.tolist() == [5, 6, 6, 7, 7, 8, 8, 9, 10, 11, 12, 12, 12, 12, 13, 14]
     assert retrive_index.tolist() == [
         [0, 1, 2, 3, 4, 5, 6, 7],
