@@ -285,6 +285,20 @@ class TokenizerManager:
             self.bootstrap_server = kv_bootstrap_server_class(
                 self.server_args.disaggregation_bootstrap_port
             )
+            is_create_store = (
+                self.server_args.node_rank == 0
+                and self.server_args.disaggregation_transfer_backend == "ascend"
+            )
+            if is_create_store:
+                from mf_adapter import create_config_store
+
+                try:
+                    ascend_url = os.getenv("ASCEND_MF_STORE_URL")
+                    create_config_store(ascend_url)
+                except Exception as e:
+                    error_message = f"Failed create mf store, invalid ascend_url."
+                    error_message += f" With exception {e}"
+                    raise error_message
 
         # For load balancing
         self.current_load = 0

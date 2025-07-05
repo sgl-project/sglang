@@ -132,13 +132,9 @@ class MooncakeKVManager(BaseKVManager):
     ):
         self.kv_args = args
         self.local_ip = get_local_ip_auto()
-        self.engine = MooncakeTransferEngine(
-            hostname=self.local_ip,
-            gpu_id=self.kv_args.gpu_id,
-            ib_device=self.kv_args.ib_device,
-        )
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
+        self.init_engine()
         # for p/d multi node infer
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
@@ -216,6 +212,13 @@ class MooncakeKVManager(BaseKVManager):
 
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
+
+    def init_engine(self):
+        self.engine = MooncakeTransferEngine(
+            hostname=self.local_ip,
+            gpu_id=self.kv_args.gpu_id,
+            ib_device=self.kv_args.ib_device,
+        )
 
     def register_buffer_to_engine(self):
         for kv_data_ptr, kv_data_len in zip(
