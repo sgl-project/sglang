@@ -20,8 +20,10 @@ class KVArgs:
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
+    ascend_mooncake: bool
     ib_device: str
     ib_traffic_class: str
+    ascend_url: str
     gpu_id: int
     # for different tp
     decode_tp_size: int
