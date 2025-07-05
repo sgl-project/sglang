@@ -13,7 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import concurrent.futures
 import logging
 import math
 import threading
@@ -178,7 +177,12 @@ class HiCacheController:
         self.page_size = page_size
         # using kernel for small page KV cache transfer and DMA for large pages
         if not io_backend:
-            self.io_backend = "direct" if self.page_size >= 64 else "kernel"
+            IO_BACKEND_PAGE_SIZE_THRESHOLD = 64
+            self.io_backend = (
+                "direct"
+                if self.page_size >= IO_BACKEND_PAGE_SIZE_THRESHOLD
+                else "kernel"
+            )
         else:
             self.io_backend = io_backend
 

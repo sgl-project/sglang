@@ -285,24 +285,24 @@ class MHATokenToKVPool(KVCache):
         # layer_num x [seq_len, head_num, head_dim]
         # layer_num x [page_num, page_size, head_num, head_dim]
         kv_data_ptrs = [
-            self.k_buffer[i].data_ptr()
+            self._get_key_buffer(i).data_ptr()
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ] + [
-            self.v_buffer[i].data_ptr()
+            self._get_value_buffer(i).data_ptr()
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
         kv_data_lens = [
-            self.k_buffer[i].nbytes
+            self._get_key_buffer(i).nbytes
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ] + [
-            self.v_buffer[i].nbytes
+            self._get_value_buffer(i).nbytes
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
         kv_item_lens = [
-            self.k_buffer[i][0].nbytes * self.page_size
+            self._get_key_buffer(i)[0].nbytes * self.page_size
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ] + [
-            self.v_buffer[i][0].nbytes * self.page_size
+            self._get_value_buffer(i)[0].nbytes * self.page_size
             for i in range(self.start_layer, self.start_layer + self.layer_num)
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
@@ -386,6 +386,12 @@ class MHATokenToKVPool(KVCache):
                 item_size=self.token_stride,
             )
 
+    def _get_key_buffer(self, layer_id: int):
+        # for internal use of referencing
+        if self.store_dtype != self.dtype:
+            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.k_buffer[layer_id - self.start_layer]
+
     def get_key_buffer(self, layer_id: int):
         # note: get_key_buffer is hooked with synchronization for layer-wise KV cache loading
         # it is supposed to be used only by attention backend not for information purpose
@@ -393,17 +399,18 @@ class MHATokenToKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        return self._get_key_buffer(self, layer_id)
+
+    def _get_value_buffer(self, layer_id: int):
+        # for internal use of referencing
         if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.k_buffer[layer_id - self.start_layer]
+            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.v_buffer[layer_id - self.start_layer]
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-
-        if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.v_buffer[layer_id - self.start_layer]
+        return self._get_value_buffer(self, layer_id)
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
@@ -1087,12 +1094,16 @@ class DoubleSparseTokenToKVPool(KVCache):
     def load_from_host_per_layer(
         self, host_pool, host_indices, device_indices, layer_id, io_backend
     ):
-        pass
+        raise NotImplementedError(
+            "HiCache not supported for DoubleSparseTokenToKVPool."
+        )
 
     def backup_to_host_all_layer(
         self, host_pool, host_indices, device_indices, io_backend
     ):
-        pass
+        raise NotImplementedError(
+            "HiCache not supported for DoubleSparseTokenToKVPool."
+        )
 
 
 @triton.jit
