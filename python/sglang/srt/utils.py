@@ -2135,6 +2135,9 @@ def is_remote_url(url: Union[str, Path]) -> bool:
     if isinstance(url, Path):
         return False
 
+    if url.startswith("file://"):
+        return False
+
     pattern = r"(.+)://(.*)"
     m = re.match(pattern, url)
     return m is not None
