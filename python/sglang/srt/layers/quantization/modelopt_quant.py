@@ -366,6 +366,13 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
 
+        if ENABLE_TRTLMM_GEN_MOE:
+            self.kernel = torch.ops.trtllm.nvfp4_gemm
+            self.sf_view_dtype = float4_sf_dtype
+        else:
+            self.kernel = cutlass_scaled_fp4_mm
+            self.sf_view_dtype = torch.float8_e4m3fn
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -497,11 +504,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         assert layer.weight_scale_interleaved.dtype == torch.float8_e4m3fn
         assert layer.alpha.dtype == torch.float32
 
-        out = cutlass_scaled_fp4_mm(
+        out = self.kernel(
             x_fp4,
             layer.weight,
-            x_scale_interleaved,
-            layer.weight_scale_interleaved,
+            x_scale_interleaved.view(self.sf_view_dtype),
+            layer.weight_scale_interleaved.view(self.sf_view_dtype),
             layer.alpha,
             output_dtype,
         )
