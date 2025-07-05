@@ -21,16 +21,10 @@ limitations under the License.
 
 #include "utils.h"
 
-template <typename T, int N, int Alignment = sizeof(T) * N>
-class alignas(Alignment) AlignedArray {
- public:
-  T data[N];
-};
-
 #define WARP_SIZE 32
 
 #define VEC_SIZE 4
-using Vec = AlignedArray<int32_t, VEC_SIZE>;
+using Vec = int4;
 
 template <typename scalar_t>
 __global__ void count_and_sort_expert_tokens_kernel(
@@ -162,20 +156,12 @@ __global__ void moe_align_block_size_kernel(
   }
 
   if (pad_sorted_token_ids) {
-    int32_t fill_val = static_cast<int32_t>(numel);
-    int32_t total = *total_tokens_post_pad;
-
     Vec fill_vec;
-#pragma unroll
-    for (int i = 0; i < VEC_SIZE; ++i) {
-      fill_vec.data[i] = fill_val;
-    }
-
-    int32_t total_vec_count = (total + VEC_SIZE - 1) / VEC_SIZE;
+    fill_vec.x = fill_vec.y = fill_vec.z = fill_vec.w = numel;
+    int32_t total_vecs = (tpad + VEC_SIZE - 1) / VEC_SIZE;
     Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
-
-    for (int32_t idx = tid; idx < total_vec_count; idx += stride) {
-      out_ptr[idx] = fill_vec;
+    for (int i = tid; i < total_vecs; i += blockDim.x) {
+      out_ptr[i] = fill_vec;
     }
   }
 }
@@ -233,20 +219,12 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   }
 
   if (pad_sorted_token_ids) {
-    int32_t fill_val = static_cast<int32_t>(numel);
-    int32_t total = *total_tokens_post_pad;
-
     Vec fill_vec;
-#pragma unroll
-    for (int i = 0; i < VEC_SIZE; ++i) {
-      fill_vec.data[i] = fill_val;
-    }
-
-    int32_t total_vec_count = (total + VEC_SIZE - 1) / VEC_SIZE;
+    fill_vec.x = fill_vec.y = fill_vec.z = fill_vec.w = numel;
+    int32_t total_vecs = (*total_tokens_post_pad + VEC_SIZE - 1) / VEC_SIZE;
     Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
-
-    for (int32_t idx = tid; idx < total_vec_count; idx += stride) {
-      out_ptr[idx] = fill_vec;
+    for (int i = tid; i < total_vecs; i += blockDim.x) {
+      out_ptr[i] = fill_vec;
     }
   }
 
