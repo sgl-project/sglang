@@ -589,7 +589,7 @@ class TokenizerManager:
         else:
             sampling_kwargs = obj.sampling_params
         sampling_params = SamplingParams(**sampling_kwargs)
-        sampling_params.normalize(self.tokenizer)
+        sampling_params.normalize()
         sampling_params.verify()
 
         # Build return object
