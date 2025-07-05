@@ -12,19 +12,21 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe.fused_moe_native import moe_forward_native
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.utils import (
-    _process_weight_after_loading,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
     is_hip,
     set_weight_attrs,
+    use_intel_amx_backend,
 )
 
 if torch.cuda.is_available():
@@ -129,7 +131,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
-            _process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 
         return
 
@@ -264,10 +266,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     ) -> torch.Tensor:
         assert activation == "silu", f"activation = {activation} is not supported."
 
-        if (
-            getattr(layer, "use_intel_amx_backend", False)
-            and not apply_router_weight_on_input
-        ):
+        if use_intel_amx_backend(layer) and not apply_router_weight_on_input:
             topk_weights, topk_ids = select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
@@ -320,6 +319,44 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 no_combine,
                 routed_scaling_factor,
             )
+
+    def forward_npu(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        inplace: bool = True,
+        no_combine: bool = False,
+        routed_scaling_factor: Optional[float] = None,
+    ) -> torch.Tensor:
+        return moe_forward_native(
+            layer,
+            x,
+            use_grouped_topk,
+            top_k,
+            router_logits,
+            renormalize,
+            topk_group,
+            num_expert_group,
+            num_fused_shared_experts,
+            custom_routing_function,
+            correction_bias,
+            activation,
+            apply_router_weight_on_input,
+            inplace,
+            no_combine,
+            routed_scaling_factor,
+        )
 
     def forward_tpu(self, *args, **kwargs) -> torch.Tensor:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
@@ -537,11 +574,6 @@ class FusedMoE(torch.nn.Module):
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         shard_size = expert_data.shape[shard_dim] // 2
 
-        if not self.use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
-            )
-
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         # w3, up_proj: Load into second logical weight of w13.
@@ -552,7 +584,24 @@ class FusedMoE(torch.nn.Module):
             start = shard_size
         else:
             start = 0
-        expert_data = expert_data.narrow(shard_dim, start, shard_size)
+
+        if _is_cpu:
+            expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                expert_data,
+                loaded_weight,
+                start,
+                shard_size * tp_rank,
+                shard_dim,
+                shard_size,
+                not self.use_presharded_weights,
+            )
+        else:
+            if not self.use_presharded_weights:
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, shard_size * tp_rank, shard_size
+                )
+
+            expert_data = expert_data.narrow(shard_dim, start, shard_size)
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
@@ -569,10 +618,21 @@ class FusedMoE(torch.nn.Module):
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
 
-        if not self.use_presharded_weights:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
+        if _is_cpu:
+            expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                expert_data,
+                loaded_weight,
+                0,  # param_data_start
+                shard_size * tp_rank,
+                shard_dim,
+                shard_size,
+                not self.use_presharded_weights,
             )
+        else:
+            if not self.use_presharded_weights:
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, shard_size * tp_rank, shard_size
+                )
 
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
