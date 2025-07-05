@@ -24,14 +24,17 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 from torch import nn
-from transformers import PretrainedConfig, SiglipVisionConfig
 
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
@@ -56,7 +59,8 @@ def get_navit_vision_model():
         "intermediate_size": 4304,
         "model_type": "siglip_vision_model",
         "num_attention_heads": 16,
-        "num_hidden_layers": 26,  # Model is originally 27-layer, we only need the first 26 layers for feature extraction.
+        "num_hidden_layers": 26,
+        # Model is originally 27-layer, we only need the first 26 layers for feature extraction.
         "patch_size": 14,
     }
     model_config = SiglipVisionConfig(**vision_config)
@@ -439,7 +443,9 @@ class Phi4MMForCausalLM(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
-            image_data_embedding_func=self.get_image_feature,
+            data_embedding_funcs={
+                Modality.IMAGE: self.get_image_feature,
+            },
             positions=positions,
         )
 
