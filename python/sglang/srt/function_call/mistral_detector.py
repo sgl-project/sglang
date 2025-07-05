@@ -3,6 +3,7 @@ import logging
 import re
 from typing import List
 
+from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -10,7 +11,6 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.ebnf_composer import EBNFComposer
-from sglang.srt.openai_api.protocol import Tool
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,7 @@ class MistralDetector(BaseFormatDetector):
         self.bot_token = "[TOOL_CALLS] ["
         self.eot_token = "]"
         self.tool_call_regex = re.compile(r"\[{.*}\]", re.DOTALL)
+        self.tool_call_separator = ", "
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Mistral format tool call."""
@@ -126,5 +127,5 @@ class MistralDetector(BaseFormatDetector):
             sequence_start_token=self.bot_token,
             sequence_end_token=self.eot_token,
             function_format="json",
-            tool_call_separator=", ",
+            tool_call_separator=self.tool_call_separator,
         )

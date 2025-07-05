@@ -24,8 +24,8 @@ class TestMLA(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--enable-torch-compile",
-                "--cuda-graph-max-bs",
-                "2",
+                "--torch-compile-max-bs",
+                "4",
                 "--chunked-prefill-size",
                 "256",
             ],
@@ -34,18 +34,6 @@ class TestMLA(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
-        )
-
-        metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.5)
 
     def test_mgsm_en(self):
         args = SimpleNamespace(

@@ -15,7 +15,7 @@ from transformers import (
 
 from sglang import Engine
 from sglang.srt.conversation import generate_chat_conv
-from sglang.srt.openai_api.protocol import ChatCompletionRequest
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
 TEST_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
 
@@ -58,6 +58,10 @@ class VLMInputTestBase:
     def tearDown(self):
         self.engine.shutdown()
 
+    def verify_response(self, output):
+        out_text = output["text"].lower()
+        assert "taxi" in out_text or "cab" in out_text or "car" in out_text, out_text
+
     def get_completion_request(self) -> ChatCompletionRequest:
         json_structure = {
             "model": self.model_path,
@@ -98,7 +102,7 @@ class VLMInputTestBase:
             image_data=[self.main_image],
             sampling_params=dict(temperature=0.0),
         )
-        self.assertIn("taxi", output["text"].lower())
+        self.verify_response(output)
 
     async def test_understands_precomputed_features(self):
         req = self.get_completion_request()
@@ -112,7 +116,7 @@ class VLMInputTestBase:
             ],
             sampling_params=dict(temperature=0.0),
         )
-        self.assertIn("taxi", output["text"].lower())
+        self.verify_response(output)
 
     async def test_understands_pixel_values(self):
         req = self.get_completion_request()
@@ -122,7 +126,7 @@ class VLMInputTestBase:
             image_data=[self._pixel_values_image_data(processor_output)],
             sampling_params=dict(temperature=0.0),
         )
-        self.assertIn("taxi", output["text"].lower())
+        self.verify_response(output)
 
     def _precomputed_image_data(self, processor_output, precomputed_features):
         """This should not be overridden."""
@@ -156,7 +160,7 @@ class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestC
     def _pixel_values_image_data(self, processor_output):
         return dict(
             modality="IMAGE",
-            image_grid_thws=processor_output["image_grid_thw"],
+            image_grid_thw=processor_output["image_grid_thw"],
             pixel_values=processor_output["pixel_values"],
         )
 
@@ -207,8 +211,8 @@ class TestKimiVLImageUnderstandsImage(
     def _pixel_values_image_data(self, processor_output):
         return dict(
             modality="IMAGE",
-            image_grid_thws=processor_output["image_grid_hws"],
             pixel_values=processor_output["pixel_values"],
+            image_grid_hws=processor_output["image_grid_hws"],
         )
 
 

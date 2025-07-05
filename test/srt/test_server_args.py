@@ -11,12 +11,14 @@ class TestPrepareServerArgs(CustomTestCase):
         server_args = prepare_server_args(
             [
                 "--model-path",
-                "model_path",
+                "meta-llama/Meta-Llama-3.1-8B-Instruct",
                 "--json-model-override-args",
                 '{"rope_scaling": {"factor": 2.0, "rope_type": "linear"}}',
             ]
         )
-        self.assertEqual(server_args.model_path, "model_path")
+        self.assertEqual(
+            server_args.model_path, "meta-llama/Meta-Llama-3.1-8B-Instruct"
+        )
         self.assertEqual(
             json.loads(server_args.json_model_override_args),
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
@@ -76,7 +78,7 @@ class TestPortArgs(unittest.TestCase):
         port_args = PortArgs.init_new(server_args, dp_rank=2)
 
         print(f"{port_args=}")
-        self.assertTrue(port_args.scheduler_input_ipc_name.endswith(":25007"))
+        self.assertTrue(port_args.scheduler_input_ipc_name.endswith(":25008"))
 
         self.assertTrue(port_args.tokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
