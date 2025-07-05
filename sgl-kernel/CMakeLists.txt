@@ -407,22 +407,3 @@ install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
 
 install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
         DESTINATION "deep_gemm/include/cutlass")
-
-set(RADIX_SOURCES
-    "csrc/radix_tree/tree_v2.cpp"
-    "csrc/radix_tree/tree_v2_debug.cpp"
-    "csrc/radix_tree/tree_v2_binding.cpp"
-)
-Python_add_library(radix_tree_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${RADIX_SOURCES})
-set(RADIX_TREE_CPP_FLAGS
-    "-O3"
-    "-fPIC"
-    "-std=c++20" # need <span>
-    "-Wall"
-    "-Wextra"
-    "-Werror"
-)
-target_compile_options(radix_tree_cpp PRIVATE ${RADIX_TREE_CPP_FLAGS})
-find_library(TORCH_PYTHON_LIBRARY torch_python PATH "${TORCH_INSTALL_PREFIX}/lib")
-target_link_libraries(radix_tree_cpp PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY})
-install(TARGETS radix_tree_cpp LIBRARY DESTINATION sgl_kernel)
