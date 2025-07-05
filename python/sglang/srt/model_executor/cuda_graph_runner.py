@@ -168,7 +168,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
         capture_bs += [model_runner.req_to_token_pool.size]
 
     if server_args.enable_two_batch_overlap:
-        capture_bs = [bs for bs in capture_bs if bs >= 2]
+        capture_bs = [bs for bs in capture_bs if bs % 2 == 0]
 
     if server_args.cuda_graph_max_bs:
         capture_bs = [bs for bs in capture_bs if bs <= server_args.cuda_graph_max_bs]
@@ -679,6 +679,7 @@ class CudaGraphRunner:
                 forward_mode=self.capture_forward_mode,
                 bs=bs,
                 num_token_non_padded=len(forward_batch.input_ids),
+                spec_info=forward_batch.spec_info,
             )
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = self.custom_mask
