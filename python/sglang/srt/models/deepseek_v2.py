@@ -115,7 +115,6 @@ _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 
 ENABLE_TRTLMM_GEN_MOE = get_bool_env_var("SGLANG_ENABLE_TRTLLM_GEN_MOE", "false")
-GATE_TOKENS_THRESHOLD = (16 + 1) if ENABLE_TRTLMM_GEN_MOE else 4
 
 if _is_cuda:
     from sgl_kernel import (
@@ -213,8 +212,10 @@ class MoEGate(nn.Module):
         self,
         config,
         prefix: str = "",
+        is_nextn: bool = False,
     ):
         super().__init__()
+        self.is_nextn = is_nextn
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
@@ -236,16 +237,23 @@ class MoEGate(nn.Module):
                 True,  # is_vnni
             )
 
+        # NOTE: For some unknown reason, router_gemm seems degrade accept length.
+        if ENABLE_TRTLMM_GEN_MOE and not self.is_nextn:
+            return torch.ops.trtllm.dsv3_router_gemm_op(
+                hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
+            )
+
         if (
             _is_cuda
-            and hidden_states.shape[0] < GATE_TOKENS_THRESHOLD
+            and not self.is_nextn
+            and hidden_states.shape[0] < 4
             and hidden_states.shape[1] == 7168
             and self.weight.shape[0] == 256
             and _device_sm >= 90
         ):
-            logits = dsv3_router_gemm(hidden_states, self.weight)  # outdtype fp32
-            if not ENABLE_TRTLMM_GEN_MOE:
-                logits = logits.to(hidden_states.dtype)
+            logits = dsv3_router_gemm(hidden_states, self.weight).to(
+                hidden_states.dtype
+            )
         else:
             logits = F.linear(hidden_states, self.weight, None)
         return logits
@@ -260,6 +268,7 @@ class DeepseekV2MoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -286,7 +295,9 @@ class DeepseekV2MoE(nn.Module):
                 "Only silu is supported for now."
             )
 
-        self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
+        self.gate = MoEGate(
+            config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
+        )
 
         self.experts = get_moe_impl_class()(
             num_experts=config.n_routed_experts
@@ -1781,6 +1792,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
+                is_nextn=is_nextn,
             )
         else:
             if enable_moe_dense_fully_dp():
