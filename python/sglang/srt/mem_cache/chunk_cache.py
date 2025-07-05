@@ -2,11 +2,14 @@ from __future__ import annotations
 
 """Cache for chunked prefill, used when RadixCache is disabled."""
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    SWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
@@ -63,3 +66,32 @@ class ChunkCache(BasePrefixCache):
 
     def pretty_print(self):
         return ""
+
+
+class SWAChunkCache(ChunkCache):
+    """ChunkCache with support for hybrid KV cache operations."""
+
+    def __init__(
+        self,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: SWATokenToKVPoolAllocator,
+        page_size: int,
+    ):
+        super().__init__(req_to_token_pool, token_to_kv_pool_allocator, page_size)
+        assert isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+
+    def evict(
+        self,
+        req: Req,
+        prelen: int,
+        attention_chunk_size: int,
+    ):
+        if prelen >= req.evicted_seqlen_local + attention_chunk_size:
+            new_evicted_seqlen_local = attention_chunk_size * (
+                prelen // attention_chunk_size
+            )
+            free_slots = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
+            ]
+            self.token_to_kv_pool_allocator.free_swa(free_slots)
+            req.evicted_seqlen_local = new_evicted_seqlen_local

@@ -52,6 +52,9 @@ elif _is_hip:
 
 logger = logging.getLogger(__name__)
 
+if is_npu():
+    import torch_npu
+
 
 class RMSNorm(CustomOp):
     def __init__(
@@ -75,6 +78,18 @@ class RMSNorm(CustomOp):
             return x, residual
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         return out
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None:
+            out, _, residual_out = torch_npu.npu_add_rms_norm(
+                residual, x, self.weight.data, self.variance_epsilon
+            )
+            return out, residual_out
+        return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
 
     def forward_aiter(
         self,
@@ -147,6 +162,32 @@ class RMSNorm(CustomOp):
             )
         else:
             return self.forward_native(x, residual)
+
+    def forward_with_allreduce_fusion(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Forward method with allreduce fusion, prioritizing flashinfer fused operations
+        """
+        if residual is not None:
+            from sglang.srt.distributed import get_tensor_model_parallel_world_size
+            from sglang.srt.layers.flashinfer_comm_fusion import (
+                flashinfer_allreduce_add_rmsnorm,
+            )
+
+            if get_tensor_model_parallel_world_size() > 1:
+                fused_result = flashinfer_allreduce_add_rmsnorm(
+                    input_tensor=x,
+                    residual=residual,
+                    weight=self.weight,
+                    eps=self.variance_epsilon,
+                )
+                if fused_result[0] is not None:
+                    return fused_result
+
+        return self.forward(x, residual)
 
 
 class GemmaRMSNorm(CustomOp):

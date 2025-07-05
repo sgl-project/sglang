@@ -278,9 +278,9 @@ pub struct ServerConfig {
     pub port: u16,
     pub worker_urls: Vec<String>,
     pub policy_config: PolicyConfig,
-    pub verbose: bool,
     pub max_payload_size: usize,
     pub log_dir: Option<String>,
+    pub log_level: Option<String>,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
     pub prometheus_config: Option<PrometheusConfig>,
     pub request_timeout_secs: u64,
@@ -292,11 +292,17 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
 
     let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
         Some(logging::init_logging(LoggingConfig {
-            level: if config.verbose {
-                Level::DEBUG
-            } else {
-                Level::INFO
-            },
+            level: config
+                .log_level
+                .as_deref()
+                .and_then(|s| match s.to_uppercase().parse::<Level>() {
+                    Ok(l) => Some(l),
+                    Err(_) => {
+                        warn!("Invalid log level string: '{}'. Defaulting to INFO.", s);
+                        None
+                    }
+                })
+                .unwrap_or(Level::INFO),
             json_format: false,
             log_dir: config.log_dir.clone(),
             colorize: true,

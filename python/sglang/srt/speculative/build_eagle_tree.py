@@ -4,7 +4,7 @@ from typing import List
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip, rank0_print
+from sglang.srt.utils import is_cuda, is_hip, rank0_log
 
 if is_cuda() or is_hip():
     from sgl_kernel import (
@@ -344,13 +344,13 @@ def test_build_tree_kernel_efficient():
         num_verify_tokens=num_draft_token,
     )
 
-    rank0_print("=========== build tree kernel efficient ==========")
-    # rank0_print(f"{tree_mask=}", flush=True)
-    rank0_print(f"{position=}", flush=True)
-    rank0_print(f"{retrive_index=}", flush=True)
-    rank0_print(f"{retrive_next_token=}", flush=True)
-    rank0_print(f"{retrive_next_sibling=}", flush=True)
-    rank0_print(f"{draft_tokens=}", flush=True)
+    rank0_log("=========== build tree kernel efficient ==========")
+    # rank0_log(f"{tree_mask=}")
+    rank0_log(f"{position=}")
+    rank0_log(f"{retrive_index=}")
+    rank0_log(f"{retrive_next_token=}")
+    rank0_log(f"{retrive_next_sibling=}")
+    rank0_log(f"{draft_tokens=}")
     assert position.tolist() == [5, 6, 6, 7, 7, 8, 8, 9, 10, 11, 12, 12, 12, 12, 13, 14]
     assert retrive_index.tolist() == [
         [0, 1, 2, 3, 4, 5, 6, 7],

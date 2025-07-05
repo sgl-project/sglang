@@ -823,6 +823,7 @@ register_conv_template(
         sep_style=SeparatorStyle.GEMMA3,
         stop_str=["<end_of_turn>"],
         image_token="<start_of_image>",
+        audio_token="<start_of_audio>",
     )
 )
 

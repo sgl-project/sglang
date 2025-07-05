@@ -48,10 +48,12 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     ImageDataItem,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
+    UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -115,13 +117,13 @@ class Engine(EngineBase):
         atexit.register(self.shutdown)
 
         # Allocate ports for inter-process communications
-        port_args = PortArgs.init_new(server_args)
+        self.port_args = PortArgs.init_new(server_args)
         logger.info(f"{server_args=}")
 
         # Launch subprocesses
         tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
             server_args=server_args,
-            port_args=port_args,
+            port_args=self.port_args,
         )
         self.server_args = server_args
         self.tokenizer_manager = tokenizer_manager
@@ -130,7 +132,7 @@ class Engine(EngineBase):
 
         context = zmq.Context(2)
         self.send_to_rpc = get_zmq_socket(
-            context, zmq.DEALER, port_args.rpc_ipc_name, True
+            context, zmq.DEALER, self.port_args.rpc_ipc_name, True
         )
 
     def generate(
@@ -242,6 +244,7 @@ class Engine(EngineBase):
         token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
         lora_path: Optional[List[Optional[str]]] = None,
         custom_logit_processor: Optional[Union[List[str], str]] = None,
+        return_hidden_states: bool = False,
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
@@ -274,6 +277,7 @@ class Engine(EngineBase):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
+            return_hidden_states=return_hidden_states,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
             bootstrap_host=bootstrap_host,
@@ -414,12 +418,21 @@ class Engine(EngineBase):
             self.tokenizer_manager.init_weights_update_group(obj, None)
         )
 
-    def update_weights_from_distributed(self, name: str, dtype, shape):
+    def update_weights_from_distributed(
+        self,
+        names: list[str],
+        dtypes: list[str],
+        shapes: list[list[int]],
+        group_name: str = "weight_update_group",
+        flush_cache: bool = True,
+    ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
-            name=name,
-            dtype=dtype,
-            shape=shape,
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name=group_name,
+            flush_cache=flush_cache,
         )
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
@@ -474,6 +487,29 @@ class Engine(EngineBase):
         loop = asyncio.get_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.get_weights_by_name(obj, None)
+        )
+
+    def load_lora_adapter(self, lora_name: str, lora_path: str):
+        """Load a new LoRA adapter without re-launching the engine."""
+
+        obj = LoadLoRAAdapterReqInput(
+            lora_name=lora_name,
+            lora_path=lora_path,
+        )
+
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.load_lora_adapter(obj, None)
+        )
+
+    def unload_lora_adapter(self, lora_name: str):
+        """Unload a LoRA adapter without re-launching the engine."""
+
+        obj = UnloadLoRAAdapterReqInput(lora_name=lora_name)
+
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.unload_lora_adapter(obj, None)
         )
 
     def release_memory_occupation(self, tags: Optional[List[str]] = None):
@@ -606,7 +642,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.2.6.post1",
+            "0.2.7.post1",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -614,7 +650,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda:
         assert_pkg_version(
             "sgl-kernel",
-            "0.1.9",
+            "0.2.2",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 

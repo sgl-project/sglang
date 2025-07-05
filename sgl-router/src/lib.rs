@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+pub mod config;
 pub mod logging;
 use std::collections::HashMap;
 pub mod openai_api_types;
@@ -36,8 +37,8 @@ struct Router {
     eviction_interval_secs: u64,
     max_tree_size: usize,
     max_payload_size: usize,
-    verbose: bool,
     log_dir: Option<String>,
+    log_level: Option<String>,
     service_discovery: bool,
     selector: HashMap<String, String>,
     service_discovery_port: u16,
@@ -56,6 +57,83 @@ struct Router {
     decode_urls: Option<Vec<String>>,
 }
 
+impl Router {
+    /// Convert PyO3 Router to RouterConfig
+    pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
+        use config::{
+            DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
+        };
+
+        // Determine routing mode
+        let mode = if self.pd_disaggregation {
+            RoutingMode::PrefillDecode {
+                prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
+                decode_urls: self.decode_urls.clone().unwrap_or_default(),
+            }
+        } else {
+            RoutingMode::Regular {
+                worker_urls: self.worker_urls.clone(),
+            }
+        };
+
+        // Convert policy
+        let policy = match self.policy {
+            PolicyType::Random => ConfigPolicyConfig::Random,
+            PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
+            PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
+                cache_threshold: self.cache_threshold,
+                balance_abs_threshold: self.balance_abs_threshold,
+                balance_rel_threshold: self.balance_rel_threshold,
+                eviction_interval_secs: self.eviction_interval_secs,
+                max_tree_size: self.max_tree_size,
+            },
+            PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
+                load_check_interval_secs: 5, // Default value
+            },
+        };
+
+        // Service discovery configuration
+        let discovery = if self.service_discovery {
+            Some(DiscoveryConfig {
+                enabled: true,
+                namespace: self.service_discovery_namespace.clone(),
+                port: self.service_discovery_port,
+                check_interval_secs: 60,
+                selector: self.selector.clone(),
+                prefill_selector: self.prefill_selector.clone(),
+                decode_selector: self.decode_selector.clone(),
+                bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
+            })
+        } else {
+            None
+        };
+
+        // Metrics configuration
+        let metrics = match (self.prometheus_port, self.prometheus_host.as_ref()) {
+            (Some(port), Some(host)) => Some(MetricsConfig {
+                port,
+                host: host.clone(),
+            }),
+            _ => None,
+        };
+
+        Ok(config::RouterConfig {
+            mode,
+            policy,
+            host: self.host.clone(),
+            port: self.port,
+            max_payload_size: self.max_payload_size,
+            request_timeout_secs: self.request_timeout_secs,
+            worker_startup_timeout_secs: self.worker_startup_timeout_secs,
+            worker_startup_check_interval_secs: self.worker_startup_check_interval,
+            discovery,
+            metrics,
+            log_dir: self.log_dir.clone(),
+            log_level: self.log_level.clone(),
+        })
+    }
+}
+
 #[pymethods]
 impl Router {
     #[new]
@@ -72,8 +150,8 @@ impl Router {
         eviction_interval_secs = 60,
         max_tree_size = 2usize.pow(24),
         max_payload_size = 256 * 1024 * 1024,  // 256MB default for large batches
-        verbose = false,
         log_dir = None,
+        log_level = None,
         service_discovery = false,
         selector = HashMap::new(),
         service_discovery_port = 80,
@@ -101,8 +179,8 @@ impl Router {
         eviction_interval_secs: u64,
         max_tree_size: usize,
         max_payload_size: usize,
-        verbose: bool,
         log_dir: Option<String>,
+        log_level: Option<String>,
         service_discovery: bool,
         selector: HashMap<String, String>,
         service_discovery_port: u16,
@@ -130,8 +208,8 @@ impl Router {
             eviction_interval_secs,
             max_tree_size,
             max_payload_size,
-            verbose,
             log_dir,
+            log_level,
             service_discovery,
             selector,
             service_discovery_port,
@@ -149,68 +227,23 @@ impl Router {
     }
 
     fn start(&self) -> PyResult<()> {
-        let policy_config = if self.pd_disaggregation {
-            // PD mode - map PolicyType to PDSelectionPolicy
-            let pd_selection_policy = match &self.policy {
-                PolicyType::Random => pd_types::PDSelectionPolicy::Random,
-                PolicyType::PowerOfTwo => pd_types::PDSelectionPolicy::PowerOfTwo,
-                PolicyType::CacheAware => pd_types::PDSelectionPolicy::CacheAware {
-                    cache_threshold: self.cache_threshold,
-                    balance_abs_threshold: self.balance_abs_threshold,
-                    balance_rel_threshold: self.balance_rel_threshold,
-                },
-                PolicyType::RoundRobin => {
-                    return Err(pyo3::exceptions::PyValueError::new_err(
-                        "RoundRobin policy is not supported in PD disaggregated mode",
-                    ));
-                }
-            };
+        // Convert to RouterConfig and validate
+        let router_config = self.to_router_config().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {}", e))
+        })?;
 
-            let prefill_urls = self.prefill_urls.as_ref().ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "PD disaggregated mode requires prefill_urls",
-                )
-            })?;
-            let decode_urls = self.decode_urls.as_ref().ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "PD disaggregated mode requires decode_urls",
-                )
-            })?;
+        // Validate the configuration
+        router_config.validate().map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Configuration validation failed: {}",
+                e
+            ))
+        })?;
 
-            router::PolicyConfig::PrefillDecodeConfig {
-                selection_policy: pd_selection_policy,
-                prefill_urls: prefill_urls.clone(),
-                decode_urls: decode_urls.clone(),
-                timeout_secs: self.worker_startup_timeout_secs,
-                interval_secs: self.worker_startup_check_interval,
-            }
-        } else {
-            // Regular mode
-            match &self.policy {
-                PolicyType::Random => router::PolicyConfig::RandomConfig {
-                    timeout_secs: self.worker_startup_timeout_secs,
-                    interval_secs: self.worker_startup_check_interval,
-                },
-                PolicyType::RoundRobin => router::PolicyConfig::RoundRobinConfig {
-                    timeout_secs: self.worker_startup_timeout_secs,
-                    interval_secs: self.worker_startup_check_interval,
-                },
-                PolicyType::CacheAware => router::PolicyConfig::CacheAwareConfig {
-                    timeout_secs: self.worker_startup_timeout_secs,
-                    interval_secs: self.worker_startup_check_interval,
-                    cache_threshold: self.cache_threshold,
-                    balance_abs_threshold: self.balance_abs_threshold,
-                    balance_rel_threshold: self.balance_rel_threshold,
-                    eviction_interval_secs: self.eviction_interval_secs,
-                    max_tree_size: self.max_tree_size,
-                },
-                PolicyType::PowerOfTwo => {
-                    return Err(pyo3::exceptions::PyValueError::new_err(
-                        "PowerOfTwo policy is only supported in PD disaggregated mode",
-                    ));
-                }
-            }
-        };
+        // Convert to internal policy config
+        let policy_config = router_config
+            .to_routing_policy_config()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
         // Create service discovery config if enabled
         let service_discovery_config = if self.service_discovery {
@@ -239,22 +272,26 @@ impl Router {
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
         });
 
-        actix_web::rt::System::new().block_on(async move {
+        // Use tokio runtime instead of actix-web System for better compatibility
+        let runtime = tokio::runtime::Runtime::new()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        // Block on the async startup function
+        runtime.block_on(async move {
             server::startup(server::ServerConfig {
                 host: self.host.clone(),
                 port: self.port,
                 worker_urls: self.worker_urls.clone(),
                 policy_config,
-                verbose: self.verbose,
                 max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
+                log_level: self.log_level.clone(),
                 service_discovery_config,
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
             })
             .await
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-            Ok(())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })
     }
 }

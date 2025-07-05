@@ -140,9 +140,11 @@ class EAGLEWorker(TpModelWorker):
             self.draft_model_runner.model.set_embed(embed)
 
             # grab hot token ids
-            self.hot_token_id = self.draft_model_runner.model.get_hot_token_id().to(
-                embed.device
-            )
+            if self.draft_model_runner.model.hot_token_id is not None:
+                self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
+                    embed.device
+                )
+
         else:
             if self.hot_token_id is not None:
                 head = head.clone()

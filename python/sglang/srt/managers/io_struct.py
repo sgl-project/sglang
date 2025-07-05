@@ -20,18 +20,17 @@ import copy
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
-from sglang.srt.mm_utils import has_valid_data
+from sglang.srt.managers.schedule_batch import BaseFinishReason
+from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.sampling.sampling_params import SamplingParams
 
-# handle serialization of Image for pydantic
+# Handle serialization of Image for pydantic
 if TYPE_CHECKING:
     from PIL.Image import Image
 else:
     Image = Any
-
-from sglang.srt.managers.schedule_batch import BaseFinishReason
-from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 @dataclass
@@ -40,6 +39,7 @@ class SessionParams:
     rid: Optional[str] = None
     offset: Optional[int] = None
     replace: Optional[bool] = None
+    drop_previous_output: Optional[bool] = None
 
 
 AudioDataItem = Union[str, Dict]
@@ -182,6 +182,7 @@ class GenerateReqInput:
         # Determine parallel sample count
         if self.sampling_params is None:
             self.parallel_sample_num = 1
+            return
         elif isinstance(self.sampling_params, dict):
             self.parallel_sample_num = self.sampling_params.get("n", 1)
         else:  # isinstance(self.sampling_params, list):
@@ -516,9 +517,6 @@ class EmbeddingReqInput:
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
 
-    def contains_mm_input(self) -> bool:
-        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
-
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
         if self.text is None and self.input_ids is None and self.image_data is None:
@@ -571,6 +569,9 @@ class EmbeddingReqInput:
     def regenerate_rid(self):
         self.rid = uuid.uuid4().hex
         return self.rid
+
+    def contains_mm_input(self) -> bool:
+        return has_valid_data(self.image_data) or has_valid_data(self.audio_data)
 
     def __getitem__(self, i):
         if self.is_cross_encoder_request:
@@ -740,6 +741,8 @@ class UpdateWeightFromDiskReqInput:
     model_path: str
     # The format to load the weights
     load_format: Optional[str] = None
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
 
 
 @dataclass
@@ -752,9 +755,15 @@ class UpdateWeightFromDiskReqOutput:
 
 @dataclass
 class UpdateWeightsFromDistributedReqInput:
-    name: str
-    dtype: str
-    shape: List[int]
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
+    # The group name
+    group_name: str = "weight_update_group"
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
 
 
 @dataclass
@@ -776,6 +785,8 @@ class UpdateWeightsFromTensorReqInput:
     load_format: Optional[str] = None
     # Whether to flush the cache after updating weights
     flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
 
 
 @dataclass
@@ -854,7 +865,9 @@ class SlowDownReqOutput:
 @dataclass
 class AbortReq:
     # The request id
-    rid: str
+    rid: str = ""
+    # Whether to abort all requests
+    abort_all: bool = False
 
 
 @dataclass
@@ -1002,3 +1015,27 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
+
+
+@dataclass
+class LoadLoRAAdapterReqInput:
+    # The name of the lora module to newly loaded.
+    lora_name: str
+    # The path of loading.
+    lora_path: str
+
+
+@dataclass
+class UnloadLoRAAdapterReqInput:
+    # The name of lora module to unload.
+    lora_name: str
+
+
+@dataclass
+class LoRAUpdateResult:
+    success: bool
+    error_message: Optional[str] = None
+    loaded_adapters: Dict[str, str] = field(default_factory=dict)
+
+
+LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = LoRAUpdateResult

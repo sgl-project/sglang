@@ -31,6 +31,11 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.eplb.expert_distribution import (
+    ExpertDistributionRecorder,
+    get_global_expert_distribution_recorder,
+)
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -64,11 +69,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.expert_distribution import (
-    ExpertDistributionRecorder,
-    get_global_expert_distribution_recorder,
-)
-from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -143,6 +143,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
+            # Additional args for FusedMoE
+            **(
+                dict(
+                    enable_flashinfer_moe=True,
+                    enable_ep_moe=global_server_args_dict["enable_ep_moe"],
+                )
+                if global_server_args_dict["enable_flashinfer_moe"]
+                else {}
+            ),
         )
 
         self.gate = ReplicatedLinear(
@@ -291,6 +300,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -393,6 +403,7 @@ class Qwen2MoeModel(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         decoder_layer_type: type[nn.Module] = Qwen2MoeDecoderLayer,
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -418,6 +429,7 @@ class Qwen2MoeModel(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
+                alt_stream=alt_stream,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,

@@ -66,6 +66,13 @@ class BaseReasoningFormatDetector:
         self._buffer += new_text
         current_text = self._buffer
 
+        # If the current text is a prefix of the think token, keep buffering
+        if any(
+            token.startswith(current_text) and token != current_text
+            for token in [self.think_start_token, self.think_end_token]
+        ):
+            return StreamingParseResult()
+
         # Strip `<think>` token if present
         if not self.stripped_think_start and self.think_start_token in current_text:
             current_text = current_text.replace(self.think_start_token, "")
@@ -150,6 +157,24 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         )
 
 
+class KimiDetector(BaseReasoningFormatDetector):
+    """
+    Detector for Kimi Thinking model.
+    Assumes reasoning format:
+      ◁think▷*(.*)◁/think▷
+    Returns all the text before the ◁/think▷ tag as `reasoning_text`
+    and the rest of the text as `normal_text`.
+    """
+
+    def __init__(self, stream_reasoning: bool = True):
+        super().__init__(
+            "◁think▷",
+            "◁/think▷",
+            force_reasoning=False,
+            stream_reasoning=stream_reasoning,
+        )
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -164,6 +189,7 @@ class ReasoningParser:
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
         "qwen3": Qwen3Detector,
+        "kimi": KimiDetector,
     }
 
     def __init__(self, model_type: Optional[str] = None, stream_reasoning: bool = True):

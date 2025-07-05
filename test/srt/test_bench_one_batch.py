@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
 class TestBenchOneBatch(CustomTestCase):
 
     def test_bs1_small(self):
-        output_throughput = run_bench_one_batch(
+        _, output_throughput, _ = run_bench_one_batch(
             DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["--cuda-graph-max-bs", "2"]
         )
         self.assertGreater(output_throughput, 50)

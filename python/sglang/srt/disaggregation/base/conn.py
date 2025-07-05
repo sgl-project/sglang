@@ -27,6 +27,8 @@ class KVArgs:
     decode_tp_size: int
     # for pp prefill
     prefill_pp_size: int
+    kv_head_num: int
+    page_size: int
 
 
 class KVPoll:

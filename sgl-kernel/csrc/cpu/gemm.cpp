@@ -318,8 +318,8 @@ void weight_packed_linear_kernel_impl(
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
 
-  // use avx512-bf16 when a) M is small; b) dtype is bfloat16, otherwise use amx
-  const bool use_brgemm = (M > 4) || (!std::is_same_v<scalar_t, at::BFloat16>);
+  // use avx512-bf16 when a) M is small; b) dtype is bfloat16, otherwise use amx c) N is small
+  const bool use_brgemm = (M > 4) || (!std::is_same_v<scalar_t, at::BFloat16>) || (N < 64);
 
   // parallel on [MB, NB]
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {

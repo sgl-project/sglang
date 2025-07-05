@@ -12,7 +12,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.math_utils import ceil_div
 from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -25,6 +24,7 @@ from sglang.srt.layers.quantization.int8_kernel import (
     sglang_per_token_group_quant_int8,
 )
 from sglang.srt.utils import (
+    ceil_div,
     cpu_has_amx_support,
     direct_register_custom_op,
     get_bool_env_var,
@@ -32,7 +32,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
-    log_info_on_rank0,
     next_power_of_2,
 )
 

@@ -140,7 +140,7 @@ class TestGemma3itServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--mem-fraction-static",
-                "0.75",
+                "0.70",
                 "--enable-multimodal",
             ],
         )
@@ -225,9 +225,10 @@ class TestPhi4MMServer(TestOpenAIVisionServer):
 class TestVILAServer(TestOpenAIVisionServer):
     @classmethod
     def setUpClass(cls):
-        cls.model = "AndyZijianZhang/NVILA-Lite-2B"
+        cls.model = "Efficient-Large-Model/NVILA-Lite-2B-hf-0626"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
+        cls.revision = "6bde1de5964b40e61c802b375fff419edc867506"
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -236,6 +237,7 @@ class TestVILAServer(TestOpenAIVisionServer):
             other_args=[
                 "--trust-remote-code",
                 "--context-length=65536",
+                f"--revision={cls.revision}",
             ],
         )
         cls.base_url += "/v1"
