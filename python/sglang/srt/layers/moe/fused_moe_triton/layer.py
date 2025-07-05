@@ -19,6 +19,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -413,6 +414,7 @@ class FusedMoE(torch.nn.Module):
         routed_scaling_factor: Optional[float] = None,
         enable_flashinfer_moe: Optional[bool] = False,
         enable_ep_moe: Optional[bool] = False,
+        enable_flashinfer_fp4_allgather: Optional[bool] = False,
     ):
         super().__init__()
 
@@ -431,8 +433,10 @@ class FusedMoE(torch.nn.Module):
             logger.warning("Disable flashinfer MoE when quantization config is None.")
             enable_flashinfer_moe = False
             enable_ep_moe = False
+            enable_flashinfer_fp4_allgather = False
 
         self.enable_flashinfer_moe = enable_flashinfer_moe
+        self.enable_flashinfer_fp4_allgather = enable_flashinfer_fp4_allgather
         if enable_ep_moe:
             assert (
                 self.enable_flashinfer_moe
@@ -839,7 +843,12 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ):
         assert self.quant_method is not None
 
         # Matrix multiply.
@@ -864,6 +873,8 @@ class FusedMoE(torch.nn.Module):
                     tp_size=self.tp_size,
                     ep_rank=self.ep_rank,
                     ep_size=self.ep_size,
+                    enable_flashinfer_fp4_allgather=self.enable_flashinfer_fp4_allgather,
+                    global_num_tokens_cpu=forward_batch.global_num_tokens_cpu,
                 )
                 if self.quant_method.__class__.__name__ == "ModelOptNvFp4FusedMoEMethod"
                 else {}
