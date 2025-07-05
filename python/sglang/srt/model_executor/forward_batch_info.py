@@ -68,6 +68,8 @@ class ForwardMode(IntEnum):
     MIXED = auto()
     # No sequence to forward. For data parallel attention, some workers will be IDLE if no sequence are allocated.
     IDLE = auto()
+    # Split Prefill for PD multiplexing
+    SPLIT_PREFILL = auto()
 
     # Used in speculative decoding: verify a batch in the target model.
     TARGET_VERIFY = auto()
@@ -94,6 +96,9 @@ class ForwardMode(IntEnum):
 
     def is_mixed(self):
         return self == ForwardMode.MIXED
+
+    def is_split_prefill(self):
+        return self == ForwardMode.SPLIT_PREFILL
 
     def is_idle(self):
         return self == ForwardMode.IDLE
@@ -193,6 +198,14 @@ class ForwardBatch:
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+
+    # For split prefill
+    # intermediate values for split prefill
+    hidden_states: torch.Tensor = None
+    residual: torch.Tensor = None
+    model_specific_states: Dict[str, any] = None
+    # current split index of layer
+    split_index: int = 0
 
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether the kv cache needs to be attended in current pass
