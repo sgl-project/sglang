@@ -146,6 +146,7 @@ def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
 
 def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
     reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+
     seg_indptr = torch.zeros(num_experts + 1, device=topk_ids.device, dtype=torch.int64)
     src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
 
@@ -158,7 +159,64 @@ def run_moe_ep_preproess(topk_ids: torch.Tensor, num_experts: int):
     compute_src2dst_triton_kernel[grid](
         reorder_ids, src2dst, topk_ids.numel(), BLOCK_SIZE
     )
+
     return reorder_topk_ids, src2dst, seg_indptr
+
+
+def run_cutlass_moe_ep_preproess(local_topk_ids: torch.Tensor, local_num_experts: int):
+    reorder_topk_ids, reorder_ids = torch.sort(local_topk_ids.view(-1), stable=True)
+
+    seg_indptr = torch.zeros(
+        local_num_experts + 1, device=local_topk_ids.device, dtype=torch.int64
+    )
+    src2dst = torch.empty(
+        local_topk_ids.numel(), device=local_topk_ids.device, dtype=torch.int32
+    )
+
+    BLOCK_SIZE = 512
+    grid = (triton.cdiv(local_topk_ids.numel(), BLOCK_SIZE),)
+    compute_src2dst_triton_kernel[grid](
+        reorder_ids, src2dst, local_topk_ids.numel(), BLOCK_SIZE
+    )
+
+    return reorder_topk_ids, src2dst, seg_indptr
+
+
+@triton.jit
+def pre_reorder_triton_kernel_for_cutlass_moe(
+    input_ptr,
+    gateup_input_ptr,
+    src2dst_ptr,
+    topk_ids_ptr,
+    a1_scales_ptr,
+    num_experts,
+    topk,
+    hidden_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    OutDtype = gateup_input_ptr.dtype.element_ty
+
+    src_idx = tl.program_id(0)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+
+    src_ptr = input_ptr + src_idx * hidden_size
+    for idx in range(topk):
+        expert_id = tl.load(topk_ids_ptr + idx)
+        if expert_id != num_experts:
+            if a1_scales_ptr is not None:
+                scale = 1.0 / tl.load(a1_scales_ptr)
+            else:
+                scale = 1.0
+
+            dst_idx = tl.load(src2dst_ptr + idx)
+            dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+            for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+                offset = start_offset + tl.arange(0, BLOCK_SIZE)
+                mask = offset < hidden_size
+                in_data = tl.load(src_ptr + offset, mask=mask).to(tl.float32)
+                out_data = (in_data * scale).to(OutDtype)
+                tl.store(dst_ptr + offset, out_data, mask=mask)
 
 
 @triton.jit
