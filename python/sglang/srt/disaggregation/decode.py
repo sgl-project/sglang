@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -243,7 +244,7 @@ class DecodePreallocQueue:
                 bootstrap_room=req.bootstrap_room,
                 data_parallel_rank=req.data_parallel_rank,
             )
-
+            req.time_stats.decode_prealloc_queue_entry_time = time.perf_counter()
             self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
             )
@@ -407,6 +408,9 @@ class DecodePreallocQueue:
                 kv_indices, self.token_to_kv_pool_allocator.page_size
             )
             decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
+            decode_req.req.time_stats.decode_transfer_queue_entry_time = (
+                time.perf_counter()
+            )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
 
@@ -614,6 +618,8 @@ class DecodeTransferQueue:
                 if hasattr(decode_req.kv_receiver, "clear"):
                     decode_req.kv_receiver.clear()
 
+                decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
+
                 # special handling for sampling_params.max_new_tokens == 1
                 if decode_req.req.sampling_params.max_new_tokens == 1:
                     # finish immediately
@@ -664,6 +670,9 @@ class SchedulerDisaggregationDecodeMixin:
             prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
 
             if batch:
+                for req in batch.reqs:
+                    if req.time_stats.forward_entry_time == 0.0:
+                        req.time_stats.forward_entry_time = time.perf_counter()
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
                     # Note: Logprobs should be handled on the prefill engine.
@@ -711,6 +720,9 @@ class SchedulerDisaggregationDecodeMixin:
             prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
 
             if batch:
+                for req in batch.reqs:
+                    if req.time_stats.forward_entry_time == 0.0:
+                        req.time_stats.forward_entry_time = time.perf_counter()
                 # Generate fake extend output.
                 if batch.forward_mode.is_extend():
                     # Note: Logprobs should be handled on the prefill engine.
