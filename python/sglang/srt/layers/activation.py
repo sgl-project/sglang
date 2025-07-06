@@ -232,6 +232,6 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
 
 if not (_is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_hip):
     logger.info(
-        "sgl-kernel is not available on Non-NV platforms or Non-AMX CPUs. Fallback to other kernel libraries."
+        "sgl-kernel is not available on Non-NV, Non-AMD platforms or Non-AMX CPUs. Fallback to other kernel libraries."
     )
     from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
