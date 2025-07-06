@@ -174,6 +174,16 @@ class TpModelWorker:
             self.model_runner.token_to_kv_pool.size,
         )
 
+    @property
+    def sliding_window_size(self) -> Optional[int]:
+        return self.model_runner.sliding_window_size
+
+    def get_tokens_per_layer_info(self):
+        return (
+            self.model_runner.full_tokens_per_layer,
+            self.model_runner.swa_tokens_per_layer,
+        )
+
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
 

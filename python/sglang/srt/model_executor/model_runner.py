@@ -471,10 +471,6 @@ class ModelRunner:
             if self.model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
 
-        if self.is_hybrid and not server_args.disable_radix_cache:
-            logger.info("Automatically disable radix cache for hybrid cache.")
-            server_args.disable_radix_cache = True
-
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
 
@@ -650,6 +646,7 @@ class ModelRunner:
             if hasattr(self.model, "get_attention_sliding_window_size")
             else None
         )
+        # TODO: set self.full_tokens_per_layer and self.swa_tokens_per_layer in swa memory pool init
         self.dtype = self.model_config.dtype
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)

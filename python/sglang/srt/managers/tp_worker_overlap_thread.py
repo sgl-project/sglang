@@ -101,6 +101,13 @@ class TpModelWorkerClient:
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
+    
+    def get_tokens_per_layer_info(self):
+        return self.worker.get_tokens_per_layer_info()
+
+    @property
+    def sliding_window_size(self) -> Optional[int]:
+        return self.worker.sliding_window_size
 
     def get_pad_input_ids_func(self):
         return self.worker.get_pad_input_ids_func()
