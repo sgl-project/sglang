@@ -68,6 +68,7 @@ class ServerArgs:
     # Port for the HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
+    nccl_port: Optional[int] = None
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -417,10 +418,6 @@ class ServerArgs:
 
         # DeepEP MoE
         if self.enable_deepep_moe:
-            if self.deepep_mode == "auto":
-                assert (
-                    not self.enable_dp_attention
-                ), "DeepEP MoE `auto` mode is not supported with DP Attention."
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
@@ -598,6 +595,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.port,
             help="The port of the HTTP server.",
+        )
+        parser.add_argument(
+            "--nccl-port",
+            type=int,
+            default=ServerArgs.nccl_port,
+            help="The port for NCCL distributed environment setup. Defaults to a random port.",
         )
         parser.add_argument(
             "--tokenizer-mode",
@@ -1747,14 +1750,17 @@ class PortArgs:
 
     @staticmethod
     def init_new(server_args, dp_rank: Optional[int] = None) -> "PortArgs":
-        port = server_args.port + random.randint(100, 1000)
-        while True:
-            if is_port_available(port):
-                break
-            if port < 60000:
-                port += 42
-            else:
-                port -= 43
+        if server_args.nccl_port is None:
+            port = server_args.port + random.randint(100, 1000)
+            while True:
+                if is_port_available(port):
+                    break
+                if port < 60000:
+                    port += 42
+                else:
+                    port -= 43
+        else:
+            port = server_args.nccl_port
 
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
