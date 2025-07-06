@@ -243,6 +243,7 @@ class MoEGate(nn.Module):
                 hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
             )
 
+
         if (
             _is_cuda
             and not self.is_nextn
