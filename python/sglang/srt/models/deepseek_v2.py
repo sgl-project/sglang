@@ -114,6 +114,8 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 
+ENABLE_TRTLMM_GEN_MOE = get_bool_env_var("SGLANG_ENABLE_TRTLLM_GEN_MOE", "false")
+
 if _is_cuda:
     from sgl_kernel import (
         awq_dequantize,
@@ -210,8 +212,10 @@ class MoEGate(nn.Module):
         self,
         config,
         prefix: str = "",
+        is_nextn: bool = False,
     ):
         super().__init__()
+        self.is_nextn = is_nextn
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
@@ -233,8 +237,15 @@ class MoEGate(nn.Module):
                 True,  # is_vnni
             )
 
+        # NOTE: For some unknown reason, router_gemm seems degrade accept length.
+        if ENABLE_TRTLMM_GEN_MOE and not self.is_nextn:
+            return torch.ops.trtllm.dsv3_router_gemm_op(
+                hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
+            )
+
         if (
             _is_cuda
+            and not self.is_nextn
             and hidden_states.shape[0] < 4
             and hidden_states.shape[1] == 7168
             and self.weight.shape[0] == 256
@@ -245,7 +256,6 @@ class MoEGate(nn.Module):
             )
         else:
             logits = F.linear(hidden_states, self.weight, None)
-
         return logits
 
 
@@ -258,6 +268,7 @@ class DeepseekV2MoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -284,7 +295,9 @@ class DeepseekV2MoE(nn.Module):
                 "Only silu is supported for now."
             )
 
-        self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
+        self.gate = MoEGate(
+            config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
+        )
 
         self.experts = get_moe_impl_class()(
             num_experts=config.n_routed_experts
@@ -405,7 +418,7 @@ class DeepseekV2MoE(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
     ) -> torch.Tensor:
         if not self._enable_deepep_moe:
-            DUAL_STREAM_TOKEN_THRESHOLD = 1024
+            DUAL_STREAM_TOKEN_THRESHOLD = 2048
             if (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
@@ -418,14 +431,17 @@ class DeepseekV2MoE(nn.Module):
             return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal_dual_stream(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states)
+        if not ENABLE_TRTLMM_GEN_MOE:
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states)
 
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states)
 
         with torch.cuda.stream(self.alt_stream):
+            if ENABLE_TRTLMM_GEN_MOE:
+                router_logits = self.gate(hidden_states)
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
@@ -1776,6 +1792,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
+                is_nextn=is_nextn,
             )
         else:
             if enable_moe_dense_fully_dp():
