@@ -13,7 +13,7 @@ class TestFile:
 
 suites = {
     "per-commit": [
-        TestFile("models/lora/test_lora.py", 200),
+        TestFile("models/lora/test_lora.py", 285),
         TestFile("models/lora/test_lora_backend.py", 99),
         TestFile("models/lora/test_multi_lora_backend.py", 60),
         TestFile("models/lora/test_lora_cuda_graph.py", 250),
@@ -38,7 +38,7 @@ suites = {
         TestFile("openai_server/basic/test_openai_server.py", 149),
         TestFile("openai_server/features/test_cache_report.py", 100),
         TestFile("openai_server/features/test_enable_thinking.py", 70),
-        TestFile("openai_server/features/test_json_constrained.py", 98),
+        TestFile("openai_server/features/test_json_constrained.py", 128),
         TestFile("openai_server/features/test_json_mode.py", 90),
         TestFile("openai_server/features/test_openai_server_ebnf.py", 95),
         TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
@@ -54,7 +54,7 @@ suites = {
         TestFile("test_create_kvindices.py", 2),
         TestFile("test_chunked_prefill.py", 313),
         TestFile("test_eagle_infer_a.py", 370),
-        TestFile("test_eagle_infer_b.py", 270),
+        TestFile("test_eagle_infer_b.py", 700),
         TestFile("test_ebnf_constrained.py", 108),
         TestFile("test_eval_fp8_accuracy.py", 303),
         TestFile("test_fa3.py", 376),
