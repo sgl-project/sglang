@@ -4,13 +4,11 @@ python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinki
 python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_chat_completion_without_reasoning
 python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_stream_chat_completion_with_reasoning
 python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_stream_chat_completion_without_reasoning
+python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinkingWithStructuredOutputs.test_structured_outputs_with_reasoning
+python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinkingWithStructuredOutputs.test_structured_outputs_without_reasoning
 """
 
-import asyncio
 import json
-import os
-import sys
-import time
 import unittest
 
 import openai
@@ -49,7 +47,7 @@ class TestEnableThinking(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_chat_completion_with_reasoning(self):
-        # Test non-streaming with "enable_thinking": True, reasoning_content should not be empty
+        """Test non-streaming chat completion with 'enable_thinking': True. Reasoning content should not be empty."""
         client = requests.post(
             f"{self.base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -72,7 +70,7 @@ class TestEnableThinking(CustomTestCase):
         self.assertIsNotNone(data["choices"][0]["message"]["reasoning_content"])
 
     def test_chat_completion_without_reasoning(self):
-        # Test non-streaming with "enable_thinking": False, reasoning_content should be empty
+        """Test non-streaming chat completion with 'enable_thinking': False. Reasoning content should be empty."""
         client = requests.post(
             f"{self.base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -96,7 +94,7 @@ class TestEnableThinking(CustomTestCase):
             self.assertIsNone(data["choices"][0]["message"]["reasoning_content"])
 
     def test_stream_chat_completion_with_reasoning(self):
-        # Test streaming with "enable_thinking": True, reasoning_content should not be empty
+        """Test streaming chat completion with 'enable_thinking': True. Reasoning content should not be empty."""
         response = requests.post(
             f"{self.base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -140,7 +138,7 @@ class TestEnableThinking(CustomTestCase):
         )
 
     def test_stream_chat_completion_without_reasoning(self):
-        # Test streaming with "enable_thinking": False, reasoning_content should  be empty
+        """Test streaming chat completion with 'enable_thinking': False. Reasoning content should be empty."""
         response = requests.post(
             f"{self.base_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -182,6 +180,136 @@ class TestEnableThinking(CustomTestCase):
         self.assertTrue(
             has_content, "The stream response does not contain normal content"
         )
+
+
+class TestEnableThinkingWithStructuredOutputs(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-1234"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--reasoning-parser",
+                "qwen3",
+                "--grammar-backend",
+                "xgrammar",
+            ],
+        )
+
+        cls.response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "foo",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "pattern": "^[\\w]+$"},
+                        "population": {"type": "integer"},
+                    },
+                    "required": ["name", "population"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_structured_outputs_with_reasoning(self):
+        """Test non-streaming structured outputs with 'enable_thinking': True. Reasoning content should not be empty and JSON should be valid."""
+        response = requests.post(
+            f"{self.base_url}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant.",
+                    },
+                    {
+                        "role": "user",
+                        "content": "Please generate the information of the capital of France in the JSON format.",
+                    },
+                ],
+                "temperature": 0,
+                "separate_reasoning": True,
+                "chat_template_kwargs": {"enable_thinking": True},
+                "response_format": self.response_format,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
+        data = response.json()
+
+        self.assertIn("choices", data)
+        self.assertTrue(len(data["choices"]) > 0)
+        self.assertIn("message", data["choices"][0])
+        message = data["choices"][0]["message"]
+
+        self.assertIn("reasoning_content", message)
+        self.assertIsNotNone(message["reasoning_content"])
+
+        self.assertIn("content", message)
+        try:
+            json_output = json.loads(message["content"])
+        except json.JSONDecodeError as e:
+            self.fail(f"Response is not valid JSON. Error: {e}. Response: {data}")
+
+        self.assertIsInstance(json_output, dict)
+        self.assertIsInstance(json_output["name"], str)
+        self.assertIsInstance(json_output["population"], int)
+
+    def test_structured_outputs_without_reasoning(self):
+        """Test non-streaming structured outputs with 'enable_thinking': False. Reasoning content should be empty and JSON should be valid."""
+        response = requests.post(
+            f"{self.base_url}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant.",
+                    },
+                    {
+                        "role": "user",
+                        "content": "Please generate the information of the capital of France in the JSON format.",
+                    },
+                ],
+                "temperature": 0,
+                "separate_reasoning": True,
+                "chat_template_kwargs": {"enable_thinking": False},
+                "response_format": self.response_format,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
+        data = response.json()
+
+        self.assertIn("choices", data)
+        self.assertTrue(len(data["choices"]) > 0)
+        self.assertIn("message", data["choices"][0])
+        message = data["choices"][0]["message"]
+
+        if "reasoning_content" in message:
+            self.assertIsNone(message["reasoning_content"])
+
+        self.assertIn("content", message)
+        try:
+            json_output = json.loads(message["content"])
+        except json.JSONDecodeError as e:
+            self.fail(f"Response is not valid JSON. Error: {e}. Response: {data}")
+
+        self.assertIsInstance(json_output, dict)
+        self.assertIsInstance(json_output["name"], str)
+        self.assertIsInstance(json_output["population"], int)
 
 
 if __name__ == "__main__":
