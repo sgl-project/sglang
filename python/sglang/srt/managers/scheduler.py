@@ -2334,14 +2334,6 @@ class Scheduler(
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         tags = recv_req.tags
 
-        # if self.tp_size != 1:
-        #     tags = broadcast_pyobj(
-        #         tags,
-        #         self.tp_group.rank,
-        #         self.tp_cpu_group,
-        #         src=self.tp_group.ranks[0],
-        #     )
-
         if tags is None or len(tags) == 0:
             tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
 
@@ -2360,13 +2352,6 @@ class Scheduler(
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
         tags = recv_req.tags
-        # if self.tp_size != 1:
-        #     tags = broadcast_pyobj(
-        #         tags,
-        #         self.tp_group.rank,
-        #         self.tp_cpu_group,
-        #         src=self.tp_group.ranks[0],
-        #     )
 
         if tags is None or len(tags) == 0:
             tags = [GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_KV_CACHE]
