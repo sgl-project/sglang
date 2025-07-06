@@ -363,3 +363,9 @@ inline torch::Tensor pad_tensor(const torch::Tensor& tensor, int64_t alignment =
   }
   return tensor_padded;
 }
+
+// Get the next power of 2 of a number
+inline uint32_t next_pow2(uint32_t x) noexcept {
+  if (x <= 1) return 1;
+  return 1u << (32 - __builtin_clz(x - 1));
+}

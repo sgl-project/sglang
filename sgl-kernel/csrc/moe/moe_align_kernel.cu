@@ -58,7 +58,7 @@ __global__ void moe_align_block_size_kernel(
   int32_t* shared_counts = smem;                  // [num_experts]
   int32_t* prefix = shared_counts + num_experts;  // [num_experts + 1]
   int32_t* scan_buf = prefix + num_experts + 1;   // [scan_size]
-  __shared__ int32_t tpad;
+  __shared__ int32_t s_total_tokens_post_pad;
 
   const size_t tid = threadIdx.x;
   const size_t stride = blockDim.x;
@@ -129,8 +129,8 @@ __global__ void moe_align_block_size_kernel(
   }
 
   if (tid == 0) {
-    tpad = prefix[num_experts];
-    *total_tokens_post_pad = tpad;
+    s_total_tokens_post_pad = prefix[num_experts];
+    *total_tokens_post_pad = s_total_tokens_post_pad;
   }
 
   __syncthreads();
@@ -140,7 +140,7 @@ __global__ void moe_align_block_size_kernel(
   }
 
   // fill expert_ids
-  const int32_t num_blocks = tpad / block_size;
+  const int32_t num_blocks = s_total_tokens_post_pad / block_size;
   for (int32_t i = tid; i < num_blocks; i += stride) {
     int32_t block_start = i * block_size;
     int left = 0, right = num_experts;
@@ -158,7 +158,7 @@ __global__ void moe_align_block_size_kernel(
   if (pad_sorted_token_ids) {
     Vec fill_vec;
     fill_vec.x = fill_vec.y = fill_vec.z = fill_vec.w = numel;
-    int32_t total_vecs = (tpad + VEC_SIZE - 1) / VEC_SIZE;
+    int32_t total_vecs = (s_total_tokens_post_pad + VEC_SIZE - 1) / VEC_SIZE;
     Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
     for (int32_t i = tid; i < total_vecs; i += stride) {
       out_ptr[i] = fill_vec;
@@ -236,11 +236,6 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     sorted_token_ids[rank_post_pad] = i;
     ++tokens_cnts[threadIdx.x * num_experts + expert_id];
   }
-}
-
-inline uint32_t next_pow2(uint32_t x) noexcept {
-  if (x <= 1) return 1;
-  return 1u << (32 - __builtin_clz(x - 1));
 }
 
 void moe_align_block_size(
