@@ -1,5 +1,3 @@
-# Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
-
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -107,13 +105,9 @@ class W4AFp8MoEMethod:
         num_experts_per_partition: int,
         hidden_size: int,
         intermediate_size: int,
-        params_dtype: torch.dtype,  # param_dtype = torch.bfloat16
+        params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        from sglang.srt.layers.moe.fused_moe_triton.layer import (
-            FusedMoeWeightScaleSupported,
-        )
-
         assert "weight_loader" in extra_weight_attrs
 
         # Fused gate_up_proj (column parallel)
@@ -257,9 +251,7 @@ class W4AFp8MoEMethod:
         # Process input scales
         w13_input_scale_max = layer.w13_input_scale.max().to(dtype).item()
         new_w13_input_scale = torch.tensor(
-            [
-                w13_input_scale_max
-            ],  # Pass as a list to create a 1-D tensor with one element
+            [w13_input_scale_max],
             dtype=dtype,
             device=device,
         )

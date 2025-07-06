@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused MoE kernel."""
+"""Cutlass W4A8 MoE kernel."""
 from typing import Optional
 
 import torch
@@ -112,7 +112,6 @@ def cutlass_w4a8_moe(
 
     if apply_router_weight_on_input:
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
-        # TODO: this only works for topK=1, will need to update for topK>1
 
     device = a.device
 

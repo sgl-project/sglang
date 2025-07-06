@@ -270,6 +270,8 @@ class EPMoE(torch.nn.Module):
             self.w2_weight_scale_inv if self.use_block_quant else self.w2_weight_scale,
         )
 
+    # Adapted from https://github.com/vllm-project/vllm/blob/9fb52e523abf7bdaf7e60cf2971edb5a1b13dc08/vllm/model_executor/layers/fused_moe/layer.py#L544C1-L586C43
+    # Modifications: use determine_expert_map as a class internal function, set 'global_num_experts' rather than '-1' for experts not assigned to the current rank.
     def determine_expert_map(self) -> Tuple[int, Optional[torch.Tensor]]:
         """
         Calculates how many experts should be assigned to each rank for EP and
