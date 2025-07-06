@@ -1,6 +1,9 @@
+use crate::core::worker::{worker_adapter, Worker};
+use crate::core::WorkerType;
 use crate::pd_router::PDRouter;
 use crate::pd_types::PDSelectionPolicy;
 use crate::tree::Tree;
+// use crate::utils::api_path; // Currently unused
 use ::metrics::{counter, gauge, histogram};
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
@@ -12,7 +15,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
-use tokio;
 use tracing::{debug, error, info, warn};
 
 pub fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
@@ -30,13 +32,13 @@ pub fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
 #[derive(Debug)]
 pub enum Router {
     RoundRobin {
-        worker_urls: Arc<RwLock<Vec<String>>>,
+        workers: Arc<RwLock<Vec<Arc<dyn Worker>>>>,
         current_index: AtomicUsize,
         timeout_secs: u64,
         interval_secs: u64,
     },
     Random {
-        worker_urls: Arc<RwLock<Vec<String>>>,
+        workers: Arc<RwLock<Vec<Arc<dyn Worker>>>>,
         timeout_secs: u64,
         interval_secs: u64,
     },
@@ -104,7 +106,7 @@ pub enum Router {
             Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
             during the next eviction cycle.
         */
-        worker_urls: Arc<RwLock<Vec<String>>>,
+        workers: Arc<RwLock<Vec<Arc<dyn Worker>>>>,
         tree: Arc<Mutex<Tree>>,
         running_queue: Arc<Mutex<HashMap<String, usize>>>,
         processed_queue: Arc<Mutex<HashMap<String, usize>>>,
@@ -147,8 +149,31 @@ pub enum PolicyConfig {
 
 impl Router {
     pub fn new(worker_urls: Vec<String>, policy_config: PolicyConfig) -> Result<Self, String> {
+        if let PolicyConfig::PrefillDecodeConfig {
+            selection_policy,
+            prefill_urls,
+            decode_urls,
+            timeout_secs,
+            interval_secs,
+        } = &policy_config
+        {
+            // Create PDRouter instance
+            let pd_router = PDRouter::new(
+                prefill_urls.clone(),
+                decode_urls.clone(),
+                selection_policy.clone(),
+                *timeout_secs,
+                *interval_secs,
+            )?;
+
+            return Ok(Router::PrefillDecode {
+                pd_router: Arc::new(pd_router),
+            });
+        }
+
         // Update active workers gauge
-        gauge!("sgl_router_active_workers").set(worker_urls.len() as f64);
+        let workers = worker_adapter::from_regular_vec(worker_urls.clone());
+        gauge!("sgl_router_active_workers").set(workers.len() as f64);
 
         // Get timeout and interval from policy config
         let (timeout_secs, interval_secs) = match &policy_config {
@@ -172,25 +197,11 @@ impl Router {
             } => (*timeout_secs, *interval_secs),
         };
 
-        // For PrefillDecode, we need to handle workers differently
-        match &policy_config {
-            PolicyConfig::PrefillDecodeConfig { .. } => {
-                // PD mode doesn't use the worker_urls parameter
-                // We'll validate PD workers separately
-            }
-            _ => {
-                // Wait until all workers are healthy for regular modes
-                let worker_urls = worker_urls.clone();
-                std::thread::spawn(move || {
-                    Self::wait_for_healthy_workers(&worker_urls, timeout_secs, interval_secs)
-                })
-                .join()
-                .map_err(|e| {
-                    error!("Health-check thread panicked: {:?}", e);
-                    format!("Health-check thread panicked: {e:?}")
-                })??;
-            }
-        }
+        crate::core::worker::utils::wait_for_healthy_workers_sync(
+            &workers,
+            timeout_secs,
+            interval_secs,
+        )?;
 
         // Create router based on policy...
         Ok(match policy_config {
@@ -198,7 +209,7 @@ impl Router {
                 timeout_secs,
                 interval_secs,
             } => Router::Random {
-                worker_urls: Arc::new(RwLock::new(worker_urls)),
+                workers: Arc::new(RwLock::new(workers)),
                 timeout_secs,
                 interval_secs,
             },
@@ -206,7 +217,7 @@ impl Router {
                 timeout_secs,
                 interval_secs,
             } => Router::RoundRobin {
-                worker_urls: Arc::new(RwLock::new(worker_urls)),
+                workers: Arc::new(RwLock::new(workers)),
                 current_index: std::sync::atomic::AtomicUsize::new(0),
                 timeout_secs,
                 interval_secs,
@@ -221,13 +232,13 @@ impl Router {
                 interval_secs,
             } => {
                 let mut running_queue = HashMap::new();
-                for url in &worker_urls {
-                    running_queue.insert(url.clone(), 0);
+                for worker in &workers {
+                    running_queue.insert(worker.url().to_string(), 0);
                 }
 
                 let mut processed_queue = HashMap::new();
-                for url in &worker_urls {
-                    processed_queue.insert(url.clone(), 0);
+                for worker in &workers {
+                    processed_queue.insert(worker.url().to_string(), 0);
                 }
 
                 let tree = Arc::new(Mutex::new(Tree::new()));
@@ -257,12 +268,12 @@ impl Router {
                     }
                 });
 
-                for url in &worker_urls {
-                    tree.lock().unwrap().insert("", url);
+                for worker in &workers {
+                    tree.lock().unwrap().insert("", worker.url());
                 }
 
                 Router::CacheAware {
-                    worker_urls: Arc::new(RwLock::new(worker_urls)),
+                    workers: Arc::new(RwLock::new(workers)),
                     tree,
                     running_queue,
                     processed_queue,
@@ -274,35 +285,18 @@ impl Router {
                     _eviction_thread: Some(eviction_thread),
                 }
             }
-            PolicyConfig::PrefillDecodeConfig {
-                selection_policy,
-                prefill_urls,
-                decode_urls,
-                timeout_secs,
-                interval_secs,
-            } => {
-                // Create PDRouter instance
-                let pd_router = PDRouter::new(
-                    prefill_urls,
-                    decode_urls,
-                    selection_policy,
-                    timeout_secs,
-                    interval_secs,
-                )?;
-
-                Router::PrefillDecode {
-                    pd_router: Arc::new(pd_router),
-                }
+            PolicyConfig::PrefillDecodeConfig { .. } => {
+                unreachable!();
             }
         })
     }
 
-    /// Get a reference to the worker URLs shared across threads
-    pub fn get_worker_urls(&self) -> Arc<RwLock<Vec<String>>> {
+    /// Get a reference to the workers shared across threads
+    pub fn get_workers(&self) -> Arc<RwLock<Vec<Arc<dyn Worker>>>> {
         match self {
-            Router::RoundRobin { worker_urls, .. } => Arc::clone(worker_urls),
-            Router::Random { worker_urls, .. } => Arc::clone(worker_urls),
-            Router::CacheAware { worker_urls, .. } => Arc::clone(worker_urls),
+            Router::RoundRobin { workers, .. }
+            | Router::Random { workers, .. }
+            | Router::CacheAware { workers, .. } => Arc::clone(workers),
             Router::PrefillDecode { .. } => {
                 // For PD mode, return empty list since we manage workers differently
                 Arc::new(RwLock::new(Vec::new()))
@@ -319,7 +313,7 @@ impl Router {
         let sync_client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+            .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
         loop {
             if start_time.elapsed() > Duration::from_secs(timeout_secs) {
@@ -328,8 +322,7 @@ impl Router {
                     timeout_secs, worker_urls
                 );
                 return Err(format!(
-                    "Timeout {}s waiting for workers {:?} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
-                    timeout_secs, worker_urls
+                    "Timeout {timeout_secs}s waiting for workers {worker_urls:?} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value"
                 ));
             }
 
@@ -337,7 +330,7 @@ impl Router {
             let mut unhealthy_workers = Vec::new();
 
             for url in worker_urls {
-                match sync_client.get(&format!("{}/health", url)).send() {
+                match sync_client.get(format!("{url}/health")).send() {
                     Ok(res) => {
                         if !res.status().is_success() {
                             let msg = format!(
@@ -350,7 +343,7 @@ impl Router {
                         }
                     }
                     Err(_) => {
-                        let msg = format!("Worker is not ready yet");
+                        let msg = "Worker is not ready yet".to_string();
                         info!("{}", msg);
                         all_healthy = false;
                         unhealthy_workers.push((url, msg));
@@ -371,15 +364,33 @@ impl Router {
         }
     }
 
-    fn select_first_worker(&self) -> Result<String, String> {
+    fn select_first_worker(&self) -> Result<Arc<dyn Worker>, String> {
         match self {
-            Router::RoundRobin { worker_urls, .. }
-            | Router::Random { worker_urls, .. }
-            | Router::CacheAware { worker_urls, .. } => {
-                if worker_urls.read().unwrap().is_empty() {
+            Router::RoundRobin { workers, .. }
+            | Router::Random { workers, .. }
+            | Router::CacheAware { workers, .. } => {
+                let workers_guard = workers.read().unwrap();
+                if workers_guard.is_empty() {
                     Err("No workers are available".to_string())
                 } else {
-                    Ok(worker_urls.read().unwrap()[0].clone())
+                    Ok(workers_guard[0].clone())
+                }
+            }
+            Router::PrefillDecode { .. } => {
+                Err("PrefillDecode mode doesn't use select_first_worker".to_string())
+            }
+        }
+    }
+
+    fn select_first_worker_url(&self) -> Result<String, String> {
+        match self {
+            Router::RoundRobin { workers, .. }
+            | Router::Random { workers, .. }
+            | Router::CacheAware { workers, .. } => {
+                if workers.read().unwrap().is_empty() {
+                    Err("No workers are available".to_string())
+                } else {
+                    Ok(workers.read().unwrap()[0].url().to_string())
                 }
             }
             Router::PrefillDecode { .. } => {
@@ -392,15 +403,15 @@ impl Router {
     pub async fn send_request(
         &self,
         client: &reqwest::Client,
-        worker_url: &str,
+        worker: &Arc<dyn Worker>,
         route: &str,
         req: &HttpRequest,
     ) -> HttpResponse {
         let start = Instant::now();
-        let mut request_builder = client.get(format!("{}{}", worker_url, route));
+        let mut request_builder = client.get(format!("{}{}", worker.url(), route));
 
-        // Copy all headers from original request except for /health because it does not need authorization
-        if route != "/health" {
+        // Copy all headers from original request except for health endpoint because it does not need authorization
+        if route != worker.worker_type().get_endpoints().health {
             for (name, value) in copy_request_headers(req) {
                 // Skip Content-Type and Content-Length as .json() sets them
                 if name.to_lowercase() != "content-type" && name.to_lowercase() != "content-length"
@@ -418,17 +429,15 @@ impl Router {
                 match res.bytes().await {
                     Ok(body) => HttpResponse::build(status).body(body.to_vec()),
                     Err(e) => HttpResponse::InternalServerError()
-                        .body(format!("Failed to read response body: {}", e)),
+                        .body(format!("Failed to read response body: {e}")),
                 }
             }
-            Err(e) => HttpResponse::InternalServerError().body(format!(
-                "Failed to send request to worker {}: {}",
-                worker_url, e
-            )),
+            Err(e) => HttpResponse::InternalServerError()
+                .body(format!("Failed to send request to worker {worker}: {e}")),
         };
 
         // Record request metrics
-        if route != "/health" {
+        if route != worker.worker_type().get_endpoints().health {
             let duration = start.elapsed();
             counter!("sgl_router_requests_total", "route" => route.to_string()).increment(1);
             histogram!("sgl_router_request_duration_seconds", "route" => route.to_string())
@@ -454,31 +463,25 @@ impl Router {
 
         while total_retries < MAX_TOTAL_RETRIES {
             match self.select_first_worker() {
-                Ok(worker_url) => {
+                Ok(worker) => {
                     let mut request_retries = 0;
-
                     // Try the same worker multiple times
                     while request_retries < MAX_REQUEST_RETRIES {
                         if total_retries >= 1 {
                             info!("Retrying request after {} failed attempts", total_retries);
                         }
 
-                        let response = self.send_request(client, &worker_url, route, req).await;
+                        let response = self.send_request(client, &worker, route, req).await;
 
-                        if response.status().is_success() {
-                            return response;
-                        } else {
+                        if response.status().is_success() || worker.check_health().await.is_ok() {
+                            // if the response is successful then we can return the response immediately.
                             // if the worker is healthy, it means the request is bad, so return the error response
-                            let health_response =
-                                self.send_request(client, &worker_url, "/health", req).await;
-                            if health_response.status().is_success() {
-                                return response;
-                            }
+                            return response;
                         }
 
                         warn!(
                             "Request to {} failed (attempt {}/{})",
-                            worker_url,
+                            &worker,
                             request_retries + 1,
                             MAX_REQUEST_RETRIES
                         );
@@ -487,8 +490,10 @@ impl Router {
                         total_retries += 1;
 
                         if request_retries == MAX_REQUEST_RETRIES {
-                            warn!("Removing failed worker: {}", worker_url);
-                            self.remove_worker(&worker_url);
+                            warn!("Removing failed worker: {}", &worker);
+                            if let Err(e) = self.remove_worker(worker) {
+                                warn!("Failed to remove failed worker: {}", e.to_string());
+                            }
                             break;
                         }
                     }
@@ -507,20 +512,20 @@ impl Router {
         req: &HttpRequest,
     ) -> HttpResponse {
         // Get all worker URLs based on router type
-        let worker_urls = match self {
+        let workers = match self {
             Router::PrefillDecode { .. } => {
                 // For PD mode, route_to_all is not supported directly
                 // It should be handled by PDRouter if needed
                 return HttpResponse::NotImplemented()
                     .body("route_to_all not implemented for PrefillDecode mode");
             }
-            _ => self.get_worker_urls().read().unwrap().clone(),
+            _ => self.get_workers().read().unwrap().clone(),
         };
 
         // Send requests to all workers concurrently
         let mut tasks = Vec::new();
-        for worker_url in &worker_urls {
-            let mut request_builder = client.post(format!("{}{}", worker_url, route));
+        for worker_url in workers.iter().map(|w| w.url()).collect::<Vec<_>>() {
+            let mut request_builder = client.post(format!("{worker_url}{route}"));
 
             // Copy headers from original request
             for (name, value) in copy_request_headers(req) {
@@ -562,31 +567,11 @@ impl Router {
             }
         }
 
-        let urls = self.get_worker_urls().read().unwrap().clone();
-        let prefill_urls: Vec<String> = Vec::new();
-        let decode_urls = urls;
+        let prefill_workers: Vec<Arc<dyn Worker>> = Vec::new();
+        let decode_workers = self.get_workers().read().unwrap().clone();
 
-        // Collect loads from all servers
-        let mut prefill_loads = Vec::new();
-        let mut decode_loads = Vec::new();
-
-        // Get prefill loads
-        for url in &prefill_urls {
-            let load = self.get_worker_load(client, url).await.unwrap_or(-1);
-            prefill_loads.push(serde_json::json!({
-                "engine": format!("(Prefill@{})", url),
-                "load": load as i64
-            }));
-        }
-
-        // Get decode loads
-        for url in &decode_urls {
-            let load = self.get_worker_load(client, url).await.unwrap_or(-1);
-            decode_loads.push(serde_json::json!({
-                "engine": format!("(Decode@{})", url),
-                "load": load as i64
-            }));
-        }
+        let (prefill_loads, decode_loads) =
+            get_loads_helper(client, prefill_workers, decode_workers).await;
 
         HttpResponse::Ok().json(serde_json::json!({
             "prefill": prefill_loads,
@@ -618,9 +603,20 @@ impl Router {
                     // Extract routing text directly from typed request
                     let text = typed_req.extract_text_for_routing();
                     let is_stream = typed_req.is_stream();
-
                     // Select worker based on text
                     let worker_url = self.select_generate_worker_from_text(&text);
+                    let worker = {
+                        let workers_guard = self.get_workers();
+                        let workers = workers_guard.read().unwrap();
+                        match workers.iter().find(|w| w.url() == worker_url) {
+                            Some(w) => w.clone(),
+                            None => {
+                                warn!("Worker for url {} not found, retrying", worker_url);
+                                total_retries += 1;
+                                continue;
+                            }
+                        }
+                    };
                     let mut request_retries = 0;
 
                     // Try the same worker multiple times
@@ -648,15 +644,11 @@ impl Router {
                             histogram!("sgl_router_generate_duration_seconds", "route" => route.to_string())
                                 .record(duration.as_secs_f64());
                             return response;
-                        } else {
+                        } else if worker.check_health().await.is_ok() {
                             // if the worker is healthy, it means the request is bad, so return the error response
-                            let health_response =
-                                self.send_request(client, &worker_url, "/health", req).await;
-                            if health_response.status().is_success() {
-                                counter!("sgl_router_request_errors_total", "route" => route.to_string())
-                                    .increment(1);
-                                return response;
-                            }
+                            counter!("sgl_router_request_errors_total", "route" => route.to_string())
+                                .increment(1);
+                            return response;
                         }
 
                         warn!(
@@ -671,7 +663,9 @@ impl Router {
 
                         if request_retries == MAX_REQUEST_RETRIES {
                             warn!("Removing failed worker: {}", worker_url);
-                            self.remove_worker(&worker_url);
+                            if let Err(e) = self.remove_worker(worker) {
+                                warn!("Failed to remove failed worker: {}", e.to_string());
+                            }
                             break;
                         }
                     }
@@ -688,7 +682,7 @@ impl Router {
     fn select_generate_worker_from_text(&self, text: &str) -> String {
         match self {
             Router::RoundRobin {
-                worker_urls,
+                workers,
                 current_index,
                 ..
             } => {
@@ -696,18 +690,19 @@ impl Router {
                     .fetch_update(
                         std::sync::atomic::Ordering::SeqCst,
                         std::sync::atomic::Ordering::SeqCst,
-                        |x| Some((x + 1) % worker_urls.read().unwrap().len()),
+                        |x| Some((x + 1) % workers.read().unwrap().len()),
                     )
                     .unwrap();
-                worker_urls.read().unwrap()[idx].clone()
+                workers.read().unwrap()[idx].url().to_string()
             }
 
-            Router::Random { worker_urls, .. } => worker_urls.read().unwrap()
-                [rand::random::<usize>() % worker_urls.read().unwrap().len()]
-            .clone(),
+            Router::Random { workers, .. } => workers.read().unwrap()
+                [rand::random::<usize>() % workers.read().unwrap().len()]
+            .url()
+            .to_string(),
 
             Router::CacheAware {
-                worker_urls,
+                workers,
                 tree,
                 running_queue,
                 processed_queue,
@@ -747,16 +742,16 @@ impl Router {
                         .iter()
                         .min_by_key(|(_url, &count)| count)
                         .map(|(url, _)| url.clone())
-                        .unwrap_or_else(|| worker_urls.read().unwrap()[0].clone())
+                        .unwrap_or_else(|| workers.read().unwrap()[0].url().to_string())
                 } else {
                     // Use cache-aware routing when load is balanced
-                    let (matched_text, matched_worker) = tree.prefix_match(&text);
+                    let (matched_text, matched_worker) = tree.prefix_match(text);
                     let matched_rate =
                         matched_text.chars().count() as f32 / text.chars().count() as f32;
 
                     if matched_rate > *cache_threshold {
                         counter!("sgl_router_cache_hits_total").increment(1);
-                        matched_worker.to_string()
+                        matched_worker
                     } else {
                         counter!("sgl_router_cache_misses_total").increment(1);
                         tree.get_smallest_tenant()
@@ -776,13 +771,13 @@ impl Router {
                     .set(*running_queue.get(&selected_url).unwrap() as f64);
                 counter!("sgl_router_processed_requests_total", "worker" => selected_url.to_string()).increment(1);
 
-                tree.insert(&text, &selected_url);
+                tree.insert(text, &selected_url);
 
                 selected_url
             }
             Router::PrefillDecode { .. } => {
                 // For PD mode, we don't use this method
-                return "PD_MODE_ERROR".to_string();
+                "PD_MODE_ERROR".to_string()
             }
         }
     }
@@ -804,9 +799,7 @@ impl Router {
             debug!("Sending request to {}: {}", route, json_str);
         }
 
-        let mut request_builder = client
-            .post(format!("{}{}", worker_url, route))
-            .json(typed_req); // Use json() directly with typed request
+        let mut request_builder = client.post(format!("{worker_url}{route}")).json(typed_req); // Use json() directly with typed request
 
         // Copy all headers from original request
         for (name, value) in copy_request_headers(req) {
@@ -820,7 +813,7 @@ impl Router {
             Ok(res) => res,
             Err(e) => {
                 error!("Failed to send request to {}: {}", worker_url, e);
-                return HttpResponse::InternalServerError().body(format!("Request failed: {}", e));
+                return HttpResponse::InternalServerError().body(format!("Request failed: {e}"));
             }
         };
 
@@ -832,7 +825,7 @@ impl Router {
             let response = match res.bytes().await {
                 Ok(body) => HttpResponse::build(status).body(body.to_vec()),
                 Err(e) => {
-                    let error_msg = format!("Failed to get response body: {}", e);
+                    let error_msg = format!("Failed to get response body: {e}");
                     HttpResponse::InternalServerError().body(error_msg)
                 }
             };
@@ -887,8 +880,16 @@ impl Router {
         }
     }
 
-    pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
+    pub async fn add_worker(&self, worker: Arc<dyn Worker>) -> Result<String, String> {
+        // Check for duplicates BEFORE health check to avoid unnecessary work
         let (timeout_secs, interval_secs) = match self {
+            Router::PrefillDecode { pd_router } => {
+                // For PD mode, delegate to PD router
+                return pd_router
+                    .add_worker(worker)
+                    .await
+                    .map_err(|e| e.to_string());
+            }
             Router::Random {
                 timeout_secs,
                 interval_secs,
@@ -904,128 +905,120 @@ impl Router {
                 interval_secs,
                 ..
             } => (*timeout_secs, *interval_secs),
-            Router::PrefillDecode { .. } => {
-                // For PD mode, we don't support adding workers via this method
-                return Err("Adding workers to PrefillDecode router not supported via add_worker. Use dedicated PD management methods.".to_string());
-            }
         };
 
-        let start_time = std::time::Instant::now();
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-
-        loop {
-            if start_time.elapsed() > Duration::from_secs(timeout_secs) {
-                error!(
-                    "Timeout {}s waiting for worker {} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
-                    timeout_secs, worker_url
-                );
-                return Err(format!(
-                    "Timeout {}s waiting for worker {} to become healthy. Please set --router-worker-startup-timeout-secs (sglang_router.launch_server) or --worker-startup-timeout-secs (sglang_worker.router) to a larger value",
-                    timeout_secs, worker_url
-                ));
-            }
-
-            match client.get(&format!("{}/health", worker_url)).send().await {
-                Ok(res) => {
-                    if res.status().is_success() {
-                        match self {
-                            Router::RoundRobin { worker_urls, .. }
-                            | Router::Random { worker_urls, .. }
-                            | Router::CacheAware { worker_urls, .. } => {
-                                info!("Worker {} health check passed", worker_url);
-                                let mut urls = worker_urls.write().unwrap();
-                                if urls.contains(&worker_url.to_string()) {
-                                    return Err(format!("Worker {} already exists", worker_url));
-                                }
-                                info!("Added worker: {}", worker_url);
-                                urls.push(worker_url.to_string());
-                                gauge!("sgl_router_active_workers").set(urls.len() as f64);
-                            }
-                            Router::PrefillDecode { .. } => {
-                                return Err("Adding workers to PrefillDecode router not supported via add_worker. Use dedicated PD management methods.".to_string());
-                            }
-                        }
-
-                        // If cache aware, initialize the queues for the new worker
-                        if let Router::CacheAware {
-                            running_queue,
-                            processed_queue,
-                            tree,
-                            ..
-                        } = self
-                        {
-                            // Add worker to running queue with initial count of 0
-                            running_queue
-                                .lock()
-                                .unwrap()
-                                .insert(worker_url.to_string(), 0);
-
-                            // Add worker to processed queue with initial count of 0
-                            processed_queue
-                                .lock()
-                                .unwrap()
-                                .insert(worker_url.to_string(), 0);
-
-                            // Add worker to tree
-                            tree.lock().unwrap().insert("", worker_url);
-                        }
-
-                        return Ok(format!("Successfully added worker: {}", worker_url));
-                    } else {
-                        info!(
-                            "Worker {} health check is pending with status: {}.",
-                            worker_url,
-                            res.status()
-                        );
-                        // if the url does not have http or https prefix, warn users
-                        if !worker_url.starts_with("http://") && !worker_url.starts_with("https://")
-                        {
-                            warn!("The worker url {} does not have http or https prefix. Please add the prefix to the url.", worker_url);
-                        }
-
-                        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
-                        continue;
-                    }
-                }
-                Err(e) => {
-                    info!(
-                        "Worker {} health check is pending with error: {}",
-                        worker_url, e
-                    );
-
-                    // if the url does not have http or https prefix, warn users
-                    if !worker_url.starts_with("http://") && !worker_url.starts_with("https://") {
-                        warn!("The worker url {} does not have http or https prefix. Please add the prefix to the url.", worker_url);
-                    }
-
-                    tokio::time::sleep(Duration::from_secs(interval_secs)).await;
-                    continue;
-                }
-            }
+        if matches!(
+            worker.worker_type(),
+            WorkerType::Decode | WorkerType::Prefill(_)
+        ) {
+            return Err("PD workers are only supported in PD mode".to_string());
         }
+
+        // Check for duplicates BEFORE health check to avoid unnecessary work
+        match self {
+            Router::RoundRobin { workers, .. }
+            | Router::Random { workers, .. }
+            | Router::CacheAware { workers, .. } => {
+                let workers_vec = workers.read().unwrap();
+                if workers_vec.iter().any(|w| w.url() == worker.url()) {
+                    return Err(format!("Worker {} already exists", worker.url()));
+                }
+            }
+            Router::PrefillDecode { .. } => unreachable!(),
+        }
+
+        // Only perform health check if worker is not a duplicate
+        let health_check_result = crate::core::worker::utils::wait_for_healthy_workers(
+            &[worker.clone()],
+            interval_secs,
+            timeout_secs,
+        )
+        .await;
+        if health_check_result.is_err() {
+            return Err(format!(
+                "Failed to health check worker: {}",
+                health_check_result.err().unwrap()
+            ));
+        }
+
+        match self {
+            Router::RoundRobin { workers, .. }
+            | Router::Random { workers, .. }
+            | Router::CacheAware { workers, .. } => {
+                info!("Worker {} health check passed", worker);
+                let mut workers_vec = workers.write().unwrap();
+                // Double-check for duplicates after acquiring write lock (race condition protection)
+                if workers_vec.iter().any(|w| w.url() == worker.url()) {
+                    return Err(format!("Worker {worker} already exists"));
+                }
+                info!("Added worker: {}", worker);
+                // Use the same worker instance that passed the health check
+                workers_vec.push(worker.clone());
+                gauge!("sgl_router_active_workers").set(workers_vec.len() as f64);
+            }
+            Router::PrefillDecode { .. } => unreachable!(),
+        }
+
+        // If cache aware, initialize the queues for the new worker
+        if let Router::CacheAware {
+            running_queue,
+            processed_queue,
+            tree,
+            ..
+        } = self
+        {
+            // Add worker to running queue with initial count of 0
+            running_queue
+                .lock()
+                .unwrap()
+                .insert(worker.url().to_string(), 0);
+
+            // Add worker to processed queue with initial count of 0
+            processed_queue
+                .lock()
+                .unwrap()
+                .insert(worker.url().to_string(), 0);
+
+            // Add worker to tree
+            tree.lock().unwrap().insert("", worker.url());
+        }
+
+        Ok(format!("Successfully added worker: {worker}"))
     }
 
-    pub fn remove_worker(&self, worker_url: &str) {
+    pub fn remove_worker(&self, worker: Arc<dyn Worker>) -> Result<String, String> {
+        if let Router::PrefillDecode { pd_router } = self {
+            return pd_router
+                .unified_remove_worker(worker)
+                .map_err(|e| e.to_string());
+        }
+        self.remove_worker_by_url(worker.url())
+    }
+
+    pub fn remove_worker_by_url(&self, worker_url: &str) -> Result<String, String> {
         match self {
-            Router::RoundRobin { worker_urls, .. }
-            | Router::Random { worker_urls, .. }
-            | Router::CacheAware { worker_urls, .. } => {
-                let mut urls = worker_urls.write().unwrap();
-                if let Some(index) = urls.iter().position(|url| url == &worker_url) {
-                    urls.remove(index);
-                    info!("Removed worker: {}", worker_url);
-                    gauge!("sgl_router_active_workers").set(urls.len() as f64);
+            Router::RoundRobin { workers, .. }
+            | Router::Random { workers, .. }
+            | Router::CacheAware { workers, .. } => {
+                let mut workers = workers.write().unwrap();
+                // This is safe because we are holding the write lock
+                if let Some(index) = workers.iter().position(|worker| worker.url() == worker_url) {
+                    let worker = workers.remove(index);
+                    info!("Removed worker: {}", &worker);
+                    gauge!("sgl_router_active_workers").set(workers.len() as f64);
                 } else {
-                    warn!("Worker {} not found, skipping removal", worker_url);
-                    return;
+                    warn!("Worker with url {} not found, skipping removal", worker_url);
+                    return Err(format!(
+                        "Worker with url {worker_url} not found, skipping removal"
+                    ));
                 }
             }
             Router::PrefillDecode { .. } => {
                 warn!("Removing workers from PrefillDecode router not supported via remove_worker. Use dedicated PD management methods.");
-                return;
+                return Err(
+                    "Removing workers from PrefillDecode router not supported via remove_worker."
+                        .to_string(),
+                );
             }
         }
 
@@ -1037,7 +1030,7 @@ impl Router {
             ..
         } = self
         {
-            tree.lock().unwrap().remove_tenant(&worker_url);
+            tree.lock().unwrap().remove_tenant(worker_url);
             running_queue
                 .lock()
                 .unwrap()
@@ -1051,88 +1044,7 @@ impl Router {
                 worker_url
             );
         }
-    }
-
-    /// Add a worker with PD mode support
-    pub async fn add_pd_worker(
-        &self,
-        worker_url: &str,
-        pod_type: crate::service_discovery::PodType,
-        bootstrap_port: Option<u16>,
-    ) -> Result<String, String> {
-        match self {
-            Router::PrefillDecode { pd_router } => match pod_type {
-                crate::service_discovery::PodType::Prefill => pd_router
-                    .add_prefill_server(worker_url.to_string(), bootstrap_port)
-                    .await
-                    .map_err(|e| e.to_string()),
-                crate::service_discovery::PodType::Decode => pd_router
-                    .add_decode_server(worker_url.to_string())
-                    .await
-                    .map_err(|e| e.to_string()),
-                crate::service_discovery::PodType::Regular => {
-                    Err("Regular pod type not supported in PD mode".to_string())
-                }
-            },
-            _ => Err("add_pd_worker only supported in PD mode".to_string()),
-        }
-    }
-
-    /// Remove a worker with PD mode support
-    pub async fn remove_pd_worker(
-        &self,
-        worker_url: &str,
-        pod_type: crate::service_discovery::PodType,
-    ) -> Result<String, String> {
-        match self {
-            Router::PrefillDecode { pd_router } => match pod_type {
-                crate::service_discovery::PodType::Prefill => pd_router
-                    .remove_prefill_server(worker_url)
-                    .await
-                    .map_err(|e| e.to_string()),
-                crate::service_discovery::PodType::Decode => pd_router
-                    .remove_decode_server(worker_url)
-                    .await
-                    .map_err(|e| e.to_string()),
-                crate::service_discovery::PodType::Regular => {
-                    Err("Regular pod type not supported in PD mode".to_string())
-                }
-            },
-            _ => Err("remove_pd_worker only supported in PD mode".to_string()),
-        }
-    }
-
-    async fn get_worker_load(&self, client: &reqwest::Client, worker_url: &str) -> Option<isize> {
-        match client.get(&format!("{}/get_load", worker_url)).send().await {
-            Ok(res) if res.status().is_success() => match res.bytes().await {
-                Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    Ok(data) => data
-                        .get("load")
-                        .and_then(|v| v.as_i64())
-                        .map(|v| v as isize),
-                    Err(e) => {
-                        debug!("Failed to parse load response from {}: {}", worker_url, e);
-                        None
-                    }
-                },
-                Err(e) => {
-                    debug!("Failed to read load response from {}: {}", worker_url, e);
-                    None
-                }
-            },
-            Ok(res) => {
-                debug!(
-                    "Worker {} returned non-success status: {}",
-                    worker_url,
-                    res.status()
-                );
-                None
-            }
-            Err(e) => {
-                debug!("Failed to get load from {}: {}", worker_url, e);
-                None
-            }
-        }
+        Ok(format!("Successfully removed worker: {worker_url}"))
     }
 
     // PD-specific wrapper methods that delegate to PDRouter
@@ -1232,107 +1144,1315 @@ impl Router {
     }
 }
 
+pub(crate) async fn get_loads_helper(
+    client: &reqwest::Client,
+    prefill_workers: Vec<Arc<dyn Worker + 'static>>,
+    decode_workers: Vec<Arc<dyn Worker + 'static>>,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    // Collect loads from all servers
+    let prefill_loads =
+        futures_util::future::join_all(prefill_workers.iter().map(|w| async move {
+            let load = crate::core::worker::utils::get_worker_load(client, w)
+                .await
+                .unwrap_or(-1);
+            serde_json::json!({
+                "engine": format!("(Prefill@{})", w.url()),
+                "load": load as i64
+            })
+        }))
+        .await;
+
+    let decode_loads = futures_util::future::join_all(decode_workers.iter().map(|w| async move {
+        let load = crate::core::worker::utils::get_worker_load(client, w)
+            .await
+            .unwrap_or(-1);
+        serde_json::json!({
+            "engine": format!("(Decode@{})", w.url()),
+            "load": load as i64
+        })
+    }))
+    .await;
+    (prefill_loads, decode_loads)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service_discovery::PodType;
+    use crate::core::worker::WorkerFactory;
+    use crate::test_utils::mock_servers::create_enhanced_mock_health_server;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // ============================================================================
+    // Test Helper Functions and Mock Servers
+    // ============================================================================
+
+    // Helper function to create workers with very short health check TTL for testing
+    fn create_test_worker_with_short_ttl(url: String) -> Arc<dyn Worker> {
+        WorkerFactory::create_regular_with_ttl(url, Duration::from_millis(1)) // 1ms TTL for testing
+    }
 
     fn create_test_regular_router() -> Router {
+        let workers = vec![
+            WorkerFactory::create_regular("http://worker1:8080".to_string()),
+            WorkerFactory::create_regular("http://worker2:8080".to_string()),
+        ];
         Router::Random {
-            worker_urls: Arc::new(RwLock::new(vec![
-                "http://worker1:8080".to_string(),
-                "http://worker2:8080".to_string(),
-            ])),
+            workers: Arc::new(RwLock::new(workers)),
             timeout_secs: 5,
             interval_secs: 1,
         }
     }
 
+    fn create_test_round_robin_router() -> Router {
+        let workers = vec![
+            WorkerFactory::create_regular("http://worker1:8080".to_string()),
+            WorkerFactory::create_regular("http://worker2:8080".to_string()),
+            WorkerFactory::create_regular("http://worker3:8080".to_string()),
+        ];
+        Router::RoundRobin {
+            workers: Arc::new(RwLock::new(workers)),
+            current_index: AtomicUsize::new(0),
+            timeout_secs: 5,
+            interval_secs: 1,
+        }
+    }
+
+    fn create_test_cache_aware_router() -> Router {
+        let workers = vec![
+            WorkerFactory::create_regular("http://worker1:8080".to_string()),
+            WorkerFactory::create_regular("http://worker2:8080".to_string()),
+            WorkerFactory::create_regular("http://worker3:8080".to_string()),
+        ];
+        let mut running_queue = std::collections::HashMap::new();
+        let mut processed_queue = std::collections::HashMap::new();
+
+        for worker in &workers {
+            running_queue.insert(worker.url().to_string(), 0);
+            processed_queue.insert(worker.url().to_string(), 0);
+        }
+
+        let tree = Arc::new(Mutex::new(crate::tree::Tree::new()));
+        for worker in &workers {
+            tree.lock().unwrap().insert("", worker.url());
+        }
+
+        Router::CacheAware {
+            workers: Arc::new(RwLock::new(workers)),
+            tree,
+            running_queue: Arc::new(Mutex::new(running_queue)),
+            processed_queue: Arc::new(Mutex::new(processed_queue)),
+            cache_threshold: 0.5,
+            balance_abs_threshold: 10,
+            balance_rel_threshold: 1.5,
+            timeout_secs: 5,
+            interval_secs: 1,
+            _eviction_thread: None,
+        }
+    }
+
+    // ============================================================================
+    // Basic Router Tests
+    // ============================================================================
+
     #[test]
     fn test_router_get_worker_urls_regular() {
         let router = create_test_regular_router();
-        let worker_urls = router.get_worker_urls();
-        let urls = worker_urls.read().unwrap();
+        let workers = router.get_workers();
+        let workers = workers.read().unwrap();
+        let urls = workers
+            .iter()
+            .map(|w| w.url().to_string())
+            .collect::<Vec<String>>();
 
         assert_eq!(urls.len(), 2);
         assert!(urls.contains(&"http://worker1:8080".to_string()));
         assert!(urls.contains(&"http://worker2:8080".to_string()));
     }
 
-    // #[test]
-    // fn test_router_get_worker_urls_pd_mode() {
-    //     // For PD mode, get_worker_urls returns empty list
-    //     // Note: PDRouter::new requires health checks which fail in tests
-    //     // This test would need a mock server or different test setup
-    // }
-
-    #[tokio::test]
-    async fn test_add_pd_worker_with_regular_router() {
-        let router = create_test_regular_router();
-
-        let result = router
-            .add_pd_worker("http://new-worker:8080", PodType::Prefill, Some(8081))
-            .await;
-
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("add_pd_worker only supported in PD mode"));
-    }
-
-    #[tokio::test]
-    async fn test_remove_pd_worker_with_regular_router() {
-        let router = create_test_regular_router();
-
-        let result = router
-            .remove_pd_worker("http://worker:8080", PodType::Decode)
-            .await;
-
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("remove_pd_worker only supported in PD mode"));
-    }
-
-    // #[tokio::test]
-    // async fn test_add_pd_worker_with_pd_router_regular_type() {
-    //     // Note: PDRouter::new requires health checks which fail in tests
-    //     // This test would need a mock server or different test setup
-    // }
-
-    // #[tokio::test]
-    // async fn test_remove_pd_worker_with_pd_router_regular_type() {
-    //     // Note: PDRouter::new requires health checks which fail in tests
-    //     // This test would need a mock server or different test setup
-    // }
-
     #[test]
     fn test_select_first_worker_regular() {
         let router = create_test_regular_router();
-        let result = router.select_first_worker();
+        let result = router.select_first_worker_url();
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "http://worker1:8080");
     }
 
-    // #[test]
-    // fn test_select_first_worker_pd_mode() {
-    //     // Note: PDRouter::new requires health checks which fail in tests
-    //     // This test would need a mock server or different test setup
-    // }
+    #[test]
+    fn test_select_first_worker_empty_workers() {
+        let router = Router::Random {
+            workers: Arc::new(RwLock::new(vec![])),
+            timeout_secs: 5,
+            interval_secs: 1,
+        };
+        let result = router.select_first_worker_url();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No workers are available"));
+    }
+
+    // ============================================================================
+    // Round Robin Router Tests
+    // ============================================================================
 
     #[test]
-    fn test_wait_for_healthy_workers_empty_list() {
-        let result = Router::wait_for_healthy_workers(&[], 1, 1);
-        assert!(result.is_ok());
+    fn test_round_robin_worker_selection() {
+        let router = create_test_round_robin_router();
+
+        // Test multiple selections to verify round-robin behavior
+        let mut selected_workers = Vec::new();
+        for _ in 0..6 {
+            let url = router.select_generate_worker_from_text("test");
+            selected_workers.push(url);
+        }
+
+        // Should cycle through workers in order
+        assert_eq!(selected_workers[0], "http://worker1:8080");
+        assert_eq!(selected_workers[1], "http://worker2:8080");
+        assert_eq!(selected_workers[2], "http://worker3:8080");
+        assert_eq!(selected_workers[3], "http://worker1:8080");
+        assert_eq!(selected_workers[4], "http://worker2:8080");
+        assert_eq!(selected_workers[5], "http://worker3:8080");
+    }
+
+    // ============================================================================
+    // Random Router Tests
+    // ============================================================================
+
+    #[test]
+    fn test_random_worker_selection() {
+        let router = create_test_regular_router();
+
+        // Test multiple selections - should select from available workers
+        for _ in 0..10 {
+            let url = router.select_generate_worker_from_text("test");
+            assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
+        }
+    }
+
+    // ============================================================================
+    // Cache Aware Router Tests
+    // ============================================================================
+
+    #[test]
+    fn test_cache_aware_worker_selection_balanced() {
+        let router = create_test_cache_aware_router();
+
+        // When load is balanced, should use cache-aware routing
+        let url = router.select_generate_worker_from_text("test input");
+
+        // Should select one of the available workers
+        let expected_urls = vec![
+            "http://worker1:8080",
+            "http://worker2:8080",
+            "http://worker3:8080",
+        ];
+        assert!(expected_urls.contains(&url.as_str()));
     }
 
     #[test]
-    fn test_wait_for_healthy_workers_invalid_urls() {
-        // This test will timeout quickly since the URLs are invalid
-        let result =
-            Router::wait_for_healthy_workers(&["http://nonexistent:8080".to_string()], 1, 1);
+    fn test_cache_aware_worker_selection_imbalanced() {
+        let router = create_test_cache_aware_router();
+
+        // Simulate imbalanced load
+        if let Router::CacheAware { running_queue, .. } = &router {
+            let mut queue = running_queue.lock().unwrap();
+            *queue.get_mut("http://worker1:8080").unwrap() = 20; // High load
+            *queue.get_mut("http://worker2:8080").unwrap() = 1; // Low load
+            *queue.get_mut("http://worker3:8080").unwrap() = 2; // Medium load
+        }
+
+        // Should use load balancing (shortest queue)
+        let url = router.select_generate_worker_from_text("test input");
+        assert_eq!(url, "http://worker2:8080"); // Should select worker with lowest load
+    }
+
+    // ============================================================================
+    // Policy Config Tests
+    // ============================================================================
+
+    #[test]
+    fn test_policy_config_creation() {
+        let random_config = PolicyConfig::RandomConfig {
+            timeout_secs: 10,
+            interval_secs: 2,
+        };
+
+        let round_robin_config = PolicyConfig::RoundRobinConfig {
+            timeout_secs: 15,
+            interval_secs: 3,
+        };
+
+        let cache_aware_config = PolicyConfig::CacheAwareConfig {
+            cache_threshold: 0.8,
+            balance_abs_threshold: 5,
+            balance_rel_threshold: 2.0,
+            eviction_interval_secs: 60,
+            max_tree_size: 1000,
+            timeout_secs: 20,
+            interval_secs: 4,
+        };
+
+        // Test that configs can be created and cloned
+        let _cloned_random = random_config.clone();
+        let _cloned_round_robin = round_robin_config.clone();
+        let _cloned_cache_aware = cache_aware_config.clone();
+    }
+
+    // ============================================================================
+    // Worker Management Tests
+    // ============================================================================
+
+    #[test]
+    fn test_remove_worker() {
+        let router = create_test_regular_router();
+
+        // Verify initial workers
+        {
+            let workers = router.get_workers();
+            let workers = workers.read().unwrap();
+            assert_eq!(workers.len(), 2);
+        }
+
+        // Remove a worker
+        let result = router.remove_worker_by_url("http://worker1:8080");
+        assert!(result.is_ok());
+
+        // Verify worker was removed
+        {
+            let workers = router.get_workers();
+            let workers = workers.read().unwrap();
+            assert_eq!(workers.len(), 1);
+            assert_eq!(workers[0].url(), "http://worker2:8080");
+        }
+    }
+
+    #[test]
+    fn test_remove_nonexistent_worker() {
+        let router = create_test_regular_router();
+
+        // Remove a worker that doesn't exist - should not panic
+        let result = router.remove_worker_by_url("http://nonexistent:8080");
+        assert!(result.is_err());
+
+        // Verify workers are unchanged
+        {
+            let workers = router.get_workers();
+            let workers = workers.read().unwrap();
+            assert_eq!(workers.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_cache_aware_worker_removal() {
+        let router = create_test_cache_aware_router();
+
+        // Remove a worker from cache-aware router
+        let result = router.remove_worker_by_url("http://worker1:8080");
+        assert!(result.is_ok());
+
+        // Verify worker was removed from all data structures
+        {
+            let workers = router.get_workers();
+            let workers = workers.read().unwrap();
+            assert_eq!(workers.len(), 2);
+        }
+
+        if let Router::CacheAware {
+            running_queue,
+            processed_queue,
+            ..
+        } = &router
+        {
+            let running_queue = running_queue.lock().unwrap();
+            let processed_queue = processed_queue.lock().unwrap();
+
+            assert!(!running_queue.contains_key("http://worker1:8080"));
+            assert!(!processed_queue.contains_key("http://worker1:8080"));
+        }
+    }
+
+    // ============================================================================
+    // PD Router Integration Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_add_pd_worker_with_regular_router() {
+        let router = create_test_regular_router();
+        let url = "http://new-worker:8080";
+
+        let result = router
+            .add_worker(WorkerFactory::create_decode(url.to_string()))
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("PD workers are only supported in PD mode"));
+    }
+
+    #[tokio::test]
+    async fn test_pd_endpoints_with_regular_router() {
+        let router = create_test_regular_router();
+        let client = reqwest::Client::new();
+
+        // Create a mock HTTP request
+        let req = actix_web::test::TestRequest::get().to_http_request();
+
+        // Test PD-specific endpoints return error for regular router
+        let health_response = router.route_pd_health_generate(&client, &req).await;
+        assert_eq!(
+            health_response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let models_response = router.get_pd_models(&client, &req).await;
+        assert_eq!(
+            models_response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let server_info_response = router.get_pd_server_info(&client, &req).await;
+        assert_eq!(
+            server_info_response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let model_info_response = router.get_pd_model_info(&client, &req).await;
+        assert_eq!(
+            model_info_response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let flush_response = router.route_pd_flush_cache(&client).await;
+        assert_eq!(
+            flush_response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    // ============================================================================
+    // Request Header Tests
+    // ============================================================================
+
+    #[test]
+    fn test_copy_request_headers() {
+        let req = actix_web::test::TestRequest::get()
+            .insert_header(("Authorization", "Bearer token"))
+            .insert_header(("Content-Type", "application/json"))
+            .insert_header(("Custom-Header", "custom-value"))
+            .to_http_request();
+
+        let headers = copy_request_headers(&req);
+
+        assert!(headers.contains(&("authorization".to_string(), "Bearer token".to_string())));
+        assert!(headers.contains(&("content-type".to_string(), "application/json".to_string())));
+        assert!(headers.contains(&("custom-header".to_string(), "custom-value".to_string())));
+    }
+
+    #[test]
+    fn test_copy_request_headers_empty() {
+        let req = actix_web::test::TestRequest::get().to_http_request();
+        let headers = copy_request_headers(&req);
+
+        // TestRequest may add some default headers, so we just verify that it returns a Vec
+        // and doesn't panic when there are no custom headers
+        assert!(headers.is_empty() || !headers.is_empty()); // Always true, just testing no panic
+    }
+
+    // ============================================================================
+    // Integration Tests with Mock Servers
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_route_to_first_success() {
+        let mock_url =
+            crate::test_utils::mock_servers::create_mock_http_server(r#"{"success": true}"#, 200)
+                .await;
+
+        let workers = vec![WorkerFactory::create_regular(mock_url)];
+        let router = Router::Random {
+            workers: Arc::new(RwLock::new(workers)),
+            timeout_secs: 5,
+            interval_secs: 1,
+        };
+
+        let client = reqwest::Client::new();
+        let req = actix_web::test::TestRequest::get().to_http_request();
+
+        let response = router.route_to_first(&client, "/test", &req).await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_all_loads_helper() {
+        let mock_load_response = r#"{"load": 5}"#;
+        let mock_url =
+            crate::test_utils::mock_servers::create_mock_http_server(mock_load_response, 200).await;
+
+        let client = reqwest::Client::new();
+        let prefill_workers = vec![WorkerFactory::create_prefill(mock_url.clone(), Some(8081))];
+        let decode_workers = vec![WorkerFactory::create_decode(mock_url)];
+
+        let (prefill_loads, decode_loads) =
+            get_loads_helper(&client, prefill_workers, decode_workers).await;
+
+        assert_eq!(prefill_loads.len(), 1);
+        assert_eq!(decode_loads.len(), 1);
+
+        // Verify load structure
+        assert!(prefill_loads[0]["engine"]
+            .as_str()
+            .unwrap()
+            .contains("Prefill"));
+        assert!(decode_loads[0]["engine"]
+            .as_str()
+            .unwrap()
+            .contains("Decode"));
+    }
+
+    // ============================================================================
+    // Timeout and Health Check Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_wait_for_healthy_workers_empty_list() {
+        let workers: Vec<Arc<dyn Worker>> = vec![];
+        let result = crate::core::worker::utils::wait_for_healthy_workers(
+            &workers, 1, // interval_secs
+            1, // timeout_secs
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_healthy_workers_timeout() {
+        let workers = vec![WorkerFactory::create_regular(
+            "http://nonexistent:8080".to_string(),
+        )];
+        let result = crate::core::worker::utils::wait_for_healthy_workers(
+            &workers, 1, // interval_secs
+            1, // timeout_secs
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Timeout"));
+    }
+
+    // ============================================================================
+    // Shared Test Infrastructure
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_wait_for_healthy_workers_multiple_workers_mixed() {
+        let (healthy_url, healthy_count) = create_enhanced_mock_health_server(
+            vec![(200, r#"{"status": "healthy"}"#.to_string())],
+            vec![Duration::from_millis(0)],
+            Some(5),
+        )
+        .await;
+
+        let (unhealthy_url, unhealthy_count) = create_enhanced_mock_health_server(
+            vec![
+                (503, r#"{"status": "unhealthy"}"#.to_string()),
+                (503, r#"{"status": "unhealthy"}"#.to_string()),
+                (200, r#"{"status": "healthy"}"#.to_string()),
+            ],
+            vec![Duration::from_millis(0)],
+            Some(10),
+        )
+        .await;
+
+        let workers = vec![
+            WorkerFactory::create_regular(healthy_url),
+            WorkerFactory::create_regular(unhealthy_url),
+        ];
+
+        let result = crate::core::worker::utils::wait_for_healthy_workers(
+            &workers, 1,  // interval_secs
+            10, // timeout_secs
+        )
+        .await;
+        assert!(result.is_ok());
+
+        // Verify both workers are now healthy
+        assert!(workers[0].is_healthy());
+        assert!(workers[1].is_healthy());
+
+        // Both workers should have been checked
+        assert!(healthy_count.load(Ordering::SeqCst) >= 1);
+        assert!(unhealthy_count.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[tokio::test]
+    async fn test_add_worker_with_health_check_success() {
+        let (mock_url, call_count) = create_enhanced_mock_health_server(
+            vec![(200, r#"{"status": "healthy"}"#.to_string())],
+            vec![Duration::from_millis(0)],
+            Some(5),
+        )
+        .await;
+
+        let router = create_test_regular_router();
+        let worker = WorkerFactory::create_regular(mock_url.clone());
+        let result = router.add_worker(worker).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("Successfully added worker"));
+        assert!(call_count.load(Ordering::SeqCst) > 0);
+
+        // Verify worker was actually added
+        let workers = router.get_workers();
+        let workers = workers.read().unwrap();
+        assert!(workers.iter().any(|w| w.url() == mock_url));
+    }
+
+    #[tokio::test]
+    async fn test_add_worker_with_health_check_failure() {
+        let (mock_url, call_count) = create_enhanced_mock_health_server(
+            vec![(503, r#"{"status": "unhealthy"}"#.to_string())],
+            vec![Duration::from_millis(0)],
+            Some(10),
+        )
+        .await;
+
+        let router = create_test_regular_router();
+        let worker = WorkerFactory::create_regular(mock_url.clone());
+        let result = router.add_worker(worker).await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Failed to health check worker"));
+        assert!(call_count.load(Ordering::SeqCst) > 0);
+
+        // Verify worker was not added
+        let workers = router.get_workers();
+        let workers = workers.read().unwrap();
+        assert!(!workers.iter().any(|w| w.url() == mock_url));
+    }
+
+    #[tokio::test]
+    async fn test_cache_aware_health_integration() {
+        let (mock_url, call_count) = create_enhanced_mock_health_server(
+            vec![(200, r#"{"status": "healthy"}"#.to_string())],
+            vec![Duration::from_millis(0)],
+            Some(10),
+        )
+        .await;
+
+        let router = create_test_cache_aware_router();
+        let worker = WorkerFactory::create_regular(mock_url.clone());
+        let result = router.add_worker(worker).await;
+
+        assert!(result.is_ok());
+        assert!(call_count.load(Ordering::SeqCst) > 0);
+
+        // Verify cache-aware structures were updated
+        if let Router::CacheAware {
+            running_queue,
+            processed_queue,
+            ..
+        } = &router
+        {
+            let running_queue = running_queue.lock().unwrap();
+            let processed_queue = processed_queue.lock().unwrap();
+
+            assert!(running_queue.contains_key(&mock_url));
+            assert!(processed_queue.contains_key(&mock_url));
+            assert_eq!(*running_queue.get(&mock_url).unwrap(), 0);
+            assert_eq!(*processed_queue.get(&mock_url).unwrap(), 0);
+        }
+    }
+
+    // ============================================================================
+    // Router Initialization with Batch Health Check Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_router_init_with_mixed_healthy_unhealthy_workers() {
+        // Create healthy mock servers
+        let (healthy_url1, healthy_count1) = create_enhanced_mock_health_server(
+            vec![(200, r#"{"status": "healthy"}"#.to_string())],
+            vec![Duration::from_millis(0)],
+            Some(10),
+        )
+        .await;
+
+        let (healthy_url2, healthy_count2) = create_enhanced_mock_health_server(
+            vec![(200, r#"{"status": "healthy"}"#.to_string())],
+            vec![Duration::from_millis(0)],
+            Some(10),
+        )
+        .await;
+
+        // Create unhealthy mock servers
+        let (unhealthy_url1, unhealthy_count1) = create_enhanced_mock_health_server(
+            vec![(503, r#"{"status": "unhealthy"}"#.to_string())],
+            vec![Duration::from_millis(0)],
+            Some(20),
+        )
+        .await;
+
+        let (unhealthy_url2, unhealthy_count2) = create_enhanced_mock_health_server(
+            vec![(500, r#"{"error": "internal error"}"#.to_string())],
+            vec![Duration::from_millis(0)],
+            Some(20),
+        )
+        .await;
+
+        // Try to create router with mixed healthy/unhealthy workers
+        let worker_urls = vec![
+            healthy_url1.clone(),
+            unhealthy_url1.clone(),
+            healthy_url2.clone(),
+            unhealthy_url2.clone(),
+        ];
+
+        let policy_config = PolicyConfig::RandomConfig {
+            timeout_secs: 3, // Short timeout for test
+            interval_secs: 1,
+        };
+
+        // Router initialization should fail because not all workers are healthy
+        // Use spawn_blocking to handle the sync router creation from async context
+        let result = tokio::task::spawn_blocking(move || Router::new(worker_urls, policy_config))
+            .await
+            .unwrap();
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Timeout"));
+
+        // Verify health checks were attempted on all workers
+        assert!(healthy_count1.load(Ordering::SeqCst) >= 1);
+        assert!(healthy_count2.load(Ordering::SeqCst) >= 1);
+        assert!(unhealthy_count1.load(Ordering::SeqCst) >= 1);
+        assert!(unhealthy_count2.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_router_init_with_all_healthy_workers() {
+        // Create multiple healthy mock servers
+        let mut healthy_urls = Vec::new();
+        let mut counters = Vec::new();
+
+        for i in 0..4 {
+            let (url, counter) = create_enhanced_mock_health_server(
+                vec![(
+                    200,
+                    format!(r#"{{"status": "healthy", "worker_id": {}}}"#, i),
+                )],
+                vec![Duration::from_millis(i * 50)], // Different delays
+                Some(10),
+            )
+            .await;
+            healthy_urls.push(url);
+            counters.push(counter);
+        }
+
+        let policy_config = PolicyConfig::RoundRobinConfig {
+            timeout_secs: 10,
+            interval_secs: 1,
+        };
+
+        // Router initialization should succeed with all healthy workers
+        let healthy_urls_clone = healthy_urls.clone();
+        let result =
+            tokio::task::spawn_blocking(move || Router::new(healthy_urls_clone, policy_config))
+                .await
+                .unwrap();
+
+        assert!(result.is_ok());
+
+        let router = result.unwrap();
+        let workers = router.get_workers();
+        let workers = workers.read().unwrap();
+
+        // Verify all workers were added
+        assert_eq!(workers.len(), 4);
+        for (i, worker) in workers.iter().enumerate() {
+            assert_eq!(worker.url(), healthy_urls[i]);
+            assert!(worker.is_healthy());
+        }
+
+        // Verify health checks were performed
+        for counter in &counters {
+            assert!(counter.load(Ordering::SeqCst) >= 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_router_init_with_eventually_healthy_workers() {
+        // Create workers that become healthy after initial failures
+        let mut worker_urls = Vec::new();
+        let mut counters = Vec::new();
+
+        for i in 0..3 {
+            let (url, counter) = create_enhanced_mock_health_server(
+                vec![
+                    (503, r#"{"status": "starting"}"#.to_string()),
+                    (503, r#"{"status": "loading"}"#.to_string()),
+                    (
+                        200,
+                        format!(r#"{{"status": "healthy", "worker_id": {}}}"#, i),
+                    ),
+                ],
+                vec![Duration::from_millis(100)], // Consistent delay
+                Some(20),
+            )
+            .await;
+            worker_urls.push(url);
+            counters.push(counter);
+        }
+
+        let policy_config = PolicyConfig::CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 10,
+            balance_rel_threshold: 1.5,
+            eviction_interval_secs: 60,
+            max_tree_size: 1000,
+            timeout_secs: 15, // Longer timeout to allow workers to become healthy
+            interval_secs: 2,
+        };
+
+        // Router initialization should eventually succeed
+        let start = Instant::now();
+        let result = tokio::task::spawn_blocking(move || Router::new(worker_urls, policy_config))
+            .await
+            .unwrap();
+        let duration = start.elapsed();
+
+        assert!(result.is_ok());
+        assert!(duration >= Duration::from_secs(4)); // Should take some time
+
+        let router = result.unwrap();
+        let workers = router.get_workers();
+        let workers = workers.read().unwrap();
+
+        // Verify all workers are now healthy
+        assert_eq!(workers.len(), 3);
+        for worker in workers.iter() {
+            assert!(worker.is_healthy());
+        }
+
+        // Verify multiple health checks were performed
+        for counter in &counters {
+            assert!(counter.load(Ordering::SeqCst) >= 3);
+        }
+    }
+
+    // ============================================================================
+    // Worker Addition with Health Check Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_add_multiple_workers_mixed_health_status() {
+        let router = create_test_regular_router();
+
+        // Create healthy and unhealthy workers
+        let (healthy_url, healthy_count) = create_enhanced_mock_health_server(
+            vec![(200, r#"{"status": "healthy"}"#.to_string())],
+            vec![Duration::from_millis(0)],
+            Some(5),
+        )
+        .await;
+
+        let (unhealthy_url, unhealthy_count) = create_enhanced_mock_health_server(
+            vec![(503, r#"{"status": "unhealthy"}"#.to_string())],
+            vec![Duration::from_millis(0)],
+            Some(10),
+        )
+        .await;
+
+        // Add healthy worker - should succeed
+        let healthy_worker = WorkerFactory::create_regular(healthy_url.clone());
+        let result1 = router.add_worker(healthy_worker).await;
+        assert!(result1.is_ok());
+        assert!(result1.unwrap().contains("Successfully added worker"));
+
+        // Add unhealthy worker - should fail
+        let unhealthy_worker = WorkerFactory::create_regular(unhealthy_url.clone());
+        let result2 = router.add_worker(unhealthy_worker).await;
+        assert!(result2.is_err());
+        assert!(result2
+            .unwrap_err()
+            .contains("Failed to health check worker"));
+
+        // Verify only healthy worker was added
+        let workers = router.get_workers();
+        let workers = workers.read().unwrap();
+        let added_workers: Vec<_> = workers
+            .iter()
+            .filter(|w| w.url() == healthy_url || w.url() == unhealthy_url)
+            .collect();
+
+        assert_eq!(added_workers.len(), 1);
+        assert_eq!(added_workers[0].url(), healthy_url);
+        assert!(added_workers[0].is_healthy());
+
+        // Verify health checks were performed
+        assert!(healthy_count.load(Ordering::SeqCst) >= 1);
+        assert!(unhealthy_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_add_worker_with_slow_health_check() {
+        let router = create_test_regular_router();
+
+        // Create worker with slow health check
+        let (slow_url, slow_count) = create_enhanced_mock_health_server(
+            vec![(200, r#"{"status": "healthy"}"#.to_string())],
+            vec![Duration::from_millis(800)], // Slow response
+            Some(5),
+        )
+        .await;
+
+        let start = Instant::now();
+        let worker = WorkerFactory::create_regular(slow_url.clone());
+        let result = router.add_worker(worker).await;
+        let duration = start.elapsed();
+
+        // Should succeed despite slow response
+        assert!(result.is_ok());
+        assert!(duration >= Duration::from_millis(700)); // Should take at least 700ms
+
+        // Verify worker was added and is healthy
+        let workers = router.get_workers();
+        let workers = workers.read().unwrap();
+        let added_worker = workers.iter().find(|w| w.url() == slow_url);
+
+        assert!(added_worker.is_some());
+        assert!(added_worker.unwrap().is_healthy());
+        assert_eq!(slow_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_add_duplicate_healthy_worker() {
+        let router = create_test_regular_router();
+
+        let (mock_url, call_count) = create_enhanced_mock_health_server(
+            vec![(200, r#"{"status": "healthy"}"#.to_string())],
+            vec![Duration::from_millis(0)],
+            Some(10),
+        )
+        .await;
+
+        // Add worker first time - should succeed
+        let worker1 = WorkerFactory::create_regular(mock_url.clone());
+        let result1 = router.add_worker(worker1).await;
+        assert!(result1.is_ok());
+
+        // Add same worker again - should fail with duplicate error
+        let worker2 = WorkerFactory::create_regular(mock_url.clone());
+        let result2 = router.add_worker(worker2).await;
+        assert!(result2.is_err());
+        assert!(result2.unwrap_err().contains("already exists"));
+
+        // Verify worker appears only once
+        let workers = router.get_workers();
+        let workers = workers.read().unwrap();
+        let matching_workers: Vec<_> = workers.iter().filter(|w| w.url() == mock_url).collect();
+
+        assert_eq!(matching_workers.len(), 1);
+
+        // Health check should have been called only once (for first addition)
+        // because duplicate detection now happens before health check
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    // ============================================================================
+    // Routing Failure and Worker Removal Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_routing_with_worker_failure_and_removal() {
+        // Create a worker that fails during routing but passes initial health check
+        let (failing_url, call_count) = create_enhanced_mock_health_server(
+            vec![
+                (200, r#"{"status": "healthy"}"#.to_string()), // Initial health check passes
+                (500, r#"{"error": "internal error"}"#.to_string()), // Request 1 fails
+                (500, r#"{"error": "internal error"}"#.to_string()), // Health check 1 fails
+                (500, r#"{"error": "internal error"}"#.to_string()), // Request 2 fails
+                (503, r#"{"status": "unhealthy"}"#.to_string()), // Health check 2 fails
+                (500, r#"{"error": "internal error"}"#.to_string()), // Request 3 fails
+                (503, r#"{"status": "unhealthy"}"#.to_string()), // Health check 3 fails
+                (500, r#"{"error": "internal error"}"#.to_string()), // Additional requests fail
+                (503, r#"{"status": "unhealthy"}"#.to_string()), // Additional health checks fail
+            ],
+            vec![Duration::from_millis(0)],
+            Some(20),
+        )
+        .await;
+
+        // Create router with the failing worker (using short TTL to avoid caching issues)
+        let worker = create_test_worker_with_short_ttl(failing_url.clone());
+        let router = Router::Random {
+            workers: Arc::new(RwLock::new(vec![worker.clone()])),
+            timeout_secs: 5,
+            interval_secs: 1,
+        };
+
+        // Consume the first response (200 - health check) by calling check_health
+        // This ensures routing requests get the subsequent 500 responses
+        let _ = worker.check_health().await;
+        // Wait for cache to expire
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Initial worker count
+        {
+            let workers = router.get_workers();
+            let workers = workers.read().unwrap();
+            assert_eq!(workers.len(), 1);
+            assert_eq!(workers[0].url(), failing_url);
+        }
+
+        // Attempt to route request - should fail and remove worker
+        let client = reqwest::Client::new();
+        let req = actix_web::test::TestRequest::get().to_http_request();
+
+        let response = router.route_to_first(&client, "/test", &req).await;
+
+        // Should return error response since all workers failed
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        // Worker should be removed after MAX_REQUEST_RETRIES failures
+        {
+            let workers = router.get_workers();
+            let workers = workers.read().unwrap();
+            assert_eq!(workers.len(), 0); // Worker should be removed
+        }
+
+        // Verify multiple calls were made (initial health check + failed requests + health checks)
+        assert!(call_count.load(Ordering::SeqCst) >= 4);
+    }
+
+    #[tokio::test]
+    async fn test_routing_with_multiple_workers_one_fails() {
+        // Create one healthy worker and one that fails
+        let (healthy_url, healthy_count) = create_enhanced_mock_health_server(
+            vec![(
+                200,
+                r#"{"status": "healthy", "response": "success"}"#.to_string(),
+            )],
+            vec![Duration::from_millis(0)],
+            Some(10),
+        )
+        .await;
+
+        let (failing_url, failing_count) = create_enhanced_mock_health_server(
+            vec![
+                (200, r#"{"status": "healthy"}"#.to_string()), // Initial health check
+                (500, r#"{"error": "internal error"}"#.to_string()), // Request 1 fails
+                (500, r#"{"error": "internal error"}"#.to_string()), // Health check 1 fails
+                (500, r#"{"error": "internal error"}"#.to_string()), // Request 2 fails
+                (503, r#"{"status": "unhealthy"}"#.to_string()), // Health check 2 fails
+                (500, r#"{"error": "internal error"}"#.to_string()), // Request 3 fails
+                (503, r#"{"status": "unhealthy"}"#.to_string()), // Health check 3 fails
+                (500, r#"{"error": "internal error"}"#.to_string()), // Additional requests fail
+                (503, r#"{"status": "unhealthy"}"#.to_string()), // Additional health checks fail
+            ],
+            vec![Duration::from_millis(0)],
+            Some(20),
+        )
+        .await;
+
+        let healthy_worker = create_test_worker_with_short_ttl(healthy_url.clone());
+        let failing_worker = create_test_worker_with_short_ttl(failing_url.clone());
+        let router = Router::Random {
+            workers: Arc::new(RwLock::new(vec![
+                healthy_worker.clone(),
+                failing_worker.clone(),
+            ])),
+            timeout_secs: 5,
+            interval_secs: 1,
+        };
+
+        // Consume the first response for the failing worker (200 - health check)
+        // This ensures routing requests get the subsequent 500 responses
+        let _ = failing_worker.check_health().await;
+        // Wait for cache to expire
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Initial worker count
+        {
+            let workers = router.get_workers();
+            let workers = workers.read().unwrap();
+            assert_eq!(workers.len(), 2);
+        }
+
+        let client = reqwest::Client::new();
+        let req = actix_web::test::TestRequest::get().to_http_request();
+
+        // Make multiple routing requests
+        for _i in 0..5 {
+            let response = router.route_to_first(&client, "/test", &req).await;
+
+            // Some should succeed (from healthy worker), others might fail initially
+            // but the healthy worker should eventually be selected
+            if response.status().is_success() {
+                // Successful response should be from healthy worker
+                break;
+            }
+
+            // Allow some time between requests
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Check if failing worker has been removed
+            let workers = router.get_workers();
+            let workers = workers.read().unwrap();
+            if workers.len() == 1 {
+                assert_eq!(workers[0].url(), healthy_url);
+                break;
+            }
+        }
+
+        // Eventually, the failing worker should be removed
+        {
+            let workers = router.get_workers();
+            let workers = workers.read().unwrap();
+
+            // Should have only the healthy worker remaining
+            if workers.len() == 1 {
+                assert_eq!(workers[0].url(), healthy_url);
+                assert!(workers[0].is_healthy());
+            }
+        }
+
+        // Verify both workers were accessed
+        assert!(healthy_count.load(Ordering::SeqCst) >= 1);
+        assert!(failing_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_routing_failure_with_health_check_recovery() {
+        // Create worker that fails requests but stays healthy
+        let (recovering_url, call_count) = create_enhanced_mock_health_server(
+            vec![
+                (200, r#"{"status": "healthy"}"#.to_string()), // Health checks pass
+                (500, r#"{"error": "temporary error"}"#.to_string()), // Request fails
+                (200, r#"{"status": "healthy"}"#.to_string()), // But health check passes
+                (500, r#"{"error": "temporary error"}"#.to_string()),
+                (200, r#"{"status": "healthy"}"#.to_string()),
+                (500, r#"{"error": "temporary error"}"#.to_string()),
+                (200, r#"{"status": "healthy"}"#.to_string()),
+            ],
+            vec![Duration::from_millis(0)],
+            Some(20),
+        )
+        .await;
+
+        let worker = create_test_worker_with_short_ttl(recovering_url.clone());
+        let router = Router::Random {
+            workers: Arc::new(RwLock::new(vec![worker.clone()])),
+            timeout_secs: 5,
+            interval_secs: 1,
+        };
+
+        // Consume the first response (200 - health check)
+        let _ = worker.check_health().await;
+        // Wait for cache to expire
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let client = reqwest::Client::new();
+        let req = actix_web::test::TestRequest::get().to_http_request();
+
+        // Attempt routing
+        let response = router.route_to_first(&client, "/test", &req).await;
+
+        // Should return the 500 error since worker is healthy (so request is considered bad)
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        // Worker should NOT be removed since health checks pass
+        {
+            let workers = router.get_workers();
+            let workers = workers.read().unwrap();
+            assert_eq!(workers.len(), 1);
+            assert_eq!(workers[0].url(), recovering_url);
+            assert!(workers[0].is_healthy());
+        }
+
+        // Verify both request and health check calls were made
+        assert!(call_count.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_routing_with_cache_aware_worker_removal() {
+        // Create failing worker
+        let (failing_url, call_count) = create_enhanced_mock_health_server(
+            vec![
+                (200, r#"{"status": "healthy"}"#.to_string()), // Initial health check
+                (500, r#"{"error": "internal error"}"#.to_string()), // Request 1 fails
+                (500, r#"{"error": "internal error"}"#.to_string()), // Health check 1 fails
+                (500, r#"{"error": "internal error"}"#.to_string()), // Request 2 fails
+                (503, r#"{"status": "unhealthy"}"#.to_string()), // Health check 2 fails
+                (500, r#"{"error": "internal error"}"#.to_string()), // Request 3 fails
+                (503, r#"{"status": "unhealthy"}"#.to_string()), // Health check 3 fails
+                (500, r#"{"error": "internal error"}"#.to_string()), // Additional requests fail
+                (503, r#"{"status": "unhealthy"}"#.to_string()), // Additional health checks fail
+            ],
+            vec![Duration::from_millis(0)],
+            Some(20),
+        )
+        .await;
+
+        // Create cache-aware router
+        let worker = create_test_worker_with_short_ttl(failing_url.clone());
+        let mut running_queue = std::collections::HashMap::new();
+        let mut processed_queue = std::collections::HashMap::new();
+
+        running_queue.insert(worker.url().to_string(), 0);
+        processed_queue.insert(worker.url().to_string(), 0);
+
+        let tree = Arc::new(Mutex::new(crate::tree::Tree::new()));
+        tree.lock().unwrap().insert("", worker.url());
+
+        let router = Router::CacheAware {
+            workers: Arc::new(RwLock::new(vec![worker.clone()])),
+            tree,
+            running_queue: Arc::new(Mutex::new(running_queue)),
+            processed_queue: Arc::new(Mutex::new(processed_queue)),
+            cache_threshold: 0.5,
+            balance_abs_threshold: 10,
+            balance_rel_threshold: 1.5,
+            timeout_secs: 5,
+            interval_secs: 1,
+            _eviction_thread: None,
+        };
+
+        // Consume the first response (200 - health check)
+        let _ = worker.check_health().await;
+        // Wait for cache to expire
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Verify initial cache-aware structures
+        if let Router::CacheAware {
+            running_queue,
+            processed_queue,
+            ..
+        } = &router
+        {
+            let running_queue = running_queue.lock().unwrap();
+            let processed_queue = processed_queue.lock().unwrap();
+
+            assert!(running_queue.contains_key(&failing_url));
+            assert!(processed_queue.contains_key(&failing_url));
+        }
+
+        let client = reqwest::Client::new();
+        let req = actix_web::test::TestRequest::get().to_http_request();
+
+        // Attempt routing - should fail and remove worker
+        let response = router.route_to_first(&client, "/test", &req).await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        // Worker should be removed from all cache-aware structures
+        {
+            let workers = router.get_workers();
+            let workers = workers.read().unwrap();
+            assert_eq!(workers.len(), 0);
+        }
+
+        if let Router::CacheAware {
+            running_queue,
+            processed_queue,
+            ..
+        } = &router
+        {
+            let running_queue = running_queue.lock().unwrap();
+            let processed_queue = processed_queue.lock().unwrap();
+
+            // Cache structures should be cleaned up
+            assert!(!running_queue.contains_key(&failing_url));
+            assert!(!processed_queue.contains_key(&failing_url));
+        }
+
+        assert!(call_count.load(Ordering::SeqCst) >= 4);
+    }
+
+    #[tokio::test]
+    async fn test_routing_with_all_workers_failing() {
+        // Create multiple workers that all fail
+        let mut failing_urls = Vec::new();
+        let mut counters = Vec::new();
+
+        for i in 0..2 {
+            let (url, counter) = create_enhanced_mock_health_server(
+                vec![
+                    (200, r#"{"status": "healthy"}"#.to_string()), // Initial health check
+                    (500, format!(r#"{{"error": "worker {} failed"}}"#, i)), // Request 1 fails
+                    (500, format!(r#"{{"error": "worker {} failed"}}"#, i)), // Health check 1 fails
+                    (500, format!(r#"{{"error": "worker {} failed"}}"#, i)), // Request 2 fails
+                    (503, r#"{"status": "unhealthy"}"#.to_string()), // Health check 2 fails
+                    (500, format!(r#"{{"error": "worker {} failed"}}"#, i)), // Request 3 fails
+                    (503, r#"{"status": "unhealthy"}"#.to_string()), // Health check 3 fails
+                    (500, format!(r#"{{"error": "worker {} failed"}}"#, i)), // Additional requests fail
+                    (503, r#"{"status": "unhealthy"}"#.to_string()), // Additional health checks fail
+                ],
+                vec![Duration::from_millis(0)],
+                Some(20),
+            )
+            .await;
+            failing_urls.push(url);
+            counters.push(counter);
+        }
+
+        let workers: Vec<_> = failing_urls
+            .iter()
+            .map(|url| create_test_worker_with_short_ttl(url.clone()))
+            .collect();
+
+        // Consume the first response (200 - health check) for each worker
+        for worker in &workers {
+            let _ = worker.check_health().await;
+        }
+        // Wait for cache to expire
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let router = Router::RoundRobin {
+            workers: Arc::new(RwLock::new(workers)),
+            current_index: AtomicUsize::new(0),
+            timeout_secs: 5,
+            interval_secs: 1,
+        };
+
+        // Initial worker count
+        {
+            let workers = router.get_workers();
+            let workers = workers.read().unwrap();
+            assert_eq!(workers.len(), 2);
+        }
+
+        let client = reqwest::Client::new();
+        let req = actix_web::test::TestRequest::get().to_http_request();
+
+        // Attempt routing - should exhaust all workers and fail
+        let response = router.route_to_first(&client, "/test", &req).await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        // All workers should eventually be removed
+        {
+            let workers = router.get_workers();
+            let workers = workers.read().unwrap();
+            assert_eq!(workers.len(), 0);
+        }
+
+        // Verify all workers were attempted
+        for counter in &counters {
+            assert!(counter.load(Ordering::SeqCst) >= 1);
+        }
     }
 }
